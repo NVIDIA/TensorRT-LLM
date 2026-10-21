@@ -34,14 +34,9 @@ def _build(spec, seed):
         rows, off = shape[0], spec["col_offset"]
         buffer = randn(rows, spec["row_width"])
         x = buffer[:, off : off + width]
-    elif "row_step" in spec:
-        buffer = randn(shape[0] * spec["row_step"], width)
-        x = buffer[:: spec["row_step"]]
     else:
         buffer = x = randn(*shape)
-    weight = (torch.randn(width, generator=g, device="cuda") * spec.get("weight_scale", 1.0)).to(
-        dtype
-    )
+    weight = torch.randn(width, generator=g, device="cuda").to(dtype)
     return buffer, x, weight, spec["eps"]
 
 

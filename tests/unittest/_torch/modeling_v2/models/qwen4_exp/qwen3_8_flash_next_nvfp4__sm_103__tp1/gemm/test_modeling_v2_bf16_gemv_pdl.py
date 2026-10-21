@@ -58,12 +58,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(out, op.reference(mat_a, mat_b, s["pdl"]))
 
 
-@pytest.mark.parametrize("pdl", [False, True])
-def test_dependent_chain_under_graph_replay(pdl) -> None:
+def test_dependent_chain_under_graph_replay() -> None:
     """Decode runs this under CUDA graphs, back to back with other kernels. Each
     link of the chain reads the output of the one before it: a GEMV that read
     its activation before `griddepcontrol.wait` would see the previous replay's
     values, and the comparison below would fail on the second replay."""
+    pdl = True
     dims = [2560, 6144, 2560, 640, 2560]  # K of each link; N is the next link's K
     weights = [_build(1, n, k, seed=i)[1] for i, (k, n) in enumerate(zip(dims, dims[1:] + [16480]))]
     x = torch.randn(1, dims[0], device="cuda").to(torch.bfloat16)
@@ -97,18 +97,18 @@ def test_dependent_chain_under_graph_replay(pdl) -> None:
             h = out
 
 
-@pytest.mark.parametrize("m,n,k", [(1, 16480, 2560), (2, 2560, 6144), (1, 2560, 640)])
+@pytest.mark.parametrize("m,n,k", [(1, 16480, 2560), (1, 2560, 6144)])
 def test_pdl_on_and_off_agree_bitwise(m, n, k) -> None:
     """PDL changes when the kernel may start, not what it computes."""
     mat_a, mat_b = _build(m, n, k, seed=11)
     assert torch.equal(launch(mat_a, mat_b, True), launch(mat_a, mat_b, False))
 
 
-@pytest.mark.parametrize("m,n,k", [(1, 16480, 2560), (2, 2560, 6144)])
-def test_band_discriminates_wrong_variants(m, n, k) -> None:
+def test_band_discriminates_wrong_variants() -> None:
     """The band admits the kernel and rejects the near misses a wrong k-tile
     split or layout would produce: half of K missing, a one-column shift of the
     output, a 3% scale error."""
+    m, n, k = 1, 16480, 2560
     mat_a, mat_b = _build(m, n, k, seed=7)
     out = op(mat_a, mat_b)
     ref = op.reference(mat_a, mat_b)

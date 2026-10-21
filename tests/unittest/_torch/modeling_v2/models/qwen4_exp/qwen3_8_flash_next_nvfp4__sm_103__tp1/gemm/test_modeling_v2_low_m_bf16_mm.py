@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the low_m_bf16_mm entry.
 
-Every cell names the branch `plan` must pick, so a table edit that moves a
+Every cell names the branch `plan` must pick, and a host-only check pins the
+branch of the table's other shapes and M buckets, so a table edit that moves a
 shape to another kernel fails here before it can change a number silently.
 Beyond the cells: CUDA-graph capture and replay after warmup (the way the
 decode forward runs it), the wrong-variant discrimination of the band, and the
@@ -60,11 +61,46 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(out, op.reference(mat_a, mat_b, s["pdl"]))
 
 
-@pytest.mark.parametrize("pdl", [False, True])
-def test_graph_replay_after_warmup(pdl) -> None:
-    """Decode runs this under CUDA graphs: compile in warmup, capture, then replay
-    with new activations copied into the captured input. One call per branch, in
-    a chain, so a FlashInfer kernel follows cuBLAS and vice versa."""
+#: `(M, N, K, branch)` of the table's shapes and M buckets the cells do not drive:
+#: what `plan` picks for each, held without a launch.
+_PLAN_PINS = (
+    (1, 10240, 2560, "direct"),
+    (1, 48, 2560, "direct"),
+    (1, 2560, 6144, "direct"),
+    (3, 12288, 2560, "splitk"),
+    (8, 12288, 2560, "splitk"),
+    (16, 12288, 2560, "cublas"),
+    (16, 512, 2560, "direct"),
+    (24, 512, 2560, "splitk"),
+    (16, 640, 2560, "splitk"),
+    (4, 1280, 2560, "direct"),
+    (8, 1296, 2560, "splitk"),
+    (1, 1, 2560, "direct"),
+    (1, 16480, 2560, "direct"),
+    (2, 14080, 2560, "direct"),
+    (3, 14080, 2560, "splitk"),
+    (8, 14080, 2560, "splitk"),
+    (16, 14080, 2560, "cublas"),
+    (1, 2560, 2560, "direct"),
+    (4, 2560, 2560, "direct"),
+    (8, 2560, 2560, "splitk"),
+    (1, 2560, 640, "cublas"),
+    (8192, 2560, 6144, "cublas"),
+    (1, 1024, 2048, "cublas"),
+)
+
+
+def test_plan_pins_the_branch_of_the_other_table_shapes() -> None:
+    picked = [(m, n, k, want, plan(m, n, k).kind) for m, n, k, want in _PLAN_PINS]
+    wrong = [p for p in picked if p[3] != p[4]]
+    assert not wrong, f"(M, N, K, pinned, picked): {wrong}"
+
+
+def test_graph_replay_after_warmup() -> None:
+    """Decode runs this under CUDA graphs, with PDL: compile in warmup, capture,
+    then replay with new activations copied into the captured input. One call per
+    branch, in a chain, so a FlashInfer kernel follows cuBLAS and vice versa."""
+    pdl = True
     shapes = [(1, 10240, 2560), (8, 2560, 6144), (1, 2560, 640), (8, 12288, 2560)]
     assert [plan(*s).kind for s in shapes] == ["direct", "splitk", "cublas", "splitk"]
     ins = [_build(m, n, k, seed=i) for i, (m, n, k) in enumerate(shapes)]
@@ -88,11 +124,11 @@ def test_graph_replay_after_warmup(pdl) -> None:
             _compare(out, op.reference(a, b))
 
 
-@pytest.mark.parametrize("m,n,k", [(1, 10240, 2560), (8, 2560, 6144)])
-def test_band_discriminates_wrong_variants(m, n, k) -> None:
+def test_band_discriminates_wrong_variants() -> None:
     """The band admits the kernel and rejects the near misses a wrong layout or
     a dropped K-split would produce: half of K missing, a one-column shift of
     the output, a 3% scale error."""
+    m, n, k = 8, 2560, 6144
     mat_a, mat_b = _build(m, n, k, seed=7)
     out = op(mat_a, mat_b)
     ref = op.reference(mat_a, mat_b)

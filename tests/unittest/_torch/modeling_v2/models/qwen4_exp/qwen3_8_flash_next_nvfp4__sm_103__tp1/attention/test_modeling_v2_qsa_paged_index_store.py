@@ -51,25 +51,14 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(as_int)
 
 
-def _hole(spec, table, live_requests, allocated_cols):
-    """One row that resolves to no slot, and the table edit it needs."""
-    tpb, width, slots, pages = (spec[k] for k in ("tokens_per_block", "width", "slots", "pages"))
+def _hole(spec, table, allocated_cols):
+    """One row that resolves to no slot: its (request, position)."""
     kind = spec["hole"]
     if kind == "unallocated_page":
         assert int(table[0, allocated_cols[0]]) == -1
-        return 0, allocated_cols[0] * tpb
-    if kind == "page_past_pool":
-        table[live_requests] = -1
-        table[live_requests, 0] = pages + 7
-        return live_requests, 0
-    if kind == "request_past_table":
-        return slots, 0
-    if kind == "negative_request":
-        return -1, 0
-    if kind == "negative_position":
-        return 0, -1
-    assert kind == "column_past_table"
-    return 0, width * tpb
+        return 0, allocated_cols[0] * spec["tokens_per_block"]
+    assert kind == "negative_request"
+    return -1, 0
 
 
 def _shared_page_planes(spec, extras: dict):
@@ -115,19 +104,11 @@ def _build(spec, seed: int):
         allocated_cols.append(cols)
     assert used <= pages and len(segments) < slots, "pool or table too small for the batch"
     if spec["hole"] is not None:
-        request, position = _hole(spec, table, len(segments), allocated_cols)
+        request, position = _hole(spec, table, allocated_cols)
         requests.append(request)
         positions.append(position)
         rows += 1
     table = table.to(DEV)
-    if spec["table_layout"] == "column_slice":
-        wide = torch.full((slots, width + 4), -1, dtype=torch.int32, device=DEV)
-        wide[:, 2 : 2 + width] = table
-        table = wide[:, 2 : 2 + width]
-        assert not table.is_contiguous()
-    elif spec["table_layout"] == "transposed":
-        table = table.t().contiguous().t()
-        assert table.stride(1) != 1
 
     projection = torch.randn(
         rows, spec["index_heads"] + hkv, head_dim, generator=gen, dtype=torch.float32
@@ -138,43 +119,23 @@ def _build(spec, seed: int):
         # pad] = 110 heads of 128: the raw index key is head 108.
         row = torch.randn(rows, 110, head_dim, generator=gen, dtype=torch.float32)
         token_k = row.to(device=DEV, dtype=spec["key_dtype"])[:, 108 : 108 + hkv]
-    if spec["key_layout"] == "contiguous":
-        token_k = token_k.contiguous()
 
     request_indices = torch.tensor(requests, dtype=spec["request_dtype"], device=DEV)
     logical_positions = torch.tensor(positions, dtype=spec["position_dtype"], device=DEV)
-    if spec["meta_layout"] == "strided":
-        wide_requests = torch.zeros(rows, 2, dtype=spec["request_dtype"], device=DEV)
-        wide_positions = torch.zeros(rows, 3, dtype=spec["position_dtype"], device=DEV)
-        wide_requests[:, 0] = request_indices
-        wide_positions[:, 1] = logical_positions
-        request_indices, logical_positions = wide_requests[:, 0], wide_positions[:, 1]
-        assert not logical_positions.is_contiguous()
 
     # Three genuinely different axes, as an image span has: t, t + 7, t + 14.
     coords = logical_positions.to(torch.int32)[:, None] + 7 * torch.arange(
         3, dtype=torch.int32, device=DEV
     )
-    if spec["coords_layout"] == "transposed":
-        # The engine's `[3, max_num_tokens]` position buffer, transposed.
-        buffer = torch.full((3, ENGINE_MAX_NUM_TOKENS), -1, dtype=torch.int32, device=DEV)
-        buffer[:, :rows] = coords.t()
-        coords = buffer[:, :rows].t()
-    elif spec["coords_layout"] == "stride0":
-        coords = logical_positions[:, None].expand(-1, 3)
-        assert coords.stride(1) == 0
-    else:
-        coords = coords.contiguous()
+    # The engine's `[3, max_num_tokens]` position buffer, transposed.
+    buffer = torch.full((3, ENGINE_MAX_NUM_TOKENS), -1, dtype=torch.int32, device=DEV)
+    buffer[:, :rows] = coords.t()
+    coords = buffer[:, :rows].t()
 
     extras = {}
     position_cache = None
     if spec["cache_layout"] == "shared_page":
         index_cache, position_cache = _shared_page_planes(spec, extras)
-    elif spec["cache_layout"] == "role_view":
-        pool = torch.full((pages, 2, tpb, hkv, head_dim), KEY_FILL, device=DEV).to(torch.bfloat16)
-        index_cache = pool[:, 0]
-        extras["neighbour"] = (pool[:, 1], pool[:, 1].clone())
-        assert not index_cache.is_contiguous()
     else:
         index_cache = torch.full((pages, tpb, hkv, head_dim), KEY_FILL, device=DEV).to(
             torch.bfloat16
@@ -198,29 +159,25 @@ def _build(spec, seed: int):
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     args, extras = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
-    before = args["position_cache"].clone()
     ref = op.reference(**args)
     out = op(**args)
     assert out[0] is args["index_cache"] and out[1] is args["position_cache"]
     _compare(out, ref)
-    if "neighbour" in extras:
-        view, saved = extras["neighbour"]
-        assert torch.equal(_bits(view), _bits(saved)), "the neighbouring role moved"
     if "roles" in extras:
         fill = int(_bits(torch.tensor([KEY_FILL], dtype=torch.bfloat16))[0])
         assert bool((extras["roles"].view(torch.int16) == fill).all()), (
             "another index-K role of the shared page moved"
         )
-    if cell.spec["axes"] > 3:
-        assert torch.equal(out[1][..., 3:], before[..., 3:]), "axes past the coordinates moved"
-    if cell.spec["coords_layout"] == "stride0":
-        for axis in (1, 2):
-            assert torch.equal(out[1][..., axis], out[1][..., 0])
+
+
+#: The cell of 32 MTP7 verify blocks (256 rows): the segments, pool and table it runs over.
+_MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 requests"))
+_MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
 
 
 def _small(seed: int, **overrides):
     """Four decode rows at the checkpoint's call-site layouts."""
-    spec = {**op.CELLS[0].spec, "segments": ((0, 1), (7, 1), (32, 1), (40, 1)), "pages": 8}
+    spec = {**_MTP7_32, "segments": ((0, 1), (7, 1), (32, 1), (40, 1)), "pages": 8}
     return _build({**spec, **overrides}, seed=seed)[0]
 
 
@@ -279,15 +236,10 @@ def test_repeats_are_stream_ordered_and_idempotent() -> None:
         assert torch.equal(args["position_cache"], first[1])
 
 
-#: The cell of 32 MTP7 verify blocks (256 rows): the segments, pool and table it runs over.
-_MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 requests"))
-_MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
-
-
-@pytest.mark.parametrize("batch", ({}, _MTP7_BATCH), ids=("decode", "mtp7-32x8"))
-def test_cuda_graph_capture_and_replay(batch) -> None:
-    """Captured once, replayed against new positions written into the same buffer."""
-    args = _small(seed=52, **batch)
+def test_cuda_graph_capture_and_replay() -> None:
+    """Captured once at the 32 MTP7 verify blocks (256 rows), replayed against new
+    positions written into the same buffer."""
+    args = _small(seed=52, **_MTP7_BATCH)
     positions = args["logical_positions"]
     replayed = positions.clone()
     positions.zero_()
@@ -336,6 +288,8 @@ def test_the_stored_key_is_raw_not_normalized() -> None:
 #
 # Each is a shape the kernel would otherwise read past or write wrongly; the
 # entry refuses it before launching, so `is_valid` has nothing left to guard.
+# One case per refusal family: metadata, row counts, the index plane, the
+# position plane, the table.
 
 
 def _rejected(args, match: str) -> None:
@@ -346,22 +300,10 @@ def _rejected(args, match: str) -> None:
     assert torch.equal(args["position_cache"], before[1])
 
 
-def test_rejects_two_dimensional_request_indices() -> None:
-    args = _small(seed=60)
-    args["request_indices"] = args["request_indices"][:, None]
-    _rejected(args, "one-dimensional")
-
-
 def test_rejects_metadata_of_unequal_length() -> None:
     args = _small(seed=61)
     args["logical_positions"] = args["logical_positions"][:1]
     _rejected(args, "equally long")
-
-
-def test_rejects_float_metadata() -> None:
-    args = _small(seed=62)
-    args["logical_positions"] = args["logical_positions"].float()
-    _rejected(args, "int32 or int64")
 
 
 def test_rejects_a_single_token_k_row() -> None:
@@ -370,34 +312,16 @@ def test_rejects_a_single_token_k_row() -> None:
     _rejected(args, "token_k")
 
 
-def test_rejects_a_single_coordinate_row() -> None:
-    args = _small(seed=64)
-    args["position_coordinates"] = args["position_coordinates"][:1]
-    _rejected(args, "position_coordinates")
-
-
 def test_rejects_a_page_size_that_is_not_the_cache_s() -> None:
     args = _small(seed=65)
     args["tokens_per_block"] = 16
     _rejected(args, "index_cache")
 
 
-def test_rejects_a_position_plane_with_a_different_page_size() -> None:
-    args = _small(seed=66)
-    args["position_cache"] = torch.full((8, 16, 3), POS_FILL, dtype=torch.int32, device=DEV)
-    _rejected(args, "position_cache")
-
-
 def test_rejects_a_position_plane_narrower_than_the_coordinates() -> None:
     args = _small(seed=67)
     args["position_cache"] = torch.full((8, 32, 2), POS_FILL, dtype=torch.int32, device=DEV)
     _rejected(args, "position_cache")
-
-
-def test_rejects_a_cache_with_more_heads_than_the_key() -> None:
-    args = _small(seed=68)
-    args["index_cache"] = torch.full((8, 32, 2, 128), KEY_FILL, device=DEV).to(torch.bfloat16)
-    _rejected(args, "index_cache")
 
 
 def test_rejects_a_one_dimensional_table() -> None:

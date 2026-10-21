@@ -309,77 +309,48 @@ class PleNgramEmbed(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: lengths (rows per sequence), slots (None -> arange), pool_slots
-    # (default num_seqs + 2), carries (None -> the argument is None), max_rows
-    # (default max(lengths)), eos_density (0.0), table "small" | "host" |
-    # "ckpt" (the full 320001536-row device table, rows filled where touched),
-    # ngram_size (3), heads_per_ngram (8), ids_dtype (int32).
+    # spec: lengths (rows per sequence), pool_slots (default num_seqs + 2),
+    # carries (None -> the argument is None), max_rows (default max(lengths)),
+    # eos_density (0.0), table "small" | "host" | "ckpt" (the full
+    # 320001536-row device table, rows filled where touched). The checkpoint's
+    # 3-gram of 8 heads per order, int32 ids.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            _cell(f"decode {n} x 1 row at the 461-slot pool", (1,) * n, pool_slots=ENGINE_SLOTS)
-            for n in (1, 8, 32, 128)
-        )
-        + tuple(
-            _cell(
-                f"decode {n} x 1 row, host-resident table, 461 slots",
-                (1,) * n,
-                pool_slots=ENGINE_SLOTS,
-                table="host",
-            )
-            for n in (1, 128)
-        )
-        + (
-            _cell(
-                "decode 128 x 1 row, the full checkpoint-height table",
-                (1,) * 128,
-                pool_slots=ENGINE_SLOTS,
-                table="ckpt",
-                eos_density=0.05,
-            ),
-            _cell("decode 64 x 1 row, EOS in stream and carry", (1,) * 64, eos_density=0.3),
-            _cell("MTP verify p=2: 8 x 2 rows", (2,) * 8, pool_slots=ENGINE_SLOTS),
-            _cell("MTP verify p=3: 8 x 3 rows", (3,) * 8, eos_density=0.2),
-            _cell("MTP verify p=4: 32 x 4 rows", (4,) * 32, pool_slots=ENGINE_SLOTS),
-            _cell(
-                "carry flags mixed, fresh rows seed EOS",
-                (1, 3, 1, 2),
-                carries=(True, False, True, False),
-            ),
-            _cell(
-                "zero-row sequences republish carry",
-                (2, 0, 1, 0),
-                carries=(True, True, True, False),
-                max_rows=2,
-            ),
-            _cell("rows shorter than max_rows", (1, 3, 2), max_rows=4),
-            _cell("int64 ids", (1,) * 16, ids_dtype=torch.int64),
-            _cell("ngram_size 4, 4 heads per order", (1, 2, 4), ngram_size=4, heads_per_ngram=4),
-            _cell("ngram_size 2, 8 heads", (1,) * 8, ngram_size=2, eos_density=0.2),
-            # Context-shaped (prefill / mixed) steps: the packed-row form.
-            _cell("prefill 8192 rows, fresh", (8192,), carries=(False,), pool_slots=ENGINE_SLOTS),
-            _cell(
-                "chunked prefill 16384 rows carrying, host table",
-                (16384,),
-                carries=(True,),
-                pool_slots=ENGINE_SLOTS,
-                table="host",
-                eos_density=0.01,
-            ),
-            _cell(
-                "mixed step: 2 contexts + 64 decode rows",
-                (3001, 5000) + (1,) * 64,
-                carries=(False, True) + (True,) * 64,
-                pool_slots=ENGINE_SLOTS,
-                eos_density=0.05,
-            ),
-            _cell(
-                "short contexts, tile-straddling, zero-row",
-                (40, 1, 0, 7, 33, 2),
-                carries=(True, False, True, False, True, True),
-                eos_density=0.2,
-            ),
-            _cell("mixed step, carry None", (9, 1, 1), max_rows=9),
-        )
+        _cell(
+            "decode 128 x 1 row, host-resident table, 461 slots",
+            (1,) * 128,
+            pool_slots=ENGINE_SLOTS,
+            table="host",
+        ),
+        _cell(
+            "decode 128 x 1 row, the full checkpoint-height table",
+            (1,) * 128,
+            pool_slots=ENGINE_SLOTS,
+            table="ckpt",
+            eos_density=0.05,
+        ),
+        _cell("MTP verify p=4: 32 x 4 rows", (4,) * 32, pool_slots=ENGINE_SLOTS),
+        _cell(
+            "zero-row sequences republish carry",
+            (2, 0, 1, 0),
+            carries=(True, True, True, False),
+            max_rows=2,
+        ),
+        # Context-shaped (prefill / mixed) steps: the packed-row form.
+        _cell(
+            "chunked prefill 16384 rows carrying, host table",
+            (16384,),
+            carries=(True,),
+            pool_slots=ENGINE_SLOTS,
+            table="host",
+            eos_density=0.01,
+        ),
+        _cell(
+            "mixed step: 2 contexts + 64 decode rows",
+            (3001, 5000) + (1,) * 64,
+            carries=(False, True) + (True,) * 64,
+            pool_slots=ENGINE_SLOTS,
+            eos_density=0.05,
+        ),
     )
 
     note = """

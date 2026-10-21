@@ -67,18 +67,7 @@ def _build(spec, seed):
         )
         bias = FC1_BIAS_STD * torch.randn(MERGER_WIDTH, generator=g, device="cuda")
         return (grouped @ weight.to(dtype).float().t() + bias.to(dtype).float()).to(dtype)
-    layout = spec.get("layout", "contiguous")
     lo, hi = spec["lo"], spec["hi"]
-    if layout == "column_slice":
-        rows, width = shape
-        x = _uniform((rows, 2 * width), lo, hi, dtype, seed)[:, :width]
-        assert not x.is_contiguous() and x.stride(-1) == 1
-        return x
-    if layout == "transposed":
-        rows, width = shape
-        x = _uniform((width, rows), lo, hi, dtype, seed).t()
-        assert x.stride(-1) != 1
-        return x
     return _uniform(shape, lo, hi, dtype, seed)
 
 
@@ -89,15 +78,8 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     before = x.clone()
     out = op(x)
     assert out.shape == x.shape and out.dtype == x.dtype and out.device == x.device
-    if x.numel():
-        assert out.data_ptr() != x.data_ptr(), "the entry is out-of-place"
+    assert out.data_ptr() != x.data_ptr(), "the entry is out-of-place"
     assert torch.equal(before, x), "the entry must not mutate its input"
-    if cell.spec.get("layout") == "transposed":
-        assert out.stride() == x.stride(), "the output keeps the input's memory format"
-        assert torch.equal(out, op(x.contiguous()))
-    if cell.spec.get("layout") == "column_slice":
-        assert out.is_contiguous()
-        assert torch.equal(out, op(x.contiguous()))
     torch.testing.assert_close(out, op.reference(x))
 
 

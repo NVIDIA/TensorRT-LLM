@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the gdn_prefill_conv_post entry.
 
-Every cell is checked twice: against the entry's fp32/fp64 reference, and
-against the three-call composition it replaces in the target
+Every cell is checked against the entry's fp32/fp64 reference, the conv pool
+bitwise. The three-call composition it replaces in the target
 (`extract_transpose_prefill_slice` -> `causal_conv1d_fwd` ->
-`fused_gdn_post_conv`), with the conv pool compared bitwise both times.
+`fused_gdn_post_conv`, each certified on its own) is checked once, at the
+target-call cell, again with the conv pool compared bitwise.
 Geometry is a Qwen3.8-Flash-Next linear-attention layer: 16 x 128 key heads,
 48 x 128 value heads, qkv_dim 10240, conv width 4, bf16 activations.
 """
@@ -65,19 +66,17 @@ def _build(spec, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     lengths = spec["lengths"]
     n_tok = sum(lengths)
-    layout = spec.get("layout", "in_proj")
 
     def randn(*shape):
         return torch.randn(*shape, generator=g, device=DEV).to(DTYPE)
 
-    if layout == "contiguous":
-        x, a, b = randn(n_tok, QKV_DIM), randn(n_tok, NUM_V_HEADS), randn(n_tok, NUM_V_HEADS)
-    else:
-        proj = randn(n_tok + spec.get("extra_rows", 0), IN_PROJ_WIDTH)
-        x = proj[:n_tok, :QKV_DIM]
-        a = proj[:n_tok, A_COL : A_COL + NUM_V_HEADS]
-        b = proj[:n_tok, A_COL + NUM_V_HEADS :]
-        assert x.stride(0) == a.stride(0) == IN_PROJ_WIDTH
+    # "in_proj" and "rows" both carve x, a and b out of one projection; "rows"
+    # leaves `extra_rows` trailing rows the call must not read.
+    proj = randn(n_tok + spec.get("extra_rows", 0), IN_PROJ_WIDTH)
+    x = proj[:n_tok, :QKV_DIM]
+    a = proj[:n_tok, A_COL : A_COL + NUM_V_HEADS]
+    b = proj[:n_tok, A_COL + NUM_V_HEADS :]
+    assert x.stride(0) == a.stride(0) == IN_PROJ_WIDTH
     weight = (torch.randn(QKV_DIM, CONV_WIDTH, generator=g, device=DEV) * 0.5).to(DTYPE)
     pool_slots = spec["pool_slots"]
     # The pool is a per-layer view of a two-layer buffer, as a cache manager
@@ -127,30 +126,19 @@ def _unfused(args):
     return (*out, pool)
 
 
-def _live_rows(args):
-    """Token rows of the contexts whose slot is not the pad sentinel."""
-    bounds, slots = args[3].tolist(), args[4].tolist()
-    keep = torch.zeros(args[0].shape[0], dtype=torch.bool, device=DEV)
-    for s, slot in enumerate(slots):
-        if slot != PAD:
-            keep[bounds[s] : bounds[s + 1]] = True
-    return keep
-
-
-def _compare(out, pool, want, rows=None, what=""):
+def _compare(out, pool, want, what=""):
     q, k, v, g, beta = out
     q_r, k_r, v_r, g_r, beta_r, pool_r = want
     for got, ref in zip(out, want[:5]):
         assert got.dtype == ref.dtype and got.shape == ref.shape and got.is_contiguous()
-    sel = (lambda t: t[0, rows]) if rows is not None else (lambda t: t)
     for name, got, ref in (("q", q, q_r), ("k", k, k_r), ("v", v, v_r)):
-        d = (sel(got).float() - sel(ref).float()).abs()
+        d = (got.float() - ref.float()).abs()
         flips = (d > 0).float().mean().item() if d.numel() else 0.0
         print(
             f"{what} {name}: max abs {d.max().item() if d.numel() else 0:.3e}, "
             f"differing fraction {flips:.2e}"
         )
-        torch.testing.assert_close(sel(got), sel(ref))
+        torch.testing.assert_close(got, ref)
     torch.testing.assert_close(g, g_r, rtol=8 * _APPROX_ULP, atol=G_ATOL)
     torch.testing.assert_close(beta, beta_r)
     assert torch.equal(pool, pool_r), "conv pool differs"
@@ -162,17 +150,25 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
     pool0 = args[2].clone()
     want = op.reference(*args)
-    old = _unfused([*args[:2], pool0.clone(), *args[3:]])
     inputs = [t.clone() if isinstance(t, torch.Tensor) else t for t in args]
     out = op(*args)
     for i, (arg, before) in enumerate(zip(args, inputs)):
         if isinstance(arg, torch.Tensor) and i != 2:
             assert torch.equal(arg, before), f"input {i} must be read-only"
     _compare(out, args[2], want, what=f"{cell.why[:30]} vs reference")
-    _compare(out, args[2], old, rows=_live_rows(args), what=f"{cell.why[:30]} vs unfused")
     if PAD in args[4].tolist():
         pad_free = [s for s in range(pool0.shape[0]) if s not in args[4].tolist()]
         assert torch.equal(args[2][pad_free], pool0[pad_free]), "unnamed slots written"
+
+
+def test_matches_the_unfused_composition() -> None:
+    """The target-call cell against the three calls the entry replaces; each of
+    those is certified on its own, so one representative call is the check."""
+    cell = next(c for c in op.CELLS if c.why.startswith("target call"))
+    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
+    old = _unfused(args)
+    out = op(*args)
+    _compare(out, args[2], old, what=f"{cell.why[:30]} vs unfused")
 
 
 def test_carry_and_silu_are_load_bearing() -> None:

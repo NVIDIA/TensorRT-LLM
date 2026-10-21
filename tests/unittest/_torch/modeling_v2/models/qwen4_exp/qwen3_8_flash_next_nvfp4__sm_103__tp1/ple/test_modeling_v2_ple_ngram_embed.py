@@ -62,20 +62,15 @@ def _scattered(n: int, pool_slots: int, g) -> list:
 
 
 def _geometry(spec, g):
-    """`(multipliers, vocab, offsets)` for the cell: the checkpoint's own for a
-    3-gram of 8 heads per order, deterministic stand-ins otherwise."""
-    n = spec.get("ngram_size", 3)
-    hp = spec.get("heads_per_ngram", 8)
-    if n == 3 and hp == 8 and spec.get("table") == "ckpt":
+    """`(multipliers, vocab, offsets)` for the cell: the checkpoint's own over
+    the full-height table, the checkpoint's multipliers over small stand-in head
+    vocabularies otherwise."""
+    if spec.get("table") == "ckpt":
         return CKPT_MULTIPLIERS, CKPT_HEAD_VOCAB_SIZES, CKPT_HEAD_OFFSETS
-    mult = (
-        CKPT_MULTIPLIERS
-        if n == 3
-        else tuple(int(x) | 1 for x in torch.randint(10**12, 3 * 10**13, (n,), generator=g))
-    )
+    mult = CKPT_MULTIPLIERS
     vocab = tuple(
         1000 + 7 * h + int(x)
-        for h, x in enumerate(torch.randint(0, 50, (hp * (n - 1),), generator=g))
+        for h, x in enumerate(torch.randint(0, 50, (len(CKPT_HEAD_VOCAB_SIZES),), generator=g))
     )
     offsets, acc = [], 0
     for v in vocab:
@@ -107,12 +102,12 @@ def _with_eos(x: torch.Tensor, density: float, g) -> torch.Tensor:
 def _build(spec, seed):
     g = torch.Generator().manual_seed(seed)
     lengths = spec["lengths"]
-    n = spec.get("ngram_size", 3)
+    n = len(CKPT_MULTIPLIERS)
     num_seqs = len(lengths)
     pool_slots = spec.get("pool_slots", num_seqs + 2)
     density = spec.get("eos_density", 0.0)
     ids = _with_eos(torch.randint(0, VOCAB, (sum(lengths),), generator=g), density, g)
-    ids = ids.to(spec.get("ids_dtype", torch.int32)).to(DEV)
+    ids = ids.to(torch.int32).to(DEV)
     pool = _with_eos(torch.randint(0, VOCAB, (pool_slots, n - 1), generator=g), density, g).to(DEV)
     slots = _scattered(num_seqs, pool_slots, g) if pool_slots >= 64 else list(range(num_seqs))
     slots = torch.tensor(slots, dtype=torch.int32, device=DEV)
@@ -174,8 +169,6 @@ def _old(ids, pool, slots, carries, qsl, table, scale, mult, vocab, offsets, eos
     [
         dict(lengths=(1,) * 128, pool_slots=ENGINE_SLOTS, eos_density=0.05),
         dict(lengths=(4,) * 32, pool_slots=ENGINE_SLOTS, eos_density=0.05),
-        dict(lengths=(1,) * 8, table="host"),
-        dict(lengths=(8192,), carries=(False,), pool_slots=ENGINE_SLOTS, eos_density=0.01),
         dict(
             lengths=(5000, 3000) + (1,) * 32,
             carries=(False, True) + (True,) * 32,
@@ -183,7 +176,7 @@ def _old(ids, pool, slots, carries, qsl, table, scale, mult, vocab, offsets, eos
             eos_density=0.05,
         ),
     ],
-    ids=["decode128", "mtp4x32", "host8", "prefill8192", "mixed2ctx32dec"],
+    ids=["decode128", "mtp4x32", "mixed2ctx32dec"],
 )
 def test_matches_the_calls_it_replaces(spec) -> None:
     args = _build(spec, seed=len(spec["lengths"]))

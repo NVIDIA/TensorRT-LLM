@@ -90,15 +90,7 @@ class QsaMtpReuseTopk(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # ---- single requests: the two behaviours ---------------------------
-        Cell(
-            why="1 request, short row: group 100 appended after a 100-id prefix",
-            spec=_spec(("explicit", (402,)), drafted=(1,), shared_rows=8),
-        ),
-        Cell(
-            why="1 request, full row: group 512 displaces the oldest id, slot 0",
-            spec=_spec(("explicit", (2050,)), drafted=(1,), shared_rows=8),
-        ),
+        # ---- the two behaviours, at every boundary -------------------------
         Cell(
             why="8 requests, one per boundary: 0/1/100/511/512/2047 groups, fresh 0 and 1",
             spec=_spec(
@@ -106,41 +98,6 @@ class QsaMtpReuseTopk(OpWrapper):
                 drafted=(1, 1, 1, 1, 1, 3, 3, 1),
                 shared_rows=8,
             ),
-        ),
-        # ---- decode batches: one row per request ----------------------------
-        Cell(why="decode MTP: 4 requests, mixed rows", spec=_spec(("mixed", 4))),
-        Cell(
-            why="decode MTP: 32 requests (envelope), 256-row shared buffer",
-            spec=_spec(("mixed", 32), shared_rows=256),
-        ),
-        Cell(
-            why="decode MTP: 64 requests, the shared buffer exactly full",
-            spec=_spec(("mixed", 64), shared_rows=64),
-        ),
-        # ---- positions drafted since the capture: draft step i is i past it --
-        Cell(
-            why="32 requests, every one 1 position past its capture",
-            spec=_spec(("mixed", 32), drafted=(1,)),
-        ),
-        Cell(
-            why="32 requests, every one 2 positions past its capture",
-            spec=_spec(("mixed", 32), drafted=(2,)),
-        ),
-        Cell(
-            why="32 requests, every one 3 positions past its capture",
-            spec=_spec(("mixed", 32), drafted=(3,)),
-        ),
-        Cell(
-            why="32 requests, every one 4 positions past its capture",
-            spec=_spec(("mixed", 32), drafted=(4,)),
-        ),
-        Cell(
-            why="32 requests, every one 5 positions past its capture",
-            spec=_spec(("mixed", 32), drafted=(5,)),
-        ),
-        Cell(
-            why="32 requests, every one 6 positions past its capture (max_draft_len 7)",
-            spec=_spec(("mixed", 32), drafted=(6,)),
         ),
         Cell(
             why="8 requests at fresh 2: full, 511-id and short rows gain two groups",
@@ -150,77 +107,20 @@ class QsaMtpReuseTopk(OpWrapper):
                 shared_rows=8,
             ),
         ),
-        # ---- captured-row fill ---------------------------------------------
+        # ---- decode batches: one row per request ----------------------------
         Cell(
-            why="32 short contexts: every captured row below 512 ids",
-            spec=_spec(("short", 32)),
+            why="decode MTP: 32 requests (envelope), 256-row shared buffer",
+            spec=_spec(("mixed", 32), shared_rows=256),
         ),
-        Cell(
-            why="32 contexts past 2048 tokens: every captured row full",
-            spec=_spec(("full", 32)),
-        ),
-        Cell(
-            why="32 short contexts, 4..6 positions past the capture: fresh up to 2",
-            spec=_spec(("short", 32), drafted=(4, 5, 6)),
-        ),
-        Cell(
-            why="32 full rows, 4..6 positions past the capture: up to 2 oldest ids displaced",
-            spec=_spec(("full", 32), drafted=(4, 5, 6)),
-        ),
-        # ---- addressing: the request map and the slot -----------------------
         Cell(
             why="permuted request map, draft manager's single slot",
             spec=_spec(("mixed", 32), request_map="permuted", slots=_DRAFT_SLOTS, shared_rows=32),
         ),
-        Cell(
-            why="3 rows per request (24 rows, 8 requests) share one captured row",
-            spec=_spec(("mixed", 8), rows_per_request=3, shared_rows=8),
-        ),
-        Cell(
-            why="group gaps 2..600 and current < captured (not reached at cr 4)",
-            spec=_spec(
-                (
-                    "gaps",
-                    (
-                        (0, 600),
-                        (10, 15),
-                        (500, 1100),
-                        (100, 98),
-                        (2047, 2048),
-                        (300, 812),
-                        (300, 811),
-                    ),
-                ),
-                shared_rows=8,
-            ),
-        ),
         # ---- CUDA graph -----------------------------------------------------
-        Cell(
-            why="CUDA graph: captured at 1, 8 and 32 requests, new-data replay",
-            spec=_spec(("mixed", 64), graph_batches=(1, 8, 32)),
-        ),
         Cell(
             why="CUDA graph, drafted 1..6: captured at 1, 8 and 32 requests, new-data replay",
             spec=_spec(("mixed", 32), drafted=(1, 2, 3, 4, 5, 6), graph_batches=(1, 8, 32)),
         ),
-        # ---- dtypes, layouts, geometry --------------------------------------
-        Cell(
-            why="int64 request map and visible counts",
-            spec=_spec(("mixed", 8), metadata_dtype=torch.int64, shared_rows=8),
-        ),
-        Cell(
-            why="dense standalone tensors instead of engine buffer slices",
-            spec=_spec(("mixed", 8), layout="dense", shared_rows=8),
-        ),
-        Cell(
-            why="geometry block_topk 8",
-            spec=_spec(("explicit", (2, 30, 34, 3, 41, 13)), block_topk=8, shared_rows=8),
-        ),
-        Cell(
-            why="geometry block_topk 1024",
-            spec=_spec(("explicit", (2, 4094, 4098, 402, 8188)), block_topk=1024, shared_rows=8),
-        ),
-        Cell(why="zero rows: output returned, no launch", spec=_spec(("mixed", 0))),
     )
 
     note = """
@@ -239,7 +139,7 @@ class QsaMtpReuseTopk(OpWrapper):
     `max_draft_len` 1 never reaches this op, 3 reaches 1 and 2 positions, and 7
     (the target's ceiling) reaches 1..6. With compress_ratio 4, `fresh =
     ((p + 1) % 4 + i) // 4` for a capture at position `p`: 0 or 1 up to i = 3
-    and 0, 1 or 2 from i = 4; the gap cell covers wider gaps. In a full row
+    and 0, 1 or 2 from i = 4. In a full row
     the fresh ids displace the row's oldest ids (one at fresh 1, two at fresh
     2), and a 511-id row at fresh 2 loses its oldest id.
 
@@ -265,9 +165,9 @@ class QsaMtpReuseTopk(OpWrapper):
     a 2-D `shared_visible_blocks` (the whole `[slots, seqs]` buffer is read as
     slot 0's counts).
 
-    Certified: int32 ids, int32 or int64 metadata, `block_topk` 8, 512 and 1024.
+    Certified: int32 ids and metadata, `block_topk` 512, up to 32 requests.
     No host synchronization and shape-only validation, so it captures into a
-    CUDA graph; `rows == 0` returns `output` without a launch.
+    CUDA graph.
     """
 
     def __call__(

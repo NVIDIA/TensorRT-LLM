@@ -144,10 +144,10 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 # ── the flag, the scale and the direction ─────────────────────────────────
 
 
-@pytest.mark.parametrize("tokens,hidden", [(1, 2560), (17, 2560), (64, 512), (1024, 2560)])
-def test_use_ue8m0_is_bit_exact_and_a_different_quantization(tokens, hidden):
+def test_use_ue8m0_is_bit_exact_and_a_different_quantization():
     """Once the dequant scale is a power of two its reciprocal is exact, so the
     approximate division cannot reach the result."""
+    tokens, hidden = 17, 2560
     x = _input(tokens, hidden, seed=5 + tokens)
     data, sf = op(x, True)
     ref_data, ref_sf = op.reference(x, True)

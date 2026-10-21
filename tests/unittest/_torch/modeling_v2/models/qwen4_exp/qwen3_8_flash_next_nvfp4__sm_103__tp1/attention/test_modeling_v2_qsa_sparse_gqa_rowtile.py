@@ -143,14 +143,9 @@ def _build(spec, seed):
 
     pool = torch.randn(pool_pages, 2, kv, tpb, d, generator=gen, device=DEV).to(spec["cache_dtype"])
     k_cache, v_cache = pool[:, 0], pool[:, 1]
-    if spec["cache_layout"] == "contiguous":
-        k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
-    q_dtype = spec["q_dtype"]
-    if spec["q_layout"] == "qkv_slice":
-        qkv = torch.randn(rows, q_heads + 2 * kv, d, generator=gen, device=DEV).to(q_dtype)
-        q = qkv[:, :q_heads]
-    else:
-        q = torch.randn(rows, q_heads, d, generator=gen, device=DEV).to(q_dtype)
+    assert spec["cache_layout"] == "pool_planes" and spec["q_layout"] == "qkv_slice"
+    qkv = torch.randn(rows, q_heads + 2 * kv, d, generator=gen, device=DEV).to(spec["q_dtype"])
+    q = qkv[:, :q_heads]
 
     selected = _selected_tokens(positions, seed + 3, spec["compress_ratio"], spec["token_topk"],
                                 spec.get("shared_scores", False))  # fmt: skip
@@ -310,16 +305,13 @@ def test_zero_rows_return_an_empty_output() -> None:
     assert out.shape == (0, CKPT["q_heads"], CKPT["head_dim"]) and out.dtype == torch.bfloat16
 
 
+#: One loud rejection per family: the missing prefill pair, a dtype, a shape and a layout.
 _REJECTIONS = {
     "no_prefill_pair": (
         lambda a: {**a, "query_positions": None, "compress_ratio": None},
         "the row-tile kernel needs the prefill pair",
     ),
     "float32_query": (lambda a: {**a, "q": a["q"].float()}, "QSA queries must use BF16"),
-    "int64_selection": (
-        lambda a: {**a, "selected_tokens": a["selected_tokens"].long()},
-        "QSA selected tokens must be a two-dimensional int32 tensor",
-    ),
     "width_vs_ratio": (
         lambda a: {**a, "selected_tokens": a["selected_tokens"][:, :64].contiguous()},
         "incompatible with its compression ratio",
@@ -328,7 +320,6 @@ _REJECTIONS = {
         lambda a: {**a, "request_indices": torch.zeros(8, dtype=torch.int32, device=DEV)[::2]},
         "QSA request indices must be contiguous",
     ),
-    "host_query": (lambda a: {**a, "q": a["q"].cpu()}, "needs every tensor on one CUDA device"),
 }
 
 

@@ -73,8 +73,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
             assert torch.equal(pool[slot], state[slot]), f"slot {slot} was written"
 
 
-@pytest.mark.parametrize("rows", [1, 2])
-def test_matches_the_unfused_composition(rows) -> None:
+def test_matches_the_unfused_composition() -> None:
+    rows = MAX_ROWS
     x, mat_b, state, taps = _build(rows, 461, seed=5 + rows)
     slots = torch.tensor([37, 211][:rows], dtype=torch.int32, device="cuda")
     fused_pool, unfused_pool = state.clone(), state.clone()
@@ -94,12 +94,12 @@ def test_matches_the_unfused_composition(rows) -> None:
     _compare(fused_pool, unfused_pool)
 
 
-@pytest.mark.parametrize("pdl", [False, True])
-def test_two_steps_under_graph_replay(pdl) -> None:
-    """Decode runs this under CUDA graphs, layer after layer: capture one step,
-    replay it twice with new activations. The second replay's conv reads the
+def test_two_steps_under_graph_replay() -> None:
+    """Decode runs this under CUDA graphs with PDL, layer after layer: capture one
+    step, replay it twice with new activations. The second replay's conv reads the
     window the first replay advanced, so a stale or misplaced window write fails
     the second comparison."""
+    pdl = True
     x, mat_b, state, taps = _build(1, 64, seed=3)
     slots = torch.tensor([9], dtype=torch.int32, device="cuda")
     pool = state.clone()

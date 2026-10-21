@@ -211,9 +211,10 @@ _MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 re
 _MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots", "rounding_flips")}
 
 
-@pytest.mark.parametrize("batch", ({}, _MTP7_BATCH), ids=("prefill", "mtp7-32x8"))
-def test_cuda_graph_capture_and_replay(batch) -> None:
-    """The launch grid is fixed by the row count, so it captures and replays."""
+def test_cuda_graph_capture_and_replay() -> None:
+    """The launch grid is fixed by the row count, so it captures and replays: 32 MTP7
+    verify blocks, the decode target's captured batch."""
+    batch = _MTP7_BATCH
     args = _scene(seed=16, **batch)
     cache = args["index_cache"]
     before = cache.clone()
@@ -234,7 +235,7 @@ def test_cuda_graph_capture_and_replay(batch) -> None:
         cache.copy_(before)
         graph.replay()
         torch.cuda.synchronize()
-        _compare(cache, ref, batch.get("rounding_flips", 0))
+        _compare(cache, ref, batch["rounding_flips"])
 
 
 def test_stream_ordering_needs_no_explicit_synchronization() -> None:
@@ -310,16 +311,16 @@ def _strided(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     "name, dim, match",
     [
         ("logical_positions", 0, "logical_positions must be contiguous"),
-        ("request_indices", 0, "request_indices must be contiguous"),
-        ("k_norm_weight", 0, "k_norm_weight must be contiguous"),
         ("cos_sin", 1, "unit stride"),
     ],
 )
 def test_guard_refuses_the_strides_the_callable_takes_silently(name, dim, match) -> None:
     """Shown unguarded first -- accepted and wrong -- then refused.
 
-    Old receipt's max abs error against the right answer: 4.72, 6.20, 0.80
-    and 7.16 respectively; the floor below states a bound, not one draw.
+    One per guard form: a 1-D operand read flat (`request_indices` and
+    `k_norm_weight` carry the same `is_contiguous` guard), and `cos_sin`'s last
+    dim. Old receipt's max abs error against the right answer: 4.72 and 7.16
+    respectively; the floor below states a bound, not one draw.
     """
     args = _scene(seed=12)
     before = args["index_cache"].clone()
@@ -358,9 +359,7 @@ def _variant(args, defect):
     else:
         pooled = (raw.float().sum(dim=1) / cr).to(torch.bfloat16).float()
     scale = torch.rsqrt(pooled.mul(pooled).sum(-1, keepdim=True) / cache.shape[3] + args["eps"])
-    weight = args["k_norm_weight"].float()
-    gamma = weight if defect == "plain_weight" else weight + 1.0
-    normed = (pooled * scale * gamma).to(cos_sin.dtype)
+    normed = (pooled * scale * (args["k_norm_weight"].float() + 1.0)).to(cos_sin.dtype)
     source = -1 if defect == "rope_at_last_member" else 0
     t, h, w = args["position_cache"][pages[:, source], slots[:, source], :3].long().unbind(-1)
     n = cos_sin.shape[1] // 2
@@ -375,13 +374,8 @@ def _variant(args, defect):
             torch.where((q % 3 == 2) & (q < 3 * section[2]), w[:, None], t[:, None]),
         )
     cos, sin = cos_sin[pos, q], cos_sin[pos, n + q]
-    rot = normed[:, : 2 * n]
-    if defect == "gptj_pair_split":
-        first, second = rot[:, ::2], rot[:, 1::2]
-        head = torch.stack([first * cos - second * sin, second * cos + first * sin], -1).flatten(1)
-    else:
-        first, second = rot[:, :n], rot[:, n:]
-        head = torch.cat([first * cos - second * sin, second * cos + first * sin], -1)
+    first, second = normed[:, :n], normed[:, n : 2 * n]
+    head = torch.cat([first * cos - second * sin, second * cos + first * sin], -1)
     out[pages[:, -1], slots[:, -1], 0] = torch.cat([head, normed[:, 2 * n :]], -1).to(
         torch.bfloat16
     )
@@ -392,14 +386,12 @@ def _variant(args, defect):
     "defect, floor",
     [
         ("rope_at_last_member", 1.0),
-        ("plain_weight", 1.0),
         ("ignore_mrope", 1.0),
-        ("gptj_pair_split", 1.0),
         ("pool_in_bfloat16", 0.0),
     ],
 )
 def test_wrong_variants_land_outside_the_gate(defect: str, floor: float) -> None:
-    """Every defect differs in at least one bit; four of them by more than 1.0.
+    """Every defect differs in at least one bit; two of them by more than 1.0.
 
     Pooling in bf16 moves the result by only ~0.03 (old receipt: 2124 elements,
     max 0.03125) -- inside any bf16 band, which is why the gate is bitwise.

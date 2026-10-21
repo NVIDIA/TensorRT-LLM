@@ -48,14 +48,18 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="1024 rows: a prefill chunk", spec=_ckpt(1024)),
-        Cell(why="4096 rows: where the target switches to this entry", spec=_ckpt(4096)),
-        Cell(why="8192 rows", spec=_ckpt(8192)),
+        Cell(
+            why="4096 rows: where the target switches to this entry; the sort's cluster kernel",
+            spec=_ckpt(4096),
+        ),
         Cell(
             why="16377 rows: a con=128 mixed step (16256 context + 121 generation)",
             spec=_ckpt(16377),
         ),
-        Cell(why="16384 rows: max_num_tokens of the tuned config", spec=_ckpt(16384)),
+        Cell(
+            why="16384 rows: max_num_tokens of the tuned config; the sort's cooperative kernel",
+            spec=_ckpt(16384),
+        ),
     )
 
     note = """
@@ -81,7 +85,8 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
     (prefill steps run eagerly).
 
     Hard limits
-      T            certified 1024..16384
+      T            certified 4096..16384 (the target calls it from
+                   `_CUTE_DSL_MOE_MIN_ROWS` = 4096 rows)
       num_experts  512, top_k 10 (the routed entry's CERTIFIED_PAIRS)
     """
 

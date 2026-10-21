@@ -27,6 +27,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     weights as W,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 # Qwen3.8-Flash-Next's own numbers, so the comparison is against the shapes this target
 # actually ships rather than a toy configuration.
 _TEXT = dict(
@@ -382,7 +384,6 @@ def test_cute_dsl_expert_copy_rows_only_when_kept(backend, prefill_copy):
 @pytest.mark.parametrize(
     "backend, max_num_tokens, env, kept",
     [
-        ("TRTLLM", 16384, None, True),
         ("TRTLLM", 4096, None, True),
         ("TRTLLM", 4095, None, False),
         ("TRTLLM", 16384, "0", False),

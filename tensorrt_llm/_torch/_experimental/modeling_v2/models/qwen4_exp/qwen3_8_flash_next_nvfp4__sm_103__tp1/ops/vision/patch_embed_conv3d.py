@@ -47,63 +47,19 @@ class PatchEmbedConv3d(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: num_patches, dtype; `in_channels`, `kernel`, `embed_dim` (default
-    # the checkpoint's); `bias` (default True); `layout` "flat" (default),
-    # "five_d" ([N, C, kt, kh, kw]), "column_slice" (a [N, 2*row] buffer's first
-    # half) or "transposed" (column-major rows). fp32 cells run with
-    # `torch.backends.cudnn.allow_tf32 = False` -- see note.
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"checkpoint geometry, {n} patches bf16",
-                spec=dict(num_patches=n, dtype=torch.bfloat16),
-            )
-            for n in (1, 2, 7, 64, 1024, 4096)
+    # spec: num_patches, dtype. The checkpoint's geometry, flat contiguous
+    # rows and a bias: what the vision tower passes.
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"checkpoint geometry, {n} patches bf16",
+            spec=dict(num_patches=n, dtype=torch.bfloat16),
         )
-        + (
-            Cell(
-                why="tower call ceiling: 8192 tokens x merge 2x2 = 32768 patches bf16",
-                spec=dict(num_patches=32768, dtype=torch.bfloat16),
-            ),
-        )
-        + (
-            Cell(
-                why="explicit [N, C, kt, kh, kw] rows",
-                spec=dict(num_patches=64, dtype=torch.bfloat16, layout="five_d"),
-            ),
-            Cell(
-                why="bias=None (the Qwen2-VL form)",
-                spec=dict(num_patches=128, dtype=torch.bfloat16, bias=False),
-            ),
-            Cell(why="fp16", spec=dict(num_patches=256, dtype=torch.float16)),
-            Cell(
-                why="fp32 with cudnn TF32 off",
-                spec=dict(num_patches=256, dtype=torch.float32),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"geometry read from weight: C={c} kernel={k} out={o}",
-                spec=dict(
-                    num_patches=33,
-                    dtype=torch.bfloat16,
-                    in_channels=c,
-                    kernel=k,
-                    embed_dim=o,
-                ),
-            )
-            for c, k, o in ((1, (1, 4, 4), 8), (4, (2, 8, 8), 64), (3, (1, 16, 16), 128))
-        )
-        + (
-            Cell(
-                why="column slice of a wider pixel buffer",
-                spec=dict(num_patches=8, dtype=torch.bfloat16, layout="column_slice"),
-            ),
-            Cell(
-                why="column-major pixel buffer (row elements strided)",
-                spec=dict(num_patches=8, dtype=torch.bfloat16, layout="transposed"),
-            ),
-        )
+        for n in (1, 64, 4096)
+    ) + (
+        Cell(
+            why="tower call ceiling: 8192 tokens x merge 2x2 = 32768 patches bf16",
+            spec=dict(num_patches=32768, dtype=torch.bfloat16),
+        ),
     )
 
     note = """
@@ -125,8 +81,10 @@ class PatchEmbedConv3d(OpWrapper):
     depend on how many rows share the call. Check rows against `reference`, never
     against a call of a different size.
 
-    Not certified: float8 operands; patch counts between the 4096- and 32768-row
-    cells, and past 32768.
+    Not certified: dtypes other than bf16 (the fp32 TF32 behavior above is
+    measured, not certified); other geometries, `bias=None` and non-contiguous
+    pixel rows; patch counts between the 4096- and 32768-row cells, and past
+    32768.
     """
 
     def __call__(

@@ -29,10 +29,12 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     torch.testing.assert_close(out, ref)
 
 
-#: The GDN in_proj row the old column-slice measurement used: [q k v | z] = 10240 | 6144.
-_PROJ_WIDTH, _Z_OFFSET = 16384, 10240
 #: The target's concatenated GDN input projection: [q k v | z | a | b] = 10240 | 6144 | 48 | 48.
-_IN_PROJ_WIDTH = 16480
+_IN_PROJ_WIDTH, _Z_OFFSET = 16480, 10240
+
+
+#: The checkpoint's GDN epilogue geometry over a packed `z`, for the non-cell tests.
+_PACKED = dict(op.CELLS[0].spec, tokens=17, z="packed")
 
 
 def _seed(text: str) -> int:
@@ -47,21 +49,13 @@ def _build(spec, seed):
     def randn(*shape):
         return torch.randn(*shape, generator=g, device="cuda").to(dtype)
 
-    if spec.get("x") == "strided_rows":
-        x = randn(t * heads, 2 * n)[:, :n]
-    else:
-        x = randn(t * heads, n)
-    if "x_scale" in spec:
-        x = x * spec["x_scale"]
+    x = randn(t * heads, n)
 
     layout = spec.get("z", "packed")
-    if layout == "column_slice":
-        z = randn(t, _PROJ_WIDTH)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
-    elif layout == "in_proj":
+    if layout == "in_proj":
         z = randn(t, _IN_PROJ_WIDTH)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
-    elif layout == "head_strided":
-        z = randn(t, heads, 2 * n)[:, :, :n]
     else:
+        assert layout == "packed", layout
         z = randn(t, heads, n)
 
     weight = randn(n)
@@ -76,14 +70,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     certifying(op)
     args = _build(cell.spec, seed=_seed(cell.why))
     x, z, weight, _, fp8_scale, _ = args
-    if cell.spec.get("z") == "column_slice":
-        assert z.stride()[1:] == (cell.spec["width"], 1)
-        if cell.spec["tokens"] > 1:
-            assert z.stride(0) == _PROJ_WIDTH and not z.is_contiguous()
     if cell.spec.get("z") == "in_proj" and cell.spec["tokens"] > 1:
         assert z.stride() == (_IN_PROJ_WIDTH, cell.spec["width"], 1) and not z.is_contiguous()
-    if cell.spec.get("x") == "strided_rows":
-        assert x.stride(0) == 2 * cell.spec["width"] and not x.is_contiguous()
     before = [x.clone(), z.clone(), weight.clone()]
 
     out = op(*args)
@@ -98,10 +86,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     _compare(out, op.reference(*args))
 
 
-@pytest.mark.parametrize("scale_value", [1.0, 0.5, 0.0234375])
-def test_fp8_byte_gate_discriminates(scale_value: float) -> None:
+def test_fp8_byte_gate_discriminates() -> None:
     """Each wrong variant of the reference misses the byte gate on most elements."""
-    spec = dict(op.CELLS[-1].spec, fp8_scale=scale_value)
+    spec = dict(op.CELLS[-1].spec, fp8_scale=0.0234375)
     x, z, weight, eps, fp8_scale, act = _build(spec, seed=8)
     out = op(x, z, weight, eps, fp8_scale, act)
     _compare(out, op.reference(x, z, weight, eps, fp8_scale, act))
@@ -112,18 +99,17 @@ def test_fp8_byte_gate_discriminates(scale_value: float) -> None:
         "gate applied before the norm": op.reference(gated_x, z, weight, eps, fp8_scale, act),
         "weight omitted": op.reference(x, z, torch.ones_like(weight), eps, fp8_scale, act),
     }
-    if scale_value != 1.0:  # at a scale of 1 the two directions coincide
-        wrong["scale multiplied instead of divided"] = (
-            op.reference(x, z, weight, eps, None, act).float() * fp8_scale
-        ).to(torch.float8_e4m3fn)
+    wrong["scale multiplied instead of divided"] = (
+        op.reference(x, z, weight, eps, None, act).float() * fp8_scale
+    ).to(torch.float8_e4m3fn)
     for name, other in wrong.items():
         matched = (out.view(torch.uint8) == other.view(torch.uint8)).float().mean().item()
         assert matched < 0.5, f"{name}: byte-identical on {matched:.4f} of elements"
 
 
 def test_the_two_gates_differ() -> None:
-    """A kernel ignoring `gate_activation` would fail one of the gate cells, not both."""
-    x, z, weight, eps, _, _ = _build(op.CELLS[1].spec, seed=3)
+    """A kernel ignoring `gate_activation` would pass the sigmoid cells; the two gates differ."""
+    x, z, weight, eps, _, _ = _build(_PACKED, seed=3)
     assert not torch.equal(
         op(x, z, weight, eps, None, "silu"), op(x, z, weight, eps, None, "sigmoid")
     )
@@ -131,7 +117,7 @@ def test_the_two_gates_differ() -> None:
 
 def test_guard_refuses_a_weight_of_the_wrong_length() -> None:
     """Unguarded, a length-192 weight is silently truncated to weight[:128]."""
-    x, z, weight, eps, _, act = _build(dict(op.CELLS[1].spec, tokens=4), seed=12)
+    x, z, weight, eps, _, act = _build(dict(_PACKED, tokens=4), seed=12)
     long_weight = torch.cat([weight, torch.randn(64, dtype=weight.dtype, device="cuda")])
     assert torch.equal(
         torch.ops.trtllm.rms_norm_gated_token_major(x, z, long_weight, eps, None, act),
@@ -147,7 +133,7 @@ def test_guard_refuses_a_weight_of_the_wrong_length() -> None:
 def test_guard_refuses_a_malformed_fp8_scale() -> None:
     """Unguarded, a two-element scale quantizes against element 0 and a bf16
     scale is accepted -- neither raises."""
-    x, z, weight, eps, _, act = _build(dict(op.CELLS[1].spec, tokens=4), seed=12)
+    x, z, weight, eps, _, act = _build(dict(_PACKED, tokens=4), seed=12)
     one = torch.tensor([0.5], dtype=torch.float32, device="cuda")
     two = torch.tensor([0.5, 0.25], dtype=torch.float32, device="cuda")
     half = torch.tensor([0.5], dtype=torch.bfloat16, device="cuda")
@@ -166,13 +152,13 @@ def test_guard_refuses_a_malformed_fp8_scale() -> None:
 
 
 def test_rejects_unsupported_gate_activation() -> None:
-    x, z, weight, eps, _, _ = _build(dict(op.CELLS[1].spec, tokens=4), seed=10)
+    x, z, weight, eps, _, _ = _build(dict(_PACKED, tokens=4), seed=10)
     with pytest.raises(ValueError, match="gate_activation must be 'silu' or 'sigmoid'"):
         op(x, z, weight, eps, None, "gelu")
 
 
 def test_rejects_z_that_does_not_cover_x() -> None:
-    x, z, weight, eps, _, act = _build(dict(op.CELLS[1].spec, tokens=4, heads=8), seed=11)
+    x, z, weight, eps, _, act = _build(dict(_PACKED, tokens=4, heads=8), seed=11)
     with pytest.raises(AssertionError, match="does not match x shape"):
         op(x, z[:, :7, :].contiguous(), weight, eps, None, act)
     with pytest.raises(ValueError, match="not enough values to unpack"):
@@ -182,7 +168,7 @@ def test_rejects_z_that_does_not_cover_x() -> None:
 def test_prefill_launch_rejects_z_that_does_not_cover_x() -> None:
     """From 32768 rows the op runs its own multi-row launch; a `z` one token short
     still reaches the registered op's check instead of being read past its end."""
-    x, z, weight, eps, _, act = _build(dict(op.CELLS[1].spec, tokens=683), seed=12)
+    x, z, weight, eps, _, act = _build(dict(_PACKED, tokens=683), seed=12)
     assert x.shape[0] >= 32768, x.shape
     with pytest.raises(AssertionError, match="does not match x shape"):
         op(x, z[:-1], weight, eps, None, act)

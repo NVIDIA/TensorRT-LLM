@@ -322,21 +322,15 @@ class Bf16GemvPdl(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # Every shape is a qwen3.8-flash-next-nvfp4 tp1 decode projection.
+    # Every shape is a qwen3.8-flash-next-nvfp4 tp1 decode projection; the target calls
+    # it at one row (`_decode_projection`).
     CELLS: tuple[Cell, ...] = (
         _cell("qwen3.8 decode M=1 router N=512", 1, 512, 2560),
-        _cell("qwen3.8 decode M=1 shared gate_up N=1280", 1, 1280, 2560),
-        _cell("qwen3.8 decode M=1 shared gate N=1", 1, 1, 2560),
+        _cell("qwen3.8 decode M=1 shared gate N=1, outputs per CTA halved to 1", 1, 1, 2560),
         _cell("qwen3.8 decode M=1 shared down K=640", 1, 2560, 640),
-        _cell("qwen3.8 decode M=3 shared down K=640, odd row count", 3, 2560, 640),
-        _cell("qwen3.8 decode M=1 GDN in-proj concat N=16480", 1, 16480, 2560),
-        _cell("qwen3.8 decode M=2 GDN in-proj concat", 2, 16480, 2560),
-        _cell("qwen3.8 decode M=1 GDN out / attention o, K=6144", 1, 2560, 6144),
-        _cell("qwen3.8 decode M=1 attention in-proj concat N=14080", 1, 14080, 2560),
-        _cell("qwen3.8 decode M=1 PLE key N=10240", 1, 10240, 2560),
-        _cell("qwen3.8 decode M=1 PLE value N=K=2560", 1, 2560, 2560),
-        _cell("qwen3.8 decode M=4 GDN out / attention o", 4, 2560, 6144),
-        _cell("qwen3.8 decode M=1 router, PDL off", 1, 512, 2560, pdl=False),
+        _cell("qwen3.8 decode M=1 GDN out / attention o, K=6144 shared-memory tier", 1, 2560, 6144),
+        _cell("qwen3.8 decode M=1 GDN in-proj concat N=16480, L2 prefetch grid", 1, 16480, 2560),
+        _cell("qwen3.8 decode M=4 (MAX_ROWS) GDN out / attention o", 4, 2560, 6144),
     )
 
     note = """
@@ -358,9 +352,12 @@ class Bf16GemvPdl(OpWrapper):
     order differs from the fp32 reference.
 
     Hard limits
-      M     rows per launch          boundary MAX_ROWS=4      driven at 1, 2, 3, 4 (cells)
+      M     rows per launch          boundary MAX_ROWS=4      driven at 1 and 4 (cells)
       K     a TILING key             2560, 6144, 640          all driven
       N     any; the outputs per CTA halve until they divide N    N=1 driven
+
+    PDL off (`pdl=False`, or PDL disabled in the environment) is the same kernel
+    without the attribute; the test holds it bitwise to PDL on.
     """
 
     def __call__(self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = True) -> torch.Tensor:

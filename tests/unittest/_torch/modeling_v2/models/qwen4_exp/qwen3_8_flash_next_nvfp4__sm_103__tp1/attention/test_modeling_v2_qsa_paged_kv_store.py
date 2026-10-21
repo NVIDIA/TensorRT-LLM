@@ -178,10 +178,10 @@ _MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 re
 _MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
 
 
-@pytest.mark.parametrize("batch", ({}, _MTP7_BATCH), ids=("decode", "mtp7-32x8"))
-def test_cuda_graph_replay_follows_updated_positions(batch) -> None:
-    """Captured once, replayed against new positions written into the same buffer."""
-    args, pool = _decode_args(seed=9, **batch)
+def test_cuda_graph_replay_follows_updated_positions() -> None:
+    """Captured once at 32 MTP7 verify blocks, replayed against new positions written
+    into the same buffer."""
+    args, pool = _decode_args(seed=9, **_MTP7_BATCH)
     positions = args["logical_positions"]
     saved = positions.clone()
     positions.zero_()

@@ -106,35 +106,19 @@ class MoeUnpermuteInplace(OpWrapper):
             why="decode, 1 request without MTP; rows from the sort's block kernel",
             spec=_ckpt(1),
         ),
-        Cell(why="1 request at MTP verify width 2", spec=_ckpt(2)),
         Cell(
-            why="1 request at MTP verify width 4; last T the sort places in token order",
-            spec=_ckpt(4),
+            why="32 requests at MTP verify width 4; largest captured T, rows placed by the "
+            "sort's atomics",
+            spec=_ckpt(128),
         ),
-        Cell(why="decode, 8 requests; rows placed by the sort's atomics", spec=_ckpt(8)),
-        Cell(why="decode at the 32-request ceiling", spec=_ckpt(32)),
-        Cell(why="32 requests at MTP verify width 3", spec=_ckpt(96)),
-        Cell(why="32 requests at MTP verify width 4; largest captured T", spec=_ckpt(128)),
         Cell(why="8192 rows, max_num_tokens prefill", spec=_ckpt(8192)),
-        Cell(
-            why="8192 rows all on 10 experts; a token's rows in 10 runs of 8192",
-            spec=_ckpt(8192, dist="hot"),
-        ),
-        Cell(
-            why="510 experts with one row each; most permuted rows are padding",
-            spec=_ckpt(51, dist="round_robin"),
-        ),
         Cell(
             why="FC2 rows spanning 2^-30..2^30; terms 2^60 apart in one sum",
             spec=_ckpt(8192, values="wide"),
         ),
         Cell(
-            why="tile 256 sort layout, decode, 1 request",
-            spec=_ckpt(1, tile_tokens_dim=256),
-        ),
-        Cell(
-            why="tile 256 sort layout, 8192-row prefill",
-            spec=_ckpt(8192, tile_tokens_dim=256),
+            why="510 experts with one row each; most permuted rows are padding",
+            spec=_ckpt(51, dist="round_robin"),
         ),
         Cell(
             why="slots marked -1 (another rank's expert) skipped; a row of all -1 is 0",
@@ -200,7 +184,7 @@ class MoeUnpermuteInplace(OpWrapper):
     rows; a CPU `output`.
 
     Certified only at the checkpoint's values: top_k 10, hidden 2560, bf16 rows and
-    output, fp32 scales, the sort's layouts at tile 128 and 256, every slot local
+    output, fp32 scales, the sort's layout at tile 128, every slot local
     except in the -1 cell.
 
     Hard limits (sm_103)

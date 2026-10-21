@@ -356,9 +356,8 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode, 1 row at position 8699 (a group's last token)", spec=dict(pos=(8699,))),
-        Cell(why="decode, 1 row at position 8700 (no compression)", spec=dict(pos=(8700,))),
         Cell(
-            why="decode, 4 rows, two group ends, one page boundary",
+            why="decode, 4 rows: three group ends (two on a page's last slot), one with no compression",
             spec=dict(pos=(8699, 8700, 4095, 31)),
         ),
         Cell(

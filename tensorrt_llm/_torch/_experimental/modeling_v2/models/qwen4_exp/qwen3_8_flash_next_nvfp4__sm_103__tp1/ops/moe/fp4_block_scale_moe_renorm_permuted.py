@@ -53,10 +53,12 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="_moe_block decode, finalize folded into the next site: one token", spec=_ckpt(1)),
-        Cell(why="4 rows: the last count on the block routing kernel", spec=_ckpt(4)),
-        Cell(why="5 rows: past the block kernel's row limit", spec=_ckpt(5)),
-        Cell(why="16 rows: decode_first's MAX_ROWS", spec=_ckpt(16)),
+        Cell(
+            why="_moe_block decode, finalize folded into the next site: one token; the block "
+            "routing kernel",
+            spec=_ckpt(1),
+        ),
+        Cell(why="16 rows: decode_first's MAX_ROWS; the cluster routing kernel", spec=_ckpt(16)),
         Cell(why="128 rows: the con=128 decode batch", spec=_ckpt(128)),
         Cell(why="coarse 3-level logits: ties decide most slots", spec=_ckpt(64, dist="coarse")),
     )

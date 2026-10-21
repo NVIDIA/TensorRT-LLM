@@ -333,10 +333,10 @@ def test_repeat_calls_are_bitwise_stable() -> None:
         assert torch.equal(first[0], again[0]) and torch.equal(first[1], again[1])
 
 
-@pytest.mark.parametrize("batch, p", ((4, 4), (32, 8)))
-def test_cuda_graph_capture_and_replay(batch, p) -> None:
-    """Captured once, replayed after the batch tensors' values change in place: four
-    requests of 4 tokens, and the MTP-7 verify's 32 of 8."""
+def test_cuda_graph_capture_and_replay() -> None:
+    """Captured once at the MTP-7 verify's 32 requests of 8 tokens, replayed after
+    the batch tensors' values change in place."""
+    batch, p = 32, 8
     args = _small((p,) * batch, tuple(range(batch)), seed=25, pool_slots=batch + 2)
     x, weight, _, pool, qsl, cidx, his = args[:7]
     live = pool.clone()
@@ -372,10 +372,9 @@ def test_cuda_graph_capture_and_replay(batch, p) -> None:
 @pytest.mark.parametrize(
     "case,fragment",
     [
+        # One per torch call that refuses: the pool's index copy, the convolution.
         ("pool_dtype", "index_copy_(): self and source expected to have the same dtype"),
         ("weight_2d", "weight should have at least three dimensions"),
-        ("weight_dtype", "expected scalar type BFloat16 but found Float"),
-        ("bias_dtype", "Input type (c10::BFloat16) and bias type (float) should be the same"),
     ],
 )
 def test_mismatched_operands_raise(case: str, fragment: str) -> None:
@@ -386,10 +385,6 @@ def test_mismatched_operands_raise(case: str, fragment: str) -> None:
         args[3] = args[3].float()
     elif case == "weight_2d":
         args[1] = args[1].squeeze(1).contiguous()
-    elif case == "weight_dtype":
-        args[1] = args[1].float()
-    elif case == "bias_dtype":
-        args[2] = torch.zeros(args[0].shape[0], device="cuda")
     with pytest.raises(RuntimeError) as excinfo:
         with validating(op):
             op(*args)

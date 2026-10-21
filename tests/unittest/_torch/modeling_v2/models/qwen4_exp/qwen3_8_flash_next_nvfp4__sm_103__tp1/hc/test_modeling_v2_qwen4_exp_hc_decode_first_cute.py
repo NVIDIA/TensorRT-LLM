@@ -100,14 +100,10 @@ def _build(spec, seed):
         return torch.randn(*shape, generator=g, device=DEV) * scale
 
     hyper_input = normal(rows, width, scale=3.0).to(dtype)
-    if spec.get("layout") == "row_slice":
-        buf = normal(2 * rows, width, scale=1.0).to(dtype)
-        buf[::2] = hyper_input
-        hyper_input = buf[::2]
     gamma = normal(width, scale=GAMMA_RMS)
     gamma[0], gamma[width // 2] = GAMMA_ABSMAX, -GAMMA_ABSMAX
     gamma = gamma.to(dtype)
-    n_rows = spec.get("n_rows", -(-n_cols // 128) * 128)
+    n_rows = -(-n_cols // 128) * 128
     weight = torch.zeros(n_rows, width, device=DEV)
     weight[:n_cols] = normal(n_cols, width, scale=DOWN_RMS)
     weight[n_cols - hc_count : n_cols] *= INJECT_RMS / DOWN_RMS
@@ -119,8 +115,6 @@ def _build(spec, seed):
     if spec.get("moe", False):
         shared = normal(rows, hidden, scale=2.0).to(dtype)
         gate_logits = normal(rows, 1, scale=2.0).to(dtype)
-        if spec.get("gate") == "flat":
-            gate_logits = gate_logits.reshape(rows)
     top_k = spec.get("fold", 0)
     if not top_k:
         return hyper_input, block_out, inject, gamma, first, hc_count, n_cols, shared, gate_logits

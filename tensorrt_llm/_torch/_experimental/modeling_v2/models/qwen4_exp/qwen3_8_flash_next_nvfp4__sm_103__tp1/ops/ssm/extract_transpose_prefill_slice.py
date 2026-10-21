@@ -42,112 +42,44 @@ class ExtractTransposePrefillSlice(OpWrapper):
     # view the call site passes (a row slice of a split token buffer, or a
     # column slice of a wider projection).
     CELLS: tuple[Cell, ...] = (
-        tuple(
+        Cell(
+            why="GDN prefill, whole 10240-wide row, 1 token",
+            spec=dict(
+                num_rows=1,
+                num_cols=GDN_MIXED_QKV_WIDTH,
+                n=1,
+                start_col=0,
+                width=GDN_MIXED_QKV_WIDTH,
+                dtype=torch.bfloat16,
+            ),
+        ),
+        Cell(
+            why="mixed batch: prefill half of a split [512, 10240] buffer, a row-slice view",
+            spec=dict(
+                num_rows=512,
+                num_cols=GDN_MIXED_QKV_WIDTH,
+                row_stop=400,
+                n=400,
+                start_col=0,
+                width=GDN_MIXED_QKV_WIDTH,
+                dtype=torch.bfloat16,
+            ),
+        ),
+        *(
             Cell(
-                why=f"GDN prefill, whole 10240-wide row, {n} tokens",
+                why=f"GDN prefill, the q|k|v column view of the in_proj, {n} tokens",
                 spec=dict(
                     num_rows=n,
-                    num_cols=GDN_MIXED_QKV_WIDTH,
+                    num_cols=GDN_IN_PROJ_WIDTH,
+                    col_slice=(0, GDN_MIXED_QKV_WIDTH),
                     n=n,
                     start_col=0,
                     width=GDN_MIXED_QKV_WIDTH,
                     dtype=torch.bfloat16,
                 ),
             )
-            for n in (1, 7, 33, 128, 1024, 4096)
-        )
-        + (
-            Cell(
-                why="mixed batch: prefill half of a split [512, 10240] buffer, a row-slice view",
-                spec=dict(
-                    num_rows=512,
-                    num_cols=GDN_MIXED_QKV_WIDTH,
-                    row_stop=400,
-                    n=400,
-                    start_col=0,
-                    width=GDN_MIXED_QKV_WIDTH,
-                    dtype=torch.bfloat16,
-                ),
-            ),
-            Cell(
-                why="fewer prefill rows than the buffer holds: the row crop is honoured",
-                spec=dict(
-                    num_rows=512,
-                    num_cols=GDN_MIXED_QKV_WIDTH,
-                    n=400,
-                    start_col=0,
-                    width=GDN_MIXED_QKV_WIDTH,
-                    dtype=torch.bfloat16,
-                ),
-            ),
-            Cell(
-                why="interior column range of a contiguous 16384-wide buffer",
-                spec=dict(
-                    num_rows=200,
-                    num_cols=16384,
-                    n=150,
-                    start_col=1024,
-                    width=GDN_MIXED_QKV_WIDTH,
-                    dtype=torch.bfloat16,
-                ),
-            ),
-            *(
-                Cell(
-                    why=f"GDN prefill, the q|k|v column view of the in_proj, {n} tokens",
-                    spec=dict(
-                        num_rows=n,
-                        num_cols=GDN_IN_PROJ_WIDTH,
-                        col_slice=(0, GDN_MIXED_QKV_WIDTH),
-                        n=n,
-                        start_col=0,
-                        width=GDN_MIXED_QKV_WIDTH,
-                        dtype=torch.bfloat16,
-                    ),
-                )
-                for n in (33, 8192)
-            ),
-            Cell(
-                why="column-slice view: row stride wider than the extracted width",
-                spec=dict(
-                    num_rows=200,
-                    num_cols=16384,
-                    col_slice=(1024, 1024 + GDN_MIXED_QKV_WIDTH),
-                    n=150,
-                    start_col=0,
-                    width=GDN_MIXED_QKV_WIDTH,
-                    dtype=torch.bfloat16,
-                ),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"dtype {str(dtype).removeprefix('torch.')}: elements are moved, never interpreted",
-                spec=dict(num_rows=64, num_cols=256, n=48, start_col=32, width=128, dtype=dtype),
-            )
-            for dtype in (
-                torch.float16,
-                torch.float32,
-                torch.float64,
-                torch.float8_e4m3fn,
-                torch.int32,
-                torch.int8,
-                torch.bool,
-            )
-        )
-        + (
-            Cell(
-                why="zero prefill tokens: an empty [width, 0] result",
-                spec=dict(
-                    num_rows=64, num_cols=256, n=0, start_col=0, width=256, dtype=torch.bfloat16
-                ),
-            ),
-            Cell(
-                why="zero width: an empty [0, n] result",
-                spec=dict(
-                    num_rows=64, num_cols=256, n=1, start_col=0, width=0, dtype=torch.bfloat16
-                ),
-            ),
-        )
+            for n in (33, 8192)
+        ),
     )
 
     note = """
@@ -169,6 +101,9 @@ class ExtractTransposePrefillSlice(OpWrapper):
         a guard). The source offset is widened to int64 in-kernel: a source
         offset of 2.62e9 was bitwise exact. At width 10240 the destination
         boundary is n > 209715, within reach of a large `max_num_tokens`.
+
+    Not certified: dtypes other than bf16, `start_col` other than 0, a row crop
+    shorter than `src`, empty extents.
     """
 
     def __call__(

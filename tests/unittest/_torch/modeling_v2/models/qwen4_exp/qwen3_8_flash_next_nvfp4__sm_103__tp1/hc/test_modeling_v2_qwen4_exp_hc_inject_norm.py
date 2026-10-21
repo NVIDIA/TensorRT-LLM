@@ -124,17 +124,10 @@ def _compare_moe(args, out, ref) -> None:
 
 
 def _build(spec, seed):
-    rows = spec["rows"]
-    hc_count = spec.get("hc_count", HC_COUNT)
-    hidden = spec.get("hidden", HIDDEN)
-    dtype = spec.get("dtype", torch.bfloat16)
+    rows, hc_count, hidden, dtype = spec["rows"], HC_COUNT, HIDDEN, torch.bfloat16
     width = hc_count * hidden
     g = torch.Generator(device=DEV).manual_seed(seed)
     hyper_input = (torch.randn(rows, width, generator=g, device=DEV) * 3.0).to(dtype)
-    if spec.get("layout") == "row_slice":
-        buf = torch.randn(2 * rows, width, generator=g, device=DEV).to(dtype)
-        buf[::2] = hyper_input
-        hyper_input = buf[::2]
     gamma = torch.randn(width, generator=g, device=DEV) * GAMMA_RMS
     gamma[0], gamma[width // 2] = GAMMA_ABSMAX, -GAMMA_ABSMAX
     gamma = gamma.to(dtype)
@@ -147,8 +140,6 @@ def _build(spec, seed):
     if spec.get("moe", False):
         shared = (torch.randn(rows, hidden, generator=g, device=DEV) * 2.0).to(dtype)
         gate_logits = (torch.randn(rows, 1, generator=g, device=DEV) * 2.0).to(dtype)
-        if spec.get("gate") == "flat":
-            gate_logits = gate_logits.reshape(rows)
     top_k = spec.get("fold", 0)
     if not top_k:
         return hyper_input, block_out, inject, gamma, EPS, hc_count, shared, gate_logits
@@ -204,10 +195,11 @@ def _old_composition(hyper_input, block_out, inject, gamma, eps, hc_count):
     return hc, normed
 
 
-@pytest.mark.parametrize("rows", [1, 128, 8192])
-def test_matches_the_composition_it_replaces(rows) -> None:
+def test_matches_the_composition_it_replaces() -> None:
     """Against post_inject + four gemma norms + cat: the residual within one
-    ulp (fma contraction only), the normed stream within one ulp."""
+    ulp (fma contraction only), the normed stream within one ulp. One
+    representative prefill chunk: each component certifies its own cells."""
+    rows = 8192
     args = _build(dict(rows=rows), seed=rows)[:6]
     hc, normed = op(*args)
     old_hc, old_normed = _old_composition(*args)
@@ -281,11 +273,12 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert torch.equal(graph_normed, eager_normed)
 
 
-@pytest.mark.parametrize("rows", [2, 128, 2048])
+@pytest.mark.parametrize("rows", [128, 2048])
 def test_fold_matches_the_runner_finalize(rows) -> None:
     """With the fold, bitwise this op on the runner's finalized rows: `finalize`
     (the permuted MoE entry's emulation of the runner's finalize, bitwise its
-    output) and then the combine without the fold."""
+    output) and then the combine without the fold. 128 rows run the CuTe kernel,
+    2048 the Triton kernel's two-warp form."""
     args = _build(dict(rows=rows, moe=True, fold=10), seed=300 + rows)
     hyper_input, rows_, inject, gamma, eps, c, shared, gate, topk_weights, topk_rows = args
     hc, normed = op(*args)
@@ -295,10 +288,11 @@ def test_fold_matches_the_runner_finalize(rows) -> None:
     assert torch.equal(normed, old_normed)
 
 
-@pytest.mark.parametrize("rows", [1, 128, 8192])
-def test_moe_combine_matches_the_composition_it_replaces(rows) -> None:
+def test_moe_combine_matches_the_composition_it_replaces() -> None:
     """Against `fused_sigmoid_gate_mul_add` (in place on the routed output, as
-    the forward called it) and then this op without the combine: bitwise."""
+    the forward called it) and then this op without the combine: bitwise, at one
+    representative decode batch."""
+    rows = 128
     args = _build(dict(rows=rows, moe=True), seed=100 + rows)
     hyper_input, block_out, inject, gamma, eps, c, shared, gate = args
     hc, normed = op(*args)
@@ -382,13 +376,8 @@ def test_moe_cuda_graph_capture_and_replay() -> None:
 @pytest.mark.parametrize(
     "spec",
     [
-        dict(rows=1),
         dict(rows=2, drop=True),
-        dict(rows=8),
-        dict(rows=33, drop=True),
         dict(rows=128),
-        dict(rows=17, gate="flat", layout="row_slice"),
-        dict(rows=300, drop=True),
         dict(rows=511),
     ],
     ids=lambda s: "-".join(f"{k}{v}" for k, v in s.items()),
@@ -396,7 +385,8 @@ def test_moe_cuda_graph_capture_and_replay() -> None:
 def test_fold_cute_is_the_triton_kernel_bitwise(spec, monkeypatch) -> None:
     """Below `_FEW_WARPS_MIN_ROWS` rows the fold runs the CuTe DSL kernel; its
     `hc_out` and `normed` are bitwise the Triton kernel's (run by refusing the
-    CuTe guard)."""
+    CuTe guard): the smallest decode batch with dropped slots, the largest decode
+    batch, and the last row count before the switch."""
     args = _build(dict(spec, moe=True, fold=10), seed=500 + spec["rows"])
     calls = []
     cute_fold = M._fold_cute

@@ -264,9 +264,13 @@ def test_the_tower_calls_whole_frames_and_concatenates_their_rows_in_order(monke
 def test_a_request_under_the_ceiling_is_one_call(monkeypatch):
     grid = [(2, 4, 4), (1, 4, 8)]
     tower = _tower(monkeypatch, 64)
-    tower(_pixels(grid), torch.tensor(grid))
+    pixels = _pixels(grid)
+    out = tower(pixels, torch.tensor(grid))
     assert len(tower.calls) == 1
     assert tower.calls[0][2].tolist() == [list(row) for row in grid]
+    # The one call sees the whole request and its output is the request's, row for row.
+    assert torch.equal(tower.calls[0][0], pixels)
+    assert torch.equal(out, pixels[:: MERGE * MERGE, :1].expand(-1, HIDDEN))
 
 
 def test_a_request_past_the_old_whole_request_ceiling_is_served(monkeypatch):

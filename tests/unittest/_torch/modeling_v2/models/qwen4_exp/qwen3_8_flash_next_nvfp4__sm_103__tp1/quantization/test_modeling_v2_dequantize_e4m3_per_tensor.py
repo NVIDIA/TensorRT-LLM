@@ -81,24 +81,10 @@ def _input(spec, seed: int) -> torch.Tensor:
         x = _TABLE["table"][idx]
     elif source == "all_codes":
         x = torch.arange(256, dtype=torch.uint8, device=DEV).view(shape).view(torch.float8_e4m3fn)
-    elif source == "unaligned":
-        n = shape[0] * shape[1]
-        base = _fp8(torch.randn(n + 16, device=DEV, generator=g) * 8.0)
-        x = base[1 : 1 + n].view(shape)
-        assert x.data_ptr() % 16 != 0
     else:
         x = _fp8(torch.randn(*shape, device=DEV, generator=g) * 8.0)
     assert x.is_contiguous() and x.shape == shape
     return x
-
-
-def _scales(spec, value: float, rank: int) -> torch.Tensor:
-    if not spec.get("scale_slice"):
-        return _scale(value, rank, spec["dtype"])
-    buf = torch.tensor([[9.0, value, 5.0]], dtype=spec["dtype"], device=DEV)
-    sliced = buf[:, 1:2]
-    assert sliced.shape == (1, 1) and sliced.storage_offset() == 1
-    return sliced
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -114,7 +100,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
     certifying(op)
     x = _input(cell.spec, zlib.crc32(cell.why.encode()))
     for value in cell.spec["scales"]:
-        scales = _scales(cell.spec, value, x.dim())
+        scales = _scale(value, x.dim(), cell.spec["dtype"])
         out = op(x, scales)
         assert out.shape == x.shape and out.dtype == scales.dtype and out.is_contiguous()
         _compare(out, op.reference(x, scales))

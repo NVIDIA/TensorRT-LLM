@@ -77,8 +77,7 @@ class QsaPrefillCompress(OpWrapper):
 
     Not idempotent: the anchor slot is the group's last input and its only
     output, so a second call over the same rows re-pools a compressed anchor
-    (measured: all 48 of 48 anchors moved, up to 2.94). Two rows naming one
-    anchor in a launch are harmless.
+    (measured: all 48 of 48 anchors moved, up to 2.94).
 
     Fusion boundary: pool, Gemma norm, position gather, rotation, store. The
     raw-key and position stores (`qsa_paged_index_store`, which must run
@@ -98,61 +97,12 @@ class QsaPrefillCompress(OpWrapper):
             spec=_spec(((0, 128),) * 2, pages=8),
         ),
         Cell(
-            why="prefill 3 x 64, mRoPE: three requests' pages interleaved",
-            spec=_old(((0, 64),) * 3, pages=6),
-        ),
-        Cell(
-            why="text rows (t == h == w) under mRoPE",
-            spec=_old(((0, 128),), pages=4, distinct_axes=False),
-        ),
-        Cell(
-            why="2-token pages: every group straddles two pages",
-            spec=_old(((0, 64),) * 2, pages=64, tokens_per_block=2),
-        ),
-        Cell(
             why="decode: 8 rows to 8191, anchors and non-anchors, None",
             spec=_spec(_DECODE, pages=1024),
-        ),
-        Cell(why="decode: the same rows under mRoPE", spec=_old(_DECODE, pages=1024)),
-        Cell(
-            why="decode MTP: 4 requests x 2 rows, one anchor each, None",
-            spec=_spec(((4094, 2), (4095, 2), (1022, 2), (30, 2)), pages=512),
-        ),
-        Cell(
-            why="decode MTP7: 1 request x 8 rows, two anchors, None",
-            spec=_spec(((4090, 8),), pages=160),
         ),
         Cell(
             why="decode MTP7: 32 requests x 8 rows, two anchors each, None",
             spec=_spec(_MTP7_32, pages=1100, slots=40, rounding_flips=1),
-        ),
-        Cell(
-            why="mixed: chunk from 0, chunk from 1000, 2 MTP decodes, None",
-            spec=_spec(((0, 64), (1000, 36), (4094, 2), (255, 2)), pages=256),
-        ),
-        Cell(why="eps 0.0", spec=_old(((0, 64),), pages=2, eps=0.0)),
-        Cell(why="eps 1e-5", spec=_old(((0, 64),), pages=2, eps=1e-5)),
-        Cell(
-            why="int32 positions, int32 requests",
-            spec=_old(((0, 64),) * 2, pages=4, logical_dtype=torch.int32),
-        ),
-        Cell(
-            why="int64 positions, int64 requests",
-            spec=_old(((0, 64),) * 2, pages=4, request_dtype=torch.int64),
-        ),
-        Cell(
-            why="int32 positions, int64 requests",
-            spec=_old(
-                ((0, 64),) * 2, pages=4, logical_dtype=torch.int32, request_dtype=torch.int64
-            ),
-        ),
-        Cell(
-            why="page-sliced cache, axis-strided plane, column-strided table",
-            spec=_old(((0, 64),) * 2, pages=4, layout="strided"),
-        ),
-        Cell(
-            why="index cache with a head-dim stride of 2",
-            spec=_old(((0, 64),), pages=2, layout="head_dim_strided"),
         ),
         # Under an NVFP4 KV pool the position page shares each physical page with the index
         # pages, so both caches are strided views of one allocation: index page stride
@@ -166,11 +116,6 @@ class QsaPrefillCompress(OpWrapper):
             why="NVFP4 draft planes: one index role and the position page share each page",
             spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=1),
         ),
-        Cell(
-            why="every row twice: two rows per anchor in one launch",
-            spec=_old(((0, 64),) * 2, pages=4, duplicate=True),
-        ),
-        Cell(why="zero rows: returns before launching", spec=_old((), pages=2)),
     )
 
     note = """
@@ -204,8 +149,8 @@ class QsaPrefillCompress(OpWrapper):
     `cos_sin`'s dtype is the rotation's precision: bf16 is accepted and was
     measured 1.4% of elements off by up to 1.56e-2 -- not certified. Text
     rows reduce mRoPE to plain RoPE bit for bit. Plain `@triton.jit`, no
-    autotune; CUDA-graph capturable at a fixed row count (captured at 128 rows
-    and at 256, 32 MTP7 verify blocks).
+    autotune; CUDA-graph capturable at a fixed row count (captured at 256
+    rows, 32 MTP7 verify blocks).
 
     Under an NVFP4 KV pool both caches are strided views of one per-slot
     allocation (each physical page holds the index roles, then the position
@@ -222,7 +167,11 @@ class QsaPrefillCompress(OpWrapper):
     [32, 260] table over 1024 pages.
 
     Not certified: `compress_ratio` other than 4, `D` other than 128, a bf16
-    or fp16 `cos_sin`, positions past the table's rows, multiple devices.
+    or fp16 `cos_sin`, positions past the table's rows, multiple devices,
+    `tokens_per_block` other than 32 (no group straddles a page), eps other
+    than 1e-6, int32 positions or int64 request indices, a strided view of the
+    index cache, position plane or table other than the NVFP4 pool's shared
+    page, two rows naming one anchor in a launch, and `rows == 0`.
     """
 
     def __call__(

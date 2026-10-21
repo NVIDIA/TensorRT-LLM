@@ -144,42 +144,29 @@ class LowMBf16Mm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # Every cell but the one off the table is a qwen3.8-flash-next-nvfp4 tp1
-    # projection shape; `kind` pins the branch `plan` takes for it.
+    # Every cell is a qwen3.8-flash-next-nvfp4 tp1 decode projection at M >= 2 (one row
+    # takes `bf16_gemv_pdl` in the target); `kind` pins the branch `plan` takes for it.
     CELLS: tuple[Cell, ...] = (
-        _cell("qwen3.8 decode M=1 GDN in_qkv: direct", 1, 10240, 2560, "direct"),
-        _cell("qwen3.8 decode M=2 GDN in_z: direct, 2-row tile", 2, 6144, 2560, "direct"),
-        _cell("qwen3.8 decode M=1 GDN in_a/in_b, N=48: direct", 1, 48, 2560, "direct"),
-        _cell("qwen3.8 decode M=32 GDN in_a/in_b: direct, 8-row tiles x4", 32, 48, 2560, "direct"),
-        _cell("qwen3.8 decode M=1 o_proj K=6144: direct, 256-thread K", 1, 2560, 6144, "direct"),
-        _cell("qwen3.8 decode M=8 o_proj: split-K 3 over the cluster", 8, 2560, 6144, "splitk"),
-        _cell("qwen3.8 decode M=32 o_proj: split-K, mma_n 32", 32, 2560, 6144, "splitk"),
-        _cell("qwen3.8 decode M=3 attention q: split-K, M off-bucket", 3, 12288, 2560, "splitk"),
-        _cell("qwen3.8 decode M=8 attention q: split-K, mma_n 16", 8, 12288, 2560, "splitk"),
-        _cell("qwen3.8 decode M=16 router / k / v N=512: direct", 16, 512, 2560, "direct"),
-        _cell("qwen3.8 decode M=24 router / k / v: split-K 4", 24, 512, 2560, "splitk"),
-        _cell("qwen3.8 decode M=16 index proj N=640: split-K", 16, 640, 2560, "splitk"),
-        _cell("qwen3.8 decode M=4 shared gate_up: direct", 4, 1280, 2560, "direct"),
-        _cell("qwen3.8 decode M=8 shared gate_up + gate row: split-K", 8, 1296, 2560, "splitk"),
-        _cell("qwen3.8 decode M=1 shared gate N=1: direct", 1, 1, 2560, "direct"),
-        _cell("qwen3.8 decode M=1 GDN in-proj concat N=16480: direct", 1, 16480, 2560, "direct"),
-        _cell("qwen3.8 decode M=2 GDN in-proj concat: cuBLAS branch", 2, 16480, 2560, "cublas"),
         _cell(
-            "qwen3.8 decode M=2 attention in-proj concat N=14080: direct", 2, 14080, 2560, "direct"
+            "qwen3.8 decode M=2 GDN in_z: direct, 2-row tile, pdl on",
+            2,
+            6144,
+            2560,
+            "direct",
+            pdl=True,
         ),
-        _cell("qwen3.8 decode M=3 attention in-proj concat: split-K", 3, 14080, 2560, "splitk"),
-        _cell("qwen3.8 decode M=8 attention in-proj concat: split-K", 8, 14080, 2560, "splitk"),
-        _cell("qwen3.8 decode M=16 attention in-proj concat: cuBLAS", 16, 14080, 2560, "cublas"),
-        _cell("qwen3.8 decode M=1 PLE value N=K=2560: direct", 1, 2560, 2560, "direct"),
-        _cell("qwen3.8 decode M=4 PLE value: direct, 32-thread K", 4, 2560, 2560, "direct"),
-        _cell("qwen3.8 decode M=8 PLE value: split-K 2", 8, 2560, 2560, "splitk"),
-        _cell("qwen3.8 decode M=1 shared down K=640: cuBLAS branch", 1, 2560, 640, "cublas"),
-        _cell("qwen3.8 decode M=16 attention q: cuBLAS branch", 16, 12288, 2560, "cublas"),
+        _cell(
+            "qwen3.8 decode M=8 o_proj: split-K 3 over the cluster, pdl on",
+            8,
+            2560,
+            6144,
+            "splitk",
+            pdl=True,
+        ),
+        _cell("qwen3.8 decode M=32 GDN in_a/in_b: direct, 8-row tiles x4", 32, 48, 2560, "direct"),
+        _cell("qwen3.8 decode M=32 o_proj: split-K, mma_n 32", 32, 2560, 6144, "splitk"),
+        _cell("qwen3.8 decode M=2 GDN in-proj concat: cuBLAS branch", 2, 16480, 2560, "cublas"),
         _cell("qwen3.8 decode M=128: cuBLAS branch above M=32", 128, 10240, 2560, "cublas"),
-        _cell("qwen3.8 o_proj prefill-shaped M=8192: cuBLAS branch", 8192, 2560, 6144, "cublas"),
-        _cell("decode M=1, an (N, K) not in the table: cuBLAS", 1, 1024, 2048, "cublas"),
-        _cell("qwen3.8 pdl on, direct branch", 1, 10240, 2560, "direct", pdl=True),
-        _cell("qwen3.8 pdl on, split-K branch", 8, 2560, 6144, "splitk", pdl=True),
     )
 
     note = """
@@ -203,7 +190,7 @@ class LowMBf16Mm(OpWrapper):
 
     Hard limits
       M    FlashInfer branches only at M <= 32 (both kernels' policy)  boundary 32  driven at 32
-           (cells) and 128, 8192 (cuBLAS cells)
+           (cells) and 128 (cuBLAS cell)
       N*K  largest FlashInfer-branch weight 16480*2560 = 4.2e7 elements  boundary 2^31  not probed (48x below it)
     """
 

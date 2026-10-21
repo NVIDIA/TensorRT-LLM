@@ -15,9 +15,9 @@ Two routings hit all 512 experts. In the first every token's only non-zero routi
 on its own expert, so each expert's output is checked alone: a layout error confined to one
 expert (a permutation, a scale swizzle, an alpha) cannot hide in a sum over ten. The second is
 a weighted top-10. Both backends are held to a float64 reference over the dequantized
-checkpoint tensors, with `down_proj.input_scale` both spread across the experts and uniform.
-When it is uniform the two backends requantize the SwiGLU output identically, so they are
-also held to each other.
+checkpoint tensors, with `down_proj.input_scale` spread across the experts as a calibrated
+checkpoint's is. With a uniform one the two backends requantize the SwiGLU output
+identically, so on the weighted routing they are also held to each other.
 
 The reference does not model the kernels' accumulation. It models the one rounding step
 that is not exact: the SwiGLU output is requantized to NVFP4 before FC2, at the backend's
@@ -354,16 +354,15 @@ def test_routings_hit_every_expert() -> None:
         assert torch.unique(ids[weights != 0]).numel() == E, case
 
 
-@pytest.mark.parametrize("spread", (True, False), ids=["isc2_spread", "isc2_uniform"])
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_routed_output_matches_the_float64_reference(backend: str, case: str, spread: bool) -> None:
-    err = _token_error(_routed(backend, case, spread), _reference(backend, case, spread))
-    print(f"[err] {backend} {case} spread={spread}: mean {err.mean():.4e} max {err.max():.4e}")
+def test_routed_output_matches_the_float64_reference(backend: str, case: str) -> None:
+    err = _token_error(_routed(backend, case, True), _reference(backend, case, True))
+    print(f"[err] {backend} {case}: mean {err.mean():.4e} max {err.max():.4e}")
     assert err.max() <= REFERENCE_TOLERANCE, (err.mean().item(), err.max().item())
 
 
-@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("case", ("weighted",))
 def test_cutedsl_matches_trtllm_gen_under_a_uniform_input_scale(case: str) -> None:
     err = _token_error(_routed("CUTEDSL", case, False), _routed("TRTLLM", case, False))
     print(f"[err] CUTEDSL vs TRTLLM {case}: mean {err.mean():.4e} max {err.max():.4e}")

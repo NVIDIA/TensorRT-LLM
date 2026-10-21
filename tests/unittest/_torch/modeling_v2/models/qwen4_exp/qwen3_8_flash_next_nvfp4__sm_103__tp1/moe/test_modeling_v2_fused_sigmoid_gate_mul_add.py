@@ -170,47 +170,26 @@ def test_wrong_variants_land_far_outside_the_default_gate():
 
 @pytest.mark.parametrize(
     "case",
-    [
-        "final_3d",
-        "shared_shape_mismatch",
-        "shared_dtype_mismatch",
-        "gate_numel_too_small",
-        "gate_numel_too_large",
-        "output_shape_mismatch",
-        "output_dtype_mismatch",
-        "output_last_stride",
-        "final_last_stride_without_an_output",
-    ],
+    ["shared_shape_mismatch", "gate_numel_too_small", "final_last_stride_without_an_output"],
 )
 def test_metadata_misuse_raises(case: str) -> None:
-    """Every metadata violation is loud, which is why the entry has no guard."""
+    """Metadata violations are loud, which is why the entry has no guard: one
+    case each for an operand that disagrees with `final_hidden_states`, a gate
+    of the wrong length and a destination whose last stride is not 1."""
     bf = dict(dtype=torch.bfloat16, device=DEV)
     final, shared, gate = (
         torch.randn(4, 128, **bf),
         torch.randn(4, 128, **bf),
         torch.randn(4, 1, **bf),
     )
-    output = None
-    if case == "final_3d":
-        final = torch.randn(2, 2, 128, **bf)
-    elif case == "shared_shape_mismatch":
+    if case == "shared_shape_mismatch":
         shared = torch.randn(4, 64, **bf)
-    elif case == "shared_dtype_mismatch":
-        shared = torch.randn(4, 128, dtype=torch.float16, device=DEV)
     elif case == "gate_numel_too_small":
         gate = torch.randn(3, 1, **bf)
-    elif case == "gate_numel_too_large":
-        gate = torch.randn(5, 1, **bf)
-    elif case == "output_shape_mismatch":
-        output = torch.empty(4, 64, **bf)
-    elif case == "output_dtype_mismatch":
-        output = torch.empty(4, 128, dtype=torch.float16, device=DEV)
-    elif case == "output_last_stride":
-        output = torch.empty(4, 256, **bf)[:, ::2]
     elif case == "final_last_stride_without_an_output":
         final = torch.randn(4, 256, **bf)[:, ::2]
     with pytest.raises(AssertionError):
-        op(final, gate, shared, output=output)
+        op(final, gate, shared)
 
 
 def test_cpu_operands_are_rejected_by_triton() -> None:

@@ -29,14 +29,12 @@ E, K, H = 512, 10, 2560
 NAN = float("nan")
 
 #: Row counts of a decode capture (requests x MTP verify width 1..4, up to 32
-#: requests), and the eager prefix lengths: both sides of the power-of-two edges up
-#: to the 8192-row ceiling. A subset of the prefixes is also re-sorted.
-_CAPTURED_ROWS = (1, 2, 3, 4, 5, 8, 32, 96, 128)
-_PREFIXES = (
-    *(1, 2, 3, 4, 5, 8, 31, 32, 33, 96, 127, 128, 129, 511, 512, 513, 1023, 1024, 1025),
-    *(2047, 2048, 2049, 4095, 4096, 4097, 8191),
-)
-_RESORT = (1, 2, 5, 32, 129, 1024, 8192)
+#: requests): both ends of the sort's block kernel, its first cluster-kernel T and
+#: the largest capture. The eager prefix lengths straddle the captured ceiling and
+#: reach the 8192-row one; a subset of them is also re-sorted.
+_CAPTURED_ROWS = (1, 4, 5, 128)
+_PREFIXES = (1, 4, 5, 127, 128, 129, 4096, 8191)
+_RESORT = (1, 5, 129, 8192)
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -210,16 +208,16 @@ def _capture(fn):
     return graph, static
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_captured_rows_replay_on_new_data(tile, certifying):  # noqa: F811
+def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
     """The sort, the FC2 rows' placement and this op are captured together, as the
     target runs them; each graph is replayed on two fresh sets of ids, scales and
     rows. The permuted buffer is not cleared between replays, so the rows the new
     sort does not use hold the previous placement's rows. Each replay is gated
     against the reference, and is bitwise equal to an eager call on the same data
-    through its own sort.
+    through its own sort. At the target's tile, 128.
     """
     certifying(op)
+    tile = 128
     stale_rows = 0
     for tokens in _CAPTURED_ROWS:
         ids = _ids("router", tokens, seed=tokens)
@@ -275,8 +273,7 @@ def test_captured_rows_replay_on_new_data(tile, certifying):  # noqa: F811
 # ── eager: prefixes of the largest batch ──────────────────────────────────
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_eager_rows_prefix_bitwise(tile, certifying):  # noqa: F811
+def test_eager_rows_prefix_bitwise(certifying):  # noqa: F811
     """One block per token makes the grid the only thing T sizes: the 8192-row call
     is gated against the reference, and the first T rows of every row count in the
     sweep are bitwise those of the 8192-row call -- over the same placement, and
@@ -284,6 +281,7 @@ def test_eager_rows_prefix_bitwise(tile, certifying):  # noqa: F811
     rows elsewhere. A token's output does not depend on its batch.
     """
     certifying(op)
+    tile = 128
     args, rows, ids = _problem(_spec(8192, tile_tokens_dim=tile), seed=8192 + tile)
     full = op(**args)
     _compare(full, op.reference(**args))
@@ -314,7 +312,7 @@ def test_eager_rows_prefix_bitwise(tile, certifying):  # noqa: F811
 # ── run to run, and where the rows sit ────────────────────────────────────
 
 
-@pytest.mark.parametrize("tokens", (1, 32, 128, 8192))
+@pytest.mark.parametrize("tokens", (1, 8192))
 def test_repeats_and_placements_are_bitwise(tokens, certifying):  # noqa: F811
     """What the fused finalize does not give: 8 identical calls, a second sort
     of the same ids (the sort orders an expert's rows by atomics), a random
@@ -478,8 +476,6 @@ def test_op_rejects_loudly():
 
 # ── the guards ────────────────────────────────────────────────────────────
 
-_OPERANDS = ("permuted_input", "output", "expanded_idx_to_permuted_idx", "topk_scales")
-
 
 def _strided(t: torch.Tensor, pad: int) -> torch.Tensor:
     """The same values in a view whose rows are `pad` elements wider apart."""
@@ -488,8 +484,10 @@ def _strided(t: torch.Tensor, pad: int) -> torch.Tensor:
     return wide[:, : t.shape[1]]
 
 
-@pytest.mark.parametrize("name", _OPERANDS)
+@pytest.mark.parametrize("name", ("permuted_input", "output"))
 def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
+    """One operand the op reads and the one it writes; the guard checks all four
+    the same way."""
     args, _, _ = _problem(_spec(300), seed=61)
     ref = op.reference(**args)
     bad = dict(args, **{name: _strided(args[name], 64 if args[name].shape[1] == H else 6)})

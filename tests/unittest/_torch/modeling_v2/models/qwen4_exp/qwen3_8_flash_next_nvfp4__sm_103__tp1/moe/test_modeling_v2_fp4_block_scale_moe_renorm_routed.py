@@ -136,7 +136,7 @@ def test_coarse_cell_exercises_tie_breaking():
 
 def test_strided_logits_refused():
     # More than one row: a one-row column slice is contiguous by definition.
-    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 8)
+    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 128)
     args, _, data, sf, _, logits, _, _, _, scalars = _operands(spec, 11)
     wide = torch.zeros(spec["tokens"], spec["num_experts"] + 8, device=DEV, dtype=logits.dtype)
     wide[:, : spec["num_experts"]] = logits

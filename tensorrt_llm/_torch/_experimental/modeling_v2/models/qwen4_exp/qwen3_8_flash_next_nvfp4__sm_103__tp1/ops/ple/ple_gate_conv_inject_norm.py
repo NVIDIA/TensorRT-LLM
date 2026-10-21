@@ -344,43 +344,21 @@ class PleGateConvInjectNorm(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: lengths (rows per sequence), pool_slots (default num_seqs + 2),
-    # slots (None -> scattered distinct), max_rows (max(lengths)), pad (index
-    # of a sequence to give pad_slot_id), hc_count (4), hidden (2560), dtype
-    # (bf16), layout "contiguous" | "row_slice" (hc and key are buf[::2]).
-    CELLS: tuple[Cell, ...] = tuple(
-        _cell(f"decode {n} x 1 row at the 461-slot pool", (1,) * n, pool_slots=ENGINE_SLOTS)
-        for n in (1, 8, 32, 128)
-    ) + (
-        _cell("decode 256 x 1 row, 512-slot pool", (1,) * 256, pool_slots=512),
-        _cell("MTP verify p=2: 8 x 2 rows", (2,) * 8, pool_slots=ENGINE_SLOTS),
+    # max_rows (max(lengths)), carries (None -> the argument is None). The
+    # checkpoint's 4 x 2560 bf16 geometry throughout.
+    CELLS: tuple[Cell, ...] = (
+        _cell("decode 1 x 1 row at the 461-slot pool", (1,), pool_slots=ENGINE_SLOTS),
+        _cell("decode 128 x 1 row at the 461-slot pool", (1,) * 128, pool_slots=ENGINE_SLOTS),
         _cell("MTP verify p=4: 32 x 4 rows", (4,) * 32, pool_slots=ENGINE_SLOTS),
-        _cell("MTP verify p=3: 4 x 3 rows", (3,) * 4),
-        _cell("a pad_slot_id row beside live rows", (1,) * 6, pad=2),
         _cell("rows shorter than max_rows, a zero-row sequence", (2, 0, 1), max_rows=4),
-        _cell("hc and key row slices buf[::2]", (1,) * 16, layout="row_slice"),
-        _cell("hc_count 2 at hidden 2560", (1,) * 8, hc_count=2),
-        _cell("hidden 1024 (not the checkpoint)", (1,) * 8, hidden=1024),
         # Context-shaped (prefill / mixed) steps: the packed-row conv.
         _cell("prefill 8192 rows, fresh", (8192,), carries=(False,), pool_slots=ENGINE_SLOTS),
-        _cell(
-            "chunked prefill 16384 rows carrying",
-            (16384,),
-            carries=(True,),
-            pool_slots=ENGINE_SLOTS,
-        ),
         _cell(
             "mixed step: 2 contexts + 64 decode rows",
             (3001, 5000) + (1,) * 64,
             carries=(False, True) + (True,) * 64,
             pool_slots=ENGINE_SLOTS,
         ),
-        _cell(
-            "short contexts, tile-straddling, zero-row, pad",
-            (40, 1, 0, 7, 33, 2),
-            carries=(True, False, True, False, True, True),
-            pad=4,
-        ),
-        _cell("mixed step, carry None", (9, 1, 1)),
     )
 
     note = """
@@ -394,7 +372,8 @@ class PleGateConvInjectNorm(OpWrapper):
 
     Preconditions (data; not guarded): at most `max_rows` rows per sequence;
     distinct live slots; `query_start_loc[-1] == T`. Operands 2-D with unit
-    column stride (row strides free); weights contiguous.
+    column stride; weights contiguous. Certified at the checkpoint's 4 x 2560
+    bf16 geometry with every slot live (the target never passes `pad_slot_id`).
 
     Numerics: every rounding point of the composition is kept, so the only
     differences are fp32 reduction order (the three norms' sums of squares

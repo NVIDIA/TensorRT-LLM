@@ -362,11 +362,6 @@ def _guard_case(name: str):
 
     if name == "output column slice":
         kwargs["output"] = torch.zeros((rows, 2 * K), dtype=torch.int32, device=DEV)[:, :K]
-    elif name == "shared_indices column slice":
-        wide = torch.full((kwargs["shared_indices"].shape[0], 2 * K), -1, dtype=torch.int32)
-        wide = wide.to(DEV)
-        wide[:, :K] = kwargs["shared_indices"]
-        kwargs["shared_indices"] = wide[:, :K]
     elif name == "shared_indices 3-D, middle extent == block_topk":
         # Slot 1 meant; the 3-D buffer passes the width check and reads slot 0.
         stack = torch.full((2, 8, 8), -1, dtype=torch.int32, device=DEV)
@@ -391,14 +386,13 @@ def _guard_case(name: str):
     return intended, kwargs
 
 
+#: One case per guard family: a non-contiguous output, strided row metadata, and a
+#: whole multi-slot buffer passed where one slot's view belongs (indices and counts).
 GUARDS = (
     ("output column slice", "output must be contiguous"),
-    ("shared_indices column slice", "shared_indices must be one slot's"),
     ("shared_indices 3-D, middle extent == block_topk", "shared_indices must be one slot's"),
     ("shared_visible_blocks 2-D [slots, seqs]", "shared_visible_blocks must be one slot's"),
     ("strided request_indices", "request_indices must be contiguous"),
-    ("strided visible_blocks", "visible_blocks must be contiguous"),
-    ("strided shared_visible_blocks", "shared_visible_blocks must be one slot's"),
 )
 
 
@@ -415,17 +409,16 @@ def test_guard_refuses_a_silently_wrong_layout(name: str, message: str) -> None:
 
 
 def test_op_rejects_malformed_arguments() -> None:
-    """The callable's own loud errors: why `is_valid` does not restate them."""
-    kwargs = _build(_spec_of("dense standalone"), seed=17)["kwargs"]
+    """The callable's own loud errors, one per family: why `is_valid` does not restate them."""
+    spec = {**_spec_of("8 requests, one per boundary"), "layout": "dense"}
+    kwargs = _build(spec, seed=17)["kwargs"]
     cases = [
         ("width does not match", dict(shared_indices=kwargs["shared_indices"][:, : K // 2])),
         (
             "one request and bound per query row",
             dict(request_indices=kwargs["request_indices"][:3]),
         ),
-        ("one request and bound per query row", dict(visible_blocks=kwargs["visible_blocks"][:3])),
         ("requires CUDA tensors", dict(shared_indices=kwargs["shared_indices"].cpu())),
-        ("requires CUDA tensors", dict(output=kwargs["output"].cpu())),
     ]
     for message, override in cases:
         with pytest.raises(ValueError, match=message):

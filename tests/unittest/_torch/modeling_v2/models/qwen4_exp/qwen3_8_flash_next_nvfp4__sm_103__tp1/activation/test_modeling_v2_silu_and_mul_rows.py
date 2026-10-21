@@ -26,7 +26,7 @@ INTER = 640
 
 def _build(spec, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    rows, width = spec["rows"], spec.get("width", 2 * INTER + 8)
+    rows, width = spec["rows"], 2 * INTER + 8
     x = (torch.randn(rows, width, generator=g, device="cuda") * 3.0).to(torch.bfloat16)
     if rows:
         x[0, :4] = torch.tensor([0.0, -0.0, 88.0, -100.0], device="cuda").to(torch.bfloat16)

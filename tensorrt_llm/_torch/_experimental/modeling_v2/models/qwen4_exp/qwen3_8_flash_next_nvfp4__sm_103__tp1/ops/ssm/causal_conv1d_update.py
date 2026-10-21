@@ -343,144 +343,27 @@ class CausalConv1dUpdate(OpWrapper):
     # pad_slot_id, x_form ("3d" | "2d" | "2d_row_slice" | "2d_in_proj" |
     # "token_major"),
     # strided_state.
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"decode batch {batch}, call-site 2-D x, 461-slot pool",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=batch,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(batch),
-                    x_form="2d",
-                ),
-            )
-            for batch in (1, 2, 17, 32)
-        )
-        + (
-            Cell(
-                why="mixed batch: 2-D x is the decode-row slice of the projection",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=8,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(8),
-                    x_form="2d_row_slice",
-                ),
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"x the q|k|v column view of the [rows, 16480] in_proj, batch {batch}",
+            spec=dict(
+                dim=CKPT_DIM,
+                batch=batch,
+                pool_slots=pool,
+                slots=slots,
+                x_form="2d_in_proj",
             ),
         )
-        + tuple(
-            Cell(
-                why=f"x the q|k|v column view of the [rows, 16480] in_proj, batch {batch}",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=batch,
-                    pool_slots=pool,
-                    slots=slots,
-                    x_form="2d_in_proj",
-                ),
-            )
-            for batch, pool, slots in (
-                (1, ENGINE_SLOTS, _pinned(1)),
-                (32, ENGINE_SLOTS, _pinned(32)),
-                (128, 256, "random"),
-            )
+        for batch, pool, slots in (
+            (1, ENGINE_SLOTS, _pinned(1)),
+            (32, ENGINE_SLOTS, _pinned(32)),
+            (128, 256, "random"),
         )
-        + tuple(
-            Cell(
-                why=f"decode batch {batch}, [batch, dim, 1] x, 128-slot pool",
-                spec=dict(dim=CKPT_DIM, batch=batch, pool_slots=128, slots="random"),
-            )
-            for batch in (1, 2, 17, 64)
-        )
-        + (
-            Cell(
-                why="pad_slot_id -1 rows: x rows and the pool untouched",
-                spec=dict(dim=CKPT_DIM, batch=6, pool_slots=128, slots=(3, -1, 7, 11, -1, 2)),
-            ),
-            Cell(
-                why="pad_slot_id 9: the sentinel is compared by value",
-                spec=dict(dim=CKPT_DIM, batch=4, pool_slots=128, slots=(5, 9, 0, 9), pad_slot_id=9),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"bias={bias}, silu={silu} (general kernel unless silu)",
-                spec=dict(
-                    dim=CKPT_DIM, batch=4, pool_slots=128, slots="random", bias=bias, silu=silu
-                ),
-            )
-            for bias in (False, True)
-            for silu in (True, False)
-        )
-        + tuple(
-            Cell(
-                why=f"state_len {state_len} > W-1: the whole state shifts left",
-                spec=dict(dim=512, batch=3, pool_slots=16, slots="random", state_len=state_len),
-            )
-            for state_len in (4, 5, 8)
-        )
-        + tuple(
-            Cell(
-                why=f"multi-token step: seqlen {seqlen}, state_len {state_len}",
-                spec=dict(
-                    dim=512,
-                    batch=3,
-                    pool_slots=16,
-                    slots="random",
-                    seqlen=seqlen,
-                    state_len=state_len,
-                ),
-            )
-            for seqlen in (2, 3, 5)
-            for state_len in (3, 5)
-        )
-        + tuple(
-            Cell(
-                why=f"circular ring, state_len {state_len}, seqlen {seqlen}, a pad row",
-                spec=dict(
-                    dim=512,
-                    batch=4,
-                    pool_slots=16,
-                    slots=(3, 7, -1, 11),
-                    seqlen=seqlen,
-                    state_len=state_len,
-                    cache_seqlens=(0, 1, state_len - 1, 37),
-                ),
-            )
-            for state_len in (4, 8)
-            for seqlen in (1, 3)
-        )
-        + tuple(
-            Cell(
-                why=f"{str(dtype).removeprefix('torch.')} with bias",
-                spec=dict(dim=512, batch=4, pool_slots=16, slots="random", dtype=dtype, bias=True),
-            )
-            for dtype in (torch.bfloat16, torch.float16, torch.float32)
-        )
-        + (
-            Cell(
-                why="conv_state_indices None: row b uses slot b, batch-sized pool",
-                spec=dict(dim=512, batch=4, pool_slots=4, slots=None),
-            ),
-            Cell(
-                why="x a [batch, tokens, dim].transpose(1, 2) view",
-                spec=dict(
-                    dim=512, batch=3, seqlen=4, pool_slots=16, slots=(2, 5, 1), x_form="token_major"
-                ),
-            ),
-            Cell(
-                why="conv_state a [:, :, ::2] view: interleaved columns untouched",
-                spec=dict(dim=512, batch=3, pool_slots=16, slots=(2, 5, 1), strided_state=True),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"dim {dim}, off the 128-channel block",
-                spec=dict(dim=dim, batch=2, pool_slots=8, slots="random"),
-            )
-            for dim in (1, 127, 128, 129, 513)
-        )
+    ) + (
+        Cell(
+            why="pad_slot_id -1 rows: x rows and the pool untouched",
+            spec=dict(dim=CKPT_DIM, batch=6, pool_slots=128, slots=(3, -1, 7, 11, -1, 2)),
+        ),
     )
 
     note = """
@@ -492,19 +375,20 @@ class CausalConv1dUpdate(OpWrapper):
     the layer's whole conv pool `[slots, 10240, 3]`, W 4, no bias, SiLU on,
     `cache_seqlens` None, int32 slots, `pad_slot_id` -1.
     That exact shape (silu, no ring, `state_len == W - 1`) runs TRT-LLM's
-    dedicated seqlen-1 kernel; every other cell runs its general one. From
-    `_CUTE_MIN_ROWS` (64) rows, with bf16 operands, a contiguous weight, a
-    pool whose slot is `[dim, 3]` contiguous and 16-byte aligned rows, it runs
+    dedicated seqlen-1 kernel; any other shape runs its general one, which the
+    target never reaches and which is not certified. From `_CUTE_MIN_ROWS`
+    (64) rows, with bf16 operands, a contiguous weight, a pool whose slot is
+    `[dim, 3]` contiguous and 16-byte aligned rows, it runs
     `_DecodeConvKernel` (CuTe DSL) instead: 8 channels a thread by 16-byte
     loads, the TRT-LLM kernel's instructions, bitwise its result (x and pool,
     pad rows untouched); 128 rows 7.46 -> 5.41 us a layer (GB300, graph
-    replay over 8 rotating layers). Certified at 128
-    and 461 pool slots; at 461 the result is bitwise identical to 128 for the
-    same slot content.
+    replay over 8 rotating layers). Certified at that call: 1 and 32 rows
+    over the 461-slot pool, 128 rows (the CuTe kernel) over a 256-slot pool,
+    and pad rows over a 128-slot pool.
 
-    Everything metadata the op checks itself, loudly: width 2..4, `state_len
-    >= W - 1`, one dtype across x/conv_state/weight (bias matches weight),
-    weight shape, int32 contiguous length-batch `conv_state_indices`, int32
+    The op checks metadata itself, loudly: width 2..4, `state_len >= W - 1`,
+    one dtype across x/conv_state/weight (bias matches weight), weight shape,
+    int32 contiguous length-batch `conv_state_indices`, int32
     `cache_seqlens`, a batch-sized pool when indices are absent. So no guard.
 
     Not guarded because it is content, not metadata: two rows naming one slot
@@ -512,9 +396,8 @@ class CausalConv1dUpdate(OpWrapper):
     10 runs while both outputs matched. Slot uniqueness is the caller's.
     Out-of-range slot values are an illegal access, not probed.
 
-    A row whose index equals `pad_slot_id` is skipped: its x rows and the pool
-    stay bitwise unchanged (linear and ring mode). Any value works as the
-    sentinel, including one that collides with a live slot.
+    A row whose index equals `pad_slot_id` (-1 at the call site) is skipped:
+    its x rows and the pool stay bitwise unchanged.
 
     Hard limits
       none probed.

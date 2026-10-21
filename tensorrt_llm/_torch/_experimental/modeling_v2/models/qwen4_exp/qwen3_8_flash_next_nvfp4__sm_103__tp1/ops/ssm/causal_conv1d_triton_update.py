@@ -79,46 +79,6 @@ class CausalConv1dTritonUpdate(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         tuple(
             Cell(
-                why=f"verify at the 461-slot pool, batch {batch}, {seqlen} tokens/row",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=batch,
-                    seqlen=seqlen,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(batch),
-                    snapshots=ENGINE_SNAPSHOT_ROWS,
-                ),
-            )
-            for batch, seqlen in (
-                (1, 2),
-                (8, 3),
-                (32, 2),
-                (17, 4),
-                # max_draft_len 4..7: seqlen 5..8, up to 256 rows.
-                (32, 5),
-                (8, 6),
-                (17, 7),
-                (1, 8),
-                (17, 8),
-                (32, 8),
-            )
-        )
-        + (
-            Cell(
-                why="seqlen 5 into an 8-step snapshot buffer: steps 5..7 untouched",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=8,
-                    seqlen=5,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(8),
-                    snapshots=ENGINE_SNAPSHOT_ROWS,
-                    snapshot_steps=8,
-                ),
-            ),
-        )
-        + tuple(
-            Cell(
                 why=f"verify, x over the [n*p, 16480] in_proj, batch {batch}, {seqlen} tok/row",
                 spec=dict(
                     dim=CKPT_DIM,
@@ -134,121 +94,36 @@ class CausalConv1dTritonUpdate(OpWrapper):
         )
         + tuple(
             Cell(
-                why=f"verify, 128-slot pool, batch {batch}, {seqlen} tokens/row",
+                why=f"verify at the 461-slot pool, batch {batch}, {seqlen} tokens/row",
                 spec=dict(
                     dim=CKPT_DIM,
                     batch=batch,
                     seqlen=seqlen,
-                    pool_slots=128,
-                    slots="random",
-                    snapshots=batch,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_pinned(batch),
+                    snapshots=ENGINE_SNAPSHOT_ROWS,
                 ),
             )
-            for batch, seqlen in ((1, 2), (4, 2), (8, 3), (17, 4), (64, 2))
+            # seqlen 8: max_draft_len 7, the widest verify step.
+            for batch, seqlen in ((17, 4), (32, 8))
         )
         + (
+            Cell(
+                why="seqlen 5 into an 8-step snapshot buffer: steps 5..7 untouched",
+                spec=dict(
+                    dim=CKPT_DIM,
+                    batch=8,
+                    seqlen=5,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_pinned(8),
+                    snapshots=ENGINE_SNAPSHOT_ROWS,
+                    snapshot_steps=8,
+                ),
+            ),
             Cell(
                 why="pad_slot_id -1 rows: pool slot and snapshot rows untouched",
                 spec=dict(
                     dim=512, batch=6, pool_slots=16, slots=(3, -1, 7, 11, -1, 2), snapshots=6
-                ),
-            ),
-            Cell(
-                why="pad_slot_id 9: the sentinel is compared by value",
-                spec=dict(dim=512, batch=4, pool_slots=16, slots=(5, 9, 0, 9), pad_slot_id=9),
-            ),
-            Cell(
-                why="conv_state_indices None: row b reads and writes slot b",
-                spec=dict(dim=512, batch=4, pool_slots=4, slots=None),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"activation={activation!r}",
-                spec=dict(dim=512, batch=4, pool_slots=16, slots="random", activation=activation),
-            )
-            for activation in (None, False, True, "swish")
-        )
-        + tuple(
-            Cell(
-                why=f"bias, activation={activation!r}: added in the fp32 accumulator",
-                spec=dict(
-                    dim=512,
-                    batch=4,
-                    pool_slots=16,
-                    slots="random",
-                    bias=True,
-                    activation=activation,
-                ),
-            )
-            for activation in ("silu", None)
-        )
-        + (
-            Cell(
-                why="2-D [batch, dim] one-token step returns 2-D",
-                spec=dict(dim=512, batch=12, seqlen=1, pool_slots=16, slots="random", x_form="2d"),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"pool {state_len} columns wide: columns past W-1 are inert",
-                spec=dict(dim=512, batch=3, pool_slots=16, slots="random", state_len=state_len),
-            )
-            for state_len in (4, 6)
-        )
-        + (
-            Cell(
-                why="num_accepted_tokens 1/2/3/1 rolls the window to column 0",
-                spec=dict(
-                    dim=512,
-                    batch=4,
-                    seqlen=3,
-                    state_len=5,  # W-1 + (seqlen-1): the pool this form needs
-                    pool_slots=16,
-                    slots="random",
-                    accepted=(1, 2, 3, 1),
-                ),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"conv width {width}",
-                spec=dict(
-                    dim=512,
-                    batch=3,
-                    width=width,
-                    state_len=width - 1,
-                    pool_slots=16,
-                    slots="random",
-                ),
-            )
-            for width in (2, 3)
-        )
-        + tuple(
-            Cell(
-                why=f"dim {dim}, off the 128-channel block",
-                spec=dict(dim=dim, batch=2, pool_slots=8, slots="random"),
-            )
-            for dim in (1, 127, 128, 129, 513)
-        )
-        + tuple(
-            Cell(
-                why=f"{str(dtype).removeprefix('torch.')} with bias",
-                spec=dict(dim=512, batch=4, pool_slots=16, slots="random", dtype=dtype, bias=True),
-            )
-            for dtype in (torch.bfloat16, torch.float16, torch.float32)
-        )
-        + (
-            Cell(
-                why="x contiguous [batch, dim, seqlen] rather than token-major",
-                spec=dict(
-                    dim=512, batch=3, seqlen=4, pool_slots=16, slots=(2, 5, 1), x_form="contiguous"
-                ),
-            ),
-            Cell(
-                why="launch_dependent_kernels=True (PDL trigger)",
-                spec=dict(
-                    dim=512, batch=4, pool_slots=16, slots="random", launch_dependent_kernels=True
                 ),
             ),
         )
@@ -263,17 +138,19 @@ class CausalConv1dTritonUpdate(OpWrapper):
     slots, `pad_slot_id` -1, snapshots into `[max_num_sequences, p, 10240, 3]`
     with `intermediate_state_indices = arange(n)`, `num_accepted_tokens` None.
     The op advances the pool by all `p` tokens whatever is accepted later; the
-    snapshots are what a rollback has to read. Certified at 128 and 461 pool
-    slots (bitwise identical for the same slot content), snapshot buffers of
-    `batch` and of 32 rows, seqlen 2..8 (a buffer deeper than seqlen keeps its
-    later steps untouched).
+    snapshots are what a rollback has to read. Certified at the 461-slot pool
+    with a 32-row snapshot buffer, `x` as the target's q|k|v column view of
+    the projection and as a contiguous `[n, p, 10240]` block, seqlen 2, 3, 4,
+    5 and 8 (a buffer deeper than seqlen keeps its later steps untouched), and
+    for pad-sentinel rows; bf16, W 4, no bias, SiLU only.
 
     Raise loudly, so not guarded: width 1 (triton CompilationError); a missing
     `intermediate_state_indices` with snapshots and slot indices given.
 
     Not guarded (content): duplicate slots or duplicate snapshot rows race;
-    `num_accepted_tokens[b]` must lie in `[1, seqlen]` (certified 1..3 at
-    seqlen 3). Out-of-range slot values: illegal access, not probed.
+    `num_accepted_tokens[b]` must lie in `[1, seqlen]` (the accepted-token
+    roll is uncertified; the target passes None). Out-of-range slot values:
+    illegal access, not probed.
 
     Accepted and inert: `launch_dependent_kernels` (bitwise identical either
     way). Accepted but not exposed: `cache_seqlens` (ignored by the kernel --

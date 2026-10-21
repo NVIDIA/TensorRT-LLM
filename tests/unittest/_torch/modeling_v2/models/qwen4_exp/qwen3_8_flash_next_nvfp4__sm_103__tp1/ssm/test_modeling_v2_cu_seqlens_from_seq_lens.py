@@ -49,12 +49,6 @@ def _build(spec):
         buf = torch.full((len(lengths) + 9,), 99, dtype=dtype, device=DEV)
         buf[: len(lengths)] = _seq_lens(lengths, dtype)
         return buf[: len(lengths)]
-    if layout == "strided":
-        buf = torch.full((2 * len(lengths),), 99, dtype=dtype, device=DEV)
-        buf[::2] = _seq_lens(lengths, dtype)
-        view = buf[::2]
-        assert not view.is_contiguous()
-        return view
     return _seq_lens(lengths, dtype)
 
 
@@ -132,11 +126,11 @@ def test_accumulation_happens_in_the_requested_dtype() -> None:
     assert op(seq_lens, torch.int32).tolist() == [0, 2_000_000_000, -294_967_296]
 
 
-@pytest.mark.parametrize("batch, p", ((8, 2), (32, 8)))
-def test_cuda_graph_capture_and_replay(batch, p) -> None:
+def test_cuda_graph_capture_and_replay() -> None:
     """A captured graph follows lengths rewritten in place: only the shape
-    reaches Python, the values are read on device and never synchronized on. Eight
-    requests of 2 rows, and 32 of 8 (the MTP-7 verify's 256 rows)."""
+    reaches Python, the values are read on device and never synchronized on.
+    32 requests of 8 rows (the MTP-7 verify's 256 rows)."""
+    batch, p = 32, 8
     static_lens = _seq_lens([p] * batch)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())

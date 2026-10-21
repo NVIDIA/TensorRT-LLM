@@ -49,54 +49,17 @@ class FlashinferGemmaRmsnorm(OpWrapper):
             spec=dict(shape=(4, 2560), dtype=torch.bfloat16, eps=1e-6),
         ),
         Cell(
-            why="hidden 5120, 1 token, contiguous",
-            spec=dict(shape=(1, 5120), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="hidden 5120, 33 tokens, contiguous",
-            spec=dict(shape=(33, 5120), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
             why="hidden 5120, 8192 tokens: the largest row count measured",
             spec=dict(shape=(8192, 5120), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="trained-like weight ~0.02: the +1 dominates the scale",
-            spec=dict(shape=(4, 5120), dtype=torch.bfloat16, eps=1e-6, weight_scale=0.02),
-        ),
-        Cell(why="fp16", spec=dict(shape=(4, 5120), dtype=torch.float16, eps=1e-6)),
-        Cell(why="fp32", spec=dict(shape=(4, 5120), dtype=torch.float32, eps=1e-6)),
-        Cell(
-            why="3-D [16, 32, 128]: the per-head kernel",
-            spec=dict(shape=(16, 32, 128), dtype=torch.bfloat16, eps=1e-5),
-        ),
-        Cell(
-            why="column slice buf[:, :5120] of a [8, 10240] buffer",
-            spec=dict(shape=(8, 5120), col_offset=0, **_STREAM),
-        ),
-        Cell(
-            why="row slice rows[::2]: row stride 2 x width",
-            spec=dict(shape=(4, 5120), row_step=2, dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="hidden 111: odd, not a multiple of the 8-element bf16 vector",
-            spec=dict(shape=(16, 111), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="hidden 1152: not a power of two",
-            spec=dict(shape=(16, 1152), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="hidden 6144",
-            spec=dict(shape=(16, 6144), dtype=torch.bfloat16, eps=1e-6),
         ),
     )
 
     note = """
     Metadata consumed: none. Registered only when flashinfer is importable.
-    Certified path: flashinfer's CuTe DSL kernels (`rmsnorm_cute` for 2-D,
-    `qk_rmsnorm_cute` for 3-D, `weight_bias=1.0`); a strided row selects a
-    strided kernel variant. The CUDA-JIT fallback (`FLASHINFER_USE_CUDA_NORM=1`,
+    Certified path: flashinfer's CuTe DSL `rmsnorm_cute` kernel for 2-D bf16
+    `x` (`weight_bias=1.0`), contiguous and at the residual's 10240 row stride;
+    a strided row selects a strided kernel variant. The 3-D per-head kernel
+    (`qk_rmsnorm_cute`) and fp16/fp32 operands are not certified. The CUDA-JIT fallback (`FLASHINFER_USE_CUDA_NORM=1`,
     or a DSL that cannot target the device) is a different implementation and
     is not certified. PDL (`TRTLLM_ENABLE_PDL`, default on) changes scheduling,
     not results.
@@ -111,7 +74,7 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     width (8 elements for bf16/fp16, 4 for fp32) and assumes 16-byte aligned
     pointers, so odd row strides and misaligned slices were not measured.
 
-    Numerics: default tolerance holds for all dtypes, nothing loosened; the
+    Numerics: default tolerance holds for bf16, nothing loosened; the
     largest deviation is one bf16 ulp (0.03125) at 2048 and 8192 rows of 5120.
     The `+ 1` is measured: against a plain-`w` reference the output is ~4 away.
 

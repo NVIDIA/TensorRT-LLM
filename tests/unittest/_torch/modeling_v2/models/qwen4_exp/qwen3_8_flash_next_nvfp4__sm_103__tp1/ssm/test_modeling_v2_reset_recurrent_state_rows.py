@@ -50,7 +50,7 @@ def _build(spec, seed):
     """`__call__`'s arguments, plus the backing allocations a layout views."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     slots = spec["slots"]
-    rec_shape, conv_shape = spec.get("rec_shape", REC_SHAPE), spec.get("conv_shape", CONV_SHAPE)
+    rec_shape, conv_shape = REC_SHAPE, CONV_SHAPE
     rec_dtype = spec.get("rec_dtype", torch.float32)
     layout = spec.get("layout", "plain")
 
@@ -78,14 +78,8 @@ def _build(spec, seed):
         else:
             conv = randn(slots, *conv_shape, dtype=torch.bfloat16)
 
-    if spec["indices"] == "perm":
-        indices = torch.randperm(slots, generator=g, device=DEV).to(torch.int32)
-        flags = torch.rand(slots, generator=g, device=DEV) < 0.5
-    else:
-        indices = torch.tensor(
-            spec["indices"], dtype=spec.get("index_dtype", torch.int32), device=DEV
-        )
-        flags = torch.tensor(spec["flags"], dtype=spec.get("flag_dtype", torch.bool), device=DEV)
+    indices = torch.tensor(spec["indices"], dtype=spec.get("index_dtype", torch.int32), device=DEV)
+    flags = torch.tensor(spec["flags"], dtype=torch.bool, device=DEV)
     return [rec, indices, flags, conv], backing
 
 
@@ -117,10 +111,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         for name in backing:
             for other in (0, 2):
                 assert torch.equal(backing[name][other], before[name][other]), (name, other)
-    if spec["indices"] == "perm":
-        # The cell discriminates "reset slot s" from "reset row i".
-        by_position = {i for i, f in enumerate(flags.tolist()) if not f}
-        assert reset != by_position, "the permutation failed to separate the two readings"
 
 
 def test_the_following_kernel_sees_the_zeros() -> None:
@@ -138,42 +128,23 @@ def test_the_following_kernel_sees_the_zeros() -> None:
 @pytest.mark.parametrize(
     "case,message",
     [
-        ("empty_pool", "recurrent state pool must have at least one cache line"),
         ("slot_count_mismatch", "recurrent and convolution pools must have the same slot count"),
-        ("flag_shape_mismatch", "has_initial_states and state_indices must have matching shapes"),
         ("recurrent_rows_noncontiguous", "recurrent state rows must be contiguous"),
-        ("recurrent_rows_overlapping", "recurrent state rows must not overlap"),
-        ("conv_rows_noncontiguous", "convolution state rows must be contiguous"),
-        ("conv_rows_overlapping", "convolution state rows must not overlap"),
-        ("cpu_pool", "Pointer argument cannot be accessed from Triton"),
         ("cpu_indices", "Pointer argument cannot be accessed from Triton"),
     ],
 )
 def test_op_rejects_layout_violations_loudly(case: str, message: str) -> None:
-    """Why `is_valid` guards only the index tensors: the rest raises itself."""
+    """Why `is_valid` guards only the index tensors: the rest raises itself. One case
+    per family the callable checks: slot counts, row layout, device."""
     torch.manual_seed(6)
     rec = torch.randn(2, 4, dtype=torch.float32, device=DEV)
     conv = torch.randn(2, 4, dtype=torch.bfloat16, device=DEV)
     state_indices = torch.tensor([0], dtype=torch.int32, device=DEV)
     has_initial_states = torch.tensor([False], device=DEV)
-    if case == "empty_pool":
-        rec, conv = torch.empty(0, 4, dtype=torch.float32, device=DEV), None
-    elif case == "slot_count_mismatch":
+    if case == "slot_count_mismatch":
         conv = torch.randn(3, 4, dtype=torch.bfloat16, device=DEV)
-    elif case == "flag_shape_mismatch":
-        has_initial_states = torch.tensor([False, True], device=DEV)
     elif case == "recurrent_rows_noncontiguous":
         rec = torch.randn(2, 8, dtype=torch.float32, device=DEV)[:, ::2]
-    elif case == "recurrent_rows_overlapping":
-        rec = torch.as_strided(torch.randn(6, dtype=torch.float32, device=DEV), (2, 4), (2, 1))
-        conv = None
-    elif case == "conv_rows_noncontiguous":
-        conv = torch.randn(2, 8, dtype=torch.bfloat16, device=DEV)[:, ::2]
-    elif case == "conv_rows_overlapping":
-        conv = torch.as_strided(torch.randn(6, dtype=torch.bfloat16, device=DEV), (2, 4), (2, 1))
-    elif case == "cpu_pool":
-        rec, conv = rec.cpu(), None
-        state_indices, has_initial_states = state_indices.cpu(), has_initial_states.cpu()
     elif case == "cpu_indices":
         conv = None
         state_indices, has_initial_states = state_indices.cpu(), has_initial_states.cpu()
@@ -217,8 +188,9 @@ def test_guard_hazard_two_d_index_tensors() -> None:
         _compare(got, want)
 
 
-@pytest.mark.parametrize("which", ["state_indices", "has_initial_states"])
-@pytest.mark.parametrize("how", ["strided", "two_d"])
+@pytest.mark.parametrize(
+    "which,how", [("state_indices", "strided"), ("has_initial_states", "two_d")]
+)
 def test_guard_refuses_index_tensors_the_op_misreads(which: str, how: str) -> None:
     rec, conv = _pools()
     indices = torch.zeros(3, dtype=torch.int32, device=DEV)

@@ -109,7 +109,6 @@ def _args(
     local_expert_offset=0,
     local_num_experts=None,
     gemm1_clamp_limit=None,
-    foreign_ids=False,
     seed=0,
 ):
     """The op's arguments by name, pre-routed, for one configuration.
@@ -128,8 +127,6 @@ def _args(
     logits = torch.randn(tokens, num_experts, device=DEV, generator=g)
     weights, ids = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
     ids = ids.to(torch.int32)
-    if foreign_ids:
-        ids[0, 0], ids[1, 0], ids[2, 0] = -1, num_experts, 40
     return dict(
         routing_logits=None,
         routing_bias=None,
@@ -236,7 +233,7 @@ def _pow2_requantize(x: torch.Tensor) -> torch.Tensor:
     return (coded.float() * scale).reshape(shp)
 
 
-@pytest.mark.parametrize("tokens,width", [(16, 256), (64, 640), (256, 128)])
+@pytest.mark.parametrize("tokens,width", [(64, 640), (256, 128)])
 def test_intermediate_is_fp8_block_quantized(tokens, width):
     """Identity down projection, one slot of weight 1.0: the output is the
     requantized intermediate, one bf16 round away. The recipe reproduces

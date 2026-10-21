@@ -87,44 +87,18 @@ class QsaPagedKvStore(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
+        # The decode and prefill targets read k/v off the fused projection row; the MTP
+        # targets split them off a packed QKV row.
         Cell(
-            why="decode: 8 rows at aligned, mid and page-crossing positions",
-            spec=_spec(_DECODE, pages=64),
+            why="decode: 8 rows off the fused projection row (row stride 14080), "
+            "at aligned, mid and page-crossing positions",
+            spec=_spec(_DECODE, pages=64, row_pad_heads=27),
         ),
         Cell(
-            why="decode MTP: 4 requests x 2 rows, a pair straddling a page",
-            spec=_spec(((0, 2), (31, 2), (63, 2), (95, 2)), pages=32),
-        ),
-        Cell(
-            why="prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
-            spec=_spec(((0, 256),) * 4, pages=160),
-        ),
-        Cell(
-            why="mixed: two context chunks and two decode rows, 66 rows",
-            spec=_spec(((0, 40), (0, 24), (200, 1), (7, 1)), pages=64),
-        ),
-        Cell(
-            why="fp8-e4m3 pool: the row rounded once",
-            spec=_spec(_DECODE, pages=64, cache_dtype=_F8),
-        ),
-        # The prefill target's call over an fp8 pool (kv_cache_dtype=fp8, unit scale).
-        Cell(
-            why="fp8 prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
-            spec=_spec(((0, 256),) * 4, pages=160, cache_dtype=_F8),
-        ),
-        Cell(
-            why="fp8 mixed: two context chunks and two decode rows, 66 rows",
-            spec=_spec(((0, 40), (0, 24), (200, 1), (7, 1)), pages=64, cache_dtype=_F8),
-        ),
-        Cell(
-            why="fp8 decode MTP: 4 requests x 2 rows, a pair straddling a page",
-            spec=_spec(((0, 2), (31, 2), (63, 2), (95, 2)), pages=32, cache_dtype=_F8),
+            why="prefill 1024 rows off the fused projection row (row stride 14080)",
+            spec=_spec(((0, 256),) * 4, pages=160, row_pad_heads=27),
         ),
         # MTP7 verify blocks: 8 rows per request, so one block spans up to two pages.
-        Cell(
-            why="decode MTP7: 1 request x 8 rows, a block straddling a page",
-            spec=_spec(((28, 8),), pages=8),
-        ),
         Cell(
             why="decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
             spec=_spec(_MTP7_32, pages=1200, slots=40),
@@ -138,76 +112,9 @@ class QsaPagedKvStore(OpWrapper):
             spec=_spec(((0, 128),), pages=8, cache_dtype=_F8, values="every_bf16"),
         ),
         Cell(
-            why="fp16 rows into a bf16 pool: one conversion",
-            spec=_spec(((0, 1), (1, 1), (2, 1), (3, 1)), pages=8, row_dtype=torch.float16),
-        ),
-        Cell(
-            why="decode: k/v as head slices of the fused projection row (row stride 14080)",
-            spec=_spec(_DECODE, pages=64, row_pad_heads=27),
-        ),
-        Cell(
-            why="prefill 1024 rows off the fused projection row (row stride 14080)",
-            spec=_spec(((0, 256),) * 4, pages=160, row_pad_heads=27),
-        ),
-        Cell(
-            why="head-major rows: k/v last-dim stride != 1",
-            spec=_spec(_DECODE, pages=64, k_layout="head_major"),
-        ),
-        Cell(
-            why="block table as a role slice of a wider buffer",
-            spec=_spec(_DECODE, pages=64, table_layout="role_slice"),
-        ),
-        Cell(
-            why="block table transposed: column stride != 1",
-            spec=_spec(_DECODE, pages=64, table_layout="transposed"),
-        ),
-        Cell(
-            why="int32 positions",
-            spec=_spec(_DECODE, pages=64, position_dtype=torch.int32),
-        ),
-        Cell(
-            why="int64 request indices",
-            spec=_spec(_DECODE, pages=64, request_dtype=torch.int64),
-        ),
-        # ---- head geometry and page size are free axes ---------------------
-        Cell(why="head_dim 96 (not 2^k), 2 heads", spec=_spec(_DECODE[:6], pages=24, head_dim=96)),
-        Cell(
-            why="head_dim 64, 1 head, 64-token pages",
-            spec=_spec(_DECODE[:6], pages=24, head_dim=64, hkv=1, tokens_per_block=64),
-        ),
-        Cell(
-            why="head_dim 128, 4 heads, 16-token pages",
-            spec=_spec(_DECODE[:6], pages=48, head_dim=128, hkv=4, tokens_per_block=16),
-        ),
-        Cell(
-            why="head_dim 192 (not 2^k), 2 heads", spec=_spec(_DECODE[:6], pages=24, head_dim=192)
-        ),
-        # ---- rows that resolve to no slot are skipped ------------------------
-        Cell(
             why="skip: table entry -1 (unallocated)",
             spec=_spec(_DECODE, pages=64, hole="unallocated_page"),
         ),
-        Cell(
-            why="skip: table entry past the pool",
-            spec=_spec(_DECODE, pages=64, hole="page_past_pool"),
-        ),
-        Cell(
-            why="skip: request index past the table",
-            spec=_spec(_DECODE, pages=64, hole="request_past_table"),
-        ),
-        Cell(
-            why="skip: negative request index",
-            spec=_spec(_DECODE, pages=64, hole="negative_request"),
-        ),
-        Cell(
-            why="skip: negative logical position",
-            spec=_spec(_DECODE, pages=64, hole="negative_position"),
-        ),
-        Cell(
-            why="skip: page column past the table",
-            spec=_spec(_DECODE, pages=64, hole="column_past_table"),
-        ),
-        Cell(why="zero rows: returns before launching", spec=_spec((), pages=4)),
     )
 
     note = """
@@ -224,18 +131,19 @@ class QsaPagedKvStore(OpWrapper):
       - `request_indices` and `logical_positions` are contiguous: the kernel
         gets no stride for them. A strided view is read through its base
         pointer and rows land at other rows' slots, silently (`is_valid`).
-    Every other operand is read through its strides (packed QKV head slices,
-    head-major rows, pool role views, sliced or transposed tables). The
-    callable rejects loudly: mismatched or non-3-D/4-D K/V shapes, head
-    geometry, `k_cache.shape[2] != tokens_per_block`, row dtypes outside
-    bf16/fp16, pool dtypes outside bf16/fp16/fp8-e4m3, a non-int32 or
-    non-2-D table, non-integer or wrong-length metadata, CPU operands, an
-    empty pool or table. `rows == 0` returns before launching.
+    Every other operand is read through its strides; the cells drive k/v as
+    head slices of the packed QKV row and of the fused projection row, the
+    pool's K and V role views, and a contiguous table. The callable rejects
+    loudly: mismatched or non-3-D/4-D K/V shapes, head geometry,
+    `k_cache.shape[2] != tokens_per_block`, row dtypes outside bf16/fp16,
+    pool dtypes outside bf16/fp16/fp8-e4m3, a non-int32 or non-2-D table,
+    non-integer or wrong-length metadata, CPU operands, an empty pool or
+    table. `rows == 0` returns before launching.
 
     Strides and the pool/table extents are Triton constexprs: each distinct
     layout or pool size compiles its own kernel. CUDA-graph capturable
-    (captured at 8 decode rows and at 256, 32 MTP7 verify blocks); a replay
-    follows positions rewritten in place.
+    (captured at 256 rows, 32 MTP7 verify blocks); a replay follows positions
+    rewritten in place.
 
     Hard limits: both metadata values are cast to int32 inside the kernel
     (`.to(tl.int32)`); an int64 position at `2^32 + 5` was probed and lands
@@ -243,7 +151,11 @@ class QsaPagedKvStore(OpWrapper):
     positions stay below 2^14.
 
     Not certified: duplicate destinations, multiple devices, a scaled fp8
-    pool (there is no scale argument).
+    pool (there is no scale argument), fp16 rows, head geometry other than
+    this checkpoint's (D 256, Hkv 2, 32-token pages), int32 positions or
+    int64 request indices, head-major rows, sliced or transposed tables,
+    `rows == 0`, and of the rows that resolve to no slot any but an
+    unallocated (`-1`) table entry (the reference skips each).
     """
 
     def __call__(

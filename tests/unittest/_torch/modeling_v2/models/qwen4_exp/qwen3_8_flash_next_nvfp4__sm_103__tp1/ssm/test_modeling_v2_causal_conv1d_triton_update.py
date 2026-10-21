@@ -205,25 +205,20 @@ def test_a_short_pool_writes_into_the_next_slot_and_is_refused() -> None:
 
 
 @pytest.mark.parametrize(
-    "case,overrides,match",
+    "case,match",
     [
-        ("narrow_pool", None, "must cover all 512 channels"),
-        ("short_weight", None, "must cover all 512 channels"),
-        ("short_snapshot_buffer", None, "intermediate_conv_window must be at least"),
-        # The accepted-token form needs W-1 + (seqlen-1) = 4 columns at seqlen 2.
-        ("accepted_needs_a_longer_pool", dict(accepted=(1, 1)), "must hold at least 4 columns"),
+        # The pool-width guard; the weight shares it.
+        ("narrow_pool", "must cover all 512 channels"),
+        ("short_snapshot_buffer", "intermediate_conv_window must be at least"),
     ],
 )
-def test_guard_refuses_undersized_buffers(case, overrides, match) -> None:
+def test_guard_refuses_undersized_buffers(case, match) -> None:
     """Accepted by the kernel and read or written out of bounds (measured);
     refused by the guard before the launch."""
     spec = dict(dim=512, batch=2, pool_slots=8, slots=(0, 2), snapshots=2)
-    spec.update(overrides or {})
     args = _build(spec, seed=15)
     if case == "narrow_pool":
         args[1] = torch.randn(8, 256, 3, dtype=torch.bfloat16, device="cuda")
-    elif case == "short_weight":
-        args[2] = torch.randn(256, 4, dtype=torch.bfloat16, device="cuda")
     elif case == "short_snapshot_buffer":
         args[8] = torch.zeros(2, 1, 512, 3, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(AssertionError, match=match):

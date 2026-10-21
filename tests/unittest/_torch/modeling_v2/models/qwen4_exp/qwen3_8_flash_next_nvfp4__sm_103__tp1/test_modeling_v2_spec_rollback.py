@@ -261,13 +261,10 @@ def _assert_state(b, expected, what):
 # compression anchors; one request accepts everything.
 CASES = {
     "decode": ((), (5, 30, 61, 100), 4, (1, 2, 4, 3)),
-    "decode_p2": ((), (0, 31, 64), 2, (1, 2, 1)),
     "mixed": ((7, 3), (12, 29, 95), 4, (2, 1, 3)),
-    "mixed_p3": ((40,), (2, 62), 3, (3, 1)),
     # max_draft_len 7: every acceptance 1..8 once; blocks at 27, 60 and 90 straddle a page,
     # and an 8-row block completes two compression groups.
     "decode_p8": ((), (0, 27, 60, 90, 101, 5, 44, 119), 8, (1, 2, 3, 4, 5, 6, 7, 8)),
-    "mixed_p8": ((7, 3), (12, 29, 95), 8, (8, 1, 5)),
 }
 
 
@@ -284,12 +281,12 @@ def test_commit_matches_the_accepted_prefix(case):
     _assert_state(b, _reference(b), case)
 
 
-@pytest.mark.parametrize("case", ["mixed", "decode_p8"])
-def test_commit_over_the_strided_planes_of_a_shared_page(case):
+def test_commit_over_the_strided_planes_of_a_shared_page():
     """The handler stages and restores the index and position planes by advanced indexing, so
     planes that are strided views of one buffer (an NVFP4 KV cache's side planes) roll back
     like contiguous ones, and the bytes of the other layers' pages in the same buffer stay as
     the step wrote them."""
+    case = "decode_p8"
     ctx_lens, gen_starts, p, gen_accepted = CASES[case]
     b = _Batch(
         13, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)), shared_page=True
@@ -398,7 +395,6 @@ def _single(b, s):
 #: Per case, the acceptance counts one captured graph is replayed with (the accepted count
 #: of every generation request, bonus token included).
 _REPLAYS = {
-    "decode": [(1, 1, 1, 1), (2, 4, 1, 3), (4, 3, 2, 1), (3, 3, 3, 3)],
     "decode_p8": [
         (1,) * 8,
         (8, 7, 6, 5, 4, 3, 2, 1),

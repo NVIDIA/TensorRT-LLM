@@ -6,8 +6,9 @@ Cells against the entry's reference (a stable descending sort, ties to the highe
 then the expansion entry's reference): the block list and the token selection exactly.
 Columns past each row's visible count carry garbage (huge values, NaN) that must never
 be read. Beyond the cells: bitwise the composition it replaces (`qsa_topk_select`, then
-`qsa_canonical_selection`, then `qsa_expand_block_indices`) on tie-free and tie-heavy rows;
-a stale-read check under graph replay; one compiled kernel for every row count.
+`qsa_canonical_selection`, then `qsa_expand_block_indices`, each certified on its own) on
+one representative decode batch and one context chunk; a stale-read check under graph
+replay; one compiled kernel for every row count.
 """
 
 import zlib
@@ -49,14 +50,6 @@ def _build(spec, seed):
         scores = torch.round(scores * 2.0) / 2.0  # few distinct values: ties at the threshold
     if spec.get("narrow"):
         scores = 1.0 + 0.05 * torch.rand(rows, W, generator=g, device=DEV)
-    if spec.get("const"):
-        scores = torch.full((rows, W), 0.75, device=DEV)
-    if spec.get("tied"):
-        # the 400 best distinct, then `tied` equal ones straddling the k-th place
-        scores = torch.rand(rows, W, generator=g, device=DEV)
-        best = torch.randperm(W // 4, generator=g, device=DEV)
-        scores[:, best[:400]] = 2.0 + torch.rand(rows, 400, generator=g, device=DEV)
-        scores[:, best[400 : 400 + spec["tied"]]] = 1.5
     ends = ((pos + 1) // CR).to(torch.int32)
     for r in range(rows):  # garbage past the visible blocks
         n = int(ends[r])
@@ -79,29 +72,21 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert torch.equal(sel, want_sel.to(torch.int32)), "token selection"
 
 
-def _rows(kind: str, rows: int, seed: int) -> torch.Tensor:
-    """Score rows the canonical rewrite exists for: tie-free, relu-sparse (fewer positive
-    scores than the budget, so the zero class straddles it), two-valued and all-equal."""
+def _relu_sparse_rows(rows: int, seed: int) -> torch.Tensor:
+    """Score rows the canonical rewrite exists for: relu-sparse, so fewer positive scores
+    than the budget and the zero class (negative zeros among it) straddles it."""
     g = torch.Generator(device=DEV).manual_seed(seed)
-    if kind == "tie_free":
-        return torch.rand(rows, W, generator=g, device=DEV) + 0.5
-    if kind == "relu_sparse":
-        scores = torch.relu(torch.randn(rows, W, generator=g, device=DEV) - 2.2)
-        scores[:, ::7] = -0.0  # negative zero ties with zero
-        return scores
-    if kind == "two_valued":
-        return torch.where(torch.rand(rows, W, generator=g, device=DEV) < 0.3, 2.0, 1.0)
-    assert kind == "all_equal"
-    return torch.full((rows, W), 0.75, device=DEV)
+    scores = torch.relu(torch.randn(rows, W, generator=g, device=DEV) - 2.2)
+    scores[:, ::7] = -0.0  # negative zero ties with zero
+    return scores
 
 
-@pytest.mark.parametrize("kind", ["tie_free", "relu_sparse", "two_valued", "all_equal"])
-def test_bitwise_the_canonical_composition(kind) -> None:
+def test_bitwise_the_canonical_composition() -> None:
     """Windows across the budget (below it, at it, past it, the whole table); the block
     list equals `qsa_topk_select` + `qsa_canonical_selection` and the token selection that
     list's expansion, bitwise."""
     rows = 64
-    scores = _rows(kind, rows, seed=zlib.crc32(kind.encode()) % 2**31)
+    scores = _relu_sparse_rows(rows, seed=zlib.crc32(b"relu_sparse") % 2**31)
     g = torch.Generator(device=DEV).manual_seed(5)
     pos = torch.randint(0, CR * W, (rows,), generator=g, device=DEV, dtype=torch.int64)
     pos[:6] = torch.tensor([0, 4 * K - 1, 4 * K, 4 * K + 3, 8700, CR * W - 1], device=DEV)
@@ -118,13 +103,12 @@ def test_bitwise_the_canonical_composition(kind) -> None:
     assert torch.equal(sel, want_sel.to(torch.int32)), "token selection"
 
 
-@pytest.mark.parametrize("kind", ["tie_free", "relu_sparse"])
-def test_a_context_chunk_into_a_row_range_of_the_selection(kind) -> None:
+def test_a_context_chunk_into_a_row_range_of_the_selection() -> None:
     """A context chunk's 2048 consecutive rows (one request, positions 6144..8191), written
     through `out` into rows [64, 2112) of a step-sized selection: the block list and those
     rows equal the canonical composition bitwise; the rows around them are untouched."""
     rows = 2048
-    scores = _rows(kind, rows, seed=31)
+    scores = _relu_sparse_rows(rows, seed=31)
     pos = torch.arange(6144, 6144 + rows, device=DEV, dtype=torch.int64)
     ends = ((pos + 1) // CR).to(torch.int32)
     seqlen = torch.full((rows,), 6144 + rows, dtype=torch.int32, device=DEV)

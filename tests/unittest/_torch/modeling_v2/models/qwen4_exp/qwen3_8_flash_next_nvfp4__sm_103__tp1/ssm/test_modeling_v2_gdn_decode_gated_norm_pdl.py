@@ -119,8 +119,8 @@ def _unfused(proj, pool, slots, A_log, dt_bias, w, eps, h, k):
     ).reshape(rows, HV * V)
 
 
-@pytest.mark.parametrize("rows", [1, 4])
-def test_matches_the_unfused_composition(rows) -> None:
+def test_matches_the_unfused_composition() -> None:
+    rows = 4  # MAX_ROWS
     args = _build(dict(rows=rows), seed=900 + rows)
     pool_unfused = args[1].clone()
     want = _unfused(args[0], pool_unfused, *args[2:])

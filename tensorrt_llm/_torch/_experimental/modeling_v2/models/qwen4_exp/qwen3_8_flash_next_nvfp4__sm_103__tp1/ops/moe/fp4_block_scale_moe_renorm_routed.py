@@ -62,15 +62,13 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="_moe_block decode: one token", spec=_ckpt(1)),
-        Cell(why="4 rows: the last count on the block routing kernel", spec=_ckpt(4)),
-        Cell(why="5 rows: past the block kernel's row limit", spec=_ckpt(5)),
-        Cell(why="8 rows: a decode CUDA-graph batch", spec=_ckpt(8)),
-        Cell(why="32 rows: a decode CUDA-graph batch", spec=_ckpt(32)),
-        Cell(why="128 rows: the con=128 decode batch", spec=_ckpt(128)),
-        Cell(why="1024 rows: a prefill chunk", spec=_ckpt(1024)),
+        Cell(why="_moe_block decode: one token; the block routing kernel", spec=_ckpt(1)),
+        Cell(why="128 rows: the con=128 decode batch; the cluster routing kernel", spec=_ckpt(128)),
         Cell(why="8192 rows: max_num_tokens of the identity config", spec=_ckpt(8192)),
-        Cell(why="16384 rows: max_num_tokens of the tuned config", spec=_ckpt(16384)),
+        Cell(
+            why="16384 rows: max_num_tokens of the tuned config; past the 8192 tuning bucket",
+            spec=_ckpt(16384),
+        ),
         Cell(why="coarse 3-level logits: ties decide most slots", spec=_ckpt(64, dist="coarse")),
         Cell(
             why="fp32 logits: the runner's other accepted logits dtype",

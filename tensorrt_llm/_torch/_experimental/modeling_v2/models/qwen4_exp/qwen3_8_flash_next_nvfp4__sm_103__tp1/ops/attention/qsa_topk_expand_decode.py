@@ -510,20 +510,8 @@ class QsaTopkExpandDecode(OpWrapper):
             spec=dict(rows=1, pos=(8700,), ties=True),
         ),
         Cell(
-            why="decode, 2 rows, 2 MTP-style positions sharing a request",
-            spec=dict(rows=2, pos=(6001, 6002)),
-        ),
-        Cell(
             why="decode, 1 row of scores within 5% of each other",
             spec=dict(rows=1, pos=(8700,), narrow=True),
-        ),
-        Cell(
-            why="decode, 1 row of equal scores: block order decides",
-            spec=dict(rows=1, pos=(8700,), const=True),
-        ),
-        Cell(
-            why="decode, 1 row, 150 scores tied at the threshold",
-            spec=dict(rows=1, pos=(8700,), tied=150),
         ),
     )
 

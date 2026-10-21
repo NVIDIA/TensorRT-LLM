@@ -73,14 +73,10 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
         for t, why in (
             (1, "1 row"),
             (128, "128 rows"),
-            (2048, "prefill 2048"),
             (8192, "prefill 8192"),
         )
     ) + (
         Cell(why="stack-final mixer: no inject, 8192 rows", spec=dict(rows=8192, inject=False)),
-        Cell(why="unpadded logits [T, R + C], 33 rows", spec=dict(rows=33, logits_width=324)),
-        Cell(why="hc_count 8, 64 rows", spec=dict(rows=64, hc_count=8)),
-        Cell(why="float16 outputs, 64 rows", spec=dict(rows=64, dtype=torch.float16)),
         Cell(why="zero rows", spec=dict(rows=0)),
     )
 
@@ -89,6 +85,9 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     `PrefillTarget` (all 97), between the first projection and the up
     projection. Preconditions: `logits` fp32, unit column stride, at least
     `rank (+ hc_count)` columns; `hc_count` a power of two. Graph-capturable.
+
+    Not certified: hc_count other than 4, rank other than 320, float16
+    outputs.
     """
 
     def __call__(

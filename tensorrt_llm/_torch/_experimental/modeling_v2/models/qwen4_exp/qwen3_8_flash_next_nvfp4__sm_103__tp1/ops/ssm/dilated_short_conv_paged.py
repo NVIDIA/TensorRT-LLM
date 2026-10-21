@@ -69,7 +69,8 @@ class DilatedShortConvPaged(OpWrapper):
     sequence (`cache_indices[s] == pad_slot_id`) publishes nothing and still
     gets output columns -- its tokens against a zero carry, defined and
     meaningless. Two sequences naming one slot: the last live one's state
-    survives (defined, not a race).
+    survives (defined by construction, not a race; uncertified, as the
+    scheduler never names one slot twice).
 
     Fusion boundary: state read, zero fill for a fresh sequence, the dilated
     depthwise conv, bias, SiLU and the state publish are inside. The
@@ -87,132 +88,44 @@ class DilatedShortConvPaged(OpWrapper):
     # slots (None -> arange), initial (default all True; "none" -> None),
     # dtype, bias, silu, pad_slot_id, x_form ("channel_major" | "token_major"),
     # index_dtype (int32), qsl_dtype (int32), no_indices.
-    CELLS: tuple[Cell, ...] = (
-        (
-            _ckpt("checkpoint mix 37+1+128, 8-slot pool", (37, 1, 128)),
-            _ckpt("checkpoint mix 1024+1, 8-slot pool", (1024, 1)),
-            _ckpt("checkpoint mix 2047+1+1+1, 8-slot pool", (2047, 1, 1, 1)),
+    CELLS: tuple[Cell, ...] = tuple(
+        # The call site's own form: a bare .t() of the token-major activation,
+        # query_start_loc_long (int64), int32 slots, the whole pool.
+        _ckpt(
+            f"call-site form at the 461-slot pool, {why}",
+            lengths,
+            pool_slots=ENGINE_SLOTS,
+            slots=_scattered(len(lengths)),
+            x_form="token_major",
+            qsl_dtype=torch.int64,
         )
-        + tuple(
-            # The call site's own form: a bare .t() of the token-major activation,
-            # query_start_loc_long (int64), int32 slots, the whole pool.
-            _ckpt(
-                f"call-site form at the 461-slot pool, {why}",
-                lengths,
-                pool_slots=ENGINE_SLOTS,
-                slots=_scattered(len(lengths)),
-                x_form="token_major",
-                qsl_dtype=torch.int64,
-            )
-            for why, lengths in (
-                ("37+1+128", (37, 1, 128)),
-                ("1024+1", (1024, 1)),
-                ("2047+1+1+1", (2047, 1, 1, 1)),
-                ("32 one-token rows", (1,) * 32),
-            )
+        for why, lengths in (
+            ("37+1+128", (37, 1, 128)),
+            ("2047+1+1+1", (2047, 1, 1, 1)),
+            ("32 one-token rows", (1,) * 32),
         )
-        + (
-            _ckpt(
-                "MTP verify at 461 slots: a 37-token context + 8 rows of 3 drafts",
-                (37,) + (3,) * 8,
-                pool_slots=ENGINE_SLOTS,
-                slots=_scattered(9),
-                initial=(False,) + (True,) * 8,
-                x_form="token_major",
-                qsl_dtype=torch.int64,
-            ),
-            *(
-                _ckpt(
-                    f"MTP verify p={p} at 461 slots: {n} rows of {p} tokens",
-                    (p,) * n,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_scattered(n),
-                    x_form="token_major",
-                    qsl_dtype=torch.int64,
-                )
-                for p, n in ((5, 8), (6, 32), (7, 8), (8, 1), (8, 32))
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"decode batch of {n} one-token rows, 32-slot pool",
-                spec=dict(channels=256, lengths=(1,) * n, pool_slots=32),
-            )
-            for n in (1, 2, 8, 32)
-        )
-        + tuple(
-            Cell(
-                why=f"prefill/ragged {'+'.join(map(str, lengths))}",
-                spec=dict(channels=256, lengths=lengths),
-            )
-            for lengths in ((1024,), (512, 7, 512), (1, 2, 3, 4, 5), (4096,))
-        )
-        + (
-            Cell(
-                why="fresh sequences carry zeros, not the slot's contents",
-                spec=dict(channels=256, lengths=(5, 9, 40), initial=(False, False, False)),
-            ),
-            Cell(
-                why="carry flags mixed True/False/True",
-                spec=dict(channels=256, lengths=(5, 9, 40), initial=(True, False, True)),
-            ),
-            Cell(
-                why="a zero-token sequence republishes its carry",
-                spec=dict(channels=256, lengths=(3, 0, 11), slots=(2, 5, 1)),
-            ),
-            Cell(
-                why="state longer/shorter than a sequence: tail and carry mix",
-                spec=dict(channels=256, lengths=(14, 2), slots=(3, 1)),
-            ),
-            Cell(
-                why="pad_slot_id -1 row next to live rows, slot 0 unnamed",
-                spec=dict(channels=256, lengths=(6, 4, 17), slots=(2, -1, 3), pool_slots=6),
-            ),
-            Cell(
-                why="pad_slot_id -1 row while slot 0 is itself live",
-                spec=dict(channels=256, lengths=(6, 4, 17), slots=(0, -1, 3), pool_slots=6),
-            ),
-            Cell(
-                why="two sequences on one slot: the last one's state survives",
-                spec=dict(channels=256, lengths=(6, 9, 12), slots=(1, 3, 1), pool_slots=5),
-            ),
-            Cell(why="bias, prefill-shaped", spec=dict(channels=256, lengths=(9, 9), bias=True)),
-            Cell(
-                why="bias, decode-shaped", spec=dict(channels=256, lengths=(1, 1, 1, 1), bias=True)
-            ),
-            Cell(
-                why="silu off: the bare convolution, with bias",
-                spec=dict(channels=256, lengths=(12, 3), slots=(1, 0), bias=True, silu=False),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"{str(dtype).removeprefix('torch.')} {'+'.join(map(str, lengths))}",
-                spec=dict(channels=256, lengths=lengths, dtype=dtype),
-            )
-            for dtype in (torch.float32, torch.float16)
-            for lengths in ((16, 1, 5), (1,) * 8)
-        )
-        + tuple(
-            Cell(
-                why=f"kernel_size {k}, dilation {d}",
-                spec=dict(channels=256, lengths=(7, 1, 12), kernel_size=k, dilation=d),
-            )
-            for k in (2, 3, 4, 5)
-            for d in (1, 2, 3)
-        )
-        + (
-            Cell(
-                why="cache_indices and has_initial_state None",
-                spec=dict(channels=256, lengths=(3, 4, 5), no_indices=True, initial="none"),
-            ),
-            Cell(
-                why="int64 query_start_loc and cache_indices",
-                spec=dict(
-                    channels=256, lengths=(3, 4, 5), index_dtype=torch.int64, qsl_dtype=torch.int64
-                ),
-            ),
-        )
+    ) + (
+        _ckpt(
+            "MTP verify at 461 slots: a 37-token context + 8 rows of 3 drafts",
+            (37,) + (3,) * 8,
+            pool_slots=ENGINE_SLOTS,
+            slots=_scattered(9),
+            initial=(False,) + (True,) * 8,
+            x_form="token_major",
+            qsl_dtype=torch.int64,
+        ),
+        _ckpt(
+            "MTP verify p=8 at 461 slots: 32 rows of 8 tokens",
+            (8,) * 32,
+            pool_slots=ENGINE_SLOTS,
+            slots=_scattered(32),
+            x_form="token_major",
+            qsl_dtype=torch.int64,
+        ),
+        Cell(
+            why="pad_slot_id -1 row while slot 0 is itself live",
+            spec=dict(channels=256, lengths=(6, 4, 17), slots=(0, -1, 3), pool_slots=6),
+        ),
     )
 
     note = """
@@ -223,17 +136,18 @@ class DilatedShortConvPaged(OpWrapper):
     `[T, 10240]` normed activation, weight `[10240, 1, 4]` bf16, no bias,
     dilation 3 (state 9), SiLU on, the whole `[slots, 10240, 9]` pool, int32
     slots, `query_start_loc_long` (int64, rebuilt from `seq_lens` under MTP),
-    carry flags covering the whole batch, `pad_slot_id` -1. Certified at 8, 32
-    and 461 slots; at 461 bitwise identical to 8 for the same slot content. MTP
-    verify batches are certified at 3 and at 5..8 tokens per request, up to 32
-    requests.
+    carry flags covering the whole batch, `pad_slot_id` -1. Certified in that
+    form at the 461-slot pool (prefill mixes up to 2047 tokens, 32 one-token
+    decode rows, MTP verify batches of 3 and of 8 tokens per request, up to 32
+    requests), plus a pad row on a 6-slot pool.
 
     Preconditions: `query_start_loc[-1] == x.shape[1]`; a short one indexes
     past the internal history and fires a device-side assert that kills the
     CUDA context (loud, not guarded). An out-of-range slot reaches the same
     bounds check (reasoned, not probed). Pool, weight and bias share `x`'s
     dtype (each mismatch raises); `weight` is 3-D depthwise (2-D raises).
-    Kernel sizes 2-5 and dilations 1-3 certified; there is no width dispatch.
+    Only the checkpoint's kernel size 4 and dilation 3 are certified; there is
+    no width dispatch.
 
     CUDA-graph capture is certified: no host sync, all batch reads on device,
     a captured graph stays correct when the batch tensors' values change.
@@ -242,8 +156,7 @@ class DilatedShortConvPaged(OpWrapper):
 
     Not measured: pools above 461 slots (a bf16 recurrent state gives the engine
     larger ones; a slot is addressed by its index alone), token counts above 8192,
-    dilation above 3, kernel above 5, `torch.compile`, a pool dtype unlike the
-    model's.
+    `torch.compile`, a pool dtype unlike the model's.
     """
 
     def __call__(

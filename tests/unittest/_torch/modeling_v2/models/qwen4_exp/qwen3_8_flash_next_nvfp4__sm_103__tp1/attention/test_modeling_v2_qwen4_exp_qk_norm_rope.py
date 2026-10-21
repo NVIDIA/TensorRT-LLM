@@ -162,8 +162,7 @@ def _current_pair(proj, scratch, kwargs, index_k_weight):
     return proj, scratch[:, : spec["index_heads"]]
 
 
-@pytest.mark.parametrize("tokens", [1, 19, 128])
-@pytest.mark.parametrize("rows", ["distinct", "text"])
+@pytest.mark.parametrize("tokens, rows", [(1, "distinct"), (128, "text")])
 def test_matches_the_cuda_pair_it_replaces(tokens: int, rows: str) -> None:
     """Same wiring as the two CUDA calls: mRoPE sections (11, 10) on the main
     plane, coordinate 0 alone on the index plane, q/k weight assignment. Both
@@ -290,8 +289,7 @@ def _bitwise(a, b) -> bool:
     return torch.equal(a.view(torch.int16), b.view(torch.int16))
 
 
-@pytest.mark.parametrize("tokens", [1024, 2048, 8193, 16384])
-@pytest.mark.parametrize("rows", ["distinct", "text"])
+@pytest.mark.parametrize("tokens, rows", [(1024, "distinct"), (8193, "text"), (16384, "distinct")])
 def test_cute_kernel_is_the_triton_kernel_bitwise(tokens: int, rows: str) -> None:
     """From `_CUTE_MIN_TOKENS` tokens the op runs the CuTe kernel: every output bit (both
     planes, the untouched columns and scratch heads included) is the Triton kernel's."""

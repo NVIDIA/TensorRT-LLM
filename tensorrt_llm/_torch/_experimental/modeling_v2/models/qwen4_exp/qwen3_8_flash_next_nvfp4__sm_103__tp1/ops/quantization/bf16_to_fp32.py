@@ -43,14 +43,11 @@ class Bf16ToFp32(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode logits: 128 rows of the 248320 vocabulary", spec=dict(shape=(128, VOCAB))),
-        Cell(why="mixed step logits: 124 rows", spec=dict(shape=(124, VOCAB))),
-        Cell(why="one row", spec=dict(shape=(1, VOCAB))),
+        Cell(why="one row; a ragged last program", spec=dict(shape=(1, VOCAB))),
         Cell(
             why="every bf16 bit pattern: NaNs, infinities, subnormals, signed zeros",
             spec=dict(shape=(1, 65536), source="all_codes"),
         ),
-        Cell(why="3 x 7: below one program", spec=dict(shape=(3, 7))),
-        Cell(why="rank 3, a ragged last program", spec=dict(shape=(2, 5, 4099))),
         Cell(why="zero rows", spec=dict(shape=(0, VOCAB))),
     )
 

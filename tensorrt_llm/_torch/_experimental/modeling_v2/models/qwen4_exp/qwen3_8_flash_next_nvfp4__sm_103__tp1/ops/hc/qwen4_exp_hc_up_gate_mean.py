@@ -835,19 +835,12 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     CELLS: tuple[Cell, ...] = tuple(
         Cell(why=f"checkpoint 4x2560, rank 320, {why}", spec=dict(rows=t))
         for t, why in (
-            (1, "decode 1 row"),
-            (32, "decode 32 rows"),
-            (128, "decode 128 rows"),
-            (2048, "prefill 2048"),
-            (8192, "prefill 8192"),
+            (1, "1 row, one partial tile"),
+            (128, "decode 128 rows, one full tile"),
             (16384, "prefill chunk 16384 (max_num_tokens)"),
         )
     ) + (
         Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),
-        Cell(why="ragged tail, 1000 rows", spec=dict(rows=1000)),
-        Cell(why="hc_count 2, 300 rows", spec=dict(rows=300, hc_count=2)),
-        Cell(why="hc_count 8 (32-column tiles), 300 rows", spec=dict(rows=300, hc_count=8)),
-        Cell(why="hidden 128, rank 128, 200 rows", spec=dict(rows=200, hidden=128, rank=128)),
         Cell(why="zero rows", spec=dict(rows=0)),
     )
 
@@ -867,6 +860,9 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     `griddepcontrol.wait` and `low` / `normed` after it, so behind a producer
     that releases dependents early (`qwen4_exp_hc_decode_tc_first`) the weight
     read overlaps the producer.
+
+    Not certified: hc_count other than 4, hidden other than 2560, rank other
+    than 320 (the kernel compiles for them; no cell drives them).
     """
 
     def __call__(

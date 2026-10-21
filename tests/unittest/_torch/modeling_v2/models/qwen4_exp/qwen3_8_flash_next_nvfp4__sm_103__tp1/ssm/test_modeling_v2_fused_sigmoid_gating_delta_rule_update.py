@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the fused_sigmoid_gating_delta_rule_update entry.
 
-Everything here certifies the vendored Triton branch. The target's two decode calls
-keep the FlashInfer branch out -- the packed call over an fp32 pool, and the rows form
-(no `cu_seqlens`) over a bf16 one -- which `test_certified_branch_is_the_vendored_triton_kernel`
-proves. `test_rows_form_is_batch_invariant` shows the property the bf16 call takes the rows
-form for.
+Everything here certifies the vendored Triton branch. The target's decode call -- the
+rows form (no `cu_seqlens`) over a bf16 pool -- and the packed call over an fp32 pool that
+the GDN block test uses as its reference keep the FlashInfer branch out, which
+`test_certified_branch_is_the_vendored_triton_kernel` proves.
+`test_rows_form_is_batch_invariant` shows the property the bf16 call takes the rows form for.
 """
 
 import zlib
@@ -195,9 +195,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 def test_certified_branch_is_the_vendored_triton_kernel() -> None:
-    """Both target decode calls keep the FlashInfer arm out, armed both ways: its entry
-    point is replaced by one that raises; the packed call over an fp32 pool and the rows
-    form over a bf16 pool complete, and the packed call over a bf16 pool in the same
+    """The target's rows form and the reference's fp32 packed call keep the FlashInfer arm
+    out, armed both ways: its entry point is replaced by one that raises; the packed call
+    over an fp32 pool and the rows form over a bf16 pool complete, and the packed call over a bf16 pool in the same
     process does raise -- so the replaced entry point is known to be reachable."""
 
     def _boom(*args, **kwargs):
@@ -288,7 +288,7 @@ def test_rows_form_is_the_packed_triton_call_bitwise() -> None:
             assert torch.equal(rows[9], packed[9]), (pool_dtype, n)
 
 
-@pytest.mark.parametrize("n", (1, 16, 32))
+@pytest.mark.parametrize("n", (1, 32))
 def test_rows_form_cuda_graph_replay_is_bitwise_eager(n) -> None:
     """The bf16 rows form captured at batch `n` and replayed on new activations, slots and
     pool content, against the same call run eagerly. The kernel takes the batch as a

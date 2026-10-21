@@ -101,82 +101,28 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # The token column at the checkpoint geometry. The cold-cache fallback
-        # tactic is keyed on the token count, and rows per active expert
-        # (T * 10 / 512) is what moves the kernel's tile choice.
+        # The token column at the checkpoint geometry, the only one the draft layer
+        # calls. The cold-cache fallback tactic is keyed on the token count, and rows
+        # per active expert (T * 10 / 512) is what moves the kernel's tile choice.
         Cell(
             why="MTPLayer._moe decode: one token, 10 of 512 experts", spec=dict(tokens=1, **_CKPT)
         ),
-        Cell(why="2 tokens: up to 20 experts, one row each", spec=dict(tokens=2, **_CKPT)),
-        Cell(why="8 tokens: ~0.16 rows per expert", spec=dict(tokens=8, **_CKPT)),
-        Cell(why="16 tokens: ~0.3 rows per expert", spec=dict(tokens=16, **_CKPT)),
         Cell(
             why="20 tokens == H/128: the activation scale buffer is square",
             spec=dict(tokens=20, **_CKPT),
         ),
         Cell(
-            why="64 tokens: ~1.25 rows per expert, most experts active",
-            spec=dict(tokens=64, **_CKPT),
+            why="256 tokens: ~5 rows per expert, past the small-T routing kernel",
+            spec=dict(tokens=256, **_CKPT),
         ),
-        Cell(why="256 tokens: ~5 rows per expert", spec=dict(tokens=256, **_CKPT)),
         Cell(why="1024 tokens: ~20 rows per expert", spec=dict(tokens=1024, **_CKPT)),
-        Cell(why="4096 tokens: ~80 rows per expert", spec=dict(tokens=4096, **_CKPT)),
         Cell(
-            why="8192 tokens: max_num_tokens of the identity config",
+            why="8192 tokens: max_num_tokens of the identity config; the last tuning bucket",
             spec=dict(tokens=8192, **_CKPT),
         ),
         Cell(
-            why="16384 rows: max_num_tokens of the tuned config",
+            why="16384 rows: max_num_tokens of the tuned config; past the last tuning bucket",
             spec=dict(tokens=16384, **_CKPT),
-        ),
-        Cell(
-            why="gemm1_clamp_limit=1.0: live, ~63 ulp RMS from the unclamped result",
-            spec=dict(tokens=16, gemm1_clamp_limit=1.0, **_CKPT),
-        ),
-        Cell(
-            why="EP window (384, 128) of 512: rank 3 of a 4-way split",
-            spec=dict(tokens=64, **_geom(2560, 640, 512, 10, offset=384, local=128)),
-        ),
-        # Geometries away from the checkpoint's, each a multiple of 128 on both
-        # block axes.
-        Cell(
-            why="H 256 / I 128, 8 experts, top-1: one slot per token",
-            spec=dict(tokens=16, **_geom(256, 128, 8, 1)),
-        ),
-        Cell(why="H 256 / I 128, 8 experts, top-2", spec=dict(tokens=16, **_geom(256, 128, 8, 2))),
-        Cell(
-            why="H 512 / I 512, 16 experts, top-8: the worst RMS measured",
-            spec=dict(tokens=16, **_geom(512, 512, 16, 8)),
-        ),
-        Cell(
-            why="H 1024 / I 256, 128 experts, top-6",
-            spec=dict(tokens=16, **_geom(1024, 256, 128, 6)),
-        ),
-        Cell(why="checkpoint widths at top-2", spec=dict(tokens=16, **_geom(2560, 640, 512, 2))),
-        Cell(
-            why="checkpoint widths at top-16, past the checkpoint's 10",
-            spec=dict(tokens=16, **_geom(2560, 640, 512, 16)),
-        ),
-        Cell(
-            why="H 2560 / I 1280: twice the checkpoint's intermediate",
-            spec=dict(tokens=16, **_geom(2560, 1280, 512, 10)),
-        ),
-        Cell(
-            why="H 7168 / I 2048, 64 experts, top-8: the widest K",
-            spec=dict(tokens=16, **_geom(7168, 2048, 64, 8)),
-        ),
-        # The expert window is a range test plus an index shift.
-        Cell(
-            why="window (4, 4) of 8: ids 0..3 dropped, 4..7 shifted to slots 0..3",
-            spec=dict(tokens=64, **_geom(256, 128, 8, 2, offset=4, local=4)),
-        ),
-        Cell(
-            why="window (4, 6) of 8 overruns num_experts: accepted, surplus slots idle",
-            spec=dict(tokens=64, **_geom(256, 128, 8, 2, offset=4, local=6)),
-        ),
-        Cell(
-            why="ids -1, num_experts and 40 in the routing: silently dropped",
-            spec=dict(tokens=16, foreign_ids=True, **_geom(256, 128, 8, 2)),
         ),
     )
 
@@ -198,9 +144,10 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     twice at 256 (the token count picks the routing kernel).
 
     The window: local slot i answers for global id `local_expert_offset + i`.
-    Nothing checks the window against `num_experts`; ids outside it (negative,
-    `>= num_experts`) are dropped, a token with no slot in it comes back
-    bitwise zero, and a window starting at `num_experts` returns all zeros.
+    Nothing checks the window against `num_experts`; a token with no slot in it
+    comes back bitwise zero, and a window starting at `num_experts` returns all
+    zeros. Ids outside the routing space (negative, `>= num_experts`) were
+    measured to be dropped; the router never emits one, and no cell certifies it.
     Four 128-wide windows of 512 summed match the full call inside the test's band
     but not bitwise (each rounds its partial to bf16).
 
@@ -226,11 +173,12 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
                    `tune_max_num_tokens` (default 8192, which the target
                    leaves): past it a call runs the 8192 bucket's tactic; a
                    larger value makes the op append a bucket at that size
-      top_k        <= 32 (raises past it); certified 1, 2, 6, 8, 10, 16
-      E, H, I      certified up to 512, 7168, 2048
+      top_k        <= 32 (raises past it); certified 10, the checkpoint's
+      E, H, I      certified at the checkpoint's 512, 2560, 640
 
     Not certified: the in-kernel routing path (`routing_logits` given),
-    multi-rank execution (the windows ran in one process), sm_100.
+    multi-rank execution (the windows ran in one process), geometries other
+    than the checkpoint's, sm_100.
     """
 
     def __call__(

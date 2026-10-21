@@ -113,12 +113,12 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     H._compare(y, exp.to(torch.bfloat16))
 
 
-@pytest.mark.parametrize("tokens", [1024, 4096])
-def test_close_to_the_trtllm_gen_entry(tokens):
+def test_close_to_the_trtllm_gen_entry():
     """Same experts, same routing: within the routed entry's own band of each
-    other's output (the two differ only in accumulation order)."""
-    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 1024)
-    spec = {**spec, "tokens": tokens}
+    other's output (the two differ only in accumulation order). At the row count
+    where the target switches from one to the other."""
+    tokens = 4096
+    spec = {**op.CELLS[0].spec, "tokens": tokens}
     args, ref, data, sf, x, logits, g2 = _operands(spec, 4000 + tokens)
     y = _cute_dsl(ref, data, sf, logits, g2, spec)
     s1, sg, s2 = H._scalars(spec["num_experts"], G1, g2)
@@ -143,7 +143,7 @@ def test_close_to_the_trtllm_gen_entry(tokens):
 
 
 def test_guard_refuses_a_per_expert_fc2_scale():
-    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 1024)
+    spec = {**op.CELLS[0].spec, "tokens": 1024}
     args, ref, data, sf, x, logits, g2 = _operands(spec, 9)
     fc1_w, fc1_s, fc2_w, fc2_s = _cute_dsl_experts(ref)
     s1, sg, s2 = H._scalars(spec["num_experts"], G1, g2)

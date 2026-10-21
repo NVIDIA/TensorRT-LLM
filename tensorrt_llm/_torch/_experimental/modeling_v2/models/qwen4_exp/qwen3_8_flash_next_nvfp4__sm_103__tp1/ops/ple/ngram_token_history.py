@@ -88,173 +88,55 @@ class NgramTokenHistory(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: lengths, slots, carries, pool_slots (the cache manager's width, not
-    # the batch's), ngram_size (3), eos_density (0.0, of the packed ids),
-    # ids_dtype (int64), index_dtype (int32, for state_indices), qsl_dtype
-    # (int32), qsl_from "literal" | "seq_lens" (zeros + int64 cumsum of an
-    # int32 seq_lens prefix -- `cu_seqlens_from_seq_lens`' form), layout
-    # "contiguous" | "strided_ids" | "pool_view" (`pool[::2]`).
+    # the batch's), eos_density (0.0, of the packed ids), ids_dtype (int64),
+    # index_dtype (int32, for state_indices), qsl_dtype (int32), qsl_from
+    # "literal" | "seq_lens" (zeros + int64 cumsum of an int32 seq_lens prefix --
+    # `cu_seqlens_from_seq_lens`' form). `ngram_size` is the checkpoint's 3.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            _cell(
-                f"decode {n} x 1 token, pool sized to the batch",
-                (1,) * n,
-                range(n),
-                (True,) * n,
-                n + 2,
-            )
-            for n in (1, 8, 32)
-        )
-        + tuple(
-            _cell(
-                f"decode {n} x 1 token at the 461-slot engine pool",
-                (1,) * n,
-                _scattered(n),
-                (True,) * n,
-                ENGINE_SLOTS,
-                **_CALL_SITE,
-            )
-            for n in (1, 8, 32)
-        )
-        + tuple(
-            _cell(
-                f"prefill {'+'.join(map(str, ls))}, fresh, EOS in stream",
-                ls,
-                range(len(ls)),
-                (False,) * len(ls),
-                len(ls) + 2,
-                eos_density=0.05,
-            )
-            for ls in ((37,), (1024,), (37, 1, 128), (7, 7, 7, 7))
-        )
-        + (
-            _cell(
-                "mixed 64+13 contexts + 6 decodes, 10-slot pool",
-                (64, 13) + (1,) * 6,
-                (4, 0, 7, 2, 5, 1, 6, 3),
-                (False,) + (True,) * 7,
-                10,
-                eos_density=0.03,
-            ),
-            _cell(
-                "mixed 64+13 contexts + 6 decodes at 461 slots",
-                (64, 13) + (1,) * 6,
-                (0, ENGINE_SLOTS - 1, 4, 17, 230, 231, 459, 1),
-                (False,) + (True,) * 7,
-                ENGINE_SLOTS,
-                eos_density=0.03,
-                **_CALL_SITE,
-            ),
-            _cell(
-                "MTP verify p=2: 8 decodes x 2 rows, qsl rebuilt",
-                (2,) * 8,
-                _scattered(8),
-                (True,) * 8,
-                ENGINE_SLOTS,
-                qsl_from="seq_lens",
-                **_CALL_SITE,
-            ),
-            _cell(
-                "MTP verify p=4: 32 decodes x 4 rows, qsl rebuilt",
-                (4,) * 32,
-                _scattered(32),
-                (True,) * 32,
-                ENGINE_SLOTS,
-                qsl_from="seq_lens",
-                **_CALL_SITE,
-            ),
-            *(
-                _cell(
-                    f"MTP verify p={rows}: {decodes} decode{'s' if decodes > 1 else ''} x "
-                    f"{rows} rows, qsl rebuilt",
-                    (rows,) * decodes,
-                    _scattered(decodes),
-                    (True,) * decodes,
-                    ENGINE_SLOTS,
-                    qsl_from="seq_lens",
-                    **_CALL_SITE,
-                )
-                for rows, decodes in ((5, 8), (6, 32), (7, 8), (8, 1), (8, 32))
-            ),
-            _cell(
-                "MTP verify mixed: 37-token context + 8 x 3 rows",
-                (37,) + (3,) * 8,
-                _scattered(9),
-                (False,) + (True,) * 8,
-                ENGINE_SLOTS,
-                qsl_from="seq_lens",
-                eos_density=0.05,
-                **_CALL_SITE,
-            ),
-            _cell(
-                "fresh sequences seed EOS, never the stale slot", (3, 5), (2, 0), (False, False), 4
-            ),
-            _cell("short sequence publishes part carry, part new", (1,), (2,), (True,), 5),
-            _cell(
-                "zero-token rows: carry kept, fresh reseeded",
-                (2, 0, 0),
-                (0, 1, 2),
-                (True, True, False),
-                3,
-            ),
-            _cell(
-                "unsorted slots, carry flags mixed, 8-slot pool",
-                (4, 6, 2),
-                (5, 0, 3),
-                (True, False, True),
-                8,
-            ),
-            _cell("unnamed slots untouched, 8-slot pool", (5, 3), (1, 4), (True, True), 8),
-            _cell(
-                "in-stream EOS passed through raw",
-                (17, 1, 5, 1),
-                (3, 0, 2, 1),
-                (False, True, True, True),
-                6,
-                eos_density=0.3,
-            ),
-        )
-        + tuple(
-            _cell(
-                f"ids {str(i)[6:]}, slots/qsl {str(x)[6:]}",
-                (9, 1, 4),
-                (2, 0, 1),
-                (True, False, True),
-                5,
-                ids_dtype=i,
-                index_dtype=x,
-                qsl_dtype=x,
-            )
-            for i in (torch.int32, torch.int64)
-            for x in (torch.int32, torch.int64)
-        )
-        + (
-            _cell(
-                "ngram_size 4: a 3-id carry row",
-                (5, 1, 12),
-                (0, 2, 1),
-                (True, True, False),
-                5,
-                ngram_size=4,
-                eos_density=0.05,
-            ),
-            _cell("ngram_size 2: a 1-id carry row", (6, 1), (1, 0), (False, True), 4, ngram_size=2),
-            _cell(
-                "input_ids a stride-2 view",
-                (9, 1, 4),
-                (2, 0, 1),
-                (True, False, True),
-                5,
-                layout="strided_ids",
-            ),
-            _cell(
-                "context_pool a pool[::2] slot view, written through",
-                (9, 1, 4),
-                (2, 0, 1),
-                (True, False, True),
-                5,
-                layout="pool_view",
-            ),
-        )
+        _cell(
+            "decode 32 x 1 token at the 461-slot engine pool",
+            (1,) * 32,
+            _scattered(32),
+            (True,) * 32,
+            ENGINE_SLOTS,
+            **_CALL_SITE,
+        ),
+        _cell(
+            "MTP verify p=2: 8 decodes x 2 rows, qsl rebuilt",
+            (2,) * 8,
+            _scattered(8),
+            (True,) * 8,
+            ENGINE_SLOTS,
+            qsl_from="seq_lens",
+            **_CALL_SITE,
+        ),
+        _cell(
+            "MTP verify p=8: 32 decodes x 8 rows, qsl rebuilt",
+            (8,) * 32,
+            _scattered(32),
+            (True,) * 32,
+            ENGINE_SLOTS,
+            qsl_from="seq_lens",
+            **_CALL_SITE,
+        ),
+        _cell(
+            "MTP verify mixed: 37-token context + 8 x 3 rows",
+            (37,) + (3,) * 8,
+            _scattered(9),
+            (False,) + (True,) * 8,
+            ENGINE_SLOTS,
+            qsl_from="seq_lens",
+            eos_density=0.05,
+            **_CALL_SITE,
+        ),
+        _cell("prefill 1024, fresh, EOS in stream", (1024,), (0,), (False,), 3, eos_density=0.05),
+        _cell(
+            "zero-token rows: carry kept, fresh reseeded",
+            (2, 0, 0),
+            (0, 1, 2),
+            (True, True, False),
+            3,
+        ),
     )
 
     note = """

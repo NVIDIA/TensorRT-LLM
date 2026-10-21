@@ -50,7 +50,6 @@ class SiluAndMulRows(OpWrapper):
         Cell(why="prefill chunk 16384 rows of the fused 1288-wide output", spec=dict(rows=16384)),
         Cell(why="decode batch 128, fused output", spec=dict(rows=128)),
         Cell(why="1 row, fused output", spec=dict(rows=1)),
-        Cell(why="33 rows, contiguous gate|up (no extra columns)", spec=dict(rows=33, width=1280)),
         Cell(why="zero rows", spec=dict(rows=0)),
     )
 

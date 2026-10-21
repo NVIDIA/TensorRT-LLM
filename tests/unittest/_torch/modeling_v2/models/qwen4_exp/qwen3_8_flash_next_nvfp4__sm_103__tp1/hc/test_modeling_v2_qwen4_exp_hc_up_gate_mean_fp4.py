@@ -105,16 +105,15 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _compare(out, op.reference(*args), args[4])
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_bitwise_the_composition_it_replaces(cell) -> None:
+@pytest.mark.parametrize("rows", [2, 16390])
+def test_bitwise_the_composition_it_replaces(rows) -> None:
     """`qwen4_exp_hc_up_gate_mean` then `torch.ops.trtllm.fp4_quantize` (linear
-    scales): every output bitwise equal, ties included."""
-    low, up, normed, c, gs = _build(cell.spec, seed=_seed(cell))
+    scales): every output bitwise equal, ties included. A one-tile decode batch
+    and a many-tile one with a ragged tail; the cells certify the rest."""
+    low, up, normed, c, gs = _build(dict(rows=rows), seed=rows)
     mixed, xq, xsf = op(low, up, normed, c, gs)
     old = qwen4_exp_hc_up_gate_mean(low, up, normed, c)
     assert torch.equal(mixed, old)
-    if old.shape[0] == 0:
-        return
     old_q, old_sf = torch.ops.trtllm.fp4_quantize(old, gs, 16, False, False)
     assert torch.equal(xq, old_q.view(torch.uint8)), (
         f"{(xq != old_q.view(torch.uint8)).sum().item()} bytes"
@@ -122,9 +121,10 @@ def test_bitwise_the_composition_it_replaces(cell) -> None:
     assert torch.equal(xsf, old_sf.view(torch.uint8).reshape(-1))
 
 
-@pytest.mark.parametrize("scale", [1e-6, 1e-3, 1.0, 448.0 * 6.0 / 24.0, 1e4])
+@pytest.mark.parametrize("scale", [1e-6, 448.0 * 6.0 / 24.0, 1e4])
 def test_bitwise_across_global_scales(scale) -> None:
-    """Tiny scales (zero / subnormal e4m3 bytes) and saturating ones."""
+    """A tiny scale (zero / subnormal e4m3 bytes), the calibrated one and a
+    saturating one."""
     low, up, normed, c, _ = _build(dict(rows=128), seed=11)
     h = normed.shape[1] // c
     for s in range(c):  # row 0's first 64 mix columns are exactly zero: amax 0

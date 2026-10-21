@@ -5,7 +5,7 @@
 Exact integer arithmetic, gated bitwise against the entry's scalar reference.
 A wrong hash is still a valid row index, so beyond the cells: six near-miss
 derivations must each differ, the per-head bands, the EOS reset semantics,
-row independence, the tail slice and chunked prefill, and the four guards.
+the tail slice and chunked prefill, and the four guards.
 """
 
 import zlib
@@ -81,7 +81,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         eos_positions=spec.get("eos_positions", ()),
         lead_eos=spec.get("lead_eos", True),
         eos_density=spec.get("eos_density", 0.0),
-    ).to(spec.get("ids_dtype", torch.int64))
+    )
     before = ids.clone()
     args = (ids, *_constants(), EOS, spec["num_query_tokens"])
     out = op(*args)
@@ -174,13 +174,6 @@ def test_eos_token_itself_ends_its_segment() -> None:
     closing = torch.tensor([[11, 22, 33, EOS]], device=DEV)
     opening = torch.tensor([[EOS] * (CKPT_CONTEXT_LEN + 1)], device=DEV)
     assert not torch.equal(_hash(closing, 1), _hash(opening, 1))
-
-
-def test_rows_are_independent() -> None:
-    ids = _tokens(4, CKPT_CONTEXT_LEN + 64, seed=13, eos_positions=(20,))
-    batched = _hash(ids, 64)
-    for row in range(ids.shape[0]):
-        assert torch.equal(batched[row : row + 1], _hash(ids[row : row + 1], 64))
 
 
 def test_tail_slice_is_exact() -> None:

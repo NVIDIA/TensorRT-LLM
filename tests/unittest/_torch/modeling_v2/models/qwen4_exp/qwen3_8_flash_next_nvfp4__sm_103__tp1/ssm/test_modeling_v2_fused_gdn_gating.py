@@ -29,7 +29,8 @@ from _validating import certifying, validating  # noqa: E402,F401 — path above
 assert torch.cuda.is_available(), "fused_gdn_gating requires a CUDA device"
 
 
-#: The smallest softplus `beta` a cell drives; the tail error scales as 1 / beta.
+#: The softplus `beta` the absolute floor is sized for; the tail error scales as
+#: 1 / beta. The target calls 1.0, so 0.5 leaves a factor 2 of headroom.
 _MIN_CERTIFIED_BETA = 0.5
 
 
@@ -38,9 +39,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     relative term is `4 * 2^-22`. The absolute floor is the unstabilised
     softplus's tail error -- about one approximate ulp of the log's
     argument -- scaled by `1 / beta` and by the `exp(A_log)` it multiplies;
-    `_compare` cannot see either, so it takes the certified extremes
-    (exp(A_log) <= 139.42, beta >= 0.5): atol = 4 * 2^-22 * 139.42 / 0.5 =
-    2.66e-04.
+    `_compare` cannot see either, so it takes exp(A_log) <= 139.42 (the
+    checkpoint's extreme) and beta >= 0.5 (`_MIN_CERTIFIED_BETA`): atol =
+    4 * 2^-22 * 139.42 / 0.5 = 2.66e-04.
 
     Measured against this gate on 256 checkpoint-range rows: worst error /
     allowance 0.215. Five wrong formulas (dt_bias dropped, sign dropped,
@@ -71,7 +72,7 @@ def _params(g, num_heads=NUM_V_HEADS, dtype=torch.float32):
 def _build(spec, seed):
     """`__call__`'s positional arguments for one spec."""
     g = torch.Generator(device=DEV).manual_seed(seed)
-    rows, heads = spec["rows"], spec.get("num_heads", NUM_V_HEADS)
+    rows, heads = spec["rows"], NUM_V_HEADS
     a_dtype = spec.get("a_dtype", torch.bfloat16)
     layout = spec.get("layout", "contiguous")
 
@@ -84,18 +85,9 @@ def _build(spec, seed):
         # `_gdn_block` splits the [T, 48] projection into prefill and decode rows.
         a = randn(rows + 23, heads)[23:]
         assert a.is_contiguous() and a.storage_offset() == 23 * heads
-    elif layout == "ba_column_half":
-        a = randn(rows, BA_WIDTH)[:, NUM_V_HEADS:]
-        assert a.stride() == (BA_WIDTH, 1)
-    elif layout == "ba_row_and_column":
-        a = randn(rows + 48, BA_WIDTH)[48:, NUM_V_HEADS:]
-        assert a.stride() == (BA_WIDTH, 1)
     else:
         a = randn(rows, heads)
-    A_log, dt_bias = _params(g, heads, spec.get("param_dtype", torch.float32))
-    if "overlong" in spec:
-        pad = torch.full((spec["overlong"],), 9.0, dtype=A_log.dtype, device=DEV)
-        A_log, dt_bias = torch.cat([A_log, pad]), torch.cat([dt_bias, pad])
+    A_log, dt_bias = _params(g, heads)
     return A_log, a, dt_bias, spec.get("beta", 1.0), spec.get("threshold", SOFTPLUS_THRESHOLD)
 
 
@@ -106,14 +98,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     g = op(*args)
     _compare(g, op.reference(*args))
     assert g.is_contiguous() and torch.isfinite(g).all()
-    A_log, a, dt_bias = args[:3]
-    if not a.is_contiguous():
-        # The row stride is consumed in place, not approximated.
-        assert torch.equal(g, op(A_log, a.contiguous(), dt_bias, *args[3:]))
-    if "overlong" in cell.spec:
-        heads = a.shape[1]
-        trimmed = op(A_log[:heads].clone(), a, dt_bias[:heads].clone(), *args[3:])
-        assert torch.equal(g, trimmed), "elements past a.shape[1] must not be read"
 
 
 def test_threshold_branch_is_live_for_this_checkpoint() -> None:
@@ -183,19 +167,12 @@ def test_gate_discriminates_wrong_variants() -> None:
         assert ratio > 1e3, f"{name} lands only {ratio}x outside the gate"
 
 
-@pytest.mark.parametrize(
-    "shape,message",
-    [
-        ((2, 4, NUM_V_HEADS), "too many values to unpack"),
-        ((NUM_V_HEADS,), "not enough values to unpack"),
-    ],
-)
-def test_op_rejects_a_non_2d_a(shape, message) -> None:
+def test_op_rejects_a_non_2d_a() -> None:
     """Loud, from the op's own `batch, num_heads = a.shape` -- which is why the
     guard reads `shape[-1]` / `stride(-1)` and does not preempt it."""
     A_log, dt_bias = _params(torch.Generator(device=DEV).manual_seed(109))
-    a = torch.randn(*shape, device=DEV).to(torch.bfloat16)
-    with pytest.raises(ValueError, match=message):
+    a = torch.randn(2, 4, NUM_V_HEADS, device=DEV).to(torch.bfloat16)
+    with pytest.raises(ValueError, match="too many values to unpack"):
         with validating(op):
             op(A_log, a, dt_bias)
 
@@ -220,12 +197,8 @@ def _guard_case(case):
     wide = torch.randn(2 * NUM_V_HEADS, generator=g, device=DEV)
     if case == "A_log_stride_2":
         return (wide[::2], a, dt_bias), (wide[:NUM_V_HEADS], a, dt_bias)
-    if case == "dt_bias_stride_2":
-        return (A_log, a, wide[::2]), (A_log, a, wide[:NUM_V_HEADS])
     # Short by 8: a view into a longer buffer, so the over-read lands in known memory.
-    if case == "A_log_short":
-        return (wide[:40], a, dt_bias), (wide[:NUM_V_HEADS], a, dt_bias)
-    return (A_log, a, wide[:40]), (A_log, a, wide[:NUM_V_HEADS])
+    return (wide[:40], a, dt_bias), (wide[:NUM_V_HEADS], a, dt_bias)
 
 
 @pytest.mark.parametrize(
@@ -233,9 +206,7 @@ def _guard_case(case):
     [
         ("a_head_stride_2", "head axis must be unit-stride"),
         ("A_log_stride_2", "must be contiguous 1-D"),
-        ("dt_bias_stride_2", "must be contiguous 1-D"),
         ("A_log_short", "at least a.shape"),
-        ("dt_bias_short", "at least a.shape"),
     ],
 )
 def test_guard_refuses_what_the_kernel_reads_at_the_wrong_addresses(case, match) -> None:

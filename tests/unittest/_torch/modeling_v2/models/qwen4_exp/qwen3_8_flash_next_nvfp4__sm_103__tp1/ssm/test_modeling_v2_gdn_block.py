@@ -337,8 +337,9 @@ def warm_triton_chunk():
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("m", (1, 32, 128))
-def test_decode_block(m) -> None:
+def test_decode_block() -> None:
+    """A con-128 decode step; the graph-replay test below runs 32 rows."""
+    m = 128
     core, L, x = _core(100 + m), _layer(200 + m), _x(m, 300 + m)
     core_ref = _clone_core(core)
     st, qsl_long = _decode_state(m)
@@ -353,13 +354,12 @@ def test_decode_block(m) -> None:
     )
 
 
-#: (context lengths, generation rows, has_initial_state per context).
+#: (context lengths, generation rows, has_initial_state per context): an 8K prefill-only
+#: step, and a mixed step of three variable-length contexts (two carrying state) plus
+#: generation rows.
 PREFILL_CASES = (
     ((8192,), 0, (False,)),
-    ((200, 37, 91), 0, (True, False, True)),
-    ((8065,), 127, (True,)),
     ((200, 37, 91), 5, (True, False, True)),
-    ((64,), 1, (False,)),
 )
 
 

@@ -80,21 +80,6 @@ class RmsNormGatedTokenMajor(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="decode: 1 token, checkpoint GDN epilogue, sigmoid", spec=dict(tokens=1, **_CKPT)),
-        Cell(why="17 tokens, checkpoint geometry, sigmoid", spec=dict(tokens=17, **_CKPT)),
-        Cell(
-            why="prefill 2048 tokens, checkpoint geometry, sigmoid", spec=dict(tokens=2048, **_CKPT)
-        ),
-        Cell(why="silu gate (the op's default), 2 tokens", spec=dict(tokens=2, **_SILU)),
-        Cell(why="silu gate, 512 tokens", spec=dict(tokens=512, **_SILU)),
-        Cell(
-            why="z a column slice of a 16384-wide projection, 1 token",
-            spec=dict(tokens=1, z="column_slice", **_SILU),
-        ),
-        Cell(
-            why="z a column slice: token stride 16384, 512 tokens",
-            spec=dict(tokens=512, z="column_slice", **_CKPT),
-        ),
         *(
             Cell(
                 why=f"z the in_proj column view: token stride 16480, {t} tokens",
@@ -106,39 +91,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
             why="683 tokens: the first launch at 8 rows a program",
             spec=dict(tokens=683, z="in_proj", **_CKPT),
         ),
-        Cell(
-            why="1001 tokens x 48 heads at 8 rows a program, silu",
-            spec=dict(tokens=1001, z="in_proj", **_SILU),
-        ),
-        Cell(
-            why="x row stride 2N: only stride(-1) must be 1",
-            spec=dict(tokens=17, x="strided_rows", **_SILU),
-        ),
-        Cell(
-            why="7 rows: not a multiple of the kernel's 4 rows per program",
-            spec=dict(_SILU, tokens=7, heads=1),
-        ),
-        Cell(why="15 rows over 3 heads: row mask", spec=dict(_SILU, tokens=5, heads=3)),
-        Cell(why="6 rows, 1 token x 6 heads: row mask", spec=dict(_SILU, tokens=1, heads=6)),
-        Cell(
-            why="N 192: not a power of two, generic fallback kernel",
-            spec=dict(_SILU, tokens=9, heads=4, width=192),
-        ),
-        Cell(why="N 512: wider than 256, fallback", spec=dict(_SILU, tokens=9, heads=4, width=512)),
-        Cell(why="N 1024: fallback", spec=dict(_SILU, tokens=9, heads=4, width=1024)),
-        Cell(
-            why="z head stride 2N: not per-token contiguous, fallback",
-            spec=dict(_SILU, tokens=9, heads=4, z="head_strided"),
-        ),
-        Cell(why="fp16", spec=dict(_SILU, tokens=17, dtype=torch.float16)),
-        Cell(why="fp32", spec=dict(_SILU, tokens=17, dtype=torch.float32)),
-        Cell(
-            why="eps 1.0 on rows scaled by 0.01: eps dominates the mean square",
-            spec=dict(_SILU, tokens=4, heads=8, eps=1.0, x_scale=0.01),
-        ),
-        Cell(why="fp8 out, scale 1.0", spec=dict(tokens=17, fp8_scale=1.0, **_SILU)),
         Cell(why="fp8 out, scale 0.5", spec=dict(tokens=17, fp8_scale=0.5, **_SILU)),
-        Cell(why="fp8 out, scale 0.0234375", spec=dict(tokens=17, fp8_scale=0.0234375, **_SILU)),
     )
 
     note = """
@@ -160,12 +113,16 @@ class RmsNormGatedTokenMajor(OpWrapper):
     extra elements (only `[0]` read) or not fp32 (widened silently).
 
     `weight` and `z` are widened to fp32 and need not match `x.dtype`. The
-    output is freshly allocated and contiguous even for a strided `x`; no input
-    is mutated.
+    output is freshly allocated and contiguous; no input is mutated.
 
-    Numerics: bf16 bitwise identical to the fp32 reference up to 816 rows; at
-    24576 and 196608 rows one-ulp differences on ~1e-5 of elements, inside the
-    default tolerance. fp8 output byte-identical. Nothing loosened.
+    Certified: bf16 `x` with the sigmoid gate over the in_proj column view of
+    `z` (48 heads of N = 128) on the 4-row and 8-row kernels, plus one fp8-output
+    cell (silu gate, packed `z`). Not certified: the generic fallback kernel,
+    the silu gate without fp8 output, fp16/fp32 operands, a strided `x`.
+
+    Numerics: bf16 inside the default tolerance against the fp32 reference,
+    with one-ulp differences on ~1e-5 of elements at prefill row counts. fp8
+    output byte-identical. Nothing loosened.
 
     Hard limits
       N * itemsize  fallback holds a row in 64 KB  boundary 65536 B

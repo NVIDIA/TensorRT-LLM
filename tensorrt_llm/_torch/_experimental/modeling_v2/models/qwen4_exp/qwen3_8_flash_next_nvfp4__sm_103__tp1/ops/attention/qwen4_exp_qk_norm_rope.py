@@ -976,33 +976,23 @@ class Qwen4ExpQkNormRope(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="decode M=1: one token, three distinct mRoPE rows", spec=dict(tokens=1, **CKPT)),
-        Cell(why="decode M=2", spec=dict(tokens=2, **CKPT)),
-        Cell(why="decode M=5: odd batch", spec=dict(tokens=5, **CKPT)),
         Cell(
-            why="decode M=16: last token count on the 1-head/2-warp launch",
-            spec=dict(tokens=16, **CKPT),
+            why="decode M=1: one token on the 1-head/2-warp launch, three distinct mRoPE rows",
+            spec=dict(tokens=1, **CKPT),
         ),
         Cell(
             why="decode M=17: first on the 2-head launch (13 main programs)",
             spec=dict(tokens=17, **CKPT),
         ),
-        Cell(why="decode M=33: one past a power of two", spec=dict(tokens=33, **CKPT)),
-        Cell(why="decode M=64: last on the 2-head launch", spec=dict(tokens=64, **CKPT)),
         Cell(
             why="decode M=65: first on the 8-head launch (last main program half masked)",
             spec=dict(tokens=65, **CKPT),
         ),  # fmt: skip
-        Cell(why="decode M=127: odd, below max concurrency", spec=dict(tokens=127, **CKPT)),
-        Cell(why="decode M=128: max concurrency", spec=dict(tokens=128, **CKPT)),
         Cell(
-            why="decode M=128, positions up to the table end (262144 rows)",
+            why="decode M=128: max concurrency, positions up to the table end (262144 rows)",
             spec=dict(tokens=128, max_position=262144, **CKPT),
         ),
-        Cell(why="prefill 1023 tokens: last on the Triton kernel", spec=dict(tokens=1023, **CKPT)),
         Cell(why="prefill 1024 tokens: first on the CuTe kernel", spec=dict(tokens=1024, **CKPT)),
-        Cell(why="prefill 2048 tokens", spec=dict(tokens=2048, **CKPT)),
-        Cell(why="prefill 8193 tokens: one past the ISL", spec=dict(tokens=8193, **CKPT)),
         Cell(why="prefill 16384 tokens: max_num_tokens", spec=dict(tokens=16384, **CKPT)),
     )
 

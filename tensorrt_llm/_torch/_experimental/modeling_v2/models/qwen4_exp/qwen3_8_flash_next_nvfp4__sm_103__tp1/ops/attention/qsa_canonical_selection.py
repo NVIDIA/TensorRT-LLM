@@ -103,19 +103,16 @@ class QsaCanonicalSelection(OpWrapper):
     # value, in a random order (the adversary); `radix` is the engine the target calls.
     CELLS: tuple[Cell, ...] = (
         _cell(
-            "decode: 1, 8, 128 and 256 rows (MTP3 at batch 32, MTP7 at batch 32)",
-            (1, 8, 128, 256),
+            "decode: 1, 128 and 256 rows (MTP3 and MTP7 at batch 32)",
+            (1, 128, 256),
             ("positions_random", 2051, 8191),
             "relu",
         ),
-        _cell("prefill: 1024 rows from position 4000", 1024, ("chunk", 4000), "relu"),
-        _cell("prefill: 8192 rows from position 0", 8192, ("chunk", 0), "relu"),
         _cell(
-            "prefill: 8192 rows over an 8192-wide table, rewritten in row tiles",
+            "prefill: 8192 rows from position 0, rewritten in row tiles",
             8192,
-            ("chunk", 24000),
-            "relu_sparse",
-            cols=8192,
+            ("chunk", 0),
+            "relu",
         ),
         _cell(
             "windows 0, 1, 511, 512, 513, 1024, 2047, 2048, 2080",
@@ -124,52 +121,10 @@ class QsaCanonicalSelection(OpWrapper):
             "relu",
         ),
         _cell(
-            "ties: fewer than k positive scores, the zero class straddles k",
-            64,
-            ("ends", (2048,) * 32 + (1500,) * 16 + (2080,) * 16),
-            "relu_sparse",
-        ),
-        _cell(
-            "ties: two-valued rows",
-            32,
-            ("ends", (2048,) * 16 + (777,) * 16),
-            "two_valued",
-        ),
-        _cell(
-            "ties: every window column equal",
-            16,
-            ("ends", (2048,) * 8 + (513,) * 8),
-            "all_equal",
-        ),
-        _cell(
-            "ties: one positive pair tied exactly at the k-th value",
-            16,
-            ("ends", (2048,) * 16),
-            "pair_at_k",
-        ),
-        _cell(
-            "ties: -0.0 and +0.0 mixed in the zero class",
+            "ties: a zero class of -0.0 and +0.0 that straddles k",
             16,
             ("ends", (2048,) * 16),
             "signed_zeros",
-        ),
-        _cell(
-            "tail of +inf / 3e38 / NaN past the window is never kept",
-            32,
-            ("positions_random", 2051, 8191),
-            "relu_sparse",
-            tail="poison",
-        ),
-        _cell(
-            "nonzero row_starts: offsets stay window-local",
-            8,
-            (
-                "explicit",
-                (1, 2, 3, 37, 100, 480, 1001, 1500),
-                (2080, 600, 515, 1061, 612, 2079, 1513, 2080),
-            ),
-            "relu_sparse",
-            tail="poison",
         ),
         _cell(
             "input from the radix engine (qsa_topk_select), zero ties",

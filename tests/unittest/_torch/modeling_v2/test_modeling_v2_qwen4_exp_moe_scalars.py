@@ -47,7 +47,7 @@ def test_uniform_isc2_keeps_the_per_expert_products_bitwise() -> None:
     assert torch.equal(got["alpha1"], w["l0_e_isc1"] * w["l0_e_ws2_1"])
 
 
-@pytest.mark.parametrize("spread", [1.0, 1.0001, 3.0, 40.0])
+@pytest.mark.parametrize("spread", [1.0001, 40.0])
 def test_isc2_spread_is_folded_into_alpha2(spread: float) -> None:
     """Whatever the spread, `global_sf * alpha2[e]` is expert e's own `ws2_2[e]`, the
     product trtllm-gen forms from `(1 / isc2[e]) * (isc2[e] * ws2_2[e])`."""

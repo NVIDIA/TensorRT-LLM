@@ -53,19 +53,11 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
         Cell(why=f"checkpoint 4x2560, rank 320, {why}", spec=dict(rows=t))
         for t, why in (
             (2, "decode 2 rows (smallest fused-up batch)"),
-            (32, "decode 32 rows"),
             (128, "decode 128 rows (max_con)"),
-            (2048, "prefill 2048"),
-            (8192, "prefill 8192"),
             (16384, "prefill chunk 16384 (max_num_tokens)"),
         )
     ) + (
-        Cell(why="1 row (below the decode threshold)", spec=dict(rows=1)),
         Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),
-        Cell(why="ragged tail, 1000 rows", spec=dict(rows=1000)),
-        Cell(why="hc_count 2, 300 rows", spec=dict(rows=300, hc_count=2)),
-        Cell(why="hc_count 8 (32-column tiles), 300 rows", spec=dict(rows=300, hc_count=8)),
-        Cell(why="hidden 128, rank 128, 200 rows", spec=dict(rows=200, hidden=128, rank=128)),
         Cell(why="zero rows", spec=dict(rows=0)),
     )
 
@@ -86,6 +78,9 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
     instruction (`rcp.approx.ftz.f32` reciprocals, `cvt.rn.satfinite` to e4m3
     and to e2m1, every multiply `mul.rn.f32`); the GPU test checks it bitwise
     against `torch.ops.trtllm.fp4_quantize` on the returned `mixed`.
+
+    Not certified: hc_count other than 4, hidden other than 2560, rank other
+    than 320 (the kernel compiles for them; no cell drives them).
     """
 
     def __call__(

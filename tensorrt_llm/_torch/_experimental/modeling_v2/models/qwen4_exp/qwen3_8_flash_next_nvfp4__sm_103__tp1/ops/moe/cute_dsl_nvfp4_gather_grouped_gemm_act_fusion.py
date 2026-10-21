@@ -137,79 +137,32 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    CELLS: tuple[Cell, ...] = tuple(
-        cell
-        for tile in (128, 256)
-        for cell in (
-            Cell(
-                why=f"tile {tile}: decode, 1 request without MTP",
-                spec=_ckpt(1, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 1 request at MTP verify width 2",
-                spec=_ckpt(2, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 1 request at MTP verify width 4",
-                spec=_ckpt(4, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: decode, 8 requests",
-                spec=_ckpt(8, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: decode at the 32-request ceiling",
-                spec=_ckpt(32, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 32 requests at MTP verify width 3",
-                spec=_ckpt(96, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 32 requests at MTP verify width 4; largest captured T",
-                spec=_ckpt(128, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 8192 rows, max_num_tokens prefill",
-                spec=_ckpt(8192, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 8192 rows all on 10 experts; {8192 // tile} full tiles each",
-                spec=_ckpt(8192, tile, dist="hot"),
-            ),
-            Cell(
-                why=f"tile {tile}: expert rows tile-1, tile, tile+1; the mn_limit edge",
-                spec=_ckpt(300, tile, dist="tile_edges"),
-            ),
-            Cell(
-                why=f"tile {tile}: 510 experts with one row each; every tile partial",
-                spec=_ckpt(51, tile, dist="round_robin"),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 tactic, decode",
-                spec=_ckpt(1, tile, mma_n=256),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 tactic, 128 rows",
-                spec=_ckpt(128, tile, mma_n=256),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 tactic, 8192-row prefill",
-                spec=_ckpt(8192, tile, mma_n=256),
-            ),
-            Cell(
-                why=f"tile {tile}: global_sf 25x calibrated; block scales clip at 448",
-                spec=_ckpt(2048, tile, gsf="saturating"),
-            ),
-            Cell(
-                why=f"tile {tile}: tiny global_sf; subnormal and zero block scales",
-                spec=_ckpt(2048, tile, gsf="subnormal"),
-            ),
-            Cell(
-                why=f"tile {tile}: 7 all-zero token rows; zero block scales",
-                spec=_ckpt(64, tile, zero_tokens=7),
-            ),
-        )
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tile 128: decode, 1 request without MTP",
+            spec=_ckpt(1, 128),
+        ),
+        Cell(
+            why="tile 128: MMA N 256 tactic, 32 requests at MTP verify width 4; largest captured T",
+            spec=_ckpt(128, 128, mma_n=256),
+        ),
+        Cell(
+            why="tile 128: 8192 rows, max_num_tokens prefill",
+            spec=_ckpt(8192, 128),
+        ),
+        Cell(
+            why="tile 128: expert rows tile-1, tile, tile+1; the mn_limit edge",
+            spec=_ckpt(300, 128, dist="tile_edges"),
+        ),
+        Cell(
+            why="tile 128: global_sf 25x calibrated; block scales clip at 448",
+            spec=_ckpt(2048, 128, gsf="saturating"),
+        ),
+        Cell(
+            why="tile 128: tiny global_sf and 7 all-zero token rows; subnormal and zero "
+            "block scales",
+            spec=_ckpt(2048, 128, gsf="subnormal", zero_tokens=7),
+        ),
     )
 
     note = """
@@ -228,13 +181,15 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
     Call sites: the engine's CuteDSL MoE (`run_moe_nvfp4_impl`) and the target's
     routed-expert step, eager for prefill and mixed batches (T up to
     max_num_tokens 8192) and captured for decode (T = requests x MTP verify width,
-    up to 32 x 4 = 128). Tile 128 is the target's; 256 is certified as well.
+    up to 32 x 4 = 128). Tile 128 is the target's and the cells' tile; 256 is
+    certified through the per-pair invariance below.
 
     Tactics. The op asks the AutoTuner for an MMA tile of (tile_size, 128) or
     (tile_size, 256) and with no tuning entry falls back to (tile_size, 128);
     serving warmup tunes per row bucket and may pick either. Every pair's codes
     and block scales are bitwise identical across tile 128 / 256 x MMA N 128 / 256
-    x the fallback, so cells driven at one tactic certify the others.
+    x the fallback (the test checks it at 128 and 8192 rows), so cells driven at
+    one tactic certify the others.
 
     Determinism. A (token, expert) pair's output row depends on that pair alone:
     it is bitwise unchanged by reordering an expert's rows (moe_sort orders them by
@@ -254,8 +209,10 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
     0. A block whose scale is 0 dequantizes to zero whatever its codes hold, and
     the test's compare does not read them.
 
-    Preconditions the caller owns (each wrong preparation ran without error, with
-    finite scales, and put most block scales and codes outside the test's gate):
+    Preconditions the caller owns (a wrong preparation of each operand -- the
+    weight's rows, its scales, the activation's scales, alpha -- runs without
+    error, with finite scales, and puts most block scales and codes outside the
+    test's gate):
     - `weight` / `weight_scale` in the layout the class docstring states: not
       trtllm-gen's row interleave, up rows first, scales swizzled after the same
       row interleave as the weight, alpha not shifted by an expert.

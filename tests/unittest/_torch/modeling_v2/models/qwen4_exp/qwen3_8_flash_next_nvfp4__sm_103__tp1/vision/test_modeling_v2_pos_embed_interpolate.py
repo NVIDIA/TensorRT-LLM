@@ -7,7 +7,7 @@ the entry's sample positions, so it gates numerics. `_ref_resize` here runs
 torch's own `F.interpolate` in fp64 and shares no arithmetic with the entry, so
 it gates the structure: which axis is which, how the table is read, and the
 spatial-merge row order. It sits up to 8.6e-6 from the exact value (its sample
-coordinates are float), which is why fp32 cells gate on `op.reference`.
+coordinates are float): far inside a bf16 cell's band, though not an fp32 one's.
 """
 
 import zlib
@@ -71,9 +71,8 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     assert out.dtype == table.dtype
     assert torch.equal(table, before) and out.data_ptr() != table.data_ptr()
     torch.testing.assert_close(out, op.reference(table, grid, spec["merge"]))
-    if spec["dtype"] is not torch.float32:
-        # The structural gate, from a reference that shares no arithmetic.
-        torch.testing.assert_close(out, _ref_resize(table, grid, spec["merge"]).to(out.dtype))
+    # The structural gate, from a reference that shares no arithmetic.
+    torch.testing.assert_close(out, _ref_resize(table, grid, spec["merge"]).to(out.dtype))
 
 
 def test_exact_grid_is_the_table_itself_in_merge_order() -> None:

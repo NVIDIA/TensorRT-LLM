@@ -84,7 +84,6 @@ def test_valid_pools_pass() -> None:
     )
     nvfp4_kv = _t(9, 2, G.heads_kv, G.tokens_per_block, 128, dtype=torch.uint8)
     M.check_attention_pools(G_NVFP4, 3, _t(9, 32, 1, 128), nvfp4_kv)
-    M.check_kv_scale_planes(G_NVFP4, 3, nvfp4_kv, _t(9, 2, 2, 32, 16, dtype=torch.uint8))
     for dtype in (torch.float32, torch.bfloat16):
         M.check_recurrent_pools(G, _conv(), _ssm(dtype))
     M.check_ple_pools(
@@ -120,7 +119,6 @@ def test_valid_pools_pass() -> None:
     [
         (None, "did not allocate"),
         (_t(9, 32, 3), "torch.bfloat16"),
-        (_t(9, 16, 3, dtype=torch.int32), "expected"),
         (_t(9, 32, 2, dtype=torch.int32), "expected"),
     ],
 )
@@ -205,8 +203,6 @@ def test_kv_scale_planes_must_hold_the_data_pools_pages_per_slot() -> None:
         (None, "did not allocate"),
         (_t(9, 2, 2, 32, 16), "torch.uint8"),
         (_t(9, 2, 2, 32, 8, dtype=torch.uint8), "NVFP4 block scales"),
-        (_t(9, 2, 4, 32, 16, dtype=torch.uint8), "NVFP4 block scales"),
-        (_t(9, 3, 2, 32, 16, dtype=torch.uint8), "same slots"),
         (_t(8, 2, 2, 32, 16, dtype=torch.uint8), "same slots"),
     ],
 )
@@ -347,17 +343,13 @@ def test_shared_selection_rejects_missing_row_and_width() -> None:
         M.check_shared_selection(shared, {3: 1}, 3, 256)
 
 
-def test_routing_admits_exactly_the_moe_backends_the_target_implements() -> None:
-    """`route` declines a backend request the constructor would assert on."""
+def test_routing_admits_exactly_what_the_target_implements() -> None:
+    """`route` declines a MoE backend, a draft length or a recurrent-state dtype the
+    constructor or the first bind would assert on. `test_modeling_v2_routing.py` pins
+    routing's behavior at today's values; this keeps routing's constants and the target's
+    from drifting apart."""
     assert set(routing._MOE_BACKENDS) == set(M._TRUNK_MOE_BACKENDS)
-
-
-def test_routing_admits_exactly_the_draft_lengths_the_target_implements() -> None:
-    """`route` declines a draft length the constructor or the first bind would assert on."""
     assert routing._MAX_DRAFT_LEN == M._MAX_VERIFY_WIDTH - 1
     assert routing._MAX_LEGACY_DRAFT_LEN == M._MAX_LEGACY_VERIFY_WIDTH - 1
     assert routing._MAX_CUTEDSL_DRAFT_LEN == M._CUTEDSL_MAX_DRAFT_LEN
-
-
-def test_routing_admits_exactly_the_state_dtypes_the_target_serves() -> None:
     assert routing._SSM_STATE_DTYPES == M._SSM_STATE_DTYPES

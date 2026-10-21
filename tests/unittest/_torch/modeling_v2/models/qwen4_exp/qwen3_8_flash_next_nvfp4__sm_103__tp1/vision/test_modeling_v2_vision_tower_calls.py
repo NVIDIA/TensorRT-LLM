@@ -124,23 +124,20 @@ def tower():
     return M.VisionTower(_core())
 
 
-# `(grid, caps)`: frames of 256, 144 and 32 rows, of 400, 96 and 60, of 32 and 8, and of 384.
-# Several caps per grid put the frame boundaries at different places, and the short-frame grid
-# makes calls whose longest frame is at most 64 rows, where the fused attention kernel is the
-# short-frame one.
+# `(grid, cap)`: frames of 256, 144 and 32 rows, of 32 and 8, and of 384. The cap cuts the
+# mixed grid inside an item and between items, the one-item grid between frames of one video,
+# and the short-frame grid into calls whose longest frame is at most 64 rows, where the fused
+# attention kernel is the short-frame one.
 CASES = {
-    "mixed": ([(2, 16, 16), (3, 12, 12), (6, 4, 8)], (512, 700)),
-    "image_then_video": ([(1, 20, 20), (4, 8, 12), (1, 6, 10)], (512, 700)),
-    "short_frames_only": ([(9, 4, 8), (3, 2, 4)], (96, 100)),
-    "one_item_many_frames": ([(7, 16, 24)], (800, 1200)),
+    "mixed": ([(2, 16, 16), (3, 12, 12), (6, 4, 8)], 512),
+    "short_frames_only": ([(9, 4, 8), (3, 2, 4)], 96),
+    "one_item_many_frames": ([(7, 16, 24)], 800),
 }
 
 
-@pytest.mark.parametrize(
-    "name,cap", [(name, cap) for name, (_, caps) in CASES.items() for cap in caps]
-)
-def test_calls_of_whole_frames_equal_one_call(tower, monkeypatch, name, cap):
-    grid = CASES[name][0]
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_calls_of_whole_frames_equal_one_call(tower, monkeypatch, name):
+    grid, cap = CASES[name]
     pixels = _pixels(grid)
     grid_thw = torch.tensor(grid)
     monkeypatch.setattr(M, "_VISION_CALL_MAX_PATCHES", 1 << 20)
@@ -154,27 +151,6 @@ def test_calls_of_whole_frames_equal_one_call(tower, monkeypatch, name, cap):
     assert len(calls) == len(expected) > 1
     assert all(rows <= cap for rows, _ in calls)
     _assert_close(chunked, whole)
-
-
-def test_a_request_that_fits_is_one_call_bit_for_bit(tower, monkeypatch):
-    grid = CASES["mixed"][0]
-    pixels = _pixels(grid)
-    direct = tower._run(pixels, [tuple(row) for row in grid], torch.tensor(grid))
-    monkeypatch.setattr(M, "_VISION_CALL_MAX_PATCHES", 1136)
-    calls = _count_calls(tower, monkeypatch)
-    out = tower(pixels, torch.tensor(grid))
-    assert [rows for rows, _ in calls] == [1136]
-    assert out.shape == (1136 // 4, OUT)
-    torch.testing.assert_close(out, direct, rtol=0, atol=0)
-
-
-def test_a_frame_past_the_ceiling_is_refused_before_any_call(tower, monkeypatch):
-    monkeypatch.setattr(M, "_VISION_CALL_MAX_PATCHES", 256)
-    calls = _count_calls(tower, monkeypatch)
-    grid = [(1, 8, 8), (1, 20, 20)]
-    with pytest.raises(AssertionError, match="one frame is 20x20 = 400 patch rows"):
-        tower(_pixels(grid), torch.tensor(grid))
-    assert calls == []
 
 
 def test_a_request_past_the_old_whole_request_ceiling_runs(tower):

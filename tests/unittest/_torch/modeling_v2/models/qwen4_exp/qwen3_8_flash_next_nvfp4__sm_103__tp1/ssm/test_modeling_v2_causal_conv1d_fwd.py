@@ -169,56 +169,32 @@ def test_the_initial_state_is_read() -> None:
     assert torch.equal(with_carry[:, 3:], without[:, 3:])
 
 
+#: One refusal per family the op checks itself: a kernel/layout mismatch, a
+#: metadata dtype, an operand dtype.
 _REJECTED = (
-    "channel_last_in_place",
     "channel_last_with_channel_major_out",
-    "channel_major_with_channel_last_out",
-    "out_dtype",
-    "out_shape",
-    "bias_dtype",
-    "x_float64",
     "query_start_loc_int64",
-    "has_initial_state_length",
     "conv_states_dtype",
-    "x_rank",
 )
 
 
 @pytest.mark.parametrize("case", _REJECTED)
 def test_op_rejects_loudly_what_is_valid_does_not_restate(case: str) -> None:
-    """Everything the op refuses itself -- the reason `is_valid` stays narrow."""
+    """What the op refuses itself -- the reason `is_valid` stays narrow."""
     dim, tokens = 512, 64
     base = dict(dim=dim, lengths=(30, 34), pool_slots=2, slots=(0, 1), initial=(True, True))
     args = _build(dict(base, pool_slots=None, slots=None, initial=None), seed=14)
     token_major = torch.randn(tokens, dim, dtype=torch.bfloat16, device="cuda")
     pool = torch.randn(2, dim, 3, dtype=torch.bfloat16, device="cuda")
     slots = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-    if case == "channel_last_in_place":
-        args[0] = token_major.t()
-    elif case == "channel_last_with_channel_major_out":
+    if case == "channel_last_with_channel_major_out":
         args[0] = token_major.t()
         args[9] = torch.empty(dim, tokens, dtype=torch.bfloat16, device="cuda")
-    elif case == "channel_major_with_channel_last_out":
-        args[9] = torch.empty(tokens, dim, dtype=torch.bfloat16, device="cuda").t()
-    elif case == "out_dtype":
-        args[9] = torch.empty(dim, tokens, dtype=torch.float16, device="cuda")
-    elif case == "out_shape":
-        args[9] = torch.empty(dim, tokens + 1, dtype=torch.bfloat16, device="cuda")
-    elif case == "bias_dtype":
-        args[2] = torch.randn(dim, dtype=torch.float32, device="cuda")
-    elif case == "x_float64":
-        args[0] = args[0].double()
-        args[1] = args[1].double()
     elif case == "query_start_loc_int64":
         args[4] = args[4].long()
-    elif case == "has_initial_state_length":
-        args[3], args[5] = pool, slots
-        args[6] = torch.ones(3, dtype=torch.bool, device="cuda")
     elif case == "conv_states_dtype":
         args[3], args[5] = pool.float(), slots
         args[6] = torch.ones(2, dtype=torch.bool, device="cuda")
-    elif case == "x_rank":
-        args[0] = torch.randn(2, dim, 32, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(RuntimeError):
         with validating(op):
             op(*args)
@@ -228,10 +204,8 @@ def _guard_case(case: str):
     """A fresh argument list exhibiting one silent violation."""
     dim, tokens = 512, 64
     spec = dict(dim=dim, lengths=(tokens,), pool_slots=1, slots=(0,), initial=(True,))
-    if case in ("width_one", "width_five"):
-        spec.update(
-            width=1 if case == "width_one" else 5, pool_slots=None, slots=None, initial=None
-        )
+    if case == "width_five":
+        spec.update(width=5, pool_slots=None, slots=None, initial=None)
     args = _build(spec, seed=15)
     g = torch.Generator(device="cuda").manual_seed(16)
     if case == "weight_dtype":
@@ -246,9 +220,7 @@ def _guard_case(case: str):
     return args
 
 
-@pytest.mark.parametrize(
-    "case", ["width_one", "width_five", "weight_dtype", "token_stride", "state_stride"]
-)
+@pytest.mark.parametrize("case", ["width_five", "weight_dtype", "token_stride", "state_stride"])
 def test_guard_refuses_what_the_op_answers_silently_wrong(case: str) -> None:
     """First the hazard, unguarded: the op returns without raising and its
     answer misses the reference. Then the guard refuses the same call."""

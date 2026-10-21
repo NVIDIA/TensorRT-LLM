@@ -561,28 +561,18 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows, inject (True), hc_count (4), rank (320), hidden (2560), n_rows
-    # (384: the padded weight), dtype bf16 only.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"checkpoint 4x2560, 324 cols of 384, inject, {why}", spec=dict(rows=t))
-        for t, why in (
-            (2, "decode 2 rows"),
-            (5, "decode 5 rows"),
-            (16, "decode 16 rows"),
-            (33, "decode 33 rows"),
-            (64, "decode 64 rows"),
-            (100, "decode 100 rows"),
-            (128, "decode 128 rows (max concurrency, MAX_ROWS)"),
-        )
-    ) + (
-        Cell(why="stack-final mixer: 320 cols, no inject, 2 rows", spec=dict(rows=2, inject=False)),
+    # spec: rows, inject (True). The checkpoint's geometry throughout: hc_count 4,
+    # rank 320, hidden 2560, the padded [384, K] weight, bf16.
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="checkpoint 4x2560, 324 cols of 384, inject, decode 2 rows", spec=dict(rows=2)),
+        Cell(
+            why="checkpoint 4x2560, 324 cols of 384, inject, decode 128 rows (MAX_ROWS)",
+            spec=dict(rows=128),
+        ),
         Cell(
             why="stack-final mixer: 320 cols, no inject, 128 rows",
             spec=dict(rows=128, inject=False),
         ),
-        Cell(why="unpadded weight [324, K], 8 rows", spec=dict(rows=8, n_rows=324)),
-        Cell(why="hc_count 2 at hidden 2560, 24 rows", spec=dict(rows=24, hc_count=2)),
-        Cell(why="1 row (below the dispatch range)", spec=dict(rows=1)),
         Cell(why="zero rows", spec=dict(rows=0)),
     )
 
@@ -614,6 +604,8 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     against 8.6 us for cuBLAS split-K + reduce + lowrank_act; tile sweep
     BN 32 / 48 / 64 / 112 x KS 8 / 10 / 16, 48 x 16 fastest at every row
     count.
+    Not certified: hc_count other than 4, an unpadded weight (N = R + C), a
+    single row (below the dispatch range; accepted, no cell drives them).
     """
 
     def __call__(

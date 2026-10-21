@@ -3,9 +3,9 @@
 """GPU test for the fused_recurrent_gated_delta_rule_update entry.
 
 The axis this entry exists for is more than one token per sequence per step --
-the speculative verify call -- so the cells sweep `P`, and the two state sinks
-(write-back into the pool, per-step states into the rollback buffer) are
-driven separately and together.
+the speculative verify call -- so the cells are that call as the target makes it
+(per-step states into the rollback buffer, the pool untouched) at both pool
+dtypes. The write-back sink is driven only by the property and guard tests below.
 
 Two tests answer "is this harness blind" rather than a correctness question:
 the neighbouring `chunk_gated_delta_rule` is wrong on the first indexed

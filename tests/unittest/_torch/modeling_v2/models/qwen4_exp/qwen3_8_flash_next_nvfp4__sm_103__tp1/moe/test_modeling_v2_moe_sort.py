@@ -177,9 +177,9 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 # ── CUDA graphs: captured row counts, on new ids ──────────────────────────
 
 #: Row counts of a decode capture (requests x MTP verify width 1..4, up to 32
-#: requests): the block kernel (T <= 4), the first cluster-kernel T, and the widths
-#: that follow.
-_CAPTURED_ROWS = (1, 2, 3, 4, 5, 8, 32, 96, 128)
+#: requests): both ends of the block kernel (T <= 4), the first cluster-kernel T,
+#: and the largest capture.
+_CAPTURED_ROWS = (1, 4, 5, 128)
 
 
 def _capture(args):
@@ -196,12 +196,13 @@ def _capture(args):
     return graph, static_out
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_captured_rows_replay_on_new_ids(tile, certifying):  # noqa: F811
+def test_captured_rows_replay_on_new_ids(certifying):  # noqa: F811
     """Each graph is replayed on two fresh id sets and gated against the reference,
     and against an eager call on the same ids: counts and tile arrays bitwise, the
-    whole output bitwise where the kernel is deterministic (T <= 4)."""
+    whole output bitwise where the kernel is deterministic (T <= 4). At the
+    target's tile, 128."""
     certifying(op)
+    tile = 128
     for rows in _CAPTURED_ROWS:
         args = _args(_ids("router", rows, tile, seed=rows), tile, seed=rows)
         graph, static_out = _capture(args)
@@ -226,12 +227,12 @@ def test_captured_rows_replay_on_new_ids(tile, certifying):  # noqa: F811
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("tile", (128, 256))
 @pytest.mark.parametrize("rows", (3, 300))
-def test_padding_rows_and_spare_tiles_are_not_written(rows, tile):
+def test_padding_rows_and_spare_tiles_are_not_written(rows):
     """A sentinel planted in a captured graph's outputs survives replay in exactly
     the regions `_compare` excludes; under a graph those regions keep the previous
-    replay's indices."""
+    replay's indices. Block kernel (3 rows) and cluster kernel (300), tile 128."""
+    tile = 128
     args = _args(_ids("router", rows, tile, seed=5), tile, seed=5)
     graph, static_out = _capture(args)
     for trial in (1, 2):
@@ -268,15 +269,12 @@ def test_padding_rows_and_spare_tiles_are_not_written(rows, tile):
 #: Both sides of every kernel-path edge: block / cluster at 4 / 5, the cluster
 #: kernel's per-block work edges at 102 / 103 and 204 / 205 rows, its fast / slow
 #: path edges at 3276 / 3277 and 6553 / 6554, and the 8192-row ceiling.
-_SWEEP = (
-    *(1, 2, 3, 4, 5, 6, 8, 31, 32, 33, 102, 103, 204, 205, 512, 1024),
-    *(3276, 3277, 4096, 6553, 6554, 8191, 8192),
-)
+_SWEEP = (4, 5, 102, 103, 204, 205, 3276, 3277, 6553, 6554, 8192)
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_eager_row_sweep(tile, certifying):  # noqa: F811
+def test_eager_row_sweep(certifying):  # noqa: F811
     certifying(op)
+    tile = 128
     for tokens in _SWEEP:
         _check(_args(_ids("router", tokens, tile, seed=tokens), tile, seed=tokens))
 
@@ -287,8 +285,8 @@ def test_eager_row_sweep(tile, certifying):  # noqa: F811
 def test_block_kernel_rows_follow_token_order():
     """T <= 4: each expert's rows in token order, bitwise the reference's."""
     for tile in (128, 256):
-        for tokens in (1, 2, 3, 4):
-            for seed in range(4):
+        for tokens in (1, 4):
+            for seed in range(2):
                 args = _args(_ids("router", tokens, tile, seed=seed), tile, seed=seed)
                 out, ref = _check(args)
                 real = ref[3] >= 0

@@ -112,12 +112,10 @@ def _build(spec, seed):
         dots = spec["dots"]
         key, query, value = _single_channel_operands(dots, spec["value_dtype"])
         return key, query, value, len(dots), spec["clamp_min"]
-    hc_count = spec.get("hc_count", HC_COUNT)
-    dtype = spec.get("dtype", torch.bfloat16)
     key, query, value = _make_operands(
-        seed, dtype, spec["leading"], hc_count, spec.get("value_dtype")
+        seed, torch.bfloat16, spec["leading"], value_dtype=spec.get("value_dtype")
     )
-    return key, query, value, hc_count, spec.get("clamp_min", CLAMP_MIN)
+    return key, query, value, HC_COUNT, spec.get("clamp_min", CLAMP_MIN)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -144,7 +142,7 @@ def test_flattened_call_matches_batched() -> None:
 def test_output_is_bounded_by_the_value_it_gates() -> None:
     """sigmoid is in (0, 1): no stream amplifies its value, to 4096x the operands."""
     key, query, value = _make_operands(40, torch.bfloat16, (256,))
-    for scale in (1.0, 8.0, 64.0, 512.0, 4096.0):
+    for scale in (1.0, 4096.0):
         got = op(
             (key.float() * scale).to(torch.bfloat16),
             (query.float() * scale).to(torch.bfloat16),

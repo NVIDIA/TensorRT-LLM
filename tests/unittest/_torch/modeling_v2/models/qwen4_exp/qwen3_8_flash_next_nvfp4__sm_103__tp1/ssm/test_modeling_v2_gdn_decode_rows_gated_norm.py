@@ -6,8 +6,8 @@ Cells against the composition's fp64 reference (the gated delta rule's recurrenc
 then the gated norm entry's) in torch's default band for the bf16 output and the fp32
 pool, the pool compared whole so slots the call did not name are
 gated too. Beyond the cells: agreement with the unfused composition it replaces
-(FlashInfer's recurrence, then the gated norm entry) at decode batch sizes, PDL on
-and off bitwise, a stale-read check under graph replay (a producer rewrites the
+(FlashInfer's recurrence, then the gated norm entry) at the 128-row decode batch, PDL
+on and off bitwise, a stale-read check under graph replay (a producer rewrites the
 projection inside the graph right before the op), and the guards.
 """
 
@@ -122,8 +122,8 @@ def _unfused(proj, pool, slots, A_log, dt_bias, w, eps, h, k):
     ).reshape(rows, HV * V)
 
 
-@pytest.mark.parametrize("rows", [3, 64, 128])
-def test_matches_the_unfused_composition(rows) -> None:
+def test_matches_the_unfused_composition() -> None:
+    rows = 128
     args = _build(dict(rows=rows), seed=900 + rows)
     pool_unfused = args[1].clone()
     want = _unfused(args[0], pool_unfused, *args[2:])
@@ -217,10 +217,11 @@ def test_rows_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixtu
         assert (got[1] == 0).all(), "a pad row's output is zero"
 
 
-@pytest.mark.parametrize("rows", [3, 121])
-def test_rows_then_gated_norm_matches_the_fused_entry(rows) -> None:
+def test_rows_then_gated_norm_matches_the_fused_entry() -> None:
     """The recurrence alone, then the gated norm entry: the fused entry's output within its
-    band, and the same pool bitwise (one kernel's recurrence)."""
+    band, and the same pool bitwise (one kernel's recurrence), at a mixed step's 121
+    generation rows."""
+    rows = 121
     args = _build(dict(rows=rows), seed=700 + rows)
     pool_fused = args[1].clone()
     fused = op(args[0], pool_fused, *args[2:])

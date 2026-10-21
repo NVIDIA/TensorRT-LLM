@@ -73,48 +73,19 @@ def _operands(
     return pixel_values, weight, bias_t
 
 
-def _build(spec, seed):
-    pixel_values, weight, bias = _operands(
-        spec["num_patches"],
-        dtype=spec["dtype"],
-        seed=seed,
-        in_channels=spec.get("in_channels", IN_CHANNELS),
-        kernel=spec.get("kernel", (KT, KH, KW)),
-        embed_dim=spec.get("embed_dim", EMBED_DIM),
-        bias=spec.get("bias", True),
-    )
-    layout = spec.get("layout", "flat")
-    n, row = pixel_values.shape
-    if layout == "five_d":
-        pixel_values = pixel_values.view(-1, *weight.shape[1:])
-    elif layout == "column_slice":
-        wide = torch.empty(n, 2 * row, device="cuda", dtype=pixel_values.dtype)
-        wide[:, :row] = pixel_values
-        pixel_values = wide[:, :row]
-        assert not pixel_values.is_contiguous() and pixel_values.stride(-1) == 1
-    elif layout == "transposed":
-        pixel_values = pixel_values.t().contiguous().t()
-        assert pixel_values.stride(-1) != 1
-    return pixel_values, weight, bias
-
-
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
-    pixel_values, weight, bias = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
+    spec = cell.spec
+    pixel_values, weight, bias = _operands(
+        spec["num_patches"], dtype=spec["dtype"], seed=zlib.crc32(cell.why.encode())
+    )
     before = pixel_values.clone()
-    previous = torch.backends.cudnn.allow_tf32
-    torch.backends.cudnn.allow_tf32 = False
-    try:
-        out = op(pixel_values, weight, bias)
-    finally:
-        torch.backends.cudnn.allow_tf32 = previous
+    out = op(pixel_values, weight, bias)
     assert out.shape == (pixel_values.shape[0], weight.shape[0])
     assert out.dtype == pixel_values.dtype and out.is_contiguous()
     assert out.data_ptr() != pixel_values.data_ptr()
     assert torch.equal(pixel_values, before), "the pixels are read-only"
-    if not pixel_values.is_contiguous() and pixel_values.stride(-1) == 1:
-        assert torch.equal(out, op(pixel_values.contiguous(), weight, bias))
     _compare(out, op.reference(pixel_values, weight, bias))
 
 

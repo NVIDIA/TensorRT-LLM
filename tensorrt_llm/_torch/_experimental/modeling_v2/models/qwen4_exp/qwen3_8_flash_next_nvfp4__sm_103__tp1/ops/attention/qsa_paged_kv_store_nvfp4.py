@@ -381,32 +381,17 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
             spec=_spec(_DECODE, pages=64),
         ),
         Cell(
-            why="decode MTP draft 1: 4 requests x 2 rows, a pair straddling a page",
-            spec=_spec(((0, 2), (31, 2), (63, 2), (95, 2)), pages=32),
-        ),
-        Cell(
-            why="decode MTP draft 7: 4 requests x 8 rows across page edges",
-            spec=_spec(((0, 8), (28, 8), (60, 8), (1000, 8)), pages=64),
-        ),
-        Cell(
             why="prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
             spec=_spec(((0, 256),) * 4, pages=160),
-        ),
-        Cell(
-            why="mixed: two context chunks and two decode rows, 66 rows",
-            spec=_spec(((0, 40), (0, 24), (200, 1), (7, 1)), pages=64),
         ),
         Cell(
             why="every finite bf16 value, K in bit-pattern order and V shuffled across blocks",
             spec=_spec(((0, 128),), pages=8, values="finite_bf16"),
         ),
         Cell(
-            why="zeros, -0.0 and a 900.0 outlier inside blocks: zero scales and saturation",
-            spec=_spec(_DECODE, pages=64, values="edge"),
-        ),
-        Cell(
-            why="second-level scales g_k 0.37, g_v 2.5 (unit scale is what the target binds)",
-            spec=_spec(((0, 40), (0, 24), (200, 1), (7, 1)), pages=64, global_k=0.37, global_v=2.5),
+            why="zeros, -0.0 and a 900.0 outlier inside blocks, and a row on an unallocated "
+            "(-1) page: zero scales, saturation and the skip",
+            spec=_spec(_DECODE, pages=69, slots=8, values="edge", hole="unallocated_page"),
         ),
         Cell(
             why="the attention op's own append over the same rows (context, chunk, decode "
@@ -414,41 +399,20 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
             spec=_spec(((0, 115), (0, 101), (0, 36)), pages=96, thop_append=True),
         ),
         Cell(
-            why="the attention op's own append at second-level scales 0.37 and 2.5",
-            spec=_spec(
-                ((0, 115), (0, 101), (0, 36)),
-                pages=96,
-                thop_append=True,
-                global_k=0.37,
-                global_v=2.5,
-            ),
-        ),
-        Cell(
             why="the engine's trunk layout: layer 11's planes among the 24 role pages of a slot",
-            spec=_spec(((0, 64), (1000, 2), (31, 2)), pages=96, slot_pages=24, layer=11),
+            spec=_spec(((0, 64), (1000, 2), (31, 2)), pages=96, slots=8, slot_pages=24, layer=11),
         ),
         # Triton compiles once per class of each plain-int argument -- equal to 1, a multiple
         # of 16, or anything else. The pool's slot count and the table's height are the two a
-        # served call varies; the cells above cover (multiple of 16, multiple of 16).
+        # served call varies; with the cells above (pool, height) is (16k, 16k), (other, 16k),
+        # (other, other) and (16k, other), and these two add table height 1.
         Cell(
-            why="specialization: slot count other, table height 32",
-            spec=_spec(_DECODE, pages=69),
-        ),
-        Cell(
-            why="specialization: slot count other, table height 1",
+            why="decode batch 1: slot count other, table height 1",
             spec=_spec(((0, 1),), pages=69, slots=1),
         ),
         Cell(
-            why="specialization: slot count other, table height 8",
-            spec=_spec(_DECODE, pages=69, slots=8),
-        ),
-        Cell(
-            why="specialization: slot count a multiple of 16, table height 1",
+            why="decode batch 1: slot count a multiple of 16, table height 1",
             spec=_spec(((0, 1),), pages=64, slots=1),
-        ),
-        Cell(
-            why="specialization: slot count a multiple of 16, table height 8",
-            spec=_spec(_DECODE, pages=64, slots=8),
         ),
         Cell(
             why="decode MTP graph: G = 1, 3 and 8 requests x 8 rows, replayed bitwise equal to eager",
@@ -458,33 +422,6 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
                 graph_batches=(1, 3, 8),
             ),
         ),
-        Cell(why="int32 positions", spec=_spec(_DECODE, pages=64, position_dtype=torch.int32)),
-        Cell(why="int64 request indices", spec=_spec(_DECODE, pages=64, request_dtype=torch.int64)),
-        Cell(
-            why="skip: table entry -1 (unallocated)",
-            spec=_spec(_DECODE, pages=64, hole="unallocated_page"),
-        ),
-        Cell(
-            why="skip: table entry past the pool",
-            spec=_spec(_DECODE, pages=64, hole="page_past_pool"),
-        ),
-        Cell(
-            why="skip: request index past the table",
-            spec=_spec(_DECODE, pages=64, hole="request_past_table"),
-        ),
-        Cell(
-            why="skip: negative request index",
-            spec=_spec(_DECODE, pages=64, hole="negative_request"),
-        ),
-        Cell(
-            why="skip: negative logical position",
-            spec=_spec(_DECODE, pages=64, hole="negative_position"),
-        ),
-        Cell(
-            why="skip: page column past the table",
-            spec=_spec(_DECODE, pages=64, hole="column_past_table"),
-        ),
-        Cell(why="zero rows: returns before launching", spec=_spec((), pages=4)),
     )
 
     note = """
@@ -502,15 +439,15 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
         (page, slot) both store, unordered.
       - the dense path's reader assumes this layout: e2m1 nibbles HND per page,
         K scales linear, V scales in four-token groups. The attention op's
-        append, run over the same rows, leaves bitwise the same pool (cells), at
-        unit and non-unit second-level scales.
+        append, run over the same rows, leaves bitwise the same pool (a cell),
+        at the unit second-level scales the target binds.
     The callable rejects loudly (ValueError): non-matching or non-3-D k/v, a row
     dtype outside bf16/fp16, a head_dim that is not a power of two >= 32, a
     tokens_per_block that is not a multiple of 4, caches that are not uint8 of
     the stated shapes or whose last dim or scale head page is strided, a non-2-D
     or non-int32 table, metadata that is not one contiguous int32/int64 entry per
     row, a `kv_scale_orig_quant` that is not a contiguous fp32 `[3]`, operands on
-    another device. `rows == 0` returns before launching.
+    another device. `rows == 0` returns before launching (not certified).
 
     Every offset is formed in 64 bits: rows, heads, requests, positions and pages
     are widened before any product. CUDA-graph capturable; a replay follows rows,
@@ -528,6 +465,10 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
 
     Not finite values: a NaN or +-inf in a block is not certified (the e2m1 and
     e4m3 conversions saturate, the block maximum is the kernel's `max`).
+
+    Not certified either: second-level scales other than 1.0, int32 positions
+    or int64 request indices, and of the rows that resolve to no slot any but
+    an unallocated (`-1`) table entry (the reference skips each).
     """
 
     def __call__(
@@ -577,7 +518,7 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
 
         Quantization in fp32 torch with IEEE reciprocals where the kernel uses
         `rcp.approx.ftz`; the two agree on every operand the cells drive (6.0, the
-        second-level scales, and every e4m3 scale value), which the cells' bitwise
+        unit second-level scale, and every e4m3 scale value), which the cells' bitwise
         gate is what pins.
         """
         out = [

@@ -75,9 +75,8 @@ DEV = "cuda"
 DTYPE = torch.bfloat16
 HEADS = (NUM_K_HEADS, HEAD_K_DIM, NUM_V_HEADS, HEAD_V_DIM)
 L2_NORM_EPS = 1e-6
-#: The stock mixer's `z` half of `in_proj_qkvz`, and its `[b|a]` projection width.
+#: The `z` columns of the input projection.
 Z_WIDTH = NUM_V_HEADS * HEAD_V_DIM
-BA_WIDTH = 2 * NUM_V_HEADS
 #: The target's one GDN input-projection output: [q|k|v | z | a | b].
 IN_PROJ_WIDTH = QKV_DIM + Z_WIDTH + 2 * NUM_V_HEADS  # 16480
 
@@ -92,13 +91,7 @@ def _build(spec, seed):
     def randn(*shape):
         return torch.randn(*shape, generator=g, device=DEV).to(DTYPE)
 
-    if layout == "production":
-        mixed = randn(n, QKV_DIM + Z_WIDTH)[:, :QKV_DIM]
-        prefill, decode = mixed[:n_p].t().contiguous(), mixed[n_p:]
-        ba = randn(n, BA_WIDTH)
-        b, a = ba[:, :NUM_V_HEADS], ba[:, NUM_V_HEADS:]
-        assert not decode.is_contiguous() and not a.is_contiguous()
-    elif layout == "in_proj":
+    if layout == "in_proj":
         # `_gdn_block`: one [T, 16480] GEMM output; q|k|v, a and b are its column
         # views, the decode half the row split of q|k|v, the prefill half the
         # transposing extraction of the rest.
@@ -116,11 +109,6 @@ def _build(spec, seed):
         mixed = randn(n, QKV_DIM)
         prefill, decode = mixed[:n_p].t().contiguous(), mixed[n_p:]
         assert decode.stride() == (QKV_DIM, 1) and decode.storage_offset() == n_p * QKV_DIM
-        a, b = randn(n, NUM_V_HEADS), randn(n, NUM_V_HEADS)
-    elif layout == "prefill_view":
-        prefill = randn(n_p, QKV_DIM + Z_WIDTH)[:, :QKV_DIM].t()
-        assert prefill.stride() == (1, QKV_DIM + Z_WIDTH)
-        decode = None
         a, b = randn(n, NUM_V_HEADS), randn(n, NUM_V_HEADS)
     else:
         prefill = randn(QKV_DIM, n_p)

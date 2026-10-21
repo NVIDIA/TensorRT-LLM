@@ -19,9 +19,6 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update as _fused_sigmoid_gating_delta_rule_update,
 )
 
-#: The pool width the bulk of the cells run at, from the old test: a width the
-#: engine never allocates, kept because its cells were certified there.
-SLOTS = 24
 #: A recurrent-pool slot count of a full-size engine run. The kernels address a slot by
 #: its index alone, so a pool of another size (a bf16 pool holds more slots in the same
 #: memory) takes the same path. The target passes the layer's whole pool unsliced.
@@ -29,8 +26,10 @@ ENGINE_SLOTS = 461
 
 
 def _scattered(n_seqs: int) -> tuple[int, ...]:
-    """`n_seqs` distinct engine-pool slots, both ends included."""
-    return ((0, ENGINE_SLOTS - 1) + tuple(i * 13 + 4 for i in range(n_seqs)))[:n_seqs]
+    """`n_seqs` distinct engine-pool slots, both ends first, then a stride-13 walk over the
+    interior (13 is coprime to its `ENGINE_SLOTS - 2` slots)."""
+    rest = tuple((i * 13 + 4) % (ENGINE_SLOTS - 2) + 1 for i in range(max(n_seqs - 2, 0)))
+    return ((0, ENGINE_SLOTS - 1) + rest)[:n_seqs]
 
 
 class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
@@ -72,179 +71,60 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     # contiguous copies | "rows": cu_seqlens None, one token per row, q/k/v
     # [N, 1, heads, 128] views of the packed [N, 10240] block whose token
     # stride is the row stride, and a/b [N, 1, 48] -- the target's bf16 call).
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"target decode call, N={n}, 461-slot pool",
-                spec=dict(
-                    seq_lens=(1,) * n, slots=ENGINE_SLOTS, indices=_scattered(n), ab="separate"
-                ),
-            )
-            for n in (1, 4, 16, 32)
-        )
-        + tuple(
-            Cell(
-                why=f"target decode call, in_proj column views, N={n}",
-                spec=dict(seq_lens=(1,) * n, slots=slots, indices=indices, ab="in_proj"),
-            )
-            for n, slots, indices in (
-                (1, ENGINE_SLOTS, _scattered(1)),
-                (32, ENGINE_SLOTS, _scattered(32)),
-                (128, 128, None),
-            )
-        )
-        + (
-            Cell(
-                why="varlen [3, 5, 1, 7] at the 461-slot pool",
-                spec=dict(seq_lens=(3, 5, 1, 7), slots=ENGINE_SLOTS, indices=_scattered(4)),
-            ),
-            Cell(
-                why="CUDA-graph pad rows (-1) between slot 0 and 460",
-                spec=dict(
-                    seq_lens=(1, 1, 1, 1),
-                    slots=ENGINE_SLOTS,
-                    indices=(0, -1, ENGINE_SLOTS - 1, -1),
-                    ab="separate",
-                ),
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"target bf16 decode call, rows form N={n}, 461-slot pool",
+            spec=dict(
+                seq_lens=(1,) * n,
+                slots=ENGINE_SLOTS,
+                indices=_scattered(n),
+                ab="separate",
+                layout="rows",
+                pool_dtype=torch.bfloat16,
             ),
         )
-        + tuple(
-            Cell(
-                why=f"target bf16 decode call, rows form N={n}, 461-slot pool",
-                spec=dict(
-                    seq_lens=(1,) * n,
-                    slots=ENGINE_SLOTS,
-                    indices=_scattered(n),
-                    ab="separate",
-                    layout="rows",
-                    pool_dtype=torch.bfloat16,
-                ),
-            )
-            for n in (1, 3, 10, 11, 16, 32)
-        )
-        + (
-            Cell(
-                why="bf16 rows form, pad rows (-1) between slot 0 and 460",
-                spec=dict(
-                    seq_lens=(1, 1, 1, 1),
-                    slots=ENGINE_SLOTS,
-                    indices=(0, -1, ENGINE_SLOTS - 1, -1),
-                    ab="separate",
-                    layout="rows",
-                    pool_dtype=torch.bfloat16,
-                ),
+        for n in (1, 32, 128)
+    ) + (
+        Cell(
+            why="bf16 rows form, pad rows (-1) between slot 0 and 460",
+            spec=dict(
+                seq_lens=(1, 1, 1, 1),
+                slots=ENGINE_SLOTS,
+                indices=(0, -1, ENGINE_SLOTS - 1, -1),
+                ab="separate",
+                layout="rows",
+                pool_dtype=torch.bfloat16,
             ),
-            Cell(
-                why="fp32 pool, rows form N=8, 461-slot pool",
-                spec=dict(
-                    seq_lens=(1,) * 8,
-                    slots=ENGINE_SLOTS,
-                    indices=_scattered(8),
-                    ab="separate",
-                    layout="rows",
-                ),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"decode N={n}, one token per sequence, 24 slots",
-                spec=dict(seq_lens=(1,) * n, slots=SLOTS),
-            )
-            for n in (1, 2, 4, 8, 16)
-        )
-        + tuple(
-            Cell(
-                why=f"output= a length-prefix slice of a longer buffer, N={n}",
-                spec=dict(seq_lens=(1,) * n, slots=SLOTS, output="prefix"),
-            )
-            for n in (1, 4, 16)
-        )
-        + (
-            Cell(
-                why="scattered, unsorted slots [17, 3, 0, 11]",
-                spec=dict(seq_lens=(1,) * 4, slots=SLOTS, indices=(17, 3, 0, 11)),
-            ),
-            Cell(
-                why="scattered slots [23, 5]",
-                spec=dict(seq_lens=(1, 1), slots=SLOTS, indices=(23, 5)),
-            ),
-            Cell(
-                why="negative slot indices [2, -1, 5, -1]",
-                spec=dict(seq_lens=(1,) * 4, slots=SLOTS, indices=(2, -1, 5, -1)),
-            ),
-            Cell(
-                why="every slot index negative",
-                spec=dict(seq_lens=(1, 1), slots=SLOTS, indices=(-1, -1)),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"varlen multi-token sequences {list(s)}",
-                spec=dict(seq_lens=s, slots=SLOTS),
-            )
-            for s in ((3, 5), (2, 1, 7, 1), (64, 33))
-        )
-        + (
-            Cell(
-                why="l2norm off, raw single-token q/k (one step cannot amplify)",
-                spec=dict(seq_lens=(1,) * 4, slots=SLOTS, l2norm=False),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"l2norm off, caller-normalized q/k, {list(s)}",
-                spec=dict(seq_lens=s, slots=SLOTS, l2norm=False, normalize_qk=True),
-            )
-            for s in ((3, 5), (2, 1, 7, 1))
-        )
-        + tuple(
-            Cell(
-                why=f"bf16 pool on the Triton branch (T != N), {list(s)}",
-                spec=dict(seq_lens=s, slots=SLOTS, pool_dtype=torch.bfloat16),
-            )
-            for s in ((3, 5), (2, 6))
-        )
-        + (
-            Cell(
-                why="initial_state_source None: zero state, no write-back",
-                spec=dict(seq_lens=(1,) * 4, slots=None),
-            ),
-            Cell(
-                why="pool[layer] of a [layers, slots, HV, V, K] cache",
-                spec=dict(seq_lens=(1,) * 4, slots=SLOTS, layout="layer_view"),
-            ),
-            Cell(
-                why="cu_seqlens None: batched [N, T, ...] layout, N=3, T=4",
-                spec=dict(seq_lens=(4, 4, 4), slots=SLOTS, layout="batched"),
-            ),
-        )
+        ),
+        Cell(
+            why="fp32 pool, in_proj column views, N=128: the block test's reference",
+            spec=dict(seq_lens=(1,) * 128, slots=128, ab="in_proj"),
+        ),
     )
 
     note = """
     Metadata consumed: none.
 
-    Call sites (`_gdn_block` decode), one token per sequence, int32 slots, the
-    layer's whole pool `[slots, 48, 128, 128]` at `mamba_ssm_cache_dtype`:
-    - fp32 pool: `(a_log, a, dt_bias, 1.0, 20.0, q, k, v, b, ssm_states,
-      si_all, None, True, qsl_long, None)` -- q/k/v `[1, T, heads, 128]`
-      reshaped column views of the conv output (read through `stride(1)`, no
-      repack), and `a`/`b`, all column views of the layer's one `[T, 16480]`
-      input-projection output (row stride 16480; the conv wrote q|k|v in
-      place), int64 `cu_seqlens`;
-    - bf16 pool: the rows form, `cu_seqlens` None -- q/k/v `[T, 1, heads,
-      128]` split from the whole `[T, 10240]` block reshaped to `[T, 1, 80,
-      128]`, so the token stride is the row stride (`is_valid` refuses other
-      strides), `a`/`b` `[T, 1, 48]`.
-    Certified at 24 and 461 slots; at 461 output and state are bitwise
-    identical to 24 for the same slot content. The rows form is bitwise the
-    packed Triton call at either pool dtype and runs inside a CUDA graph.
+    Call site (`_gdn_block` decode over a bf16 pool), one token per sequence,
+    int32 slots, the layer's whole pool `[slots, 48, 128, 128]`: the rows form,
+    `cu_seqlens` None -- q/k/v `[T, 1, heads, 128]` split from the whole
+    `[T, 10240]` block reshaped to `[T, 1, 80, 128]`, so the token stride is the
+    row stride (`is_valid` refuses other strides), `a`/`b` `[T, 1, 48]`. The
+    cells drive it at 1, 32 and 128 rows of a 461-slot pool, and with CUDA-graph
+    pad rows (-1). One more cell certifies the packed form the GDN block test
+    uses as its fp32-pool reference: `(a_log, a, dt_bias, 1.0, 20.0, q, k, v,
+    b, ssm_states, si_all, None, True, qsl_long, None)`, q/k/v `[1, T, heads,
+    128]` and `a`/`b` column views of one `[T, 16480]` input-projection output
+    (row stride 16480), int64 `cu_seqlens`, at 128 rows. The rows form is
+    bitwise the packed Triton call at either pool dtype and runs inside a CUDA
+    graph.
 
     Branch: the callable takes a FlashInfer CuTe-DSL kernel
     (`gdn_decode_bf16_state.gated_delta_rule`) when the pool is bf16,
     `cu_seqlens` is given and `T == N` (head dims 128, supported arch);
     everything else runs the vendored Triton kernel, and only the Triton
-    branch is certified. The target's two forms both stay on it, which the
-    test proves with the FlashInfer arm armed to raise. The bf16 call takes
+    branch is certified. The target's rows form and the reference's fp32 packed form both
+    stay on it, which the test proves with the FlashInfer arm armed to raise. The bf16 call takes
     the rows form because FlashInfer is not batch-invariant: at 48 value
     heads it runs one kernel up to N = 10 and another from N = 11, and one
     fixed row's single-step output and state differ between the two, so a
@@ -276,7 +156,9 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
 
     Not certified: the FlashInfer branch, K or V other than 128, fp16/fp32
     operands, an fp16 pool, `softplus_beta`/`softplus_threshold` other than
-    1.0/20.0, `B > 1` with `cu_seqlens`.
+    1.0/20.0, `B > 1` with `cu_seqlens`; the rows form above 32 rows; the packed
+    form over a bf16 pool, with more than one token per sequence, with an
+    `output` buffer, with `l2norm` off, without a pool or on a layer view of one.
 
     Hard limits
       none probed.

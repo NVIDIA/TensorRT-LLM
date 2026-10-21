@@ -424,18 +424,13 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows (1), inject (True), moe (False: shared + gate_logits too), gate
-    # "column" [T, 1] | "flat" [T], fold (0: top-k of the finalize folded in, block_out
-    # then the permuted rows), drop (False: some slots -1), n_cols (324), n_rows (384:
-    # the padded weight), layout ("row_slice": hyper_input a row slice).
+    # spec: rows (1), inject (True), moe (False: shared + gate_logits [T, 1] too), fold
+    # (0: top-k of the finalize folded in, block_out then the permuted rows), drop
+    # (False: some slots -1), n_cols (324). The weight is the target's padded
+    # [width, 384] (columns past n_cols never read).
     CELLS: tuple[Cell, ...] = (
         Cell(why="checkpoint 4x2560, 324 cols of 384, bf16, inject, 1 row", spec=dict(rows=1)),
         Cell(why="MoE combine, [T, 1] gate, 1 row", spec=dict(rows=1, moe=True)),
-        Cell(why="MoE combine, flat [T] gate, 1 row", spec=dict(rows=1, moe=True, gate="flat")),
-        Cell(
-            why="MoE combine into the stack-final mixer: 320 cols",
-            spec=dict(rows=1, moe=True, n_cols=320),
-        ),
         Cell(why="finalize fold, top-10, 1 row (con 1)", spec=dict(rows=1, moe=True, fold=10)),
         Cell(
             why="finalize fold into the stack-final mixer: 320 cols",
@@ -446,9 +441,6 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
             spec=dict(rows=1, moe=True, fold=10, drop=True),
         ),
         Cell(why="norm-only site (stack start / after PLE)", spec=dict(rows=1, inject=False)),
-        Cell(why="stack-final mixer: 320 cols", spec=dict(rows=1, n_cols=320)),
-        Cell(why="hyper_input a row slice buf[::2]", spec=dict(rows=1, layout="row_slice")),
-        Cell(why="unpadded weight [width, 324]", spec=dict(rows=1, n_rows=324)),
     )
 
     note = """
@@ -476,6 +468,9 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
     PDL: with `TRTLLM_ENABLE_PDL` (default on, sm_90+) the weight rows and the norm
     slice stream before `griddepcontrol.wait`, every activation read and every
     write after it, and dependents are released before the wait.
+
+    Not certified: a flat `[T]` gate, a row-slice `hyper_input`, a weight
+    narrower than the padded 384 rows (accepted; no cell drives them).
     """
 
     def __call__(

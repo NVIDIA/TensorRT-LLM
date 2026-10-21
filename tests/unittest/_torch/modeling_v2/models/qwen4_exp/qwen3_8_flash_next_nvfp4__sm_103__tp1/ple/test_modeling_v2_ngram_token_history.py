@@ -69,39 +69,27 @@ def _qsl(lengths, dtype, qsl_from="literal"):
 
 
 def _build(spec, seed):
-    """`(args, backing_pool)`: the op's positional arguments, and the tensor
-    the pool argument views (itself, unless `layout == "pool_view"`)."""
+    """The op's positional arguments for one cell."""
     g = torch.Generator().manual_seed(seed)
-    ngram_size = spec.get("ngram_size", NGRAM)
     lengths = spec["lengths"]
     total = sum(lengths)
     ids = torch.randint(0, CKPT_VOCAB_SIZE, (total,), generator=g, dtype=torch.long)
     density = spec.get("eos_density", 0.0)
     if density > 0.0:
         ids[torch.rand(total, generator=g) < density] = EOS
-    layout = spec.get("layout", "contiguous")
-    pool_rows = spec["pool_slots"] * (2 if layout == "pool_view" else 1)
-    backing = torch.randint(
-        0, CKPT_VOCAB_SIZE, (pool_rows, ngram_size - 1), generator=g, dtype=torch.long
+    pool = torch.randint(
+        0, CKPT_VOCAB_SIZE, (spec["pool_slots"], CONTEXT_LEN), generator=g, dtype=torch.long
     ).to(DEV)
-    pool = backing[::2] if layout == "pool_view" else backing
-    input_ids = ids.to(DEV, spec.get("ids_dtype", torch.int64))
-    if layout == "strided_ids":
-        wide = torch.zeros(2 * total, dtype=input_ids.dtype, device=DEV)
-        wide[::2] = input_ids
-        input_ids = wide[::2]
-        assert input_ids.stride(0) == 2
     index_dtype = spec.get("index_dtype", torch.int32)
-    args = (
-        input_ids,
+    return (
+        ids.to(DEV, spec.get("ids_dtype", torch.int64)),
         pool,
         torch.tensor(spec["slots"], dtype=index_dtype, device=DEV),
         torch.tensor(spec["carries"], dtype=torch.bool, device=DEV),
         _qsl(lengths, spec.get("qsl_dtype", torch.int32), spec.get("qsl_from", "literal")),
         EOS,
-        ngram_size,
+        NGRAM,
     )
-    return args, backing
 
 
 def _expect(args):
@@ -112,9 +100,8 @@ def _expect(args):
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
-    args, backing = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
+    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
     read_only = [a.clone() for a in (args[0], args[2], args[3], args[4])]
-    backing_before = backing.clone()
     pool_before = args[1].clone()
     expected = _expect(args)
     window = op(*args)
@@ -124,8 +111,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     # The whole-pool comparison locks the unnamed slots; this keeps it from
     # being vacuous -- every cell has a sequence that publishes new ids.
     assert not torch.equal(args[1], pool_before), "no slot moved"
-    if cell.spec.get("layout") == "pool_view":
-        assert torch.equal(backing[1::2], backing_before[1::2]), "the view wrote outside itself"
 
 
 # ----------------------------------------------------------- multi-step
@@ -236,7 +221,7 @@ def test_wrong_variants_are_separated() -> None:
         pool_slots=6,
         eos_density=0.08,
     )
-    args, _ = _build(spec, seed=9001)
+    args = _build(spec, seed=9001)
     ids, pool, slots, carries, qsl = args[:5]
     start = pool.clone()
     window = op(*args)
@@ -342,12 +327,10 @@ def test_guard_refuses_a_short_query_start_loc() -> None:
     "index,value,match",
     [
         (1, lambda a: torch.zeros(4, CONTEXT_LEN + 1, dtype=torch.long, device=DEV), "must match"),
-        (1, lambda a: a[1].to(torch.int32), "Index put requires the source and destination"),
         (3, lambda a: a[3].to(torch.int32), "where expected condition to be a boolean"),
-        (2, lambda a: a[2].reshape(-1, 1), "Index is supposed to be an empty tensor or a vector"),
         (6, lambda a: 1, "must match the size of tensor"),
     ],
-    ids=["pool_too_wide", "int32_pool", "int_flags", "2d_state_indices", "ngram_size_1"],
+    ids=["pool_too_wide", "int_flags", "ngram_size_1"],
 )
 def test_loud_refusals_are_not_guarded(index, value, match) -> None:
     args = list(_two_sequences())
@@ -382,7 +365,7 @@ def test_cuda_graph_capture_and_replay() -> None:
         ids_dtype=torch.int32,
         qsl_dtype=torch.int64,
     )
-    args, _ = _build(spec, seed=11001)
+    args = _build(spec, seed=11001)
     start = args[1].clone()
 
     side = torch.cuda.Stream()

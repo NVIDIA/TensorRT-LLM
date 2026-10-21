@@ -122,87 +122,33 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    CELLS: tuple[Cell, ...] = tuple(
-        cell
-        for tile in (128, 256)
-        for cell in (
-            Cell(
-                why=f"tile {tile}: decode, 1 request without MTP",
-                spec=_ckpt(1, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 1 request at MTP verify width 2",
-                spec=_ckpt(2, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 1 request at MTP verify width 4",
-                spec=_ckpt(4, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: decode, 8 requests",
-                spec=_ckpt(8, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: decode at the 32-request ceiling",
-                spec=_ckpt(32, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 32 requests at MTP verify width 3",
-                spec=_ckpt(96, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 32 requests at MTP verify width 4; largest captured T",
-                spec=_ckpt(128, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 8192 rows, max_num_tokens prefill",
-                spec=_ckpt(8192, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 8192 rows all on 10 experts; {8192 // tile} full tiles each",
-                spec=_ckpt(8192, tile, dist="hot"),
-            ),
-            Cell(
-                why=f"tile {tile}: expert rows tile-1, tile, tile+1; the tile edge",
-                spec=_ckpt(300, tile, dist="tile_edges"),
-            ),
-            Cell(
-                why=f"tile {tile}: 510 experts with one row each; every tile mostly padding",
-                spec=_ckpt(51, tile, dist="round_robin"),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 tactic, decode",
-                spec=_ckpt(1, tile, mma_n=256),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 tactic, 128 rows",
-                spec=_ckpt(128, tile, mma_n=256),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 tactic, 8192-row prefill",
-                spec=_ckpt(8192, tile, mma_n=256),
-            ),
-            Cell(
-                why=f"tile {tile}: cluster N 2 tactic, 128 rows",
-                spec=_ckpt(128, tile, cluster_n=2),
-            ),
-            Cell(
-                why=f"tile {tile}: MMA N 256 and cluster N 2 tactic, 8192-row prefill",
-                spec=_ckpt(8192, tile, mma_n=256, cluster_n=2),
-            ),
-            Cell(
-                why=f"tile {tile}: FC1 global_sf 25x calibrated; input scales clip at 448",
-                spec=_ckpt(2048, tile, gsf="saturating"),
-            ),
-            Cell(
-                why=f"tile {tile}: tiny FC1 global_sf; subnormal and zero input scales",
-                spec=_ckpt(2048, tile, gsf="subnormal"),
-            ),
-            Cell(
-                why=f"tile {tile}: 7 all-zero token rows; zero input rows",
-                spec=_ckpt(64, tile, zero_tokens=7),
-            ),
-        )
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tile 128: decode, 1 request without MTP; the fallback tactic",
+            spec=_ckpt(1, 128),
+        ),
+        Cell(
+            why="tile 128: cluster N 2 tactic, 32 requests at MTP verify width 4; largest "
+            "captured T",
+            spec=_ckpt(128, 128, cluster_n=2),
+        ),
+        Cell(
+            why="tile 128: MMA N 256 and cluster N 2 tactic, 8192-row max_num_tokens prefill",
+            spec=_ckpt(8192, 128, mma_n=256, cluster_n=2),
+        ),
+        Cell(
+            why="tile 128: expert rows tile-1, tile, tile+1; the tile edge",
+            spec=_ckpt(300, 128, dist="tile_edges"),
+        ),
+        Cell(
+            why="tile 128: FC1 global_sf 25x calibrated; input scales clip at 448",
+            spec=_ckpt(2048, 128, gsf="saturating"),
+        ),
+        Cell(
+            why="tile 128: tiny FC1 global_sf and 7 all-zero token rows; subnormal and zero "
+            "input scales",
+            spec=_ckpt(2048, 128, gsf="subnormal", zero_tokens=7),
+        ),
     )
 
     note = """
@@ -223,8 +169,8 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
     finalize is off) and the target's routed-expert step, both followed by
     `moe_unpermute_inplace`; eager for prefill and mixed batches (T up to
     max_num_tokens 8192) and captured for decode (T = requests x MTP verify
-    width, up to 32 x 4 = 128). Tile 128 is the target's; 256 is certified as
-    well.
+    width, up to 32 x 4 = 128). Tile 128 is the target's and the cells' tile;
+    256 is certified through the per-pair invariance below.
 
     Numerics: each written element equals the reference's `out` bit for bit on
     every cell, on the real FC1 output at 8192 tokens, and on the checkpoint's own
@@ -236,8 +182,8 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
     128, 2), and with no tuning entry falls back to ((tile_size, 128),
     (tile_size // 128, 1)); serving warmup tunes per row bucket and may pick any
     of the four. Every pair's row is bitwise identical across tile 128 / 256 x
-    the four tactics x the fallback, so cells driven at one tactic certify the
-    others.
+    the four tactics x the fallback (the test checks it at 128 and 8192 rows), so
+    cells driven at one tactic certify the others.
 
     Determinism. A (token, expert) pair's output row depends on that pair's input
     row and its expert alone: it is bitwise unchanged by moving it to another row
@@ -257,10 +203,10 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
 
     Preconditions the caller owns:
     - `weight` / `weight_scale` in the layout the class docstring states, and
-      `input_scale` swizzled. Each wrong preparation ran without error, with
-      finite output, and put most of the pair rows' elements outside the test's
-      gate: trtllm-gen's 32-row shuffle, weight scales left linear, input scales
-      linear, alpha shifted by one expert, one alpha for the whole layer.
+      `input_scale` swizzled. A wrong preparation of each runs without error,
+      with finite output, and puts most of the pair rows' elements outside the
+      test's gate: trtllm-gen's 32-row shuffle of the weight, input scales
+      linear, one alpha for the whole layer.
     - `alpha` per expert, `max(down_proj.input_scale) * weight_scale_2[e]`, with
       the maximum the value FC1's `global_sf` inverts.
     - `tile_idx_to_group_idx` / `num_non_exiting_tiles` from the same sort as

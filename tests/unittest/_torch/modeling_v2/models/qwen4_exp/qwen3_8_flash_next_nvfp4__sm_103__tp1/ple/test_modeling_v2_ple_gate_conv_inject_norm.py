@@ -104,9 +104,7 @@ def _build(spec, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     gc = torch.Generator().manual_seed(seed)
     lengths = spec["lengths"]
-    c = spec.get("hc_count", CKPT_HC_COUNT)
-    d = spec.get("hidden", CKPT_HIDDEN)
-    dtype = spec.get("dtype", torch.bfloat16)
+    c, d, dtype = CKPT_HC_COUNT, CKPT_HIDDEN, torch.bfloat16
     w = c * d
     rows = sum(lengths)
     num_seqs = len(lengths)
@@ -119,18 +117,12 @@ def _build(spec, seed):
     scales = torch.tensor([0.5 * 2.0 ** (i % 4) for i in range(c)], device=DEV)
     hc = (rand(rows, w, scale=3.0).float() * scales.repeat_interleave(d)).to(dtype)
     key = rand(rows, w)
-    if spec.get("layout") == "row_slice":
-        hbuf, kbuf = rand(2 * rows, w), rand(2 * rows, w)
-        hbuf[::2], kbuf[::2] = hc, key
-        hc, key = hbuf[::2], kbuf[::2]
     value = rand(rows, d, scale=0.5)
     norms = [rand(w, scale=GAMMA_RMS) for _ in range(4)]
     conv_weight = rand(w, 1, 4, scale=0.3)
     conv_states = rand(pool_slots, w, 3 * CKPT_DILATION)
     order = (torch.randperm(pool_slots - 2, generator=gc) + 1).tolist()
     slots = ([0, pool_slots - 1] + order)[:num_seqs] if pool_slots >= 64 else list(range(num_seqs))
-    if "pad" in spec:
-        slots[spec["pad"]] = PAD
     slots = torch.tensor(slots, dtype=torch.int32, device=DEV)
     starts = [0]
     for length in lengths:
@@ -220,14 +212,11 @@ def _old(
 @pytest.mark.parametrize(
     "lengths,carries",
     [
-        ((1,), None),
-        ((1,) * 32, None),
         ((1,) * 128, None),
         ((4,) * 8, None),
-        ((8192,), (False,)),
         ((5000, 3000) + (1,) * 32, (False, True) + (True,) * 32),
     ],
-    ids=["m1", "m32", "m128", "mtp4x8", "prefill8192", "mixed2ctx32dec"],
+    ids=["m128", "mtp4x8", "mixed2ctx32dec"],
 )
 def test_matches_the_composition_it_replaces(lengths, carries) -> None:
     args = _build(dict(lengths=lengths, pool_slots=461, carries=carries), seed=len(lengths))

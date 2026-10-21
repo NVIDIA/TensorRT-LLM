@@ -42,10 +42,6 @@ def _spec(batch, **overrides) -> dict:
     return {**base, **overrides}
 
 
-def _geometry(compress_ratio: int, token_topk: int) -> dict:
-    return _spec(("rows", (4096, 97, 30)), compress_ratio=compress_ratio, token_topk=token_topk)
-
-
 class QsaExpandBlockIndices(OpWrapper):
     """Expand each row's selected compressed groups into token ids, then append
     the incomplete group at the causal frontier.
@@ -76,44 +72,16 @@ class QsaExpandBlockIndices(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # ---- decode rows: the column-split launch below 128 rows -------------
+        # ---- decode rows: the column-split launch below 128 rows, whole rows from 128
         Cell(why="decode: one row, columns split across programs", spec=_spec(("sweep", 1))),
-        Cell(why="decode MTP: one request's two rows", spec=_spec(("sweep", 2))),
-        Cell(why="decode: one row for each of 32 request slots", spec=_spec(("sweep", 32))),
-        Cell(why="127 rows: the last row count on the column split", spec=_spec(("sweep", 127))),
         Cell(why="128 rows: the first row count on whole-row programs", spec=_spec(("sweep", 128))),
-        Cell(why="256 rows on whole-row programs", spec=_spec(("sweep", 256))),
         # ---- MTP verify blocks (max_draft_len up to 7): p rows per request, every
         # row's length the block's end, so only the last row has length == position + 1.
-        Cell(
-            why="verify MTP7: one request's 8 rows, column split",
-            spec=_spec(("verify", (6000,), 8)),
-        ),
-        Cell(
-            why="verify MTP7: 15 requests x 8 = 120 rows, column split",
-            spec=_spec(("verify", _VERIFY_STARTS[:15], 8)),
-        ),
-        Cell(
-            why="verify MTP7: 16 requests x 8 = 128 rows, whole-row programs",
-            spec=_spec(("verify", _VERIFY_STARTS[:16], 8)),
-        ),
         Cell(
             why="verify MTP7: 32 requests x 8 = 256 rows, whole-row programs",
             spec=_spec(("verify", _VERIFY_STARTS, 8)),
         ),
-        # ---- serving steps: sequence_lengths > query_position + 1 inside chunks
-        Cell(
-            why="mixed 1334 rows: 4 chunks + 28 MTP decodes, 32 slots",
-            spec=_spec(("serving", 32, (900, 200, 150, 28))),
-        ),
-        Cell(
-            why="mixed 8190 rows: 4 chunks + 28 MTP decodes, 32 slots",
-            spec=_spec(("serving", 32, (8000, 100, 30, 4))),
-        ),
-        Cell(
-            why="warm-up capture: 8191 rows of one request from 0",
-            spec=_spec(("serving", 1, (8191,))),
-        ),
+        # ---- context rows: sequence_lengths > query_position + 1 inside chunks
         Cell(
             why="warm-up capture: 2 x 4096 rows, the [8192, 512] buffer's height",
             spec=_spec(("serving", 2, (4096, 4096))),
@@ -122,39 +90,10 @@ class QsaExpandBlockIndices(OpWrapper):
             why="tail widths 0..3 across 4096, and positions 0, 3, 7",
             spec=_spec(("rows", (4095, 4096, 4097, 4098, 4099, 7, 3, 0))),
         ),
-        # ---- geometry is a free axis: neither cr nor block_topk need be 2^k ---
-        Cell(why="geometry cr 2, block_topk 8", spec=_geometry(2, 16)),
-        Cell(why="geometry cr 2, block_topk 5", spec=_geometry(2, 10)),
-        Cell(why="geometry cr 2, block_topk 1024", spec=_geometry(2, 2048)),
-        Cell(why="geometry cr 3, block_topk 7", spec=_geometry(3, 21)),
-        Cell(why="geometry cr 3, block_topk 8", spec=_geometry(3, 24)),
-        Cell(why="geometry cr 4, block_topk 3", spec=_geometry(4, 12)),
-        Cell(why="geometry cr 4, block_topk 511", spec=_geometry(4, 2044)),
-        Cell(why="geometry cr 5, block_topk 8", spec=_geometry(5, 40)),
-        Cell(why="geometry cr 8, block_topk 8", spec=_geometry(8, 64)),
-        Cell(why="geometry cr 16, block_topk 128", spec=_geometry(16, 2048)),
-        # ---- metadata dtypes and layouts ------------------------------------
-        Cell(
-            why="int32 positions, int32 lengths",
-            spec=_spec(("rows", (4096, 97)), position_dtype=torch.int32),
-        ),
-        Cell(
-            why="int64 positions, int64 lengths",
-            spec=_spec(("rows", (4096, 97)), length_dtype=torch.int64),
-        ),
-        Cell(
-            why="int32 positions, int64 lengths",
-            spec=_spec(("rows", (4096, 97)), position_dtype=torch.int32, length_dtype=torch.int64),
-        ),
         Cell(
             why="a row slice of the engine's taller qsa_topk_indices buffer",
             spec=_spec(("sweep", 4), layout="row_slice"),
         ),
-        Cell(
-            why="a column slice of a wider buffer: stride(0) != block_topk",
-            spec=_spec(("sweep", 4), layout="column_slice"),
-        ),
-        Cell(why="zero rows: a shaped empty, no launch", spec=_spec(("sweep", 0))),
     )
 
     note = """

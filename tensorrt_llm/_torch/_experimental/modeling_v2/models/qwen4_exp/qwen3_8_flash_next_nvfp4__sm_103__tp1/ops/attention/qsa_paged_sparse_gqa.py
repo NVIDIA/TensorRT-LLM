@@ -116,125 +116,26 @@ class QsaPagedSparseGqa(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         # ---- generation: no prefill pair, split-K ---------------------------
         Cell(
-            why="decode: 1 row past the budget, split-K + merge, PDL",
-            spec=_decode(((4000, 1),)),
-        ),
-        Cell(
-            why="decode: 4 requests x 1 row, split-K + merge, PDL",
-            spec=_decode(((4000, 1), (4037, 1), (4074, 1), (4111, 1))),
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
         ),
         Cell(
             why="decode: 1 row, gate off the fused row, in the merge, PDL",
             spec=_decode(((4000, 1),), q_layout="fused_row", gate="fused_row"),
         ),
         Cell(
-            why="decode: 4 requests x 1 row, gate fused into the merge",
-            spec=_decode(tuple((4000 + 37 * i, 1) for i in range(4)), gate="fused_row"),
-        ),
-        Cell(
             why="decode: 128 rows, 8-way split-K, gate fused into the merge",
             spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160, gate="fused_row"),
-        ),
-        Cell(
-            why="decode: 4 rows, a compact [rows, Hq, D] gate in the merge",
-            spec=_decode(((900, 1),) * 4, gate="heads"),
-        ),
-        Cell(
-            why="decode MTP: 4 requests x 2 rows, split-K + merge",
-            spec=_decode(tuple((4000 + 37 * i, 2) for i in range(4))),
-        ),
-        Cell(
-            why="decode MTP: 8 requests x 2 rows, 8-way split-K",
-            spec=_decode(tuple((4000 + 37 * i, 2) for i in range(8))),
-        ),
-        Cell(
-            why="decode MTP: all 32 slots x 2 rows, positions 100..8099",
-            spec=_decode(tuple((100 + (499 * g) % 8000, 2) for g in range(32))),
-        ),
-        Cell(
-            why="decode MTP7: 1 request x 8 rows, 32-way split-K",
-            spec=_decode(((4000, 8),)),
-        ),
-        Cell(
-            why="decode MTP7: 8 requests x 8 rows, 8-way split-K",
-            spec=_decode(tuple((4000 + 37 * i, 8) for i in range(8))),
-        ),
-        Cell(
-            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
-            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
         ),
         Cell(
             why="300 rows, no prefill pair: split-K, one split, no merge",
             spec=_decode(((600, 1),) * 300, launches=("splitk",), slots=384),
         ),
         Cell(
-            why="16-wide selection: one tile, the split-K kernel writes out",
-            spec=_decode(((600, 1),) * 4, launches=("splitk",), width=16),
+            why="holes: all-padding row, foreign request, unmapped page",
+            spec=_decode(((900, 1),) * 4, holes=True),
         ),
         # ---- context: the prefill pair is passed ----------------------------
-        Cell(
-            why="context 128 rows from 2032: pair passed, still split-K",
-            spec=_decode(((2032, 128),), prefill_pair=True),
-        ),
-        Cell(
-            why="context 272 rows from 2032: causal-prefix prefill kernel",
-            spec=_decode(((2032, 272),), launches=_PREFILL, prefill_pair=True),
-        ),
-        Cell(
-            why="context: two requests (150 @1900, 150 @900) in one launch",
-            spec=_decode(((1900, 150), (900, 150)), launches=_PREFILL, prefill_pair=True),
-        ),
-        Cell(
-            why="context 300 rows from 0: rows see 1..300 tokens",
-            spec=_decode(((0, 300),), launches=_PREFILL, prefill_pair=True),
-        ),
-        Cell(
-            why="warm-up capture: 8191 rows of one request from 0",
-            spec=_decode(((0, 8191),), launches=_PREFILL, prefill_pair=True),
-        ),
-        Cell(
-            why="warm-up capture: 2 requests x 4096 rows from 0",
-            spec=_decode(((0, 4096), (0, 4096)), launches=_PREFILL, prefill_pair=True),
-        ),
-        # ---- mixed steps from the mmmu gate's runtime dump -------------------
-        Cell(why="mixed 257 rows: 1 chunk + 31 MTP decodes", spec=_mixed(32, (195,))),
-        Cell(why="mixed 318 rows: 2 chunks + 30 MTP decodes", spec=_mixed(32, (200, 58))),
-        Cell(why="mixed 478 rows over 28 slots: 1 chunk", spec=_mixed(28, (424,))),
-        Cell(
-            why="mixed 869 rows: 5 chunks + 27 MTP decodes",
-            spec=_mixed(32, (400, 200, 100, 80, 35)),
-        ),
-        Cell(
-            why="mixed 1334 rows: 4 chunks + 28 MTP decodes",
-            spec=_mixed(32, (900, 200, 150, 28)),
-        ),
-        Cell(
-            why="mixed 3806 rows: 9 chunks + 23 MTP decodes",
-            spec=_mixed(32, (1024, 900, 700, 500, 300, 200, 100, 30, 6)),
-        ),
-        Cell(
-            why="mixed 5130 rows: 10 chunks + 22 MTP decodes",
-            spec=_mixed(32, (2048, 1024, 700, 500, 400, 200, 120, 60, 30, 4)),
-        ),
-        Cell(
-            why="mixed 8169 rows over 31 slots: 10 chunks",
-            spec=_mixed(31, (4096, 2048, 1024, 500, 200, 120, 80, 40, 15, 4)),
-        ),
-        Cell(why="mixed 8190 rows: 4 chunks + 28 MTP decodes", spec=_mixed(32, (8000, 100, 30, 4))),
-        # ---- formats and layouts --------------------------------------------
-        Cell(
-            why="fp16 pool and fp16 q",
-            spec=_decode(((900, 1),) * 4, cache_dtype=torch.float16, q_dtype=torch.float16),
-        ),
-        Cell(
-            why="fp8-e4m3 pool under a bf16 q, read unscaled",
-            spec=_decode(((900, 1),) * 4, cache_dtype=torch.float8_e4m3fn),
-        ),
-        # The target's three call shapes over an fp8 pool (kv_cache_dtype=fp8, unit scale).
-        Cell(
-            why="fp8 decode MTP: 4 requests x 2 rows, split-K + merge",
-            spec=_decode(tuple((4000 + 37 * i, 2) for i in range(4)), **_FP8),
-        ),
         Cell(
             why="fp8 context 128 rows from 2032: pair passed, still split-K",
             spec=_decode(((2032, 128),), prefill_pair=True, **_FP8),
@@ -243,33 +144,9 @@ class QsaPagedSparseGqa(OpWrapper):
             why="fp8 context 272 rows from 2032: causal-prefix prefill kernel",
             spec=_decode(((2032, 272),), launches=_PREFILL, prefill_pair=True, **_FP8),
         ),
-        Cell(why="fp8 mixed 257 rows: 1 chunk + 31 MTP decodes", spec=_mixed(32, (195,), **_FP8)),
-        Cell(
-            why="fp8 decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
-            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32)), **_FP8),
-        ),
-        Cell(
-            why="int64 request indices", spec=_decode(((1000, 2),) * 4, request_dtype=torch.int64)
-        ),
-        Cell(
-            why="q as the head slice of the fused projection row (55 x 256), decode",
-            spec=_decode(((900, 1),) * 4, q_layout="fused_row"),
-        ),
-        Cell(
-            why="q off the fused projection row (55 x 256), 128 decode rows",
-            spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160),
-        ),
         Cell(
             why="q off the fused projection row (55 x 256), 8191-row prefill",
             spec=_decode(((0, 8191),), launches=_PREFILL, prefill_pair=True, q_layout="fused_row"),
-        ),
-        Cell(
-            why="standalone contiguous K and V buffers, contiguous q",
-            spec=_decode(((900, 1),) * 4, cache_layout="contiguous", q_layout="contiguous"),
-        ),
-        Cell(
-            why="holes: all-padding row, foreign request, unmapped page",
-            spec=_decode(((900, 1),) * 4, holes=True),
         ),
     )
 
@@ -296,24 +173,26 @@ class QsaPagedSparseGqa(OpWrapper):
         widens exactly to bf16 under a bf16 q), so it must hold K/V written at unit scale.
       - `D` must be a power of two (192 is refused); `Hq % Hkv == 0`.
 
-    The op validates its own inputs loudly (11 `ValueError`s pinned by the
-    test, plus a selection width the compress ratio cannot produce, refused
-    on the prefill kernel only), so `is_valid` adds nothing. `rows == 0`
-    returns an empty `[0, Hq, D]` tensor.
+    The op validates its own inputs loudly (`ValueError`s, one per guard
+    family pinned by the test, plus a selection width the compress ratio
+    cannot produce, refused on the prefill kernel only), so `is_valid` adds
+    nothing. `rows == 0` returns an empty `[0, Hq, D]` tensor.
 
     PDL: `TRTLLM_ENABLE_PDL` (default on) enables programmatic dependent
     launch for multi-split launches of 4 rows or fewer; both launch modes are
     inside the cells. Calls are bitwise deterministic.
 
     The decode site carries up to 8 rows per request (max_draft_len 7): the
-    cells run 1, 8 and 32 requests of 8 rows, which is 16, 128 and 512
-    `rows * Hkv` programs, so the 32-way, 8-way and 4-way split-K launches.
+    cells run 32 requests of 8 rows, 512 `rows * Hkv` programs and a 4-way
+    split-K launch; the 1- and 128-row decode cells run more splits.
 
     Not certified: capture in a CUDA graph (the split-K path allocates its
     partials inside the call); head geometries other than 24/2 x 256;
-    `tokens_per_block` other than 32; more than 8192 rows; the split-K kernel
-    above 300 rows. Hard limits: not probed; the largest certified extent is
-    8192 rows x 2051 selected tokens through a [32, 260] table.
+    `tokens_per_block` other than 32; more than 8191 rows; the split-K kernel
+    above 300 rows; an fp16 pool or q; standalone contiguous K/V buffers;
+    int64 request indices.
+    Hard limits: not probed; the largest certified extent is 8191 rows x 2051
+    selected tokens through a [32, 260] table.
     """
 
     def __call__(

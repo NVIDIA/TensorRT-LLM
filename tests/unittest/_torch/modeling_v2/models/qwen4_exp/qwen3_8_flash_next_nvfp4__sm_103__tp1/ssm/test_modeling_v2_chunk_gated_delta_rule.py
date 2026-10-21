@@ -5,7 +5,7 @@
 The first indexed in-place call per autotune key in a process must be as correct as a
 warm one: the state kernel's autotuner restores the indexed state its benchmark launches
 write, and the pool's dtype is part of the key. "First call in the process" is a property
-of the process, so the cold-call tests re-run this file as a child:
+of the process, so the cold-call test re-runs this file as a child:
 `python <this file> <mode>`.
 """
 
@@ -79,8 +79,6 @@ def _operands(
     seed: int,
     batch: int = 1,
     num_tokens: Optional[int] = None,
-    num_k_heads: int = NUM_K_HEADS,
-    num_v_heads: int = NUM_V_HEADS,
     normalize_qk: bool = True,
 ):
     """Operands in the domain the GDN prefill path produces: unit-norm q/k,
@@ -94,29 +92,27 @@ def _operands(
         cu_seqlens = torch.tensor(
             [0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=torch.long, device=DEV
         )
-    shape_qk = (batch, total, num_k_heads, HEAD_K_DIM)
+    shape_qk = (batch, total, NUM_K_HEADS, HEAD_K_DIM)
     q = torch.randn(shape_qk, generator=gen, device=DEV)
     k = torch.randn(shape_qk, generator=gen, device=DEV)
     if normalize_qk:
         q, k = _l2norm(q), _l2norm(k)
     q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
     v = torch.randn(
-        batch, total, num_v_heads, HEAD_V_DIM, generator=gen, device=DEV, dtype=torch.bfloat16
+        batch, total, NUM_V_HEADS, HEAD_V_DIM, generator=gen, device=DEV, dtype=torch.bfloat16
     )
-    a_log = torch.log(torch.rand(num_v_heads, generator=gen, device=DEV) * 15 + 1)
-    dt_bias = torch.randn(num_v_heads, generator=gen, device=DEV)
-    a = torch.randn(batch, total, num_v_heads, generator=gen, device=DEV)
+    a_log = torch.log(torch.rand(NUM_V_HEADS, generator=gen, device=DEV) * 15 + 1)
+    dt_bias = torch.randn(NUM_V_HEADS, generator=gen, device=DEV)
+    a = torch.randn(batch, total, NUM_V_HEADS, generator=gen, device=DEV)
     g = (-torch.exp(a_log) * torch.nn.functional.softplus(a + dt_bias)).float()
-    beta = torch.rand(batch, total, num_v_heads, generator=gen, device=DEV).sigmoid().float()
+    beta = torch.rand(batch, total, NUM_V_HEADS, generator=gen, device=DEV).sigmoid().float()
     return q, k, v, g, beta, cu_seqlens
 
 
-def _pool(
-    num_slots: int, seed: int, num_v_heads: int = NUM_V_HEADS, dtype: torch.dtype = torch.float32
-) -> torch.Tensor:
+def _pool(num_slots: int, seed: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """A recurrent-state pool, `[slots, H, V, K]` (K innermost), at `dtype`."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    shape = (num_slots, num_v_heads, HEAD_V_DIM, HEAD_K_DIM)
+    shape = (num_slots, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM)
     return (torch.randn(shape, generator=gen, device=DEV) * 0.1).to(dtype)
 
 
@@ -288,8 +284,8 @@ def test_gate_discriminates_wrong_variants() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The cold call. The cells above have already benchmarked these autotune keys by
-# the time pytest reaches these, so each runs in a fresh interpreter.
+# The cold call. The cells above have already benchmarked this autotune key by
+# the time pytest reaches it, so it runs in a fresh interpreter.
 
 CHILD_TIMEOUT_S = 420
 #: The GDN prefill call shape, packed varlen, state by slot index.
@@ -331,25 +327,8 @@ def _child_cold_call(pool_dtype: torch.dtype = torch.float32) -> None:
     _gate_pool(args[6], ref)
 
 
-def _child_cold_call_odd_heads() -> None:
-    """A head geometry (5 key / 20 value heads) nothing else uses."""
-    autotuner = _state_kernel_autotuner()
-    assert not autotuner.cache, "the child must be the first indexed call in its process"
-    q, k, v, g, beta, cu = _operands((96,), seed=83, num_k_heads=5, num_v_heads=20)
-    pool = _pool(4, seed=831, num_v_heads=20)
-    indices = torch.tensor([1], dtype=torch.int32, device=DEV)
-    args = (q, k, v, g, beta, None, pool, indices, True, False, cu, False, None)
-    ref = op.reference(*args)
-    o, _ = op(*args)
-    assert len(autotuner.cache) == 1, "the call must have benchmarked exactly one key"
-    _gate_output(o, ref)
-    _gate_pool(pool, ref)
-
-
 _CHILD_MODES = {
-    "cold-call": _child_cold_call,
     "cold-call-bf16-pool": lambda: _child_cold_call(torch.bfloat16),
-    "cold-call-odd-heads": _child_cold_call_odd_heads,
 }
 
 
@@ -373,20 +352,11 @@ def _run_child(mode: str) -> None:
     )
 
 
-def test_cold_indexed_call_at_this_checkpoints_geometry() -> None:
-    """The first indexed call of a process at 16 / 48 heads, K = V = 128, in the
-    mixer's shape (256 + 96 packed, by slot, into `output=`), matches the reference."""
-    _run_child("cold-call")
-
-
 def test_cold_indexed_call_over_a_bf16_pool() -> None:
-    """The same call over a bf16 pool, the autotune key an fp32 pool never touches."""
+    """The first indexed call of a process at 16 / 48 heads, K = V = 128, over a bf16
+    pool, in the mixer's shape (256 + 96 packed, by slot, into `output=`), matches the
+    reference."""
     _run_child("cold-call-bf16-pool")
-
-
-def test_cold_indexed_call_at_an_unused_head_geometry() -> None:
-    """The same at 5 / 20 heads, an autotune key nothing else here touches."""
-    _run_child("cold-call-odd-heads")
 
 
 if __name__ == "__main__":

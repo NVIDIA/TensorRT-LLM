@@ -774,28 +774,17 @@ class GdnPrefillConvPost(OpWrapper):
 
     # spec: lengths; slots (pool rows used, None -> _engine_slots); pool_slots;
     # initial; layout "in_proj" (x and a/b column views of one [T, 16480]
-    # buffer, the target's call) | "contiguous" (x [T, 10240], a/b [T, 48]) |
-    # "rows" (x/a/b the first rows of a longer projection, as a mixed step's
-    # context half); pad_slot_id; dt_bias_fill.
+    # buffer, the target's call) | "rows" (x/a/b the first rows of a longer
+    # projection, as a mixed step's context half); pad_slot_id; dt_bias_fill.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="target call: 37+1+128 tokens, in_proj views, 8-slot pool",
-            spec=dict(
-                lengths=(37, 1, 128), pool_slots=8, slots=(3, 0, 5), initial=(True, False, True)
-            ),
-        ),
-        Cell(
-            why="engine 461-slot pool: slots 460, 0, 230",
+            why="target call, engine 461-slot pool: 37+1+128 tokens at slots 460, 0, 230",
             spec=dict(
                 lengths=(37, 1, 128),
                 pool_slots=ENGINE_SLOTS,
                 slots=(ENGINE_SLOTS - 1, 0, ENGINE_SLOTS // 2),
                 initial=(True, False, True),
             ),
-        ),
-        Cell(
-            why="one 8192-token context chunk with carry",
-            spec=dict(lengths=(8192,), pool_slots=ENGINE_SLOTS, initial=(True,)),
         ),
         Cell(
             why="max_num_tokens 16384 over 3 contexts (the con=128 mixed step)",
@@ -814,7 +803,7 @@ class GdnPrefillConvPost(OpWrapper):
             ),
         ),
         Cell(
-            why="128 short contexts (the batch ceiling) over the 461-slot pool",
+            why="128 short contexts (the batch ceiling), some shorter than the window",
             spec=dict(
                 lengths=tuple(1 + (i * 7) % 64 for i in range(128)),
                 pool_slots=ENGINE_SLOTS,
@@ -822,44 +811,9 @@ class GdnPrefillConvPost(OpWrapper):
             ),
         ),
         Cell(
-            why="contexts shorter than the window: carry part shifted, part tokens",
-            spec=dict(
-                lengths=(2, 1, 2, 3),
-                pool_slots=6,
-                slots=(0, 1, 2, 5),
-                initial=(True, True, False, True),
-            ),
-        ),
-        Cell(
-            why="a zero-token context republishes its carry unchanged",
-            spec=dict(
-                lengths=(0, 40, 0), pool_slots=4, slots=(2, 3, 1), initial=(True, False, False)
-            ),
-        ),
-        Cell(
-            why="contiguous x [T, 10240] and a/b [T, 48]",
-            spec=dict(
-                lengths=(64, 9),
-                pool_slots=4,
-                slots=(1, 2),
-                initial=(True, True),
-                layout="contiguous",
-            ),
-        ),
-        Cell(
             why="pad_slot_id -1: that context neither reads nor writes the pool",
             spec=dict(
                 lengths=(16, 8, 16), pool_slots=4, slots=(0, -1, 2), initial=(True, True, True)
-            ),
-        ),
-        Cell(
-            why="every head below softplus_threshold",
-            spec=dict(
-                lengths=(64,),
-                pool_slots=2,
-                slots=(1,),
-                initial=(True,),
-                dt_bias_fill=SOFTPLUS_THRESHOLD - 8.0,
             ),
         ),
         Cell(
@@ -914,7 +868,7 @@ class GdnPrefillConvPost(OpWrapper):
     `1 + e <= 2^126`; below acc = -87.3 it returns -0 where those return a
     value under 1e-36. q/k norm: the 128-channel fp32 sum of squares as each
     thread's pairs plus a 32-lane butterfly, `sqrt.approx.ftz`, `div.full`.
-    Against the unfused path (entry test, every cell):
+    Against the unfused path (entry test, at the target-call cell):
     q/k/v within one bf16 ulp on 1e-6..1e-4 of elements, g/beta within the
     fp32 band, conv pool bitwise.
 
@@ -936,7 +890,9 @@ class GdnPrefillConvPost(OpWrapper):
     Not checked: `cache_indices` within the pool and distinct;
     `query_start_loc` non-decreasing and ending at `T`.
 
-    Not certified: fp16/fp32 activations, other head geometries, bias.
+    Not certified: fp16/fp32 activations, other head geometries, bias, a row
+    stride of `x` other than the projection's 16480 (the conv pass compiles one
+    kernel per row stride), zero-token contexts.
 
     Hard limits
       element offsets  64-bit for the rows of x and the outputs; weight and

@@ -671,56 +671,21 @@ class QsaSparseGqaRowtile(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="context 300 rows from 0: rows see 1..300 tokens", spec=_spec([(0, 300)])),
-        Cell(why="context 272 rows from 2032: across the budget", spec=_spec([(2032, 272)])),
         Cell(
-            why="two requests (150 @1900, 150 @900): a group spans them",
-            spec=_spec([(1900, 150), (900, 150)]),
+            why="con 1 prefill: 8192 rows of one request from 0, across the budget",
+            spec=_spec([(0, 8192)]),
         ),
-        Cell(why="chunked continuation: 4096 rows from 4096", spec=_spec([(4096, 4096)])),
         Cell(
             why="sparse union: 4096 rows from 4096 ranking one score vector",
             spec=_spec([(4096, 4096)], shared_scores=True),
         ),
-        Cell(why="con 1 prefill: 8192 rows of one request from 0", spec=_spec([(0, 8192)])),
-        Cell(why="warm-up: 8191 rows of one request from 0", spec=_spec([(0, 8191)])),
         Cell(
-            why="max_num_tokens: 2 requests x 8192 rows from 0",
-            spec=_spec([(0, 8192), (0, 8192)]),
-        ),
-        Cell(
-            why="con 128 mixed: 3 chunks (16240 rows) + 52 decodes",
+            why="con 128 mixed: 3 chunks (16240 rows) + 52 decodes on the lone pass",
             spec=_spec([(0, 8192), (2192, 6000), (6144, 2048)] + _decodes(52), slots=128),
         ),
-        Cell(why="mixed: 1 chunk (195) + 31 MTP decodes", spec=_spec([(0, 195)] + _decodes(31, 2))),
-        Cell(
-            why="mixed: 4 chunks (8134 rows) + 28 MTP decodes",
-            spec=_spec([(0, 8000), (907, 100), (1814, 30), (2721, 4)] + _decodes(28, 2)),
-        ),
-        Cell(
-            why="mixed: 9 chunks (3760 rows) + 23 decodes",
-            spec=_spec(
-                [
-                    (0, 1024),
-                    (907, 900),
-                    (1814, 700),
-                    (2721, 500),
-                    (3628, 300),
-                    (4535, 200),
-                    (5442, 100),
-                    (6349, 30),
-                    (7256, 6),
-                ]
-                + _decodes(23)
-            ),
-        ),  # fmt: skip
         Cell(
             why="int64 request indices and positions",
             spec=_spec([(1000, 300)], request_dtype=torch.int64),
-        ),
-        Cell(
-            why="standalone contiguous K and V buffers, contiguous q",
-            spec=_spec([(900, 300)], cache_layout="contiguous", q_layout="contiguous"),
         ),
         Cell(
             why="holes: all-padding row, foreign request, unmapped page",

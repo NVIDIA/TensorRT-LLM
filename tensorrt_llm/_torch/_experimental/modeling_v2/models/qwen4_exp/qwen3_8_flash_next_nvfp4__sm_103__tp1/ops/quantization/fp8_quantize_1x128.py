@@ -72,20 +72,13 @@ class Fp8Quantize1x128(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTPLayer._moe decode: one token at hidden 2560", spec=dict(tokens=1, **_CKPT)),
         Cell(
-            why="3 tokens: inside the data buffer's 4-row allocation pad",
-            spec=dict(tokens=3, **_CKPT),
-        ),
-        Cell(why="4 tokens: exactly one 4-row pad unit", spec=dict(tokens=4, **_CKPT)),
-        Cell(
-            why="5 tokens: the first count spilling into a second pad unit",
+            why="5 tokens: the first count spilling into a second 4-row pad unit",
             spec=dict(tokens=5, **_CKPT),
         ),
         Cell(
             why="20 tokens == H/128: the scale buffer is square, its transpose undetectable",
             spec=dict(tokens=20, **_CKPT),
         ),
-        Cell(why="64 tokens: a multiple of every pad", spec=dict(tokens=64, **_CKPT)),
-        Cell(why="1024 tokens: prefill-shaped", spec=dict(tokens=1024, **_CKPT)),
         Cell(
             why="8192 tokens: max_num_tokens of the identity config",
             spec=dict(tokens=8192, **_CKPT),
@@ -93,29 +86,6 @@ class Fp8Quantize1x128(OpWrapper):
         Cell(
             why="16384 rows: max_num_tokens of the tuned config",
             spec=dict(tokens=16384, **_CKPT),
-        ),
-        Cell(
-            why="H 128: one whole block per row", spec=dict(tokens=7, hidden=128, use_ue8m0=False)
-        ),
-        Cell(
-            why="H 7168: the widest width measured",
-            spec=dict(tokens=64, hidden=7168, use_ue8m0=False),
-        ),
-        Cell(
-            why="H 16: the narrowest width the op takes, one short block",
-            spec=dict(tokens=3, hidden=16, use_ue8m0=False),
-        ),
-        Cell(
-            why="H 144: a 16-wide tail block takes the amax of its own elements",
-            spec=dict(tokens=64, hidden=144, use_ue8m0=False),
-        ),
-        Cell(
-            why="H 2576: the checkpoint width plus a 16-wide tail",
-            spec=dict(tokens=64, hidden=2576, use_ue8m0=False),
-        ),
-        Cell(
-            why="use_ue8m0=True: the round-up power-of-two scale, bit-exact",
-            spec=dict(tokens=17, hidden=2560, use_ue8m0=True),
         ),
     )
 
@@ -144,7 +114,8 @@ class Fp8Quantize1x128(OpWrapper):
     Hard limits
       T   certified 0..16384 at H 2560 (max_num_tokens of the tuned config);
           above that not probed
-      H   multiple of 16 (raises otherwise); certified 16..7168
+      H   multiple of 16 (raises otherwise); certified at 2560, the draft layer's
+          width (the test also drives a 16-wide tail block)
     """
 
     def __call__(

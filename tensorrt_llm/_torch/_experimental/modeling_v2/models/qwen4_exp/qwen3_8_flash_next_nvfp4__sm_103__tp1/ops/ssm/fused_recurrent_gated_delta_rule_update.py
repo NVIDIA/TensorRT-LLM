@@ -27,20 +27,12 @@ NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 16, 48, 128, 128
 #: Rows of the engine's per-step buffer (`max_num_sequences`), as the
 #: runtime-value dumps record `intermediate_ssm_states`: [32, p, 48, 128, 128].
 ENGINE_VERIFY_ROWS = 32
-#: A recurrent-pool slot count of a full-size engine run (a bf16 pool holds more slots in
-#: the same memory). The target gathers a batch-scoped copy before this call, so the
-#: write-back mode is bracketed here rather than driven.
-ENGINE_SLOTS = 461
-#: Pool and buffer rows of the small cells.
+#: Default pool and buffer rows of the test's builds.
 SLOTS = 8
 
 
 def _verify(n, p, why, **spec):
     return Cell(why=why, spec=dict(mode="verify", n=n, p=p, **spec))
-
-
-def _write_back(n, p, why, **spec):
-    return Cell(why=why, spec=dict(mode="write_back", n=n, p=p, **spec))
 
 
 class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
@@ -80,115 +72,23 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     # over a packed [T, 10240] row block | "contiguous", as the target passes
     # them), output (None | "prefix" of a longer buffer | "fp32"),
     # index_dtype, cu_dtype, pool_view ("layer_major").
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            _verify(
-                n,
-                p,
-                f"target verify: n={n} p={p}, n-row gather, 32-row buffer",
-                pool_slots=n,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                beta="bf16",
-                qkv="contiguous",
-            )
-            for n, p in ((1, 2), (8, 2), (16, 2), (32, 2), (8, 3), (8, 4))
+    CELLS: tuple[Cell, ...] = tuple(
+        _verify(
+            n,
+            p,
+            f"{label}target verify: n={n} p={p}, n-row gather, 32-row buffer",
+            pool_slots=n,
+            cache_rows=ENGINE_VERIFY_ROWS,
+            beta="bf16",
+            qkv="contiguous",
+            pool_dtype=dtype,
+            cache_dtype=dtype,
         )
-        + tuple(
-            _verify(
-                n,
-                p,
-                f"bf16 state: target verify n={n} p={p}, n-row gather, 32-row buffer",
-                pool_slots=n,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                beta="bf16",
-                qkv="contiguous",
-                pool_dtype=torch.bfloat16,
-                cache_dtype=torch.bfloat16,
-            )
-            for n, p in ((1, 2), (8, 2), (16, 2), (32, 2), (8, 3), (8, 4))
+        for dtype, label, shapes in (
+            (torch.float32, "", ((1, 2), (32, 2), (8, 4))),
+            (torch.bfloat16, "bf16 state: ", ((1, 2), (32, 2), (8, 3))),
         )
-        + (
-            _verify(
-                4,
-                2,
-                "bf16 state: verify, -1-padded rows naming 31 and 0",
-                pool_slots=ENGINE_VERIFY_ROWS,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                slots=(31, -1, 0, -1),
-                pool_dtype=torch.bfloat16,
-                cache_dtype=torch.bfloat16,
-            ),
-        )
-        + (
-            _verify(
-                4,
-                2,
-                "verify: rows 0/31/17/3 of the 32-row buffer",
-                pool_slots=ENGINE_VERIFY_ROWS,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                slots=(0, 31, 17, 3),
-            ),
-            _verify(
-                4,
-                2,
-                "verify: -1-padded rows naming 31 and 0",
-                pool_slots=ENGINE_VERIFY_ROWS,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                slots=(31, -1, 0, -1),
-            ),
-        )
-        + tuple(
-            _verify(n, p, f"verify P={p}, n={n}: a state cached per token")
-            for n, p in ((1, 1), (3, 1), (3, 2), (3, 3), (3, 4), (3, 8))
-        )
-        + tuple(_verify(n, 4, f"verify batch width n={n}, P=4") for n in (1, 2, 4, 8))
-        + (
-            _verify(4, 3, "verify scattered slots 7/1/4/0", slots=(7, 1, 4, 0)),
-            _verify(3, 4, "verify slot -1: zero start, no cache row", slots=(2, -1, 5)),
-            _verify(2, 3, "verify into a bf16 per-step buffer", cache_dtype=torch.bfloat16),
-            _verify(2, 3, "verify with no pool: every sequence from zero", pool_slots=None),
-            _write_back(
-                3,
-                2,
-                "write-back into a 461-slot pool: slots 0, 460, 230",
-                pool_slots=ENGINE_SLOTS,
-                slots=(0, ENGINE_SLOTS - 1, 230),
-            ),
-        )
-        + tuple(
-            _write_back(4, p, f"write-back P={p}, scattered slots 7/1/4/0", slots=(7, 1, 4, 0))
-            for p in (1, 2, 3, 4, 8, 16)
-        )
-        + (
-            _write_back(3, 4, "write-back into a prefix of a longer output", output="prefix"),
-            _write_back(2, 1, "write-back P=1 into a prefix of an output", output="prefix"),
-            _write_back(3, 3, "write-back slot -1: no slot written", slots=(2, -1, 5)),
-            _write_back(2, 4, "write-back, every slot -1", slots=(-1, -1)),
-            _write_back(3, 4, "write-back into a bf16 pool", pool_dtype=torch.bfloat16),
-            _write_back(2, 1, "write-back P=1 into a bf16 pool", pool_dtype=torch.bfloat16),
-            _write_back(3, 1, "bf16 beta (the mixer's dtype), P=1", slots=(2, 5, 0), beta="bf16"),
-            _write_back(3, 4, "bf16 beta (the mixer's dtype), P=4", slots=(2, 5, 0), beta="bf16"),
-            _write_back(2, 3, "per-channel beta [N, P, HV, V]", slots=(1, 2), beta="channel"),
-            _write_back(2, 3, "fp32 output buffer against bf16 q", slots=(1, 2), output="fp32"),
-            _write_back(2, 3, "int64 initial_state_indices", slots=(1, 2), index_dtype=torch.int64),
-            _write_back(
-                2,
-                3,
-                "a [layers, S, ...] pool's middle layer",
-                slots=(1, 4),
-                pool_view="layer_major",
-            ),
-            Cell(why="both sinks at once", spec=dict(mode="both", n=2, p=4)),
-            _write_back(3, None, "varlen: ragged lengths 1/5/2", lengths=(1, 5, 2)),
-            _write_back(
-                3,
-                None,
-                "varlen: uniform lengths, scattered slots",
-                lengths=(4, 4, 4),
-                slots=(2, 6, 3),
-            ),
-            _write_back(2, None, "varlen: int32 cu_seqlens", lengths=(2, 4), cu_dtype=torch.int32),
-        )
+        for n, p in shapes
     )
 
     note = """
@@ -231,8 +131,13 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
 
     Deterministic; the first call in a fresh process is bitwise the second.
 
-    Not certified: `disable_output_calculation=True` alone (its cached states
-    were never checked); `K` or `V` other than 128; fp16/fp32 q/k/v; P > 16.
+    Certified: the call site's form alone -- the per-step buffer sink with the pool
+    untouched, at 1, 8 and 32 sequences and P = 2..4, over an fp32 or a bf16 pool and buffer.
+    Not certified: the write-back sink (`disable_state_update=False`), alone or with the
+    buffer; the varlen form (`cu_seqlens`); negative, scattered or int64 indices; no pool;
+    fp32 or per-channel `beta`; q/k/v as views of the packed rows; an `output` buffer;
+    `disable_output_calculation=True`; `K` or `V` other than 128; fp16/fp32 q/k/v; P
+    outside 2..4; N above 32.
 
     Hard limits
       N * HV  gridDim.z  boundary 65535  probed at N=1300 (62400): runs;

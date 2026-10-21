@@ -96,13 +96,13 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0)
 
 
-@pytest.mark.parametrize("gated", [True, False])
-def test_matches_the_composition(gated) -> None:
-    args = _build(dict(pos=(8700,), gated=gated), seed=91)
+def test_matches_the_composition() -> None:
+    """One representative gated decode row; the composition is certified on its own."""
+    args = _build(dict(pos=(8700,), gated=True), seed=91)
     got = op(*args)
     want = qsa_paged_sparse_gqa(**_kw(args))
     assert_within_ulp(got, want, element_ulp=4.0, rms_ulp=2.0)
-    print(f"\n  gated={gated}: bitwise the composition's {(got == want).float().mean().item():.4f}")
+    print(f"\n  bitwise the composition's {(got == want).float().mean().item():.4f}")
 
 
 def _replays_like_eager(step, refresh) -> None:

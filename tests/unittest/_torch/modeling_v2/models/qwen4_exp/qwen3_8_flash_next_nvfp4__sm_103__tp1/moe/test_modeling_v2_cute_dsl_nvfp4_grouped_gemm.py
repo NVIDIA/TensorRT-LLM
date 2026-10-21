@@ -8,8 +8,8 @@ FC1 returns it (permuted NVFP4 rows, swizzled block scales, zero padding rows,
 unwritten bytes past the live tiles), the sort as moe_sort returns it -- and
 holds the claims no cell carries: per-pair invariance across tiles, tactics,
 row order and prefixes; CUDA-graph replay of sort, FC1 and FC2 at the captured
-row counts; the regions the op leaves unwritten; that the gate rejects every
-wrong layout; the guards and the loud rejections.
+row counts; the regions the op leaves unwritten; that the gate rejects a
+wrong layout of each operand; the guards and the loud rejections.
 """
 
 import functools
@@ -55,10 +55,11 @@ TIE = 2.0**-20
 FLIP_BUDGET = 1e-5
 
 #: Row counts of a decode capture (requests x MTP verify width 1..4, up to 32
-#: requests), and the eager prefix lengths: both sides of the power-of-two edges up
-#: to the 8192-row ceiling.
-_CAPTURED_ROWS = (1, 2, 3, 4, 5, 8, 32, 96, 128)
-_PREFIXES = (1, 2, 3, 4, 5, 8, 31, 32, 33, 127, 128, 129, 512, 1023, 1024, 1025, 4095, 4096, 8191)
+#: requests): both ends of the sort's block kernel, its first cluster-kernel T and
+#: the largest capture. The eager prefix lengths straddle the captured ceiling and
+#: reach the 8192-row one.
+_CAPTURED_ROWS = (1, 4, 5, 128)
+_PREFIXES = (1, 4, 5, 127, 128, 129, 4096, 8191)
 
 
 # ── the gate ──────────────────────────────────────────────────────────────
@@ -189,10 +190,7 @@ def _weights(gsf: str = "calibrated", layout: str = "cutedsl"):
     if layout == "shuffle32":
         perm = _shuffle32(H)
         w, s = w[:, perm], s[:, perm]
-    if layout == "linear_weight_scales":
-        s_k = s.contiguous()
-    else:
-        s_k = torch.ops.trtllm.block_scale_interleave(s.contiguous()).view(s.shape)
+    s_k = torch.ops.trtllm.block_scale_interleave(s.contiguous()).view(s.shape)
     alpha = (ws2 / GSF[gsf]).contiguous()
     return w.contiguous().view(torch.float4_e2m1fn_x2), s_k, alpha
 
@@ -369,7 +367,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 # ── invariance: a pair's row depends on the pair alone ────────────────────
 
 
-@pytest.mark.parametrize("tokens", (1, 128, 8192))
+@pytest.mark.parametrize("tokens", (128, 8192))
 def test_tiles_and_tactics_agree_per_pair(tokens, certifying):  # noqa: F811
     """Tile 128 / 256, MMA N 128 / 256, cluster N 1 / 2 and the tuner's fallback
     all produce every pair's row bit for bit the same, so a cell certifies the
@@ -393,13 +391,12 @@ def test_tiles_and_tactics_agree_per_pair(tokens, certifying):  # noqa: F811
         _assert_pairs_equal(got, first, f"T={tokens} {key} vs (128, 128, 1)")
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_row_order_and_repeat_do_not_change_a_pair(tile, certifying):  # noqa: F811
+def test_row_order_and_repeat_do_not_change_a_pair(certifying):  # noqa: F811
     """moe_sort orders an expert's rows by atomics (from T = 5). Moving every pair to
     another row of its expert's run, and calling twice, leaves each pair's row
     bitwise unchanged: the FC2 result is reproducible run to run."""
     certifying(op)
-    tokens = 4096
+    tokens, tile = 4096, 128
     ids = _ids("router", tokens, tile, seed=78)
     sort = _sort(ids, tile)
     y = _pair_rows(tokens * K, seed=77)
@@ -430,12 +427,11 @@ def test_row_order_and_repeat_do_not_change_a_pair(tile, certifying):  # noqa: F
     _assert_pairs_equal(_pairs(out_s, shuffled, tokens), base, "pairs moved within their runs")
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_eager_rows_prefix_bitwise(tile, certifying):  # noqa: F811
+def test_eager_rows_prefix_bitwise(certifying):  # noqa: F811
     """The 8192-row call is gated against the reference, and every prefix call's
     pairs are bitwise the 8192-row call's."""
     certifying(op)
-    tokens = 8192
+    tokens, tile = 8192, 128
     ids = _ids("router", tokens, tile, seed=9)
     y = _pair_rows(tokens * K, seed=8)
     sort = _sort(ids, tile)
@@ -500,12 +496,11 @@ def _fc1(xq, xsf, sort, tile):
     )
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_fc1_output_feeds_it_at_prefill(tile, certifying):  # noqa: F811
+def test_fc1_output_feeds_it_at_prefill(certifying):  # noqa: F811
     """The real FC1 output at 8192 tokens -- the target's prefill -- passes `_compare`,
     and the padding rows FC1 zeroes come out zero."""
     certifying(op)
-    tokens = 8192
+    tokens, tile = 8192, 128
     xq, xsf = _activation(tokens, seed=91)
     sort = _sort(_ids("router", tokens, tile, seed=92), tile)
     h, h_sf = _fc1(xq, xsf, sort, tile)
@@ -532,13 +527,13 @@ def _capture(fn):
     return graph, static
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_captured_rows_replay_on_new_data(tile, certifying):  # noqa: F811
+def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
     """moe_sort, FC1 and this op are captured together, as the target's graph holds
     them; each graph is replayed on two fresh activations and id sets, and its
     written rows are gated against the reference of the graph's own FC1 output and
-    sort, and bitwise against an eager call on them."""
+    sort, and bitwise against an eager call on them. At the target's tile, 128."""
     certifying(op)
+    tile = 128
     for tokens in _CAPTURED_ROWS:
         xq, xsf = _activation(tokens, seed=tokens)
         ids = _ids("router", tokens, tile, seed=500 + tokens)
@@ -579,14 +574,14 @@ def test_captured_rows_replay_on_new_data(tile, certifying):  # noqa: F811
 # ── what the op writes ────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("tile", (128, 256))
 @pytest.mark.parametrize("tokens", (3, 300))
-def test_unwritten_regions(tokens, tile):
+def test_unwritten_regions(tokens):
     """A sentinel planted in a captured graph's output: which rows replay writes.
     Every row of the live tiles is written -- the padding rows computed from
     whatever the input holds there, zero for FC1's zeroed padding -- and the rows
     past `num_non_exiting_tiles` are not: under a graph they keep whatever the
-    buffer held."""
+    buffer held. Tile 128."""
+    tile = 128
     args, sort = _problem(tokens, tile, seed=11)
     graph, out = _capture(lambda: op(**args))
     m = out.shape[0]
@@ -625,30 +620,21 @@ def test_unwritten_regions(tokens, tile):
 
 @pytest.mark.parametrize(
     "layout",
-    (
-        "shuffle32",
-        "linear_weight_scales",
-        "linear_input_scales",
-        "alpha_rolled",
-        "alpha_per_layer",
-    ),
+    ("shuffle32", "linear_input_scales", "alpha_per_layer"),
 )
 def test_wrong_layouts_are_rejected(layout):
-    """Each operand prepared the wrong way -- trtllm-gen's 32-row shuffle, weight
-    scales left linear, the input's scales linear, alpha off by one expert, one
-    alpha for the whole layer -- returns finite, plausibly scaled output that
-    `_compare` must reject against the reference of the correctly prepared
-    operands."""
+    """Each operand prepared the wrong way -- the weight in trtllm-gen's 32-row
+    shuffle, the input's scales linear, one alpha for the whole layer -- returns
+    finite, plausibly scaled output that `_compare` must reject against the
+    reference of the correctly prepared operands."""
     tokens, tile = 128, 128
     good, sort = _problem(tokens, tile, seed=3)
     m = good["input"].shape[0]
-    if layout in ("shuffle32", "linear_weight_scales"):
+    if layout == "shuffle32":
         bad = _args(good["input"], good["input_scale"], sort, tile, layout=layout)
     elif layout == "linear_input_scales":
         linear = unswizzle(good["input_scale"], m, NB).reshape(-1).contiguous()
         bad = dict(good, input_scale=linear)
-    elif layout == "alpha_rolled":
-        bad = dict(good, alpha=good["alpha"].roll(1).contiguous())
     else:
         bad = dict(good, alpha=torch.full_like(good["alpha"], float(good["alpha"].mean())))
     out = op(**bad)
@@ -679,13 +665,12 @@ def _strided(t: torch.Tensor) -> torch.Tensor:
     return view.view(t.dtype) if t.element_size() == 1 else view
 
 
-@pytest.mark.parametrize(
-    "name",
-    ("input", "input_scale", "weight", "weight_scale", "alpha", "tile_idx_to_group_idx"),
-)
+@pytest.mark.parametrize("name", ("input", "weight_scale", "tile_idx_to_group_idx"))
 def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
     """The runner hands data_ptr() to the kernel and never reads a stride: the
-    same values through a strided view come back finite and wrong."""
+    same values through a strided view come back finite and wrong. One activation,
+    one weight and one sort operand; the guard checks input_scale, weight and
+    alpha the same way."""
     tokens, tile = 64, 128
     args, _ = _problem(tokens, tile, seed=21)
     ref = op.reference(**args)

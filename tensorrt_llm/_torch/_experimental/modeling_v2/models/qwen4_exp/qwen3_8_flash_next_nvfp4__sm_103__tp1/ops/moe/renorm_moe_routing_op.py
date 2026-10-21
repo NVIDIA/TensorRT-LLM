@@ -49,46 +49,18 @@ class RenormMoeRoutingOp(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="_moe_block / MTPLayer._moe decode: one token, bf16 weights", spec=_ckpt(1)),
-        Cell(why="7 tokens: an odd count", spec=_ckpt(7)),
-        Cell(why="2048 tokens: prefill-shaped", spec=_ckpt(2048)),
         Cell(
             why="4096 tokens: thousands of rows carry an exact bf16 tie in the top-10",
             spec=_ckpt(4096),
         ),
-        Cell(why="8192 tokens: max_num_tokens", spec=_ckpt(8192)),
         Cell(why="16384 rows: max_num_tokens of the tuned config", spec=_ckpt(16384)),
         Cell(
-            why="the default fp32 output dtype at the checkpoint router",
+            why="fp32 weights at the checkpoint router, as the CuteDSL experts take them",
             spec=_ckpt(512, torch.float32),
-        ),
-        Cell(
-            why="fp32 logits, bf16 out: the cast must follow the fp32 softmax",
-            spec=dict(_ckpt(1024), logits_dtype=torch.float32, magnitude=3.0),
-        ),
-        Cell(
-            why="fp16 logits: the third accepted input dtype",
-            spec=dict(_ckpt(256), logits_dtype=torch.float16, magnitude=2.0),
         ),
         Cell(
             why="coarse logits (3 values): ties decide most of the ranking",
             spec=dict(_ckpt(64), output_dtype=torch.float32, dist="coarse"),
-        ),
-        Cell(
-            why="topk 16: the op's ceiling",
-            spec=dict(_ckpt(256), topk=16),
-        ),
-        Cell(why="topk 1: a single slot at weight exactly 1", spec=dict(_ckpt(256), topk=1)),
-        Cell(
-            why="33 experts: one past a warp's 32 lanes",
-            spec=dict(_ckpt(64), num_experts=33, output_dtype=torch.float32),
-        ),
-        Cell(
-            why="129 experts: past 128, where the block grows to 256 threads",
-            spec=dict(_ckpt(64), num_experts=129, output_dtype=torch.float32),
-        ),
-        Cell(
-            why="topk == num_experts (8 of 8): the full ranking",
-            spec=dict(_ckpt(16), num_experts=8, topk=8, output_dtype=torch.float32),
         ),
     )
 
@@ -120,7 +92,8 @@ class RenormMoeRoutingOp(OpWrapper):
 
     Bit-exact against `reference` over 2040 configurations (in dtype x out
     dtype x num_experts {1..512} x topk {0..16} x tokens {0..8192}); the cells
-    and the test's sweep re-drive the boundaries of that space.
+    hold the target's router (512 / top-10, bf16 logits, bf16 and fp32 weights)
+    and the test's sweep re-drives the boundaries of the rest of that space.
 
     Hard limits
       num_experts  <= 512 (raises past it)

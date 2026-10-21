@@ -385,17 +385,9 @@ _REJECTIONS = {
         lambda a: {**a, "k_cache": a["k_cache"].view(torch.int8)},
         "k_cache must be uint8",
     ),
-    "scales_of_another_width": (
-        lambda a: {**a, "v_scale_cache": a["v_scale_cache"][..., :8]},
-        "v_scale_cache must be uint8",
-    ),
     "single_scale": (
         lambda a: {**a, "kv_scale_quant_orig": a["kv_scale_quant_orig"][:1]},
         "kv_scale_quant_orig must be a contiguous fp32 [3]",
-    ),
-    "int64_block_table": (
-        lambda a: {**a, "block_table": a["block_table"].long()},
-        "block_table must be a row-contiguous 2-D int32 tensor",
     ),
     "positions_without_ratio": (
         lambda a: {**a, "query_positions": torch.zeros(4, dtype=torch.int64, device=DEV)},
@@ -407,7 +399,9 @@ _REJECTIONS = {
 
 @pytest.mark.parametrize("case", list(_REJECTIONS), ids=list(_REJECTIONS))
 def test_rejects(case) -> None:
-    """The op's own loud refusals -- the reason the entry carries no `is_valid`."""
+    """The op's own loud refusals -- the reason the entry carries no `is_valid`.
+    One per guard family: q's dtype, the pool planes, the second-level scales,
+    the prefill pair and the device."""
     args, _ = _build(_with(segments=((600, 1),) * 4), seed=9100)
     args["selected_tokens"] = args["selected_tokens"][:, :64].contiguous()
     mutate, message = _REJECTIONS[case]

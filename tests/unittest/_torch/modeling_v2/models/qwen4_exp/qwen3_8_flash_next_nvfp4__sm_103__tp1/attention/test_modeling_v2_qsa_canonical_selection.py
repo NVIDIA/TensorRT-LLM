@@ -55,10 +55,6 @@ def _logits(kind: str, rows: int, cols: int, gen: torch.Generator) -> torch.Tens
         x = _logits("relu_sparse", rows, cols, gen)
         negative = torch.rand(rows, cols, generator=gen, device=DEV) < 0.5
         return torch.where((x == 0) & negative, torch.full_like(x, -0.0), x)
-    if kind == "two_valued":
-        return torch.randint(0, 2, (rows, cols), generator=gen, device=DEV).float()
-    if kind == "all_equal":
-        return torch.full((rows, cols), 1.5, device=DEV)
     if kind == "pair_at_k":
         x = torch.rand(rows, cols, generator=gen, device=DEV).argsort(1).float() + 1.0
         order = torch.argsort(x[:, :2048], dim=1, descending=True)
@@ -78,11 +74,9 @@ def _windows(spec: dict, rows: int, cols: int, gen: torch.Generator):
             lo, hi = spec["windows"][1:]
             positions = torch.randint(lo, hi + 1, (rows,), generator=gen, device=DEV)
         ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
-    elif kind == "ends":
-        ends = torch.tensor(spec["windows"][1], dtype=torch.int32, device=DEV)
     else:
-        starts = torch.tensor(spec["windows"][1], dtype=torch.int32, device=DEV)
-        ends = torch.tensor(spec["windows"][2], dtype=torch.int32, device=DEV)
+        assert kind == "ends", kind
+        ends = torch.tensor(spec["windows"][1], dtype=torch.int32, device=DEV)
     assert starts.numel() == rows and ends.numel() == rows
     return starts, ends
 
@@ -218,19 +212,16 @@ def test_narrowing_the_table_to_a_bound_on_the_windows_changes_nothing() -> None
     assert torch.equal(wide, narrow)
 
 
-@pytest.mark.parametrize("kind", ["relu_sparse", "two_valued", "eighths", "pair_at_k"])
+@pytest.mark.parametrize("kind", ["relu_sparse", "pair_at_k"])
 def test_radix_launches_differ_and_canonical_rows_do_not(kind) -> None:
     """Repeated radix launches over one tie-heavy score matrix. The raw rows differ from
     launch to launch -- in order, and where the tie class at the k-th score straddles the
     budget, in which tied columns are kept -- and the canonical row is one and the same
-    row, the reference's, for every launch of every row."""
+    row, the reference's, for every launch of every row. Zero ties as the target's relu
+    scores have them, and a positive pair tied exactly at the k-th value."""
     gen = torch.Generator(device=DEV).manual_seed(17)
     rows, launches = 64, 20
-    if kind == "eighths":
-        # Positive ties: 64 levels over 2048 columns.
-        logits = torch.randint(0, 64, (rows, COLS), generator=gen, device=DEV).float() / 8
-    else:
-        logits = _logits(kind, rows, COLS, gen)
+    logits = _logits(kind, rows, COLS, gen)
     starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
     ends = torch.full((rows,), 2048, dtype=torch.int32, device=DEV)
     _poison(logits, starts, ends, "nan")

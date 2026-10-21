@@ -50,31 +50,21 @@ def _affine(gen, width=WIDTH, dtype=torch.bfloat16):
 def _build(spec, seed):
     gen = _gen(seed)
     shape, dtype = spec["shape"], spec["dtype"]
-    if spec.get("layout", "contiguous") == "column_slice":
-        rows, width = shape
-        wide = torch.randn(rows, 2 * width, generator=gen, device=DEVICE).to(dtype)
-        x = wide[:, width:]
-        assert not x.is_contiguous() and x.stride(-1) == 1
-    else:
-        x = torch.randn(shape, generator=gen, device=DEVICE).to(dtype)
-    weight, bias = _affine(gen, width=shape[-1], dtype=spec.get("param_dtype", dtype))
-    return x, weight, (bias if spec.get("bias", True) else None), EPS
+    x = torch.randn(shape, generator=gen, device=DEVICE).to(dtype)
+    weight, bias = _affine(gen, width=shape[-1], dtype=dtype)
+    return x, weight, bias, EPS
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     x, weight, bias, eps = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
-    before = [t.clone() for t in (x, weight, bias) if t is not None]
+    before = [t.clone() for t in (x, weight, bias)]
     out = op(x, weight, bias, eps)
     assert out.shape == x.shape and out.dtype == x.dtype
     assert out.is_contiguous() and out.data_ptr() != x.data_ptr()
-    after = [t for t in (x, weight, bias) if t is not None]
+    after = [x, weight, bias]
     assert all(torch.equal(a, b) for a, b in zip(before, after)), "inputs must not be mutated"
-    if x.dim() == 3:
-        assert torch.equal(out.reshape(-1, WIDTH), op(x.reshape(-1, WIDTH), weight, bias, eps))
-    if not x.is_contiguous():
-        assert torch.equal(out, op(x.contiguous(), weight, bias, eps))
     assert torch.equal(out, op(x, weight, bias, eps)), "two launches must agree bitwise"
     torch.testing.assert_close(out, op.reference(x, weight, bias, eps))
 

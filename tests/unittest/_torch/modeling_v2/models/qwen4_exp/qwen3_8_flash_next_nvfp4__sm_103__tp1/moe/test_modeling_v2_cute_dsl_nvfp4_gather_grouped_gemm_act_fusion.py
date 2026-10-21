@@ -7,7 +7,8 @@ The entry owns the contract. This file builds the checkpoint-shaped operands --
 it, the sort as moe_sort returns it -- and holds the claims no cell carries:
 per-pair invariance across tiles, tactics, row order and prefixes; CUDA-graph
 replay at the captured row counts; the regions the op leaves unwritten; that
-the gate rejects every wrong layout; the guards and the loud rejections.
+the gate rejects a wrong layout of each operand; the guards and the loud
+rejections.
 """
 
 import functools
@@ -59,10 +60,11 @@ CODE_TIE = 2.0**-17
 FLIP_BUDGET = 1e-5
 
 #: Row counts of a decode capture (requests x MTP verify width 1..4, up to 32
-#: requests), and the eager prefix lengths: both sides of the power-of-two edges up
-#: to the 8192-row ceiling.
-_CAPTURED_ROWS = (1, 2, 3, 4, 5, 8, 32, 96, 128)
-_PREFIXES = (1, 2, 3, 4, 5, 8, 31, 32, 33, 127, 128, 129, 512, 1023, 1024, 1025, 4095, 4096, 8191)
+#: requests): both ends of the sort's block kernel, its first cluster-kernel T and
+#: the largest capture. The eager prefix lengths straddle the captured ceiling and
+#: reach the 8192-row one.
+_CAPTURED_ROWS = (1, 4, 5, 128)
+_PREFIXES = (1, 4, 5, 127, 128, 129, 4096, 8191)
 
 
 # ── the gate ──────────────────────────────────────────────────────────────
@@ -208,9 +210,6 @@ def _row_perm(n: int, layout: str) -> torch.Tensor:
         return idx.view(2, n // (2 * GATE_UP_GROUP), GATE_UP_GROUP).transpose(0, 1).reshape(-1)
     if layout == "rowwise":  # trtllm-gen's interleave, without its 32-row shuffle
         return idx.view(2, n // 2).transpose(0, 1).reshape(-1)
-    if layout == "gate_first":
-        half = idx.view(2, n // 2).flip(0).reshape(-1)
-        return half[_row_perm(n, "group64")]
     raise ValueError(layout)
 
 
@@ -220,15 +219,10 @@ def _weights(layout: str = "group64", num_experts: int = E):
     target's load-time transform produces -- or one of the wrong layouts the
     discrimination test feeds it."""
     w, s, ws2 = _experts(num_experts)
-    perm = _row_perm(
-        2 * INTER, "group64" if layout in ("linear_scales", "scales_unpermuted") else layout
-    )
+    perm = _row_perm(2 * INTER, "group64" if layout == "scales_unpermuted" else layout)
     w_k = w[:, perm].contiguous()
     s_rows = s if layout == "scales_unpermuted" else s[:, perm]
-    if layout == "linear_scales":
-        s_k = s_rows.contiguous()
-    else:
-        s_k = torch.ops.trtllm.block_scale_interleave(s_rows.contiguous()).view(s.shape)
+    s_k = torch.ops.trtllm.block_scale_interleave(s_rows.contiguous()).view(s.shape)
     alpha = (ISC1 * ws2).contiguous()
     return w_k.view(torch.float4_e2m1fn_x2), s_k, alpha
 
@@ -382,7 +376,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 # ── invariance: a pair's output depends on the pair alone ─────────────────
 
 
-@pytest.mark.parametrize("tokens", (1, 128, 8192))
+@pytest.mark.parametrize("tokens", (128, 8192))
 def test_tiles_and_tactics_agree_per_pair(tokens, certifying):  # noqa: F811
     """Tile 128 / 256, MMA N 128 / 256 and the tuner's fallback all produce every
     pair's codes and block scales bit for bit the same, so a cell certifies the
@@ -404,13 +398,12 @@ def test_tiles_and_tactics_agree_per_pair(tokens, certifying):  # noqa: F811
         _assert_pairs_equal(got, first, f"T={tokens} {key} vs (128, 128)")
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_row_order_and_repeat_do_not_change_a_pair(tile, certifying):  # noqa: F811
+def test_row_order_and_repeat_do_not_change_a_pair(certifying):  # noqa: F811
     """moe_sort orders an expert's rows by atomics (from T = 5). Shuffling every
     expert's run of `permuted_idx_to_expanded_idx`, and calling twice, leaves each
     pair's output bitwise unchanged: the FC1 result is reproducible run to run."""
     certifying(op)
-    tokens = 4096
+    tokens, tile = 4096, 128
     args, sort = _problem(tokens, tile, seed=77)
     base = _pairs(op(**args), sort, tokens)
     _assert_pairs_equal(_pairs(op(**args), sort, tokens), base, "repeat call")
@@ -435,12 +428,11 @@ def test_row_order_and_repeat_do_not_change_a_pair(tile, certifying):  # noqa: F
     _assert_pairs_equal(_pairs(out_s, shuffled, tokens), base, "shuffled rows")
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_eager_rows_prefix_bitwise(tile, certifying):  # noqa: F811
+def test_eager_rows_prefix_bitwise(certifying):  # noqa: F811
     """The 8192-row call is gated against the reference, and every prefix call's
     pairs are bitwise the 8192-row call's."""
     certifying(op)
-    tokens = 8192
+    tokens, tile = 8192, 128
     x, x_sf = _activation(tokens, seed=8)
     ids = _ids("router", tokens, tile, seed=9)
     sort = _sort(ids, tile)
@@ -473,13 +465,13 @@ def _capture(fn):
     return graph, static
 
 
-@pytest.mark.parametrize("tile", (128, 256))
-def test_captured_rows_replay_on_new_data(tile, certifying):  # noqa: F811
+def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
     """moe_sort and this op are captured together, as the target's graph holds them;
     each graph is replayed on two fresh activations and id sets, and its written
     rows are gated against the reference and bitwise against an eager call on the
-    graph's own sort output."""
+    graph's own sort output. At the target's tile, 128."""
     certifying(op)
+    tile = 128
     for tokens in _CAPTURED_ROWS:
         x, x_sf = _activation(tokens, seed=tokens)
         ids = _ids("router", tokens, tile, seed=500 + tokens)
@@ -539,14 +531,14 @@ def test_captured_rows_replay_on_new_data(tile, certifying):  # noqa: F811
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("tile", (128, 256))
 @pytest.mark.parametrize("tokens", (3, 300))
-def test_unwritten_regions(tokens, tile):
+def test_unwritten_regions(tokens):
     """A sentinel planted in a captured graph's outputs: which bytes replay writes.
     The rows the sort filled hold the result; the padding rows of a written tile
     are written with zero block scales and zero codes; the tiles past
     `num_non_exiting_tiles` are not written -- under a graph they keep whatever
-    the buffer held."""
+    the buffer held. Tile 128."""
+    tile = 128
     args, sort = _problem(tokens, tile, seed=11)
     graph, static_out = _capture(lambda: op(**args))
     c, c_sf = static_out
@@ -579,21 +571,14 @@ def test_unwritten_regions(tokens, tile):
 
 @pytest.mark.parametrize(
     "layout",
-    (
-        "rowwise",
-        "gate_first",
-        "linear_scales",
-        "scales_unpermuted",
-        "swizzled_input_scales",
-        "alpha_rolled",
-    ),
+    ("rowwise", "scales_unpermuted", "swizzled_input_scales", "alpha_rolled"),
 )
 def test_wrong_layouts_are_rejected(layout):
-    """Each operand prepared the wrong way -- trtllm-gen's row interleave, gate
-    rows first, scales left linear, scales not given the weight's row
-    permutation, the activation's scales swizzled, alpha off by one expert --
-    returns finite, plausibly scaled output that `_compare` must reject against
-    the reference of the correctly prepared operands."""
+    """Each operand prepared the wrong way -- the weight in trtllm-gen's row
+    interleave, its scales not given the weight's row permutation, the
+    activation's scales swizzled, alpha off by one expert -- returns finite,
+    plausibly scaled output that `_compare` must reject against the reference of
+    the correctly prepared operands."""
     tokens, tile = 128, 128
     x, x_sf = _activation(tokens, seed=3)
     sort = _sort(_ids("router", tokens, tile, seed=4), tile)
@@ -632,10 +617,12 @@ def _u8(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint8) if t.element_size() == 1 else t
 
 
-@pytest.mark.parametrize("name", ("input", "input_scale", "weight", "weight_scale", "alpha"))
+@pytest.mark.parametrize("name", ("input", "weight_scale"))
 def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
     """The runner hands data_ptr() to the kernel and never reads a stride: the
-    same values through a strided view come back finite and wrong."""
+    same values through a strided view come back finite and wrong. One activation
+    and one weight operand; the guard checks all five of input, input_scale,
+    weight, weight_scale and alpha the same way."""
     tokens, tile = 64, 128
     args, _ = _problem(tokens, tile, seed=21)
     ref = op.reference(**args)

@@ -59,89 +59,24 @@ class ResetRecurrentStateRows(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: slots (pool rows), indices, flags, index_dtype (int32), flag_dtype
-    # (bool), rec_dtype (fp32), conv (True), rec_shape/conv_shape (checkpoint),
-    # layout: "plain" | "row_padding" (stride(0) > row) | "layer_view"
-    # (pool[1] of a [3, slots, ...] allocation); `indices="perm"` is a random
-    # permutation of every slot with random flags.
+    # spec: slots (pool rows), indices, flags (bool), index_dtype (int32),
+    # rec_dtype (fp32), conv (True), layout: "plain" | "row_padding"
+    # (stride(0) > row) | "layer_view" (pool[1] of a [3, slots, ...] allocation).
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="checkpoint geometry prefill batch, mixed flags",
-            spec=dict(slots=6, indices=(3, 0, 5, 1), flags=(False, True, False, True)),
-        ),
-        Cell(
-            why="engine pool 461, 4 requests, slot 460 reset",
-            spec=_engine_case(4, flip=False),
-        ),
-        Cell(
             why="engine pool 461, 32 requests, slot 460 reset",
-            spec=_engine_case(32, flip=False),
-        ),
-        Cell(
-            why="engine pool 461, 32 requests, slot 0 reset",
             spec=_engine_case(32, flip=True),
-        ),
-        Cell(
-            why="bf16 recurrent pool 461, 4 requests, slot 0 reset",
-            spec=dict(_engine_case(4, flip=False), rec_dtype=torch.bfloat16),
         ),
         Cell(
             why="bf16 recurrent pool 461, 32 requests, slot 0 reset",
             spec=dict(_engine_case(32, flip=False), rec_dtype=torch.bfloat16),
         ),
         Cell(
-            why="bf16 recurrent pool 461, 32 requests, flags flipped: slot 460 reset",
-            spec=dict(_engine_case(32, flip=True), rec_dtype=torch.bfloat16),
-        ),
-        Cell(
-            why="every request continues: pools bitwise unchanged",
-            spec=dict(slots=6, indices=(0, 1, 2, 3, 4, 5), flags=(True,) * 6),
-        ),
-        Cell(
-            why="one named slot; the other five untouched",
-            spec=dict(slots=6, indices=(2,), flags=(False,)),
-        ),
-    )
-    CELLS += tuple(
-        Cell(
-            why=f"negative and out-of-range slots skipped, {str(d)[6:]}",
-            spec=dict(slots=6, indices=(-1, 6, 23, -99999, 2), flags=(False,) * 5, index_dtype=d),
-        )
-        for d in (torch.int32, torch.int64)
-    )
-    CELLS += tuple(
-        Cell(
-            why=f"index dtype {str(d)[6:]} widened after the load",
-            spec=dict(slots=4, indices=(1,), flags=(False,), index_dtype=d),
-        )
-        for d in (torch.int8, torch.int16, torch.int64, torch.uint8)
-    )
-    CELLS += tuple(
-        Cell(
-            why=f"flag dtype {str(d)[6:]}: a nonzero test, not a low bit",
+            why="negative and out-of-range slots skipped, int32",
             spec=dict(
-                slots=4,
-                indices=(0, 1, 2, 3),
-                flags=(0, 1, 1, 1) if d is torch.bool else (0, 1, 2, 3),
-                flag_dtype=d,
+                slots=6, indices=(-1, 6, 23, -99999, 2), flags=(False,) * 5, index_dtype=torch.int32
             ),
-        )
-        for d in (torch.bool, torch.uint8, torch.int32, torch.int64, torch.float32)
-    )
-    CELLS += (
-        Cell(
-            why="conv_states omitted: that pool is not touched",
-            spec=dict(slots=6, indices=(4,), flags=(False,), conv=False),
         ),
-    )
-    CELLS += tuple(
-        Cell(
-            why=f"slot named twice, flags {flags}",
-            spec=dict(slots=6, indices=(2, 2), flags=flags),
-        )
-        for flags in ((False, True), (True, False), (True, True))
-    )
-    CELLS += (
         Cell(
             why="stride(0) > row size: the padding lane untouched",
             spec=dict(slots=6, indices=(1,), flags=(False,), conv=False, layout="row_padding"),
@@ -150,36 +85,14 @@ class ResetRecurrentStateRows(OpWrapper):
             why="pool[layer] of a [layers, slots, ...] allocation",
             spec=dict(slots=4, indices=(2, 0), flags=(False, True), layout="layer_view"),
         ),
-        Cell(
-            why="empty batch launches nothing",
-            spec=dict(slots=6, indices=(), flags=()),
-        ),
-    )
-    CELLS += tuple(
-        Cell(
-            why=f"recurrent pool {str(d)[6:]} (--mamba_ssm_cache_dtype)",
-            spec=dict(slots=3, indices=(1,), flags=(False,), rec_dtype=d),
-        )
-        for d in (torch.bfloat16, torch.float16)
-    )
-    CELLS += (
-        Cell(
-            why="conv row wider than the recurrent row",
-            spec=dict(slots=3, indices=(1,), flags=(False,), rec_shape=(8,), conv_shape=(5000,)),
-        ),
-        Cell(
-            why="64-slot random permutation: slot-indexed, not position-indexed",
-            spec=dict(slots=64, indices="perm", flags="random"),
-        ),
     )
 
     note = """
     Metadata consumed: none. At the call site `state_indices` /
     `has_initial_states` are the context prefix of `Mamba2Metadata`'s int32 /
     bool buffers, and the pools are the layer's views of the cache manager's
-    `[layers, slots, ...]` allocations, passed unsliced. Certified at 3..64
-    and 461 slots; at 461 the result is bitwise identical to the 64-slot
-    result for the same slot content.
+    `[layers, slots, ...]` allocations, passed unsliced. Certified at 4, 6
+    and 461 slots, over an fp32 and a bf16 recurrent pool.
 
     Loud, from the callable itself (ValueError): an empty recurrent pool, conv
     and recurrent slot counts differing (the in-range test uses the recurrent

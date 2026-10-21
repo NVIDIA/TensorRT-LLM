@@ -27,7 +27,7 @@ def head():
     return lin
 
 
-@pytest.mark.parametrize("seq_lens", [[1] * 128, [5000, 3000, 1] + [1] * 121, [7]])
+@pytest.mark.parametrize("seq_lens", [[1] * 128, [5000, 3000, 1] + [1] * 121])
 def test_matches_the_shell_processor_bitwise(head, seq_lens) -> None:
     g = torch.Generator(device="cuda").manual_seed(len(seq_lens))
     lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")

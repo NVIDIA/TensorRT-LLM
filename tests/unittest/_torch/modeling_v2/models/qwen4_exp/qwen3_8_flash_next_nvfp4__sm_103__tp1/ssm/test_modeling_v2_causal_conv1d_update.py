@@ -138,63 +138,40 @@ def _small(**overrides):
     return _build(spec, seed=14)[0]
 
 
+#: One metadata violation per family the op checks: the conv width, the slot
+#: indices, the operand dtypes.
 _REJECTIONS = {
-    "width_1": (
-        "causal_conv1d only supports width between 2 and 4",
-        dict(dim=128, width=1, state_len=1),
-    ),
     "width_5": (
         "causal_conv1d only supports width between 2 and 4",
         dict(dim=128, width=5, state_len=4),
     ),
-    "state_too_short": ("conv_state_len >= width - 1", dict(state_len=2)),
-    "indices_length": ("conv_state_indices must have shape", None),
     "indices_int64": ("conv_state_indices.scalar_type", None),
-    "indices_non_contiguous": ("is_contiguous", None),
-    "cache_seqlens_int64": ("cache_seqlens.scalar_type", None),
-    "no_indices_oversize_pool": ("conv_state must have shape", dict(slots=None)),
-    "weight_shape": ("weight must have shape", None),
-    "conv_state_dtype": ("conv_state.scalar_type", None),
     "weight_dtype": ("weight type must equal to input type", None),
-    "bias_dtype": ("bias.scalar_type", None),
-    "float64": ("input_type == at::ScalarType::Float", None),
 }
 
 
 @pytest.mark.parametrize("case", sorted(_REJECTIONS))
-def test_op_rejects_every_metadata_violation_loudly(case: str) -> None:
-    """Why the entry has no `is_valid`: every metadata violation probed raises."""
+def test_op_rejects_metadata_violations_loudly(case: str) -> None:
+    """Why the entry has no `is_valid`: the op raises on metadata violations
+    itself (one probe per family here)."""
     fragment, overrides = _REJECTIONS[case]
     args = _small(**(overrides or {}))
-    if case == "indices_length":
-        args[6] = args[6][:3]
-    elif case == "indices_int64":
+    if case == "indices_int64":
         args[6] = args[6].long()
-    elif case == "indices_non_contiguous":
-        args[6] = torch.arange(8, dtype=torch.int32, device="cuda")[::2]
-    elif case == "cache_seqlens_int64":
-        args[5] = torch.zeros(4, dtype=torch.int64, device="cuda")
-    elif case == "weight_shape":
-        args[2] = torch.randn(256, 4, dtype=torch.bfloat16, device="cuda")
-    elif case == "conv_state_dtype":
-        args[1] = args[1].float()
     elif case == "weight_dtype":
         args[2] = args[2].float()
-    elif case == "bias_dtype":
-        args[3] = torch.randn(512, dtype=torch.float32, device="cuda")
-    elif case == "float64":
-        args[0], args[1], args[2] = args[0].double(), args[1].double(), args[2].double()
     with pytest.raises(RuntimeError, match=fragment.replace("(", r"\(").replace(")", r"\)")):
         with validating(op):
             op(*args)
 
 
-@pytest.mark.parametrize("rows", [64, 121, 128])
-def test_decode_rows_match_the_trtllm_kernel_bitwise(rows: int) -> None:
-    """From 64 rows the decode shape runs the CuTe kernel: x and the whole pool
-    bitwise what `torch.ops.trtllm.causal_conv1d_update` leaves, a pad row untouched.
+def test_decode_rows_match_the_trtllm_kernel_bitwise() -> None:
+    """From 64 rows the decode shape runs the CuTe kernel: at that boundary x and
+    the whole pool are bitwise what `torch.ops.trtllm.causal_conv1d_update` leaves,
+    a pad row untouched.
     x is the q|k|v column view of an in_proj output; the pool a per-layer view of a
     two-layer buffer, as the engine hands both over."""
+    rows = 64
     g = torch.Generator(device="cuda").manual_seed(rows)
     dim = 10240
     proj = torch.randn(rows, dim + _IN_PROJ_TAIL, generator=g, device="cuda").to(torch.bfloat16)

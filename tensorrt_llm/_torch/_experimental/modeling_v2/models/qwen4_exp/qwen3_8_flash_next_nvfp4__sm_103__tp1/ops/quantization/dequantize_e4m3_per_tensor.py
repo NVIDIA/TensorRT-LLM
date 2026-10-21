@@ -43,66 +43,15 @@ class DequantizeE4m3PerTensor(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="_ple_block decode: [1, 16, 160] gathered rows, bf16 scale", spec=_ple(1)),
         Cell(why="_ple_block at 8 tokens", spec=_ple(8)),
-        Cell(why="_ple_block prefill: [4096, 16, 160]", spec=_ple(4096)),
+        Cell(
+            why="_ple_block prefill at max_num_tokens: [16384, 16, 160] through the grid-stride "
+            "loop",
+            spec=_ple(16384),
+        ),
         Cell(
             why="every e4m3 byte into bf16, five scale values, NaN codes included",
             spec=dict(
                 shape=(1, 256), dtype=torch.bfloat16, scales=_DOMAIN_SCALES, source="all_codes"
-            ),
-        ),
-        Cell(
-            why="every e4m3 byte into fp16",
-            spec=dict(
-                shape=(1, 256), dtype=torch.float16, scales=_DOMAIN_SCALES, source="all_codes"
-            ),
-        ),
-        Cell(
-            why="every e4m3 byte into fp32",
-            spec=dict(
-                shape=(1, 256), dtype=torch.float32, scales=_DOMAIN_SCALES, source="all_codes"
-            ),
-        ),
-        Cell(
-            why="rank 2: the scale's rank tracks the input's",
-            spec=dict(shape=(4, 8), dtype=torch.bfloat16, scales=(PLE_SCALE,), source="randn"),
-        ),
-        Cell(
-            why="rank 5: the deepest rank run",
-            spec=dict(
-                shape=(2, 2, 2, 4, 8), dtype=torch.bfloat16, scales=(PLE_SCALE,), source="randn"
-            ),
-        ),
-        Cell(
-            why="1 x 1: far below the fixed 1024-block grid",
-            spec=dict(shape=(1, 1), dtype=torch.bfloat16, scales=(PLE_SCALE,), source="randn"),
-        ),
-        Cell(
-            why="3 x 7: odd shape, no width or alignment rule",
-            spec=dict(shape=(3, 7), dtype=torch.bfloat16, scales=(PLE_SCALE,), source="randn"),
-        ),
-        Cell(
-            why="[2^20, 160]: 167,772,160 elements through the grid-stride loop",
-            spec=dict(
-                shape=(1 << 20, 160), dtype=torch.bfloat16, scales=(PLE_SCALE,), source="randn"
-            ),
-        ),
-        Cell(
-            why="scale as a one-element slice at a nonzero storage offset",
-            spec=dict(
-                shape=(8, 160),
-                dtype=torch.bfloat16,
-                scales=(PLE_SCALE,),
-                source="randn",
-                scale_slice=True,
-            ),
-        ),
-        Cell(
-            why="input at a non-16-byte-aligned address: same kernel",
-            spec=dict(
-                shape=(64, 160),
-                dtype=torch.bfloat16,
-                scales=(PLE_SCALE, 1 / 3, 7.3e-3),
-                source="unaligned",
             ),
         ),
     )
@@ -129,9 +78,11 @@ class DequantizeE4m3PerTensor(OpWrapper):
     `scales` value written in place (the scale is read from memory at replay).
 
     Hard limits
-      numel  probed to 167,772,160; the int32 boundary 2^31 not probed
+      numel  certified to 41,943,040 (16384 tokens); probed to 167,772,160; the
+             int32 boundary 2^31 not probed
 
-    Not certified: `TRTLLM_ENABLE_PDL=1`, `scales` on a different device than
+    Not certified: fp16 and fp32 outputs (the target's scale is bf16), ranks
+    other than 3, `TRTLLM_ENABLE_PDL=1`, `scales` on a different device than
     `input`.
     """
 

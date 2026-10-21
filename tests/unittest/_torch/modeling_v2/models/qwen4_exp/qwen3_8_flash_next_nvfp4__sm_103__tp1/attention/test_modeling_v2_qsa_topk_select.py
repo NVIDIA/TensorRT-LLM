@@ -67,29 +67,18 @@ def _logits(kind: str, rows: int, cols: int, gen: torch.Generator) -> torch.Tens
 def _build(spec: dict, seed: int):
     gen = torch.Generator(device=DEV).manual_seed(seed)
     rows, cols, index_topk = spec["rows"], spec["cols"], spec["index_topk"]
-    if spec.get("strided"):
-        backing = _logits(spec["logits"], rows, 2 * cols, gen).view(rows, cols, 2)
-        logits = backing[:, :, 0]
-        assert logits.stride() == (2 * cols, 2)
-    else:
-        logits = _logits(spec["logits"], rows, cols, gen)
+    logits = _logits(spec["logits"], rows, cols, gen)
 
-    kind = spec["windows"][0]
-    if kind in ("positions", "chunk"):
-        if kind == "positions":
-            positions = torch.tensor(spec["windows"][1], device=DEV)
-        else:
-            positions = spec["windows"][1] + torch.arange(rows, device=DEV)
-        assert positions.numel() == rows
-        # QSA's per-row causal bound: complete compressed blocks at the position.
-        row_ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
-        row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    elif kind == "explicit":
-        row_starts = torch.tensor(spec["windows"][1], dtype=torch.int32, device=DEV)
-        row_ends = torch.tensor(spec["windows"][2], dtype=torch.int32, device=DEV)
+    kind, start = spec["windows"]
+    if kind == "positions":
+        positions = torch.tensor(start, device=DEV)
     else:
-        row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-        row_ends = torch.randint(0, cols + 1, (rows,), generator=gen, device=DEV).to(torch.int32)
+        assert kind == "chunk", kind
+        positions = start + torch.arange(rows, device=DEV)
+    assert positions.numel() == rows
+    # QSA's per-row causal bound: complete compressed blocks at the position.
+    row_ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
 
     if spec["tail"] == "nan":
         columns = torch.arange(cols, device=DEV)[None, :]

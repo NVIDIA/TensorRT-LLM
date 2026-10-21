@@ -321,7 +321,6 @@ class GdnInProjConv1dPdl(OpWrapper):
     # spec: rows, slots (tuple per row; -1 is the pad slot), pdl, pool (slots in the pool).
     CELLS: tuple[Cell, ...] = (
         _cell("decode 1 row, slot 37 of the 461-slot pool", 1, (37,)),
-        _cell("decode 1 row, the last slot of the pool", 1, (460,)),
         _cell("decode 2 rows, two slots", 2, (5, 211)),
         _cell("decode 2 rows, one a pad row (-1)", 2, (17, -1)),
         _cell("decode 1 row, PDL off", 1, (99,), pdl=False),

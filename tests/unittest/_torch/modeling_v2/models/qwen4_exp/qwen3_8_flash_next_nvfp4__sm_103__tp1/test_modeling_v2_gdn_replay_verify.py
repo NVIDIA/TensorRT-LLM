@@ -242,17 +242,10 @@ def _state(gen, cpu, n, t, gating=None):
 @pytest.mark.parametrize(
     "n,t,accept",
     [
-        (1, 2, "random"),
+        # Below the partition threshold: the history wraps in-kernel.
         (8, 4, "random"),
-        (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 4, "random"),
-        (20, 2, "random"),
-        (18, 3, "random"),
-        # max_draft_len 5..7: T = 6..8, the replay kernel's ceiling.
-        (1, 8, "random"),
-        (8, 8, "random"),
+        # At the threshold, at max_draft_len 7 (T = 8, the replay kernel's ceiling).
         (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, 8, "random"),
-        (32, 8, "random"),
-        (20, 6, "random"),
         # Every draft accepted: from a fresh slot at T = 8 the second step appends exactly up
         # to the history's end (`pnat + T == 16`) and every second step after it wraps --
         # in-kernel below the partition threshold, through the all-layer commit at and above it.

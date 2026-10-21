@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_hc_decode_mix_fp4_cute entry: cells against the entry's
-float64 reference in its band (`mixed` and `inject_out` in `rtol = eps`,
-`atol = eps * max|ref|`; the NVFP4 exact on the returned `mixed` outside the
-reciprocal tie window), a stale-read check under CUDA-graph replay with PDL, the
-guards."""
+"""GPU test for the two entries of qwen4_exp_hc_decode_mix_fp4_cute: the NVFP4 build
+(`qwen4_exp_hc_decode_mix_fp4_cute`) and the plain build (`qwen4_exp_hc_decode_mix_cute`)
+of the CuTe mix kernel. Each entry's cells against its float64 reference in its band
+(`mixed` and `inject_out` in `rtol = eps`, `atol = eps * max|ref|`; for the NVFP4 build,
+the NVFP4 exact on the returned `mixed` outside the reciprocal tie window), a
+determinism check, a stale-read check under CUDA-graph replay with PDL for each build,
+the guards."""
 
 import zlib
 
@@ -16,7 +18,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
     fp4_quantize,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (  # noqa: E501
-    qwen4_exp_hc_decode_mix_fp4_cute as op,
+    qwen4_exp_hc_decode_mix_cute,
+    qwen4_exp_hc_decode_mix_fp4_cute,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -27,6 +30,9 @@ assert torch.cuda.is_available(), "qwen4_exp_hc_decode_mix_fp4_cute requires a C
 DEV = "cuda"
 HC_COUNT, HIDDEN, RANK, EPS = 4, 2560, 320, 1e-6
 UP_RMS, GAMMA_RMS, GAMMA_ABSMAX = 0.0681, 0.477, 6.625
+
+ENTRIES = {"fp4": qwen4_exp_hc_decode_mix_fp4_cute, "plain": qwen4_exp_hc_decode_mix_cute}
+CASES = [(name, cell) for name, entry in ENTRIES.items() for cell in entry.CELLS]
 
 
 def nvfp4_reference(x, gs):
@@ -70,7 +76,8 @@ def _check_quant(mixed, xq, xsf, gs) -> None:
     assert not stray.any(), f"{stray.sum().item()} e2m1 codes differ outside the tie window"
 
 
-def _build(spec, seed):
+def _build(spec, seed, fp4=True):
+    """The entry's arguments; `fp4` appends the NVFP4 build's global scale."""
     rows, hc_count, hidden, rank, dtype = 1, HC_COUNT, HIDDEN, RANK, torch.bfloat16
     with_inject = spec.get("with_inject", True)
     width = hc_count * hidden
@@ -91,31 +98,42 @@ def _build(spec, seed):
     n_pad = -(-(rank + hc_count) // 4) * 4
     part = normal(hc_count, rows, n_pad + 4, scale=60.0)[:, :, :n_pad]
     up = normal(width, rank, scale=UP_RMS).to(dtype).t()
-    # A calibrated activation global scale: 448 * 6 / amax of the mix (~|8|).
-    gs = torch.tensor([448.0 * 6.0 / 8.0], device=DEV, dtype=torch.float32)
-    return [part, ss, up, hc_out, gamma, EPS, hc_count, with_inject, gs]
+    args = [part, ss, up, hc_out, gamma, EPS, hc_count, with_inject]
+    if fp4:
+        # A calibrated activation global scale: 448 * 6 / amax of the mix (~|8|).
+        args.append(torch.tensor([448.0 * 6.0 / 8.0], device=DEV, dtype=torch.float32))
+    return args
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
+@pytest.mark.parametrize(
+    "name,cell", CASES, ids=[f"{name}-{cell.why[:44]}" for name, cell in CASES]
+)
+def test_certified_cells(name, cell, certifying) -> None:  # noqa: F811 — fixture by name
+    op = ENTRIES[name]
     certifying(op)
-    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
+    fp4 = name == "fp4"
+    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31), fp4=fp4)
     out = op(*args)
     assert out[0].shape == (1, HIDDEN)
     _compare(out, op.reference(*args))
-    _check_quant(out[0], out[2], out[3], args[8])
+    if fp4:
+        _check_quant(out[0], out[2], out[3], args[8])
 
 
 def test_deterministic() -> None:
+    op = qwen4_exp_hc_decode_mix_fp4_cute
     args = _build(dict(), seed=3)
     for a, b in zip(op(*args), op(*args)):
         assert torch.equal(a, b)
 
 
-def test_reads_after_the_wait_under_graph_replay() -> None:
+@pytest.mark.parametrize("name", list(ENTRIES))
+def test_reads_after_the_wait_under_graph_replay(name) -> None:
     """Producer kernels rewrite `part`, `ss` and `hc_out` inside the graph right before
-    the op; with PDL a read before `griddepcontrol.wait` would see the previous replay's."""
-    args = _build(dict(), seed=8)
+    the op; with PDL a read before `griddepcontrol.wait` would see the previous replay's.
+    Each build is its own compiled variant, so each is replayed."""
+    op, fp4 = ENTRIES[name], name == "fp4"
+    args = _build(dict(), seed=8, fp4=fp4)
     targets = (args[0], args[1], args[3])
     sources = [t.clone() for t in targets]
 
@@ -134,7 +152,7 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
     with torch.cuda.graph(graph):
         graph_out = step()
     for trial in range(3):
-        fresh = _build(dict(), seed=100 + trial)
+        fresh = _build(dict(), seed=100 + trial, fp4=fp4)
         for src, new in zip(sources, (fresh[0], fresh[1], fresh[3])):
             src.copy_(new)
         graph.replay()
@@ -144,6 +162,8 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
 
 
 def test_guards() -> None:
+    """Both entries share the shape checks; the NVFP4 build's `is_valid` runs them."""
+    op = qwen4_exp_hc_decode_mix_fp4_cute
     args = _build(dict(), seed=6)
     two = args[3].expand(2, -1).contiguous()
     with validating(op), pytest.raises(AssertionError):

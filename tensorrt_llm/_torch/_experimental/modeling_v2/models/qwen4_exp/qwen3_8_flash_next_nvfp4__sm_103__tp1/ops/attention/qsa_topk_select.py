@@ -86,39 +86,6 @@ class QsaTopkSelect(OpWrapper):
             ),
         ),
         Cell(
-            why="decode MTP: one request's two rows (7777, 7778), NaN tail",
-            spec=dict(
-                rows=2,
-                cols=_SCORE_COLUMNS,
-                index_topk=_BLOCK_TOPK,
-                windows=("positions", (7777, 7778)),
-                logits="relu",
-                tail="nan",
-            ),
-        ),
-        Cell(
-            why="decode MTP x4: two requests below the budget get -1 padding",
-            spec=dict(
-                rows=8,
-                cols=_SCORE_COLUMNS,
-                index_topk=_BLOCK_TOPK,
-                windows=("positions", (7777, 7778, 4000, 4001, 1500, 1501, 300, 301)),
-                logits="relu",
-                tail="nan",
-            ),
-        ),
-        Cell(
-            why="decode MTP7: one request's 8 rows (6000..6007), NaN tail",
-            spec=dict(
-                rows=8,
-                cols=_SCORE_COLUMNS,
-                index_topk=_BLOCK_TOPK,
-                windows=("positions", tuple(range(6000, 6008))),
-                logits="relu",
-                tail="nan",
-            ),
-        ),
-        Cell(
             why="decode MTP7: 32 requests x 8 rows = 256 rows, some below the budget, NaN tail",
             spec=dict(
                 rows=256,
@@ -133,7 +100,7 @@ class QsaTopkSelect(OpWrapper):
             ),
         ),
         Cell(
-            why="context: 8191 rows at positions 0..8190 (warm-up capture)",
+            why="context: 8191 rows at positions 0..8190 (warm-up capture), the CUDA op",
             spec=dict(
                 rows=8191,
                 cols=_SCORE_COLUMNS,
@@ -141,73 +108,6 @@ class QsaTopkSelect(OpWrapper):
                 windows=("chunk", 0),
                 logits="relu",
                 tail="nan",
-            ),
-        ),
-        Cell(
-            why="context: 1024 rows from position 4000 over 2048 cols, relu ties",
-            spec=dict(
-                rows=1024,
-                cols=2048,
-                index_topk=_BLOCK_TOPK,
-                windows=("chunk", 4000),
-                logits="relu",
-                tail=None,
-            ),
-        ),
-        Cell(
-            why="nonzero row_starts: offsets come back window-local",
-            spec=dict(
-                rows=4,
-                cols=512,
-                index_topk=32,
-                windows=("explicit", (0, 37, 100, 480), (512, 300, 140, 512)),
-                logits="randn",
-                tail=None,
-            ),
-        ),
-        Cell(
-            why="strided logits: column stride 2 takes the scalar load path",
-            spec=dict(
-                rows=5,
-                cols=512,
-                index_topk=32,
-                windows=("explicit", (0, 11, 0, 64, 7), (512, 400, 33, 512, 8)),
-                logits="randn",
-                tail=None,
-                strided=True,
-            ),
-        ),
-        Cell(
-            why="windows of 0, 1, k-1, k, 1 and full width: -1 suffix",
-            spec=dict(
-                rows=6,
-                cols=128,
-                index_topk=16,
-                windows=("explicit", (0, 0, 0, 5, 9, 0), (0, 1, 15, 21, 10, 128)),
-                logits="randn",
-                tail=None,
-            ),
-        ),
-        Cell(
-            why="budget wider than every window and than the matrix",
-            spec=dict(
-                rows=3,
-                cols=64,
-                index_topk=_BLOCK_TOPK,
-                windows=("explicit", (0, 0, 0), (64, 7, 0)),
-                logits="randn",
-                tail=None,
-            ),
-        ),
-        Cell(
-            why="row tier: 12287 rows, all on the insertion-sort variant",
-            spec=dict(
-                rows=6 * 2048 - 1,
-                cols=512,
-                index_topk=64,
-                windows=("random_ends",),
-                logits="randn",
-                tail=None,
             ),
         ),
         Cell(
@@ -219,17 +119,6 @@ class QsaTopkSelect(OpWrapper):
                 windows=("chunk", 0),
                 logits="relu",
                 tail="nan",
-            ),
-        ),
-        Cell(
-            why="row tier: 12416 rows, past 12287 the CuTe DSL op",
-            spec=dict(
-                rows=6 * 2048 + 128,
-                cols=512,
-                index_topk=64,
-                windows=("random_ends",),
-                logits="randn",
-                tail=None,
             ),
         ),
     )

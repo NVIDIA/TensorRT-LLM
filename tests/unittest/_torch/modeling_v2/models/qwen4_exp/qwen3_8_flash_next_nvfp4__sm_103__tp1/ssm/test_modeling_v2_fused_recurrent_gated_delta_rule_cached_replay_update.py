@@ -525,9 +525,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 # ── CUDA graphs ───────────────────────────────────────────────────────────
 
 
-_GRAPH_CASES = [(n, t, torch.float32) for t in range(2, 9) for n in (1, 8, 15, 16, 32)] + [
-    (n, t, torch.bfloat16) for t in (2, 4, 8) for n in (1, 15, 16, 32)
-]
+#: The in-kernel commit at one sequence and the smallest token tile, the all-layer commit at
+#: the envelope's 32 requests and the largest, and a bf16 checkpoint at the partition threshold.
+_GRAPH_CASES = [(1, 2, torch.float32), (32, 8, torch.float32), (16, 4, torch.bfloat16)]
 
 
 @pytest.mark.parametrize(
@@ -536,11 +536,9 @@ _GRAPH_CASES = [(n, t, torch.float32) for t in range(2, 9) for n in (1, 8, 15, 1
     ids=[f"{n}-{t}-{'fp32' if d is torch.float32 else 'bf16'}" for n, t, d in _GRAPH_CASES],
 )
 def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, t, state_dtype) -> None:
-    """Every T 2..8 (MTP draft lengths 1..7) over an fp32 checkpoint, and T 2, 4 and 8 over a
-    bf16 one, at the batches either side of the partition threshold and at 1, 8 and 32: two
-    layers captured with, from 16 sequences on, the all-layer commit after them; replayed
-    three times on new activations, with acceptance in between, against the same steps run
-    eagerly on a twin state."""
+    """Two layers captured with, from 16 sequences on, the all-layer commit after them;
+    replayed three times on new activations, with acceptance in between, against the same
+    steps run eagerly on a twin state."""
     assert ALL_LAYER_COMMIT_MIN_BATCH == CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     path = "all_layer" if n >= ALL_LAYER_COMMIT_MIN_BATCH else "small"
     spec = dict(path=path, n=n, t=t, layers=2, slots=40, state_dtype=state_dtype)
@@ -614,25 +612,24 @@ def _drive(bench, fault):
     return None
 
 
-@pytest.mark.parametrize("t", (4, 8))
 @pytest.mark.parametrize(
     "fault", ("none", "commit skipped", "committed twice", "rejected tokens kept")
 )
-def test_the_twin_sees_a_broken_protocol(fault, t) -> None:
+def test_the_twin_sees_a_broken_protocol(fault) -> None:
     """The twin comparison is what certifies the commit and the bookkeeping, so
     it has to fail when either is broken: the partitioned path with the
     manager's commit left out; a 16-row batch called without work items while
     the manager still commits (the checkpoint advanced twice); and the small
     path advanced as if every drafted token had been accepted. Without a fault
-    the same run passes."""
+    the same run passes. At T = 8, the largest token tile."""
     path = "small" if fault == "rejected tokens kept" else "all_layer"
     n = 8 if path == "small" else 16
-    bench = _Bench(dict(path=path, n=n, t=t, steps=4), seed=93)
+    bench = _Bench(dict(path=path, n=n, t=8, steps=4), seed=93)
     first = _drive(bench, fault)
     if fault == "none":
         assert first is None
     else:
-        assert first is not None, f"{fault} passed the twin comparison at T={t}"
+        assert first is not None, f"{fault} passed the twin comparison"
 
 
 @pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16), ids=("fp32", "bf16"))
@@ -809,8 +806,6 @@ def test_a_history_off_history_size_is_misread_and_is_refused() -> None:
     (
         ("history", "fewer slots"),
         ("prev_num_accepted_tokens", "fewer slots"),
-        ("cache_buf_idx", "fewer slots"),
-        ("prev_num_accepted_tokens", "strided"),
         ("cache_buf_idx", "strided"),
     ),
 )

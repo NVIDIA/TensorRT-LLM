@@ -780,73 +780,34 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows, inject (True), moe (False: shared + gate_logits too), gate
-    # "column" [T, 1] | "flat" [T], hc_count (4), hidden (2560), dtype (bf16),
-    # layout "contiguous" | "row_slice" (hyper_input = buf[::2]).
+    # spec: rows, inject (True), moe (False: shared + gate_logits [T, 1] too), fold
+    # (0: top-k of the finalize folded in), drop (False: some slots -1). The
+    # checkpoint's geometry throughout: hc_count 4, hidden 2560, bf16, contiguous rows.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(why=f"checkpoint 4x2560 bf16, inject, {why}", spec=dict(rows=t))
-            for t, why in (
-                (1, "decode 1 token"),
-                (8, "decode batch 8"),
-                (33, "33 tokens, odd count"),
-                (128, "decode batch 128 (max concurrency)"),
-                (2048, "prefill chunk 2048"),
-                (8192, "prefill chunk 8192 (max_num_tokens)"),
-            )
-        )
-        + tuple(
-            Cell(why=f"norm only (no inject), {why}", spec=dict(rows=t, inject=False))
-            for t, why in ((1, "decode 1 token"), (128, "decode 128"), (8192, "prefill 8192"))
-        )
-        + tuple(
-            Cell(why=f"MoE combine, [T, 1] gate, {why}", spec=dict(rows=t, moe=True))
-            for t, why in (
-                (1, "decode 1 token"),
-                (8, "decode batch 8"),
-                (33, "33 tokens, odd count"),
-                (128, "decode batch 128 (max concurrency)"),
-                (2048, "prefill chunk 2048"),
-                (8192, "prefill chunk 8192"),
-                (16384, "prefill chunk 16384 (the ladder's max_num_tokens)"),
-            )
-        )
-        + tuple(
-            Cell(
-                why=f"MoE combine + finalize fold (top-10), {why}",
-                spec=dict(rows=t, moe=True, fold=10),
-            )
-            for t, why in (
-                (2, "decode batch 2"),
-                (33, "33 tokens, odd count"),
-                (128, "decode batch 128 (max concurrency)"),
-            )
-        )
-        + (
-            Cell(
-                why="MoE combine + finalize fold, three slots mapped to -1, 8 rows",
-                spec=dict(rows=8, moe=True, fold=10, drop=True),
-            ),
-            Cell(
-                why="MoE combine, flat [T] gate, 17 rows", spec=dict(rows=17, moe=True, gate="flat")
-            ),
-            Cell(
-                why="MoE combine, float16 operands, 64 rows",
-                spec=dict(rows=64, moe=True, dtype=torch.float16),
-            ),
-            Cell(why="MoE combine, zero rows", spec=dict(rows=0, moe=True)),
-        )
-        + (
-            Cell(
-                why="hyper_input a row slice buf[::2], inject, 16 rows",
-                spec=dict(rows=16, layout="row_slice"),
-            ),
-            Cell(why="hc_count 2 at hidden 2560, 64 rows", spec=dict(rows=64, hc_count=2)),
-            Cell(why="hc_count 8 at hidden 2560, 64 rows", spec=dict(rows=64, hc_count=8)),
-            Cell(why="hidden 128 (not the checkpoint), 48 rows", spec=dict(rows=48, hidden=128)),
-            Cell(why="float16 operands, 512 rows", spec=dict(rows=512, dtype=torch.float16)),
-            Cell(why="zero rows", spec=dict(rows=0)),
-        )
+        Cell(
+            why="checkpoint 4x2560 bf16, inject, decode batch 128 (eight-warp form)",
+            spec=dict(rows=128),
+        ),
+        Cell(
+            why="checkpoint 4x2560 bf16, inject, prefill chunk 8192 (two-warp form)",
+            spec=dict(rows=8192),
+        ),
+        Cell(
+            why="norm only (no inject: stack start / after PLE), decode 128",
+            spec=dict(rows=128, inject=False),
+        ),
+        Cell(
+            why="MoE combine, [T, 1] gate, prefill chunk 16384 (the ladder's max_num_tokens)",
+            spec=dict(rows=16384, moe=True),
+        ),
+        Cell(
+            why="MoE combine + finalize fold (top-10, CuTe kernel), decode batch 128",
+            spec=dict(rows=128, moe=True, fold=10),
+        ),
+        Cell(
+            why="MoE combine + finalize fold, three slots mapped to -1, 8 rows",
+            spec=dict(rows=8, moe=True, fold=10, drop=True),
+        ),
     )
 
     note = """
@@ -899,6 +860,10 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     reduction tree -- bitwise its `hc_out` and `normed`. GB300, graph replay,
     16 rotating sites, us: 128 rows 7.00 -> 5.97, 64 rows 6.63 -> 5.25, 8 rows
     3.59 -> 3.09; it releases dependents at its start as the Triton kernel does.
+
+    Not certified: hc_count other than 4, hidden other than 2560, float16
+    operands, a flat `[T]` gate, row strides other than the width, zero rows
+    (the kernels take them; no cell drives them).
 
     Hard limits: row offsets are int64 (`program_id(0)` widened); the grid is
     `rows * hc_count` programs along x (2^31 - 1); the column offset

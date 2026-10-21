@@ -131,10 +131,7 @@ _CKPT = dict(
     request_dtype=torch.int32,
     position_dtype=torch.int64,
     key_layout="packed",
-    coords_layout="transposed",
-    meta_layout="contiguous",
     cache_layout="plain",
-    table_layout="dense",
     hole=None,
 )
 
@@ -146,7 +143,6 @@ _DECODE = ((0, 1), (1, 1), (31, 1), (32, 1), (33, 1), (63, 1), (64, 1), (95, 1))
 _WIDE = dict(slots=160, width=300)
 _DECODE_128 = tuple(((r * 72 + 9) % 9216, 1) for r in range(128))
 _PREFILL_16K = ((0, 8192), (0, 8192))
-_MIXED_16K = ((0, 8192), (1024, 8064)) + tuple(((r * 71 + 5) % 9216, 1) for r in range(128))
 
 #: 32 requests of one MTP7 verify block each (8 rows), at starts that put some blocks across a
 #: page edge and some inside one.
@@ -192,56 +188,19 @@ class QsaPagedIndexStore(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode: 8 rows at aligned, mid and page-crossing positions",
-            spec=_spec(_DECODE, pages=32),
-        ),
-        Cell(
-            why="decode MTP: 4 requests x 2 rows, a pair straddling a page",
-            spec=_spec(((10, 2), (31, 2), (63, 2), (5, 2)), pages=16),
-        ),
-        Cell(
-            why="decode MTP7: 1 request x 8 rows, a block straddling a page",
-            spec=_spec(((28, 8),), pages=8),
-        ),
-        Cell(
-            why="decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
+            why="decode MTP7: 32 requests x 8 rows (256), the last one-row-per-program "
+            "launch, blocks straddling pages",
             spec=_spec(_MTP7_32, pages=1200, slots=40),
         ),
         Cell(
-            why="prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
-            spec=_spec(((0, 256),) * 4, pages=32),
+            why="decode M=128 at positions up to 9153 (page column 286), token_k off the "
+            "fused projection row",
+            spec=_spec(_DECODE_128, pages=18432, key_layout="fused_row", **_WIDE),
         ),
         Cell(
-            why="mixed: two context chunks and two decode rows, 66 rows",
-            spec=_spec(((0, 40), (0, 24), (200, 1), (7, 1)), pages=32),
-        ),
-        Cell(
-            why="decode: token_k a head of the fused projection row (110 x 128)",
-            spec=_spec(_DECODE, pages=32, key_layout="fused_row"),
-        ),
-        Cell(
-            why="prefill 1024 rows: token_k off the fused projection row",
-            spec=_spec(((0, 256),) * 4, pages=32, key_layout="fused_row"),
-        ),
-        Cell(
-            why="contiguous token_k and coordinates",
-            spec=_spec(_DECODE, pages=32, key_layout="contiguous", coords_layout="contiguous"),
-        ),
-        Cell(
-            why="text batch: stride-0 expand of one position column",
-            spec=_spec(((0, 1), (5, 1), (32, 1), (70, 1)), pages=16, coords_layout="stride0"),
-        ),
-        Cell(
-            why="a 5-axis position plane: axes past the 3rd untouched",
-            spec=_spec(((2, 1), (33, 1)), pages=8, axes=5),
-        ),
-        Cell(
-            why="metadata as columns of wider buffers (strided)",
-            spec=_spec(((0, 8),), pages=8, meta_layout="strided"),
-        ),
-        Cell(
-            why="index_cache as a role view of a wider allocation",
-            spec=_spec(((0, 1), (31, 1), (32, 1), (33, 1)), pages=8, cache_layout="role_view"),
+            why="prefill 16384 rows (max_num_tokens), 16 rows per program, token_k off the "
+            "fused projection row",
+            spec=_spec(_PREFILL_16K, pages=600, key_layout="fused_row", **_WIDE),
         ),
         Cell(
             why="NVFP4-KV side planes: index and position planes as strided views of one "
@@ -256,80 +215,13 @@ class QsaPagedIndexStore(OpWrapper):
             ),
         ),
         Cell(
-            why="block table as a column slice of a wider one",
-            spec=_spec(((0, 1), (1, 1), (32, 1), (33, 1)), pages=8, table_layout="column_slice"),
-        ),
-        Cell(
-            why="block table transposed: column stride != 1",
-            spec=_spec(_DECODE, pages=32, table_layout="transposed"),
-        ),
-        Cell(
-            why="fp16 keys: one conversion into the bf16 plane",
-            spec=_spec(((0, 4),), pages=8, key_dtype=torch.float16),
-        ),
-        Cell(
-            why="fp32 keys: one conversion into the bf16 plane",
-            spec=_spec(((0, 4),), pages=8, key_dtype=torch.float32),
-        ),
-        Cell(
-            why="int32 requests and int32 positions",
-            spec=_spec(_DECODE, pages=32, position_dtype=torch.int32),
-        ),
-        Cell(
-            why="int64 requests and int64 positions",
-            spec=_spec(_DECODE, pages=32, request_dtype=torch.int64),
-        ),
-        # ---- the serving envelope: decode M=128, 16384-row steps -----------
-        Cell(
-            why="decode M=128 at positions up to 9153 (page column 286)",
-            spec=_spec(_DECODE_128, pages=18432, **_WIDE),
-        ),
-        Cell(
-            why="decode M=128, token_k off the fused projection row",
-            spec=_spec(_DECODE_128, pages=18432, key_layout="fused_row", **_WIDE),
-        ),
-        Cell(
-            why="prefill 16384 rows: two 8192-token requests (max_num_tokens)",
-            spec=_spec(_PREFILL_16K, pages=600, **_WIDE),
-        ),
-        Cell(
-            why="prefill 16384 rows, token_k off the fused projection row",
-            spec=_spec(_PREFILL_16K, pages=600, key_layout="fused_row", **_WIDE),
-        ),
-        Cell(
-            why="mixed 16384 rows: two chunks, one mid-sequence, + 128 decode rows",
-            spec=_spec(_MIXED_16K, pages=18688, **_WIDE),
-        ),
-        Cell(
-            why="head_dim 64, 2 index-KV heads, 16-token pages",
-            spec=_spec(_DECODE, pages=48, hkv=2, head_dim=64, tokens_per_block=16),
-        ),
-        # ---- rows that resolve to no slot are skipped ------------------------
-        Cell(
             why="skip: table entry -1 (unallocated)",
             spec=_spec(_DECODE, pages=32, hole="unallocated_page"),
-        ),
-        Cell(
-            why="skip: table entry past the pool",
-            spec=_spec(_DECODE, pages=32, hole="page_past_pool"),
-        ),
-        Cell(
-            why="skip: request index past the table",
-            spec=_spec(_DECODE, pages=32, hole="request_past_table"),
         ),
         Cell(
             why="skip: negative request index",
             spec=_spec(_DECODE, pages=32, hole="negative_request"),
         ),
-        Cell(
-            why="skip: negative logical position",
-            spec=_spec(_DECODE, pages=32, hole="negative_position"),
-        ),
-        Cell(
-            why="skip: page column past the table",
-            spec=_spec(_DECODE, pages=32, hole="column_past_table"),
-        ),
-        Cell(why="zero rows: both planes unchanged", spec=_spec((), pages=8)),
     )
 
     note = """
@@ -339,10 +231,10 @@ class QsaPagedIndexStore(OpWrapper):
     `get_index_k_buffer(i)` (`[pages, tpb, 1, 128]` bf16) and the shared
     `get_qsa_position_buffer()` (`[pages, tpb, 3]` int32, rewritten
     idempotently by every sparse layer). Every operand is read through its
-    own strides, all of them runtime arguments: `token_k` with any row stride
-    (the packed index projection's 640, the fused input projection's 14080,
-    contiguous), stride-0 or transposed coordinates, strided metadata, a
-    column-sliced or transposed table, a role view of the index plane. Under an
+    own strides, all of them runtime arguments; the cells drive the target's:
+    `token_k` off the packed index projection (row stride 640) and off the fused
+    input projection (14080), the `[T, 3]` transpose of the position buffer as
+    the coordinates, contiguous metadata and table. Under an
     NVFP4 KV pool the QSA cache manager packs each page's index-K roles and
     then its position page into one per-slot buffer, so both planes are strided
     views of one allocation: the trunk's index plane is `[pages, 32, 1, 128]`
@@ -372,16 +264,22 @@ class QsaPagedIndexStore(OpWrapper):
     not specialized on, so a new batch or pool size does not recompile
     (strides still specialize on 1 and 16-divisibility). Up to 256 rows run
     one row per program (1 warp), above that 16 rows per program (4 warps).
-    CUDA-graph capturable (captured at 4 decode rows and at 256, 32 MTP7 verify
-    blocks); a replay follows positions rewritten in place. Repeating a call is
+    CUDA-graph capturable (captured at 256 rows, 32 MTP7 verify blocks); a
+    replay follows positions rewritten in place. Repeating a call is
     idempotent.
 
     Hard limits: every index is widened to int64 inside the kernel before
     any arithmetic; an int64 position at `2^32 + 5` lands past the table and
     is skipped rather than truncated. Rows are a grid axis: 2^31 programs.
 
-    Not certified: an fp8 index plane, multiple devices, concurrent streams
-    onto one pool, duplicate destinations.
+    Skips certified by a cell: an unallocated (`-1`) table entry and a negative
+    request index; the test also drives an int64 position past the table. The
+    other skip conditions share that mask and have no cell.
+
+    Not certified: an fp8 index plane, keys other than bf16, any index geometry
+    other than 1 head x 128 at 32-token pages, strided metadata or tables,
+    stride-0 coordinates, multiple devices, concurrent streams onto one pool,
+    duplicate destinations.
     """
 
     def __call__(

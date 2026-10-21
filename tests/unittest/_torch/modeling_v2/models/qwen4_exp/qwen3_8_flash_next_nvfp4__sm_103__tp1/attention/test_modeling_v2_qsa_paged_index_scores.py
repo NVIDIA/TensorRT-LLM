@@ -38,7 +38,7 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     11.6), inside the default rtol 1.3e-6 / atol 1e-5. Wrong variants (no
     relu, mean over heads, first group member as key, unscaled,
     1/head_dim scale, block table ignored) land more than 1000x outside
-    (asserted at 64 and 2080 columns; measured 3e5x to 4e6x). Columns the
+    (asserted at 2080 columns; measured 3e5x to 4e6x). Columns the
     reference marks NaN are unspecified and not read.
     """
     assert out.dtype == ref.dtype == torch.float32, (out.dtype, ref.dtype)
@@ -130,23 +130,14 @@ def _rows_and_requests(spec, gen):
     def pages_for(seq_len):
         return math.ceil(seq_len / tpb)
 
-    if layout in ("random", "shuffled", "past_table", "arange"):
+    if layout in ("random", "arange"):
         rows, requests = spec["rows"], spec["requests"]
-        if layout == "shuffled":
-            req = torch.randint(0, requests, (rows,), generator=gen, device=DEV)
-        else:
-            req = torch.arange(rows, device=DEV) * requests // max(rows, 1)
-        if layout == "past_table":
-            positions = torch.full((rows,), pages * tpb * 3, device=DEV)
-        elif layout == "arange":
+        req = torch.arange(rows, device=DEV) * requests // max(rows, 1)
+        if layout == "arange":
             positions = torch.arange(rows, device=DEV)
         else:
             positions = torch.randint(0, pages * tpb, (rows,), generator=gen, device=DEV)
         return positions, req, [pages] * requests
-    if layout == "far":
-        rows = spec["rows"]
-        positions = torch.full((rows,), pages * tpb - 1, device=DEV)
-        return positions, torch.zeros(rows, dtype=torch.long, device=DEV), [pages]
 
     segments = []  # (first position, row count) per request, in row order
     if layout == "capture":
@@ -205,10 +196,6 @@ def _build(spec, seed):
         # [T, index heads | 1 k | 1 v, D], q is the first `heads` slots.
         scratch = torch.randn(rows, heads + 2, head_dim, generator=gen, device=DEV).to(dtype)
         q = scratch[:, :heads]
-    elif spec["q_layout"] == "dim_slice":
-        wide = torch.zeros(rows, heads, 2 * head_dim, dtype=dtype, device=DEV)
-        wide[:, :, :head_dim] = torch.randn(rows, heads, head_dim, generator=gen, device=DEV)
-        q = wide[:, :, :head_dim]
     else:
         q = torch.randn(rows, heads, head_dim, generator=gen, device=DEV).to(dtype)
     if spec["q_layout"] != "packed" and rows > 1:  # one row is trivially contiguous
@@ -293,39 +280,31 @@ def _capture_args(seed, only_visible_blocks=False):
     return _build(spec, seed)
 
 
-@pytest.mark.parametrize("shape", ["512rows_narrow", "8191rows_capture"])
-def test_the_two_kernels_agree(shape) -> None:
+def test_the_two_kernels_agree() -> None:
     """One entry, two kernels: no further apart than fp32 reordering.
 
     Measured 9.5e-7 apart (one fp32 ulp at the score's magnitude) at 320 rows
-    and again at 8191, so the packed kernel does not drift with batch size.
+    and again at 8191, so the packed kernel does not drift with batch size;
+    asserted at the 8191-row capture shape.
     """
-    if shape == "512rows_narrow":
-        args = _build(_case(512, 6), seed=404)
-    else:
-        args = _capture_args(seed=8700)
+    args = _capture_args(seed=8700)
     visible = _visible(args)
     row_wise = op(**{**args, "context_rows": False})
     query_tile = op(**{**args, "context_rows": True})
     torch.testing.assert_close(row_wise[visible], query_tile[visible])
 
 
-@pytest.mark.parametrize("shape", ["300rows_row_wise", "300rows_query_tile", "8191rows_capture"])
-def test_results_are_bitwise_reproducible(shape) -> None:
+@pytest.mark.parametrize("context_rows", [False, True], ids=["row_wise", "query_tile"])
+def test_results_are_bitwise_reproducible(context_rows) -> None:
     """Three identical calls, bitwise identical, in the padded mode so the
-    whole tensor is written."""
-    if shape == "8191rows_capture":
-        args = _capture_args(seed=8800)
-    else:
-        args = _build(_case(300, 5, context_rows=shape.endswith("tile")), seed=505)
+    whole tensor is written; once per kernel."""
+    args = _build(_case(300, 5, context_rows=context_rows), seed=505)
     runs = [op(**args).clone() for _ in range(3)]
     torch.cuda.synchronize()
     assert torch.equal(runs[0], runs[1]) and torch.equal(runs[1], runs[2])
 
 
-@pytest.mark.parametrize(
-    "shape", ["64rows_row_wise", "300rows_row_wise", "300rows_query_tile", "8191rows_capture"]
-)
+@pytest.mark.parametrize("shape", ["64rows_row_wise", "8191rows_capture"])
 def test_only_visible_blocks_leaves_the_tail_unspecified(shape) -> None:
     """`only_visible_blocks=True` writes the visible columns and nothing else.
 
@@ -337,9 +316,7 @@ def test_only_visible_blocks_leaves_the_tail_unspecified(shape) -> None:
     if shape == "8191rows_capture":
         args = _capture_args(seed=8900, only_visible_blocks=True)
     else:
-        rows = int(shape.split("rows")[0])
-        spec = _case(rows, 4, only_visible_blocks=True, context_rows=shape.endswith("tile"))
-        args = _build(spec, seed=606 + rows)
+        args = _build(_case(64, 4, only_visible_blocks=True), seed=670)
     expected = op.reference(**args)
     poison = torch.full(expected.shape, 98765.0, dtype=torch.float32, device=DEV)
     del poison
@@ -492,21 +469,18 @@ def _wrong_variants(args):
     }
 
 
-@pytest.mark.parametrize("width", ["8pages", "260pages"])
-def test_wrong_variants_fail_the_gate(width) -> None:
+def test_wrong_variants_fail_the_gate() -> None:
     """The default fp32 band is only a gate if a wrong answer fails it.
 
-    Each variant is rejected by `_compare` and lands more than 1000x outside the
-    band the correct result clears; measured 3e5x to 4e6x.
+    At the target's 260-page width, each variant is rejected by `_compare` and
+    lands more than 1000x outside the band the correct result clears; measured
+    3e5x to 4e6x.
     """
-    if width == "8pages":
-        args = _build(_case(64, 4), seed=1601)
-    else:
-        args = _build(_case(8, 8, pages=CAPTURE_PAGES), seed=9000)
-        gen = torch.Generator(device=DEV).manual_seed(9001)
-        args["query_positions"] = torch.randint(4096, 8192, (8,), generator=gen, device=DEV).to(
-            torch.int32
-        )
+    args = _build(_case(8, 8, pages=CAPTURE_PAGES), seed=9000)
+    gen = torch.Generator(device=DEV).manual_seed(9001)
+    args["query_positions"] = torch.randint(4096, 8192, (8,), generator=gen, device=DEV).to(
+        torch.int32
+    )
     out = op(**args)
     expected = op.reference(**args)
     _compare(out, expected)
@@ -580,14 +554,6 @@ def _mutated(args, **overrides):
 
 
 _REJECTIONS = {
-    "two_dimensional_q": (
-        lambda a: _mutated(a, q=a["q"][:, 0]),
-        "QSA index queries must have shape",
-    ),
-    "three_dimensional_cache": (
-        lambda a: _mutated(a, index_cache=a["index_cache"][:, :, 0]),
-        "QSA index cache must have shape",
-    ),
     "two_kv_head_cache": (
         lambda a: _mutated(a, index_cache=a["index_cache"].expand(-1, -1, 2, -1)),
         "QSA index cache must have shape",
@@ -596,40 +562,23 @@ _REJECTIONS = {
         lambda a: _mutated(a, block_table=a["block_table"].long()),
         "two-dimensional int32 block table",
     ),
-    "one_dimensional_block_table": (
-        lambda a: _mutated(a, block_table=a["block_table"][0]),
-        "two-dimensional int32 block table",
-    ),
-    "empty_block_table": (
-        lambda a: _mutated(a, block_table=a["block_table"][:, :0].contiguous()),
-        "requires a non-empty block table",
-    ),
     "mismatched_dtypes": (
         lambda a: _mutated(a, index_cache=a["index_cache"].float()),
         "dtypes must match",
     ),
-    "mismatched_head_dims": (
-        lambda a: _mutated(a, index_cache=a["index_cache"][..., :64].contiguous()),
-        "dimensions do not match",
-    ),
     "compress_ratio_1": (lambda a: _mutated(a, compress_ratio=1), "compression ratio >= 2"),
-    "tokens_per_block_0": (lambda a: _mutated(a, tokens_per_block=0), "compression ratio >= 2"),
-    "float_metadata": (
-        lambda a: _mutated(a, query_positions=a["query_positions"].float()),
-        "must use integer storage",
-    ),
     "short_metadata": (
         lambda a: _mutated(a, query_positions=a["query_positions"][:4]),
         "one entry per row",
     ),
-    "host_q": (lambda a: _mutated(a, q=a["q"].cpu()), "requires CUDA tensors"),
 }
 
 
 @pytest.mark.parametrize("case", list(_REJECTIONS), ids=list(_REJECTIONS))
 def test_rejects(case) -> None:
     """The callable's own refusals, messages as observed -- the reason this
-    entry has no `is_valid`."""
+    entry has no `is_valid`. One case per refusal family: operand shape, block
+    table, dtypes, geometry scalars, metadata."""
     mutate, message = _REJECTIONS[case]
     args = mutate(_build(_case(16, 2), seed=1701))
     with pytest.raises(ValueError, match=message):

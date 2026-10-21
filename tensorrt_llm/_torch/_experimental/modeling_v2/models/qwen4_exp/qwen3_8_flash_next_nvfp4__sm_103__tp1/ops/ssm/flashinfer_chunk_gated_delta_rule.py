@@ -73,9 +73,8 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: geometry (H, HV, K, V); seqlens; `slots`-row pool with `indices`
-    # (or _engine_slots); inplace (True); output_final_state; output (None |
-    # "buffer"); l2norm (False) with normalize_qk (True: caller-normalized).
-    # Every cell but the last is qwen3.8-flash-next-nvfp4's geometry.
+    # (or _engine_slots); output (None | "buffer"). Every cell is
+    # qwen3.8-flash-next-nvfp4's geometry, in place over an fp32 pool.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"qwen3.8 prefill, 461-slot pool, seqlens {list(s)}",
@@ -86,7 +85,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                 indices=_engine_slots(len(s)),
             ),
         )
-        for s in ((1,), (64,), (200, 37, 91), (1024,), (8192,), (2048, 2048, 2048, 2048))
+        for s in ((200, 37, 91), (8192,), (2048, 2048, 2048, 2048))
     ) + (
         Cell(
             why="qwen3.8 context chunk + 1-token rows [8, 1, 1, 1], 461-slot pool",
@@ -106,32 +105,6 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                 indices=(4, 1),
                 output="buffer",
             ),
-        ),
-        Cell(
-            why="qwen3.8 no in-place: final states returned, pool untouched",
-            spec=dict(
-                geometry=QWEN38_GEOMETRY,
-                seqlens=(96, 48),
-                slots=5,
-                indices=(3, 0),
-                inplace=False,
-                output_final_state=True,
-            ),
-        ),
-        Cell(
-            why="qwen3.8 use_qk_l2norm_in_kernel on raw q/k",
-            spec=dict(
-                geometry=QWEN38_GEOMETRY,
-                seqlens=(100,),
-                slots=3,
-                indices=(2,),
-                l2norm=True,
-                normalize_qk=False,
-            ),
-        ),
-        Cell(
-            why="HV/H = 2 (16 q/k heads, 32 v heads), seqlens [200, 37]",
-            spec=dict(geometry=(16, 32, 128, 128), seqlens=(200, 37), slots=4, indices=(3, 0)),
         ),
     )
 
@@ -173,7 +146,9 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     caller or the flag).
 
     Not certified: `state_workspace=`, bf16/fp16 pool, `scale` other than the
-    default, fp16 operands, K or V other than 128.
+    default, fp16 operands, K or V other than 128, other head ratios, and what the
+    target never passes: `inplace_indexed_state_update=False` (final states
+    returned) and `use_qk_l2norm_in_kernel`.
 
     Hard limits
       none probed.

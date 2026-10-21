@@ -99,13 +99,13 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert torch.equal(g_mixed, op(fresh[0], up, fresh[2], c))
 
 
-@pytest.mark.parametrize("rows", [1, 33, 128, 2048, 8192, 16384])
-@pytest.mark.parametrize("with_inject", [True, False])
-def test_mixer_matches_the_gated_residual_reference(rows, with_inject) -> None:
+def test_mixer_matches_the_gated_residual_reference() -> None:
     """The mixer as the forward runs it -- `cublas_mm` over the zero-padded
     `[down; inject]` (fp32 out), `qwen4_exp_hc_lowrank_act`, this op -- against
     `qwen4_exp_gated_residual.reference` (float64 from `normed`), in the band
-    that entry certifies its own op in."""
+    that entry certifies its own op in. One prefill-sized case: each component
+    is certified over its own cells, and the injection columns never reach
+    `mixed`."""
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
     from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
         qwen4_exp_gated_residual,
@@ -114,7 +114,7 @@ def test_mixer_matches_the_gated_residual_reference(rows, with_inject) -> None:
         qwen4_exp_hc_lowrank_act,
     )
 
-    hc, hidden, rank, eps = 4, 2560, 320, 1e-6
+    rows, hc, hidden, rank, eps = 2048, 4, 2560, 320, 1e-6
     width = hc * hidden
     g = torch.Generator(device=DEV).manual_seed(rows)
 
@@ -128,16 +128,14 @@ def test_mixer_matches_the_gated_residual_reference(rows, with_inject) -> None:
     x = torch.randn(rows, hc, hidden, generator=g, device=DEV)
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     normed = (x.flatten(-2) * (1.0 + gamma.float())).to(torch.bfloat16)
-    first = torch.cat([down, inject_w], 0) if with_inject else down
+    first = torch.cat([down, inject_w], 0)
     first = torch.cat(
         [first, torch.zeros(384 - first.shape[0], width, device=DEV, dtype=first.dtype)]
     )
     low, _ = qwen4_exp_hc_lowrank_act(
-        cublas_mm(normed, first.t(), None, torch.float32), rank, hc, with_inject, torch.bfloat16
+        cublas_mm(normed, first.t(), None, torch.float32), rank, hc, True, torch.bfloat16
     )
     mixed = op(low, up.t(), normed, hc)
-    want = qwen4_exp_gated_residual.reference(
-        normed, down, up, inject_w if with_inject else None, hc
-    )
+    want = qwen4_exp_gated_residual.reference(normed, down, up, inject_w, hc)
     _compare(mixed, want[0])
     print(f"\n  rows {rows}: fused {gate_ratio(mixed, want[0]):.3f}x band")

@@ -84,43 +84,6 @@ def test_select_is_the_canonical_row_ascending_with_padding_last():
         assert row == ids + [-1] * (K - len(ids)), "padding must stay last"
 
 
-def test_decode_capture_takes_each_request_last_accepted_row():
-    p, batch = 4, 3
-    accepted = [1, 4, 2]
-    topk = torch.arange(batch * p * K, dtype=torch.int32, device=DEV).reshape(batch * p, K)
-    visible = torch.arange(100, 100 + batch * p, dtype=torch.int32, device=DEV)
-    md = _metadata(batch, accepted)
-
-    _target(m.DecodeTarget)._capture_selection(md, topk, visible, batch, p)
-
-    rows = [s * p + a - 1 for s, a in enumerate(accepted)]
-    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :batch], topk[rows])
-    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :batch], visible[rows])
-    # Other slots and rows past the batch are untouched.
-    assert torch.all(md.qsa_shared_topk_indices[SLOT, batch:] == -7)
-    assert torch.all(md.qsa_shared_topk_indices[0] == -7)
-    assert md.qsa_shared_topk_captured_slots == {SLOT}
-
-
-def test_prefill_capture_takes_chunk_last_row_and_last_accepted_row():
-    """Two context requests (chunks of 5 and 3 rows) then two generation
-    requests (4 rows each, 2 and 4 accepted). The context requests' accepted
-    count is whatever the worker left there and must not matter."""
-    seq_lens = [5, 3, 4, 4]
-    accepted = [3, 1, 2, 4]
-    rows_total = sum(seq_lens)
-    topk = torch.arange(rows_total * K, dtype=torch.int32, device=DEV).reshape(rows_total, K)
-    visible = torch.arange(200, 200 + rows_total, dtype=torch.int32, device=DEV)
-    md = _metadata(4, accepted, seq_lens=seq_lens, num_contexts=2)
-
-    _target(m.PrefillTarget)._capture_selection(md, topk, visible)
-
-    rows = [4, 7, 8 + 1, 12 + 3]
-    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :4], topk[rows])
-    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :4], visible[rows])
-    assert md.qsa_shared_topk_captured_slots == {SLOT}
-
-
 def test_decode_capture_at_draft_seven_takes_row_s_times_8_plus_a_minus_1():
     """max_draft_len 7: eight rows per request, accepted 1..8, so the captured row is
     `s * 8 + a - 1` -- the first and the last row of a block included."""
@@ -136,25 +99,28 @@ def test_decode_capture_at_draft_seven_takes_row_s_times_8_plus_a_minus_1():
     assert rows == [0, 15, 20, 26]
     torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :batch], topk[rows])
     torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :batch], visible[rows])
+    # Other slots and rows past the batch are untouched.
     assert torch.all(md.qsa_shared_topk_indices[SLOT, batch:] == -7)
+    assert torch.all(md.qsa_shared_topk_indices[0] == -7)
     assert md.qsa_shared_topk_captured_slots == {SLOT}
 
 
 def test_prefill_capture_at_draft_seven():
-    """A mixed batch at max_draft_len 7: one 5-row context chunk, then three generation
-    requests of 8 rows with 8, 1 and 6 accepted."""
-    seq_lens = [5, 8, 8, 8]
-    accepted = [2, 8, 1, 6]
+    """A mixed batch at max_draft_len 7: two context chunks of 5 and 3 rows, then three
+    generation requests of 8 rows with 8, 1 and 6 accepted. A context request captures its
+    chunk's last row whatever accepted count the worker left there."""
+    seq_lens = [5, 3, 8, 8, 8]
+    accepted = [2, 3, 8, 1, 6]
     rows_total = sum(seq_lens)
     topk = torch.arange(rows_total * K, dtype=torch.int32, device=DEV).reshape(rows_total, K)
     visible = torch.arange(400, 400 + rows_total, dtype=torch.int32, device=DEV)
-    md = _metadata(4, accepted, seq_lens=seq_lens, num_contexts=1)
+    md = _metadata(5, accepted, seq_lens=seq_lens, num_contexts=2)
 
     _target(m.PrefillTarget)._capture_selection(md, topk, visible)
 
-    rows = [4, 5 + 7, 13 + 0, 21 + 5]
-    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :4], topk[rows])
-    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :4], visible[rows])
+    rows = [4, 7, 8 + 7, 16 + 0, 24 + 5]
+    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :5], topk[rows])
+    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :5], visible[rows])
     assert md.qsa_shared_topk_captured_slots == {SLOT}
 
 

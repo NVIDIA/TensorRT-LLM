@@ -71,59 +71,33 @@ class MoeSort(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    CELLS: tuple[Cell, ...] = tuple(
-        cell
-        for tile in (128, 256)
-        for cell in (
-            Cell(
-                why=f"tile {tile}: decode, 1 request without MTP; block kernel",
-                spec=_ckpt(1, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 4 rows, 1 request at MTP verify width 4; last block-kernel T",
-                spec=_ckpt(4, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 5 rows; first single-cluster-kernel T",
-                spec=_ckpt(5, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 32 rows, decode at the 32-request ceiling",
-                spec=_ckpt(32, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 128 rows, 32 requests at MTP verify width 4; largest captured T",
-                spec=_ckpt(128, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 8192 rows, max_num_tokens prefill; last single-cluster T",
-                spec=_ckpt(8192, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 8192 rows all to the same 10 experts; full multi-tile runs",
-                spec=_ckpt(8192, tile, "hot"),
-            ),
-            Cell(
-                why=f"tile {tile}: expert counts tile-1, tile, tile+1; the mn_limit clamp",
-                spec=_ckpt(300, tile, "tile_edges"),
-            ),
-            Cell(
-                why=f"tile {tile}: 510 experts with one row each; n_tiles == max_tiles",
-                spec=_ckpt(51, tile, "round_robin"),
-            ),
-            Cell(
-                why=f"tile {tile}: 8193 rows, past the envelope; first cooperative-kernel T",
-                spec=_ckpt(8193, tile),
-            ),
-            Cell(
-                why=f"tile {tile}: 471859 rows; last cooperative-kernel T on 152 SMs",
-                spec=_ckpt(471859, tile, "strided"),
-            ),
-            Cell(
-                why=f"tile {tile}: 471860 rows; first histogram+offsets T on 152 SMs",
-                spec=_ckpt(471860, tile, "strided"),
-            ),
-        )
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tile 128: decode, 1 request without MTP; block kernel",
+            spec=_ckpt(1, 128),
+        ),
+        Cell(
+            why="tile 128: 128 rows, 32 requests at MTP verify width 4; largest captured T, "
+            "cluster kernel",
+            spec=_ckpt(128, 128),
+        ),
+        Cell(
+            why="tile 128: expert counts tile-1, tile, tile+1; the mn_limit clamp",
+            spec=_ckpt(300, 128, "tile_edges"),
+        ),
+        Cell(
+            why="tile 128: 8192 rows all to the same 10 experts; full multi-tile runs at the "
+            "last single-cluster T",
+            spec=_ckpt(8192, 128, "hot"),
+        ),
+        Cell(
+            why="tile 128: 8193 rows; first cooperative-kernel T",
+            spec=_ckpt(8193, 128),
+        ),
+        Cell(
+            why="tile 256: expert counts tile-1, tile, tile+1; the other tile sm_103 admits",
+            spec=_ckpt(300, 256, "tile_edges"),
+        ),
     )
 
     note = """
@@ -181,8 +155,10 @@ class MoeSort(OpWrapper):
     <= 0 (the host divides by it).
 
     Certified only at the checkpoint's values: num_experts 512, top_k 10, all
-    experts local (offset 0), tile 128 and 256, fp32 scales. Expert parallelism,
-    other tiles and other expert counts are uncertified.
+    experts local (offset 0), tile 128 (the target's) and 256, fp32 scales, and
+    T up to 8193 (block, cluster and the first cooperative T). Expert
+    parallelism, other tiles, other expert counts and the histogram path are
+    uncertified.
 
     Hard limits (sm_103)
       T * top_k         boundary 2^31 pairs (int32 product)

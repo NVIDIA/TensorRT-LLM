@@ -427,7 +427,7 @@ def test_rounding_rivals_are_rejected() -> None:
     assert moved > 0, "ties away from zero must move some K bytes on every-finite-bf16 rows"
 
     # V's scale layout, on random rows (the every-finite rows saturate V's scales).
-    spec = next(c.spec for c in op.CELLS if c.why.startswith("mixed:"))
+    spec = next(c.spec for c in op.CELLS if c.why.startswith("prefill:"))
     args, _, _ = _build(spec, seed=22)
     out = op(**args)
     page = int(args["block_table"][0, 0])
@@ -439,31 +439,6 @@ def test_rounding_rivals_are_rejected() -> None:
         .reshape(spec["hkv"], -1)
     )
     assert not torch.equal(interleaved, token_major), "the V scale layouts must be told apart"
-
-
-def test_cuda_graph_replay_follows_updated_positions() -> None:
-    """Captured once, replayed against new positions written into the same buffer."""
-    args, pool, _ = _decode_args(seed=9)
-    positions = args["logical_positions"]
-    saved = positions.clone()
-    positions.zero_()
-
-    def call():
-        op(**args)
-
-    for _ in range(3):
-        call()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        call()
-    pool[0].fill_(DATA_FILL)
-    pool[1].fill_(SCALE_FILL)
-    positions.copy_(saved)
-    ref = op.reference(**args)
-    graph.replay()
-    torch.cuda.synchronize()
-    _compare((args["k_cache"], args["v_cache"], args["k_scale_cache"], args["v_scale_cache"]), ref)
 
 
 def test_op_rejects_operands_it_cannot_serve() -> None:

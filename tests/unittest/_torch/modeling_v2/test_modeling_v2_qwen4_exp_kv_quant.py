@@ -175,7 +175,9 @@ def test_unquantized_kv_cache_keeps_the_checkpoints_bf16() -> None:
     core = _core(None)
     assert core.quant_mode == 0
     assert core.kv_pool_dtype == torch.bfloat16
-    assert core._pool_geometry(32).kv_dtype == torch.bfloat16
+    geometry = core._pool_geometry(32)
+    assert geometry.kv_dtype == torch.bfloat16
+    assert geometry.kv_width == core.head_dim
     assert core.kv_scale_orig_quant is None and core.kv_scale_quant_orig is None
 
 
@@ -187,6 +189,7 @@ def test_fp8_kv_cache_stores_e4m3_under_the_fp8_quant_mode() -> None:
     # planes keep the activation dtype.
     geometry = core._pool_geometry(32)
     assert geometry.kv_dtype == torch.float8_e4m3fn
+    assert geometry.kv_width == core.head_dim
     assert geometry.dtype == torch.bfloat16
 
 
@@ -199,12 +202,6 @@ def test_nvfp4_kv_cache_stores_e2m1_pairs_under_the_nvfp4_quant_mode() -> None:
     assert geometry.kv_dtype == torch.uint8
     assert geometry.kv_width == core.head_dim // 2
     assert geometry.dtype == torch.bfloat16
-
-
-@pytest.mark.parametrize("algo", [None, QuantAlgo.FP8])
-def test_unquantized_and_fp8_pools_are_a_full_head_wide(algo) -> None:
-    core = _core(algo)
-    assert core._pool_geometry(32).kv_width == core.head_dim
 
 
 @pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
