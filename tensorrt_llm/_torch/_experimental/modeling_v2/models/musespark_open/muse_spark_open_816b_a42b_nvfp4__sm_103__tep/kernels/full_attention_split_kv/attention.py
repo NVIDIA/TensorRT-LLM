@@ -48,7 +48,7 @@ from __future__ import annotations
 import collections
 import functools
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, Tuple
+from typing import ClassVar, Deque, Dict, Optional, Tuple
 
 import torch
 
@@ -107,6 +107,8 @@ def _capturing() -> bool:
 class SplitKvCall:
     """One full layer's decode call: what the stand-in needs, and what it did."""
 
+    #: The fast path the stand-in names when the call runs the built-in FMHA.
+    PATH: ClassVar[str] = "full_attention_split_kv"
     folded: "_prep_append.FoldedPreprocess"
     kv_scale: torch.Tensor
     splits: int
