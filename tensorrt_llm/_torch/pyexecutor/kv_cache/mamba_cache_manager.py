@@ -940,19 +940,19 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache_index[r] = block
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                self.mamba_cache.cache_buf_idx[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                self.mamba_cache.cache_buf_idx[block].zero_()
             elif (isinstance(self.mamba_cache, self.SpeculativeState)
                   and self._use_kda_replay_update):
                 # Fresh request: no drafts pending in the replay caches.
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
             if self._mamba_ssm_rand_seed is not None:
                 # Deterministic per-slot rotation on fresh assignment.
                 # `block` is pulled from mamba_cache_free_blocks, which
                 # excludes _padding_slot by construction (see __init__),
                 # so padding sentinels never reach this branch.
                 self._seed_request_counter += 1
-                self._mamba_ssm_rand_seed[block] = (
+                self._mamba_ssm_rand_seed[block].fill_(
                     _compute_deterministic_mamba_seed(
                         self._seed_request_counter, block,
                         self._seed_rank_offset))
@@ -986,9 +986,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         if not blocks:
             return
         conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
-        idx = torch.tensor(sorted(set(blocks)),
-                           dtype=torch.long,
-                           device=conv.device)
+        idx = _host_slots_to_device(sorted(set(blocks)), conv.device)
         d = conv.shape[2] // 3
         committed = conv.shape[3]
         cs = conv.index_select(1, idx)
@@ -1009,7 +1007,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                     self.mamba_cache.kda_v_cache,
                     self.mamba_cache.kda_beta_cache):
             buf.index_fill_(1, idx, 0)
-        self.mamba_cache.prev_num_accepted_tokens[idx] = 0
+        self.mamba_cache.prev_num_accepted_tokens.index_fill_(0, idx, 0)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         requests = (scheduled_batch.context_requests +
@@ -1047,11 +1045,11 @@ class PythonMambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_index[r]
                 if (isinstance(self.mamba_cache, self.SpeculativeState)
                         and self._use_replay_state_update):
-                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                    self.mamba_cache.cache_buf_idx[block] = 0
+                    self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                    self.mamba_cache.cache_buf_idx[block].zero_()
                 elif (isinstance(self.mamba_cache, self.SpeculativeState)
                       and self._use_kda_replay_update):
-                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                    self.mamba_cache.prev_num_accepted_tokens[block].zero_()
                 continue
             if self._is_padding_sentinel(r):
                 block = self._padding_slot
@@ -1065,11 +1063,11 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache_index[r] = block
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                self.mamba_cache.cache_buf_idx[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                self.mamba_cache.cache_buf_idx[block].zero_()
             elif (isinstance(self.mamba_cache, self.SpeculativeState)
                   and self._use_kda_replay_update):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
@@ -4671,7 +4669,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     num_accepted,
                     state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
                 )
-            self.prev_num_accepted_tokens[slot] = 0
+            self.prev_num_accepted_tokens[slot].zero_()
 
     def add_dummy_requests(
         self,
