@@ -53,7 +53,8 @@ import math
 import os
 import socket
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -777,6 +778,31 @@ def build_metrics_sse_event(headers: Dict[str, str]) -> bytes:
     return (f"event: {SSE_METRICS_EVENT}\ndata: {payload}\n\n").encode()
 
 
+@contextmanager
+def _input_processing_context(
+    state: dict[str, Any],
+    observer: Callable[[str, float, str | None], None] | None = None,
+) -> Iterator[None]:
+    """Keep input timings local to one HTTP request or background batch item."""
+    input_metrics: dict[str, float] = {}
+    state["input_processing_metrics"] = input_metrics
+    input_lock = threading.Lock()
+
+    def observe_input(stage: str, seconds: float, modality: str | None) -> None:
+        name = f"media_{stage}_{modality}" if modality is not None else stage
+        # Concurrent media decode workers share this bounded request record.
+        with input_lock:
+            input_metrics[name] = input_metrics.get(name, 0.0) + seconds
+        if observer is not None:
+            observer(stage, seconds, modality)
+
+    token = _input_processing_observer.set(observe_input)
+    try:
+        yield
+    finally:
+        _input_processing_observer.reset(token)
+
+
 class PerfMetricsMiddleware:
     """Expose request metrics and optionally persist completed records."""
 
@@ -848,20 +874,5 @@ class PerfMetricsMiddleware:
                         return
             await send(message)
 
-        input_metrics: dict[str, float] = {}
-        scope["state"]["input_processing_metrics"] = input_metrics
-        input_lock = threading.Lock()
-
-        def observe_input(stage: str, seconds: float, modality: str | None) -> None:
-            name = f"media_{stage}_{modality}" if modality is not None else stage
-            # Concurrent media decode workers share this bounded request record.
-            with input_lock:
-                input_metrics[name] = input_metrics.get(name, 0.0) + seconds
-            if self._input_processing_observer is not None:
-                self._input_processing_observer(stage, seconds, modality)
-
-        token = _input_processing_observer.set(observe_input)
-        try:
+        with _input_processing_context(scope["state"], self._input_processing_observer):
             await self._app(scope, receive, send_metrics)
-        finally:
-            _input_processing_observer.reset(token)
