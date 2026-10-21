@@ -56,7 +56,7 @@ from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, is_mla,
+from .config_utils import (is_glm5_next, is_hybrid_linear, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
@@ -235,6 +235,19 @@ def validate_fp4_mla_config(model_config: ModelConfig,
         # HP/V-scale side pools are not switched by draft_kv_cache_context.
         # Set this before models and workers consult the shared predicate.
         spec_config._allow_separate_draft_kv_cache = False
+
+
+def disable_glm5_next_separate_draft_kv_cache(
+        model_config: ModelConfig) -> None:
+    """Keep glm5_next one-engine draft layers in the target KV cache manager."""
+    spec_config = model_config.spec_config
+    if (spec_config is None or not spec_config.spec_dec_mode.use_one_engine()
+            or not is_glm5_next(model_config.pretrained_config)):
+        return
+    # The glm_kpool slot tables live in the recurrent metadata and are not
+    # switched by draft_kv_cache_context. Set this before models and workers
+    # consult the shared predicate.
+    spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -2005,6 +2018,7 @@ class ModelLoader:
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_fp4_mla_config(config, self.llm_args)
+        disable_glm5_next_separate_draft_kv_cache(config)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
             self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,
