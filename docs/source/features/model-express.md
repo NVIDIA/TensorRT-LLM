@@ -55,6 +55,9 @@ transfers the shared table once, as `model.embed_tokens.weight`, and the
 Because the two profiles transfer different tensor sets, the tied profile has
 its own transform-layout ABI, and a tied source never pairs with an untied
 receiver, even under the `ENFORCE` identity policy.
+The constructed model must realize the tie that the checkpoint declares: when
+the `tie_word_embeddings` flag and the constructed `lm_head` and `embed_tokens`
+weights disagree, no profile matches.
 
 The Mistral identity covers dense Hugging Face-format checkpoints that resolve
 to the exact `MistralForCausalLM` / `mistral` pair and whose realized attention
