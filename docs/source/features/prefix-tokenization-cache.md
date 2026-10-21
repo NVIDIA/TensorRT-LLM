@@ -19,6 +19,26 @@ re-tokenizes from there, and accepts the splice only if the re-tokenized ids
 equal the cached ids over that seam. Otherwise the prompt is tokenized in full.
 The output is always identical to tokenizing the whole prompt.
 
+When the tokenizer allows it, the cache runs **piecewise** instead. A fast
+tokenizer encodes the text between its non-normalized added tokens (the chat
+template's role and message markers) independently, so the cache splits prompts
+there: a cached prompt ends at an added token, a tail needs no seam check, and
+each piece's ids are kept in a second LRU keyed by the piece text. A prompt that
+does not extend a cached one, such as a first turn or a conversation whose
+history was edited, then still reuses the pieces it shares with earlier prompts,
+and the pieces not yet cached are encoded in one batch call. Piecewise mode is
+chosen at startup only if it is exact for the tokenizer: no added token with
+`lstrip`, `rstrip`, or `single_word`, no added token containing another one, no
+`Metaspace` pre-tokenizer that marks only the first word, `split_special_tokens`
+off, no Python-side preprocessing in the tokenizer class, and a probe that
+encodes identically both ways. The startup log line says which mode is in use,
+and the piece LRU is bounded by `TLLM_PREFIX_TOKEN_CACHE_MAX_CHARS` on its own.
+A prompt is split piecewise only if an added token starts within its last 256
+characters, as a chat template's generation prompt does; otherwise, for example
+with plain-text role markers, it takes the offsets splice. Either way, a prompt
+that extends a cached one re-tokenizes at most a few hundred characters of the
+cached text.
+
 ## Enabling the cache
 
 The cache is **off by default**. Enable it with the `enable_tokenization_cache`
@@ -52,8 +72,9 @@ feature you turned on.
 
 - Each `DefaultInputProcessor` owns its own cache, so cached ids are never
   shared across tokenizers.
-- The cache requires a fast (Rust-backed) tokenizer, because it relies on
-  character offsets. With a slow tokenizer the cache is disabled with a warning.
+- The cache requires a fast (Rust-backed) tokenizer, for character offsets or
+  piecewise encoding. With a slow tokenizer the cache is disabled with a
+  warning.
 - The cache is used only when the tokenizer would be called exactly as the
   cache calls it: `add_special_tokens=False` and no prompt truncation. Chat
   completions apply the chat template and tokenize with
@@ -88,7 +109,14 @@ This is a **latency win, not a throughput win**, at that operating point:
 total throughput and inter-token latency are flat. Do not expect a throughput
 improvement from it.
 
-The splice was also checked against real `gpt2`, Llama-3, and Qwen3
+The offsets-mode splice was also checked against real `gpt2`, Llama-3, and Qwen3
 tokenizers on 300 randomly grown multi-turn prompts each, with deltas
 deliberately starting mid-word: 300/300 identical ids, 280 cache hits, and 0
 re-synchronization fallbacks per tokenizer.
+
+Piecewise mode was checked by replaying the 2,031 chat prompts of a MiniMax-M3
+AgentX run (TP4, concurrency 20) in arrival order: ids identical to tokenizing
+each prompt in full, and per-request tokenization time on a B300 node's host CPU
+of 29.6 ms mean, 8.9 ms p50, and 358 ms p99 in offsets mode versus 9.6 ms,
+3.9 ms, and 96 ms piecewise. The gain is largest on prompts that miss the prefix
+lookup: first turns and turns whose history the agent rewrote.
