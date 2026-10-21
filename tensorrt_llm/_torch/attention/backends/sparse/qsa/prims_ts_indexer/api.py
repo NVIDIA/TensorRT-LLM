@@ -46,6 +46,13 @@ def _pick_n_splits(tiles_bound: int, n_max: int, min_splits: int, num_sms: int) 
     return best
 
 
+def _aligned(t: torch.Tensor) -> torch.Tensor:
+    # Row slices of the caller's packed metadata land on 4 B boundaries; the
+    # kernel's vector loads and TMA need 16 B.
+    t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
 def _ptr(t, dtype):
     import cutlass
     from cutlass.cute.runtime import make_ptr
@@ -131,7 +138,7 @@ def prepare_qsa_index_scores(
     num_requests = block_table.shape[0]
     max_blocks = block_table.shape[1] * blocks_per_page
     tile_meta = torch.empty(2 * num_requests, dtype=torch.int32, device=device)
-    request_indices = request_indices.contiguous()
+    request_indices = _aligned(request_indices)
     tiles_bound = (rows + _k.QUERY_ROWS_PER_TILE - 1) // _k.QUERY_ROWS_PER_TILE + num_requests
     n_max = max(1, (max_blocks + _k.TILE_N - 1) // _k.TILE_N)
     pages_per_tile = _k.TILE_N // blocks_per_page
@@ -140,16 +147,16 @@ def prepare_qsa_index_scores(
     n_splits = _pick_n_splits(tiles_bound, n_max, min_splits, num_sms)
     grid_size = tiles_bound * n_splits
     scores = torch.empty(rows, max_blocks, dtype=torch.float32, device=device)
-    positions = (
+    positions = _aligned(
         query_positions if query_positions.dtype == torch.int32 else query_positions.to(torch.int32)
     )
     fn = _compiled(blocks_per_page, compress_ratio)
     import cuda.bindings.driver as cuda_driver
     import cutlass
 
-    block_table = block_table.contiguous()
-    q = q.contiguous()
-    index_cache = index_cache.contiguous()
+    block_table = _aligned(block_table)
+    q = _aligned(q)
+    index_cache = _aligned(index_cache)
     # Raw pointers go into the compiled call; these tensors own the storage.
     keepalive = (
         q,
