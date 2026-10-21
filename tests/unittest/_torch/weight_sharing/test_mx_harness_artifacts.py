@@ -22,6 +22,10 @@ tests lay out exactly that and check that `timing.json` still lands in the
 archive without raising, which would otherwise replace the failure that ended
 the run.
 
+Transfer bound: `mx_transfer_upper_bound` counts a storage that several
+parameters share once, and `assert_transfer_within_manifests` rejects a
+receiver rank whose RDMA record moves more than its manifest holds.
+
 Probe arguments: the remaining tests check how a row's probe becomes
 `mx_e2e_worker.py` arguments, including missing probe images, and that the
 worker rejects inconsistent probe arguments and sizes every role of an
@@ -52,10 +56,12 @@ from defs.model_express.mx_harness import (  # noqa: E402
     MxE2ECase,
     MxRunLayout,
     archive_run_artifacts,
+    assert_transfer_within_manifests,
     assert_weight_manifests,
     collect_available_manifests,
     collect_available_payloads,
     collect_weight_manifests,
+    mx_transfer_upper_bound,
     probe_worker_args,
     report_timings,
 )
@@ -229,6 +235,51 @@ def test_manifest_roles_must_include_both_mx_roles(tmp_path: Path) -> None:
         collect_weight_manifests(tmp_path, _case(), roles=("baseline", "donor"))
     with pytest.raises(ValueError, match="include"):
         assert_weight_manifests(_case(), {}, roles=("donor", "donor", "receiver"))
+
+
+class _SharedStorageModule(nn.Module):
+    """A tied head, a runtime alias module, two empty parameters, and a buffer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(4, 2)
+        self.norm = nn.LayerNorm(2)
+        self.next_layer_layernorm = self.norm
+        self.lm_head = nn.Linear(2, 4, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight
+        self.empty = nn.Parameter(torch.empty(0))
+        self.other_empty = nn.Parameter(torch.empty(0))
+        self.register_buffer("scale", torch.ones(2))
+
+
+def test_mx_transfer_upper_bound_counts_each_shared_view_once() -> None:
+    # The MX catalog holds embed_tokens.weight (which the head shares),
+    # norm.weight, norm.bias, and one empty parameter: 32 + 8 + 8 + 0 bytes.
+    # The bound counts the second empty parameter as well.
+    assert mx_transfer_upper_bound(build_weight_manifest(_SharedStorageModule())) == (5, 48)
+
+
+@pytest.mark.parametrize(
+    "logged, within",
+    [
+        pytest.param("4 tensors, 0.00 GB", True, id="empty-parameters-merged"),
+        pytest.param("5 tensors, 0.00 GB", True, id="bound"),
+        pytest.param("6 tensors, 0.00 GB", False, id="shared-storage-sent-twice"),
+        pytest.param("5 tensors, 0.02 GB", False, id="too-many-bytes"),
+    ],
+)
+def test_receiver_transfer_must_stay_within_its_manifest(
+    tmp_path: Path, logged: str, within: bool
+) -> None:
+    manifests = {("transfer", "receiver", 0): build_weight_manifest(_SharedStorageModule())}
+    receiver_log = tmp_path / "receiver.log"
+    receiver_log.write_text(f"[Worker 0] INFO: [TIMING] RDMA transfer complete: {logged}, 1.0s\n")
+
+    if within:
+        assert_transfer_within_manifests(_case(), receiver_log, manifests)
+    else:
+        with pytest.raises(pytest.fail.Exception, match="moved more than"):
+            assert_transfer_within_manifests(_case(), receiver_log, manifests)
 
 
 def _image_probe_case() -> MxE2ECase:
