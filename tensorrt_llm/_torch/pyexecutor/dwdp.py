@@ -38,11 +38,13 @@ import torch
 import torch.nn as nn
 from mpi4py.MPI import COMM_WORLD
 
+from tensorrt_llm._torch.cute_dsl_utils import set_sm_reserve
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp import (
     DWDPWeightManager,
     StoreDwdpGroup,
     dwdp_global_rank,
+    fabric_gather,
     setup_dwdp,
     store_rendezvous_enabled,
     teardown_dwdp,
@@ -156,6 +158,10 @@ class DwdpManager:
         self.start_expert_id = self.dwdp_rank * self.num_prefetch_experts
         self.end_expert_id = self.start_expert_id + self.num_experts_per_worker
 
+        # SMs the expert gather holds for the whole step; persistent grids leave
+        # them out (``set_sm_reserve`` on ``__enter__``, before the model is built).
+        self.resident_sms = fabric_gather.resident_sms()
+
         self.dwdp_group = self._create_dwdp_comm()
 
         # SSOT for MoE layer indices; populated by configurable_moe.add_layer()
@@ -199,12 +205,14 @@ class DwdpManager:
         if get_global_dwdp_manager() is not None:
             raise RuntimeError("DwdpManager already registered globally")
         set_global_dwdp_manager(self)
+        set_sm_reserve(self.resident_sms)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         try:
             self.cleanup()
         finally:
+            set_sm_reserve(0)
             set_global_dwdp_manager(None)
         return False
 
