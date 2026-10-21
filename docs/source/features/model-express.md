@@ -33,9 +33,12 @@ profiles:
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
-declared by the profile. An unregistered subclass, config alias, or undeclared
-runtime variant does not inherit support. It falls back to the standard Hugging
-Face checkpoint path before any P2P transfer starts.
+declared by the profile. Profiles whose post-transform layout depends on the GPU
+architecture also constrain the SM version of the device that runs the load. An
+unregistered subclass, config alias, or undeclared runtime variant does not
+inherit support. It falls back to the standard Hugging Face checkpoint path
+before any P2P transfer starts, and a donor that does not qualify does not
+publish its weights.
 
 The Qwen2 identity includes Qwen2 and Qwen2.5 dense checkpoints that resolve to
 the exact `Qwen2ForCausalLM` / `qwen2` pair and satisfy the constraints above.
@@ -53,6 +56,22 @@ The native `mistral` checkpoint format (`params.json` with
 model type to `mistral_common`; it cannot be combined with the MX loading path.
 The unregistered Llama-based `MistralForCausalLM` class in `modeling_llama.py`
 shares components with the qualified root but is not qualified.
+
+The Qwen3 FP8 block-scale identity covers `Qwen3ForCausalLM` / `qwen3`
+checkpoints whose quantization resolves to `FP8_BLOCK_SCALES` with 128x128
+weight blocks and an unquantized KV cache; Qwen3-8B-FP8 (`quant_method: fp8`,
+`weight_block_size: [128, 128]`, dynamic activations) is the qualified canary.
+Other sources that resolve to the same algorithm, such as static-activation FP8
+checkpoints or ModelOpt and compressed-tensors block FP8 exports, meet the same
+constraints, and any calibrated activation scale they load is transferred byte
+for byte; only the canary has end-to-end evidence. Per-tensor FP8 checkpoints
+(ModelOpt `FP8`), an FP8 KV cache, and every GPU other than SM90 do not match
+this profile. On SM100-family GPUs (by default) and SM120 GPUs,
+`transform_weights()` resmooths the weights to power-of-two scales and repacks
+the scales for DeepGEMM, and SM107 can use a CuTe DSL scale layout, so the SM90
+tensors are not valid there. Such loads fall back to the Hugging Face path.
+`SourceIdentity` does not record the SM version, so this profile constraint is
+what keeps the SM90 layout on SM90.
 
 TensorRT LLM applies two independent compatibility gates:
 
@@ -73,11 +92,14 @@ disabled until layout state is tracked and qualified independently for each
 submodel.
 
 The Llama, Qwen2, Qwen3, and Mistral profiles are text-only and do not enable
-reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
-or KV cache, alternate attention backends, YaRN, tied embeddings, TP greater
-than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention, attention
-DP, multi-node transfer, and speculative decoding require separate
-qualification rows. Each profile also pins its qualified RoPE realization:
+reward-model, embedding, MoE, or vision-language roots. FP16, quantized weight
+formats other than SM90 FP8 block scales on Qwen3, a quantized KV cache,
+alternate attention backends, YaRN, tied embeddings, TP greater than 2, PP
+greater than 1, CP greater than 1, LoRA, sparse attention, attention DP,
+multi-node transfer, and speculative decoding require separate qualification
+rows. The Qwen3 FP8 block-scale profile is pinned to SM90 because its realized
+weight and scale layout differs on other GPU architectures. Each profile also
+pins its qualified RoPE realization:
 Llama, Qwen2, and Mistral require the default fused RoPE path, so unfused RoPE
 requires separate qualification for them, while Qwen3 fuses RoPE into the
 QK-norm kernel and therefore requires `rope_fusion=False` in the realized
@@ -98,7 +120,10 @@ Support for another model family requires a focused qualification change:
    `cache_derived_state()`.
 2. Verify that every one-time transform is guarded by `_weights_transformed`
    and that the staged receiver can skip `transform_weights()` without
-   changing aliases, derived state, tensor layout, or outputs.
+   changing aliases, derived state, tensor layout, or outputs. For quantized
+   rows, audit each quantization method's `transform_weights()` per GPU
+   architecture and constrain `sm_versions` to the architectures whose
+   realized layout the row's ABI describes.
 3. Add an exact qualification profile only after the reusable harness in
    `tests/unittest/utils/post_transform_qualification.py` proves tensor,
    alias, transform-guard, derived-state, and deterministic output
@@ -147,7 +172,7 @@ byte:
 A row may list `final_manifest_exempt_patterns` on its `MxE2ECase` to exempt
 named tensors from the final-tier digest comparison. That is never a numeric
 tolerance and never applies to the transfer tier, and every pattern needs a
-code comment explaining why; the current BF16 dense rows exempt nothing.
+code comment explaining why; the current rows exempt nothing.
 Manifests carry a `manifest_format_version`, and manifests of different
 versions never compare.
 
@@ -175,6 +200,9 @@ checkpoint path. The Qwen2, Qwen3, and Mistral profile rows use
 `qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`, and
 `mistral-bf16-tp1` / `mistral-bf16-tp2`, with optional model path overrides in
 `TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, and `TRTLLM_MX_MISTRAL_MODEL`.
+The Qwen3 FP8 block-scale profile rows use `qwen3-fp8-block-tp1` /
+`qwen3-fp8-block-tp2` with Qwen3-8B-FP8, overridable through
+`TRTLLM_MX_QWEN3_FP8_MODEL`; the H100 CI stages satisfy its SM90 constraint.
 `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -242,7 +270,8 @@ PyTorch backend. The Qwen3 GSM8K entry is the one gated by
 `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B`,
 so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
 Qwen2, or Mistral checkpoint has such a reference today, so those families are
-covered by their smoke rows until one is added.
+covered by their smoke rows until one is added. The Qwen3 FP8 block-scale
+profile has no accuracy canary either; its smoke rows cover it.
 
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
@@ -300,6 +329,11 @@ When adding an ABI ID:
    every profile that adopts the ID.
 4. Never reinterpret an already published ID. Supporting two ABIs requires an
    explicit compatibility decision and tests for each producer/receiver pair.
+5. When a quantization method realizes a different tensor layout per GPU
+   architecture, give each realized layout its own ID and pin the profile's
+   `sm_versions` to the architectures it was qualified on. `SourceIdentity`
+   does not record the SM version, so the pin is what keeps a receiver from
+   accepting bytes laid out for another architecture.
 
 ## Installation
 
@@ -392,9 +426,10 @@ path.
 ## Notes and Limitations
 
 - Post-transform MX reception is currently limited to the exact Llama,
-  Qwen2/Qwen2.5 dense, Qwen3 dense, and Mistral dense profiles above. Other
-  roots and variants that do not match the documented identity and runtime
-  envelope safely fall back to Hugging Face loading until explicitly qualified.
+  Qwen2/Qwen2.5 dense, Qwen3 dense (BF16 or SM90 FP8 block-scale), and Mistral
+  dense profiles above. Other roots and variants that do not match the
+  documented identity and runtime envelope safely fall back to Hugging Face
+  loading until explicitly qualified.
 - Mistral checkpoints served through the native `mistral` checkpoint format
   (`mistral_common` model type), sliding-window or Ministral `layer_types`
   variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
