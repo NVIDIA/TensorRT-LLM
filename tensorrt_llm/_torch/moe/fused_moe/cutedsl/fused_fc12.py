@@ -250,6 +250,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # all-to-all combine workspace.
         return True
 
+    def prequantized_nvfp4_input_scale(self) -> torch.Tensor | None:
+        """``quantize_input`` passes an unswizzled ``Fp4QuantizedTensor`` through, except on a
+        layer with a pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC)."""
+        if getattr(self, "fc31_act_scale", None) is not None:
+            return None
+        return self.fc31_input_scale
+
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """The fused kernel's persistent grid launches enough whole clusters fewer to leave
         ``num_sms`` SMs without an FC12 CTA (``sm_reserve`` of the op)."""

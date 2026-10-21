@@ -517,10 +517,16 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
 
     received = {}
 
-    def routed_experts(value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
-        calls.append(("routed_moe", current_stream))
-        received.update(kwargs)
-        return value
+    class _RoutedExperts:
+        """BF16-input routed experts (no NVFP4 input contract)."""
+
+        def __call__(self, value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+            calls.append(("routed_moe", current_stream))
+            received.update(kwargs)
+            return value
+
+        def nvfp4_input_scale(self, num_tokens: int) -> None:
+            return None
 
     def compute_logits(value: torch.Tensor) -> torch.Tensor:
         calls.append(("router_gemm", current_stream))
@@ -529,7 +535,7 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=compute_logits)
-    runtime.routed_experts = routed_experts
+    runtime.routed_experts = _RoutedExperts()
     runtime.routed_expert_down_proj = _Projection("routed_down")
     runtime.routed_expert_norm = _Projection("routed_norm")
     runtime.routed_expert_up_proj = _Projection("routed_up")
@@ -537,6 +543,7 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = False
     runtime.shared_expert_stream = None
+    runtime._shared_gemms_can_lead = False
     runtime.moe_main_event = _Event("fork")
     runtime.moe_shared_event = _Event("shared_done")
     runtime.moe_routed_event = None

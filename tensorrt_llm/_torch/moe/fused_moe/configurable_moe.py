@@ -496,6 +496,29 @@ class ConfigurableMoE(MoE):
             torch.device("cuda"),
         )
 
+    def nvfp4_input_scale(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """Global scale of an NVFP4 input that a forward of ``num_tokens``
+        tokens takes as is (``Fp4QuantizedTensor`` with linear scale factors,
+        e.g. from :meth:`quantize_nvfp4_input` or a producer's epilogue), or
+        ``None`` when it needs an unquantized input: the backend must accept
+        one (``prequantized_nvfp4_input_scale``), with no communication
+        strategy, EPLB or router weight folded into the input, and in one
+        chunk."""
+        if (
+            self.comm is not None
+            or self._using_load_balancer()
+            or self.apply_router_weight_on_input
+            or num_tokens > self.moe_max_num_tokens
+        ):
+            return None
+        return self.backend.prequantized_nvfp4_input_scale()
+
+    def quantize_nvfp4_input(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """``x`` quantized as the backend quantizes its input, for a forward
+        whose :meth:`nvfp4_input_scale` is not ``None``."""
+        x_fp4, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
+        return Fp4QuantizedTensor(x_fp4, x_sf, is_sf_swizzled=False)
+
     @property
     def num_fused_shared_expert(self) -> int:
         """Expose the backend's fused-shared-expert count so model code (e.g.

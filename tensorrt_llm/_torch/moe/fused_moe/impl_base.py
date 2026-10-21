@@ -299,6 +299,14 @@ class MoEImplBase(
         """
         return None
 
+    def prequantized_nvfp4_input_scale(self) -> "torch.Tensor | None":
+        """Global scale under which ``run_moe`` takes an NVFP4 input quantized
+        ahead of it as is (``Fp4QuantizedTensor``: 16-element groups, linear
+        E4M3 scale factors, as ``quantize_input(x, post_quant_comm=False)``
+        produces), or ``None`` (the default) when the backend quantizes its
+        input itself only."""
+        return None
+
     def consumes_sort_tables(self) -> bool:
         """Whether ``run_moe`` runs on ``MoERunContext.sort_tables`` (the
         ``moe_sort`` outputs a routing kernel wrote) instead of sorting itself.
