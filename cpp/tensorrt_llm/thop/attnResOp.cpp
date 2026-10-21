@@ -264,7 +264,7 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_res
 //! and this op should go away.
 std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_persistent_fwd(at::Tensor layer_residual,
     std::optional<at::Tensor> layer_residual_add, at::Tensor block_residual, at::Tensor res_weight,
-    at::Tensor rms_weight, at::Tensor output_rms_weight, double rms_eps, double output_rms_eps)
+    at::Tensor rms_weight, at::Tensor output_rms_weight, double rms_eps, double output_rms_eps, int64_t sm_reserve)
 {
     TORCH_CHECK(layer_residual.dim() == 3, "attn_res_add_rmsnorm_persistent_fwd: layer_residual must be [T, B, H]");
     // The addend is optional: the pre-attention mix and the post-attention mix
@@ -348,7 +348,7 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_persistent_fwd(at::Tenso
     params.outputRmsEps = static_cast<float>(output_rms_eps);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    kernels::kimiK3AttnRes::invokeAttnResPersistentFusedFwd(params, stream);
+    kernels::kimiK3AttnRes::invokeAttnResPersistentFusedFwd(params, static_cast<int>(sm_reserve), stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {updated_layer_residual, output};
 }
@@ -376,7 +376,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "attn_res_add_rmsnorm_persistent_fwd(Tensor layer_residual, Tensor? layer_residual_add, "
         "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
-        "float rms_eps, float output_rms_eps) -> (Tensor, Tensor)");
+        "float rms_eps, float output_rms_eps, int sm_reserve=0) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
