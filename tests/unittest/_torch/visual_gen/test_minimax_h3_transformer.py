@@ -1532,8 +1532,10 @@ def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
     # The released Diffusers layout: to_q / to_k / to_v (no qkv_proj) and ff.net.{0.proj,2}
     # with SwiGLU stored as [up, gate].
     checkpoint: dict[str, torch.Tensor] = {}
+    expected: dict[str, torch.Tensor] = {}
     for name, value in model.state_dict().items():
         value = torch.randn_like(value) if value.is_floating_point() else value.clone()
+        expected[name] = value
         if ".ff.gate_up_proj." in name:
             gate, up = value.chunk(2, dim=0)
             checkpoint[name.replace(".ff.gate_up_proj.", ".ff.net.0.proj.")] = torch.cat((up, gate))
@@ -1546,7 +1548,6 @@ def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
 
     model.load_weights(checkpoint)
 
+    # Every parameter, including the re-ordered gate_up_proj and the renamed down_proj.
     for name, parameter in model.named_parameters():
-        if ".ff." in name:
-            continue
-        torch.testing.assert_close(parameter, checkpoint[name].to(parameter.dtype), rtol=0, atol=0)
+        torch.testing.assert_close(parameter, expected[name].to(parameter.dtype), rtol=0, atol=0)
