@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi-K3 decode attention-residual mix + RMSNorm (+ residual add) with a PDL prologue.
 
-Runs on SM100, SM103 and SM107: the kernel uses no tensor-core instructions, at most five named
+Runs on SM100, SM103 and SM107: the kernel uses no tensor-core instructions, at most four named
 barriers per CTA and portable cluster sizes.
 
 For ``M`` tokens of hidden size 7168, ``N - 1`` snapshot rows ``block[n]`` and the layer row
@@ -33,8 +33,20 @@ of the elements; the updated prefix sum, an elementwise add, is bit-identical.
 
 Snapshot rows and the prefix sum may be read before the wait because they are older than the
 previous kernel: the bank rows are written by plain copy kernels at least one layer earlier, and
-the prefix sum before the previous kernel's own predecessor, which waits for its predecessor
-before it triggers its dependents.
+the prefix sum by the previous attention-residual launch, which is separated from this one by a
+grid that waits for its predecessor before it triggers its dependents (an all-reduce, or a KDA /
+MLA attention kernel).
+
+The kernel releases its dependent grid right after its own ``griddepcontrol.wait``, so the next
+kernel (the decode projection GEMM or the router) can become resident and stream its weights
+while this one finishes. Every grid upstream has completed when a dependent starts; only this
+grid may still run. The grids that can start before it completes are its dependents and,
+through dependents that trigger before their own wait (the FP8 low-M GEMMs), theirs; before
+their wait these read only weights, weight scales, routing metadata and recurrent-state pools
+and write no global memory, and they read this kernel's outputs (normed row, updated prefix)
+only after a wait. The next attention-residual launch, which reads the prefix this kernel stores
+before its wait, starts only after a grid between them waited for this one to complete (see
+above).
 """
 
 from __future__ import annotations
@@ -673,9 +685,10 @@ class KimiK3AttnResKernel:
             for e in cutlass.range_constexpr(8):
                 premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
-        # ---- wait for the previous grid ----
+        # ---- wait for the previous grid, then release the dependent grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
+            _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             addend = unpack(load(add_addr + row + col, False))
@@ -754,9 +767,6 @@ class KimiK3AttnResKernel:
         y = [_mul_ftz(_round_bf16(_mul_ftz(mixed[e], out_rs)), w_out[e]) for e in range(8)]
         words = [_pack_bf16x2(y[2 * i], y[2 * i + 1]) for i in range(4)]
         _stg_v4_if(valid, out_addr + row + col, words)
-        if cutlass.const_expr(self.use_pdl):
-            _bar_sync(4, self.threads)
-            _griddepcontrol_launch_dependents()
 
 
 # ---------------------------------------------------------------------------
