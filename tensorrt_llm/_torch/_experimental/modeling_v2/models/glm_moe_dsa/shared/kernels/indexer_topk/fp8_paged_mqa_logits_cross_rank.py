@@ -35,7 +35,7 @@ The notes of the indexer_topk ``rows`` kernel follow.
 
 indexer_topk variant of the CuTe DSL FP8 paged MQA logits kernel for Blackwell (SM100).
 
-Derived from ``cute_dsl_kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits``
+Derived from ``attention/kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits``
 for the GLM-5.x indexer shape, where all verify rows of a request fit one UMMA
 tile (``N = next_n * num_heads <= 256``). The only functional change is the
 size of the per-thread register cache of epilogue weights
@@ -109,7 +109,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import griddepcontrol_launch_dependents
+from tensorrt_llm._torch.kernels.blackwell.utils import griddepcontrol_launch_dependents
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.

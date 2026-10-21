@@ -16,7 +16,7 @@
 
 Scores all ``next_n`` verify rows of a request against one stream of the
 paged FP8 indexer K cache, derived from the native CuTe DSL kernel
-``cute_dsl_kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits``.
+``attention/kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits``.
 
 Differences from the native kernel (same TMA/UMMA building blocks, same
 epilogue arithmetic per element):

@@ -154,7 +154,7 @@ def _build(
     from cutlass.cutlass_dsl import T, dsl_user_op
     from cutlass.utils.smem_allocator import SmemAllocator
 
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import mma_sync
+    from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import mma_sync
 
     geo = plan(n_dim, k_dim, grid)
     rows_max = geo["rows_max"]

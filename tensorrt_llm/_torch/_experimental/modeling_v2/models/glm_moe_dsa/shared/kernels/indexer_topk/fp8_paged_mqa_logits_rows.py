@@ -15,7 +15,7 @@
 """
 indexer_topk variant of the CuTe DSL FP8 paged MQA logits kernel for Blackwell (SM100).
 
-Derived from ``cute_dsl_kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits``
+Derived from ``attention/kernels/blackwell/paged_mqa_logits/fp8_paged_mqa_logits``
 for the GLM-5.x indexer shape, where all verify rows of a request fit one UMMA
 tile (``N = next_n * num_heads <= 256``). The only functional change is the
 size of the per-thread register cache of epilogue weights
