@@ -112,7 +112,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1009,30 +1009,6 @@ class FinalizeAllReduceTransport(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="no speculation: one token", spec=dict(tokens=1)),
-        Cell(why="DFlash2 K=7 verify: 8 tokens", spec=dict(tokens=8)),
-        Cell(
-            why="the widest call on this kernel (the ring-buddy decode bound)", spec=dict(tokens=16)
-        ),
-        Cell(
-            why="every slot of a token on one rank, none on the others",
-            spec=dict(tokens=8, placement="concentrated"),
-        ),
-        Cell(
-            why="ring-buddy placement: each slot on its owner or successor",
-            spec=dict(tokens=8, placement="buddy"),
-        ),
-        Cell(
-            why="exact and negative zeros in the rows, tokens with no valid slot",
-            spec=dict(tokens=8, zeros=True),
-        ),
-        Cell(
-            why="invalid slots and cancelling rows: the rank-order sum is observable",
-            spec=dict(tokens=8, invalid=True, cancel=True),
-        ),
-    )
 
     note = """
     Metadata consumed: ``indices`` (the expert op's ``[tokens, 8]`` row map,

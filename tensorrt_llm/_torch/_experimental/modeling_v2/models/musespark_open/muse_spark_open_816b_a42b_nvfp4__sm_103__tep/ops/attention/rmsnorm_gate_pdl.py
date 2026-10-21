@@ -31,7 +31,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 try:
     import cutlass
@@ -188,33 +188,6 @@ class AttentionRmsNormGatePdl(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="tep4, 17 requests at K=7 (136 rows): the first row count above the Triton band",
-            spec=dict(rows=136, heads=32, gate_ndim=3, trigger="after_wait"),
-        ),
-        Cell(
-            why="tep4, 24 requests (192 rows), the gate as the prep's strided [rows, H, 64] view",
-            spec=dict(rows=192, heads=32, gate_ndim=3, trigger="after_wait"),
-        ),
-        Cell(
-            why="tep4, 64 requests (512 rows): the largest decode step the target serves",
-            spec=dict(rows=512, heads=32, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="a row count that is not a multiple of 8 (129): a partial last CTA",
-            spec=dict(rows=129, heads=32, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="the entry trigger",
-            spec=dict(rows=256, heads=32, gate_ndim=3, trigger="entry"),
-        ),
-        Cell(
-            why="the implicit trigger at exit",
-            spec=dict(rows=256, heads=32, gate_ndim=3, trigger="exit"),
-        ),
-    )
 
     note = """
     Certified bit for bit against the built-in `rmsnorm_gate` (raw BF16 bits, heads

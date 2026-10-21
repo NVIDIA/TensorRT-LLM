@@ -23,9 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
-from .draft_shard_topk import CHUNK, NUM_WARPS, SHARD, TOP_K, DraftShardTopK
+from .draft_shard_topk import CHUNK, NUM_WARPS, TOP_K, DraftShardTopK
 
 #: Per-chunk keys one row program reduces.
 MAX_KEYS = 4096
@@ -87,36 +87,6 @@ class DraftRankTopK(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS = (
-        Cell(
-            "a TP4 rank's shard at five requests (40 rows): 13 chunks, 208 keys to 16",
-            dict(rows=40, shard=202048 // 4, top_k=TOP_K, rank=1, ranks=4, values="logits"),
-        ),
-        Cell(
-            "32 requests (256 rows), the last rank of four",
-            dict(rows=256, shard=202048 // 4, top_k=TOP_K, rank=3, ranks=4, values="logits"),
-        ),
-        Cell(
-            "ties everywhere: 40 distinct values, so selection is decided by column",
-            dict(rows=40, shard=202048 // 4, top_k=TOP_K, rank=0, ranks=4, values="grid"),
-        ),
-        Cell(
-            "signed zeros, infinities and NaN at the top: torch's radix key order",
-            dict(rows=48, shard=202048 // 4, top_k=TOP_K, rank=2, ranks=4, values="special"),
-        ),
-        Cell(
-            "the TP8 shard (7 chunks)",
-            dict(rows=40, shard=SHARD, top_k=TOP_K, rank=5, ranks=8, values="logits"),
-        ),
-        Cell(
-            "a shard of fewer than top_k columns: empty slots",
-            dict(rows=3, shard=11, top_k=TOP_K, rank=0, ranks=2, values="logits"),
-        ),
-        Cell(
-            "a ragged last chunk",
-            dict(rows=40, shard=2 * 4096 + 5, top_k=TOP_K, rank=1, ranks=2, values="logits"),
-        ),
-    )
     note = (
         "Used with draft_topk_merge after the draft head's MNNVL fp32 all-reduce "
         "(wide_draft_topk's RankTopKExchange, from 33 rows): the sum of "

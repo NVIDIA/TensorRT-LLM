@@ -39,7 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -143,26 +143,6 @@ class RouterShard(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows, the served launch (prepare stream, 16 warps)",
-            spec=dict(rows=8, num_warps=16),
-        ),
-        Cell(why="one row at 16 warps (no speculation)", spec=dict(rows=1, num_warps=16)),
-        Cell(
-            why="an odd row count the built-in launches at 1-row tiles (3 rows)",
-            spec=dict(rows=3, num_warps=16),
-        ),
-        Cell(
-            why="8 rows without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=8, num_warps=4),
-        ),
-        Cell(
-            why="tep4 K=7 verify: 8 rows, 64 columns per rank (one tray)",
-            spec=dict(rows=8, num_warps=16, ranks=4),
-        ),
-    )
 
     note = """
     The claim the test proves is equality with the built-in kernel's columns
@@ -284,22 +264,6 @@ class RouterShardSide(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows, the served launch (prepare stream, 16 warps)",
-            spec=dict(rows=8, num_warps=16),
-        ),
-        Cell(why="one row at 16 warps (no speculation)", spec=dict(rows=1, num_warps=16)),
-        Cell(
-            why="an odd row count the built-in launches at 1-row tiles (3 rows)",
-            spec=dict(rows=3, num_warps=16),
-        ),
-        Cell(
-            why="8 rows without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=8, num_warps=4),
-        ),
-    )
 
     note = """
     The claim the test proves is equality with ``router_shard`` and with the
@@ -454,22 +418,6 @@ class RouterShardPublish(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows, the served launch (16 warps), four boxes",
-            spec=dict(rows=8, num_warps=16),
-        ),
-        Cell(why="one row at 16 warps: one box", spec=dict(rows=1, num_warps=16)),
-        Cell(
-            why="an odd row count (3 rows): two boxes, the second CTA one row",
-            spec=dict(rows=3, num_warps=16),
-        ),
-        Cell(
-            why="8 rows without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=8, num_warps=4),
-        ),
-    )
 
     note = """
     The claim the test proves is that every box holds ``router_shard``'s logits

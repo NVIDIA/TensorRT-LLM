@@ -67,7 +67,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: The published DFlash 2 drafter at TP8: 64 query / 8 KV heads over eight
 #: ranks, head width 128, a 2048-token two-sided window (FlashAttention bounds
@@ -522,96 +522,6 @@ class DflashWindowAttention(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: batch, m (block rows), hq / hkv / d, window, ctx (context length
-    # L - M per request), capacity (arena columns), slots, pdl, append, dtype.
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the serving step: TP8 rank, block 8, ~100k context in a 1M-token arena",
-            spec=_spec(ctx=[100_770], capacity=1_048_584),
-        ),
-        Cell(
-            why="the serving step with programmatic dependent launch",
-            spec=_spec(ctx=[100_770], capacity=1_048_584, pdl=True),
-        ),
-        Cell(
-            why="the serving step with the block's K/V appended by the op",
-            spec=_spec(ctx=[100_770], capacity=1_048_584, pdl=True, append=True),
-        ),
-        Cell(
-            why="pdl_merge: the decode step, appended, the merge releasing its dependent at entry",
-            spec=_spec(ctx=[100_770], capacity=1_048_584, pdl=True, append=True, entry=True),
-        ),
-        Cell(
-            why="pdl_merge: merge entry trigger with a short context (trailing splits empty)",
-            spec=_spec(ctx=[500], capacity=4_200, pdl=True, entry=True),
-        ),
-        *(
-            Cell(why=f"block {m} (K = {m - 1}), context past the window", spec=_spec(m=m))
-            for m in (1, 2, 4, 6, 7)
-        ),
-        *(
-            Cell(
-                why=f"context {ctx}: window edge (rows see different first keys)",
-                spec=_spec(ctx=[ctx], capacity=4_200),
-            )
-            for ctx in (2_039, 2_040, 2_041, 2_047, 2_048, 2_049)
-        ),
-        *(
-            Cell(
-                why=f"context {ctx}: shorter than the window, trailing splits empty",
-                spec=_spec(ctx=[ctx], capacity=4_200),
-            )
-            for ctx in (0, 1, 63, 500)
-        ),
-        Cell(
-            why="appended block at a split boundary and inside the first split",
-            spec=_spec(batch=2, ctx=[2_047 + 64, 30], capacity=4_200, append=True),
-        ),
-        Cell(
-            why="several requests in distinct slots (c > 1), mixed context lengths",
-            spec=_spec(batch=3, ctx=[9_000, 17, 2_100], capacity=9_100, slots=4),
-        ),
-        Cell(
-            why="TP1 drafter: 64 query / 8 KV heads, appended",
-            spec=_spec(hq=64, hkv=8, ctx=[3_000], capacity=3_100, slots=1, append=True),
-        ),
-        Cell(
-            why="the serving step at a TP4 rank: 16 query / 2 KV heads, appended, PDL",
-            spec=_spec(hq=16, hkv=2, ctx=[100_770], capacity=1_048_584, pdl=True, append=True),
-        ),
-        Cell(
-            why="TP4 rank: the merge releasing its dependent at entry, appended",
-            spec=_spec(
-                hq=16, hkv=2, ctx=[100_770], capacity=1_048_584, pdl=True, append=True, entry=True
-            ),
-        ),  # fmt: skip
-        Cell(
-            why="TP4 rank: a windowed-arena slot (capacity = window + block + 16), appended",
-            spec=_spec(hq=16, hkv=2, ctx=[2_064], capacity=2_080, append=True),
-        ),
-        Cell(
-            why="TP4 rank: a context shorter than the window, trailing splits empty",
-            spec=_spec(hq=16, hkv=2, ctx=[500], capacity=4_200, pdl=True),
-        ),
-        Cell(
-            why="narrow window (single split, merge skipped) and a bounded right side",
-            spec=_spec(batch=2, window=(31, 3), ctx=[400, 20], capacity=500),
-        ),
-        Cell(
-            why="narrow window, single split, appended",
-            spec=_spec(batch=2, window=(31, 3), ctx=[400, 20], capacity=500, append=True),
-        ),
-        Cell(why="fp16 operands", spec=_spec(ctx=[4_000], capacity=4_100, dtype=torch.float16)),
-        Cell(
-            why="wide window (4,095 left keys): two-tile splits, merge at 65 splits",
-            spec=_spec(window=(4_095, 4_095), ctx=[7_000], capacity=7_100),
-        ),
-        Cell(
-            why="wide window (16,383 left keys): five-tile splits, appended",
-            spec=_spec(window=(16_383, 16_383), ctx=[20_000], capacity=20_100, append=True),
-        ),
-    )
 
     note = (
         "Not bitwise flash_attn_with_kvcache: different split boundaries change the "

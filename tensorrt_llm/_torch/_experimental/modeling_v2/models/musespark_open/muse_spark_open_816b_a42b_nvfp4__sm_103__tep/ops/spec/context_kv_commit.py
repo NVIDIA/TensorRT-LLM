@@ -36,7 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Generation requests one call takes; the single program loops over them.
 MAX_REQUESTS = 64
@@ -189,99 +189,6 @@ class ContextKvCommit(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the target's decode step: one request, K + 1 = 8 rows, 5 layers, 1 kv head x 128",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, accepted=(4,)),
-        ),
-        Cell(
-            why="every row accepted: nothing is zeroed, the length still advances",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, accepted=(8,)),
-        ),
-        Cell(
-            why="only the bonus row accepted: seven rows zeroed",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, accepted=(1,)),
-        ),
-        Cell(
-            why="a context at the arena's end: columns clamp to max_ctx - 1, the length to max_ctx",
-            spec=dict(
-                gens=1,
-                rows=8,
-                layers=5,
-                kv_heads=1,
-                head_dim=128,
-                slots=2,
-                accepted=(3,),
-                at_end=True,
-            ),
-        ),
-        Cell(
-            why="several requests in distinct slots, int64 counts",
-            spec=dict(
-                gens=3,
-                rows=4,
-                layers=2,
-                kv_heads=2,
-                head_dim=64,
-                slots=5,
-                accepted=(1, 4, 2),
-                int64=True,
-            ),
-        ),
-        Cell(
-            why="4 kv heads x 128: three tiles per request, the last one partly past the columns",
-            spec=dict(
-                gens=2,
-                rows=8,
-                layers=5,
-                kv_heads=4,
-                head_dim=128,
-                slots=3,
-                accepted=(2, 6),
-            ),
-        ),
-        Cell(
-            why="no V arena (single-latent drafter cache)",
-            spec=dict(
-                gens=1,
-                rows=8,
-                layers=5,
-                kv_heads=1,
-                head_dim=128,
-                slots=2,
-                accepted=(5,),
-                no_v=True,
-            ),
-        ),
-        Cell(
-            why="windowed arena: rows at ctx_len - ctx_base, columns clamped to the window's last",
-            spec=dict(
-                gens=3,
-                rows=8,
-                layers=5,
-                kv_heads=2,
-                head_dim=128,
-                slots=4,
-                accepted=(2, 8, 5),
-                windowed=True,
-            ),
-        ),
-        Cell(
-            why="windowed arena at its last column: the rows past it share that column",
-            spec=dict(
-                gens=2,
-                rows=8,
-                layers=5,
-                kv_heads=2,
-                head_dim=128,
-                slots=3,
-                accepted=(3, 7),
-                windowed=True,
-                at_end=True,
-            ),
-        ),
-    )
 
     note = """
     Metadata consumed: none. One Triton program (grid 1, 4 warps) that loops

@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Columns per program and warps per program: the built-in launch's
 #: (``torch_custom_ops.silu_and_mul``: ``BLOCK_SIZE=1024``, Triton's default four warps).
@@ -93,35 +93,6 @@ class DrafterSiluAndMul(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows, d (half width), dtype, entry_trigger, specials (inf / nan / signed zeros).
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the drafter's served call: 8 rows (K = 7 block) x 3584 per TP8 rank, entry trigger",
-            spec=dict(rows=8, d=3584, entry_trigger=True),
-        ),
-        Cell(
-            why="the same call without the trigger (a plain launch)",
-            spec=dict(rows=8, d=3584, entry_trigger=False),
-        ),
-        Cell(
-            why="one row; d not a multiple of 1024 (masked tail of the last program)",
-            spec=dict(rows=1, d=1000, entry_trigger=True),
-        ),
-        Cell(
-            why="infinities, NaNs, signed zeros and large magnitudes in gate and up",
-            spec=dict(rows=8, d=3584, entry_trigger=True, specials=True),
-        ),
-        Cell(
-            why="fp16 operands", spec=dict(rows=4, d=2048, dtype=torch.float16, entry_trigger=True)
-        ),
-        Cell(
-            why="fp32 operands", spec=dict(rows=4, d=2048, dtype=torch.float32, entry_trigger=True)
-        ),
-        Cell(
-            why="0 rows: an empty result, no launch", spec=dict(rows=0, d=3584, entry_trigger=True)
-        ),
-    )
 
     note = """
     Metadata consumed: none. One Triton kernel, JIT-compiled per

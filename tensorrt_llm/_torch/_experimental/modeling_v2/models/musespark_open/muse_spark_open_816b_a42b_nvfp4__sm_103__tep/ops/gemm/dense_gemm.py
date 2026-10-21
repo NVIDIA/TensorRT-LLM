@@ -54,7 +54,6 @@ import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
-    Cell,
     OpWrapper,
     true_fp32_matmul,
 )
@@ -150,89 +149,6 @@ class DenseGemm(OpWrapper):
     for every kernel, M <= 32 for split-K and cuBLAS."""
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="QKV at the verify width of K=7 drafts: [8, 8192] x [2304, 8192]^T, split-K 4",
-            spec=dict(m=8, k=8192, n=2304, kernel="splitk:64,8,4,12"),
-        ),
-        Cell(
-            why="QKV of K=5 drafts (6 rows): a row count that is not a power of two",
-            spec=dict(m=6, k=8192, n=2304, kernel="splitk:64,8,4,12"),
-        ),
-        Cell(
-            why="QKV of a one-row step by the direct kernel, the plan for 1-2 rows",
-            spec=dict(m=1, k=8192, n=2304, kernel="direct:256,1"),
-        ),
-        Cell(
-            why="QKV of a one-row step by split-K, the 3-8 row kernel at its edge",
-            spec=dict(m=1, k=8192, n=2304, kernel="splitk:64,8,4,12"),
-        ),
-        Cell(
-            why="QKV by rank 0's autotuned tactic, the split-K-4 sibling the pinned one must equal",
-            spec=dict(m=8, k=8192, n=2304, kernel="splitk:64,16,4,10"),
-        ),
-        Cell(
-            why="o_proj, K=1024 -> N=8192 by cuBLAS, the pinned kernel while its predecessor triggers late",
-            spec=dict(m=8, k=1024, n=8192, kernel="cublas"),
-        ),
-        Cell(
-            why="o_proj by flashinfer without split, the choice once its predecessor triggers early",
-            spec=dict(m=8, k=1024, n=8192, kernel="splitk:64,8,1,12"),
-        ),
-        Cell(
-            why="o_proj of 2 rows by the direct kernel: K=1024 is one 64-thread x 16-value pass",
-            spec=dict(m=2, k=1024, n=8192, kernel="direct:64,4"),
-        ),
-        Cell(
-            why="pooler slice, K=8192 -> N=512 at the verify width: direct, 2 outputs per CTA",
-            spec=dict(m=8, k=8192, n=512, kernel="direct:128,2"),
-        ),
-        Cell(
-            why="pooler slice at 5 rows: an odd row count held by one CTA",
-            spec=dict(m=5, k=8192, n=512, kernel="direct:128,2"),
-        ),
-        Cell(
-            why="pooler slice of a one-row step: 256 threads x 32 K values each",
-            spec=dict(m=1, k=8192, n=512, kernel="direct:256,1"),
-        ),
-        Cell(
-            why="pooler slice by split-K 4 (8 column tiles), kept as an override",
-            spec=dict(m=8, k=8192, n=512, kernel="splitk:64,8,4,12"),
-        ),
-        Cell(
-            why="unpooler slice, K=4096 -> N=1024 at 4 rows (K=3 drafts), direct",
-            spec=dict(m=4, k=4096, n=1024, kernel="direct:64,2"),
-        ),
-        Cell(
-            why="unpooler slice at the verify width of K=7 drafts, direct",
-            spec=dict(m=8, k=4096, n=1024, kernel="direct:64,2"),
-        ),
-        Cell(
-            why="unpooler slice at the verify width by split-K 4, kept as an override",
-            spec=dict(m=8, k=4096, n=1024, kernel="splitk:64,8,4,12"),
-        ),
-        Cell(
-            why="TP4 QKV of four requests at K=7: [32, 8192] x [4608, 8192]^T, split-K 2, 32-row MMA N",
-            spec=dict(m=32, k=8192, n=4608, kernel="splitk:64,32,2,9"),
-        ),
-        Cell(
-            why="TP4 QKV of two requests (16 rows), split-K 2, 16-row MMA N",
-            spec=dict(m=16, k=8192, n=4608, kernel="splitk:64,16,2,11"),
-        ),
-        Cell(
-            why="TP4 pooler slice of three requests (24 rows), split-K 4, two 16-row tiles",
-            spec=dict(m=24, k=8192, n=1024, kernel="splitk:64,16,4,10"),
-        ),
-        Cell(
-            why="TP4 unpooler slice of four requests (32 rows), split-K 2, two 16-row tiles",
-            spec=dict(m=32, k=4096, n=2048, kernel="splitk:64,16,2,11"),
-        ),
-        Cell(
-            why="TP4 unpooler slice of 9 rows (a row count that is not a multiple of 8) by cuBLAS",
-            spec=dict(m=9, k=4096, n=2048, kernel="cublas"),
-        ),
-    )
 
     note = """
     The flashinfer kernels validate their operands themselves (2-D, row- or
@@ -355,25 +271,6 @@ class L2Prefetch(OpWrapper):
     """Ask the L2 to hold ``tensor``'s bytes soon; return without waiting for them."""
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="QKV weight, 37.75 MB: what is fetched while the unpool gather and boundary run",
-            spec=dict(rows=2304, cols=8192, row_offset=0),
-        ),
-        Cell(
-            why="o_proj weight, 16.8 MB: fetched while the prep, KV append and FMHA run",
-            spec=dict(rows=8192, cols=1024, row_offset=0),
-        ),
-        Cell(
-            why="rank 7's pooler slice: a view starting 7 * 512 rows into the replicated weight",
-            spec=dict(rows=512, cols=8192, row_offset=7 * 512),
-        ),
-        Cell(
-            why="a size that is not a multiple of the chunk: the last request is short",
-            spec=dict(rows=3, cols=1000, row_offset=0),
-        ),
-    )
 
     note = """
     Nothing observable is computed, so `reference` returns None and the test

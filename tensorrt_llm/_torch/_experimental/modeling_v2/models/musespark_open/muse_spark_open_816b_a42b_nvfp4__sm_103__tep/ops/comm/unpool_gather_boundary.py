@@ -55,7 +55,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WIDE_ROWS, WORLDS, ProjectionInbox
 
@@ -551,80 +551,6 @@ class UnpoolGatherBoundary(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, the post-FFN norm's gain, BF16-first pre-QKV norm",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="decode without drafts: 1 row, cluster of 16 CTAs, two CTAs per peer slice",
-            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="a short draft (3 rows) between the two cluster shapes",
-            spec=dict(rows=3, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="the FP32-residual pre-QKV norm ordering switch",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True),
-        ),
-        Cell(
-            why="a weightless first norm (the boundary's other arm)",
-            spec=dict(rows=8, with_gain=False, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="dependents launched right after the wait",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="after_wait"),
-        ),
-        Cell(
-            why="early release: dependents launched at entry, the next QKV streams its weight meanwhile",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry"),
-        ),
-        Cell(
-            why="capture with early release: the capture from a boundary that releases the next QKV at entry",
-            spec=dict(
-                rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry", capture=True
-            ),
-        ),
-        Cell(
-            why="capture: K=7 verify that also stores the layer's DFlash capture",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, capture=True),
-        ),
-        Cell(
-            why="capture: the capture at 1 row (cluster of 16 CTAs)",
-            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False, capture=True),
-        ),
-        Cell(
-            why="capture: the capture with the FP32-residual pre-QKV norm (no BF16 residual in-kernel)",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True, capture=True),
-        ),
-        Cell(
-            why="TP4 wide inbox: two requests at K=7 (16 rows, clusters of 4, one peer slice per CTA)",
-            spec=dict(rows=16, with_gain=True, norm_fp32_residual=False, wide=True),
-        ),
-        Cell(
-            why="TP4 wide inbox: four requests (32 rows), early release, capture",
-            spec=dict(
-                rows=32,
-                with_gain=True,
-                norm_fp32_residual=False,
-                trigger="entry",
-                capture=True,
-                wide=True,
-            ),
-        ),
-        Cell(
-            why="TP4 wide inbox: three requests (24 rows), early release",
-            spec=dict(
-                rows=24, with_gain=True, norm_fp32_residual=False, trigger="entry", wide=True
-            ),
-        ),
-        Cell(
-            why="TP4 wide inbox: 9 rows, a weightless first norm",
-            spec=dict(rows=9, with_gain=False, norm_fp32_residual=False, wide=True),
-        ),
-    )
 
     note = """
     Certified against the built-in gather + cluster boundary bit for bit (the

@@ -52,7 +52,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .dflash_window_attention import (
     MAX_SPLITS,
@@ -459,83 +459,6 @@ class DflashWindowAttentionWide(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: batch, m (block rows), hq / hkv / d, window, ctx (context length L - M
-    # per request), capacity (arena columns), slots, pdl, append, dtype.
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="5 requests (40 rows), windowed arena slots full, appended, PDL",
-            spec=_spec(batch=5, pdl=True, append=True),
-        ),
-        Cell(
-            why="8 requests (64 rows), appended, PDL",
-            spec=_spec(batch=8, pdl=True, append=True),
-        ),
-        Cell(
-            why="12 requests, mixed context lengths: short, at and past the window edge",
-            spec=_spec(
-                batch=12,
-                ctx=[0, 1, 17, 63, 500, 2_039, 2_040, 2_041, 2_047, 2_048, 2_049, 2_056],
-                append=True,
-            ),
-        ),
-        Cell(
-            why="16 requests (128 rows), appended, PDL",
-            spec=_spec(batch=16, pdl=True, append=True),
-        ),
-        Cell(
-            why="24 requests (192 rows), appended, PDL",
-            spec=_spec(batch=24, pdl=True, append=True),
-        ),
-        Cell(
-            why="32 requests (256 rows), appended, PDL",
-            spec=_spec(batch=32, pdl=True, append=True),
-        ),
-        Cell(
-            why="64 requests (512 rows), appended, PDL",
-            spec=_spec(batch=64, pdl=True, append=True),
-        ),
-        Cell(
-            why="128 requests (1024 rows, a 1P1D generation step), appended, PDL",
-            spec=_spec(batch=128, pdl=True, append=True),
-        ),
-        Cell(
-            why="5 requests in a full-length arena (contexts ~100k, columns past 2^16)",
-            spec=_spec(batch=5, ctx=[100_770 + 37 * b for b in range(5)], capacity=101_000),
-        ),
-        Cell(
-            why="8 requests without the append (the block already in the arena)",
-            spec=_spec(batch=8),
-        ),
-        *(
-            Cell(why=f"block {m} (K = {m - 1}), 8 requests, appended", spec=_spec(m=m, append=True))
-            for m in (1, 2, 4, 7)
-        ),
-        Cell(
-            why="narrow window (single split, merge skipped) and a bounded right side",
-            spec=_spec(batch=6, window=(31, 3), ctx=[400, 20, 3, 40, 31, 32], capacity=500),
-        ),
-        Cell(
-            why="narrow window, single split, appended",
-            spec=_spec(
-                batch=6, window=(31, 3), ctx=[400, 20, 3, 40, 31, 32], capacity=500, append=True
-            ),
-        ),
-        Cell(
-            why="fp16 operands",
-            spec=_spec(batch=8, dtype=torch.float16, append=True),
-        ),
-        Cell(
-            why="wide window (16,383 left keys), appended",
-            spec=_spec(
-                batch=6,
-                window=(16_383, 16_383),
-                ctx=[20_000, 16_390, 9_000, 100, 16_376, 16_377],
-                capacity=20_100,
-                append=True,
-            ),
-        ),
-    )
 
     note = (
         "Not bitwise dflash_window_attention or flash_attn_with_kvcache: different split "

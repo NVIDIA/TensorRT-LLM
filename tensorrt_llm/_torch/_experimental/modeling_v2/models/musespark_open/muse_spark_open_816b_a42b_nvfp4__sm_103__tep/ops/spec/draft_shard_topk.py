@@ -28,7 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: The draft head this target runs: 202048 / 8 vocabulary rows per rank, K + 1
 #: = 8 block positions with K <= 7 drafted, top 16 candidates.
@@ -114,40 +114,6 @@ class DraftShardTopK(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS = (
-        Cell(
-            "this target's draft head: K = 7 rows of one request, 8-way shard",
-            dict(rows=7, shard=SHARD, top_k=TOP_K, chunk=CHUNK, values="logits"),
-        ),
-        Cell(
-            "K + 1 = 8 rows; every row a different value distribution",
-            dict(rows=8, shard=SHARD, top_k=TOP_K, chunk=CHUNK, values="logits"),
-        ),
-        Cell(
-            "one drafted position",
-            dict(rows=1, shard=SHARD, top_k=TOP_K, chunk=CHUNK, values="logits"),
-        ),
-        Cell(
-            "ties everywhere: 40 distinct values, so selection is decided by column",
-            dict(rows=7, shard=SHARD, top_k=TOP_K, chunk=CHUNK, values="grid"),
-        ),
-        Cell(
-            "signed zeros, infinities and NaN at the top: torch's radix key order",
-            dict(rows=7, shard=SHARD, top_k=TOP_K, chunk=CHUNK, values="special"),
-        ),
-        Cell(
-            "a ragged last chunk shorter than top_k: empty slots",
-            dict(rows=3, shard=2 * 4096 + 5, top_k=TOP_K, chunk=4096, values="logits"),
-        ),
-        Cell(
-            "a smaller chunk: more programs, more candidates per rank",
-            dict(rows=7, shard=SHARD, top_k=TOP_K, chunk=2048, values="logits"),
-        ),
-        Cell(
-            "the largest shard the 16-bit column field holds",
-            dict(rows=2, shard=65536, top_k=TOP_K, chunk=CHUNK, values="logits"),
-        ),
-    )
     note = (
         "Used with draft_topk_merge, which decodes the keys; the pair is exact "
         "against torch.topk over the gathered fp32 logits. NaN payloads are not "

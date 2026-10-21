@@ -72,7 +72,6 @@ import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
-    Cell,
     OpWrapper,
     true_fp32_matmul,
 )
@@ -413,30 +412,6 @@ class MultiRequestSplitKv(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=why, spec=dict(lens=lens, window=window))
-        for lens, window, why in (
-            ((100000, 100000), 0, "two equal 100k requests"),
-            ((131072,) * 16, 0, "16 requests of 128k tokens"),
-            ((65536,) * 32, 0, "32 requests of 64k tokens"),
-            ((250000, 8, 40000, 161, 1027, 455031, 19457, 8192), 0, "mixed lengths, tiny to 455k"),
-            ((1048581, 1048581), 0, "two requests near the 1M sequence limit"),
-            ((8, 8, 8, 8), 0, "first steps: every key is new"),
-            ((300, 4096), 0, "fewer pages than CTAs (key-less CTAs)"),
-            ((100000,) * 64, 0, "64 requests: 512 rows, the last batch of the 64-request build"),
-            ((65536,) * 65, 0, "65 requests: the first batch of the 128-request build"),
-            (
-                tuple(8 + (i * 7919) % 200000 for i in range(96)),
-                0,
-                "96 requests of mixed lengths (128-request build)",
-            ),
-            ((100000,) * 128, 0, "128 requests: 1024 rows"),
-            ((131072,) * 128, 2048, "sliding window 2048, 128 x 128k"),
-            ((100000, 2100, 2055, 1000, 40), 2048, "sliding window 2048, mixed"),
-            ((131072,) * 32, 2048, "sliding window 2048, 32 x 128k"),
-        )
-    )
 
     note = """
     Metadata consumed: seq_lens (device; read by both kernels, never on the host), the batch's

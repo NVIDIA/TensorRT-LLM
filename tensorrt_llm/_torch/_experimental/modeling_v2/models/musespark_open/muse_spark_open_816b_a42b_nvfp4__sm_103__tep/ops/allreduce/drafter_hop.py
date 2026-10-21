@@ -97,7 +97,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1005,24 +1005,6 @@ class DrafterHop(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="K = 7 drafter block: 8 rows, the measured configuration", spec=dict(rows=8)),
-        Cell(why="K = 3 drafter block: 4 rows", spec=dict(rows=4, block=4)),
-        Cell(why="one row: no previous row, the tap-1 term is masked", spec=dict(rows=1, block=1)),
-        Cell(
-            why="two requests of block 4 in 8 rows: row 4 reads row 3 and masks it",
-            spec=dict(rows=8, block=4),
-        ),
-        Cell(
-            why="cancelling partials: the FP32 rank-order sum differs from other orders",
-            spec=dict(rows=8, cancel=True),
-        ),
-        Cell(
-            why="exact zeros, negative zeros and denormals in partials, residual and coefficients",
-            spec=dict(rows=8, zeros=True),
-        ),
-    )
 
     note = """
     Metadata consumed: none. Call sites: the DFlash 2 drafter's two hops per

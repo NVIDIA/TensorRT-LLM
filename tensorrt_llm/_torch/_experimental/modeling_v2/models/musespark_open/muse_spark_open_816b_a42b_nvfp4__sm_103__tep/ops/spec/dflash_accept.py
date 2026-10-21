@@ -28,7 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Forced-acceptance modes, as the built-in override branches.
 FORCE_NONE, FORCE_FIXED, FORCE_FRACTIONAL = 0, 1, 2
@@ -186,61 +186,6 @@ class DflashAccept(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the target's decode step: one request, K = 7, forced 3.05 (fractional)",
-            spec=dict(contexts=0, gens=1, k=7, force=FORCE_FRACTIONAL, rate=3.05),
-        ),
-        Cell(
-            why="strict acceptance, no override: leading-match count",
-            spec=dict(contexts=0, gens=1, k=7, force=FORCE_NONE, rate=0.0),
-        ),
-        Cell(
-            why="integer override: every request gets base_total",
-            spec=dict(contexts=0, gens=3, k=5, force=FORCE_FIXED, rate=2.0),
-        ),
-        Cell(
-            why="fractional override, several requests: per-request pool slots",
-            spec=dict(contexts=0, gens=4, k=3, force=FORCE_FRACTIONAL, rate=1.6),
-        ),
-        Cell(
-            why="mixed batch: context rows take one token, gens are strict",
-            spec=dict(contexts=2, gens=2, k=7, force=FORCE_NONE, rate=0.0),
-        ),
-        Cell(
-            why="mixed batch under the fractional override",
-            spec=dict(contexts=1, gens=2, k=7, force=FORCE_FRACTIONAL, rate=3.05),
-        ),
-        Cell(
-            why="K = 1: one draft per request",
-            spec=dict(contexts=0, gens=2, k=1, force=FORCE_NONE, rate=0.0),
-        ),
-        Cell(
-            why="int64 target tokens (the greedy argmax path)",
-            spec=dict(contexts=0, gens=2, k=7, force=FORCE_NONE, rate=0.0, int64=True),
-        ),
-        Cell(
-            why="64 requests: the loop kernel's largest batch, forced 3.05",
-            spec=dict(contexts=0, gens=64, k=7, force=FORCE_FRACTIONAL, rate=3.05),
-        ),
-        Cell(
-            why="65 requests: the tile kernel's smallest batch, strict acceptance",
-            spec=dict(contexts=0, gens=65, k=7, force=FORCE_NONE, rate=0.0),
-        ),
-        Cell(
-            why="96 requests on the tile kernel, forced 3.05 (fractional)",
-            spec=dict(contexts=0, gens=96, k=7, force=FORCE_FRACTIONAL, rate=3.05),
-        ),
-        Cell(
-            why="128 requests on the tile kernel, integer override",
-            spec=dict(contexts=0, gens=128, k=7, force=FORCE_FIXED, rate=2.0),
-        ),
-        Cell(
-            why="128 requests on the tile kernel, int64 tokens, strict",
-            spec=dict(contexts=0, gens=128, k=7, force=FORCE_NONE, rate=0.0, int64=True),
-        ),
-    )
 
     note = """
     Metadata consumed: none. One Triton program (grid 1), JIT-compiled per (K,

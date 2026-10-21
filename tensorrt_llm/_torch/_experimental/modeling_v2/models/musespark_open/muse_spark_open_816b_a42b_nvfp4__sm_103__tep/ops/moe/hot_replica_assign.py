@@ -52,7 +52,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Model geometry at tep4: 256 experts over 4 expert-parallel ranks of 64.
 EXPERTS = 256
@@ -339,41 +339,6 @@ class HotReplicaAssign(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the band's first row count (33 rows, a 512-slot tile mostly masked)",
-            spec=dict(rows=33, routing="keep5", replicas=4),
-        ),
-        Cell(
-            why="5 requests at the DFlash K=7 verify width, correlated rows",
-            spec=dict(rows=40, routing="keep5", replicas=4),
-        ),
-        Cell(
-            why="8 requests, correlated rows (the shape of the served routing census)",
-            spec=dict(rows=64, routing="keep5", replicas=4),
-        ),
-        Cell(
-            why="16 requests (a decode step capped at 16 requests), skewed toward a hot set",
-            spec=dict(rows=128, routing="hot", replicas=4),
-        ),
-        Cell(
-            why="24 requests (a decode step capped at 24 requests), hot-set skew, 8 copies",
-            spec=dict(rows=192, routing="hot", replicas=8),
-        ),
-        Cell(
-            why="32 requests, independent rows (most experts touched)",
-            spec=dict(rows=256, routing="uniform", replicas=4),
-        ),
-        Cell(
-            why="every selected expert in one block: the copies carry the whole relief",
-            spec=dict(rows=64, routing="one_block", replicas=8),
-        ),
-        Cell(
-            why="the slot limit: 64 requests, 4096 slots, 2 copies per rank",
-            spec=dict(rows=512, routing="hot", replicas=2),
-        ),
-    )
 
     note = """
     Pure function of ``selected``, ``table`` and ``rank``; one program over at most

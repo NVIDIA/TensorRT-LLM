@@ -47,7 +47,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Generation rows one call takes (the shift kernel compares every pair in one program).
 MAX_GENS = 256
@@ -147,110 +147,6 @@ class CtxWindowCompact(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: gens (generation rows), slots (arena slots), layers, kv_heads,
-    # head_dim, keep, capacity, phys (each row's physical length after the
-    # step's accepted tokens: an int, or one per row), dup (the last `dup` rows
-    # share one dummy slot), dtype.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"TP4 drafter, {gens} generation row(s): {why}",
-            spec=dict(
-                gens=gens,
-                slots=max(gens, 1) + 1,
-                layers=5,
-                kv_heads=2,
-                head_dim=128,
-                keep=2048,
-                capacity=2064,
-                phys=phys,
-                dup=dup,
-            ),
-        )
-        for gens, phys, dup, why in (
-            (1, 2052, 0, "a single-request step, four accepted tokens past the window"),
-            (2, (2049, 2056), 0, "one and eight tokens past the window"),
-            (4, (2048, 2052, 100, 2050), 0, "a row inside the window shifts by 0"),
-            (8, 2052, 3, "the bs-8 graph with three padding rows on one dummy slot"),
-            (16, 2052, 1, "the bs-16 graph with one padding row"),
-            (24, (2056, 2049) * 12, 5, "the bs-24 graph, mixed shifts, five padding rows"),
-            (32, 2064, 0, "every slot full to capacity: shift 16, the clamped tail moves"),
-            (64, 2051, 7, "the largest step"),
-        )
-    ) + (
-        Cell(
-            why="TP8 drafter (one KV head), 8 rows",
-            spec=dict(
-                gens=8,
-                slots=9,
-                layers=5,
-                kv_heads=1,
-                head_dim=128,
-                keep=2048,
-                capacity=2064,
-                phys=2053,
-                dup=0,
-            ),
-        ),
-        Cell(
-            why="an MLA-style drafter: no V half",
-            spec=dict(
-                gens=4,
-                slots=5,
-                layers=5,
-                kv_heads=2,
-                head_dim=128,
-                keep=2048,
-                capacity=2064,
-                phys=2052,
-                dup=0,
-                no_v=True,
-            ),
-        ),
-        Cell(
-            why="a shift above the tile width (keep 32, capacity 200, 150 past)",
-            spec=dict(
-                gens=3,
-                slots=4,
-                layers=2,
-                kv_heads=2,
-                head_dim=128,
-                keep=32,
-                capacity=200,
-                phys=182,
-                dup=0,
-            ),
-        ),
-        Cell(
-            why="8 rows of a 64-element column: the wide launch falls back to 64 elements",
-            spec=dict(
-                gens=8,
-                slots=9,
-                layers=5,
-                kv_heads=1,
-                head_dim=64,
-                keep=2048,
-                capacity=2064,
-                phys=2052,
-                dup=2,
-            ),
-        ),
-        Cell(
-            why="FP16 arena",
-            spec=dict(
-                gens=4,
-                slots=5,
-                layers=5,
-                kv_heads=2,
-                head_dim=128,
-                keep=2048,
-                capacity=2064,
-                phys=2052,
-                dup=0,
-                dtype="float16",
-            ),
-        ),
-    )
 
     note = """
     Metadata consumed: the generation rows' slots, every touched slot's

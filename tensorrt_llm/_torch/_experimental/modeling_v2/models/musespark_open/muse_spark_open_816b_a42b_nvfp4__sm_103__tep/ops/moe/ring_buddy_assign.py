@@ -56,7 +56,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Model geometry: 256 experts over the 8 expert-parallel ranks of tep8 (the
 #: defaults), or over the 4 of tep4 (``ranks=4``).
@@ -237,60 +237,6 @@ class RingBuddyAssign(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="a single decode row: 8 experts, the no-speculation shape",
-            spec=dict(rows=1, routing="uniform"),
-        ),
-        Cell(
-            why="DFlash with 1 draft token (16 slots, the smallest tile, partly masked)",
-            spec=dict(rows=2, routing="keep5"),
-        ),
-        Cell(
-            why="DFlash with 2 draft tokens: 24 of the 32-slot tile live",
-            spec=dict(rows=3, routing="keep5"),
-        ),
-        Cell(
-            why="DFlash with 4 draft tokens: 40 of the 64-slot tile live",
-            spec=dict(rows=5, routing="keep5"),
-        ),
-        Cell(
-            why="DFlash K=7 verify width with independent rows: ~57 distinct experts",
-            spec=dict(rows=8, routing="uniform"),
-        ),
-        Cell(
-            why="DFlash K=7 verify width with correlated rows (keep 5 of the previous "
-            "row's 8): ~28 distinct experts, the measured served census",
-            spec=dict(rows=8, routing="keep5"),
-        ),
-        Cell(
-            why="every selected expert in one block: the most skewed census, the "
-            "carry must propagate across ranks",
-            spec=dict(rows=8, routing="one_block"),
-        ),
-        Cell(
-            why="the program's slot limit: 16 rows, 128 slots",
-            spec=dict(rows=16, routing="uniform"),
-        ),
-        Cell(
-            why="tep4 (4 ranks of 64-expert blocks, 64-bit presence words) at the DFlash K=7 "
-            "verify width with correlated rows",
-            spec=dict(rows=8, routing="keep5", ranks=4),
-        ),
-        Cell(
-            why="tep4, a single decode row",
-            spec=dict(rows=1, routing="uniform", ranks=4),
-        ),
-        Cell(
-            why="tep4, every selected expert in one 64-expert block, high bits of the word set",
-            spec=dict(rows=8, routing="one_block", ranks=4),
-        ),
-        Cell(
-            why="tep4 at the program's slot limit: 16 rows, 128 slots",
-            spec=dict(rows=16, routing="uniform", ranks=4),
-        ),
-    )
 
     note = """
     Pure function of ``selected`` and ``rank``; one program, so it is meant for

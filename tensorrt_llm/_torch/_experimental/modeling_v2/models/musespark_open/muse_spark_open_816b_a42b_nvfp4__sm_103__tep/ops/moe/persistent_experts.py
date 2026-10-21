@@ -41,7 +41,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     _E2M1_VALUES,
 )
@@ -392,50 +392,6 @@ class PersistentExperts(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash K=7 verify width on the ring-buddy stack, ~4-5 active local experts: the "
-            "typical two-window census",
-            spec=dict(rows=8, window=64, active=5),
-        ),
-        Cell(
-            why="the same width with no expert of this window selected: nothing to compute, "
-            "every slot -1",
-            spec=dict(rows=8, window=64, active=0),
-        ),
-        Cell(
-            why="a rank's own 32-expert block (plain expert parallelism), 6 active experts",
-            spec=dict(rows=8, window=32, active=6),
-        ),
-        Cell(
-            why="tep4: a rank's own 64-expert block (the owner-only window), the busiest rank "
-            "of a K=7 verify step (~28 distinct experts over 4 ranks, up to ~12 on one)",
-            spec=dict(rows=8, window=64, active=12),
-        ),
-        Cell(
-            why="a single decode row: one token, up to 8 local experts",
-            spec=dict(rows=1, window=64, active=8),
-        ),
-        Cell(
-            why="three rows: token columns past M must stay zero and unwritten",
-            spec=dict(rows=3, window=64, active=7),
-        ),
-        Cell(
-            why="every slot local and distinct: 64 active experts, the longest tile queue",
-            spec=dict(rows=8, window=64, active=64),
-        ),
-        Cell(
-            why="the three-window stack at the verify width, ~4 active experts spread "
-            "over all three blocks (third-word bits of the active set)",
-            spec=dict(rows=8, window=96, active=4),
-        ),
-        Cell(
-            why="the three-window stack with 64 distinct active experts across the three blocks: "
-            "every slot of the table, prefixes over three words",
-            spec=dict(rows=8, window=96, active=64),
-        ),
-    )
 
     note = """
     Bitwise equal, row for row, to the routed FC2 rows of

@@ -28,7 +28,7 @@ from typing import Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from . import pool_gather_fp4quant as _gather
 from .projection_inbox import HAS_CUTE_DSL
@@ -396,23 +396,6 @@ class PoolPublishRmsnormFp4Quant(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="eight requests at K = 7 (64 rows)", spec=dict(rows=64)),
-        Cell(
-            why="five requests: the first served row count of the band (40 rows)",
-            spec=dict(rows=40, buffer=1),
-        ),
-        Cell(
-            why="16 requests at K = 7 (128 rows) on the third buffer", spec=dict(rows=128, buffer=2)
-        ),
-        Cell(why="24 requests at K = 7 (192 rows)", spec=dict(rows=192)),
-        Cell(why="64 requests: the transport full (512 rows)", spec=dict(rows=512, buffer=1)),
-        Cell(
-            why="33 rows: an odd row count, the last CTA's second row idle",
-            spec=dict(rows=33),
-        ),
-    )
 
     note = """
     Certified bit for bit (payload and scales) against the built-in pool consumer --

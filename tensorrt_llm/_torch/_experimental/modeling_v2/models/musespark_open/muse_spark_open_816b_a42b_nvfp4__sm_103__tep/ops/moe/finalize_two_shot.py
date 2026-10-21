@@ -102,7 +102,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -847,28 +847,6 @@ class FinalizeTwoShot(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="the fewest tokens: eight requests at K = 7", spec=dict(tokens=MIN_ROWS)),
-        Cell(why="the built-in fused finalize's largest call", spec=dict(tokens=128)),
-        Cell(why="the first call past the built-in fused finalize", spec=dict(tokens=129)),
-        Cell(why="the first call the served unfused combine takes sparse", spec=dict(tokens=160)),
-        Cell(why="twenty-four requests: the bs-24 graph", spec=dict(tokens=192)),
-        Cell(why="the transport's capacity: 64 requests", spec=dict(tokens=MAX_ROWS)),
-        Cell(why="a token count the rank count does not divide", spec=dict(tokens=101)),
-        Cell(
-            why="every slot of a token on one rank, none on the others",
-            spec=dict(tokens=64, placement="concentrated"),
-        ),
-        Cell(
-            why="exact and negative zeros in the rows, tokens with no valid slot",
-            spec=dict(tokens=64, zeros=True),
-        ),
-        Cell(
-            why="invalid slots and cancelling rows: the rank-order sum is observable",
-            spec=dict(tokens=64, invalid=True, cancel=True),
-        ),
-    )
 
     note = """
     Metadata consumed: ``indices`` (the expert op's ``[tokens, 8]`` row map, under the

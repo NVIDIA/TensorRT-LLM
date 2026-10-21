@@ -34,7 +34,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Width of one attention head.
 HEAD_DIM = 64
@@ -136,33 +136,6 @@ class AttentionNormGate(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows x 16 heads per rank, the gate as preattn_prep writes it",
-            spec=dict(rows=8, heads=16, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="K=7 verify with the gate as the built-in prep's [rows, H, 64] view",
-            spec=dict(rows=8, heads=16, gate_ndim=3, trigger="after_wait"),
-        ),
-        Cell(
-            why="plain decode: one row",
-            spec=dict(rows=1, heads=16, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="a short draft, 3 rows",
-            spec=dict(rows=3, heads=16, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="the entry trigger: the dependent may overlap the predecessor's tail",
-            spec=dict(rows=8, heads=16, gate_ndim=2, trigger="entry"),
-        ),
-        Cell(
-            why="the implicit trigger at exit",
-            spec=dict(rows=8, heads=16, gate_ndim=2, trigger="exit"),
-        ),
-    )
 
     note = """
     Certified bit for bit against the built-in `_attention_norm_gate_kernel`

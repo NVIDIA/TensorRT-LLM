@@ -102,7 +102,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1045,36 +1045,6 @@ class PostAttnHopWide(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="the fewest rows: 9, the first row count past the 8-row hop", spec=dict(rows=9)),
-        Cell(why="two requests at K = 7", spec=dict(rows=16)),
-        Cell(
-            why="four requests: the last row count the built-in joins on the cluster",
-            spec=dict(rows=32),
-        ),
-        Cell(why="the first row count the built-in joins in Triton", spec=dict(rows=33)),
-        Cell(why="eight requests", spec=dict(rows=64)),
-        Cell(why="sixteen requests", spec=dict(rows=128)),
-        Cell(why="twenty-four requests: the bs-24 graph", spec=dict(rows=192)),
-        Cell(why="the served transport's capacity: 64 requests", spec=dict(rows=MAX_ROWS)),
-        Cell(
-            why="65 requests: the first call on the larger transport", spec=dict(rows=MAX_ROWS + 8)
-        ),
-        Cell(why="the larger transport's capacity: 128 requests", spec=dict(rows=WIDE_MAX_ROWS)),
-        Cell(
-            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
-            spec=dict(rows=64, norm_fp32=True),
-        ),
-        Cell(
-            why="exact zeros and negative zeros in every rank's partial",
-            spec=dict(rows=64, zeros=True),
-        ),
-        Cell(
-            why="cancelling partials: the FP32 rank-order sum differs from other orders",
-            spec=dict(rows=64, cancel=True),
-        ),
-    )
 
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of

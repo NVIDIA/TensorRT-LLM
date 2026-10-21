@@ -64,7 +64,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from ..gemm.dense_gemm import _bulk_prefetch_l2
 from .paged_decode_attention import _to_cache_fp8
@@ -312,63 +312,6 @@ class MultiRequestPrepAppend(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: seqs, rows_per_seq, ctx (an int for every sequence, or one per
-    # sequence), rope (sliding-window RoPE layer vs full-attention NoPE), page,
-    # permuted (low-latency weight layout), scale (the cache's quant scale),
-    # gain (projection magnitude: saturating E4M3), zero_heads (exact-zero heads),
-    # heads ((query, KV) heads of a rank; default a tep4 rank's (32, 4)).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"{seqs} sequences of a K=7 verify block, {'RoPE' if rope else 'NoPE'}: {why}",
-            spec=dict(seqs=seqs, rows_per_seq=8, ctx=ctx, rope=rope, page=32),
-        )
-        for seqs, ctx, why in (
-            (2, (100000, 4100), "two requests, one straddling a page boundary"),
-            (4, (100000, 40000, 4096, 8), "the bs-4 graph: a page end and a first step"),
-            (8, 60000, "the bs-8 graph at a 60k-token context"),
-            (16, 120000, "the bs-16 graph at a 120k-token context"),
-            (24, 90000, "the bs-24 graph"),
-            (32, 30000, "the bs-32 graph"),
-            (64, (1 << 20) - 5, "64 sequences (512 rows) near the 2^20-position limit"),
-            (96, 70000, "the bs-96 graph of a generation worker"),
-            (128, (1 << 20) - 5, "the largest step (1024 rows) near the 2^20-position limit"),
-        )
-        for rope in (True, False)
-    ) + (
-        Cell(
-            why="2 sequences of a K=3 verify block (4 rows each)",
-            spec=dict(seqs=2, rows_per_seq=4, ctx=(70001, 333), rope=True, page=32),
-        ),
-        Cell(
-            why="3 sequences of plain decode (1 row each)",
-            spec=dict(seqs=3, rows_per_seq=1, ctx=(5, 32, 33), rope=True, page=32),
-        ),
-        Cell(
-            why="8 sequences, 64-token pages",
-            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=64),
-        ),
-        Cell(
-            why="8 sequences, low-latency weight layout",
-            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, permuted=True),
-        ),
-        Cell(
-            why="8 sequences, a quant scale other than 1 (bf16-rounded before the multiply)",
-            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=False, page=32, scale=0.7071),
-        ),
-        Cell(
-            why="8 sequences, magnitudes past the E4M3 range (satfinite)",
-            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, gain=200.0),
-        ),
-        Cell(
-            why="8 sequences with exact-zero heads (rsqrt(eps) times zero, signed E4M3 zeros)",
-            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, zero_heads=True),
-        ),
-        Cell(
-            why="8 sequences at a tep8 rank's 16 query / 2 KV heads",
-            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, heads=(16, 2)),
-        ),
-    )
 
     note = """
     Metadata consumed: seq_lens[0:B] (device, read by the kernel), the

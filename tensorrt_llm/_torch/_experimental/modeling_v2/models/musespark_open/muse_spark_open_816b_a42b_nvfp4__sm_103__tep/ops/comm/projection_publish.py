@@ -67,7 +67,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from cuda.bindings import runtime as _cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -516,41 +516,6 @@ class UnpoolPublishJoin(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="eight requests at K = 7 (64 rows)",
-            spec=dict(rows=64, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="five requests: the first served row count of the band (40 rows)",
-            spec=dict(rows=40, with_gain=True, norm_fp32_residual=False, buffer=1),
-        ),
-        Cell(
-            why="16 requests at K = 7 (128 rows) on the third buffer",
-            spec=dict(rows=128, with_gain=True, norm_fp32_residual=False, buffer=2),
-        ),
-        Cell(
-            why="24 requests at K = 7 (192 rows)",
-            spec=dict(rows=192, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="64 requests: the transport full (512 rows)",
-            spec=dict(rows=512, with_gain=True, norm_fp32_residual=False, buffer=1),
-        ),
-        Cell(
-            why="the FP32-residual pre-QKV norm ordering switch",
-            spec=dict(rows=128, with_gain=True, norm_fp32_residual=True),
-        ),
-        Cell(
-            why="a weightless first norm (the join's other arm)",
-            spec=dict(rows=64, with_gain=False, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="33 rows: the first row count of the band, an odd one",
-            spec=dict(rows=33, with_gain=True, norm_fp32_residual=False),
-        ),
-    )
 
     note = """
     Certified bit for bit against the built-in Triton join run on the gathered branch

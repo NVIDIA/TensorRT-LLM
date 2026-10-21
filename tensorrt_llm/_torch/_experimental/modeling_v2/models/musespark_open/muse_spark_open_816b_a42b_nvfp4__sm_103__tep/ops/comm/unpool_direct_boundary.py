@@ -79,7 +79,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from cuda.bindings import runtime as _cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -823,51 +823,6 @@ class UnpoolDirectBoundary(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, the one row count the target publishes at",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="the second buffer: odd layers publish into buffer 1",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, parity=1),
-        ),
-        Cell(
-            why="the third buffer: the last fused layer of an odd count (61 in the model)",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, parity=2),
-        ),
-        Cell(
-            why="early release: dependents launched at entry, the next QKV streams its weight meanwhile",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry"),
-        ),
-        Cell(
-            why="capture with early release: the DFlash capture from a boundary releasing the next QKV at entry",
-            spec=dict(
-                rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry", capture=True
-            ),
-        ),
-        Cell(
-            why="the FP32-residual pre-QKV norm ordering switch",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True),
-        ),
-        Cell(
-            why="a weightless first norm (the boundary's other arm)",
-            spec=dict(rows=8, with_gain=False, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="dependents launched right after the wait",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="after_wait"),
-        ),
-        Cell(
-            why="1 row: the cluster of 16 CTAs, two CTAs per peer slice",
-            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="3 rows, a short draft between the two cluster shapes",
-            spec=dict(rows=3, with_gain=True, norm_fp32_residual=False, parity=1),
-        ),
-    )
 
     note = """
     Certified against ``unpool_gather_boundary`` on the same slices bit for bit (the test publishes with

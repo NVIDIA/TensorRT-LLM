@@ -47,7 +47,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WIDE_ROWS, WORLDS, ProjectionInbox
 
@@ -559,24 +559,6 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="DFlash2 K=7 verify: 8 rows (four CTAs of two rows)", spec=dict(rows=8)),
-        Cell(why="decode without drafts: 1 row, the second row of the CTA idle", spec=dict(rows=1)),
-        Cell(why="an odd row count between the two (3 rows)", spec=dict(rows=3)),
-        Cell(
-            why="TP4, two requests at K=7 (16 rows) on a wide inbox",
-            spec=dict(rows=16, wide=True),
-        ),
-        Cell(
-            why="TP4, four requests at K=7 (32 rows, the wide inbox full)",
-            spec=dict(rows=32, wide=True),
-        ),
-        Cell(
-            why="TP4, 9 rows on a wide inbox: the first wide row count, an odd one",
-            spec=dict(rows=9, wide=True),
-        ),
-    )
 
     note = """
     Certified against the built-in gather followed by flashinfer's

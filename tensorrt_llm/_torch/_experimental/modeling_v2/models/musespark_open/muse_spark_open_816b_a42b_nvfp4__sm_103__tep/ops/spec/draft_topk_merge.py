@@ -33,7 +33,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: ``torch.topk`` sorts k <= 32 results with this many bitonic slots.
 SORT_SLOTS = 32
@@ -261,33 +261,6 @@ class DraftTopKMerge(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS = (
-        Cell(
-            "this target's draft head: one request, K = 7, 8 ranks, top 16, rank 256",
-            dict(requests=1, positions=7, ranks=8, values="logits"),
-        ),
-        Cell(
-            "K = 3, the shortest block the deployment drafts",
-            dict(requests=1, positions=3, ranks=8, values="logits"),
-        ),
-        Cell(
-            "two requests in one decode step",
-            dict(requests=2, positions=7, ranks=8, values="logits"),
-        ),
-        Cell(
-            "ties everywhere, across rank boundaries: order is decided by the network",
-            dict(requests=1, positions=7, ranks=8, values="grid"),
-        ),
-        Cell(
-            "every logit equal: selection by lowest id, order by the network",
-            dict(requests=1, positions=7, ranks=8, values="zeros"),
-        ),
-        Cell(
-            "signed zeros and infinities at the top",
-            dict(requests=1, positions=7, ranks=8, values="special"),
-        ),
-        Cell("a 4-rank shard (2x wider)", dict(requests=1, positions=7, ranks=4, values="logits")),
-    )
     note = (
         "Tie order is torch 2.14's (SortUtils.cuh bitonicSort, k <= 32 -> 32 "
         "slots), which torch does not document. draft_head.install checks it "

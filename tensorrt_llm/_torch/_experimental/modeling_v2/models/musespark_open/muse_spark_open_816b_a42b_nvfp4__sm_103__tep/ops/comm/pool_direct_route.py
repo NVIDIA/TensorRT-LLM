@@ -80,7 +80,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from cuda.bindings import runtime as _cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1166,40 +1166,6 @@ class PoolDirectRoute(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, balanced placement, buffer 0",
-            spec=dict(rows=8, place=_route.PLACE_BALANCE, buffer=0),
-        ),
-        Cell(
-            why="8 rows over three ring windows, the second buffer",
-            spec=dict(rows=8, place=_route.PLACE_BALANCE3, buffer=1),
-        ),
-        Cell(
-            why="the third buffer (the last call of an odd count)",
-            spec=dict(rows=8, place=_route.PLACE_BALANCE, buffer=2),
-        ),
-        Cell(
-            why="8 rows, routing only (no placement)", spec=dict(rows=8, place=PLACE_NONE, buffer=0)
-        ),
-        Cell(
-            why="1 row: one CTA, its second row idle, one logit box",
-            spec=dict(rows=1, place=_route.PLACE_BALANCE, buffer=1),
-        ),
-        Cell(
-            why="3 rows: the second CTA carries one row",
-            spec=dict(rows=3, place=_route.PLACE_BALANCE, buffer=0),
-        ),
-        Cell(
-            why="8 rows, owner-only placement",
-            spec=dict(rows=8, place=_route.PLACE_OWNER, buffer=1),
-        ),
-        Cell(
-            why="8 rows, static placement",
-            spec=dict(rows=8, place=_route.PLACE_STATIC, buffer=0),
-        ),
-    )
 
     note = """
     Certified against `pool_gather_route` on the same slices and logits bit for bit

@@ -62,7 +62,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm.mapping import Mapping
 
 #: The CUDA sources of the library, in ``_head_sampler/``.
@@ -248,93 +248,6 @@ class SplitSample(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the target's verify block: 8 neutral rows (T 1), per-row RNG, N(0, 40) logits",
-            spec=dict(rows=8, kind="n40", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="shared RNG entry: the row index is the Philox subsequence",
-            spec=dict(rows=8, kind="n10", temperature=1.0, rng="shared"),
-        ),
-        Cell(
-            why="wide logits: a few tokens carry the mass",
-            spec=dict(rows=8, kind="n120", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="spiky row: 64 outliers",
-            spec=dict(rows=8, kind="spiky", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="one dominant token: the walk crosses on its first elements",
-            spec=dict(rows=8, kind="peaked", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="flat row: every thread carries mass, the crossing thread anywhere",
-            spec=dict(rows=8, kind="flat", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="saturated soft cap: ties after the cap, argmax tie-breaking",
-            spec=dict(rows=8, kind="sat", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="temperature other than 1 on a neutral row",
-            spec=dict(rows=8, kind="n40", temperature=0.7, rng="row"),
-        ),
-        Cell(
-            why="greedy sentinel temperature on a neutral row (1 / 1e-6 scaling)",
-            spec=dict(rows=8, kind="n40", temperature=0.0, rng="row"),
-        ),
-        Cell(
-            why="one row (a single-row call counts as per-row RNG)",
-            spec=dict(rows=1, kind="n40", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="filtered rows fall back to the shipped body: top-k, top-p, min-p, mixed with neutral rows",
-            spec=dict(rows=8, kind="n40", temperature=1.0, rng="row", filters="mixed"),
-        ),
-        Cell(
-            why="16 rows: the verify blocks of 2 requests",
-            spec=dict(rows=16, kind="n40", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="64 rows: the verify blocks of 8 requests",
-            spec=dict(rows=64, kind="n40", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="128 rows: 16 requests, the shipped sampler's widest 1024-thread call",
-            spec=dict(rows=128, kind="n40", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="128 rows, shared RNG entry: the row index is the Philox subsequence",
-            spec=dict(rows=128, kind="spiky", temperature=0.7, rng="shared"),
-        ),
-        Cell(
-            why="128 rows with filtered rows on the shipped body, mixed with neutral rows",
-            spec=dict(rows=128, kind="n40", temperature=1.0, rng="row", filters="mixed"),
-        ),
-        Cell(
-            why="129 rows: the shipped sampler's first 512-thread call",
-            spec=dict(rows=129, kind="n40", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="256 rows (32 requests), spiky rows, shared RNG entry",
-            spec=dict(rows=256, kind="spiky", temperature=0.7, rng="shared"),
-        ),
-        Cell(
-            why="256 rows with filtered rows on the shipped 512-thread body",
-            spec=dict(rows=256, kind="n40", temperature=1.0, rng="row", filters="mixed"),
-        ),
-        Cell(
-            why="512 rows (64 requests), flat rows: the crossing thread anywhere",
-            spec=dict(rows=512, kind="flat", temperature=1.0, rng="row"),
-        ),
-        Cell(
-            why="1024 rows (128 requests, a 1P1D generation step), saturated soft cap",
-            spec=dict(rows=1024, kind="sat", temperature=1.0, rng="row"),
-        ),
-    )
-
     note = """
     Metadata consumed: none. Two launches (kernel A grid (rows, V / 128) x 128
     threads; kernel B grid rows x V threads, V = ``virtual_threads(rows)``: 1024
@@ -453,29 +366,6 @@ class GatherSplitSample(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the target's verify block: 8 rows, 8 shards of 25256, inbox published before the call",
-            spec=dict(rows=8, ranks=8, shard=25256, kind="n40", publish="before"),
-        ),
-        Cell(
-            why="the inbox published while kernel A already polls (concurrent producer)",
-            spec=dict(rows=8, ranks=8, shard=25256, kind="n40", publish="during"),
-        ),
-        Cell(
-            why="negative zeros and saturated caps survive the gather bit for bit",
-            spec=dict(rows=8, ranks=8, shard=25256, kind="sat", publish="before", zeros=True),
-        ),
-        Cell(
-            why="gather only (the materialize path for greedy / non-fused steps)",
-            spec=dict(rows=8, ranks=8, shard=25256, kind="n40", publish="before", sample=False),
-        ),
-        Cell(
-            why="fewer rows than slots: the other rows' words stay untouched",
-            spec=dict(rows=3, ranks=8, shard=25256, kind="n10", publish="before"),
-        ),
-    )
 
     note = """
     Metadata consumed: none. Kernel A polls with ``ld.relaxed.sys`` (8 bytes:

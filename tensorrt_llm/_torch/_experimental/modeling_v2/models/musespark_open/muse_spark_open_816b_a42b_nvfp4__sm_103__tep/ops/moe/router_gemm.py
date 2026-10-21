@@ -44,7 +44,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -115,30 +115,6 @@ class RouterGemm(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the smallest call taken: 9 rows, a 16-row tile with 7 masked rows",
-            spec=dict(rows=9),
-        ),
-        Cell(why="two requests at K=7: 16 rows", spec=dict(rows=16)),
-        Cell(why="four requests: 32 rows", spec=dict(rows=32)),
-        Cell(
-            why="a row count off the power-of-two tiles: 40 rows in a 64-row tile",
-            spec=dict(rows=40),
-        ),
-        Cell(why="sixteen requests: 128 rows, one full tile, 76 splits", spec=dict(rows=128)),
-        Cell(
-            why="seventeen requests: 136 rows, a second, nearly empty row tile, 38 splits",
-            spec=dict(rows=136),
-        ),
-        Cell(why="thirty-two requests: 256 rows, two full tiles", spec=dict(rows=256)),
-        Cell(why="a third row tile: 300 rows, 25 splits", spec=dict(rows=300)),
-        Cell(
-            why="sixty-four requests: 512 rows, the largest call taken, 19 splits",
-            spec=dict(rows=512),
-        ),
-    )
 
     note = """
     Budgeted, not bitwise: the test gates every cell against the float64 product

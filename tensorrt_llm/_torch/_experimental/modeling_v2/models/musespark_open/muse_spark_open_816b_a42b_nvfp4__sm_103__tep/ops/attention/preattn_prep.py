@@ -36,7 +36,7 @@ try:
 except ImportError:  # the pre-3.2 layout
     from triton.language.extra.cuda import libdevice
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Head width the kernel's reduction tree is written for: 8 threads x 8 elements.
 HEAD_DIM = 64
@@ -451,86 +451,6 @@ class PreattnPrep(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows, rope (sliding-window RoPE layer vs full-attention NoPE),
-    # permuted (low-latency weight layout), positions ("uniform" over the
-    # table, "tail" = the last 2048 positions, "sequences" = K=7 verify blocks,
-    # "chunk" = consecutive positions after a 98,304-token prefix), zero_heads
-    # (exact-zero heads).
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(why=f"{rows} rows, RoPE layer: {why}", spec=dict(rows=rows, rope=True))
-            for rows, why in (
-                (1, "plain decode"),
-                (2, "DFlash K=1 verify"),
-                (3, "K=2 verify"),
-                (4, "K=3 verify"),
-                (5, "K=4 verify"),
-                (6, "K=5 verify"),
-                (7, "K=6 verify"),
-                (8, "K=7 verify, the primary width"),
-            )
-        )
-        + tuple(
-            Cell(why=f"{rows} rows, NoPE full-attention layer", spec=dict(rows=rows, rope=False))
-            for rows in (1, 4, 6, 8)
-        )
-        + (
-            Cell(
-                why="1 row, low-latency weight layout, RoPE: the layout's own one-row path",
-                spec=dict(rows=1, rope=True, permuted=True),
-            ),
-            Cell(
-                why="8 rows, low-latency weight layout, RoPE",
-                spec=dict(rows=8, rope=True, permuted=True),
-            ),
-            Cell(
-                why="8 rows, low-latency weight layout, NoPE",
-                spec=dict(rows=8, rope=False, permuted=True),
-            ),
-            Cell(
-                why="8 rows, positions in the last 2048 entries of the 2^20 table",
-                spec=dict(rows=8, rope=True, positions="tail"),
-            ),
-            Cell(
-                why="8 rows with exact-zero heads (rsqrt(eps) times zero)",
-                spec=dict(rows=8, rope=True, zero_heads=True),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"{rows} rows, {'RoPE' if rope else 'NoPE'} layer: {why}",
-                spec=dict(rows=rows, rope=rope, positions="sequences"),
-            )
-            for rows, rope, why in (
-                (16, True, "2 requests of a K=7 verify block"),
-                (64, True, "8 requests of a K=7 verify block"),
-                (64, False, "8 requests of a K=7 verify block"),
-                (512, True, "64 requests of a K=7 verify block, the largest step"),
-                (512, False, "64 requests of a K=7 verify block, the largest step"),
-            )
-        )
-        + (
-            Cell(
-                why="512 rows, low-latency weight layout, RoPE, 64 requests",
-                spec=dict(rows=512, rope=True, permuted=True, positions="sequences"),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"{rows} rows, {'RoPE' if rope else 'NoPE'} layer: {why}",
-                spec=dict(rows=rows, rope=rope, positions="chunk"),
-            )
-            for rows, rope, why in (
-                (513, True, "the smallest row-kernel step, a one-row last program"),
-                (513, False, "the smallest row-kernel step, a one-row last program"),
-                (1032, True, "a context chunk with a half-masked last program"),
-                (3000, True, "a context chunk with a half-masked last program"),
-                (8192, True, "an 8k context chunk after a 98,304-token prefix"),
-                (8192, False, "an 8k context chunk after a 98,304-token prefix"),
-            )
-        )
-    )
 
     note = """
     Metadata consumed: none beyond the per-row positions; every row and head

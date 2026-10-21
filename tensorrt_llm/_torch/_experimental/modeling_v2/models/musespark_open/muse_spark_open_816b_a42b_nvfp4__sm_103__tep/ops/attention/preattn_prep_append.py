@@ -36,7 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .paged_decode_attention import _to_cache_fp8
 from .preattn_prep import HEAD_DIM, _inverse_rms, _load8, _normalize, _split_projection
@@ -241,45 +241,6 @@ class PreattnPrepAppend(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows, ctx (= seq_lens[0], the step's rows included), page,
-    # permuted (low-latency weight layout), scale (the cache's quant scale),
-    # zero_heads (exact-zero heads), gain (projection magnitude: saturating E4M3).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"{rows} rows at {ctx} keys: {why}", spec=dict(rows=rows, ctx=ctx, page=32))
-        for rows, ctx, why in (
-            (8, 100000, "K=7 verify at a 100k-token context, the primary cell"),
-            (8, 455000, "K=7 verify at a 455k-token context"),
-            (8, 1 << 20, "K=7 verify at the 2^20-position limit"),
-            (8, 4100, "the step's rows straddle a page boundary"),
-            (8, 4096, "the step ends exactly on a page boundary"),
-            (8, 8, "the first step: the step's rows are the whole sequence"),
-            (1, 100000, "one row (plain decode)"),
-            (4, 100003, "a partial verify (K=3)"),
-            (6, 77777, "a partial verify (K=5), off a page boundary"),
-        )
-    ) + (
-        Cell(
-            why="8 rows, 64-token pages",
-            spec=dict(rows=8, ctx=100000, page=64),
-        ),
-        Cell(
-            why="8 rows, low-latency weight layout",
-            spec=dict(rows=8, ctx=100000, page=32, permuted=True),
-        ),
-        Cell(
-            why="8 rows, a quant scale other than 1 (bf16-rounded before the multiply)",
-            spec=dict(rows=8, ctx=100000, page=32, scale=0.7071),
-        ),
-        Cell(
-            why="8 rows, magnitudes past the E4M3 range (satfinite)",
-            spec=dict(rows=8, ctx=100000, page=32, gain=200.0),
-        ),
-        Cell(
-            why="8 rows with exact-zero heads (rsqrt(eps) times zero, signed zeros in E4M3)",
-            spec=dict(rows=8, ctx=100000, page=32, zero_heads=True),
-        ),
-    )
 
     note = """
     Metadata consumed: seq_lens[0] (device, read by the kernel), the
