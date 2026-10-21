@@ -48,6 +48,16 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for Qwen3 dense rows with FP8 block-scale (128x128) weights:
+# every Linear the realized quant config quantizes holds E4M3 weights [N, K],
+# FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim FP32 `input_scale`
+# and `inv_input_scale` as loaded (1.0 unless a non-fused projection's
+# checkpoint stores an input scale). All other tensors, the Q/K norm state, and
+# the target-only receiver finalization follow the Qwen3 dense contract, and no
+# one-shot transform changes them.
+QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-qwen3-dense-fp8-block128-fp32scale-target-layout-v1"
+)
 # Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
