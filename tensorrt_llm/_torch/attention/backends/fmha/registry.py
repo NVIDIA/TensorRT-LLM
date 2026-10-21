@@ -54,9 +54,8 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         # DeepSeek-V4 generation on the vendored PrimTS native sparse MLA
         # kernel. Enabled by default: it only reports itself available for
-        # DeepSeek-V4 on SM100, so every other model and architecture
-        # never sees it, and it precedes the TRTLLM-Gen fallback that served
-        # that phase before.
+        # DeepSeek-V4 on SM100, so every other model and architecture never
+        # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,

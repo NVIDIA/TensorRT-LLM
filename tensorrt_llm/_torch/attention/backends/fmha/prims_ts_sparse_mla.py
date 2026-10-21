@@ -79,6 +79,9 @@ if TYPE_CHECKING:
 
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
+# Same compiler-target gate as fmha/prims_ts.py: the kernels share one CuTe DSL
+# task-scheduling stack, so a toolchain the dense libraries refuse is refused here too.
+_MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _FUSED_OUTPUT_BLOCK = 128
@@ -95,6 +98,15 @@ def get_prims_ts_toolchain_unsupported_reason() -> Optional[str]:
             f"nvidia-cutlass-dsl>={_MIN_CUTLASS_DSL_VERSION} is required, got {installed_version}."
         )
     try:
+        cutlass = import_module("cutlass")
+        compiler_version_supported = cutlass.target_version(
+            min_version=_MIN_CUTLASS_COMPILER_VERSION
+        )
+    except Exception as error:  # noqa: BLE001 - availability probes must fail closed
+        return f"could not query the active CUTLASS compiler version: {error}"
+    if not compiler_version_supported:
+        return f"the active CUTLASS compiler must target CUDA>={_MIN_CUTLASS_COMPILER_VERSION}."
+    try:
         import_module("cutlass.experimental.task_scheduling")
     except ImportError:
         return "CUTLASS task scheduling is missing."
@@ -103,16 +115,9 @@ def get_prims_ts_toolchain_unsupported_reason() -> Optional[str]:
 
 @dataclass
 class _SparsePlan:
-    """One planned wrapper plus the live-length buffers it reads on every launch.
-
-    The index lists come straight from ``sparse_attn_predict``'s metadata
-    buffer; only the per-row live lengths are derived here, into buffers whose
-    addresses stay stable for CUDA graph replay.
-    """
+    """One planned wrapper for a static profile; every launch input comes from the metadata."""
 
     wrapper: "BatchSparseMLADecodePagedTSWrapper"
-    lengths: torch.Tensor
-    extra_lengths: Optional[torch.Tensor]
     validated: bool = False
 
 
@@ -123,9 +128,13 @@ class PrimsTSSparseMlaFmha(Fmha):
     MAX_HEADS = 128
     # Plans live in ``TrtllmAttentionMetadata.fmha_plan_caches`` under this key,
     # like the block-sparse and FlashInfer wrappers: every layer that runs with
-    # one metadata object plans each static profile once and reuses its
-    # workspace, and layers sharing a metadata object execute serially.
+    # one metadata object plans each static profile once, and layers sharing a
+    # metadata object execute serially. All plans of a metadata object share
+    # one kernel workspace (under WORKSPACE_CACHE_KEY), grown to the largest
+    # profile, so the eager metadata does not accumulate one workspace per
+    # distinct generation row count.
     PLAN_CACHE_KEY = "prims_ts_sparse_mla"
+    WORKSPACE_CACHE_KEY = "prims_ts_sparse_mla.workspace"
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
@@ -150,10 +159,11 @@ class PrimsTSSparseMlaFmha(Fmha):
         reason = cls._unavailable_reason(attn)
         if reason is not None:
             # A DeepSeek-V4 layer that does not get this library falls back to
-            # TRTLLM-Gen silently otherwise; say so once per layer at info.
-            logger.info(
-                f"PrimTS sparse MLA FMHA is unavailable for layer "
-                f"{getattr(attn, 'layer_idx', None)}: {reason}"
+            # TRTLLM-Gen silently otherwise; say so once per reason at info.
+            logger.info_once(
+                f"PrimTS sparse MLA FMHA is unavailable, DeepSeek-V4 generation stays on the "
+                f"TRTLLM-Gen fallback: {reason}",
+                key=f"prims_ts_sparse_mla_unavailable:{reason}",
             )
             return False
         return True
@@ -162,13 +172,9 @@ class PrimsTSSparseMlaFmha(Fmha):
     def _unavailable_reason(cls, attn: "TrtllmAttention") -> Optional[str]:
         sm = get_sm_version()
         if sm == 103:
-            # The vendored kernels admit SM103 through their architecture guard
-            # but flashinfer has only signed off accuracy and performance on
-            # SM100 (prims_ts/kernels/mla_decode/README.md). TRT-LLM L0 #64329
-            # hit an illegal memory access in the GB300 DeepSeek-V4-Pro perf
-            # sanity warmup (TP4/ADP, FP8 KV, MTP 3) that the same configuration
-            # at TP8 does not reproduce on B200, so B300/GB300 stay on the
-            # TRTLLM-Gen fallback until the kernels are qualified there.
+            # The kernels' architecture guard admits SM103, but they are only
+            # signed off on SM100 (prims_ts/kernels/mla_decode/README.md); keep
+            # B300/GB300 on the TRTLLM-Gen fallback until they are qualified.
             return "SM103 is not yet qualified for the PrimTS sparse MLA kernels."
         if sm != 100:
             return f"requires SM100, got SM{sm}."
@@ -231,7 +237,9 @@ class PrimsTSSparseMlaFmha(Fmha):
         if metadata.beam_width != 1:
             return "beam search is not supported."
         if getattr(metadata, "token_positions_cuda", None) is None:
-            return "token positions are required for lengths and output RoPE."
+            return "token positions are required for the output RoPE."
+        if getattr(metadata, "sparse_mla_swa_lens", None) is None:
+            return "per-step live lengths are required (DeepSeek-V4 metadata)."
         if fwd.attention_mask_data is not None or fwd.relative_attention_bias is not None:
             return "custom masks and relative bias are not supported."
         if metadata.helix_position_offsets is not None:
@@ -434,9 +442,7 @@ class PrimsTSSparseMlaFmha(Fmha):
         geometry: device, query rows, extra capacity, heads, window, dtype,
         sinks, fusion groups. One plan serves every layer with that profile.
         """
-        from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
-            BatchSparseMLADecodePagedTSWrapper,
-        )
+        from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
         attn = self.attn
         heads = int(attn.num_heads)
@@ -451,11 +457,7 @@ class PrimsTSSparseMlaFmha(Fmha):
                 "PrimTS sparse MLA plans must be created during eager warmup, not under "
                 f"CUDA graph capture (rows={rows}, extra={extra}, dtype={q_dtype})."
             )
-        wrapper = BatchSparseMLADecodePagedTSWrapper()
-        wrapper.plan(
-            device,
-            rows,
-            heads,
+        plan_kwargs = dict(
             max_topk=window,
             max_extra_topk=extra,
             max_seq_len_q=1,
@@ -467,23 +469,28 @@ class PrimsTSSparseMlaFmha(Fmha):
             # dual-pool layout, but the ratio-4 indexer top-k may carry holes;
             # keep the generic mask path.
             assume_valid_prefix=False,
-            **(
-                dict(
-                    output_quant_block_size=_FUSED_OUTPUT_BLOCK,
-                    out_scale_format="fp32",
-                    num_output_groups=fused_groups,
-                )
-                if fused_groups
-                else {}
-            ),
         )
-        plan = _SparsePlan(
-            wrapper=wrapper,
-            lengths=torch.empty((rows,), device=device, dtype=torch.int32),
-            extra_lengths=(
-                torch.empty((rows,), device=device, dtype=torch.int32) if extra else None
-            ),
+        if fused_groups:
+            plan_kwargs.update(
+                output_quant_block_size=_FUSED_OUTPUT_BLOCK,
+                out_scale_format="fp32",
+                num_output_groups=fused_groups,
+            )
+        # One workspace per metadata object, shared by every plan and grown to
+        # the largest profile: plans run serially, and a plan's scratch is only
+        # live during its own launch. The size comes from the same resolver the
+        # wrapper's plan() uses (its fifth result is the byte extent).
+        required_bytes = int(
+            mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[4]
         )
+        shared = metadata.fmha_plan_caches.setdefault(self.WORKSPACE_CACHE_KEY, {})
+        workspace = shared.get("buffer")
+        if workspace is None or workspace.numel() < required_bytes:
+            workspace = torch.empty((required_bytes,), device=device, dtype=torch.uint8)
+            shared["buffer"] = workspace
+        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
+        wrapper.plan(device, rows, heads, **plan_kwargs)
+        plan = _SparsePlan(wrapper=wrapper)
         cache[key] = plan
         return plan
 
@@ -518,9 +525,9 @@ class PrimsTSSparseMlaFmha(Fmha):
         groups = int(output.shape[0]) if fused else None
 
         if is_fp8:
-            # The MLA preprocessing quantizes Q with the KV-cache scale, so both
-            # descales equal the layer's kv_scale_quant_orig (see
-            # DeepseekV4TrtllmAttention.sparse_attn_predict).
+            # Mirror the fallback's scheduler prologue, which sets both
+            # dequant_scale_q and dequant_scale_kv to the layer's
+            # kv_scale_quant_orig (DeepseekV4TrtllmAttention.sparse_attn_predict).
             dequant = self._kv_dequant()
             q_scale = kv_scale = dequant
             query = (
@@ -551,23 +558,20 @@ class PrimsTSSparseMlaFmha(Fmha):
 
         # Storage-row indices straight from sparse_attn_predict: the window
         # slots address the SWA pool and the compressed slots address the
-        # compress pool, both relative to their pool base. The live window
-        # length is the token's position within the window; the compressed
-        # length is what the indexer's top-k selected beyond the window.
+        # compress pool, both relative to their pool base. The live lengths
+        # come from the metadata too, derived once per step: the token's
+        # position within the window, and the compressed rows selected beyond
+        # the window.
         indices = forward_args.sparse_runtime_params.sparse_attn_indices
         positions = metadata.token_positions_cuda[start:end]
-        torch.add(positions, 1, out=plan.lengths)
-        plan.lengths.clamp_(max=window)
+        lengths = metadata.sparse_mla_swa_lens[start:end]
         swa_pool = self._pool_view(manager, DeepseekV4AttentionType.SWA, 1)
         extra_pool = None
         run_kwargs = {}
         if extra:
-            topk_lens = metadata.sparse_mla_topk_lens[ratio][start:end]
-            torch.sub(topk_lens, window, out=plan.extra_lengths)
-            plan.extra_lengths.clamp_(min=0, max=extra)
             extra_pool = self._pool_view(manager, DeepseekV4AttentionType.COMPRESS, ratio)
             run_kwargs["extra_indices"] = indices[:, window:]
-            run_kwargs["extra_lengths"] = plan.extra_lengths
+            run_kwargs["extra_lengths"] = metadata.sparse_mla_extra_lens[ratio][start:end]
 
         if fused:
             # TRT-LLM's fused epilogue buffers are group-major [G, T, C] with
@@ -590,7 +594,7 @@ class PrimsTSSparseMlaFmha(Fmha):
             query,
             swa_pool,
             indices[:, :window],
-            plan.lengths,
+            lengths,
             extra_pool,
             softmax_scale=softmax_scale,
             output_scale=output_scale,

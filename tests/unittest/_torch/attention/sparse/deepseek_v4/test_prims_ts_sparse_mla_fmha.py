@@ -60,9 +60,8 @@ def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
 def test_sm103_stays_on_the_fallback_until_qualified(monkeypatch) -> None:
     """B300/GB300 report an SM reason; SM100 proceeds to the shape and toolchain checks.
 
-    The vendored kernels admit SM103 through their architecture guard, but the
-    flashinfer signoff is SM100 only and L0 #64329 hit an illegal memory access
-    in the GB300 DeepSeek-V4-Pro warmup, so the adapter keeps SM103 on TRTLLM-Gen.
+    The vendored kernels admit SM103 through their architecture guard, but they
+    are signed off on SM100 only, so the adapter keeps SM103 on TRTLLM-Gen.
     """
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
 
@@ -88,8 +87,7 @@ def test_softmax_scale_follows_qk_head_dim() -> None:
     """The scale uses ``qk_nope + qk_rope`` like attentionOp.cpp, not the 512 latent.
 
     DeepSeek-V4 checkpoints have 448 + 64 = 512, so only a narrower nope width
-    (the 128 + 64 scenario of ``test_deepseek_v4_sparse_mla``) tells the two apart;
-    L0 #64329 caught the latent-width version as a ~0.3 BF16 output mismatch.
+    (the 128 + 64 scenario of ``test_deepseek_v4_sparse_mla``) tells the two apart.
     """
     attn = SimpleNamespace(qk_nope_head_dim=128, qk_rope_head_dim=64, q_scaling=0.5336)
     expected = 1.0 / (0.5336 * math.sqrt(192.0))
@@ -158,10 +156,18 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
     planned = []
 
     class _FakeWrapper:
+        def __init__(self, workspace_buffer=None):
+            self.workspace_buffer = workspace_buffer
+
         def plan(self, device, rows, heads, **kwargs):
-            planned.append((device, rows, heads, kwargs))
+            planned.append((device, rows, heads, kwargs, self.workspace_buffer))
+
+    def fake_resolve(device, rows, heads, **kwargs):
+        # The wrapper's resolver returns the workspace byte extent fifth.
+        return (device, None, None, {}, 1024 * (1 + kwargs["max_extra_topk"] // 256), None, None)
 
     monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
+    monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
 
     class _Attn:  # weak-referenceable stand-in for TrtllmAttention
         num_heads = 16
@@ -186,12 +192,16 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
     assert planned[0][3]["max_topk"] == 128 and planned[0][3]["max_extra_topk"] == 256
     cache = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.PLAN_CACHE_KEY]
     assert list(cache.values()) == [plan_a]
+    workspace = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.WORKSPACE_CACHE_KEY]["buffer"]
+    assert planned[0][4] is workspace and workspace.numel() == 2048
 
-    other = layer_a._get_plan(**{**profile, "extra": 0})
-    assert other is not plan_a
-    assert other.extra_lengths is None
-    assert len(planned) == 2
-    assert len(cache) == 2
+    # A smaller profile reuses the shared workspace; a larger one grows it.
+    smaller = layer_a._get_plan(**{**profile, "extra": 0})
+    assert smaller is not plan_a and planned[1][4] is workspace
+    larger = layer_b._get_plan(**{**profile, "extra": 512})
+    grown = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.WORKSPACE_CACHE_KEY]["buffer"]
+    assert larger is not plan_a and planned[2][4] is grown and grown.numel() == 3072
+    assert len(planned) == 3 and len(cache) == 3
 
 
 def _rope_table(max_positions: int, device: torch.device) -> torch.Tensor:
@@ -209,6 +219,119 @@ def _random_indices(rows: int, capacity: int, pool_rows: int, device: torch.devi
     inactive = torch.arange(capacity, device=device)[None, :] >= lengths[:, None]
     indices[inactive] = -1
     return indices, lengths
+
+
+def _two_source_case(rows: int, heads: int, topk: int, extra_topk: int, device, dtype):
+    """Pools, query and two index sets for one two-source BF16/FP8 attention."""
+    pool_rows, extra_rows = 2048, 1024
+    pool = torch.randn(pool_rows, 1, LATENT, dtype=torch.bfloat16, device=device).to(dtype)
+    extra_pool = torch.randn(extra_rows, 1, LATENT, dtype=torch.bfloat16, device=device).to(dtype)
+    query = (torch.randn(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device) * 0.5).to(
+        dtype
+    )
+    sets = []
+    for _ in range(2):
+        indices, lengths = _random_indices(rows, topk, pool_rows, device)
+        extra_indices, extra_lengths = _random_indices(rows, extra_topk, extra_rows, device)
+        sets.append((indices, lengths, extra_indices, extra_lengths))
+    return pool, extra_pool, query, sets
+
+
+def test_reloaded_kernel_accepts_the_same_launch():
+    """A kernel reloaded from the persistent compile cache runs the adapter's launch.
+
+    CI processes always compile cold, while every later process (and
+    production restarts) reload the exported TVM-FFI kernels, whose positional
+    entry has no Python defaults. Drop the in-process kernel memo after the
+    first run so the second plan takes the reload path, and require identical
+    output.
+    """
+    _skip_unless_toolchain()
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    rows, heads, topk, extra_topk = 5, 64, 128, 256
+    pool, extra_pool, query, sets = _two_source_case(
+        rows, heads, topk, extra_topk, device, torch.bfloat16
+    )
+    indices, lengths, extra_indices, extra_lengths = sets[0]
+
+    def run_fresh_plan() -> torch.Tensor:
+        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+        wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk)
+        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
+        wrapper.run(
+            query,
+            pool,
+            indices,
+            lengths,
+            extra_pool,
+            extra_indices=extra_indices,
+            extra_lengths=extra_lengths,
+            softmax_scale=LATENT**-0.5,
+            output_scale=1.0,
+            out=out,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    first = run_fresh_plan()
+    mla_decode._get_compiled_mla_decode.cache_clear()
+    second = run_fresh_plan()
+    torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+
+def test_graph_replay_follows_new_indices_and_lengths():
+    """A captured run reads the live index and length buffers on replay.
+
+    Warm up eagerly, capture one run with ``validate=False``, swap in a second
+    index set and compare the replayed output with an eager run on that set.
+    """
+    _skip_unless_toolchain()
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    rows, heads, topk, extra_topk = 8, 64, 128, 256
+    pool, extra_pool, query, sets = _two_source_case(
+        rows, heads, topk, extra_topk, device, torch.bfloat16
+    )
+    buffers = [tensor.clone() for tensor in sets[0]]  # fixed-address launch inputs
+    indices, lengths, extra_indices, extra_lengths = buffers
+    out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
+    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk)
+
+    def launch(validate: bool) -> None:
+        wrapper.run(
+            query,
+            pool,
+            indices,
+            lengths,
+            extra_pool,
+            extra_indices=extra_indices,
+            extra_lengths=extra_lengths,
+            softmax_scale=LATENT**-0.5,
+            output_scale=1.0,
+            out=out,
+            validate=validate,
+        )
+
+    launch(validate=True)  # eager warmup on set 0, also prepares the scalar cache
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(validate=False)
+    for buffer, source in zip(buffers, sets[1]):
+        buffer.copy_(source)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = out.clone()
+    launch(validate=True)  # eager reference on set 1 through the same plan
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, out, rtol=0, atol=0)
+    assert not torch.equal(replayed, torch.zeros_like(replayed))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
