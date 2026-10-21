@@ -52,6 +52,12 @@ class _DecodedMediaReservation:
         self._retained_bytes = retained_bytes
         self._active = True
 
+    def shrink(self, retained_bytes: int) -> None:
+        if not self._active or not 0 <= retained_bytes <= self._retained_bytes:
+            raise ValueError("invalid decoded-media reservation shrink")
+        self._budget._shrink(self._peak_bytes, self._retained_bytes, retained_bytes)
+        self._peak_bytes = self._retained_bytes = retained_bytes
+
     def commit(self, retained_bytes: int) -> None:
         if not self._active:
             raise RuntimeError("decoded-media reservation is no longer active")
@@ -110,6 +116,12 @@ class _DecodedMediaBudget:
             self._used += peak_bytes
             self._reserved_retained += retained_bytes
         return _DecodedMediaReservation(self, peak_bytes, retained_bytes)
+
+    def _shrink(self, peak_bytes: int, reserved_retained: int, retained_bytes: int) -> None:
+        with self._condition:
+            self._used -= peak_bytes - retained_bytes
+            self._reserved_retained -= reserved_retained - retained_bytes
+            self._condition.notify_all()
 
     def _settle(self, peak_bytes: int, reserved_retained: int, retained_bytes: int) -> None:
         with self._condition:

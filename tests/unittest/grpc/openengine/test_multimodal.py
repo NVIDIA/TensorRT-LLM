@@ -4,9 +4,11 @@
 """Unit tests for OpenEngine multimodal input mapping and discovery."""
 
 import asyncio
+import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +25,7 @@ from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
+from tensorrt_llm.inputs import media_io  # noqa: E402
 from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData  # noqa: E402
 from tensorrt_llm.inputs.registry import (  # noqa: E402
@@ -278,12 +281,124 @@ def test_decoded_video_bytes_include_frames_and_audio():
 
 
 def test_decoded_media_budget_settles_peak_to_retained_bytes():
-    budget = request_mapping._DecodedMediaBudget(20)
+    budget = request_mapping._DecodedMediaBudget(20, peak_limit=20)
 
     first = budget.reserve(15, 5)
     first.commit(5)
+    assert (budget._used, budget._retained, budget._reserved_retained) == (5, 5, 0)
     second = budget.reserve(15, 5)
     second.release()
+    assert (budget._used, budget._retained, budget._reserved_retained) == (5, 5, 0)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "resampled",
+        "oversized",
+        "decode_failure",
+        "concat_failure",
+        "no_audio",
+        "cancelled",
+    ],
+)
+def test_embedded_audio_reserves_chunks_and_concatenation(outcome, monkeypatch):
+    budget = request_mapping._DecodedMediaBudget(27 if outcome == "oversized" else 35)
+    converted = []
+    concatenated = []
+    grabs = iter([True])
+    capture = SimpleNamespace(
+        isOpened=lambda: True,
+        get=lambda _key: 1,
+        grab=lambda: next(grabs, False),
+        retrieve=lambda _scratch: (True, np.zeros((1, 1, 3), dtype=np.uint8)),
+        release=lambda: None,
+    )
+    monkeypatch.setattr(
+        media_io,
+        "_get_cv2",
+        lambda: SimpleNamespace(
+            VideoCapture=lambda _source: capture,
+            CAP_PROP_FRAME_COUNT=0,
+            CAP_PROP_FPS=1,
+            COLOR_BGR2RGB=2,
+            cvtColor=lambda _source, _code, dst: dst.fill(0),
+        ),
+    )
+
+    def audio_frame(index):
+        def to_ndarray():
+            converted.append(index)
+            if outcome == "decode_failure" and index == 1:
+                raise RuntimeError("audio decode failed")
+            if outcome == "cancelled" and index == 0:
+                budget.cancel()
+            return np.full((1, 4), index, dtype=np.float32)
+
+        return SimpleNamespace(
+            samples=4,
+            layout=SimpleNamespace(channels=("mono",)),
+            to_ndarray=to_ndarray,
+        )
+
+    stream = SimpleNamespace(
+        rate=16000,
+        format=SimpleNamespace(name="s16" if outcome == "resampled" else "fltp"),
+        layout=SimpleNamespace(name="mono"),
+    )
+    container = SimpleNamespace(
+        streams=SimpleNamespace(audio=[] if outcome == "no_audio" else [stream]),
+        decode=lambda _stream: [audio_frame(0), audio_frame(1)],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "av",
+        SimpleNamespace(
+            open=lambda _source: nullcontext(container),
+            AudioResampler=lambda **_kwargs: SimpleNamespace(resample=lambda frame: [frame]),
+        ),
+    )
+    monkeypatch.setenv("TRTLLM_ENABLE_PYAV", "1")
+    concatenate = np.concatenate
+
+    def checked_concatenate(chunks, **kwargs):
+        concatenated.append(True)
+        assert (budget._used, budget._retained, budget._reserved_retained) == (67, 0, 35)
+        if outcome == "concat_failure":
+            raise MemoryError("audio concatenation failed")
+        return concatenate(chunks, **kwargs)
+
+    monkeypatch.setattr(media_io.np, "concatenate", checked_concatenate)
+
+    def load():
+        return media_io._load_video_by_cv2(
+            "video.mp4",
+            fps=-1,
+            format="np",
+            extract_audio=True,
+            decoded_memory_reserver=budget.reserve,
+        )
+
+    if outcome in ("success", "resampled", "no_audio"):
+        video = load()
+        retained = media_io._decoded_video_bytes(video)
+        assert retained == (3 if outcome == "no_audio" else 35)
+        assert (budget._used, budget._retained, budget._reserved_retained) == (
+            retained,
+            retained,
+            0,
+        )
+        if outcome != "no_audio":
+            np.testing.assert_array_equal(video.audio.samples, [0] * 4 + [1] * 4)
+            assert video.audio.sample_rate == 16000
+    else:
+        with pytest.raises(MemoryError if outcome == "concat_failure" else ValueError):
+            load()
+        assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+    if outcome in ("oversized", "cancelled"):
+        assert converted == [0]
+        assert not concatenated
 
 
 def test_video_retained_limit_does_not_reject_1080p_conversion_peak():

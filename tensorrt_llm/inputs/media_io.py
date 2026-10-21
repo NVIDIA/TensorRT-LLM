@@ -52,6 +52,8 @@ class MediaFetchError(RuntimeError):
 
 
 class _DecodedMemoryReservation(Protocol):
+    def shrink(self, retained_bytes: int) -> None: ...
+
     def commit(self, retained_bytes: int) -> None: ...
 
     def release(self) -> None: ...
@@ -463,12 +465,12 @@ def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
     return chunk
 
 
-# TODO(TRTLLM-12001): Add unit tests for this.
 def extract_audio_from_video(
     source: Union[str, BytesIO],
     *,
     sr: Optional[float] = None,
     mono: bool = True,
+    decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
 ) -> Tuple[np.ndarray, int]:
     """Extract the audio track from a video file using PyAV.
 
@@ -476,6 +478,8 @@ def extract_audio_from_video(
         source: File path, URL, or BytesIO containing the video.
         sr: Target sample rate. If `None`, the native sample rate is kept.
         mono: If `True` (default), average channels to produce a mono waveform.
+        decoded_memory_reserver: Shared budget for retained chunks and the final
+            concatenation buffer. Codec and resampler working memory is excluded.
 
     Returns:
         `(waveform, sample_rate)` where *waveform* is a 1-D float32
@@ -494,51 +498,85 @@ def extract_audio_from_video(
     except ImportError:
         raise ImportError("PyAV is required for audio extraction from video but is not installed.")
 
+    chunks: List[np.ndarray] = []
+    reservations: List[Tuple[_DecodedMemoryReservation, int]] = []
+    concatenation_reservation: Optional[_DecodedMemoryReservation] = None
+
+    def append_frame(frame) -> None:
+        if decoded_memory_reserver is not None:
+            channels = 1 if mono else len(frame.layout.channels)
+            retained_bytes = frame.samples * channels * np.dtype(np.float32).itemsize
+            reservation = decoded_memory_reserver(retained_bytes, retained_bytes)
+            reservations.append((reservation, retained_bytes))
+        chunk = _audio_frame_to_array(frame, mono)
+        if decoded_memory_reserver is not None and (
+            chunk.dtype != np.float32 or chunk.nbytes != retained_bytes
+        ):
+            raise ValueError("Decoded audio chunk does not match its float32 reservation")
+        chunks.append(chunk)
+
     try:
-        with av.open(source) as container:
-            if not container.streams.audio:
-                raise ValueError("No audio stream found in the video.")
-            stream = container.streams.audio[0]
-            stream.thread_type = "AUTO"
-            native_sr = stream.rate
-            target_sr = int(sr) if sr is not None else native_sr
+        try:
+            with av.open(source) as container:
+                if not container.streams.audio:
+                    raise ValueError("No audio stream found in the video.")
+                stream = container.streams.audio[0]
+                stream.thread_type = "AUTO"
+                native_sr = stream.rate
+                target_sr = int(sr) if sr is not None else native_sr
 
-            chunks: List[np.ndarray] = []
-            target_layout = "mono" if mono else stream.layout.name
-            needs_resampling = (
-                not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
-                or stream.format.name != "fltp"
-                or stream.layout.name != target_layout
-            )
-            resampler = (
-                av.AudioResampler(
-                    format="fltp",
-                    layout=target_layout,
-                    rate=target_sr,
+                target_layout = "mono" if mono else stream.layout.name
+                needs_resampling = (
+                    not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
+                    or stream.format.name != "fltp"
+                    or stream.layout.name != target_layout
                 )
-                if needs_resampling
-                else None
+                resampler = (
+                    av.AudioResampler(
+                        format="fltp",
+                        layout=target_layout,
+                        rate=target_sr,
+                    )
+                    if needs_resampling
+                    else None
+                )
+                for frame in container.decode(stream):
+                    if needs_resampling:
+                        for out_frame in resampler.resample(frame):
+                            append_frame(out_frame)
+                    else:
+                        append_frame(frame)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(
+                "Invalid or corrupted video data when extracting audio. "
+                "Ensure the input is a valid video file."
+            ) from e
+
+        if not chunks:
+            raise ValueError("No audio frames decoded from the video.")
+
+        if decoded_memory_reserver is not None:
+            concatenation_reservation = decoded_memory_reserver(
+                sum(chunk.nbytes for chunk in chunks), 0
             )
-            for frame in container.decode(stream):
-                if needs_resampling:
-                    for out_frame in resampler.resample(frame):
-                        chunks.append(_audio_frame_to_array(out_frame, mono))
-                else:
-                    chunks.append(_audio_frame_to_array(frame, mono))
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            "Invalid or corrupted video data when extracting audio. "
-            "Ensure the input is a valid video file."
-        ) from e
+        audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
+        chunks.clear()
+        if concatenation_reservation is not None:
+            concatenation_reservation.release()
+            concatenation_reservation = None
+        # The waveform replaces the chunks without changing retained-byte ownership.
+        for reservation, retained_bytes in reservations:
+            reservation.commit(retained_bytes)
 
-    if not chunks:
-        raise ValueError("No audio frames decoded from the video.")
-
-    audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
-
-    return audio, target_sr
+        return audio, target_sr
+    finally:
+        chunks.clear()
+        if concatenation_reservation is not None:
+            concatenation_reservation.release()
+        for reservation, _ in reservations:
+            reservation.release()
 
 
 def _get_cv2():
@@ -973,9 +1011,18 @@ def _load_video_by_cv2(
         # audio extraction on Windows) and to avoid leaking descriptors.
         vidcap.release()
 
+    video_data = VideoData(
+        frames=loaded_frames,
+        metadata=metadata,
+        raw_bytes_hash=raw_bytes_hash,
+    )
     try:
-        audio = None
+        frame_bytes = (
+            _decoded_video_bytes(video_data) if decoded_memory_reservation is not None else 0
+        )
         if extract_audio:
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.shrink(frame_bytes)
             # extract_audio_from_video accepts Union[str, BytesIO]. When the
             # in-memory cv2 path was taken, `video` is still the original
             # bytes parameter — wrap in a fresh BytesIO (the one consumed by
@@ -987,30 +1034,21 @@ def _load_video_by_cv2(
                 else video
             )
             try:
-                audio_samples, audio_sample_rate = extract_audio_from_video(audio_source)
-                audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
+                audio_samples, audio_sample_rate = extract_audio_from_video(
+                    audio_source, decoded_memory_reserver=decoded_memory_reserver
+                )
+                video_data.audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
             except ValueError as e:
                 if "No audio stream found" in str(e):
                     logger.warning("Video has no audio track, skipping audio extraction.")
                 else:
                     raise
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.commit(frame_bytes)
     except BaseException:
         if decoded_memory_reservation is not None:
             decoded_memory_reservation.release()
         raise
-
-    video_data = VideoData(
-        frames=loaded_frames,
-        metadata=metadata,
-        audio=audio,
-        raw_bytes_hash=raw_bytes_hash,
-    )
-    if decoded_memory_reservation is not None:
-        try:
-            decoded_memory_reservation.commit(_decoded_video_bytes(video_data))
-        except Exception:
-            decoded_memory_reservation.release()
-            raise
     return video_data
 
 
