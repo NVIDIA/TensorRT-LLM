@@ -132,6 +132,7 @@ class MxE2ECase:
     probe: str = "text"
 
     def __post_init__(self) -> None:
+        """Reject a probe that `mx_e2e_worker.py` does not implement."""
         if self.probe not in PROBES:
             raise ValueError(f"Unknown MX E2E probe {self.probe!r}; expected one of {PROBES}")
 
