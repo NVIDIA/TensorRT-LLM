@@ -5755,6 +5755,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
           out_eps):
         return torch.empty_like(prefix), torch.empty_like(prefix)
 
+    @torch.library.custom_op(
+        "trtllm::kimi_k3_attn_res_add_rmsnorm_in_place_addend",
+        mutates_args=(),
+        device_types="cuda")
+    def kimi_k3_attn_res_add_rmsnorm_in_place_addend(
+            prefix: torch.Tensor, uc_local: int, flags: torch.Tensor,
+            block: torch.Tensor, res_weight: torch.Tensor,
+            rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``kimi_k3_attn_res_add_rmsnorm`` whose addend is the result of the
+        pushed MNNVL all-reduce finished in place last on the workspace with
+        local buffer address ``uc_local`` and state ``flags``
+        (``MnnvlInPlaceResult``)."""
+        output = torch.empty_like(prefix)
+        updated = torch.empty_like(prefix)
+        kimi_k3_attn_res.run_attn_res(prefix, (),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      updated,
+                                      in_place_addend=(uc_local,
+                                                       flags.data_ptr()))
+        return updated, output
+
+    @torch.library.register_fake(
+        "trtllm::kimi_k3_attn_res_add_rmsnorm_in_place_addend")
+    def _(prefix, uc_local, flags, block, res_weight, rms_weight, out_weight,
+          rms_eps, out_eps):
+        return torch.empty_like(prefix), torch.empty_like(prefix)
+
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm",
                              mutates_args=(),
                              device_types="cuda")

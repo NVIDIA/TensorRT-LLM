@@ -238,6 +238,40 @@ def test_mxfp8_side_output_other_hidden_sizes(hidden: int):
     assert torch.equal(xs[r128c4_offsets(m, hidden)], ref_s)
 
 
+@pytest.mark.parametrize("n", [2, 9])
+@pytest.mark.parametrize("m", [1, 7, 14, 64])
+def test_in_place_all_reduce_addend(m: int, n: int):
+    """The addend read in place from a pushed all-reduce's workspace (a one-rank stand-in: the
+    result rows in the broadcast stage of the state's dirty buffer) gives the results of the
+    tensor addend, also when the rows land while the kernel polls."""
+    _kernel()
+    t = _inputs(m, n, 1.0, seed=3 * m + n)
+    w = _weights(t)
+    stage_bytes = m * HIDDEN * 2
+    nbytes = 2 * stage_bytes  # two-shot: scatter and broadcast stage
+    dirty = 1
+    # Every 32-bit word starts as the empty-slot sentinel 0x80000000.
+    workspace = torch.full((3 * nbytes // 4,), -(2**31), dtype=torch.int32, device="cuda")
+    flags = torch.tensor(
+        [(dirty + 1) % 3, dirty, nbytes, 2, 0, 0, 0, 0, 0], dtype=torch.uint32, device="cuda"
+    )
+    start = ((dirty * 2 + 1) * stage_bytes) // 2
+    rows = workspace.view(torch.bfloat16)[start : start + m * HIDDEN].view(m, HIDDEN)
+    ref_updated, ref_out = torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm(
+        t["layer"], t["addend"], t["block"], *w
+    )
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000)
+        rows.copy_(t["addend"])
+    updated, out = torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_in_place_addend(
+        t["layer"], workspace.data_ptr(), flags, t["block"], *w
+    )
+    torch.cuda.synchronize()
+    assert _mismatches(updated, ref_updated) == 0 and _mismatches(out, ref_out) == 0
+
+
 def test_can_run():
     k = _kernel()
     t = _inputs(k.MAX_TOKENS, 4, 1.0)

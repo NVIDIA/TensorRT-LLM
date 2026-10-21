@@ -81,6 +81,9 @@ class _FakeMcastBuffer:
     def get_uc_buffer(self, *args: object, **kwargs: object) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.float32)
 
+    def get_mc_buffer(self, *args: object, **kwargs: object) -> torch.Tensor:
+        return torch.zeros(1, dtype=torch.float32)
+
     def is_mapped(self) -> bool:
         return self.mapped
 

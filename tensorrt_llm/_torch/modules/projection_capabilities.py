@@ -19,8 +19,32 @@ attention modules test for the class rather than for a concrete projection
 type, so they need not know which module implements it.
 """
 
+from typing import Optional
+
 import torch
 from torch import nn
+
+
+class OutputAllReduceProjection(nn.Module):
+    """A row-parallel projection that may be built with the all-reduce of its partial sums
+    (``output_all_reduce``).
+
+    One built with it returns the reduced output from every forward (or, where it was built
+    to, the result left in the all-reduce's workspace, ``MnnvlInPlaceResult``), so the module
+    that made that all-reduce does not run it again (:func:`reduces_output`).
+    """
+
+    @property
+    def output_all_reduce(self) -> Optional[nn.Module]:
+        raise NotImplementedError
+
+
+def reduces_output(projection: nn.Module) -> bool:
+    """Whether ``projection`` returns the all-reduce of its partial sums."""
+    return (
+        isinstance(projection, OutputAllReduceProjection)
+        and projection.output_all_reduce is not None
+    )
 
 
 class GatedEpilogueProjection(nn.Module):

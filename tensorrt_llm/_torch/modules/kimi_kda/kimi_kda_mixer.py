@@ -31,7 +31,7 @@ from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
 from ...cute_dsl_utils import sm_reserve
-from ...distributed import AllReduce, AllReduceStrategy
+from ...distributed import AllReduce, AllReduceStrategy, MnnvlInPlaceResult
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
@@ -41,6 +41,7 @@ from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ..multi_stream_utils import maybe_execute_in_parallel
+from ..projection_capabilities import reduces_output
 from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 
 if TYPE_CHECKING:
@@ -499,7 +500,7 @@ class KimiKDALinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
         """Select the eager path or breakable-CUDA-graph path.
 
         ``prequantized_input``: the MXFP8 form ``(activation, scale)`` of ``hidden_states``
@@ -617,13 +618,23 @@ class KimiKDALinearAttention(nn.Module):
             return output
         return cores[0] if len(cores) == 1 else torch.cat(cores, dim=0)
 
-    def _project_output(self, core: Union[torch.Tensor, _KdaPrequantizedCore]) -> torch.Tensor:
-        """Project the post-o_norm KDA core and reduce TP partials."""
+    @property
+    def output_all_reduce(self) -> Optional[AllReduce]:
+        """The all-reduce of the o_proj partial sums (None without head-sharded TP); an
+        ``o_proj`` built with it (``reduces_output``) runs it itself."""
+        return self._o_allreduce
+
+    def _project_output(
+        self, core: Union[torch.Tensor, _KdaPrequantizedCore]
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        """Project the post-o_norm KDA core and reduce TP partials (in ``o_proj`` where it was
+        built with :attr:`output_all_reduce`; its result may then stay in the all-reduce's
+        workspace, ``MnnvlInPlaceResult``)."""
         if isinstance(core, _KdaPrequantizedCore):
             out = self.o_proj.forward_prequantized(core.activation, core.scale)
         else:
             out = self.o_proj(core.reshape(-1, self.proj_size))
-        if self._o_allreduce is not None:
+        if self._o_allreduce is not None and not reduces_output(self.o_proj):
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
             out = self._o_allreduce(out)

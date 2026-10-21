@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import math
 import os
 import platform
@@ -57,6 +58,22 @@ if _MNNVL_ONE_SHOT_THRESHOLD_BYTES < 0:
         "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got "
         f"{_MNNVL_ONE_SHOT_THRESHOLD_BYTES}")
 
+
+def mnnvl_allreduce_transport(num_tokens: int, hidden_dim: int, group_size: int,
+                              dtype: torch.dtype) -> Tuple[bool, int]:
+    """The kernel the MNNVL all-reduce of ``[num_tokens, hidden_dim]`` over ``group_size`` ranks
+    runs, as ``mnnvlFusionAllReduce`` in ``thop/allreduceOp.cpp`` picks it: whether it is the
+    one-shot kernel (all ranks' input at most ``_MNNVL_ONE_SHOT_THRESHOLD_BYTES``), and the bytes
+    of one Lamport buffer it uses (one-shot: every rank's rows; two-shot: two stages of a
+    ``group_size``-aligned share of the rows)."""
+    elem_size = dtype.itemsize
+    all_ranks_bytes = num_tokens * hidden_dim * group_size * elem_size
+    if all_ranks_bytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES:
+        return True, all_ranks_bytes
+    return False, 2 * math.ceil(
+        num_tokens / group_size) * group_size * hidden_dim * elem_size
+
+
 _thread_local = threading.local()
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
@@ -101,6 +118,49 @@ class _MpiCommProtocol(Protocol):
         ...
 
 
+@dataclasses.dataclass(frozen=True)
+class LamportWorkspaceView:
+    """Device addresses of one MNNVL all-reduce workspace for pushed calls
+    (``kernels/blackwell/mnnvl_pushed_allreduce.py``).
+
+    ``uc_local``: this rank's unicast mapping of the workspace; ``mc_base``: its multicast
+    mapping; ``peer_ptrs``: int64 CUDA tensor with every rank's unicast mapping (this rank's own
+    at index ``rank``); ``flags``: the uint32 rotation state shared with the C++ kernels;
+    ``bytes_per_buffer``: size of one of the three Lamport buffers.
+    """
+
+    world: int
+    rank: int
+    uc_local: int
+    mc_base: int
+    peer_ptrs: torch.Tensor
+    flags: torch.Tensor
+    bytes_per_buffer: int
+
+
+def _lamport_workspace_view(handle: McastGPUBuffer, uc_buffer: torch.Tensor,
+                            buffer_flags: torch.Tensor, buffer_size_bytes: int,
+                            mapping: Mapping) -> LamportWorkspaceView:
+    """The view of a workspace's mappings; its peer pointer table is a host-to-device copy, so it
+    is built where the workspace is created (eagerly, never during CUDA graph capture). A
+    checkpoint restore maps the workspace at the same addresses, so the view stays valid."""
+    peers = [
+        handle.get_uc_buffer(r, (1, ), torch.uint8, 0).data_ptr()
+        for r in range(mapping.tp_size)
+    ]
+    return LamportWorkspaceView(
+        world=mapping.tp_size,
+        rank=mapping.tp_rank,
+        uc_local=uc_buffer.data_ptr(),
+        mc_base=handle.get_mc_buffer((1, ), torch.uint8, 0).data_ptr(),
+        peer_ptrs=torch.tensor(peers,
+                               dtype=torch.int64,
+                               device=uc_buffer.device),
+        flags=buffer_flags,
+        bytes_per_buffer=buffer_size_bytes,
+    )
+
+
 class _MnnvlWorkspace(TypedDict):
     handle: McastGPUBuffer
     uc_buffer: torch.Tensor
@@ -112,6 +172,8 @@ class _MnnvlWorkspace(TypedDict):
     # Set once the workspace is handed out during CUDA graph capture: the captured graphs launch on its buffers and
     # flags, so a larger workspace that replaces it must keep it alive.
     captured: bool
+    # Device addresses of the workspace for pushed all-reduces (MNNVLAllReduce.push_target).
+    push_view: LamportWorkspaceView
 
 
 _named_allreduce_topology_warmups = set()
@@ -438,6 +500,9 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 dtype=torch.uint32,
                 device=torch.device("cuda", _mnnvl_device_index(mapping)),
             )
+            push_view = _lamport_workspace_view(mcast_buf_handle, buffer,
+                                                buffer_flags, buffer_size_bytes,
+                                                mapping)
             candidate_workspace = {
                 "handle": mcast_buf_handle,
                 "uc_buffer": buffer,
@@ -445,6 +510,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 "buffer_size_bytes": buffer_size_bytes,
                 "comm": comm,
                 "captured": False,
+                "push_view": push_view,
             }
         except Exception as error:
             candidate_error = error
@@ -842,6 +908,50 @@ def reducescatter(
     return output
 
 
+@dataclasses.dataclass
+class MnnvlPushTarget:
+    """One MNNVL all-reduce whose input the producer kernel pushes (``AllReduce.push_target``).
+
+    The producer stores its BF16 ``[num_tokens, hidden_dim]`` output into the Lamport slots of
+    ``view`` with the ``one_shot`` (else two-shot) transport; ``AllReduce.finish_push`` then
+    completes the all-reduce, bitwise like the C++ MNNVL kernel. With ``in_place`` the result
+    stays in the workspace (``MnnvlInPlaceResult``), else it goes to ``output``.
+    """
+
+    view: LamportWorkspaceView
+    num_tokens: int
+    hidden_dim: int
+    one_shot: bool
+    in_place: bool
+    output: Optional[torch.Tensor]
+
+
+@dataclasses.dataclass
+class MnnvlInPlaceResult:
+    """The result of a pushed two-shot MNNVL all-reduce left in its workspace
+    (``AllReduce.finish_push`` of an ``in_place`` target).
+
+    The kernel that runs next reads the rows with
+    ``mnnvl_pushed_allreduce.poll_result_v4(view.uc_local, view.flags, ...)`` after its own
+    ``griddepcontrol.wait``, or ``materialize`` copies them into a tensor. The rows live until
+    the next all-reduce on the workspace re-arms their buffer: the next pushed call's finish
+    kernel does that as soon as it is resident, which its producer allows only after its own
+    ``griddepcontrol.wait``; the C++ kernels do it after their wait. So the consumer must lie on
+    every dependency path from this call to the next one on the workspace.
+    """
+
+    view: LamportWorkspaceView
+    shape: Tuple[int, int]
+
+    def materialize(self) -> torch.Tensor:
+        """The result as a BF16 tensor (a copy kernel on the current stream)."""
+        from ..kernels.blackwell import mnnvl_pushed_allreduce
+        output = torch.empty(self.shape,
+                             dtype=torch.bfloat16,
+                             device=self.view.flags.device)
+        return mnnvl_pushed_allreduce.run_gather(self.view, output)
+
+
 class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
@@ -1012,19 +1122,8 @@ class MNNVLAllReduce(nn.Module):
     @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
-        elem_size = torch.tensor([], dtype=dtype).element_size()
-        # This should match the heuristic in allreduceOp.cpp.
-        is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
-                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
-        if is_one_shot:
-            # For one-shot, each rank needs to store num_tokens * group_size tokens
-            workspace_size = num_tokens * hidden_dim * group_size * elem_size
-        else:
-            # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
-            # 2 Stage is required for the two-shot allreduce.
-            workspace_size = 2 * math.ceil(
-                num_tokens / group_size) * group_size * hidden_dim * elem_size
-        return workspace_size
+        return mnnvl_allreduce_transport(num_tokens, hidden_dim, group_size,
+                                         dtype)[1]
 
     def checkpoint_prepare(self) -> None:
         """Collectively detach handles after external global quiescence.
@@ -1283,6 +1382,40 @@ class MNNVLAllReduce(nn.Module):
                     tactic,
                     scale=params.scale if quant else None,
                     norm_out=norm_out)
+    def push_target(self, num_tokens: int, hidden_dim: int,
+                    in_place: bool) -> Optional[MnnvlPushTarget]:
+        """See ``AllReduce.push_target``."""
+        from ..kernels.blackwell import mnnvl_pushed_allreduce
+        world = self.mapping.tp_size
+        if world not in mnnvl_pushed_allreduce.WORLD_SIZES:
+            return None
+        one_shot, need = mnnvl_allreduce_transport(num_tokens, hidden_dim,
+                                                   world, self.dtype)
+        if need >= 2**32 - 1:
+            return None
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=need)
+        # Only the two-shot transport leaves its result in the workspace.
+        in_place = in_place and not one_shot
+        output = None if in_place else torch.empty(
+            (num_tokens, hidden_dim),
+            dtype=self.dtype,
+            device=workspace["uc_buffer"].device)
+        return MnnvlPushTarget(workspace["push_view"], num_tokens, hidden_dim,
+                               one_shot, in_place, output)
+
+    @staticmethod
+    def finish_push(
+            target: MnnvlPushTarget) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        from ..kernels.blackwell import mnnvl_pushed_allreduce
+        if target.in_place:
+            mnnvl_pushed_allreduce.run_finish_in_place(target.view,
+                                                       target.num_tokens,
+                                                       target.hidden_dim)
+            return MnnvlInPlaceResult(target.view,
+                                      (target.num_tokens, target.hidden_dim))
+        return mnnvl_pushed_allreduce.run_finish(target.view, target.output,
+                                                 target.one_shot)
 
 
 class AllReduce(nn.Module):
@@ -1462,6 +1595,46 @@ class AllReduce(nn.Module):
                                                         input_scale,
                                                         all_reduce_params,
                                                         gemm_tactic)
+    def push_target(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        in_place: bool = False,
+        all_reduce_params: Optional[AllReduceParams] = None
+    ) -> Optional[MnnvlPushTarget]:
+        """The MNNVL all-reduce of a BF16 ``[num_tokens, hidden_dim]`` input as a target a
+        producer kernel pushes its output into (the FP8 block-scale low-M GEMM's push epilogue),
+        where ``forward(input, all_reduce_params)`` runs that all-reduce for the plain sum (no
+        fusion op); else None.
+
+        A producer that stored its output into the target replaces this all-reduce's input;
+        ``finish_push`` then returns what ``forward`` returns, bit for bit. Targets must be
+        finished in the order they were made, by every rank. The call takes the C++ kernel's
+        transport; ``in_place`` asks for the result in the workspace (``MnnvlInPlaceResult``),
+        which the two-shot transport (above the one-shot size threshold) leaves there.
+        """
+        if all_reduce_params is not None and (
+                not all_reduce_params.enable_allreduce
+                or all_reduce_params.fusion_op != AllReduceFusionOp.NONE):
+            return None
+        if (self.mapping.tp_size == 1 or self.mnnvl_allreduce is None
+                or self.symm_mem_allreduce is not None
+                or self.mnnvl_allreduce.dtype != torch.bfloat16
+                or hidden_dim % 8 or torch.compiler.is_compiling()):
+            return None
+        return self.mnnvl_allreduce.push_target(num_tokens, hidden_dim,
+                                                in_place)
+
+    def finish_push(
+            self,
+            target: MnnvlPushTarget) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        """Complete a target the producer pushed into: the reduced tensor, or for an
+        ``in_place`` target the result left in the workspace.
+
+        Must be the next launch on the stream after the producer kernel, which releases its
+        dependents (PDL) only after its own ``griddepcontrol.wait``: the finish kernel reads the
+        workspace's rotation state before it waits for the producer."""
+        return self.mnnvl_allreduce.finish_push(target)
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.

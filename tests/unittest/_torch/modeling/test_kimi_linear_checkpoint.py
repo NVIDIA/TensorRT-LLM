@@ -269,6 +269,8 @@ def _model(
     )
     layer = nn.Module()
     layer.is_kda, layer.is_moe = kda, False
+    # The attention keeps its (local) output all-reduce: o_proj is built without one.
+    layer.attention_output_reduction = lambda: (None, 0)
     # These tests inspect rank-local loading and GEMMs on one GPU. No
     # collective is executed, so avoid allocating multi-GPU IPC workspaces.
     with (

@@ -102,6 +102,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    Union,
 )
 
 import torch
@@ -120,6 +121,7 @@ from ..distributed import (
     AllReduceFusionOp,
     AllReduceParams,
     AllReduceStrategy,
+    MnnvlInPlaceResult,
     allgather,
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
@@ -136,7 +138,12 @@ from ..modules.linear import (
 )
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
-from ..modules.projection_capabilities import GatedEpilogueProjection, PrequantizedInputProjection
+from ..modules.projection_capabilities import (
+    GatedEpilogueProjection,
+    OutputAllReduceProjection,
+    PrequantizedInputProjection,
+    reduces_output,
+)
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
@@ -491,14 +498,29 @@ def _decode_attn_res_on_device(device_index: int) -> bool:
     return kimi_k3_attn_res.is_supported_device(device_index)
 
 
+def _attn_res_decode_max_tokens(hidden: int, num_candidates: int, device_index: int) -> int:
+    """Largest token count of a BF16 ``[M, hidden]`` mix over ``num_candidates`` on the device
+    that the decode kernel serves (``kimi_k3_attn_res.supports``: from 1 up to 64 tokens);
+    0 where it serves none. ``_attn_res_kernel`` picks the decode kernel exactly there."""
+    if not _FUSED_ATTN_RES_ENABLED or not _decode_attn_res_on_device(device_index):
+        return 0
+    from ..kernels.blackwell import kimi_k3_attn_res
+
+    max_tokens = kimi_k3_attn_res.MAX_TOKENS
+    return max_tokens if kimi_k3_attn_res.supports(max_tokens, hidden, num_candidates) else 0
+
+
 def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResKernel:
     """The kernel of the attention-residual mix + RMSNorm of ``prefix_sum [M, H]`` over
     ``num_candidates`` (the snapshots and the prefix sum).
 
-    The decode kernel where it serves the shape (``kimi_k3_attn_res.supports``: up to 64
-    tokens), else the persistent kernel where ``KIMI_K3_ATTN_RES_TOPOLOGY=1`` and it serves the
-    shape, else unfused. This is the only place that decides it: the fused mixes and the MoE
-    layers' residual deferral (``_defers_moe_residual``) both ask here.
+    The decode kernel where it serves the shape (``_attn_res_decode_max_tokens``), else the
+    persistent kernel where ``KIMI_K3_ATTN_RES_TOPOLOGY=1`` and it serves the shape, else
+    unfused. The fused mixes and the MoE layers' residual deferral (``_defers_moe_residual``)
+    ask here. The attention o_proj's in-place all-reduce result is sized at load time from the
+    same ``_attn_res_decode_max_tokens`` (``KimiLinearDecoderLayer.attention_output_reduction``);
+    a mix that does not pick the decode kernel for it gathers it
+    (``MnnvlInPlaceResult.materialize``).
     """
     if (
         not _FUSED_ATTN_RES_ENABLED
@@ -507,11 +529,9 @@ def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResK
     ):
         return _AttnResKernel.UNFUSED
     num_tokens, hidden = prefix_sum.shape
-    if _decode_attn_res_on_device(prefix_sum.device.index):
-        from ..kernels.blackwell import kimi_k3_attn_res
-
-        if kimi_k3_attn_res.supports(num_tokens, hidden, num_candidates):
-            return _AttnResKernel.DECODE
+    decode_max_tokens = _attn_res_decode_max_tokens(hidden, num_candidates, prefix_sum.device.index)
+    if 1 <= num_tokens <= decode_max_tokens:
+        return _AttnResKernel.DECODE
     if _PERSISTENT_ATTN_RES_ENABLED and hidden == 7168 and 2 <= num_candidates <= 9:
         return _AttnResKernel.PERSISTENT
     return _AttnResKernel.UNFUSED
@@ -596,7 +616,7 @@ def _defers_moe_residual(prefix_sum: torch.Tensor, num_candidates: int) -> bool:
 
 def _attn_res_decode_kernel(
     layer: torch.Tensor,
-    addends: Tuple[torch.Tensor, ...],
+    addends: Tuple[Union[torch.Tensor, MnnvlInPlaceResult], ...],
     block_residual: torch.Tensor,
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
@@ -607,7 +627,8 @@ def _attn_res_decode_kernel(
     (``kimi_k3_attn_res``: PDL prologue, cluster per token) where ``_attn_res_kernel`` picks it,
     else None.
 
-    ``addends``: ``()``; ``(addend,)`` for ``layer + addend``; ``(routed, shared)`` for the MoE
+    ``addends``: ``()``; ``(addend,)`` for ``layer + addend``, where ``addend`` may be an
+    all-reduce result left in its workspace (read in place); ``(routed, shared)`` for the MoE
     residual update ``layer + bf16(routed + shared)``. With ``mxfp8`` (MoE residual update only)
     the result also holds the MXFP8 form ``(activation, scale)`` of the normed mix.
     """
@@ -615,12 +636,21 @@ def _attn_res_decode_kernel(
     if _attn_res_kernel(layer, num_candidates) is not _AttnResKernel.DECODE:
         return None
     M, H = layer.shape
+    in_place = len(addends) == 1 and isinstance(addends[0], MnnvlInPlaceResult)
+    if in_place and addends[0].shape != (M, H):
+        return None
     # The kernel reads dense rows; these are no-ops for the decoder's tensors.
     layer, block_residual = layer.contiguous(), block_residual.contiguous()
-    addends = tuple(addend.contiguous() for addend in addends)
+    if not in_place:
+        addends = tuple(addend.contiguous() for addend in addends)
     weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
     _note_attn_res_fusion(f"attn_res+norm/decode/add{len(addends)}", True, M, H, num_candidates)
     eps, out_eps = float(norm.eps), _rms_norm_eps(output_norm)
+    if in_place:
+        view = addends[0].view
+        return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_in_place_addend(
+            layer, view.uc_local, view.flags, block_residual, *weights, eps, out_eps
+        )
     if not addends:
         output = torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(
             layer, block_residual, *weights, eps, out_eps
@@ -776,13 +806,25 @@ def _apply_attn_res_and_rmsnorm(
 
 def _apply_attn_res_add_and_rmsnorm(
     prefix_sum: torch.Tensor,
-    addend: torch.Tensor,
+    addend: Union[torch.Tensor, MnnvlInPlaceResult],
     block_residual: torch.Tensor,
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Add an attention output to the running residual, then select and norm."""
+    """Add an attention output to the running residual, then select and norm.
+
+    ``addend`` may be the attention output's all-reduce result left in its workspace: the decode
+    attention-residual kernel reads it in place where it serves the mix, else it is gathered.
+    """
+    if isinstance(addend, MnnvlInPlaceResult):
+        if _FUSED_ATTN_RES_ENABLED:
+            decode = _attn_res_decode_kernel(
+                prefix_sum, (addend,), block_residual, proj, norm, output_norm
+            )
+            if decode is not None:
+                return decode
+        addend = addend.materialize()
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
             prefix_sum, addend, block_residual, proj, norm, output_norm
@@ -914,6 +956,12 @@ def _low_m_gemm_gated_applies(x: torch.Tensor, gate: torch.Tensor, out_features:
     return fp8_block_scale_low_m_gemm.gate_fits(x, gate, out_features)
 
 
+def _low_m_gemm_push_applies(num_rows: int, out_features: int, in_features: int) -> bool:
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.all_reduce_push_applies(num_rows, out_features, in_features)
+
+
 def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """The DeepGEMM-packed scale the low-M GEMM reads, from the SM107 CuTe MXFP8 scale."""
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm
@@ -921,7 +969,9 @@ def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> 
     return fp8_block_scale_low_m_gemm.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
 
 
-class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputProjection):
+class _Fp8BlockScaleWeightReadLinear(
+    GatedEpilogueProjection, PrequantizedInputProjection, OutputAllReduceProjection
+):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
     Attention loads checkpoint E4M3 codes and 128x128 scales directly. The optional
@@ -934,10 +984,24 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
     generic FP8 block-scale linear (``Fp8BlockScaleLowMGemmRange``); it reads a
     DeepGEMM-packed scale, which is ``weight_scale`` on SM100/SM103 and a copy
     repacked from the MXFP8 scale on SM107.
+
+    A row-parallel projection built with ``output_all_reduce`` returns the
+    all-reduce of its partial sums from every forward. Where the low-M kernel
+    serves a forward and the all-reduce runs the MNNVL kernel, the GEMM pushes
+    its output straight into the all-reduce's Lamport buffers and a finish
+    kernel completes it, bitwise like the GEMM followed by the all-reduce. Up
+    to ``in_place_max_rows`` rows (the consumer reads those in place), such a
+    forward returns the result the two-shot transport leaves in the workspace
+    (``MnnvlInPlaceResult``).
     """
 
     def __init__(
-        self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, out_features: int
+        self,
+        weight_fp8: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_features: int,
+        output_all_reduce: Optional[AllReduce] = None,
+        in_place_max_rows: int = 0,
     ) -> None:
         super().__init__()
         self.in_features = weight_fp8.shape[1]
@@ -955,6 +1019,8 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
         self._low_m_weight_scale: Optional[torch.Tensor] = None
         # Largest row count :meth:`forward_nvfp4` serves (0: never); set at post-load.
         self._nvfp4_out_max_m = 0
+        self._output_all_reduce = output_all_reduce
+        self._in_place_max_rows = in_place_max_rows
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -965,6 +1031,10 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
     def has_w4a8_nvfp4_fp8(self) -> bool:
         """Match the ``Linear`` interface consumed by ``GatedMLP``."""
         return False
+
+    @property
+    def output_all_reduce(self) -> Optional[AllReduce]:
+        return self._output_all_reduce
 
     @property
     def supports_prequantized_input(self) -> bool:
@@ -1028,16 +1098,25 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
         return weight_fp8, weight_scale
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear | TrtllmLinear) -> "_Fp8BlockScaleWeightReadLinear":
+    def from_linear(
+        cls,
+        linear: nn.Linear | TrtllmLinear,
+        output_all_reduce: Optional[AllReduce] = None,
+        in_place_max_rows: int = 0,
+    ) -> "_Fp8BlockScaleWeightReadLinear":
+        """The FP8 weight-read form of ``linear``; see the class for ``output_all_reduce`` and
+        ``in_place_max_rows``."""
         assert linear.bias is None, "FP8 weight read expects a bias-free Linear"
+        reduction = (output_all_reduce, in_place_max_rows)
         if isinstance(linear, TrtllmLinear) and linear.has_fp8_block_scales:
-            result = cls(linear.weight.detach(), linear.weight_scale.detach(), linear.out_features)
+            weight, weight_scale = linear.weight.detach(), linear.weight_scale.detach()
+            result = cls(weight, weight_scale, linear.out_features, *reduction)
             result.quant_config = linear.quant_config
             result.tp_size, result.tp_rank = linear.tp_size, linear.tp_rank
             result._weights_transformed = False
             return result
         weight_fp8, weight_scale = cls.quantize_weight(linear.weight.data)
-        return cls(weight_fp8, weight_scale, linear.out_features)
+        return cls(weight_fp8, weight_scale, linear.out_features, *reduction)
 
     def transform_weights(self) -> None:
         if not self._weights_transformed:
@@ -1089,6 +1168,39 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
             self._output_slice_cache = Fp8BlockScaleWeightSliceCache()
         self._output_slice_cache.prepare(self.weight, self.weight_scale, start, end)
 
+    def _push_target(self, x_flat: torch.Tensor, all_reduce_params: Optional[AllReduceParams]):
+        """The all-reduce of this forward's output as a target the low-M GEMM pushes into, or
+        None where the GEMM stores its output and the all-reduce runs after it."""
+        if self._output_all_reduce is None:
+            return None
+        num_rows = x_flat.shape[0]
+        if not self._low_m.serves(x_flat, kernel=True) or not _low_m_gemm_push_applies(
+            num_rows, self.out_features, self.in_features
+        ):
+            return None
+        return self._output_all_reduce.push_target(
+            num_rows,
+            self.out_features,
+            in_place=num_rows <= self._in_place_max_rows,
+            all_reduce_params=all_reduce_params,
+        )
+
+    def _push(self, x_flat: torch.Tensor, target, gate: Optional[torch.Tensor] = None):
+        """The low-M GEMM pushing into ``target``, then the all-reduce's finish."""
+        from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+        fp8_block_scale_low_m_gemm.run_low_m_gemm_all_reduce_push(
+            x_flat, self.weight, self._low_m_weight_scale, target.view, target.one_shot, gate=gate
+        )
+        return self._output_all_reduce.finish_push(target)
+
+    def _reduce(
+        self, out: torch.Tensor, all_reduce_params: Optional[AllReduceParams]
+    ) -> torch.Tensor:
+        if self._output_all_reduce is None:
+            return out
+        return self._output_all_reduce(out, all_reduce_params=all_reduce_params)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1096,8 +1208,16 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
-    ) -> torch.Tensor:
-        return self._apply_with_weights(x, self.weight, self.weight_scale)
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        x_flat = x.reshape(-1, x.shape[-1])
+        push_target = self._push_target(x_flat, all_reduce_params)
+        if push_target is not None:
+            out = self._push(x_flat, push_target)
+            if isinstance(out, MnnvlInPlaceResult):
+                return out
+            return out.reshape(*x.shape[:-1], self.out_features)
+        out = self._apply_with_weights(x, self.weight, self.weight_scale)
+        return self._reduce(out.reshape(x_flat.shape[0], -1), all_reduce_params).reshape(out.shape)
 
     def _apply_with_weights(
         self, x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
@@ -1126,8 +1246,9 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
         return out.reshape(out_shape)
 
     def emits_nvfp4(self, num_rows: int) -> bool:
-        """Whether :meth:`forward_nvfp4` serves ``num_rows`` rows."""
-        return 1 <= num_rows <= self._nvfp4_out_max_m
+        """Whether :meth:`forward_nvfp4` serves ``num_rows`` rows; never for a projection that
+        reduces its output."""
+        return self._output_all_reduce is None and 1 <= num_rows <= self._nvfp4_out_max_m
 
     def forward_nvfp4(
         self, x: torch.Tensor, global_scale: torch.Tensor
@@ -1136,11 +1257,15 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
         projection, from one low-M GEMM whose epilogue quantizes (bitwise the GEMM at the same
         tactic followed by ``fp4_quantize``). Returns E2M1 codes ``uint8 [M, out / 2]`` and E4M3
         scales ``uint8 [M * out / 16]``. For ``num_rows`` where :meth:`emits_nvfp4`."""
+        if self._output_all_reduce is not None:
+            raise RuntimeError("forward_nvfp4 of a projection that reduces its output")
         return torch.ops.trtllm.fp8_block_scale_low_m_gemm_nvfp4(
             x.reshape(-1, x.shape[-1]), self.weight, self._low_m_weight_scale, global_scale
         )
 
-    def forward_gated(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward_gated(
+        self, x: torch.Tensor, gate: torch.Tensor
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
         """``forward(x * gate)``, bit for bit, for an output-gated projection.
 
         Where :meth:`forward` would run the low-M kernel, one gated launch multiplies inside
@@ -1151,15 +1276,22 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
         if self._low_m.serves(x_flat, kernel=True) and _low_m_gemm_gated_applies(
             x_flat, gate_flat, self.out_features
         ):
+            out_shape = (*x.shape[:-1], self.out_features)
+            push_target = self._push_target(x_flat, None)
+            if push_target is not None:
+                out = self._push(x_flat, push_target, gate=gate_flat)
+                return out if isinstance(out, MnnvlInPlaceResult) else out.reshape(out_shape)
             out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
                 x_flat, self.weight, self._low_m_weight_scale, gate=gate_flat
             )
-            return out.reshape(*x.shape[:-1], self.out_features)
+            return self._reduce(out, None).reshape(out_shape)
         return self.forward(x * gate)
 
     def forward_sigmoid(self, x: torch.Tensor) -> torch.Tensor:
         """``forward(x).sigmoid()``, bit for bit; one launch where :meth:`forward` would run
-        the low-M kernel."""
+        the low-M kernel. Not for a projection that reduces its output."""
+        if self._output_all_reduce is not None:
+            raise RuntimeError("forward_sigmoid of a projection that reduces its output")
         x_flat = x.reshape(-1, x.shape[-1])
         if self._low_m.serves(x_flat, kernel=True):
             out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
@@ -1205,17 +1337,21 @@ class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputP
                 output_dtype=torch.bfloat16,
                 fine_grained_m=True,
             )
-        return out.reshape(activation.shape[:-1] + (self.out_features,))
+        return self._reduce(out, None).reshape(activation.shape[:-1] + (self.out_features,))
 
 
 def _swap_linear_to_fp8_weight_read(
     parent: nn.Module,
     attr: str,
     linear_types: Tuple[type, ...] = (nn.Linear,),
+    output_all_reduce: Optional[AllReduce] = None,
+    in_place_max_rows: int = 0,
 ) -> int:
     """Replace ``parent.<attr>`` with an FP8 weight-read module if it is a
     plain linear of one of ``linear_types``; return the number of modules
     converted (0 or 1), so callers can accumulate a conversion count.
+    ``output_all_reduce`` and ``in_place_max_rows``: see
+    ``_Fp8BlockScaleWeightReadLinear``.
 
     Transfer checkpoint FP8 storage or release the original BF16 storage
     after conversion. The loader's transient parameter map must not retain
@@ -1224,7 +1360,11 @@ def _swap_linear_to_fp8_weight_read(
     child = getattr(parent, attr, None)
     if not isinstance(child, linear_types):
         return 0
-    setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
+    setattr(
+        parent,
+        attr,
+        _Fp8BlockScaleWeightReadLinear.from_linear(child, output_all_reduce, in_place_max_rows),
+    )
     child.weight.data = child.weight.data.new_empty(0)
     return 1
 
@@ -2406,15 +2546,23 @@ class KimiMLARuntime(nn.Module):
         (``prequantized_input``, see ``KimiK3MLAAttention.takes_prequantized_input``)."""
         return self.mixer.takes_prequantized_input(num_rows, attn_metadata)
 
+    @property
+    def output_all_reduce(self) -> Optional[AllReduce]:
+        """The all-reduce of the o_proj partial sums (None without head-sharded TP); an
+        ``o_proj`` built with it (``reduces_output``) runs it itself."""
+        return self._o_allreduce
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        """The attention output, reduced over the head shards; an ``MnnvlInPlaceResult`` where
+        ``o_proj`` leaves its all-reduce result in place."""
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
         out = self.mixer(None, hidden_states, attn_metadata, prequantized_input=prequantized_input)
-        if self._o_allreduce is not None:
+        if self._o_allreduce is not None and not reduces_output(self.mixer.o_proj):
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
             out = self._o_allreduce(out)
@@ -2705,6 +2853,24 @@ class KimiLinearDecoderLayer(nn.Module):
 
         prefix_sum = prefix_sum + self.mlp(hidden_states)
         return prefix_sum, num_snapshots
+
+    def attention_output_reduction(self) -> Tuple[Optional[AllReduce], int]:
+        """What an FP8 weight-read attention ``o_proj`` is built with: the attention's all-reduce
+        of the o_proj partial sums (it then pushes its partial sums straight into it, MNNVL), and
+        the largest row count whose result the mix after attention reads in place.
+
+        That mix reads it in place where the decode attention-residual kernel serves it: never on
+        snapshot layers, whose attention output becomes the running prefix sum; on the others,
+        which follow ``layer_idx // attn_res_block_size + 1`` snapshots, over that many
+        candidates plus the prefix sum.
+        """
+        attention = self.linear_attn if self.is_kda else self.self_attn
+        if self.layer_idx % self.attn_res_block_size == 0:
+            return attention.output_all_reduce, 0
+        num_candidates = self.layer_idx // self.attn_res_block_size + 2
+        return attention.output_all_reduce, _attn_res_decode_max_tokens(
+            self.hidden_size, num_candidates, torch.cuda.current_device()
+        )
 
     def skip_forward(
         self,
@@ -4067,9 +4233,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 attention._build_mtp_conv_weights()
             else:
                 attention = layer.self_attn.mixer
+            o_proj_reduction = layer.attention_output_reduction()
             for name, linear in attention.named_children():
                 if isinstance(linear, TrtllmLinear) and linear.has_fp8_block_scales:
-                    _swap_linear_to_fp8_weight_read(attention, name, (TrtllmLinear,))
+                    reduction = o_proj_reduction if name == "o_proj" else (None, 0)
+                    _swap_linear_to_fp8_weight_read(attention, name, (TrtllmLinear,), *reduction)
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
                 attention.accept_prequantized_qkvg_input(fused.takes_prequantized_input)

@@ -31,6 +31,12 @@ The statistics are summed in another order than the C++ attention-residual kerne
 normalized output can differ from theirs by one or two BF16 rounding steps in a small fraction
 of the elements; the updated prefix sum, an elementwise add, is bit-identical.
 
+The addend of ``bf16(prefix + addend)`` may also be the result of a pushed two-shot MNNVL
+all-reduce left in its workspace (``mnnvl_pushed_allreduce.run_finish_in_place``): the kernel
+then polls each 16-byte vector from the broadcast stage of that call's buffer after
+``griddepcontrol.wait`` (``mnnvl_pushed_allreduce.poll_result_v4``), the bits the gather would
+have stored, so the results are bitwise those of the gathered tensor.
+
 Optionally the kernel also stores the MXFP8 form of its normalized output: E4M3 codes and one
 UE8M0 exponent per 1x32 group in the R128c4 scale layout, the bits the FP8 low-M GEMM's
 in-kernel quantization makes of the BF16 output, so a projection can consume it instead of
@@ -60,6 +66,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import fp8_block_scale_low_m_gemm as low_m_gemm
+from . import mnnvl_pushed_allreduce as pushed_ar
 
 #: Candidate counts (snapshots + the layer row) the kernel is instantiated for.
 MIN_CANDIDATES, MAX_CANDIDATES = 2, 12
@@ -438,6 +445,21 @@ def _shfl_xor(value, offset: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _selp_b32(cond, a, b, *, loc=None, ip=None):
+    """32-bit ``a if cond != 0 else b``."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(cond, loc=loc, ip=ip), _iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nselp.b32 $0, $2, $3, p;\n}",
+            "=r,r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _selp(cond, a, b, *, loc=None, ip=None):
     """``a if cond != 0 else b``."""
     return Float32(
@@ -516,11 +538,19 @@ class KimiK3AttnResKernel:
     """A cluster of ``c`` CTAs per token, one 16-byte vector per thread.
 
     Each CTA owns ``hidden / c`` contiguous elements and each thread eight of them (one 16-byte
-    load per row).
+    load per row). ``in_place_addend`` (``ADD_PREFIX``): the addend is the in-place result of a
+    pushed MNNVL all-reduce, ``add_addr`` / ``add2_addr`` the workspace's local buffer and state
+    flags.
     """
 
     def __init__(
-        self, num_candidates: int, add_mode: int, cluster: int, hidden: int, mxfp8: bool = False
+        self,
+        num_candidates: int,
+        add_mode: int,
+        cluster: int,
+        hidden: int,
+        mxfp8: bool = False,
+        in_place_addend: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -528,7 +558,10 @@ class KimiK3AttnResKernel:
             raise ValueError(f"add_mode={add_mode} cluster={cluster}")
         if not supports_hidden_size(hidden):
             raise ValueError(f"hidden={hidden} is not supported")
+        if in_place_addend and add_mode != ADD_PREFIX:
+            raise ValueError("the in-place all-reduce addend is an ADD_PREFIX variant")
         self.mxfp8 = mxfp8
+        self.in_place_addend = in_place_addend
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -716,7 +749,13 @@ class KimiK3AttnResKernel:
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             pre = unpack(load(layer_addr + row + col, False))
-            addend = unpack(load(add_addr + row + col, False))
+            if cutlass.const_expr(self.in_place_addend):
+                # Threads past the row poll the row's first vector and use zeros.
+                off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
+                polled = pushed_ar.poll_result_v4(add_addr, add2_addr, Int32(token), off, hidden)
+                addend = unpack([_selp_b32(valid, w, Int32(0)) for w in polled])
+            else:
+                addend = unpack(load(add_addr + row + col, False))
             x = [_round_bf16(_add_ftz(pre[e], addend[e])) for e in range(8)]
         elif cutlass.const_expr(self.add_mode == ADD_MOE):
             pre = unpack(load(layer_addr + row + col, False))
@@ -810,8 +849,15 @@ def cluster_size(num_tokens: int, num_candidates: int) -> int:
 
 
 @functools.cache
-def _compiled(num_candidates: int, add_mode: int, cluster: int, hidden: int, mxfp8: bool):
-    kernel = KimiK3AttnResKernel(num_candidates, add_mode, cluster, hidden, mxfp8)
+def _compiled(
+    num_candidates: int,
+    add_mode: int,
+    cluster: int,
+    hidden: int,
+    mxfp8: bool,
+    in_place_addend: bool,
+):
+    kernel = KimiK3AttnResKernel(num_candidates, add_mode, cluster, hidden, mxfp8, in_place_addend)
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -887,6 +933,7 @@ def run_attn_res(
     updated: torch.Tensor | None,
     *,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    in_place_addend: tuple[int, int] | None = None,
 ) -> None:
     """Launch on the current stream with PDL (inputs are not re-validated; see :func:`can_run`).
 
@@ -902,8 +949,15 @@ def run_attn_res(
         updated: ``bf16 [M, H]`` updated prefix sum; required with addends.
         mxfp8_out: ``(xq, xs)``: also store the MXFP8 form of ``output``, E4M3 ``xq [M, H]``
             and UE8M0 ``xs`` (uint8, :func:`mxfp8_scale_numel` bytes) in the R128c4 layout.
+        in_place_addend: ``(uc_local, flags)`` device addresses of an MNNVL all-reduce workspace
+            (``distributed.ops.LamportWorkspaceView``) instead of ``addends`` (then
+            ``()``): ``bf16(layer + addend)`` with the ``[M, H]`` result of the pushed two-shot
+            all-reduce finished in place last on the workspace. The next all-reduce on the
+            workspace re-arms that buffer, so it must not start before this kernel completed.
     """
-    add_mode = len(addends)
+    if in_place_addend is not None and addends:
+        raise ValueError("pass either addends or in_place_addend")
+    add_mode = ADD_PREFIX if in_place_addend is not None else len(addends)
     num_tokens, hidden = layer.shape
     num_candidates = block.shape[0] + 1
     compiled = _compiled(
@@ -912,11 +966,17 @@ def run_attn_res(
         cluster_size(num_tokens, num_candidates),
         hidden,
         mxfp8_out is not None,
+        in_place_addend is not None,
     )
+    if in_place_addend is not None:
+        add_addr, add2_addr = in_place_addend
+    else:
+        add_addr = addends[0].data_ptr() if add_mode >= 1 else 0
+        add2_addr = addends[1].data_ptr() if add_mode == 2 else 0
     compiled(
         Int64(layer.data_ptr()),
-        Int64(addends[0].data_ptr() if add_mode >= 1 else 0),
-        Int64(addends[1].data_ptr() if add_mode == 2 else 0),
+        Int64(add_addr),
+        Int64(add2_addr),
         Int64(block.data_ptr()),
         Int64(res_weight.data_ptr()),
         Int64(rms_weight.data_ptr()),
