@@ -3141,6 +3141,12 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
+        # Managers with their own pools (hybrid, sparse) are not wired up yet.
+        if type(self) is not KVCacheManagerV2:
+            raise NotImplementedError(
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is only supported by the "
+                f"standard KV cache manager, not {type(self).__name__}"
+            )
         self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")

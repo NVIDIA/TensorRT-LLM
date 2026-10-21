@@ -263,3 +263,19 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     )
     assert source.tolist() == [4, 7]
     assert destination.tolist() == [2, 6]
+
+
+def test_mixed_precision_rejects_custom_managers():
+    """Hybrid and sparse managers own extra pools; mixed precision refuses them up front."""
+
+    class _CustomManager(KVCacheManagerV2):
+        pass
+
+    manager = object.__new__(_CustomManager)
+    with pytest.raises(NotImplementedError, match="_CustomManager"):
+        manager._init_mixed_precision(
+            KvCacheConfig(dtype="mixed_nvfp4_fp8"), None, 1024, DataType.FP8
+        )
+    # A plain dtype never reaches the check.
+    manager._init_mixed_precision(KvCacheConfig(), None, 1024, DataType.FP8)
+    assert manager.high_layers == {}
