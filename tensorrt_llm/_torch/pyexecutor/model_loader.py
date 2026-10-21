@@ -23,7 +23,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -119,6 +120,24 @@ _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
 _MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_types=frozenset({"mrope"}),
+    rope_fusion=frozenset({False}),
+)
+# MoE profiles pin the configured MoE backend and the routed-expert partition.
+# The routed-expert layout differs per MoE implementation, so the pinned
+# backend and quantization must name exactly one: `CUTLASS` with unquantized
+# weights is the `trtllm.cutlass.grouped_gemm.none` leaf, which
+# `test_moe_profile_backend_literals_realize_one_implementation` checks. With
+# TP <= 2, MoE TP x MoE EP x MoE cluster == TP admits only the pure MoE-TP and
+# MoE-EP partitions; wider TP needs a joint partition constraint.
+_MX_BF16_CUTLASS_MOE_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    moe_backends=frozenset({"CUTLASS"}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1, 2}),
+    moe_cluster_sizes=frozenset({1}),
+)
+_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_CUTLASS_MOE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
 )
 
@@ -870,6 +889,19 @@ class ModelLoader:
             transform_abi_id=QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
             runtime_constraints=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3-moe-for-causal-lm-bf16-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_moe",
+                "Qwen3MoeForCausalLM"),
+            architecture="Qwen3MoeForCausalLM",
+            model_type="qwen3_moe",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
     ))
 

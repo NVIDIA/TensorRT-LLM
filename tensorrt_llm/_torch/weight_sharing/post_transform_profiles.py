@@ -63,6 +63,13 @@ PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
 # Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
 # finalization.
 QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
+# Stable contract for unquantized Qwen3 MoE fused-QKV tensors, Q/K norm state,
+# the replicated router weight, CUTLASS routed-expert tensors (`w3_w1_weight`
+# with the up projection before the gate projection, and `w2_weight`)
+# partitioned by MoE TP or EP, and target-only receiver finalization. Routed
+# expert layouts differ per MoE implementation, so another implementation
+# needs its own ID.
+QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
 _MISSING = object()
 
 
