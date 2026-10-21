@@ -565,6 +565,31 @@ def test_minimax_m3_parallel_names_the_target_topology(mapping_kwargs, parallel)
     assert routing._parallel(Mapping(**mapping_kwargs)) == parallel
 
 
+# The MiniMax-M3 text model's shape fields, in ``routing._SHAPE`` order.
+_M3_SHAPE_FIELDS = (
+    "num_hidden_layers",
+    "hidden_size",
+    "num_local_experts",
+    "intermediate_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+)
+# The MiniMax-M3 RoPE base and sparse-attention layers (dense 0-2, sparse 3-59), as its config.json reads.
+_M3_LAYOUT = dict(
+    rope_theta=5_000_000, sparse_attention_config=dict(sparse_attention_freq=[0] * 3 + [1] * 57)
+)
+# Another checkpoint revision with the same architecture class and shape: another RoPE base and sparse layout.
+_OTHER_LAYOUT = dict(
+    rope_theta=1_000_000, sparse_attention_config=dict(sparse_attention_freq=[0] * 4 + [1] * 56)
+)
+
+
+def _m3_text_config(**layout):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    return dict(zip(_M3_SHAPE_FIELDS, routing._SHAPE), **(layout or _M3_LAYOUT))
+
+
 _M3_TARGETS = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3"
 _M3_TP2 = dict(world_size=2, tp_size=2, moe_tp_size=2, moe_ep_size=1)
 _M3_TP4 = dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1)
@@ -607,148 +632,100 @@ def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     monkeypatch.setattr(routing, "_quant_algo", lambda _config: QuantAlgo.MIXED_PRECISION)
 
-    text_config = dict(
-        num_hidden_layers=60,
-        hidden_size=6144,
-        num_local_experts=128,
-        intermediate_size=3072,
-        num_attention_heads=64,
-        num_key_value_heads=4,
-    )
-    pretrained = types.SimpleNamespace(text_config=text_config)
+    pretrained = types.SimpleNamespace(text_config=_m3_text_config())
     mapping = Mapping(**mapping_kwargs)
-    runtime = _m3_runtime()
     if target is None:
         with pytest.raises(NoTarget, match="sm107 \\(Rubin\\) with 2, 4 or 8 ranks"):
-            routing.route(
-                pretrained, mapping, capability, None, runtime.kv_cache_quant_algo, runtime=runtime
-            )
+            routing.route(pretrained, mapping, capability, None, QuantAlgo.NVFP4)
         return
-    resolved = routing.route(
-        pretrained, mapping, capability, None, runtime.kv_cache_quant_algo, runtime=runtime
-    )
+    resolved = routing.route(pretrained, mapping, capability, None, QuantAlgo.NVFP4)
     directory, name = target.split(".")
     assert resolved.__module__ == f"{_M3_TARGETS}.{directory}.modeling"
     assert resolved.__name__ == name
 
 
-# The MiniMax-M3 Eagle3 drafter of the released checkpoint (inferact MiniMax-M3-EAGLE3-GQA), as its config.json reads.
-_M3_DRAFTER = dict(
-    num_hidden_layers=1,
-    fc_norm=True,
-    hidden_size=6144,
-    num_attention_heads=64,
-    num_key_value_heads=4,
-    head_dim=128,
-    intermediate_size=18432,
-    vocab_size=200064,
-    draft_vocab_size=200064,
-    attention_bias=False,
-    tie_word_embeddings=False,
-)
-
-
-def _m3_drafter_spec(tmp_path, captured=None, **overrides):
-    import json
+@pytest.mark.parametrize("spec", [None, "eagle3"], ids=["no_speculation", "one_model_eagle3"])
+@pytest.mark.parametrize("tp", [4, 8])
+def test_minimax_m3_route_takes_the_released_checkpoint(monkeypatch, spec, tp):
     from types import SimpleNamespace
 
-    (tmp_path / "config.json").write_text(json.dumps({**_M3_DRAFTER, **overrides}))
-    return SimpleNamespace(speculative_model=str(tmp_path), eagle3_layers_to_capture=captured)
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
+    spec_config = (
+        None
+        if spec is None
+        else SimpleNamespace(spec_dec_mode=SimpleNamespace(name="EAGLE3_ONE_MODEL"))
+    )
+    target = routing.route(
+        SimpleNamespace(text_config=_m3_text_config()),
+        Mapping(world_size=tp, tp_size=tp, moe_tp_size=tp, moe_ep_size=1),
+        routing._SM,
+        spec_config,
+        QuantAlgo.NVFP4,
+    )
+    assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
 
 
 @pytest.mark.parametrize(
-    "overrides, captured, reason",
+    "layout, reason",
     [
-        ({}, None, None),
-        ({}, {1, 29, 56}, None),
-        (dict(num_hidden_layers=2), None, "2 drafter layers, not 1"),
-        (dict(fc_norm=False), None, "no per-layer fc_norm"),
-        (dict(eagle_config={"eh_proj_before_attn": True}), None, "eh_proj before attention"),
-        (dict(eagle_config={"norm_before_fc": True}), None, "norm before the fc"),
-        (dict(kv_lora_rank=512), None, "an MLA drafter layer"),
-        (dict(target_hidden_size=4096), None, "a target hidden size other than the drafter's"),
-        (dict(draft_vocab_size=32000), None, "a draft vocabulary other than the target's"),
-        (dict(mlp_bias=True), None, "biased projections"),
-        (dict(tie_word_embeddings=True), None, "a tied head"),
-        ({}, {-1}, "a single captured target layer"),
-        (dict(num_key_value_heads=1), None, "num_key_value_heads=1, not 4"),
-        (dict(intermediate_size=14336), None, "intermediate_size=14336, not 18432"),
+        (_OTHER_LAYOUT, "rope_theta 1000000, not 5000000; sparse attention layers other than 3-59"),
+        (dict(_M3_LAYOUT, rope_theta=1_000_000), "rope_theta 1000000, not 5000000"),
         (
-            dict(hidden_size=4096, head_dim=None),
-            None,
-            "hidden_size=4096, not 6144; head_dim=64, not 128",
+            dict(_M3_LAYOUT, sparse_attention_config=_OTHER_LAYOUT["sparse_attention_config"]),
+            "sparse attention layers other than 3-59",
+        ),
+        (
+            dict(sparse_attention_config=_M3_LAYOUT["sparse_attention_config"]),
+            "rope_theta None, not 5000000",
+        ),
+        (
+            dict(
+                _M3_LAYOUT,
+                sparse_attention_config=dict(
+                    _M3_LAYOUT["sparse_attention_config"], use_sparse_attention=False
+                ),
+            ),
+            "sparse attention layers other than 3-59",
         ),
     ],
-    ids=[
-        "released_drafter",
-        "three_captured_layers",
-        "two_layers",
-        "no_fc_norm",
-        "eh_proj_before_attn",
-        "norm_before_fc",
-        "mla",
-        "target_hidden",
-        "draft_vocab",
-        "bias",
-        "tied_head",
-        "one_captured_layer",
-        "one_kv_head",
-        "mlp_width",
-        "hidden_size",
-    ],
+    ids=["other_revision", "rope_base", "sparse_layers", "no_rope_base", "sparse_disabled"],
 )
-def test_minimax_m3_routes_only_the_drafter_its_targets_build(
-    tmp_path, overrides, captured, reason
-):
-    """The targets draft with their own one-layer fc_norm Eagle3 drafter: any other drafter is declined in routing
-    (``auto`` takes the built-in model, ``require`` names the criterion) instead of failing at construction."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-
-    spec = _m3_drafter_spec(tmp_path, captured, **overrides)
-    assert routing._drafter_mismatch(spec) == reason
-    assert routing._drafter_mismatch(None) is None
-
-
-@pytest.mark.parametrize("drafter_layers", [1, 3], ids=["flat_drafter", "multi_layer_drafter"])
-def test_minimax_m3_route_declines_a_drafter_it_does_not_build(
-    tmp_path, monkeypatch, drafter_layers
-):
+def test_minimax_m3_route_declines_another_rope_base_or_sparse_layout(monkeypatch, layout, reason):
+    """The architecture name and the shape do not pin the RoPE base or which layers are sparse: a checkpoint with
+    the target shape but another of either (another checkpoint revision) is not routed to the MiniMax-M3 targets,
+    even with their quantization."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-    from tensorrt_llm.quantization.mode import QuantAlgo
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
-    monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
-    text_config = dict(
-        zip(
-            (
-                "num_hidden_layers",
-                "hidden_size",
-                "num_local_experts",
-                "intermediate_size",
-                "num_attention_heads",
-                "num_key_value_heads",
-            ),
-            routing._SHAPE,
+    text_config = _m3_text_config(**layout)
+    assert routing._layout_mismatch(text_config) == reason
+    with pytest.raises(NoTarget, match=reason.split(";")[0]):
+        routing.route(
+            SimpleNamespace(text_config=text_config),
+            Mapping(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1),
+            routing._SM,
+            None,
+            QuantAlgo.NVFP4,
         )
-    )
-    spec = _m3_drafter_spec(tmp_path, num_hidden_layers=drafter_layers)
-    spec.spec_dec_mode = SimpleNamespace(name="EAGLE3_ONE_MODEL")
-    mapping = Mapping(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1)
-    pretrained = SimpleNamespace(text_config=text_config)
-    runtime = _m3_runtime()
-    if drafter_layers == 1:
-        target = routing.route(
-            pretrained, mapping, routing._SM, spec, runtime.kv_cache_quant_algo, runtime=runtime
+
+
+def test_minimax_m3_layout_reads_rope_theta_from_rope_parameters():
+    """A config that keeps the RoPE base under ``rope_parameters`` (newer transformers) reads the same."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    sparse = _M3_LAYOUT["sparse_attention_config"]
+    assert routing._layout_mismatch(_m3_text_config()) is None
+    for rope in (dict(rope_theta=5_000_000), dict(full_attention=dict(rope_theta=5_000_000))):
+        assert (
+            routing._layout_mismatch(dict(sparse_attention_config=sparse, rope_parameters=rope))
+            is None
         )
-        assert target.__name__ == "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"
-    else:
-        with pytest.raises(NoTarget, match="Eagle3 drafter: 3 drafter layers, not 1"):
-            routing.route(
-                pretrained, mapping, routing._SM, spec, runtime.kv_cache_quant_algo, runtime=runtime
-            )
 
 
 def _m3_sparse(**overrides):
@@ -765,87 +742,12 @@ def _m3_sparse(**overrides):
     return MiniMaxM3SparseAttentionConfig(**fields)
 
 
-def _m3_runtime(sparse=None, kv="NVFP4"):
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import RuntimeFacts
-
-    return RuntimeFacts(
-        sparse_attention_config=_m3_sparse() if sparse is None else sparse, kv_cache_quant_algo=kv
-    )
-
-
-# Every runtime the engine accepts for MiniMax-M3 that the targets are not written for; the built-in model runs them.
-_M3_RUNTIME_DECLINES = [
-    (
-        dict(implementation="triton", indexer_kv_dtype="bf16", fuse_qkv_index_projection=False),
-        "FP8",
-        "sparse attention implementation 'triton', not 'msa'; indexer_kv_dtype 'bf16', not 'fp8'",
-    ),
-    (
-        dict(indexer_kv_dtype="bf16", fuse_qkv_index_projection=False),
-        "FP8",
-        "indexer_kv_dtype 'bf16', not 'fp8'",
-    ),
-    (
-        dict(fuse_qkv_index_projection=False),
-        None,
-        "a BF16 main KV cache, not FP8 or NVFP4",
-    ),
-]
-_M3_RUNTIME_DECLINE_IDS = ["triton", "bf16_indexer", "bf16_main_kv"]
-
-
-@pytest.mark.parametrize(
-    "sparse, kv",
-    [
-        (dict(), "NVFP4"),
-        (dict(), "FP8"),
-        (dict(fuse_qkv_index_projection=False), "FP8"),
-        (dict(fuse_qkv_index_projection=False), "NVFP4"),
-    ],
-    ids=["fused_nvfp4", "fused_fp8", "unfused_fp8", "unfused_nvfp4"],
-)
-def test_minimax_m3_runtime_the_targets_are_written_for(sparse, kv):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-
-    assert routing._runtime_mismatch(_m3_runtime(_m3_sparse(**sparse), kv)) is None
-
-
-@pytest.mark.parametrize("sparse, kv, reason", _M3_RUNTIME_DECLINES, ids=_M3_RUNTIME_DECLINE_IDS)
-def test_minimax_m3_runtime_mismatch_names_the_setting(sparse, kv, reason):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-
-    assert routing._runtime_mismatch(_m3_runtime(_m3_sparse(**sparse), kv)) == reason
-
-
-def test_minimax_m3_runtime_without_its_sparse_config_is_declined():
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import RuntimeFacts
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-
-    runtime = RuntimeFacts(sparse_attention_config=None, kv_cache_quant_algo="NVFP4")
-    assert routing._runtime_mismatch(runtime) == "no MiniMax-M3 sparse_attention_config"
-
-
-def _m3_resolve_config(sparse, kv_checkpoint, tp=4):
+def _m3_resolve_config(sparse, kv_checkpoint, tp=4, layout=None):
     """A ModelConfig as the loader holds it when it resolves: the MiniMax-M3 VL wrapper with the target text shape,
     the checkpoint's KV quantization (before kv_cache_config.dtype is applied) and the sparse-attention runtime."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    text_config = dict(
-        zip(
-            (
-                "num_hidden_layers",
-                "hidden_size",
-                "num_local_experts",
-                "intermediate_size",
-                "num_attention_heads",
-                "num_key_value_heads",
-            ),
-            routing._SHAPE,
-        )
-    )
     pretrained = PretrainedConfig(
-        architectures=["MiniMaxM3SparseForConditionalGeneration"], text_config=text_config
+        architectures=["MiniMaxM3SparseForConditionalGeneration"],
+        text_config=_m3_text_config(**(layout or {})),
     )
     return ModelConfig(
         pretrained_config=pretrained,
@@ -872,7 +774,6 @@ def _minimax_m3_sm(_on_sm10x):
 def test_minimax_m3_pr_runtime_resolves_to_the_target(monkeypatch, mode, tp):
     """The PR deployment (MSA, FP8 indexer, fused projection, kv_cache_config.dtype='nvfp4') takes the target."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-    from tensorrt_llm.quantization.mode import QuantAlgo
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(), None, tp)
@@ -881,42 +782,52 @@ def test_minimax_m3_pr_runtime_resolves_to_the_target(monkeypatch, mode, tp):
 
 
 @pytest.mark.usefixtures("_minimax_m3_sm")
-@pytest.mark.parametrize("sparse, kv, reason", _M3_RUNTIME_DECLINES, ids=_M3_RUNTIME_DECLINE_IDS)
 @pytest.mark.parametrize("tp", [4, 8])
-def test_minimax_m3_other_runtimes_fall_back_under_auto(monkeypatch, sparse, kv, reason, tp):
-    """``auto`` resolves nothing, so the loader builds the registered built-in MiniMax-M3 model."""
+def test_minimax_m3_bf16_kv_cache_falls_back_under_auto(monkeypatch, tp):
+    """The targets run an FP8 or NVFP4 KV cache: ``auto`` with the BF16 cache resolves nothing, so the loader builds
+    the registered built-in MiniMax-M3 model."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
-    from tensorrt_llm.quantization.mode import QuantAlgo
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     # kv_cache_config.dtype 'auto' keeps the checkpoint's KV quantization (None: the BF16 cache).
-    config = _m3_resolve_config(_m3_sparse(**sparse), kv, tp)
+    config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None, tp)
     assert modeling_v2_resolve(config, _m3_llm_args("auto", "auto")) is None
     resolved = replace(config, modeling_v2_target=None)
     assert AutoModelForCausalLM._resolve_class(resolved) is MiniMaxM3VLForConditionalGeneration
 
 
 @pytest.mark.usefixtures("_minimax_m3_sm")
-@pytest.mark.parametrize("sparse, kv, reason", _M3_RUNTIME_DECLINES, ids=_M3_RUNTIME_DECLINE_IDS)
-def test_minimax_m3_other_runtimes_raise_under_require(monkeypatch, sparse, kv, reason):
+def test_minimax_m3_bf16_kv_cache_raises_under_require(monkeypatch):
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-    from tensorrt_llm.quantization.mode import QuantAlgo
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
-    config = _m3_resolve_config(_m3_sparse(**sparse), kv)
+    config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
     with pytest.raises(ValueError) as excinfo:
         modeling_v2_resolve(config, _m3_llm_args("require", "auto"))
     message = str(excinfo.value)
     assert "MiniMaxM3SparseForConditionalGeneration" in message
-    assert f"runtime: {reason}" in message
+    assert "KV cache bf16" in message
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_minimax_m3_other_checkpoint_revision_is_declined(monkeypatch, tp):
+    """Another checkpoint revision (same architecture class and shape, another RoPE base and sparse layout) with the
+    PR runtime: ``auto`` builds the built-in model and ``require`` names the layout."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(), None, tp, layout=_OTHER_LAYOUT)
+    assert modeling_v2_resolve(config, _m3_llm_args("auto", "nvfp4")) is None
+    with pytest.raises(ValueError, match="rope_theta 1000000, not 5000000"):
+        modeling_v2_resolve(config, _m3_llm_args("require", "nvfp4"))
 
 
 @pytest.mark.usefixtures("_minimax_m3_sm")
 def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
     """An explicit kv_cache_config.dtype is the KV cache the engine runs with, whatever the checkpoint declares."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-    from tensorrt_llm.quantization.mode import QuantAlgo
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)

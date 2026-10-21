@@ -23,7 +23,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops import (  # noqa: E501
     m3_spec_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.spec.m3_shard_accept import (  # noqa: E501
@@ -285,5 +285,5 @@ def test_the_drafter_is_the_in_tree_drafter() -> None:
     ):
         assert not hasattr(module, name), f"{module.__name__}.{name}"
     pkg = modeling.__name__.rsplit(".", 1)[0]
-    for gone in ("kernels.m3_draft_head", "ops.spec.m3_draft_head", "ops.gemm.m3_draft_gemv"):
+    for gone in ("ops.m3_draft_head", "ops.spec.m3_draft_head", "ops.gemm.m3_draft_gemv"):
         assert importlib.util.find_spec(f"{pkg}.{gone}") is None, gone

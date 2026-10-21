@@ -7,14 +7,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels.msa_kv_update import (  # noqa: E501
-    msa_kv_update as hook,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.msa_kv_update import (  # noqa: E501
     TOKENS_PER_BLOCK,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.msa_kv_update import (  # noqa: E501
     msa_kv_update as op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.msa_kv_update import (  # noqa: E501
+    msa_kv_update as hook,
 )
 
 __extra_import_path__ = ["../../../.."]
