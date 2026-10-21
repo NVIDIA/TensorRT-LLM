@@ -33,11 +33,6 @@ void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const&)
     TLLM_THROW("Per-layer dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
 }
 
-void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const&, cudaStream_t)
-{
-    TLLM_THROW("Per-layer dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
-}
-
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

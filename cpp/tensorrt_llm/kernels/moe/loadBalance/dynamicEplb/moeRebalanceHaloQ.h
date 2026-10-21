@@ -19,8 +19,6 @@
 
 #include "tensorrt_llm/common/config.h"
 
-#include <cuda_runtime.h>
-
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -28,6 +26,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+// The HALO-Q scheduler phase of the fused scheduler + in-switch copy kernel
+// (megamoe_tma_copy_submit_fused).
 struct MoeRebalanceHaloQParams
 {
     int const* routes;
@@ -42,7 +42,6 @@ struct MoeRebalanceHaloQParams
     int* gridSync;
     int* planWorkspace;
     int* routePrefix;
-    int* planChannel;
     int ep;
     int experts;
     int helpers;
@@ -50,18 +49,12 @@ struct MoeRebalanceHaloQParams
     int routeCapacity;
     int ctas;
     int threads;
-    bool enablePdl;
     std::uint64_t spinCycles;
-    int planAbiVersion;
-    int planChannelWords;
-    int routeFeatures;
     int validRouteCount;
 };
 
 // Throws unless params describe a valid scheduler launch.
 void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const& params);
-
-void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const& params, cudaStream_t stream);
 
 } // namespace kernels
 
