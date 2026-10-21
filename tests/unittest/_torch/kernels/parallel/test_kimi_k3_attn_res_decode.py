@@ -389,7 +389,9 @@ def pdl_switch_outputs() -> list:
     side output, on fixed inputs (compared with and without ``TRTLLM_ENABLE_PDL``)."""
     from torch import nn
 
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+        Fp8BlockScaleWeightReadLinear,
+    )
 
     m, n = 12, 9
     t = _inputs(m, n, 1.0, seed=7)
@@ -405,7 +407,7 @@ def pdl_switch_outputs() -> list:
     results.extend((prefix, out, xq.view(torch.uint8), xs[r128c4_offsets(m, HIDDEN)]))
     torch.manual_seed(3)
     dense = nn.Linear(HIDDEN, 3072, bias=False, dtype=torch.bfloat16, device="cuda")
-    proj = _Fp8BlockScaleWeightReadLinear.from_linear(dense)
+    proj = Fp8BlockScaleWeightReadLinear.from_linear(dense)
     proj.post_load_weights()
     results.append(proj(out))
     if proj.takes_prequantized_input(m):
