@@ -32,3 +32,8 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tp8ep2(NemotronHBf16Target):
 
     def test_gsm8k(self):
         self._gsm8k(max_batch_size=256)
+
+    def test_gsm8k_fp8_kv(self):
+        # The fp8-e4m3 KV pool at unit kv scales (94.731 before the rebase; the built-in
+        # implementation over the same pool 94.655, the reference).
+        self._gsm8k(max_batch_size=256, kv_cache_dtype="fp8")
