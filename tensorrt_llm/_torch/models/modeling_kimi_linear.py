@@ -182,6 +182,8 @@ _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 # Expected routed rows per rank (tokens x top-k x local experts / experts) from which the routed
 # experts of a decode forward wait for the shared expert's GEMMs (``_shared_gemms_lead``).
 _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS = 80
+# Largest token count for which the router GEMM is issued before latent_down (``forward_parts``).
+_ROUTER_FIRST_MAX_TOKENS = 64
 # SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
 # that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
 # the fused FC12 kernel on Rubin does). 16 of the R200's SMs is the measured split.
@@ -2135,6 +2137,7 @@ class KimiK3MoERuntime(nn.Module):
             )
         else:
             shared_first = False
+            router_logits = None
             if (
                 self.latent_down_stream is not None
                 and do_multi_stream()
@@ -2144,6 +2147,13 @@ class KimiK3MoERuntime(nn.Module):
                 # Forked ahead of the router GEMM: the latent chain needs only
                 # hidden_states.
                 self.moe_latent_fork_event.record()
+                if hidden_states.shape[0] <= _ROUTER_FIRST_MAX_TOKENS:
+                    # Same graph edges either way; issued first, the router GEMM is launched
+                    # first once the MoE input is ready. At decode sizes it and latent_down's
+                    # GEMM each fill most of an SM, so the one launched second runs on the SMs
+                    # the other leaves; the routing gates the routed experts, so the router
+                    # goes first.
+                    router_logits = self.gate.compute_logits(hidden_states)
                 with torch.cuda.stream(self.latent_down_stream):
                     self.moe_latent_fork_event.wait()
                     early_routed_in = self._routed_projection(
@@ -2157,7 +2167,8 @@ class KimiK3MoERuntime(nn.Module):
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
-            router_logits = self.gate.compute_logits(hidden_states)
+            if router_logits is None:
+                router_logits = self.gate.compute_logits(hidden_states)
             if shared_first:
                 shared_partial = self._issue_shared_gemms(identity)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
