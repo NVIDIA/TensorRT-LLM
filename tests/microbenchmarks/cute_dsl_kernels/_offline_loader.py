@@ -40,13 +40,20 @@ pure-Python kernel trees resolve to the checkout.
 The drivers call :func:`install` only after a first import has failed, and that
 attempt may already have imported modules from the install (for example
 ``tensorrt_llm``, ``tensorrt_llm._torch`` and ``tensorrt_llm._torch.moe``) and
-left them in ``sys.modules``. They are kept, and the matching checkout
-directory is put first on the ``__path__`` of each cached package, so the
-retried import finds the kernel trees that the install does not have. Modules
-the first attempt imported stay the install's copies; a module first imported
-after :func:`install` resolves to the checkout wherever the checkout has it.
-Such a process therefore runs a mix of the two, and checkout code that imports
-a name missing from the install's copy of a cached module still fails.
+left them in ``sys.modules``. They are kept: the two seeded packages are extended
+as described above, and the matching checkout directory is put first on the
+``__path__`` of each cached package under ``tensorrt_llm._torch``, so the
+retried import finds the kernel trees that the install does not have. Every
+other cached ``tensorrt_llm.*`` package (``tensorrt_llm.executor``, for
+example) keeps its installed ``__path__``. Modules the first attempt imported
+stay the install's copies, and so do modules first imported later beneath one
+of those other cached packages; any other module first imported after
+:func:`install` resolves to the checkout wherever the checkout has it. Such a
+process therefore runs a mix of the two, and checkout code that imports a name
+missing from the install's copy of a cached module still fails. With
+``TRTLLM_OFFLINE_LOADER_VERBOSE`` set to a non-empty value, :func:`install`
+prints to stderr the ``__path__`` of both seeded packages and the name of each
+cached package whose ``__path__`` it changed.
 
 Scope: this fallback covers "an install exists, only the paths moved". It does
 not promise to work with no TensorRT-LLM install at all -- the drivers whose
@@ -112,19 +119,25 @@ def _seed(name, directory):
 
 
 def _prefer_checkout_for_cached_packages(root):
-    """Put the checkout first on every cached ``tensorrt_llm.*`` package's ``__path__``.
+    """Put the checkout first on every cached ``tensorrt_llm._torch.*`` package's ``__path__``.
 
     A package imported from an install keeps its installed ``__path__``, so a
     subpackage that exists only in the checkout stays unresolvable beneath it
-    until the checkout directory is added.
+    until the checkout directory is added. Only subpackages of
+    ``tensorrt_llm._torch`` are extended, because the relocated kernel trees,
+    which an older install lacks, all live under it; the packages outside it
+    that the drivers reach indirectly exist in the install as well.
+
+    Returns the names of the packages whose ``__path__`` was changed.
     """
+    changed = []
     for name in sorted(sys.modules):
-        if not name.startswith("tensorrt_llm."):
+        if not name.startswith("tensorrt_llm._torch."):
             continue
         module = sys.modules[name]
-        # Read the namespace directly: a module-level ``__getattr__`` (such as
-        # the one in ``tensorrt_llm.executor.ray.stub``) may raise for any
-        # missing name, ``__path__`` included.
+        # Read the namespace directly: a module-level ``__getattr__`` may raise
+        # for a missing name, ``__path__`` included, and not necessarily with
+        # ``AttributeError``.
         path = vars(module).get("__path__") if isinstance(module, types.ModuleType) else None
         # Only regular packages, whose ``__path__`` is a plain list, are
         # extended; the trees the drivers import contain no namespace packages.
@@ -133,7 +146,9 @@ def _prefer_checkout_for_cached_packages(root):
         directory = root.joinpath(*name.split("."))
         if directory.is_dir() and str(directory) not in path:
             path.insert(0, str(directory))
+            changed.append(name)
     importlib.invalidate_caches()
+    return changed
 
 
 def install(repo_root):
@@ -163,13 +178,20 @@ def install(repo_root):
                 "checkout at %s" % (name, module.__path__[0], directory)
             )
 
-    _prefer_checkout_for_cached_packages(root)
+    changed = _prefer_checkout_for_cached_packages(root)
 
     if os.environ.get(_VERBOSE_ENV):
+        # stderr on purpose: driver stdout is benchmark output.
         for name, _ in _STUBS:
-            # stderr on purpose: driver stdout is benchmark output.
             print(
                 "[offline-loader] %s.__path__ = %r" % (name, list(sys.modules[name].__path__)),
+                file=sys.stderr,
+            )
+        # These packages came from the install; submodules they already
+        # imported stay the install's copies.
+        for name in changed:
+            print(
+                "[offline-loader] checkout prepended to cached %s.__path__" % (name,),
                 file=sys.stderr,
             )
     return sys.modules["tensorrt_llm"]
