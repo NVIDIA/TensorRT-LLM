@@ -772,7 +772,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 @pytest.mark.skipif(
     not (89 <= get_sm_version() < 100 or is_sm_120f()),
-    reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",
+    reason="Dense Marlin NVFP4 runs on SM89-99 and SM12x family",
 )
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

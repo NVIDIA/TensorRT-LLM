@@ -27,6 +27,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+import tensorrt_llm._utils
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -237,6 +238,7 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
     # Reporting w == 0 for a config that still stages the fp8 K/V buffers reserves nothing and installs no
     # admission cap -- exactly the mid-forward OOM this reservation exists to prevent.
     monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(tensorrt_llm._utils, "get_sm_version", lambda: sm)
     monkeypatch.setenv("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", short_seq_mha)
     model_config = _fp8_mla_model_config(sparse_algorithm)
     if sparse_algorithm == "csa2":
