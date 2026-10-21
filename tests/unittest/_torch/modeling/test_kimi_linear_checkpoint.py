@@ -13,13 +13,17 @@ from torch import nn
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_kimi_k3_loader import (  # noqa: E402
+    _helix_cp_v_b_shard,
+    _shard_head_major_param,
+)
 from tensorrt_llm._torch.models.modeling_kimi_linear import (  # noqa: E402
     KimiLinearForCausalLM,
     KimiMLARuntime,
-    _Fp8BlockScaleWeightReadLinear,
-    _helix_cp_v_b_shard,
-    _shard_head_major_param,
     resolve_attention_quant_config,
+)
+from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+    Fp8BlockScaleWeightReadLinear,
 )
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.linear import Linear
@@ -378,7 +382,7 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
     attention = model.model.layers[0].linear_attn
     for name in _KDA_PROJECTIONS[:5]:
         module = getattr(attention, name)
-        assert isinstance(module, _Fp8BlockScaleWeightReadLinear)
+        assert isinstance(module, Fp8BlockScaleWeightReadLinear)
         expected = checkpoint[f"model.layers.0.self_attn.{name}.weight"]
         expected = expected.chunk(tp_size, dim=1 if name == "o_proj" else 0)[tp_rank]
         scales = checkpoint[f"model.layers.0.self_attn.{name}.weight_scale"][:, 0, :, 0]
@@ -391,14 +395,14 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
         if module._fused_projection is not None:
             # q/k/v/g are fused into qkvg_proj and prepared at load, so their
             # checkpoint shard is held in its GEMM-ready (UE8M0) form.
-            expected, scales = _Fp8BlockScaleWeightReadLinear._prepare_weights(expected, scales)
+            expected, scales = Fp8BlockScaleWeightReadLinear._prepare_weights(expected, scales)
         assert torch.equal(
             module.weight[: module.out_features].view(torch.uint8), expected.view(torch.uint8)
         )
         assert module.weight.dtype == torch.float8_e4m3fn
         torch.testing.assert_close(module.weight_scale, scales, rtol=0, atol=0)
     for module in model.modules():
-        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+        if isinstance(module, (Linear, Fp8BlockScaleWeightReadLinear)):
             module.post_load_weights()
     hidden = torch.randn(7, 256, dtype=torch.bfloat16, device="cuda")
     expected = torch.cat(
@@ -445,7 +449,7 @@ def test_mla_load_preserves_checkpoint_and_absorption_pairs(tp_size, tp_rank, cp
     attention = model.model.layers[0].self_attn.mixer
     for name in _MLA_PROJECTIONS:
         module, rows = _projection(attention, name)
-        assert isinstance(module, _Fp8BlockScaleWeightReadLinear)
+        assert isinstance(module, Fp8BlockScaleWeightReadLinear)
         assert module.weight.dtype == torch.float8_e4m3fn
         if name != "kv_b_proj":
             expected = checkpoint[f"model.layers.0.self_attn.{name}.weight"]
@@ -469,7 +473,7 @@ def test_mla_load_preserves_checkpoint_and_absorption_pairs(tp_size, tp_rank, cp
         attention.v_b_proj_scale, scale[:, 1:].chunk(cp_size, dim=0)[attention.mapping.cp_rank]
     )
     for module in model.modules():
-        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+        if isinstance(module, (Linear, Fp8BlockScaleWeightReadLinear)):
             module.post_load_weights()
     hidden = torch.randn(7, 256, dtype=torch.bfloat16, device="cuda")
     assert torch.isfinite(attention.kv_a_proj_with_mqa(hidden)).all()
@@ -504,7 +508,7 @@ def test_checkpoint_projection_gemms_use_checkpoint_scales(kda, cute_mm):
     checkpoint = _checkpoint(model)
     model.load_weights(checkpoint)
     for module in model.modules():
-        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+        if isinstance(module, (Linear, Fp8BlockScaleWeightReadLinear)):
             module.post_load_weights()
     layer = model.model.layers[0]
     attention = layer.linear_attn if kda else layer.self_attn.mixer
@@ -568,7 +572,7 @@ def test_mla_a_fusion_follows_checkpoint_datatypes(quantized):
             weight *= scales.repeat_interleave(128, 0).repeat_interleave(128, 1)[: weight.shape[0]]
         references.append((module, rows, torch.nn.functional.linear(hidden.float(), weight)))
     for module in model.modules():
-        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+        if isinstance(module, (Linear, Fp8BlockScaleWeightReadLinear)):
             module.post_load_weights()
     for module, rows, expected in references:
         actual = module(hidden)[:, rows].float()
