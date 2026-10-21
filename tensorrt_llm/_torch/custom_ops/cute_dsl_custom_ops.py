@@ -21,7 +21,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
-                              IS_CUTLASS_DSL_RUBIN_AVAILABLE, sm_reserve)
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                              reserved_max_active_clusters, sm_reserve)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import (get_current_locality_domain,
@@ -18790,6 +18791,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             runs 1-CTA (mma_tiler 128x{128,256}, cluster (1,1)) and
             tile_size=256 runs 2-CTA (mma_tiler 256x{128,256}, cluster (2,1));
             the autotuner picks between them per shape.  scheduler="l2_atomic".
+            ``sm_reserve`` SMs are left without an FC12 CTA (whole clusters fewer,
+            at least one launched): one CTA fills an SM's register file, so kernels
+            another stream issues while FC12 runs otherwise get SMs only as its CTAs
+            exit. FC12 hands tiles out through atomic counters, so fewer CTAs change
+            only which CTA computes a tile.
             """
             kernel_class = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
             kernel_cache = dict()
@@ -18808,7 +18814,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     enable_alltoall: bool = False,
                     activation_type: ActivationType = ActivationType.Swiglu,
                     situ_beta: Optional[float] = None,
-                    situ_linear_beta: Optional[float] = None):
+                    situ_linear_beta: Optional[float] = None,
+                    sm_reserve: int = 0):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -18820,6 +18827,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.activation_type = ActivationType(int(activation_type))
                 self.situ_beta = situ_beta
                 self.situ_linear_beta = situ_linear_beta
+                if sm_reserve < 0:
+                    raise ValueError(
+                        f"sm_reserve must be non-negative, got {sm_reserve}")
+                self.sm_reserve = sm_reserve
                 # Used only by the in-op output memset (moved here so the memset
                 # is the fused kernel's immediate stream predecessor).
                 self.ep_size = ep_size
@@ -18847,6 +18858,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     int(self.activation_type),
                     self.situ_beta,
                     self.situ_linear_beta,
+                    self.sm_reserve,
                 )
 
             def get_valid_tactics(
@@ -19131,8 +19143,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # runners): avoids re-querying HardwareInfo on every forward
                 # and during CUDA-graph capture. FC12 never runs inside a
                 # locality-domain context, so this is the full-device value.
-                max_active_clusters = get_max_activate_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+                max_active_clusters = reserved_max_active_clusters(
+                    get_max_activate_clusters(cluster_size), cluster_size,
+                    self.sm_reserve)
 
                 # The fused kernel exposes only ``__call__`` (cute.Tensor args),
                 # no ptr-based wrapper. ``make_ordered_layout`` needs an MLIR
@@ -19400,6 +19414,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: ActivationType = ActivationType.Swiglu,
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            sm_reserve: int = 0,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
             runner = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
@@ -19415,6 +19430,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 activation_type=ActivationType(activation_type),
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                sm_reserve=sm_reserve,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
             # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
@@ -19453,7 +19469,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt scaling_vector_size=16, "
             "str? precomputed_tactic=None, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
-            "float situ_beta=-1.0, float situ_linear_beta=-1.0) -> ()",
+            "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "SymInt sm_reserve=0) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_fc12_fused_rubin(
             input: torch.Tensor,
@@ -19485,6 +19502,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            sm_reserve: int = 0,
         ) -> None:
             # In-place: finalize scatter-adds into ``output`` (mutates_args);
             # the op returns nothing so it does not alias its own input.
@@ -19498,7 +19516,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swiglu_limit, precomputed_tactic, expanded_idx_to_permuted_idx,
                 ep_size, enable_alltoall,
                 "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
-                ActivationType(activation_type), situ_beta, situ_linear_beta)
+                ActivationType(activation_type), situ_beta, situ_linear_beta,
+                sm_reserve)
 
         @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
         def _(
@@ -19531,5 +19550,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            sm_reserve: int = 0,
         ) -> None:
             return None

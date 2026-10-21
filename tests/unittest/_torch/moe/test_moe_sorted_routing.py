@@ -93,6 +93,25 @@ cute_dsl = pytest.mark.skipif(
 )
 
 
+def _fc12_available() -> bool:
+    if not torch.cuda.is_available() or get_sm_version() != 107:
+        return False
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    return IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+
+BACKENDS = [
+    pytest.param("CUTEDSL", marks=cute_dsl),
+    pytest.param(
+        "CUTEDSL_FC12",
+        marks=pytest.mark.skipif(
+            not _fc12_available(), reason="CUTEDSL_FC12 needs SM107 and CuTe DSL internal"
+        ),
+    ),
+]
+
+
 def _logits(m, seed):
     """Router-like FP32 logits (popular experts, tokens of a request alike) and a bias."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -189,12 +208,12 @@ def _assert_same_rows(actual, expected, local_counts):
         assert ((a - e).abs() <= tol).all(), f"max diff {(a - e).abs().max().item():.3e}"
 
 
-@cute_dsl
+@pytest.mark.parametrize("moe_backend", BACKENDS)
 @pytest.mark.parametrize("m", [1, 8, 64, 200])
-def test_cute_dsl_runs_on_sorted_routing(monkeypatch, m):
-    """CUTEDSL: the routing kernel's tables replace ``moe_sort``; same output."""
+def test_backend_runs_on_sorted_routing(monkeypatch, moe_backend, m):
+    """The routing kernel's tables replace ``moe_sort``; same output."""
     logits, bias = _logits(m, seed=m)
-    moe = _nvfp4_moe("CUTEDSL", _routing(bias))
+    moe = _nvfp4_moe(moe_backend, _routing(bias))
     x = (torch.randn((m, HIDDEN), device="cuda") * 0.5).to(torch.bfloat16)
 
     real_moe_sort = torch.ops.trtllm.moe_sort
@@ -246,3 +265,163 @@ def test_sorted_routing_cuda_graph_replay(monkeypatch):
                 expected = moe(x, static_logits)
             torch.cuda.synchronize()
             _assert_same_rows(out, expected, _local_counts(ids, 0, NUM_EXPERTS))
+
+
+class _SharedExperts(torch.nn.Module):
+    """Stand-in shared expert: ``0.5 x`` partial, all-reduce adds one."""
+
+    def __init__(self):
+        super().__init__()
+        self.down_proj = torch.nn.Module()
+        self.down_proj.all_reduce = lambda value: value + 1.0
+
+    def forward(self, value, final_all_reduce_params=None):
+        out = value * 0.5
+        if final_all_reduce_params is None or final_all_reduce_params.enable_allreduce:
+            out = self.down_proj.all_reduce(out)
+        return out
+
+
+def _runtime(moe, logits):
+    """``KimiK3MoERuntime`` around ``moe`` with identity latent projections and both streams."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoERuntime
+
+    runtime = KimiK3MoERuntime.__new__(KimiK3MoERuntime)
+    torch.nn.Module.__init__(runtime)
+    runtime.gate = type("Gate", (), {"compute_logits": staticmethod(lambda value: logits)})()
+    runtime.routed_experts = moe
+    runtime.top_k, runtime.num_experts, runtime.experts_per_rank = TOP_K, NUM_EXPERTS, NUM_EXPERTS
+    runtime.routed_expert_down_proj = torch.nn.Identity()
+    runtime.routed_expert_norm = torch.nn.Identity()
+    runtime.routed_expert_up_proj = torch.nn.Identity()
+    runtime.shared_experts = _SharedExperts()
+    runtime._shared_all_reduce = True
+    runtime._reduce_routed_output = False
+    runtime._defer_shared_allreduce = False
+    runtime.moe_routed_event = None
+    runtime.shared_expert_stream = torch.cuda.Stream()
+    runtime.latent_down_stream = torch.cuda.Stream()
+    for name in (
+        "moe_main_event",
+        "moe_shared_event",
+        "moe_latent_fork_event",
+        "moe_latent_ready_event",
+        "moe_shared_gemm_event",
+    ):
+        setattr(runtime, name, torch.cuda.Event())
+    runtime._can_fuse_router_down = lambda value: False
+    runtime._routed_projection = lambda value, projection: value * 1.0
+    return runtime
+
+
+@cute_dsl
+@pytest.mark.parametrize("m", [8, 64])
+def test_shared_gemms_lead_routed_experts(monkeypatch, m):
+    """From enough routed rows, the routed experts wait for the shared GEMMs and take the input
+    the latent chain quantized; the output equals the concurrent order's."""
+    moe_backend = "CUTEDSL"
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    logits, bias = _logits(m, seed=80 + m)
+    moe = _nvfp4_moe(moe_backend, _routing(bias))
+    runtime = _runtime(moe, logits)
+    # m * 16 routed rows on the single rank: both sizes lead at a threshold of one row.
+    monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", 1)
+    assert runtime._shared_gemms_lead(m)
+
+    quantized_inputs = []
+    real_quantize = runtime._quantize_routed_input
+
+    def counting_quantize(latent):
+        quantized_inputs.append(latent.shape[0])
+        return real_quantize(latent)
+
+    monkeypatch.setattr(runtime, "_quantize_routed_input", counting_quantize)
+    hidden = (torch.randn((m, HIDDEN), device="cuda") * 0.5).to(torch.bfloat16)
+    outputs = {}
+    for lead in (False, False, True):
+        monkeypatch.setattr(runtime, "_shared_gemms_lead", lambda num_tokens, lead=lead: lead)
+        quantized_inputs.clear()
+        with torch.inference_mode(), with_multi_stream(True):
+            routed, shared = runtime.forward_parts(hidden)
+        torch.cuda.synchronize()
+        assert quantized_inputs == ([m] if lead else [])
+        torch.testing.assert_close(shared, hidden * 0.5 + 1.0, rtol=0, atol=0)
+        outputs.setdefault(lead, []).append(routed)
+
+    # Same kernels on the same inputs: bit-identical wherever the backend reproduces itself
+    # (scatter-adds of tokens with several local experts may land in another order).
+    ids = torch.ops.trtllm.noaux_tc_op(logits, bias, 1, 1, TOP_K, SCALE)[1]
+    if torch.equal(outputs[False][0], outputs[False][1]):
+        assert torch.equal(outputs[True][0], outputs[False][0])
+    else:
+        _assert_same_rows(outputs[True][0], outputs[False][0], _local_counts(ids, 0, NUM_EXPERTS))
+
+
+@cute_dsl
+def test_grouped_gemm_backend_keeps_every_sm():
+    """The CuteDSL grouped GEMM does not shrink its grid for concurrent kernels, so the shared
+    expert keeps every SM and may lead the routed experts there."""
+    logits, bias = _logits(8, seed=95)
+    moe = _nvfp4_moe("CUTEDSL", _routing(bias))
+    assert moe.backend.reserve_sms_for_concurrent_kernels(16) == 0
+
+
+@pytest.mark.skipif(not _fc12_available(), reason="CUTEDSL_FC12 needs SM107 and CuTe DSL internal")
+@pytest.mark.parametrize("m", [8, 64])
+def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
+    """Beside the fused FC12 grid the shared expert never leads: its GEMMs keep to the SMs FC12
+    leaves free (torch's SM carveout, set only while it is issued on the side stream) and FC12
+    launches with that SM reserve. The routed output equals the unreserved kernel's."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    shared_sms = modeling_kimi_linear._SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
+    logits, bias = _logits(m, seed=97 + m)
+    moe = _nvfp4_moe("CUTEDSL_FC12", _routing(bias))
+    runtime = _runtime(moe, logits)
+    hidden = (torch.randn((m, HIDDEN), device="cuda") * 0.5).to(torch.bfloat16)
+    with torch.inference_mode(), with_multi_stream(True):
+        unreserved, _ = runtime.forward_parts(hidden)
+    torch.cuda.synchronize()
+
+    assert moe.backend.reserve_sms_for_concurrent_kernels(shared_sms) == shared_sms
+    runtime._shared_sms = shared_sms
+    monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", 1)
+    assert not runtime._shared_gemms_lead(m)
+
+    reserves = []
+    real_reserved = cute_dsl_custom_ops.reserved_max_active_clusters
+
+    def recording_reserved(full, cluster_size, reserve):
+        reserves.append(reserve)
+        return real_reserved(full, cluster_size, reserve)
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "reserved_max_active_clusters", recording_reserved)
+    carveouts = []
+    real_shared = runtime.shared_experts.forward
+
+    def recording_shared(value, final_all_reduce_params=None):
+        carveouts.append(torch._C._get_sm_carveout_experimental())
+        return real_shared(value, final_all_reduce_params)
+
+    monkeypatch.setattr(runtime.shared_experts, "forward", recording_shared)
+    before = torch._C._get_sm_carveout_experimental()
+    with torch.inference_mode(), with_multi_stream(True):
+        routed, shared = runtime.forward_parts(hidden)
+    torch.cuda.synchronize()
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    assert carveouts == [total - shared_sms]
+    assert torch._C._get_sm_carveout_experimental() == before
+    assert reserves and set(reserves) == {shared_sms}
+    torch.testing.assert_close(shared, hidden * 0.5 + 1.0, rtol=0, atol=0)
+    ids = torch.ops.trtllm.noaux_tc_op(logits, bias, 1, 1, TOP_K, SCALE)[1]
+    _assert_same_rows(routed, unreserved, _local_counts(ids, 0, NUM_EXPERTS))
+
+    # In order on one stream (no CUDA graph) there is nothing to share SMs with.
+    carveouts.clear()
+    with torch.inference_mode(), with_multi_stream(False):
+        runtime.forward_parts(hidden)
+    assert carveouts == [before]
