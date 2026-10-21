@@ -86,6 +86,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
@@ -452,6 +453,16 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         self._kv_heads_local = 0
         self._rows_per_page = 0  # pool rows of head_dim per view page: 2 * H * tpb
         self._kv_offset = 0  # the V plane's offset in the TRTLLM op's offset encoding
+
+    def _reserve_guard_page(self) -> None:
+        """No guard page: the attention backends over this cache never park page-list
+        entries on one, and ``open`` claims every page of the pool."""
+        if self._guard_page_fill:
+            logger.warning(
+                "BlockCausalKVCacheManager: TRTLLM_KV_GUARD_PAGE is ignored; this cache "
+                "does not use a guard page"
+            )
+        self._guard_page_fill = ""
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -1237,8 +1248,11 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
+        *,
+        raw_indices: bool = False,
     ) -> List[List[int]]:
-        """The rotated page table in V2's per-layer view units, one list per request.
+        """The rotated page table in V2's per-layer view units, one list per request;
+        with ``raw_indices``, as base pages (``page_table()``).
 
         Overrides the inherited accessor, which would report the pages in
         allocation order and disagree with what the attention backends read.
@@ -1249,7 +1263,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             raise ValueError(
                 f"BlockCausalKVCacheManager serves request {_ROLLOUT_REQUEST_ID} only; got {ids}"
             )
-        row = self._host_table.tolist()
+        row = self.page_table() if raw_indices else self._host_table.tolist()
         widths = [len(row)] * len(ids) if num_blocks_per_seq is None else list(num_blocks_per_seq)
         return [row[:n] for n in widths]
 

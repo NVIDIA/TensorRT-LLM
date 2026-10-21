@@ -690,8 +690,23 @@ def test_inherited_table_accessors_report_the_rotated_table(cache):
     assert two == [expected[:3], expected[:2]]
     flat = cache.get_batch_cache_indices_flat(cache.request_ids(2), [3, 2])
     assert flat.dtype == torch.int32 and flat.tolist() == expected[:3] + expected[:2]
+    raw = cache.get_batch_cache_indices(cache.request_ids(1), raw_indices=True)
+    assert raw == [cache.page_table()]
     with pytest.raises(ValueError):
         cache.get_batch_cache_indices([7])
+
+
+def test_guard_page_variable_is_ignored(monkeypatch):
+    """With TRTLLM_KV_GUARD_PAGE set the cache still builds and opens, and reserves no
+    guard page: open() claims every page of the pool."""
+    monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "nan")
+    cache = make_cache(32)
+    try:
+        assert cache.guard_page_index(0) is None
+        open_cache(cache)
+        assert len(set(cache.page_table())) == cache.num_pages
+    finally:
+        cache.shutdown()
 
 
 def test_rejects_bad_geometry():
