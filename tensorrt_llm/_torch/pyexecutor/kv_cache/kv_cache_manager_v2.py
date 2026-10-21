@@ -3883,14 +3883,11 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        if (
-            self._has_cp_helix
-            and not req.is_dummy_request
-            and req.prompt_len != req.total_input_len_cp
-        ):
+        if self._has_cp_helix and self.is_disagg and not req.is_dummy_request:
             raise ValueError(
-                "resize_context needs the full prompt under helix: a request "
-                "sliced to this rank's tokens would under-size the global ledger."
+                "resize_context is not available under disaggregated helix: "
+                "requests hold only this rank's slice of the prompt, which "
+                "would under-size the global ledger."
             )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:

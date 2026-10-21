@@ -369,12 +369,11 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
         )
 
 
-def _context_resize_mgr(cp_rank: int, cp_size: int, resizes: list) -> SimpleNamespace:
+def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
     kv = SimpleNamespace(capacity=0, resize=lambda cap: resizes.append(cap) or True)
     return SimpleNamespace(
         _has_cp_helix=True,
-        _helix_cp_rank=cp_rank,
-        _helix_cp_size=cp_size,
+        is_disagg=is_disagg,
         kv_cache_map={7: kv},
         num_extra_kv_tokens=0,
         _connector_reservations_enabled=lambda: False,
@@ -395,25 +394,28 @@ def _context_req(prompt_len: int, total_input_len_cp: int) -> SimpleNamespace:
     )
 
 
-def test_resize_context_allows_full_prompt_helix_request() -> None:
+def test_resize_context_allows_agg_helix_request() -> None:
     """An agg helix request holds the full prompt on every rank, so its
-    context target is already in global ledger tokens and is rank-invariant."""
-    cp_size = 4
+    context target is already in global ledger tokens."""
     resizes = []
-    for r in range(cp_size):
-        req = _context_req(prompt_len=200, total_input_len_cp=200)
-        assert KVCacheManagerV2.resize_context(
-            _context_resize_mgr(r, cp_size, resizes), req, num_tokens=32
-        )
-    assert resizes == [64 + 32] * cp_size
+    req = _context_req(prompt_len=200, total_input_len_cp=200)
+    assert KVCacheManagerV2.resize_context(
+        _context_resize_mgr(is_disagg=False, resizes=resizes), req, num_tokens=32
+    )
+    assert resizes == [64 + 32]
 
 
-def test_resize_context_rejects_sliced_helix_request() -> None:
+@pytest.mark.parametrize("prompt_len", [50, 200])
+def test_resize_context_rejects_disagg_helix_request(prompt_len: int) -> None:
     """A disagg helix request holds only this rank's slice of the prompt; a
-    rank-local target would under-size the global ledger."""
-    req = _context_req(prompt_len=50, total_input_len_cp=200)
-    with pytest.raises(ValueError, match="needs the full prompt"):
-        KVCacheManagerV2.resize_context(_context_resize_mgr(0, 4, []), req, num_tokens=32)
+    rank-local target would under-size the global ledger. The guard keys on
+    disagg mode, so a slice that happens to equal the full prompt (a
+    single-block prompt on rank 0) is rejected too."""
+    req = _context_req(prompt_len=prompt_len, total_input_len_cp=200)
+    with pytest.raises(ValueError, match="disaggregated helix"):
+        KVCacheManagerV2.resize_context(
+            _context_resize_mgr(is_disagg=True, resizes=[]), req, num_tokens=32
+        )
 
 
 def test_dummy_frozen_fields_sum_invariant() -> None:
