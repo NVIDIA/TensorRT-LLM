@@ -154,7 +154,7 @@ def test_optimized_two_pool_prefill_and_decode(
             runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
         )
         metadata.prepare()
-        view = metadata.mixed_precision_kv_views[0]
+        view = metadata.mixed_precision_staging
         assert view.get_buffers(0).dtype == high_torch_dtype
         q, k, v = [
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
@@ -494,7 +494,7 @@ def test_mla_cached_context_and_decode(backend):
             )
             metadata.prepare()
             if backend is TrtllmAttention:
-                view = metadata.mixed_precision_kv_views[0]
+                view = metadata.mixed_precision_staging
                 paged_context_fmha = metadata.use_paged_context_fmha
                 native_kv = metadata._swap_mixed_precision_kv(view)
                 assert metadata.kv_cache_manager is view
@@ -758,7 +758,7 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
             metadata.prepare()
             return metadata
 
-        view = make_metadata().mixed_precision_kv_views[0]
+        view = make_metadata().mixed_precision_staging
         # TRTLLM stages 32-token HND pages; every row spans the full max_seq_len.
         page_bytes = manager.kv_factor * heads_per_rank * 32 * width * 2
         assert view.max_page_bytes == page_bytes
@@ -769,7 +769,7 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
         # and reused by later metadata objects (the final engine after profiling).
         blocks = get_memory_buffers().buffers["mixed_kv_staging"]
         assert any(b.is_reserved and b.buffer.data_ptr() == staging.data_ptr() for b in blocks)
-        again = make_metadata().mixed_precision_kv_views[0]
+        again = make_metadata().mixed_precision_staging
         assert again.get_buffers(0).data_ptr() == staging.data_ptr()
         assert len(get_memory_buffers().buffers["mixed_kv_staging"]) == len(blocks)
         # The KV quota is not reduced for staging.

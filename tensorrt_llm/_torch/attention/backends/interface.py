@@ -206,19 +206,12 @@ class AttentionMetadata:
     see `TokensPrompt` for details.
     """
 
-    # Mixed-precision KV: the batch's native-dtype staging cache, keyed by every
-    # layer it serves. None when the KV cache manager has no mixed-precision
-    # layers. See prepare_mixed_precision_kv().
-    mixed_precision_kv_views: Optional[Dict[int,
-                                            "MixedPrecisionKVStaging"]] = field(
-                                                init=False,
-                                                default=None,
-                                                repr=False,
-                                                compare=False)
+    # Mixed-precision KV: the staging copy attention reads, created by the
+    # first prepare() on a manager with mixed-precision layers.
+    mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
+        init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.mixed_precision_kv_views = ({} if self._has_mixed_precision_kv()
-                                         else None)
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
             self.cross = self
@@ -371,7 +364,7 @@ class AttentionMetadata:
         from ...pyexecutor.kv_cache.mixed_precision_staging import \
             MixedPrecisionKVStaging
 
-        view = next(iter(self.mixed_precision_kv_views.values()), None)
+        view = self.mixed_precision_staging
         if view is None or not self.is_cuda_graph:
             # The eager metadata and every CUDA graph copy share the process
             # buffer pool, so the staging copy is allocated once per rank and
@@ -392,7 +385,7 @@ class AttentionMetadata:
                 f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
                 "tokens per page)",
                 key="mixed_precision_kv_staging")
-            self.mixed_precision_kv_views = dict.fromkeys(view.pools, view)
+            self.mixed_precision_staging = view
         view.update(self.request_ids,
                     self.kv_cache_params.num_cached_tokens_per_seq,
                     self.seq_lens.tolist(),
@@ -406,8 +399,10 @@ class AttentionMetadata:
     def get_mixed_precision_kv_view(
             self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
         """Return the staging cache of a mixed-precision layer, else None."""
-        views = self.mixed_precision_kv_views
-        return None if views is None else views.get(layer_idx)
+        staging = self.mixed_precision_staging
+        if staging is None or layer_idx not in staging.pools:
+            return None
+        return staging
 
     @contextlib.contextmanager
     def mixed_precision_kv_staging(self, layer_idx: int):

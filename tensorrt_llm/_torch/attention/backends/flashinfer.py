@@ -1195,7 +1195,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 layer_buffer = self.kv_cache_manager.get_buffers(layer_idx)
                 if layer_buffer is not None:
                     max_num_blocks = max(max_num_blocks, layer_buffer.shape[0])
-            if self.mixed_precision_kv_views is not None:
+            if self._has_mixed_precision_kv():
                 # The staging page space spans every sequence slot.
                 max_num_blocks = max(
                     max_num_blocks,
@@ -1225,7 +1225,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
                            get_scale(layer_idx))
-                    if (self.mixed_precision_kv_views is not None
+                    if (self._has_mixed_precision_kv()
                             and layer_offset in mgr.high_layers):
                         key = ("mixed_precision_staging", )
                     space_ids.setdefault(key, len(space_ids))
@@ -1736,7 +1736,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
-        if self.mixed_precision_kv_views is not None:
+        if self._has_mixed_precision_kv():
             self.prepare_mixed_precision_kv(
                 self.kv_layout, self.kv_cache_manager.tokens_per_block)
 
