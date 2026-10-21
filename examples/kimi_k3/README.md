@@ -40,11 +40,12 @@ architectures may be added in a future release.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem
   path).
-- A Slurm cluster with 16 NVIDIA Blackwell GPUs (GB300-class per-GPU memory
-  for DEP16 and TEP8; see Hardware support) and a TensorRT-LLM container
-  image. The image passed as `--image` below must already provide
-  TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
-  container; a build or devel image without them does not work. The Slurm
+- A Slurm cluster with 8 GB300 GPUs for TEP8, or 16 NVIDIA Blackwell GPUs
+  (GB300-class per-GPU memory for DEP16; see Hardware support), and a
+  TensorRT-LLM container image. The image passed as `--image` below must
+  already provide TensorRT-LLM's runtime dependencies, that is, a
+  release-style TensorRT-LLM container; a build or devel image without them
+  does not work. The Slurm
   scripts start a fresh container from that image. They mount the
   repository, including `.venv-3.12`, and the checkpoint, so packages installed in
   that virtual environment are available. Packages installed only in the preparation
@@ -67,6 +68,44 @@ architectures may be added in a future release.
   .venv-3.12/bin/python -m pip install fla-core einops
   ```
 ## Run the model
+
+### Optional Model Streamer weight loading
+
+Install a Model Streamer wheel that provides
+`SafetensorsStreamer.stream_files(tensor_names=...)` in the runtime used by
+every serving rank. Choose the `aarch64` or `x86_64` wheel for the worker CPU:
+
+```bash
+python -m pip install /path/to/runai_model_streamer-*.whl
+```
+
+Set `checkpoint_io_policy: model_streamer` in the `trtllm-serve --config`
+YAML to use the Kimi K3 streamer. Keep `load_format: AUTO` and
+`checkpoint_format: HF` (their defaults). Use `checkpoint_io_policy: native`
+for the standard reader, or `auto` for TRT-LLM's default I/O policy. Automatic
+selection does not enable Model Streamer.
+
+```yaml
+checkpoint_io_policy: model_streamer
+load_format: AUTO
+checkpoint_format: HF
+disable_mm_encoder: true
+```
+
+The streamer reads only tensors needed by the ranks on each node and uses
+node-local distributed loading when multiple ranks share a node. Its current
+scope is local Hugging Face safetensors checkpoints for the text Kimi K3 model.
+Set `disable_mm_encoder: true` with either I/O policy to load only the
+language model from a multimodal Kimi K3 checkpoint and serve text requests.
+
+This experimental option requires a complete checkpoint. For multi-rank MPI
+launches, it initializes a PyTorch distributed group when needed. Rank 0
+selects a fresh rendezvous address and shares it through MPI; inherited
+`MASTER_ADDR` and `MASTER_PORT` values are not used. For the quick start below, pass
+`--checkpoint-io-policy model_streamer` to the Slurm
+script after installing the wheel in the serving runtime. On 4-GPU GB300
+workers, `sbatch --nodes=2 ... --tp-size 8` selects the documented TEP8
+configuration; the script defaults to 16 GPUs on four nodes.
 
 Kimi K3 requires a multi-node launch. From the repository root, submit the
 quick-start Slurm job with the checkpoint and container paths:
