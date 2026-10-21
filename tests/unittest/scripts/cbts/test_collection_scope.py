@@ -19,6 +19,9 @@ from cbts.coverage.collection.compact_db import canonicalize_path
 from cbts.coverage.collection.pystart import PyStartTracker, read_source_config
 
 pytestmark = pytest.mark.cpu_only
+_REQUIRES_MONITORING = pytest.mark.skipif(
+    not hasattr(sys, "monitoring"), reason="sys.monitoring requires Python 3.12+"
+)
 
 
 @pytest.mark.parametrize(
@@ -39,6 +42,24 @@ def test_canonicalize_checkout_and_wheel_paths(
     absolute = str(tmp_path / path)
     assert canonicalize_path(absolute, str(tmp_path / "checkout")) == (expected or absolute)
     assert canonicalize_path("examples/x.py", str(tmp_path / "checkout")) == "examples/x.py"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("checkout/tensorrt_llm/x.py", "tensorrt_llm/x.py"),
+        ("env/lib/site-packages/tensorrt_llm/x.py", "tensorrt_llm/x.py"),
+        ("env/lib/dist-packages/tensorrt_llm/x.py", "tensorrt_llm/x.py"),
+        ("outside/x.py", None),
+    ],
+)
+def test_canonicalize_without_repository_root(
+    tmp_path: Path, path: str, expected: str | None
+) -> None:
+    """Legacy callers retain installed/source package identities without a checkout root."""
+    absolute = str(tmp_path / path)
+    assert canonicalize_path(absolute) == (expected or absolute)
+    assert canonicalize_path("examples/x.py") == "examples/x.py"
 
 
 @pytest.mark.parametrize(
@@ -70,8 +91,14 @@ def test_tracker_uses_configured_include_patterns(
 
 
 @pytest.mark.parametrize("linked_root", [False, True])
+@_REQUIRES_MONITORING
 def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_root: bool) -> None:
     """Real and symlinked filenames produce the same persisted coverage symbol."""
+    tool_id = next(
+        (slot for slot in (3, 5, 4, 2, 1, 0) if sys.monitoring.get_tool(slot) is None), None
+    )
+    if tool_id is None:
+        pytest.skip("No sys.monitoring tool ID is available")
     checkout = tmp_path / "checkout"
     source = checkout / "examples/x.py"
     source.parent.mkdir(parents=True)
@@ -80,7 +107,11 @@ def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_roo
     link.symlink_to(checkout, target_is_directory=True)
     root = link if linked_root else checkout
     tracker = PyStartTracker(
-        [str(root)], str(tmp_path), repository_root=str(root), include=["examples/*.py"]
+        [str(root)],
+        str(tmp_path),
+        tool_id=tool_id,
+        repository_root=str(root),
+        include=["examples/*.py"],
     )
     tracker.switch_test_context("test_scope")
     assert tracker.start()
@@ -194,7 +225,54 @@ def test_bootstrap_passes_scope_and_disables_on_config_errors(
         timeout=30,
     )
     if config_kind == "valid":
-        assert json.loads(result.stdout) == [True, os.path.realpath(tmp_path), ["examples/*.py"]]
+        assert json.loads(result.stdout) == [
+            hasattr(sys, "monitoring"),
+            os.path.realpath(tmp_path),
+            ["examples/*.py"],
+        ]
     else:
         assert json.loads(result.stdout) == [False, None, []]
         assert "coverage disabled" in result.stderr
+
+
+def test_worker_excludes_symlinked_repository_root_from_product_imports(tmp_path: Path) -> None:
+    """A checkout alias must not become a product import watched by an MPI worker."""
+    checkout = tmp_path / "checkout"
+    package = checkout / "fakeprod"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("value = 1\n")
+    link = tmp_path / "linked-checkout"
+    link.symlink_to(checkout, target_is_directory=True)
+    rcfile = tmp_path / ".coveragerc"
+    rcfile.write_text(
+        f"[run]\nrepository_root = {checkout}\nsource =\n    {link}/\n    {package}/\n"
+        f"data_file = {tmp_path}/.coverage.worker\n"
+    )
+    cbts_root = Path(__file__).resolve().parents[4] / "jenkins/scripts/cbts"
+    environment = dict(os.environ)
+    environment.pop("CBTS_PROCESS_ROLE", None)
+    environment.update(
+        PYTHONPATH=os.pathsep.join(
+            [str(cbts_root / "cbts_injectors"), str(cbts_root), str(checkout)]
+        ),
+        CBTS_COVERAGE_CONFIG=str(rcfile),
+    )
+    probe = (
+        "import sys; sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']; "
+        "import site; site.main(); import json, sitecustomize; "
+        "print(json.dumps(sorted(sitecustomize._product_tops))); import fakeprod; "
+        "print(json.dumps(sorted(sitecustomize._watched_imports)))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert [json.loads(line) for line in result.stdout.splitlines()] == [
+        ["fakeprod"],
+        ["mpi4py.futures"],
+    ]
