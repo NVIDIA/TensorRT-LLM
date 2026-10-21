@@ -760,6 +760,19 @@ class MoEReplicaPlan:
 
 
 @dataclass(frozen=True)
+class MoESortTables:
+    """This rank's ``moe_sort`` outputs, produced by the routing kernel itself.
+
+    ``outputs`` are the six tensors ``torch.ops.trtllm.moe_sort`` returns, in
+    its order, for the routed expert ids, the rank's expert range and
+    ``tile_size``.
+    """
+
+    tile_size: int
+    outputs: Tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 
@@ -794,6 +807,9 @@ class MoERunContext:
     prerouted: Optional[PreroutedRouting] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
+    # produced by routing when the impl's ``try_route_with_sort`` routed this
+    # forward: the ``moe_sort`` tables of ``token_selected_experts``.
+    sort_tables: Optional[MoESortTables] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

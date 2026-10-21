@@ -723,6 +723,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..kernels.blackwell.utils import TRTLLM_ENABLE_PDL, make_ptr
+    from ..moe.kernels.blackwell import kimi_k3_routing
     from ..moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
         BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
@@ -5847,6 +5848,62 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (torch.empty_like(residual), torch.empty_like(residual),
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
+
+    # Ungrouped ``noaux_tc_op`` top-16 + ``moe_sort`` (128-row tiles) of one
+    # expert-parallel rank in one launch (``kimi_k3_routing.py``); inputs as
+    # ``kimi_k3_routing.can_run`` accepts them.
+    @torch.library.custom_op("trtllm::noaux_tc_route_sort",
+                             mutates_args=(),
+                             device_types="cuda")
+    def noaux_tc_route_sort(
+        logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
+        routed_scaling_factor: float, local_expert_offset: int,
+        local_num_experts: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(topk_ids int32 [M, 16], topk_weights fp32 [M, 16], *moe_sort outputs)``.
+
+        Top-k equals ``noaux_tc_op`` (one group) on the same logits bit for bit; the six sort
+        outputs have ``moe_sort``'s shapes and dtypes for ``tile_tokens_dim=128``, only valid
+        entries are written (as in ``moe_sort``), and the rows of an expert are in ascending
+        token order.
+        """
+        m = logits.shape[0]
+        topk_ids = torch.empty((m, kimi_k3_routing.TOP_K),
+                               dtype=torch.int32,
+                               device=logits.device)
+        topk_weights = torch.empty((m, kimi_k3_routing.TOP_K),
+                                   dtype=torch.float32,
+                                   device=logits.device)
+        sort_outputs = kimi_k3_routing.sort_outputs(m, local_num_experts,
+                                                    logits.device)
+        kimi_k3_routing.run_route_sort(logits, e_score_correction_bias,
+                                       routed_scaling_factor,
+                                       local_expert_offset, local_num_experts,
+                                       topk_ids, topk_weights, sort_outputs)
+        return (topk_ids, topk_weights, *sort_outputs)
+
+    @torch.library.register_fake("trtllm::noaux_tc_route_sort")
+    def _(logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
+          routed_scaling_factor: float, local_expert_offset: int,
+          local_num_experts: int):
+        m = logits.shape[0]
+        max_tiles, max_permuted = kimi_k3_routing.sort_buffer_sizes(
+            m, local_num_experts)
+
+        def i32(*shape):
+            return logits.new_empty(shape, dtype=torch.int32)
+
+        return (
+            i32(m, kimi_k3_routing.TOP_K),
+            logits.new_empty((m, kimi_k3_routing.TOP_K), dtype=torch.float32),
+            i32(max_tiles),
+            i32(max_tiles),
+            i32(m, kimi_k3_routing.TOP_K),
+            i32(max_permuted),
+            i32(1),
+            i32(1),
+        )
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
