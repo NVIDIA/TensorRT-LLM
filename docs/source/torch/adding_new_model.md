@@ -11,6 +11,7 @@ Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 3. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
     2. [Model Definition](#model-definition)
+        1. [Multimodal Encoder Parallelism](#multimodal-encoder-parallelism)
     3. [Weight Loading](#weight-loading)
     4. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
@@ -127,6 +128,27 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+
+#### Multimodal Encoder Parallelism
+
+For models using `MultimodalModelMixin`, explicit encoder TP/DP uses the shared
+item metadata, input slicing, and encoder execution contract. Construct encoder
+front ends with `make_multimodal_encoder_model_config(model_config)` so their
+mapping is independent of the language model's attention parallelism.
+
+Implement `get_multimodal_encoder_parallel_modes(model_config)` to declare
+supported modes for each enabled logical encoder, including its projector.
+Declare `tp` when the implementation and weight loader shard weights with the
+encoder mapping, and `dp` when it supports independent replicas through the
+shared execution path. Return only encoders enabled by the config; audio and
+vision can have different capabilities. The loader checks these declarations
+before constructing weights. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
+for the configuration and an example declaration.
+
+`supports_mm_encoder_item_scheduling` describes the separate item scheduling
+contract. Shared encoder TP across attention-DP ranks requires it. Validate
+output ordering, empty-rank participation, and unsupported combinations with
+each encoder and with the model's combined modalities.
 
 ### Weight Loading
 

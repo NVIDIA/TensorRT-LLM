@@ -46,8 +46,6 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 class _EncoderDpModel(torch.nn.Module, MultimodalModelMixin):
-    supports_encoder_data_parallel = True
-
     def __init__(self, rank: int, *, enable_attention_dp: bool) -> None:
         super().__init__()
         self.model_config = ModelConfig(

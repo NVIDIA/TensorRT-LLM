@@ -87,7 +87,7 @@ from .modeling_gemma4mm import (
     Gemma4MultimodalModelBase,
     _gemma4_input_partitions,
 )
-from .modeling_multimodal_mixin import make_multimodal_encoder_model_config
+from .modeling_multimodal_mixin import EncoderParallelMode, make_multimodal_encoder_model_config
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 # Raw HF nn.LayerNorm default eps (the unified vision LayerNorms use this, NOT
@@ -254,7 +254,15 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
     """Gemma 4 12B Unified model with encoder-free multimodal projections."""
 
     supported_encoder_attention_backends = {}
-    supports_encoder_tensor_parallel = False
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {
+            name: frozenset({"dp"})
+            for name in super().get_multimodal_encoder_parallel_modes(model_config)
+        }
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
