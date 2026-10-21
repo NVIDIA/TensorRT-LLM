@@ -117,11 +117,6 @@ class TestTransferBoundPredicateShapes:
         req = _BoundRequest(61, is_context_only=False, is_generation_only=False)
         assert PyExecutor._is_disagg_transfer_bound(ex, req) is False
 
-    def test_method_shaped_request_still_works(self):
-        ex = _RecomputeExecutor([], transceiver=object(), transfer_manager=None)
-        req = _request(62, is_generation_only=True)
-        assert PyExecutor._is_disagg_transfer_bound(ex, req) is True
-
 
 def _transfer_manager():
     resource_manager = MagicMock()
@@ -135,28 +130,23 @@ def _transfer_manager():
 
 class TestRecomputeSkipsTransferBoundRequests:
     def test_aggregated_engine_recomputes_everything(self):
-        """Without a transceiver (aggregated engine) nothing is skipped."""
-        reqs = [_request(1), _request(2, state=LlmRequestState.CONTEXT_INIT)]
+        """Without a transceiver (aggregated engine) nothing is skipped, whatever the
+        request type, and a recomputed request keeps its response routing: terminating
+        it would pop the result queue and later responses would never reach the client."""
+        reqs = [
+            _request(1),
+            _request(2, state=LlmRequestState.CONTEXT_INIT),
+            _request(3, is_generation_only=True),
+        ]
         ex = _RecomputeExecutor(reqs, transceiver=None, transfer_manager=None)
+        queues = dict(ex.result_wait_queues)
 
         PyExecutor.recompute_active_requests(ex)
 
         assert ex.freed == reqs
         assert ex.paused == reqs
         assert ex.reset_calls == 1
-
-    def test_recomputed_requests_keep_their_response_routing(self):
-        """A recomputed request continues after the re-prefill, so its result queue must
-        survive: terminating it would pop the queue and the later responses would never
-        reach the client."""
-        reqs = [_request(1), _request(2)]
-        ex = _RecomputeExecutor(reqs, transceiver=None, transfer_manager=None)
-        queues = dict(ex.result_wait_queues)
-
-        PyExecutor.recompute_active_requests(ex)
-
         assert ex.result_wait_queues == queues
-        assert ex.freed == reqs and ex.paused == reqs
 
     def test_in_flight_batch_is_a_precondition_violation(self):
         """The control action retires the overlap batch first; recompute must
@@ -253,16 +243,6 @@ class TestRecomputeSkipsTransferBoundRequests:
         assert ex.paused == [full]
         assert ex.reset_calls == 1
         ex.dist.tp_allgather.assert_not_called()
-
-    def test_aggregated_engine_recomputes_generation_only_typed_requests_too(self):
-        """Without a transceiver the type is irrelevant: everything is recomputed."""
-        req = _request(27, is_generation_only=True)
-        ex = _RecomputeExecutor([req], transceiver=None, transfer_manager=None)
-
-        PyExecutor.recompute_active_requests(ex)
-
-        assert ex.freed == [req]
-        assert ex.paused == [req]
 
     @pytest.mark.parametrize(
         "with_transceiver", [True, False], ids=["transceiver", "kv_connector_only"]

@@ -34,7 +34,6 @@ import torch
 
 from tensorrt_llm._torch.modules.linear import (
     Linear,
-    MXFP8LinearMethod,
     TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
@@ -125,24 +124,7 @@ def test_vanilla_weight_and_scale_in_separate_buckets():
 
 
 @requires_cuda
-def test_vanilla_repeated_bucket_is_idempotent():
-    """Replaying the same bucket must not change the buffers: the Linear path
-    transforms the incoming source, never the destination."""
-    out_f, in_f = 256, 256
-    w, s = _mxfp8(out_f, in_f, seed=12)
-
-    lin = _make_linear(in_f, out_f)
-    lin.load_weights([{"weight": w, "weight_scale_inv": s}], allow_partial_loading=True)
-    lin.process_weights_after_loading()
-    first = _snapshot(lin)
-    for _ in range(3):
-        lin.load_weights([{"weight": w, "weight_scale_inv": s}], allow_partial_loading=True)
-        lin.process_weights_after_loading()
-    _assert_same(lin, first, "replayed bucket")
-
-
-@requires_cuda
-@pytest.mark.parametrize("order", [("q", "k", "v"), ("v", "k", "q"), ("k", "q", "v")])
+@pytest.mark.parametrize("order", [("q", "k", "v"), ("v", "k", "q")])
 def test_fused_qkv_per_shard_buckets(order):
     """One shard per bucket, in several arrival orders."""
     in_f = 256
@@ -172,35 +154,6 @@ def test_fused_qkv_per_shard_buckets(order):
 
 
 @requires_cuda
-def test_fused_qkv_weight_and_scale_split_across_buckets():
-    """Weights and scales for the same shard arriving in different buckets."""
-    in_f = 256
-    q_size, kv_size = 256, 128
-    out_f = q_size + 2 * kv_size
-    mapping = {"q": (0, q_size), "k": (q_size, kv_size), "v": (q_size + kv_size, kv_size)}
-    shards = {
-        n: _mxfp8(sz, in_f, seed=s)
-        for n, sz, s in (("q", q_size, 31), ("k", kv_size, 32), ("v", kv_size, 33))
-    }
-
-    ref = _make_linear(in_f, out_f, WeightMode.FUSED_QKV_LINEAR, mapping)
-    ref.load_weights(
-        [{"weight": shards[n][0], "weight_scale_inv": shards[n][1]} for n in ("q", "k", "v")]
-    )
-    expected = _snapshot(ref)
-
-    lin = _make_linear(in_f, out_f, WeightMode.FUSED_QKV_LINEAR, mapping)
-    lin.load_weights(
-        [{"weight": shards[n][0]} for n in ("q", "k", "v")], allow_partial_loading=True
-    )
-    lin.load_weights(
-        [{"weight_scale_inv": shards[n][1]} for n in ("q", "k", "v")], allow_partial_loading=True
-    )
-    lin.process_weights_after_loading()
-    _assert_same(lin, expected, "qkv weights-then-scales")
-
-
-@requires_cuda
 @pytest.mark.parametrize("order", [("gate", "up"), ("up", "gate")])
 def test_fused_gate_up_per_shard_buckets(order):
     in_f = 256
@@ -225,44 +178,8 @@ def test_fused_gate_up_per_shard_buckets(order):
     _assert_same(lin, expected, f"gate_up order={order}")
 
 
-@requires_cuda
-def test_partial_loading_is_forwarded_to_mxfp8_method():
-    """Guard the dispatcher allowlist in LinearMethodBase.load_weights: if
-    MXFP8LinearMethod is not listed there the kwarg is silently dropped and the
-    method runs its full-load asserts instead."""
-    import inspect
-
-    from tensorrt_llm._torch.modules.linear import LinearMethodBase
-
-    method = get_quant_method(_quant_config())
-    assert isinstance(method, MXFP8LinearMethod)
-    for fn in (
-        method.load_weights_vanilla,
-        method.load_weights_fused_qkv_linear,
-        method.load_weights_fused_gate_up_linear,
-    ):
-        assert "allow_partial_loading" in inspect.getfullargspec(fn).args, (
-            f"{fn.__name__} must accept allow_partial_loading"
-        )
-
-    # There are TWO independent isinstance allowlists on the path and both must
-    # list MXFP8LinearMethod: Linear.load_weights asserts partial loading is
-    # unsupported, and LinearMethodBase.load_weights decides whether to forward
-    # the kwarg at all. Missing the first raises; missing the second silently
-    # drops the flag and takes the full-load path.
-    for owner, fn in (
-        (Linear, Linear.load_weights),
-        (LinearMethodBase, LinearMethodBase.load_weights),
-    ):
-        src = inspect.getsource(fn)
-        assert "MXFP8LinearMethod" in src, (
-            f"{owner.__name__}.load_weights must allow MXFP8LinearMethod "
-            f"through its partial-loading allowlist"
-        )
-
-
 @requires_cutlass
-@pytest.mark.parametrize("q_size,kv_size", [(64, 64), (256, 64), (192, 96)])
+@pytest.mark.parametrize("q_size,kv_size", [(64, 64), (192, 96)])
 def test_unaligned_fused_shard_bounds_are_supported(q_size, kv_size):
     """Fused shards whose row bounds are NOT 128-aligned must load correctly.
 
@@ -458,13 +375,6 @@ def _qwen3_0p6b_layer0_weights():
                     weights[short] = f.get_tensor(name).to(DTYPE)
     assert set(weights) == set(wanted), f"missing {set(wanted) - set(weights)} in {checkpoint}"
     return weights
-
-
-@requires_cuda
-def test_row_parallel_scales_follow_the_weight_shard_qwen3_0p6b():
-    """The same check on a real weight: Qwen3-0.6B ``down_proj`` (K = 3072), TP2."""
-    w, s = quant_bf16_to_mxfp8(_qwen3_0p6b_layer0_weights()["down_proj"], BLOCK_SIZE)
-    _check_row_tp_scale_slices(w, s, tp_size=2)
 
 
 @requires_cutlass

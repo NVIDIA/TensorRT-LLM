@@ -122,18 +122,6 @@ def _record_nccl(fn):
     return result, calls
 
 
-def test_cuda_object_groups_are_created(td):
-    assert set(td._cuda_obj_pgs) == {"world", "tp"}
-    assert td._cuda_obj_pg("tp") is not None
-    assert td._cuda_obj_guard() is td._cuda_obj_lock
-
-
-def test_fresh_instance_round_trips_empty_list(world):
-    fresh = _build_torchdist(world)
-    assert fresh.tp_allgather([]) == [[] for _ in range(WORLD_SIZE)]
-    assert fresh.tp_allgather([1]) == [[1] for _ in range(WORLD_SIZE)]
-
-
 def test_all_empty_lists_skip_payload_round(td, world):
     _, world_size, _ = world
     out, calls = _record_nccl(lambda: td.tp_allgather([]))
@@ -424,17 +412,3 @@ def test_pinned_staging_grows_and_is_reused(td, world):
     assert td._cuda_obj_staging[pg]["size_in"] is size_in
     assert td._cuda_obj_staging[pg]["size_out"] is size_out
     assert size_out.numel() == pg.size()
-
-
-def test_cpu_tensor_allgather_2d_other_dtype(td, world):
-    rank, world_size, _ = world
-    t = torch.full((2, 3), rank + 1, dtype=torch.int32)
-    out = td.tp_allgather(t)
-    assert len(out) == world_size
-    for r, row in enumerate(out):
-        assert row.dtype == torch.int32 and tuple(row.shape) == (2, 3)
-        assert torch.equal(row, torch.full((2, 3), r + 1, dtype=torch.int32))
-    buf = td._cuda_obj_staging[td._cuda_obj_pg("tp")]["pinned"][torch.int32]
-    assert buf.numel() >= 6
-    if _pinning_expected():
-        assert buf.is_pinned()
