@@ -401,6 +401,15 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             fps = video_kwargs.get("fps", video_processor.fps)
             if "num_frames" in video_kwargs and "fps" not in video_kwargs:
                 fps = None
+            # Validate HF's effective targets even when sampling can be skipped.
+            if (
+                sampling_kwargs.get("do_sample_frames", True)
+                and num_frames is not None
+                and fps is not None
+            ):
+                raise ValueError(
+                    "`num_frames` and `fps` are mutually exclusive arguments, please use only one!"
+                )
             videos = []
             video_metadata = []
             for vd in video_datas:
