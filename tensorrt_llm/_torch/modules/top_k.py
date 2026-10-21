@@ -395,20 +395,19 @@ class TopK(nn.Module):
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
+            alignment_elements = 8 if scores.dtype == torch.bfloat16 else 4
             if (
                 # engine hardware-format gate (falls through otherwise):
-                # fp32 row-major scores with a float4-aligned row stride and
-                # a 16B-aligned base (the DSL paged-MQA arena view — column-
-                # sliced from a 256-aligned buffer — satisfies this; odd
-                # max_seq_len DeepGEMM layouts do not). Single-row batches
-                # derive their row window from shape[1] (arena last-row
-                # safety), so that width must satisfy the same float4 rule —
-                # otherwise run_varlen raises instead of falling through.
-                scores.dtype == torch.float32
+                # fp32/bf16 row-major scores with a 16B-aligned row stride
+                # and base. Single-row batches derive their row window from
+                # shape[1] (arena last-row safety), so that width must also
+                # satisfy the alignment rule; otherwise run_varlen raises
+                # instead of falling through.
+                scores.dtype in (torch.float32, torch.bfloat16)
                 and scores.stride(1) == 1
-                and scores.stride(0) % 4 == 0
+                and scores.stride(0) % alignment_elements == 0
                 and scores.data_ptr() % 16 == 0
-                and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
+                and (scores.shape[0] > 1 or scores.shape[1] % alignment_elements == 0)
             ):
                 # hint-free k derives from the output width; pin it to the module's k
                 assert output_indices.shape[1] == self.top_k
@@ -420,6 +419,28 @@ class TopK(nn.Module):
                     f"next_n={next_n}, hint-free).",
                     key="selfsampling_topk_engaged",
                 )
+                if self.gvr_deterministic and scores.dtype == torch.bfloat16:
+                    # The deterministic engine is FP32-only. Widen the BF16
+                    # scores (exact) into a float4-aligned FP32 view so the
+                    # requested selection and order semantics hold; the BF16
+                    # gate above (8-element row stride, 8-element single-row
+                    # width) implies the FP32 alignment rule for this view.
+                    # One num_rows x width FP32 temporary per call from the
+                    # caching allocator (CUDA-graph safe, no host reads).
+                    logger.warning_once(
+                        "deterministic self-sampling GVR top-K received BF16 "
+                        "scores; widening them to FP32 for the deterministic "
+                        "engine (one FP32 copy of the scores per call).",
+                        key="selfsampling_topk_det_bf16_widen",
+                    )
+                    num_rows, width = scores.shape
+                    widened = torch.empty(
+                        (num_rows, (width + 3) // 4 * 4),
+                        dtype=torch.float32,
+                        device=scores.device,
+                    )[:, :width]
+                    widened.copy_(scores)
+                    scores = widened
                 # Self-sampling GVR varlen engine:
                 # one launch for the batch; per-row n from device kv_lens,
                 # capture-stable tuning from the max-seq-len engine constant
