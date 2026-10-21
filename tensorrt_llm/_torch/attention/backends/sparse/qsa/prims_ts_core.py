@@ -3,6 +3,7 @@
 """PrimTS QToken-KvBlock-Sparse core attention for QSA."""
 
 import functools
+import os
 import threading
 
 import torch
@@ -12,6 +13,9 @@ from tensorrt_llm.logger import logger
 from .params import QSASparseParams
 
 _PREFILL_GROUP_SIZE = 4
+# A plan miss costs ~40 ms per layer; padding prefill rows to a bucket bounds
+# the plan keys to max_num_tokens / bucket per layer.
+_PREFILL_ROW_BUCKET = 256
 _MIN_DECODE_ROWS = 64
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
@@ -65,10 +69,11 @@ def _unsupported_reason(
 def use_prims_ts_indexer(params: QSASparseParams, q: torch.Tensor) -> bool:
     """Whether the indexer scoring runs on the PrimTS kernel instead of Triton.
 
-    Follows ``sparse_core_backend``: ``triton`` never, ``prims_ts`` always
-    (raising if unsupported), ``auto`` when the device and inputs qualify.
+    Follows ``sparse_core_backend`` unless ``TLLM_QSA_INDEXER`` overrides it:
+    ``triton`` never, ``prims_ts`` always (raising if unsupported), ``auto``
+    when the device and inputs qualify.
     """
-    backend = params.sparse_core_backend
+    backend = os.environ.get("TLLM_QSA_INDEXER", params.sparse_core_backend)
     if backend == "triton":
         return False
     reason = None
@@ -131,6 +136,24 @@ def _request_boundaries(request_indices: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _pad_rows(t: torch.Tensor, rows: int, fill: float) -> torch.Tensor:
+    padded = t.new_full((rows, *t.shape[1:]), fill)
+    padded[: t.shape[0]] = t
+    return padded
+
+
+def slice_request_boundaries(cu_seq_lens: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Request boundaries of packed rows ``[start, end)`` from host cumulative lengths."""
+    inner = cu_seq_lens[(cu_seq_lens > start) & (cu_seq_lens < end)] - start
+    return torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32),
+            inner.to(torch.int32),
+            torch.tensor([end - start], dtype=torch.int32),
+        )
+    )
+
+
 class _PrimsTSSparseCore:
     def __init__(self) -> None:
         self._plans: dict[tuple, object] = {}
@@ -161,6 +184,7 @@ class _PrimsTSSparseCore:
         max_seq_len_kv: int,
         softmax_scale: float,
         is_decode: bool,
+        request_boundaries: torch.Tensor | None = None,
     ) -> torch.Tensor:
         wrapper_cls, workspace_size, make_qo_indptr = _prims_ts_api()
         rows, num_qo_heads, head_dim = q.shape
@@ -180,6 +204,16 @@ class _PrimsTSSparseCore:
 
         request_indices = request_indices.to(torch.int32).contiguous()
         q = q.contiguous()
+        num_rows = rows
+        if not is_decode:
+            rows = -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
+            if rows != num_rows:
+                # Padding rows attend to nothing but token 0 of request 0; the
+                # suffix gets its own routes and is sliced off the output.
+                q = _pad_rows(q, rows, 0)
+                block_ids = _pad_rows(block_ids, rows, -1)
+                request_indices = _pad_rows(request_indices, rows, 0)
+                query_positions = _pad_rows(query_positions, rows, 0)
         if is_decode:
             route_q = q.view(rows, 1, 1, num_qo_heads, head_dim)
             qo_indptr = None
@@ -188,8 +222,12 @@ class _PrimsTSSparseCore:
             split_kv = True
         else:
             route_q = q
+            if request_boundaries is None:
+                # Host readback; callers with host sequence lengths pass the
+                # boundaries to keep the stream running.
+                request_boundaries = _request_boundaries(request_indices)
             qo_indptr = make_qo_indptr(
-                _request_boundaries(request_indices),
+                request_boundaries,
                 rows,
                 group_size=_PREFILL_GROUP_SIZE,
                 device=q.device,
@@ -291,7 +329,7 @@ class _PrimsTSSparseCore:
                 )
                 raise RuntimeError(f"{error}; ABI changes vs last eager run: {changed}") from error
             self._last_abi[key] = abi
-        return out
+        return out[:num_rows]
 
 
 _CORE = _PrimsTSSparseCore()
@@ -310,12 +348,14 @@ def prims_ts_sparse_gqa(
     max_seq_len_kv: int,
     softmax_scale: float,
     is_decode: bool,
+    request_boundaries: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse GQA over HND paged K/V from compact indexer block IDs.
 
     ``block_ids`` is the ``[rows, block_topk]`` Int32 Top-K output; the causal
     tail is added by the kernel. Decode rows use the fixed ``[rows,1,1,Hq,D]``
-    layout with split-KV; prefill packs rows into request-safe groups of four.
+    layout with split-KV; prefill packs rows into request-safe groups of four,
+    using host ``request_boundaries`` (Int32 offsets into the rows) when given.
     """
     return _CORE.run(
         q,
@@ -329,6 +369,7 @@ def prims_ts_sparse_gqa(
         max_seq_len_kv=max_seq_len_kv,
         softmax_scale=softmax_scale,
         is_decode=is_decode,
+        request_boundaries=request_boundaries,
     )
 
 
@@ -336,4 +377,5 @@ __all__ = [
     "prims_ts_available",
     "prims_ts_sparse_gqa",
     "resolve_sparse_core_backend",
+    "slice_request_boundaries",
 ]

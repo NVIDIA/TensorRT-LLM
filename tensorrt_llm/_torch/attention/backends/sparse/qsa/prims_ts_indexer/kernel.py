@@ -348,11 +348,11 @@ class SmemKResource(MemoryResource):
             groups_per_page = self.blocks_per_page // GROUP_ROWS
             if lane < TILE_N // GROUP_ROWS:
                 physical_page = cutlass.Int32(self.smem_pages[page_base + lane // groups_per_page])
-                row0 = physical_page * self.blocks_per_page + (lane % groups_per_page) * GROUP_ROWS
+                row0 = cutlass.Int32((lane % groups_per_page) * GROUP_ROWS)
                 prims.cp_async_bulk_tensor_shared_cta_global(
                     sk.subview(_K_GROUP_ELEMS * lane),
                     self.tma_desc_k,
-                    (cutlass.Int32(0), row0, cutlass.Int32(0)),
+                    (cutlass.Int32(0), row0, cutlass.Int32(0), physical_page),
                     stage_info.barrier,
                 )
         else:
@@ -365,7 +365,8 @@ class SmemKResource(MemoryResource):
                         (
                             cutlass.Int32(half * STAGE_K),
                             cutlass.Int32(self.compress_ratio - 1),
-                            physical_page * self.blocks_per_page,
+                            cutlass.Int32(0),
+                            physical_page,
                         ),
                         stage_info.barrier,
                     )
@@ -464,8 +465,11 @@ class TmemSResource(MemoryResource):
 
 @dataclass
 class GmemScoreResource(MemoryResource):
-    """Score sink: relu, head-sum, scale and causal mask straight from
-    registers into the fp32 score rows with 16-byte vector stores."""
+    """Score sink.
+
+    Relu, head-sum, scale and causal mask straight from registers into the
+    fp32 score rows with 16-byte vector stores.
+    """
 
     scores: cute.Tensor = field(init=False, default=None)
     positions: cute.Tensor = field(init=False, default=None)
@@ -972,7 +976,8 @@ def qsa_index_scores_host(
     num_requests: cutlass.Int32,
     max_pages: cutlass.Int32,
     max_blocks: cutlass.Int32,
-    block_rows: cutlass.Int32,
+    num_pages: cutlass.Int32,
+    page_stride: cutlass.Int32,
     num_rows: cutlass.Int32,
     n_splits: cutlass.Int32,
     scale: cutlass.Float32,
@@ -1012,28 +1017,28 @@ def qsa_index_scores_host(
         index_groups = cute.make_tensor(
             index_ptr + (compress_ratio - 1) * HEAD_DIM,
             cute.make_layout(
-                (block_rows, Q_HALVES, STAGE_K),
-                stride=(compress_ratio * HEAD_DIM, STAGE_K, 1),
+                (blocks_per_page, num_pages, Q_HALVES, STAGE_K),
+                stride=(compress_ratio * HEAD_DIM, page_stride, STAGE_K, 1),
             ),
         )
         tma_desc_k = cuda.create_tensor_map_tiled_from_view(
             index_groups,
-            box_dims=(GROUP_ROWS, Q_HALVES, STAGE_K),
-            stride_order=(2, 0, 1),
+            box_dims=(GROUP_ROWS, 1, Q_HALVES, STAGE_K),
+            stride_order=(3, 0, 2, 1),
             swizzle=cuda.TensorMapSwizzle.s128b,
         )
     else:
         index_groups = cute.make_tensor(
             index_ptr,
             cute.make_layout(
-                (block_rows, compress_ratio, HEAD_DIM),
-                stride=(compress_ratio * HEAD_DIM, HEAD_DIM, 1),
+                (blocks_per_page, num_pages, compress_ratio, HEAD_DIM),
+                stride=(compress_ratio * HEAD_DIM, page_stride, HEAD_DIM, 1),
             ),
         )
         tma_desc_k = cuda.create_tensor_map_tiled_from_view(
             index_groups,
-            box_dims=(blocks_per_page, 1, STAGE_K),
-            stride_order=(2, 1, 0),
+            box_dims=(blocks_per_page, 1, 1, STAGE_K),
+            stride_order=(3, 2, 0, 1),
             swizzle=cuda.TensorMapSwizzle.s128b,
         )
     qsa_index_scores_kernel(

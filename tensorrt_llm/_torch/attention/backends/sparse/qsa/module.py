@@ -766,6 +766,12 @@ class QSASparseHooks(AttentionSparseHooks):
             attn_metadata.qsa_block_table.shape[1] * tokens_per_block // params.compress_ratio
         )
         chunk_size = _query_chunk_size(num_tokens, score_columns)
+        if use_prims_ts:
+            from .prims_ts_core import slice_request_boundaries
+
+            cu_seq_lens = torch.cumsum(
+                attn_metadata.seq_lens[: attn_metadata.num_seqs].to(torch.int64), dim=0
+            )
         output = torch.empty_like(q)
         for start in range(0, num_tokens, chunk_size):
             end = min(start + chunk_size, num_tokens)
@@ -798,6 +804,7 @@ class QSASparseHooks(AttentionSparseHooks):
                     max_seq_len_kv=max_seq_len_kv,
                     softmax_scale=softmax_scale,
                     is_decode=False,
+                    request_boundaries=slice_request_boundaries(cu_seq_lens, start, end),
                 )
                 continue
             output[packed_slice] = qsa_sparse_gqa(

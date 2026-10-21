@@ -231,3 +231,31 @@ def test_prepared_launch_graph_replay():
     torch.cuda.synchronize()
     ref, visible = _reference(q, cache, table, pos, req, 32)
     _check(scores, ref, visible, False)
+
+
+@pytest.mark.parametrize("tokens_per_block", (16, 32))
+def test_strided_index_cache_view_is_not_copied(tokens_per_block):
+    _requires_prims_ts()
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_indexer import (
+        prepare_qsa_index_scores,
+    )
+
+    q, cache, table, pos, req = _case((200, 56), 4096, tokens_per_block, 23)
+    # The KV pool coalesces the index cache with K/V, so production views have
+    # a page stride larger than one page.
+    pool = torch.zeros(
+        (cache.shape[0], 5, *cache.shape[1:]), dtype=cache.dtype, device=cache.device
+    )
+    view = pool[:, 2]
+    view.copy_(cache)
+    assert not view.is_contiguous()
+    launch, scores = prepare_qsa_index_scores(
+        q, view, table, pos, req, tokens_per_block=tokens_per_block, compress_ratio=RATIO
+    )
+    assert any(t.data_ptr() == view.data_ptr() for t in launch.keepalive)
+    launch()
+    dense = _scorer()(
+        q, cache, table, pos, req, tokens_per_block=tokens_per_block, compress_ratio=RATIO
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(scores, dense)
