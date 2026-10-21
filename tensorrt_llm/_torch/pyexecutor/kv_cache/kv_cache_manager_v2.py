@@ -66,7 +66,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -296,7 +295,8 @@ class KVCacheLayerSpec:
     buffer_roles: tuple[DataRole, ...]
     sliding_window_size: Optional[int] = None
     num_sink_tokens: Optional[int] = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    # [agentx port] No reuse_policy field: the agentx KV bindings predate main's per-layer
+    # AttentionReusePolicy (#19727), so every layer has the default (REQUIRED) reuse.
 
     def __post_init__(self) -> None:
         if self.global_layer_id < 0:
@@ -364,6 +364,23 @@ class KVCacheLayerSpec:
     def kv_factor(self) -> int:
         """Number of data planes exposed by the layer's paged tensor view."""
         return 2 if Role.VALUE in self.buffer_roles else 1
+
+
+def _coalescing_group_kwargs(group: int) -> dict[str, int]:
+    """[agentx port] ``BufferConfig`` kwargs for a buffer's coalescing group.
+
+    The stack's C++ adds ``BufferConfig.coalescing_group``; the agentx image's
+    prebuilt bindings do not have it. Group 0 is their implicit behaviour
+    (coalesce by size alone), so the field is passed only for a nonzero group.
+    """
+    if group == 0:
+        return {}
+    if not hasattr(BufferConfig, "coalescing_group"):
+        raise NotImplementedError(
+            "NVFP4 KV layer specs need BufferConfig.coalescing_group; rebuild the "
+            "bindings with this branch's cpp/ changes"
+        )
+    return {"coalescing_group": group}
 
 
 def _swa_endpoint_priority(
@@ -623,12 +640,7 @@ def _estimate_swa_cache_size(
             elif not scratch:
                 size_per_token += layer_size
             else:
-                scratch_key = (
-                    int(window_size),
-                    layer_size,
-                    sink_blocks,
-                    layer.reuse_policy if layer else None,
-                )
+                scratch_key = (int(window_size), layer_size, sink_blocks)
                 if scratch_key in scratch_keys:
                     size_per_request += window_tokens * layer_size
                 else:
@@ -3262,7 +3274,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             size=layer.bytes_per_token(role) * tokens_per_block,
                             # Keep NVFP4 data (1), its scales (2), and other data (0)
                             # separate while preserving matching K/V page order.
-                            coalescing_group=(
+                            # [agentx port] Only NVFP4 groups reach the binding; see
+                            # _coalescing_group_kwargs.
+                            **_coalescing_group_kwargs(
                                 1 + int(role in scale_roles) if layer.dtype == DataType.NVFP4 else 0
                             ),
                         )
@@ -3271,7 +3285,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     ],
                     sliding_window_size=self.max_attention_window_vec[local_layer_id],
                     num_sink_tokens=layer.num_sink_tokens,
-                    reuse_policy=layer.reuse_policy,
                 )
                 for local_layer_id, layer in enumerate(self.layer_specs)
             ]
@@ -3374,7 +3387,6 @@ class KVCacheManagerV2(BaseResourceManager):
                             buffers=buffers,
                             sliding_window_size=layer.sliding_window_size,
                             num_sink_tokens=layer.num_sink_tokens,
-                            reuse_policy=layer.reuse_policy,
                         )
                     )
                 else:
