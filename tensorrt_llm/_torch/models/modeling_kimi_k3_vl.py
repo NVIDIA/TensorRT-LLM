@@ -36,6 +36,8 @@ reuses everything numerically identical from the K2.5 implementation:
     text backbone         | DeepseekV3ForCausalLM      | KimiLinearForCausalLM
 """
 
+from __future__ import annotations
+
 import copy
 from typing import Optional, Tuple
 
@@ -55,6 +57,7 @@ from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from ..pyexecutor.config_utils import resolve_hf_torch_dtype
+from .checkpoints.model_streamer.model_loading import ModelStreamerPlan
 from .modeling_kimi_k25 import (
     _MEDIA_PLACEHOLDER_TOKEN_ID,
     DISAGG,
@@ -492,7 +495,7 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
         # --- Vision encoder (deferred under MetaInitMode, recreated in
         # load_weights) ---
         self.mm_encoder = None
-        if not DISAGG:
+        if not DISAGG and not model_config.disable_mm_encoder:
             try:
                 mm_encoder = self._VISION_MODEL_CLS(model_config)
                 if _has_meta_tensors(mm_encoder):
@@ -543,3 +546,45 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     # load_weights is inherited from KimiK25ForConditionalGeneration: the
     # MetaInitMode deferral/recreation logic is identical and constructs the
     # tower via _VISION_MODEL_CLS, which this class overrides above.
+
+    def plan_model_streamer_load(self, checkpoint_keys: set[str]) -> ModelStreamerPlan:
+        """Tell the streaming code which text and vision tensors to stream and how to load them.
+
+        Called by `load_weights_with_model_streamer` for
+        ``checkpoint_io_policy="model_streamer"``. Takes the text model's plan
+        from `KimiLinearForCausalLM.plan_model_streamer_load()` and adds one
+        group with every vision and projector tensor, which
+        ``mm_encoder.load_weights()`` loads together. Every rank keeps the whole
+        vision encoder, so all ranks need the same vision tensors, and they
+        stream together with the text tensors.
+
+        Without a vision encoder (``disable_mm_encoder`` or disaggregated
+        serving), the plan holds only the text tensors.
+
+        Args:
+            checkpoint_keys: names of all tensors in the checkpoint, e.g.
+                ``{"language_model.lm_head.weight", "vision_tower.<name>", "mm_projector.<name>", ...}``.
+
+        Raises:
+            - If the model has a vision encoder but the checkpoint has no
+              vision tensors (KeyError).
+        """
+        plan: ModelStreamerPlan = self.llm.plan_model_streamer_load(checkpoint_keys)
+        # Build the vision encoder if meta init deferred it.
+        self._ensure_mm_encoder()
+        if self.mm_encoder is not None:
+            # Name prefixes of vision encoder and projector tensors.
+            vision_prefixes = (
+                "vision_tower.",
+                "visual.",
+                "vision_model.",
+                "mm_projector.",
+                "mlp1.",
+            )
+            vision_keys: set[str] = {
+                key for key in checkpoint_keys if key.startswith(vision_prefixes)
+            }
+            if not vision_keys:
+                raise KeyError("Kimi K3 Model Streamer found no vision weights")
+            plan.groups.append((vision_keys, self.mm_encoder.load_weights))
+        return plan
