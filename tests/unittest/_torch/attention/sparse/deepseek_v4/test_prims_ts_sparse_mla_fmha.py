@@ -145,6 +145,55 @@ def test_pool_view_cache_follows_the_owning_manager() -> None:
     assert tuple(fmha._pool_view(third, DeepseekV4AttentionType.SWA, 1).shape) == (4, 1, LATENT)
 
 
+def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
+    """Layers with one static profile share one plan via ``metadata.fmha_plan_caches``.
+
+    The plan owns the kernel workspace, so caching it per layer would keep one
+    workspace per layer per CUDA-graph geometry; the metadata cache (the
+    convention of the block-sparse and FlashInfer wrappers) keeps one per
+    profile, and layers sharing a metadata object run serially.
+    """
+    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
+
+    planned = []
+
+    class _FakeWrapper:
+        def plan(self, device, rows, heads, **kwargs):
+            planned.append((device, rows, heads, kwargs))
+
+    monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
+
+    class _Attn:  # weak-referenceable stand-in for TrtllmAttention
+        num_heads = 16
+        sparse_attention_config = SimpleNamespace(window_size=128)
+
+    attn_a, attn_b = _Attn(), _Attn()
+    layer_a, layer_b = PrimsTSSparseMlaFmha(attn_a), PrimsTSSparseMlaFmha(attn_b)
+    metadata = SimpleNamespace(fmha_plan_caches={})
+    profile = dict(
+        metadata=metadata,
+        device=torch.device("cuda"),
+        rows=4,
+        extra=256,
+        q_dtype=torch.bfloat16,
+        has_sinks=False,
+        fused_groups=None,
+    )
+    plan_a = layer_a._get_plan(**profile)
+    plan_b = layer_b._get_plan(**profile)
+    assert plan_a is plan_b
+    assert len(planned) == 1
+    assert planned[0][3]["max_topk"] == 128 and planned[0][3]["max_extra_topk"] == 256
+    cache = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.PLAN_CACHE_KEY]
+    assert list(cache.values()) == [plan_a]
+
+    other = layer_a._get_plan(**{**profile, "extra": 0})
+    assert other is not plan_a
+    assert other.extra_lengths is None
+    assert len(planned) == 2
+    assert len(cache) == 2
+
+
 def _rope_table(max_positions: int, device: torch.device) -> torch.Tensor:
     """Forward [cos(32), sin(32)] rows, the layout both kernels consume."""
     inv_freq = 1.0 / (

@@ -121,12 +121,14 @@ class PrimsTSSparseMlaFmha(Fmha):
 
     # The native kernel reads one KV head of 512 channels per selected token.
     MAX_HEADS = 128
+    # Plans live in ``TrtllmAttentionMetadata.fmha_plan_caches`` under this key,
+    # like the block-sparse and FlashInfer wrappers: every layer that runs with
+    # one metadata object plans each static profile once and reuses its
+    # workspace, and layers sharing a metadata object execute serially.
+    PLAN_CACHE_KEY = "prims_ts_sparse_mla"
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
-        # Plans are keyed by the execution profile that changes kernel
-        # selection or buffer geometry: query rows, dtype, sinks, fusion.
-        self._plans: dict[tuple, _SparsePlan] = {}
         # FP8 dequantization scales are fixed per layer; the wrapper takes host
         # scalars, so read them once during eager warmup, never under capture.
         self._kv_dequant_scale: Optional[float] = None
@@ -418,6 +420,7 @@ class PrimsTSSparseMlaFmha(Fmha):
     def _get_plan(
         self,
         *,
+        metadata: "TrtllmAttentionMetadata",
         device: torch.device,
         rows: int,
         extra: int,
@@ -425,6 +428,12 @@ class PrimsTSSparseMlaFmha(Fmha):
         has_sinks: bool,
         fused_groups: Optional[int],
     ) -> _SparsePlan:
+        """Return the metadata-cached plan for this static profile, planning it once.
+
+        The key holds every value that changes kernel selection or buffer
+        geometry: device, query rows, extra capacity, heads, window, dtype,
+        sinks, fusion groups. One plan serves every layer with that profile.
+        """
         from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
             BatchSparseMLADecodePagedTSWrapper,
         )
@@ -432,8 +441,9 @@ class PrimsTSSparseMlaFmha(Fmha):
         attn = self.attn
         heads = int(attn.num_heads)
         window = int(attn.sparse_attention_config.window_size)
-        key = (rows, extra, q_dtype, has_sinks, fused_groups)
-        plan = self._plans.get(key)
+        key = (device, rows, extra, heads, window, q_dtype, has_sinks, fused_groups)
+        cache = metadata.fmha_plan_caches.setdefault(self.PLAN_CACHE_KEY, {})
+        plan = cache.get(key)
         if plan is not None:
             return plan
         if torch.cuda.is_current_stream_capturing():
@@ -474,7 +484,7 @@ class PrimsTSSparseMlaFmha(Fmha):
                 torch.empty((rows,), device=device, dtype=torch.int32) if extra else None
             ),
         )
-        self._plans[key] = plan
+        cache[key] = plan
         return plan
 
     # ------------------------------------------------------------------ forward
@@ -530,6 +540,7 @@ class PrimsTSSparseMlaFmha(Fmha):
 
         sinks = self._sinks(forward_args)
         plan = self._get_plan(
+            metadata=metadata,
             device=q.device,
             rows=rows,
             extra=extra,
@@ -571,8 +582,9 @@ class PrimsTSSparseMlaFmha(Fmha):
         else:
             run_kwargs["out"] = output.view(rows, 1, heads, _LATENT_DIM)
 
-        # Validate the index contract once per plan while still eager; graph
-        # replay must keep validation off because it synchronizes.
+        # Validate the index contract once per plan (the first layer that uses
+        # it) while still eager; graph replay must keep validation off because
+        # it synchronizes.
         validate = not plan.validated and not torch.cuda.is_current_stream_capturing()
         plan.wrapper.run(
             query,
