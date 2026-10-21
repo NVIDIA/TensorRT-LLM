@@ -28,8 +28,10 @@ from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
 from .request_mapping import (
-    _input_from_request,
+    _load_prepared_input,
     _metadata_from_context,
+    _prepare_input_from_request,
+    _validate_media_placeholders,
     conversation_affinity_enabled,
     conversation_params_from_request,
     media_capabilities_for_model,
@@ -48,17 +50,29 @@ class _LocalRequest:
     """Abort-aware local request state spanning mapping and generation."""
 
     def __init__(self) -> None:
-        self.handle: Any = None
+        self.mapping_task: asyncio.Task[Any] | None = None
+        self.engine_handle: Any = None
         self.aborted = False
 
-    def bind(self, handle: Any) -> None:
-        self.handle = handle
+    def bind_mapping(self, task: asyncio.Task[Any]) -> None:
+        self.mapping_task = task
+        if self.aborted:
+            task.cancel()
+
+    def clear_mapping(self, task: asyncio.Task[Any]) -> None:
+        if self.mapping_task is task:
+            self.mapping_task = None
+
+    def bind_engine(self, handle: Any) -> None:
+        self.engine_handle = handle
         if self.aborted:
             handle.abort()
 
     def abort(self) -> None:
-        if self.handle is not None:
-            self.handle.abort()
+        if self.engine_handle is not None:
+            self.engine_handle.abort()
+        if self.mapping_task is not None:
+            self.mapping_task.cancel()
         self.aborted = True
 
 
@@ -162,6 +176,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 )
             if self._frontend is not None:
                 reservation = await self._frontend.reserve(request.request_id)
+                reservation.bind(local_request)
             async with aclosing(
                 self._generate(request, context, local_request, registration, reservation)
             ) as responses:
@@ -207,7 +222,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if request.kv.HasField("bypass_prefix_cache") and request.kv.bypass_prefix_cache:
                     raise UnsupportedFeatureError("prefix cache bypass is not supported")
 
-            inputs = await _input_from_request(request, self._llm, self._media_capabilities)
+            prepared_input = _prepare_input_from_request(
+                request, self._llm, self._media_capabilities
+            )
             sampling_params = sampling_params_from_request(request, self._guided_backend)
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
@@ -259,11 +276,48 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if request.HasField("kv") and request.kv.HasField("cache_salt")
                 else None
             )
+
+            async def prepare_inputs() -> Any:
+                if prepared_input.media:
+                    await asyncio.to_thread(_validate_media_placeholders, prepared_input, self._llm)
+                inputs = await _load_prepared_input(prepared_input, self._llm)
+                if prepared_input.media:
+                    return await asyncio.to_thread(
+                        self._llm.preprocess, inputs, sampling_params, disaggregated_params
+                    )
+                return inputs
+
+            mapping_task = asyncio.create_task(prepare_inputs())
+            local_request.bind_mapping(mapping_task)
+            try:
+                # wait() reports child cancellation as completion; RPC cancellation
+                # raises here instead, so the two paths remain distinguishable.
+                await asyncio.wait((mapping_task,))
+                if mapping_task.cancelled() and local_request.aborted:
+                    await context.abort(
+                        grpc.StatusCode.CANCELLED, "Request aborted before submission"
+                    )
+                    return
+                try:
+                    inputs = mapping_task.result()
+                except (UnsupportedFeatureError, MediaUnavailableError, ValueError):
+                    raise
+                except Exception as error:
+                    # Unexpected preparation failures are worker errors, not bad inputs.
+                    logger.error(f"OpenEngine request {request_id} could not be prepared: {error}")
+                    await context.abort(grpc.StatusCode.INTERNAL, str(error))
+                    return
+            except asyncio.CancelledError:
+                mapping_task.cancel()
+                await asyncio.gather(mapping_task, return_exceptions=True)
+                raise
+            finally:
+                local_request.clear_mapping(mapping_task)
         except UnsupportedFeatureError as error:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(error))
             return
         except MediaUnavailableError as error:
-            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
             return
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
@@ -316,9 +370,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
 
-        local_request.bind(result_handle)
-        if reservation is not None:
-            reservation.bind(result_handle)
+        local_request.bind_engine(result_handle)
 
         engine_terminal = False
         abort_requested = False

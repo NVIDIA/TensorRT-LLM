@@ -4,6 +4,8 @@
 """Unit tests for OpenEngine image input mapping and discovery."""
 
 import asyncio
+import re
+import threading
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -17,8 +19,9 @@ grpc = pytest.importorskip(
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.request_mapping as request_mapping  # noqa: E402
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import generation_pb2, model_pb2  # noqa: E402
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
+from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
@@ -26,6 +29,7 @@ from tensorrt_llm.inputs.registry import (  # noqa: E402
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
 )
+from tensorrt_llm.llmapi.llm import PreprocessedInputs  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,7 +39,12 @@ def _ignore_synthetic_decoded_size(monkeypatch) -> None:
     monkeypatch.setitem(
         request_mapping._MEDIA_HANDLERS,
         generation_pb2.MODALITY_IMAGE,
-        request_mapping._MediaHandler(handler.name, handler.loader_factory, lambda _decoded: 0),
+        request_mapping._MediaHandler(
+            handler.name,
+            handler.validate,
+            handler.loader_factory,
+            lambda _decoded: 0,
+        ),
     )
 
 
@@ -78,6 +87,13 @@ class _ImageInputProcessor(BaseMultimodalInputProcessor):
 
 
 class _Tokenizer:
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        del add_special_tokens
+        return [
+            1000 + int(token[7:-1]) if token.startswith("<image_") else ord(token)
+            for token in re.findall(r"<image_\d+>|.", text, re.DOTALL)
+        ]
+
     def convert_ids_to_tokens(
         self, token_ids: Sequence[int], skip_special_tokens: bool = False
     ) -> list[str]:
@@ -142,6 +158,50 @@ class _ImageLlm:
         self.generate_kwargs = kwargs
         return self.result_handle
 
+    def preprocess(self, inputs, sampling_params, disaggregated_params):
+        return inputs
+
+
+class _Reservation:
+    def __init__(self) -> None:
+        self.handle: Any = None
+        self.aborted = False
+        self.released = False
+        self._release_task: asyncio.Task[None] | None = None
+
+    def bind(self, handle: Any) -> None:
+        self.handle = handle
+        if self.aborted:
+            handle.abort()
+
+    def abort(self) -> bool:
+        if self.handle is not None:
+            self.handle.abort()
+        self.aborted = True
+        return True
+
+    def release(self) -> asyncio.Task[None]:
+        async def mark_released() -> None:
+            self.released = True
+
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(mark_released())
+        return self._release_task
+
+
+class _Frontend:
+    def __init__(self, abort_before_bind: bool = False) -> None:
+        self.abort_before_bind = abort_before_bind
+        self.reservations: list[_Reservation] = []
+
+    async def reserve(self, _request_id: str) -> _Reservation:
+        reservation = _Reservation()
+        self.reservations.append(reservation)
+        if self.abort_before_bind:
+            self.abort_before_bind = False
+            reservation.abort()
+        return reservation
+
 
 @pytest.fixture
 def image_llm(monkeypatch):
@@ -179,6 +239,41 @@ def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
         ).modalities
         == set()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_disabled_mm_encoder_agrees_between_discovery_and_generate(image_llm, disabled):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm.args.disable_mm_encoder = disabled
+    llm.args.reasoning_parser = None
+    llm.args.max_seq_len = 2048
+    inference = OpenEngineInferenceServicer(llm, model="image-model")
+    control = OpenEngineControlServicer(llm, "image-model", inference)
+
+    info = await control.GetModelInfo(
+        model_pb2.GetModelInfoRequest(model="image-model"), FakeServicerContext()
+    )
+
+    assert info.supports_multimodal is (not disabled)
+    assert list(info.extra["trtllm_supported_modalities"]) == ([] if disabled else ["image"])
+    if disabled:
+        context = FakeServicerContext()
+        request = generation_pb2.GenerateRequest(
+            request_id="disabled-encoder",
+            model="image-model",
+            prompt="<image_1>",
+            media=[
+                generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+            ],
+        )
+        with pytest.raises(AbortError):
+            async for _ in inference.Generate(request, context):
+                pass
+        assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+        assert llm.generate_kwargs is None
+        assert inference.active_request_count() == 0
 
 
 def test_media_capabilities_are_hashable():
@@ -219,7 +314,12 @@ async def test_handler_table_drives_capability_and_mapping(image_llm, monkeypatc
     monkeypatch.setitem(
         request_mapping._MEDIA_HANDLERS,
         generation_pb2.MODALITY_VIDEO,
-        request_mapping._MediaHandler("video", video_loader_factory, lambda decoded: len(decoded)),
+        request_mapping._MediaHandler(
+            "video",
+            lambda _item, _index: None,
+            video_loader_factory,
+            lambda decoded: len(decoded),
+        ),
     )
     monkeypatch.setattr(
         MULTIMODAL_PLACEHOLDER_REGISTRY,
@@ -327,6 +427,151 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
         {"modality": "image", "index": 1, "placeholder": "<image_2>"},
         {"modality": "image", "index": 2, "placeholder": "<image_3>"},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid_case", "metadata", "expected_code"),
+    [
+        ("sampling", (), grpc.StatusCode.INVALID_ARGUMENT),
+        ("metadata", (("openengine-priority", "1"),), grpc.StatusCode.UNIMPLEMENTED),
+        (
+            "affinity",
+            (("x-trtllm-subagent-affinity-id", "parent"),),
+            grpc.StatusCode.INVALID_ARGUMENT,
+        ),
+        ("rank", (("openengine-target-dp-rank", "1"),), grpc.StatusCode.INVALID_ARGUMENT),
+    ],
+)
+async def test_request_validation_precedes_media_loading(
+    image_llm, monkeypatch, invalid_case, metadata, expected_code
+):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            raise AssertionError("media loading must not start for an invalid request")
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    request = generation_pb2.GenerateRequest(
+        request_id=f"invalid-{invalid_case}",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+        ],
+    )
+    if invalid_case == "sampling":
+        request.sampling.num_sequences = 0
+    context = FakeServicerContext(metadata=metadata)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+
+    with pytest.raises(AbortError):
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    assert context.abort_code == expected_code
+    assert llm.generate_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_capability_error_precedes_other_request_validation(image_llm):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="unsupported-video",
+        model="image-model",
+        prompt="video",
+        sampling=generation_pb2.SamplingParams(num_sequences=0),
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                raw_bytes=b"video",
+            )
+        ],
+    )
+    context = FakeServicerContext()
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+
+    with pytest.raises(AbortError):
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+    assert "video" in context.abort_details
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        {},
+        {"url": "https://"},
+        {"url": "https://example.com:bad/image"},
+        {"url": "https://example.com:65536/image"},
+        {"url": "https://[invalid/image"},
+        {"data_uri": "data:image/png;base64"},
+        {"data_uri": "data:image/png;base64,"},
+        {"data_uri": "data:image/png,AAAA"},
+        {"data_uri": "data:audio/wav;base64,AAAA"},
+    ],
+)
+async def test_all_media_descriptions_are_validated_before_loading(image_llm, monkeypatch, source):
+    llm, _ = image_llm
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            raise AssertionError("media loading must not start before every item is valid")
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    request = generation_pb2.GenerateRequest(
+        prompt="images",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"valid",
+            ),
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, **source),
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"media\[1\]"):
+        await request_mapping._input_from_request(request, llm)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"url": "https://example.com/image.png"},
+        {"url": "https://example.com:8443/image.png"},
+        {"data_uri": "data:image/png;base64,AAAA"},
+        {"data_uri": "data:;base64,AAAA"},
+        {"raw_bytes": b"image", "mime_type": "image/png"},
+    ],
+)
+def test_media_description_validation_accepts_supported_sources(image_llm, source):
+    llm, _ = image_llm
+    request = generation_pb2.GenerateRequest(
+        prompt="image",
+        media=[generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, **source)],
+    )
+
+    prepared = request_mapping._prepare_input_from_request(request, llm)
+
+    assert len(prepared.media) == 1
+    assert prepared.media[0][0] == request.media[0]
 
 
 @pytest.mark.asyncio
@@ -534,7 +779,7 @@ async def test_generate_submits_image_and_reports_expanded_prompt_usage(image_ll
     request = generation_pb2.GenerateRequest(
         request_id="image-request",
         model="image-model",
-        token_ids=generation_pb2.TokenIds(ids=[1, 2]),
+        token_ids=generation_pb2.TokenIds(ids=[1001, 2]),
         media=[
             generation_pb2.MediaItem(
                 modality=generation_pb2.MODALITY_IMAGE,
@@ -551,15 +796,111 @@ async def test_generate_submits_image_and_reports_expanded_prompt_usage(image_ll
 
 
 @pytest.mark.asyncio
-async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, monkeypatch):
+@pytest.mark.parametrize("input_kind", ["prompt", "token_ids"])
+@pytest.mark.parametrize(
+    "shape", ["missing", "duplicate", "extra_bare_pad", "unexpected_video_pad"]
+)
+async def test_placeholder_mismatch_does_not_poison_hashing(
+    image_llm, monkeypatch, input_kind, shape
+):
+    import torch
+
     capability_llm, _ = image_llm
-    llm = _ImageLlm(
-        capability_llm.input_processor,
-        capability_llm._hf_model_config,
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    processor = llm.input_processor
+    processor.multimodal_hashing_supported = None
+    monkeypatch.setattr(processor, "get_mm_token_ids", lambda: torch.tensor([21, 23]))
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda _model_type, _modality: "<|vision_start|><|image_pad|><|vision_end|>",
     )
-    load_started = asyncio.Event()
-    release_load = asyncio.Event()
-    load_count = 0
+
+    class _QwenTokenizer(_Tokenizer):
+        def encode(self, text, add_special_tokens=True):
+            ids = {
+                "<|vision_start|>": 20,
+                "<|image_pad|>": 21,
+                "<|vision_end|>": 22,
+                "<|video_pad|>": 23,
+            }
+            return [ids.get(token, 0) for token in re.findall(r"<\|[^>]+\|>|.", text)]
+
+    llm.tokenizer = _QwenTokenizer()
+    placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    prompts = {
+        "missing": "describe",
+        "duplicate": placeholder * 2,
+        "extra_bare_pad": placeholder + "<|image_pad|>",
+        "unexpected_video_pad": placeholder + "<|video_pad|>",
+    }
+    decoder_creations = 0
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            nonlocal decoder_creations
+            decoder_creations += 1
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    def preprocess(inputs, sampling_params, disaggregated_params):
+        processor.multimodal_hashing_supported = True
+        return inputs
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(llm, "preprocess", preprocess)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="placeholder-validation",
+        model="image-model",
+        media=[
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+        ],
+    )
+
+    def set_input(prompt):
+        if input_kind == "prompt":
+            request.prompt = prompt
+        else:
+            request.token_ids.CopyFrom(generation_pb2.TokenIds(ids=llm.tokenizer.encode(prompt)))
+
+    set_input(prompts[shape])
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "placeholder" in context.abort_details
+    assert processor.multimodal_hashing_supported is None
+    assert decoder_creations == 0
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
+
+    set_input(placeholder)
+    responses = [response async for response in servicer.Generate(request, FakeServicerContext())]
+    assert responses
+    assert decoder_creations == 1
+    assert processor.multimodal_hashing_supported is True
+    assert servicer.active_request_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["complete", "local_abort", "coordinator_abort", "rpc_cancel"])
+async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monkeypatch, outcome):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    loop = asyncio.get_running_loop()
+    serving_thread = threading.get_ident()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+    preprocessed = PreprocessedInputs(prompt_token_ids=[1, 2, 3])
+    preprocess_calls = []
+    submitted = []
 
     class _ImageIo:
         @classmethod
@@ -567,11 +908,169 @@ async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, mon
             return cls()
 
         async def async_load_bytes(self, data):
-            nonlocal load_count
-            load_count += 1
-            load_started.set()
-            await release_load.wait()
             return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    def preprocess(inputs, sampling_params, disaggregated_params):
+        assert threading.get_ident() != serving_thread
+        preprocess_calls.append(inputs)
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(timeout=5), "test must release the preprocessing thread"
+            return preprocessed
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    def generate_async(**kwargs):
+        assert threading.get_ident() == serving_thread
+        submitted.append(kwargs["inputs"])
+        return llm.result_handle
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(llm, "preprocess", preprocess)
+    monkeypatch.setattr(llm, "generate_async", generate_async)
+    frontend = _Frontend()
+    servicer = OpenEngineInferenceServicer(llm, model="image-model", frontend=frontend)
+    request = generation_pb2.GenerateRequest(
+        request_id="preprocessing",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+        ],
+    )
+    context = FakeServicerContext()
+
+    async def collect():
+        return [response async for response in servicer.Generate(request, context)]
+
+    task = asyncio.create_task(collect())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        text_request = generation_pb2.GenerateRequest(
+            request_id="concurrent-text", model="image-model", prompt="hello"
+        )
+
+        async def collect_text():
+            return [
+                response
+                async for response in servicer.Generate(text_request, FakeServicerContext())
+            ]
+
+        assert await asyncio.wait_for(collect_text(), timeout=1)
+        assert submitted == ["hello"]
+        if outcome == "complete":
+            release.set()
+            assert await asyncio.wait_for(task, timeout=2)
+            assert submitted[1] is preprocessed
+        elif outcome == "rpc_cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+            assert context.abort_code is None
+        else:
+            if outcome == "local_abort":
+                assert servicer.abort_request_by_id(request.request_id)
+            else:
+                assert frontend.reservations[0].abort()
+            with pytest.raises(AbortError):
+                await asyncio.wait_for(task, timeout=1)
+            assert context.abort_code == grpc.StatusCode.CANCELLED
+    finally:
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=2)
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert len(preprocess_calls) == 1
+    assert len(submitted) == (2 if outcome == "complete" else 1)
+    assert servicer.active_request_count() == 0
+    if outcome != "complete":
+        monkeypatch.setattr(llm, "preprocess", lambda *args: preprocessed)
+        responses = [
+            response async for response in servicer.Generate(request, FakeServicerContext())
+        ]
+        assert responses
+        assert submitted[-1] is preprocessed
+        assert len(submitted) == 2
+        assert servicer.active_request_count() == 0
+    assert all(reservation.released for reservation in frontend.reservations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (ValueError("invalid processor input"), grpc.StatusCode.INVALID_ARGUMENT),
+        (TypeError("processor contract changed"), grpc.StatusCode.INTERNAL),
+        (RuntimeError("processor failed"), grpc.StatusCode.INTERNAL),
+    ],
+)
+async def test_preprocessing_errors_are_classified(image_llm, monkeypatch, error, expected_code):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    def preprocess(*args):
+        raise error
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(llm, "preprocess", preprocess)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="preprocess-error",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+        ],
+    )
+    context = FakeServicerContext()
+
+    with pytest.raises(AbortError):
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    assert context.abort_code == expected_code
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, monkeypatch):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+    load_started = asyncio.Event()
+    load_cancelled = asyncio.Event()
+    load_count = 0
+    block_load = True
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            nonlocal block_load, load_count
+            load_count += 1
+            if not block_load:
+                return np.zeros((1, 1, 3), dtype=np.uint8)
+            load_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                load_cancelled.set()
+                raise
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
     servicer = OpenEngineInferenceServicer(llm, model="image-model")
@@ -594,21 +1093,157 @@ async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, mon
     first = asyncio.create_task(collect(first_context))
     await load_started.wait()
     duplicate_context = FakeServicerContext()
-    try:
-        with pytest.raises(AbortError):
-            await asyncio.wait_for(collect(duplicate_context), timeout=1)
-        assert duplicate_context.abort_code == grpc.StatusCode.ALREADY_EXISTS
-        assert load_count == 1
-        assert servicer.active_request_count() == 1
-        assert servicer.abort_request_by_id(request.request_id)
-    finally:
-        release_load.set()
-        first_outcome = await asyncio.gather(first, return_exceptions=True)
+    with pytest.raises(AbortError):
+        await asyncio.wait_for(collect(duplicate_context), timeout=1)
+    assert duplicate_context.abort_code == grpc.StatusCode.ALREADY_EXISTS
+    assert load_count == 1
+    assert servicer.active_request_count() == 1
+    assert servicer.abort_request_by_id(request.request_id)
+    first_outcome = await asyncio.wait_for(asyncio.gather(first, return_exceptions=True), timeout=1)
 
     assert isinstance(first_outcome[0], AbortError)
     assert first_context.abort_code == grpc.StatusCode.CANCELLED
+    assert load_cancelled.is_set()
     assert llm.generate_kwargs is None
     assert servicer.active_request_count() == 0
+
+    block_load = False
+    responses = await collect(FakeServicerContext())
+    assert responses
+    assert servicer.active_request_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_path", ["coordinator", "rpc", "coordinator_and_rpc"])
+async def test_media_loading_stops_for_coordinator_abort_or_rpc_cancellation(
+    image_llm, monkeypatch, cancel_path
+):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+    load_started = asyncio.Event()
+    load_cancelled = asyncio.Event()
+    block_load = True
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            if not block_load:
+                return np.zeros((1, 1, 3), dtype=np.uint8)
+            load_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                load_cancelled.set()
+                raise
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    frontend = _Frontend()
+    servicer = OpenEngineInferenceServicer(llm, model="image-model", frontend=frontend)
+    request = generation_pb2.GenerateRequest(
+        request_id=f"{cancel_path}-during-media",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+        ],
+    )
+
+    async def collect(context):
+        return [response async for response in servicer.Generate(request, context)]
+
+    context = FakeServicerContext()
+    task = asyncio.create_task(collect(context))
+    await load_started.wait()
+    if cancel_path == "coordinator":
+        assert frontend.reservations[0].abort()
+        with pytest.raises(AbortError):
+            await asyncio.wait_for(task, timeout=1)
+        assert context.abort_code == grpc.StatusCode.CANCELLED
+    else:
+        if cancel_path == "coordinator_and_rpc":
+            assert frontend.reservations[0].abort()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert context.abort_code is None
+
+    assert load_cancelled.is_set()
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
+    assert frontend.reservations[0].released
+
+    block_load = False
+    responses = await collect(FakeServicerContext())
+    assert responses
+    assert servicer.active_request_count() == 0
+    assert len(frontend.reservations) == 2
+    assert all(reservation.released for reservation in frontend.reservations)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_abort_before_reservation_binding_prevents_media_loading(
+    image_llm, monkeypatch
+):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+    decoder_creations = 0
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            nonlocal decoder_creations
+            decoder_creations += 1
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    frontend = _Frontend(abort_before_bind=True)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model", frontend=frontend)
+    request = generation_pb2.GenerateRequest(
+        request_id="abort-before-bind",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+        ],
+    )
+
+    async def collect(context):
+        return [response async for response in servicer.Generate(request, context)]
+
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await collect(context)
+
+    assert context.abort_code == grpc.StatusCode.CANCELLED
+    assert decoder_creations == 0
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
+    assert frontend.reservations[0].released
+
+    responses = await collect(FakeServicerContext())
+    assert responses
+    assert decoder_creations == 1
+    assert servicer.active_request_count() == 0
+    assert len(frontend.reservations) == 2
+    assert all(reservation.released for reservation in frontend.reservations)
 
 
 @pytest.mark.asyncio
@@ -657,7 +1292,12 @@ async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
 
 
 @pytest.mark.asyncio
-async def test_generate_maps_transient_media_fetch_to_unavailable(image_llm, monkeypatch):
+@pytest.mark.parametrize(
+    "message", ["connection timed out", "remote media server returned HTTP 503"]
+)
+async def test_generate_maps_transient_media_fetch_to_failed_precondition(
+    image_llm, monkeypatch, message
+):
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
@@ -670,7 +1310,7 @@ async def test_generate_maps_transient_media_fetch_to_unavailable(image_llm, mon
             return cls()
 
         async def async_load(self, source):
-            raise MediaFetchError("connection timed out")
+            raise MediaFetchError(message)
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
     servicer = OpenEngineInferenceServicer(llm, model="image-model")
@@ -678,7 +1318,7 @@ async def test_generate_maps_transient_media_fetch_to_unavailable(image_llm, mon
     request = generation_pb2.GenerateRequest(
         request_id="remote-image",
         model="image-model",
-        prompt="image",
+        prompt="<image_1>",
         media=[
             generation_pb2.MediaItem(
                 modality=generation_pb2.MODALITY_IMAGE,
@@ -690,7 +1330,10 @@ async def test_generate_maps_transient_media_fetch_to_unavailable(image_llm, mon
     with pytest.raises(AbortError):
         async for _ in servicer.Generate(request, context):
             pass
-    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
+    assert context.abort_code == grpc.StatusCode.FAILED_PRECONDITION
+    assert message in context.abort_details
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
 
 
 @pytest.mark.asyncio

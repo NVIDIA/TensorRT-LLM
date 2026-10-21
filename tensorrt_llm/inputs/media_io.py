@@ -297,38 +297,33 @@ async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            try:
-                async with fetch_session.get(
-                    current_url, timeout=timeout, allow_redirects=False
-                ) as response:
-                    if response.status in _REDIRECT_STATUSES:
-                        redirect_url = response.headers.get("Location", "")
-                        current_url = urljoin(current_url, redirect_url)
-                        await asyncio.to_thread(_validate_url, current_url)
-                        continue
-                    maybe_coro = response.raise_for_status()
-                    if asyncio.iscoroutine(maybe_coro):
-                        await maybe_coro
-                    return await _read_aiohttp_content(response)
-            except MediaFetchError:
-                raise
-            except aiohttp.ClientResponseError as error:
-                if error.status in (408, 429) or error.status >= 500:
-                    raise MediaFetchError(
-                        f"remote media server returned HTTP {error.status}"
-                    ) from error
-                raise
-            except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                raise MediaFetchError(f"remote media fetch failed: {error}") from error
-        raise RuntimeError("Too many redirects")
-
-    return await _fetch(await _get_aiohttp_session())
+    session = await _get_aiohttp_session()
+    current_url = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            async with session.get(current_url, timeout=timeout, allow_redirects=False) as response:
+                if response.status in _REDIRECT_STATUSES:
+                    redirect_url = response.headers.get("Location", "")
+                    current_url = urljoin(current_url, redirect_url)
+                    await asyncio.to_thread(_validate_url, current_url)
+                    continue
+                maybe_coro = response.raise_for_status()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+                return await _read_aiohttp_content(response)
+        except MediaFetchError:
+            raise
+        except aiohttp.ClientResponseError as error:
+            if error.status in (408, 429) or error.status >= 500:
+                raise MediaFetchError(
+                    f"remote media server returned HTTP {error.status}"
+                ) from error
+            raise
+        except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            raise MediaFetchError(f"remote media fetch failed: {error}") from error
+    raise RuntimeError("Too many redirects")
 
 
 def _load_and_convert_image(image):

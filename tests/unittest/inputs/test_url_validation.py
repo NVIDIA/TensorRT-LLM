@@ -589,6 +589,45 @@ class TestSafeAiohttpGet:
                 self._run(_safe_aiohttp_get("http://169.254.169.254/latest/"))
             mock_session.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_rejects_redirect_to_private_literal_before_second_request(self):
+        class _RedirectResponse:
+            status = 302
+            headers = {"Location": "http://127.0.0.1/private"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+        class _FakeSession:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url, **kwargs):
+                self.urls.append(url)
+                return _RedirectResponse()
+
+        def resolve(host, *_args, **_kwargs):
+            return _dns("127.0.0.1") if host == "127.0.0.1" else PUBLIC_DNS
+
+        session = _FakeSession()
+        with (
+            patch(
+                "tensorrt_llm.inputs.media_io.socket.getaddrinfo",
+                side_effect=resolve,
+            ),
+            patch(
+                "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+                new=AsyncMock(return_value=session),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="non-public"):
+                await _safe_aiohttp_get("http://example.com/image.jpg")
+
+        assert session.urls == ["http://example.com/image.jpg"]
+
     def test_rejects_private_address_from_connection_resolver(self):
         async def resolve():
             resolver = _ValidatingResolver()
