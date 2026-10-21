@@ -76,10 +76,10 @@ init_ubuntu() {
   # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
-  # Packages only needed by CI/dev images; release images (IS_RELEASE=1, set by the
+  # Packages only needed by CI/dev images; NGC release images (IS_NGC_RELEASE=1, set by the
   # NGC release build in jenkins/BuildDockerImage.groovy) skip them.
   local ci_only_packages=()
-  if [ "${IS_RELEASE:-0}" != "1" ]; then
+  if [ "${IS_NGC_RELEASE:-0}" != "1" ]; then
     ci_only_packages+=(
       git-lfs
     )

@@ -113,7 +113,7 @@ base_pull:
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
-		$(if $(IS_RELEASE), --build-arg IS_RELEASE="$(IS_RELEASE)") \
+		$(if $(IS_NGC_RELEASE), --build-arg IS_NGC_RELEASE="$(IS_NGC_RELEASE)") \
 		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
 		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \

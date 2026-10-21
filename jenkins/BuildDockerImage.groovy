@@ -438,7 +438,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
     // Also reaches the dependent ngc-devel build (it shares `args`), where install_base.sh runs.
     if (target == "ngc-release") {
-        args += " IS_RELEASE=1"
+        args += " IS_NGC_RELEASE=1"
     }
 
     stage (config.stageName) {

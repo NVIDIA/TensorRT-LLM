@@ -61,7 +61,7 @@ ENV NCCL_GIN_GPUNETIO_PATH=/opt/hpcx/nccl_spectrum-x_plugin/lib/libdoca_gpunetio
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-ARG IS_RELEASE=0
+ARG IS_NGC_RELEASE=0
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
@@ -76,7 +76,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     echo "Using Python version: ${PYTHON_VERSION}" && \
     . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
-    IS_RELEASE=${IS_RELEASE} \
+    IS_NGC_RELEASE=${IS_NGC_RELEASE} \
     PYTHON_VERSION=${PYTHON_VERSION} \
     CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
