@@ -23,6 +23,7 @@ agent-team = "agent_flow.workflows.agent_team.cli:main"
 modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
 perf-analyze = "agent_flow.workflows.perf_analyze.cli:main"
 perf-optimize = "agent_flow.workflows.perf_optimize.cli:main"
+trtllm-modeling-v2 = "agent_flow.workflows.trtllm_modeling_v2.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -33,8 +34,43 @@ include = ["agent_flow*"]
 
 # Prompt assets read at runtime (the analyzer copies the TRT-LLM kernel
 # taxonomy into its workspace), so they must survive a non-editable install.
+#
+# trtllm_modeling_v2 ships its agents' knowledge the same way: the skills and
+# their reference documents are copied into each run's workspace, so they are
+# versioned with the workflow that dispatches them instead of depending on a
+# checkout's `.claude/skills` having the right thing in it. The example task
+# spec is listed too — a workflow whose `--task` template is missing from an
+# install is one nobody can start.
 [tool.setuptools.package-data]
 "agent_flow.workflows.perf_analyze" = ["assets/*.json"]
+"agent_flow.workflows.trtllm_modeling_v2" = [
+    "task.example.yaml",
+    "onboard/runtime_index.yaml",
+    "onboard/kernel_sources.yaml",
+    "agents/skills/**/*.md",
+    # Named by the failure message on every infrastructure stop, so an
+    # install without it points the operator at a path that is not there —
+    # at the exact moment they are already debugging something.
+    "TROUBLESHOOTING.md",
+    "BUILD_AND_TEST.md",
+    "README.md",
+    "LESSONS.md",
+    # The compute-session substrate: the watcher entry and the operator's
+    # shell wrappers run by path inside and outside the container.
+    "infra/spool_watcher.sh",
+    "infra/scripts/*.sh",
+    "infra/scripts/mn/*",
+    # Not a package: the scheduler puts this directory on every job's
+    # PYTHONPATH so its sitecustomize records which checkout each process
+    # imported.
+    "infra/substrate/resolvehook/*.py",
+    # Not a package either: the engine gates put this directory first on
+    # PYTHONPATH so every rank's worker prints what its engine runs.
+    "checks/harness/rankhook/*.py",
+    # The driver's packaged templates: the standing turn instructions and the
+    # per-turn subagent prompt.
+    "infra/driver/*.md",
+]
 
 ####################################################################################################
 ###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################
@@ -86,6 +122,9 @@ extend-ignore = [
 # Markdown tables in prompt string literals — a table row must stay on one line.
 "agent_flow/workflows/modeling_bringup/prompts/plan_drafter_extra.py" = ["E501"]
 "agent_flow/workflows/modeling_bringup/prompts/reviewer_extra.py" = ["E501"]
+# Same reason: every trtllm_modeling_v2 role prompt ends in a Red-flags table, whose
+# rows are `| Impulse | Reality |` pairs. Wrapping one breaks the table.
+"agent_flow/workflows/trtllm_modeling_v2/agents/prompts/*.py" = ["E501"]
 
 [tool.ruff.lint.pycodestyle]
 max-line-length = 120
