@@ -21,7 +21,9 @@ as global latent-cache row IDs in GlmKpoolBackendForwardArgs.topk_rows.
 Queries have no rotary component and are absorbed into the 512-wide latent
 space. Small TP generation batches use native TRTLLM-GEN query heads; other
 shapes use FlashMLA. FP8 cache rows are gathered and dequantized
-in bounded query chunks. Prepared GLM page tables and live TRTLLM lengths
+in bounded query chunks. On SM120/SM121, FlashInfer's GLM53_NOPE sparse MLA
+reads the selected FP8 rows, packed with inline scales in the same bounded
+query chunks. Prepared GLM page tables and live TRTLLM lengths
 provide the same cache contract for prefill, decode and verification.
 """
 
@@ -32,6 +34,7 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.math_utils import ceil_div
 
 from ...interface import (
     AttentionForwardArgs,
@@ -41,7 +44,12 @@ from ...interface import (
     merge_attention_forward_args,
 )
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
+from ..flashinfer_utils import (
+    SPARSE_MLA_SPLIT_KV_TILE,
+    allocate_sparse_mla_split_workspace,
+    get_sparse_mla_op,
+)
+from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update, pack_glm53_kv_rows
 from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
 from .params import INDEX_SENTINEL, GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
@@ -125,6 +133,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     # FlashMLA instantiates 64/128 query heads. Pad TP-local heads to the next
     # size and discard the extra outputs; heads attend independently.
     _KERNEL_HEAD_COUNTS = (64, 128)
+
+    # FlashInfer's SM120 GLM53_NOPE prefill instantiates these query-head counts.
+    _SM120_KERNEL_HEAD_COUNTS = (8, 16, 32, 64)
 
     # Bound selected-KV staging independently of the configured context length.
     # At the published 2112-entry selection this uses 132 MiB of BF16 rows.
@@ -471,6 +482,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         output ``[T, H, kv_lora]``; :meth:`_finalize_output` flattens it to the
         base-contract shape at the ``forward`` boundary.
         """
+        if get_sm_version() in (120, 121):
+            return self._dispatch_sparse_core_sm120(q_latent, kv_rows, topk_rows)
         if kv_rows.dtype == torch.float8_e4m3fn:
             # Like DeepSeek-V4's BF16 context adapter, dequantize only selected
             # rows and reuse FlashMLA. Chunk query rows so prefill never stages
@@ -516,6 +529,72 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             # consumes strided batches, so no copy of [T, H, kv_lora] here.
             out = out[:, :local_heads, :]
         return out
+
+    def _dispatch_sparse_core_sm120(
+        self,
+        q_latent: torch.Tensor,
+        kv_rows: torch.Tensor,
+        topk_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run FlashInfer's GLM53_NOPE sparse MLA; same contract as :meth:`_dispatch_sparse_core`.
+
+        The kernel reads 528-byte FP8 rows with inline group scales, so each
+        query chunk's selected rows are packed from the per-tensor-scaled FP8
+        cache (:func:`pack_glm53_kv_rows`) and addressed by local row ids.
+        """
+        if kv_rows.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "glm_kpool on SM120/SM121 runs FlashInfer's FP8 sparse MLA and needs an "
+                f"FP8 latent cache (kv_cache_config.dtype='fp8'); got {kv_rows.dtype}"
+            )
+        pad = (-topk_rows.shape[-1]) % self._KERNEL_TOPK_ALIGN
+        if pad:
+            topk_rows = torch.nn.functional.pad(topk_rows, (0, pad), value=INDEX_SENTINEL)
+        num_tokens, local_heads, dim = q_latent.shape
+        kernel_heads = next((h for h in self._SM120_KERNEL_HEAD_COUNTS if h >= local_heads), None)
+        if kernel_heads is None:
+            raise ValueError(
+                f"glm_kpool: {local_heads} query heads exceed every FlashInfer SM120 "
+                f"sparse-kernel instantiation {self._SM120_KERNEL_HEAD_COUNTS}"
+            )
+        if kernel_heads != local_heads:
+            q_padded = q_latent.new_zeros((num_tokens, kernel_heads, dim))
+            q_padded[:, :local_heads, :] = q_latent
+            q_latent = q_padded
+        else:
+            q_latent = q_latent.contiguous()
+        output = q_latent.new_empty((num_tokens, kernel_heads, self.kv_lora_rank))
+        num_splits = ceil_div(topk_rows.shape[-1], SPARSE_MLA_SPLIT_KV_TILE)
+        for start in range(0, num_tokens, self._FP8_QUERY_CHUNK_SIZE):
+            stop = min(start + self._FP8_QUERY_CHUNK_SIZE, num_tokens)
+            pages, local_indices = pack_glm53_kv_rows(
+                kv_rows, topk_rows[start:stop], self.kv_scale_quant_orig
+            )
+            out_lse = torch.empty(
+                (stop - start, kernel_heads), dtype=torch.float32, device=q_latent.device
+            )
+            mid_out, mid_lse = allocate_sparse_mla_split_workspace(
+                num_tokens=stop - start,
+                num_heads=kernel_heads,
+                num_splits=num_splits,
+                value_dim=self.kv_lora_rank,
+                device=q_latent.device,
+            )
+            get_sparse_mla_op()(
+                q_latent[start:stop],
+                pages,
+                local_indices,
+                output[start:stop],
+                out_lse,
+                self.softmax_scale,
+                d_v=self.kv_lora_rank,
+                kv_scale_format="arbitrary_fp32",
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+            )
+        if kernel_heads != local_heads:
+            output = output[:, :local_heads, :]
+        return output
 
     def _finalize_output(
         self, out_latent: torch.Tensor, output: torch.Tensor | None
