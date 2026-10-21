@@ -13,16 +13,11 @@ from ...memory_buffer_utils import Buffers
 
 
 class MixedPrecisionKVStaging:
-    """Present the mixed-precision pools of a batch as one native paged KV cache.
+    """Staging copy that lets attention read a mixed-precision layer as one ordinary KV cache.
 
-    ``KVCacheManagerV2`` stores each mixed-precision layer in two pools: the
-    full history in a low-precision pool and the first_n/last_n tokens of every
-    sequence in a high-precision pool. Attention kernels read a single cache in
-    the attention dtype, so this object owns a staging copy for the current
-    batch: :meth:`convert` gathers both pools into it before attention runs and
-    writes the newly produced tokens back afterwards. It also implements the
-    part of the cache manager interface that the attention backends read while
-    the staging copy is in use.
+    Before attention runs, the low-precision history and the retained
+    high-precision tokens are gathered into it in the attention dtype; after
+    attention, the tokens just written are copied back to the two pools.
     """
 
     def __init__(
@@ -35,17 +30,10 @@ class MixedPrecisionKVStaging:
         pool_layout: str,
         tokens_per_block: int,
     ) -> None:
-        """Allocate the staging copy and the pool views for ``rows`` requests.
+        """Allocate the staging copy once per rank, from the attention metadata's buffer pool.
 
-        ``buffers`` is the attention metadata's buffer pool; the staging copy is
-        taken from it once, sized for this rank: ``rows`` requests (the
-        metadata's sequence capacity) times the manager's ``max_seq_len`` times
-        the largest local mixed-precision layer page, whose head count is
-        already sharded by the manager. ``layout`` and ``tokens_per_block``
-        describe the paged cache the attention kernels read; the kernels may
-        need smaller pages than the manager stores (TRTLLM paged-context FMHA
-        uses 32-token pages). ``pool_layout`` is the layout the backend writes
-        the manager's pools in.
+        It is sized for the largest batch and the longest sequence the engine
+        can run, in the page geometry the attention kernels read.
         """
         self.manager = manager
         self.buffers = buffers
