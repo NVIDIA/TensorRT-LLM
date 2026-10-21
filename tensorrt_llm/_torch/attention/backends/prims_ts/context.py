@@ -328,6 +328,9 @@ def _make_context_kernel(
         enable_skip_correction=True,
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
+        use_blackwell_tma_oob_workaround=(
+            torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
+        ),
         **paged_kwargs,
     )
     return fmha
