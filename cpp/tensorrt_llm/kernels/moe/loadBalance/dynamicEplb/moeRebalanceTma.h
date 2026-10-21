@@ -206,7 +206,7 @@ extern "C"
 
 /* Launches HALO-Q and the GPU-direct copy of its plan as one kernel of config.sms
  * CTAs. scheduler must pass checkMoeRebalanceHaloQParams, use config.sms CTAs and
- * no plan channel, and write the outputs bound by megamoe_tma_copy_bind_gpu_direct.
+ * write the outputs bound by megamoe_tma_copy_bind_gpu_direct.
  * route_epoch is a caller-owned uint64 that only fused launches change: each CTA
  * adds one with a system-scope release once its routes are written, and
  * route_target is its value after this launch. A cuStreamWaitValue64 (GEQ

@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-/* HALO-Q scheduler device code. The standalone scheduler kernel and the fused
- * scheduler + in-switch copy kernel both run halo_q_scheduler_body. */
+/* HALO-Q scheduler device code, the first phase of the fused scheduler +
+ * in-switch copy kernel. */
 #ifndef TRTLLM_KERNELS_MOE_REBALANCE_HALO_Q_KERNEL_CUH
 #define TRTLLM_KERNELS_MOE_REBALANCE_HALO_Q_KERNEL_CUH
 
@@ -53,15 +53,6 @@ enum PlanField
     kPlanOwner = 4,
     kPlanHelper = 5,
 };
-
-// Adapt placement storage to the copy layer without exposing scheduler
-// internals.
-__device__ __forceinline__ sami_copy::PlacementView copy_placement_view(int const* plan)
-{
-    return {plan[1], kMaxBroadcasts, plan + 2 + kPlanExpert * kMaxBroadcasts, plan + 2 + kPlanLevel * kMaxBroadcasts,
-        plan + 2 + kPlanGroupBegin * kMaxBroadcasts, plan + 2 + kPlanGroupSize * kMaxBroadcasts,
-        plan + 2 + kPlanOwner * kMaxBroadcasts, plan + 2 + kPlanHelper * kMaxBroadcasts};
-}
 
 __device__ __forceinline__ int imin(int a, int b)
 {
@@ -1774,25 +1765,16 @@ __device__ void materialize_worker_routes(int const* routes, int* output, int co
 
 /* One scheduler generation on a grid of ctas resident CTAs of 512 threads:
  * CTA 0 plans and publishes the helper placement, the other CTAs write routes.
- * Callers launch it as halo_q_scheduler_kernel or as the first phase of the
- * fused scheduler + in-switch copy kernel. */
+ * The fused scheduler + in-switch copy kernel runs it as its first phase. */
 template <int FixedEp, int FixedExperts, int FixedHelpers>
 __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* out_slots, int* out_ids, int* out_levels,
     int* out_owners, unsigned long long const* peer_bases, int* status, int* partial, int* route_aux, int* grid_sync,
-    int* plan, int* route_prefix, int* plan_channel, int runtime_ep, int runtime_experts, int runtime_helpers,
-    int local_rank, int route_capacity, int ctas, int enable_pdl, unsigned long long spin_cycles, int plan_abi_version,
-    int plan_channel_words, int route_features, int capacity, int route_count)
+    int* plan, int* route_prefix, int runtime_ep, int runtime_experts, int runtime_helpers, int local_rank,
+    int route_capacity, int ctas, unsigned long long spin_cycles, int capacity, int route_count)
 {
     int const ep = FixedEp > 0 ? FixedEp : runtime_ep;
     int const experts = FixedExperts > 0 ? FixedExperts : runtime_experts;
     int const helpers = FixedHelpers > 0 ? FixedHelpers : runtime_helpers;
-    (void) plan_channel_words; // Validated by the host launch wrapper.
-    /* The scheduler grid is deliberately residency-safe (one CTA per SM and
-     * CTA count <= SM count), so signal as soon as every CTA starts.  The
-     * independent same-stream quantizer may then occupy all unused SMs while
-     * these CTAs retain their own SMs for the complete scheduler lifetime. */
-    if (enable_pdl && threadIdx.x == 0)
-        cudaTriggerProgrammaticLaunchCompletion();
     // Only the caller's valid prefix is readable. Keep the public output at
     // its configured capacity, clearing stale routes inside this same kernel.
     // Empty ranks still execute every collective; no route load occurs at N=0.
@@ -1911,31 +1893,16 @@ __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* ou
             }
             if (warp == 0 || warp == 8)
                 scheduler_tail_barrier();
-            if (warp == 0)
-            {
-                /* Release the worker CTAs here rather than after the channel
-                 * publish.  They gate on grid_sync+2 and consume route_prefix,
-                 * which is complete above; plan_channel is consumed only by the
-                 * copy stack, which acquires on the channel's own epoch word
-                 * written with store_release_system below.  Publishing after
-                 * the release lets the workers coloring pass -- the work that
-                 * actually determines when the kernel ends -- overlap the whole
-                 * publish instead of waiting behind it. */
-                if (threadIdx.x == 0)
-                    store_release_device(grid_sync + 2, epoch);
-                sami_copy::publish_plan_channel_warp(plan_channel, out_ids, out_levels, out_owners,
-                    copy_placement_view(plan), helpers, ep, local_rank, experts, plan_abi_version, route_features);
-                __syncwarp();
-            }
+            /* The worker CTAs gate on grid_sync+2 and consume route_prefix,
+             * which is complete above. */
+            if (threadIdx.x == 0)
+                store_release_device(grid_sync + 2, epoch);
             return;
         }
         if (threadIdx.x == 0)
             store_release_device(plan + 0, epoch);
         __syncthreads();
         build_route_prefix(counts, quota, route_prefix, plan, broadcasts, ep, experts, local_rank, blockDim.x);
-        __syncthreads();
-        sami_copy::publish_plan_channel_warp(plan_channel, out_ids, out_levels, out_owners, copy_placement_view(plan),
-            helpers, ep, local_rank, experts, plan_abi_version, route_features);
         /* The block barrier orders route-prefix/helper writes before release. */
         __syncthreads();
     }
