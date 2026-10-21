@@ -15,7 +15,6 @@
 """MX post-transform qualification tests for the Qwen3.5 dense vision-language root."""
 
 import json
-from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,8 +23,11 @@ import torch
 import transformers
 from torch import nn
 from utils.post_transform_qualification import (
+    AllReduceStub,
     PostTransformQualificationCase,
     assert_post_transform_lifecycle_equivalent,
+    module_state_snapshot,
+    mx_canonical_parameter_catalog,
 )
 
 import tensorrt_llm.mapping as mapping_mod
@@ -35,6 +37,7 @@ from tensorrt_llm._torch.models import modeling_qwen3_5 as modeling_qwen3_5_mod
 from tensorrt_llm._torch.models import modeling_qwen3_next as modeling_qwen3_next_mod
 from tensorrt_llm._torch.models import modeling_qwen3vl as modeling_qwen3vl_mod
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
@@ -66,21 +69,6 @@ _MAX_NUM_TOKENS = 16
 
 class _UnqualifiedQwen3_5VLModel(modeling_qwen3_5_mod.Qwen3_5VLModel):
     """Subclass that must not inherit the exact-root Qwen3.5 profile."""
-
-
-class _AllReduceStub(nn.Module):
-    """Identity all-reduce for simulating one TP rank in a single process."""
-
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        super().__init__()
-
-    def uses_nccl_symmetric_memory_window(self) -> bool:
-        """Report that no NCCL symmetric memory window is in use."""
-        return False
-
-    def forward(self, tensor: torch.Tensor, **_kwargs: object) -> torch.Tensor:
-        """Return the local partial result unchanged."""
-        return tensor
 
 
 def _tiny_hf_config_dict(*, tie_word_embeddings: bool = False) -> dict:
@@ -151,6 +139,7 @@ def _tiny_hf_config_dict(*, tie_word_embeddings: bool = False) -> dict:
 
 
 def _write_tiny_checkpoint_config(path: Path, **config_overrides: object) -> Path:
+    """Write the tiny `config.json` into `path` and return `path`."""
     path.mkdir(parents=True, exist_ok=True)
     (path / "config.json").write_text(
         json.dumps(_tiny_hf_config_dict(**config_overrides)), encoding="utf-8"
@@ -198,6 +187,8 @@ def _tiny_hf_state_dict(*, tie_word_embeddings: bool = False) -> dict[str, torch
 
 
 def _hf_checkpoint_loader(state_dict: dict[str, torch.Tensor]):
+    """Return a `prepare_producer` hook that loads `state_dict` like a real HF load."""
+
     def _load(model: nn.Module) -> None:
         mapper = Qwen3_5MoeHfWeightMapper()
         mapper.init_model_and_config(model, model.model_config)
@@ -207,6 +198,7 @@ def _hf_checkpoint_loader(state_dict: dict[str, torch.Tensor]):
 
 
 def _qualify(model: nn.Module):
+    """Qualify `model` with the identity that `ModelLoader` captures before construction."""
     return ModelLoader._qualify_post_transform_profile(
         model,
         config_identity=_CONFIG_IDENTITY,
@@ -216,10 +208,12 @@ def _qualify(model: nn.Module):
 
 
 def _runtime_config(model: nn.Module) -> PostTransformRuntimeConfig:
+    """Realize the runtime config of a constructed root."""
     return PostTransformRuntimeConfig.from_model_config(model.model_config, model=model)
 
 
 def _qwen3_5_vl_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
+    """The realized runtime config of the qualified TP1 envelope, with overrides."""
     values = {
         "dtype": "bfloat16",
         "quant_algorithm": "none",
@@ -248,27 +242,13 @@ def _qwen3_5_vl_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
     return PostTransformRuntimeConfig(**values)
 
 
-def _scalar_module_state(model: nn.Module) -> dict[str, object]:
-    """Scalar and enum attributes of every module, plus the vision config.
-
-    A staged receiver skips `load_weights`, so any of these that only the load
-    path sets would differ from the fully loaded producer.
-    """
-    state: dict[str, object] = {}
-    for module_name, module in model.named_modules():
-        for attribute, value in vars(module).items():
-            if isinstance(value, (bool, int, float, str, Enum, type(None))):
-                state[f"{module_name}.{attribute}"] = value
-    if model.mm_encoder is not None:
-        state["mm_encoder.visual.config"] = model.mm_encoder.visual.config.to_dict()
-    return state
-
-
 def _qwen3_5_vl_layout_state(model: nn.Module) -> dict[str, object]:
-    """Structural facts that the profile's layout ABI depends on."""
+    """Structural and realized facts that the profile's layout ABI depends on."""
     llm = model.llm
     layers = llm.model.layers
-    return {
+    full_attention = layers[1].self_attn
+    gated_mlps = [module for module in model.modules() if hasattr(module, "gate_up_proj")]
+    state = {
         "mm_encoder_present": model.mm_encoder is not None,
         "deepstack_num_level": model.deepstack_num_level,
         "layer_types": tuple(type(layer).__name__ for layer in layers),
@@ -277,8 +257,16 @@ def _qwen3_5_vl_layout_state(model: nn.Module) -> dict[str, object]:
             is (layers[index + 1].input_layernorm if index + 1 < len(layers) else llm.model.norm)
             for index, layer in enumerate(layers)
         ),
+        "gdn_norm_fp8_scale_is_none": layers[0].linear_attn.norm.fp8_scale is None,
+        "share_gate_up_quantize": tuple(mlp._maybe_share_gate_up_quantize for mlp in gated_mlps),
+        "fuse_qk_norm_rope": full_attention.fuse_qk_norm_rope,
+        "rope_fusion": full_attention.rope_fusion,
         "tied_lm_head": llm.lm_head.weight.data_ptr() == llm.model.embed_tokens.weight.data_ptr(),
     }
+    if model.mm_encoder is not None:
+        vision_config = model.mm_encoder.visual.config
+        state["vision_num_attention_heads"] = vision_config.num_attention_heads
+    return state
 
 
 def _derived_tensor_caches(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -289,6 +277,15 @@ def _derived_tensor_caches(model: nn.Module) -> dict[str, torch.Tensor]:
             if isinstance(value, torch.Tensor) and not isinstance(value, nn.Parameter):
                 caches[f"{module_name}.{attribute}"] = value
     return caches
+
+
+def _vision_patch_embed_output(model: nn.Module) -> torch.Tensor:
+    """Run the vision patch embedding on fixed flattened patches."""
+    patch_embed = model.mm_encoder.visual.patch_embed
+    weight = patch_embed.proj.weight
+    patch_size = weight[0].numel()
+    patches = torch.arange(4 * patch_size, dtype=torch.float32, device=weight.device)
+    return patch_embed(((patches % 7) / 7).reshape(4, patch_size).to(weight.dtype))
 
 
 def _linear_outputs(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -305,9 +302,27 @@ def _linear_outputs(model: nn.Module) -> dict[str, torch.Tensor]:
 
 
 def _embedding_logits(model: nn.Module) -> torch.Tensor:
+    """Run token embedding straight into the LM head."""
     llm = model.llm
     token_ids = torch.arange(8, device=llm.model.embed_tokens.weight.device)
     return llm.lm_head(llm.model.embed_tokens(token_ids))
+
+
+def _assert_every_parameter_was_loaded(producer: nn.Module, factory_model: nn.Module) -> None:
+    """Assert that `prepare_producer` overwrote every parameter of the factory fill.
+
+    The lifecycle probes then compare bytes that came from the checkpoint
+    through the weight mapper rather than the factory's placeholder values.
+    """
+    # Look parameters up by the factory's canonical names: after
+    # `setup_aliases()` the producer also reaches some of them through
+    # `next_layer_layernorm` alias names.
+    unchanged = [
+        name
+        for name, factory_parameter in factory_model.named_parameters()
+        if torch.equal(producer.get_parameter(name), factory_parameter)
+    ]
+    assert unchanged == [], f"Parameters not written by the producer load: {unchanged}"
 
 
 def _lifecycle_case(
@@ -317,8 +332,10 @@ def _lifecycle_case(
     tp_size: int = 1,
     rank: int = 0,
 ) -> PostTransformQualificationCase:
+    """Build the lifecycle case whose producer runs the real HF load of `state_dict`."""
     output_probes = [
         ("linear-outputs", _linear_outputs),
+        ("vision-patch-embed", _vision_patch_embed_output),
         ("derived-tensor-caches", _derived_tensor_caches),
     ]
     if tp_size == 1:
@@ -335,10 +352,10 @@ def _lifecycle_case(
         qualify_model=_qualify,
         state_probes=(
             ("layout", _qwen3_5_vl_layout_state),
-            ("scalar-module-state", _scalar_module_state),
+            ("module-state", module_state_snapshot),
         ),
         output_probes=tuple(output_probes),
-        load_producer=_hf_checkpoint_loader(state_dict),
+        prepare_producer=_hf_checkpoint_loader(state_dict),
     )
 
 
@@ -355,6 +372,8 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
     producer, receiver = assert_post_transform_lifecycle_equivalent(
         _lifecycle_case(checkpoint_dir, state_dict)
     )
+
+    _assert_every_parameter_was_loaded(producer, _tiny_qwen3_5_vl_model(checkpoint_dir))
 
     # The producer's bytes come from the checkpoint through the weight mapper.
     for trtllm_name, hf_name in (
@@ -378,7 +397,12 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
         "deepstack_num_level": 0,
         "layer_types": ("Qwen3NextLinearDecoderLayer", "Qwen3NextFullAttentionDecoderLayer"),
         "next_layer_layernorm_aliases": (True, True),
+        "gdn_norm_fp8_scale_is_none": True,
+        "share_gate_up_quantize": (False, False),
+        "fuse_qk_norm_rope": True,
+        "rope_fusion": False,
         "tied_lm_head": False,
+        "vision_num_attention_heads": 2,
     }
     # The vision tower is part of the transfer: its parameters are not owned
     # by the language model.
@@ -391,6 +415,57 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
         workspace = model.mrope_rotary_cos_sin_workspace
         assert workspace.shape[-1] % _MAX_NUM_TOKENS == 0
         assert not workspace.any()
+
+
+def test_qwen3_5_vl_mx_tensor_catalog_is_complete_and_stable(tmp_path: Path) -> None:
+    """The MX tensor catalog holds vision and language tensors and survives staged finalization.
+
+    MX registers tensors after the receiver's alias preparation and publishes
+    them after finalization, so the catalog must not change in between and must
+    match the producer's names, shapes, and dtypes.
+    """
+    checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
+    producer = _tiny_qwen3_5_vl_model(checkpoint_dir)
+    _hf_checkpoint_loader(_tiny_hf_state_dict())(producer)
+    ModelLoader._walk_full_post_load(producer)
+    receiver = _tiny_qwen3_5_vl_model(checkpoint_dir)
+
+    ModelLoader._setup_aliases(receiver)
+    registered_catalog = mx_canonical_parameter_catalog(receiver)
+    ModelLoader._setup_aliases(receiver)
+    ModelLoader._mark_weights_transformed(receiver)
+    ModelLoader._walk_cache_state(receiver)
+    published_catalog = mx_canonical_parameter_catalog(receiver)
+
+    assert published_catalog == registered_catalog
+    assert any(name.startswith("mm_encoder.") for name in registered_catalog)
+    assert any(name.startswith("llm.") for name in registered_catalog)
+    producer_layout = {
+        name: entry[1:] for name, entry in mx_canonical_parameter_catalog(producer).items()
+    }
+    assert {name: entry[1:] for name, entry in registered_catalog.items()} == producer_layout
+
+
+def test_qwen3_vl_mrope_workspace_is_zero_initialized_under_meta_init(tmp_path: Path) -> None:
+    """Meta-device construction still allocates the M-RoPE workspace as CUDA zeros.
+
+    `ModelLoader` constructs roots under `MetaInitMode`, which turns `empty`
+    allocations into meta tensors that are later materialized uninitialized;
+    weight manifests hash this buffer, so its bytes must be deterministic.
+    """
+    model_config = ModelConfig(
+        pretrained_config=load_pretrained_config(
+            str(_write_tiny_checkpoint_config(tmp_path / "ckpt"))
+        ),
+        max_num_tokens=_MAX_NUM_TOKENS,
+        max_seq_len=_MAX_NUM_TOKENS,
+    )
+    with MetaInitMode():
+        model = modeling_qwen3_5_mod.Qwen3_5VLModel(model_config)
+
+    workspace = model.mrope_rotary_cos_sin_workspace
+    assert workspace.device.type == "cuda"
+    assert not workspace.any()
 
 
 def test_qwen3_5_vl_qualification_requires_preconstruction_identity(tmp_path: Path) -> None:
@@ -424,13 +499,17 @@ def test_qwen3_5_vl_profile_qualifies_tp2_rank_lifecycle(
 ) -> None:
     """Each simulated TP2 rank's staged receiver matches its fully loaded producer."""
     monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
-    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
-    monkeypatch.setattr(modeling_qwen3_next_mod, "AllReduce", _AllReduceStub)
-    monkeypatch.setattr(modeling_qwen3_next_mod, "MoEAllReduce", _AllReduceStub)
+    monkeypatch.setattr(distributed_mod, "AllReduce", AllReduceStub)
+    monkeypatch.setattr(modeling_qwen3_next_mod, "AllReduce", AllReduceStub)
+    monkeypatch.setattr(modeling_qwen3_next_mod, "MoEAllReduce", AllReduceStub)
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
 
     producer, _receiver = assert_post_transform_lifecycle_equivalent(
         _lifecycle_case(checkpoint_dir, _tiny_hf_state_dict(), tp_size=2, rank=rank)
+    )
+
+    _assert_every_parameter_was_loaded(
+        producer, _tiny_qwen3_5_vl_model(checkpoint_dir, tp_size=2, rank=rank)
     )
 
     assert _runtime_config(producer) == _qwen3_5_vl_runtime_config(
@@ -518,7 +597,7 @@ def test_qwen3_5_vl_source_identity_binds_runtime_max_num_tokens(tmp_path: Path)
     decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
 
     assert not decision.should_share
-    assert "shard_fingerprint" in decision.match_result.mismatched_fields
+    assert decision.match_result.mismatched_fields == ["shard_fingerprint"]
 
 
 def _qualify_registry(**overrides: object):
@@ -580,16 +659,6 @@ def test_qwen3_5_vl_profile_matches_its_exact_identity() -> None:
             id="moe-model-type",
         ),
         pytest.param(
-            {"speculative_mode": "mtp"},
-            PostTransformQualificationReason.SPECULATIVE_MODE_NOT_REGISTERED,
-            id="mtp",
-        ),
-        pytest.param(
-            {"speculative_mode": "dflash"},
-            PostTransformQualificationReason.SPECULATIVE_MODE_NOT_REGISTERED,
-            id="dflash",
-        ),
-        pytest.param(
             {"transfer_scope": PostTransformTransferScope.TARGET_MODEL},
             PostTransformQualificationReason.TRANSFER_SCOPE_NOT_REGISTERED,
             id="target-model-scope",
@@ -616,14 +685,51 @@ def test_qwen3_5_vl_profile_is_exact(
 
 
 @pytest.mark.cpu_only
-def test_qwen3_5_vl_profile_rejects_separately_loaded_draft_model() -> None:
-    """A synthetic separately loaded draft model is an unsupported feature."""
-    decision = _qualify_registry(
-        enabled_features=frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
-    )
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        pytest.param(
+            {"speculative_mode": "mtp"},
+            PostTransformQualificationReason.SPECULATIVE_MODE_NOT_REGISTERED,
+            id="mtp",
+        ),
+        pytest.param(
+            {"speculative_mode": "dflash"},
+            PostTransformQualificationReason.SPECULATIVE_MODE_NOT_REGISTERED,
+            id="dflash",
+        ),
+        pytest.param(
+            {"enabled_features": frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})},
+            PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+            id="synthetic-separate-draft-model",
+        ),
+        pytest.param(
+            {
+                "enabled_features": frozenset(
+                    {PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS}
+                )
+            },
+            PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+            id="synthetic-localized-weights",
+        ),
+    ],
+)
+def test_qwen3_5_vl_profile_rejects_speculative_and_draft_loads(
+    overrides: dict[str, object],
+    reason: PostTransformQualificationReason,
+) -> None:
+    """Speculative modes and lifecycle features fall back.
 
-    assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
-    assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+    The checkpoints ship MTP layers, and DFlash loads report their own mode, so
+    both are rejected by speculative mode. The feature cases call the registry
+    directly with `speculative_mode=None`.
+    """
+    decision = _qualify_registry(**overrides)
+
+    assert not decision.qualified
+    assert decision.reason is reason
+    if reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED:
+        assert decision.unsupported_features == overrides["enabled_features"]
 
 
 @pytest.mark.cpu_only
@@ -645,9 +751,11 @@ def test_qwen3_5_vl_profile_rejects_separately_loaded_draft_model() -> None:
         pytest.param({"lora_enabled": True}, "lora_enabled", id="lora"),
         pytest.param({"sparse_attention_enabled": True}, "sparse_attention_enabled", id="sparse"),
         pytest.param({"attention_backend": "FLASHINFER"}, "attention_backend", id="flashinfer"),
-        pytest.param({"tp_size": 4, "attention_tp_size": 4}, "tp_size", id="tp4"),
+        pytest.param({"tp_size": 4}, "tp_size", id="tp4"),
         pytest.param({"pp_size": 2}, "pp_size", id="pp2"),
-        pytest.param({"cp_size": 2, "attention_cp_size": 2}, "cp_size", id="cp2"),
+        pytest.param({"cp_size": 2}, "cp_size", id="cp2"),
+        pytest.param({"attention_tp_size": 4}, "attention_tp_size", id="attention-tp4"),
+        pytest.param({"attention_cp_size": 2}, "attention_cp_size", id="attention-cp2"),
         pytest.param({"attention_dp": True}, "attention_dp", id="attention-dp"),
         pytest.param({"multi_node": True}, "multi_node", id="multi-node"),
         pytest.param({"rope_type": "default"}, "rope_type", id="rope-default"),
@@ -660,11 +768,11 @@ def test_qwen3_5_vl_profile_rejects_unqualified_runtime_variants(
     runtime_overrides: dict[str, object],
     dimension: str,
 ) -> None:
-    """Each unqualified runtime variant reports the dimension that blocks it."""
+    """Each unqualified runtime variant reports exactly the dimension that blocks it."""
     decision = _qualify_registry(runtime_config=_qwen3_5_vl_runtime_config(**runtime_overrides))
 
     assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
-    assert dimension in decision.unsupported_runtime_dimensions
+    assert decision.unsupported_runtime_dimensions == frozenset({dimension})
 
 
 @pytest.mark.cpu_only
@@ -687,19 +795,21 @@ def test_qwen3_5_vl_profile_ignores_moe_only_runtime_dimensions(
 
 
 @pytest.mark.cpu_only
-def test_runtime_config_realizes_mrope_from_flattened_rope_scaling() -> None:
-    """A flattened `{type: mrope}` rope config without `rope_type` realizes `mrope`.
+def test_qwen3_5_vl_config_realizes_mrope_rope_type(tmp_path: Path) -> None:
+    """The production config normalizer leaves a text config that realizes `mrope`.
 
-    This is the form the Qwen3.5 config normalizer and root constructor leave
-    on the text config, and the form the profile's `rope_types` pins.
+    The checkpoints declare `rope_type: default` with M-RoPE sections; the
+    normalizer flattens them into `{type: mrope}` without `rope_type`, which is
+    the value the profile pins. A bare `{type: mrope}` dict realizes the same.
     """
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(
-            rope_scaling={"type": "mrope", "mrope_section": [11, 11, 10]},
-            tie_word_embeddings=False,
-        )
+    config = load_pretrained_config(str(_write_tiny_checkpoint_config(tmp_path / "ckpt")))
+
+    realized = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=config.text_config)
+    )
+    flattened = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling={"type": "mrope"}))
     )
 
-    runtime_config = PostTransformRuntimeConfig.from_model_config(model_config)
-
-    assert runtime_config.rope_type == "mrope"
+    assert realized.rope_type == "mrope"
+    assert flattened.rope_type == "mrope"

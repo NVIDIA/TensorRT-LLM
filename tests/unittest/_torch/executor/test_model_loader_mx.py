@@ -22,6 +22,7 @@ from utils.post_transform_qualification import (
     assert_post_transform_lifecycle_equivalent,
 )
 
+import tensorrt_llm._torch.weight_sharing as weight_sharing_mod
 import tensorrt_llm.mapping as mapping_mod
 from tensorrt_llm._torch import distributed as distributed_mod
 from tensorrt_llm._torch.attention import mla as mla_mod
@@ -740,16 +741,14 @@ def _format_documented_values(
 _DOCUMENTED_SCOPES = {
     PostTransformTransferScope.TARGET_MODEL: "dense {dtypes}",
     PostTransformTransferScope.COMPLETE_MODEL: (
-        "dense {dtypes} vision-language model with its local vision encoder"
+        "dense {dtypes} vision-language model with its vision encoder"
     ),
 }
-_DOCUMENTED_ROPE_TYPES = {
-    frozenset({"default"}): "default",
-    frozenset({"mrope"}): "M-RoPE",
-}
-_DOCUMENTED_ROPE_FUSION = {
-    frozenset({True}): "fused RoPE",
-    frozenset({False}): "fused QK-norm/RoPE",
+# Keyed by the profile's (`rope_types`, `rope_fusion`) constraints.
+_DOCUMENTED_ROPE = {
+    (frozenset({"default"}), frozenset({True})): "default fused RoPE",
+    (frozenset({"default"}), frozenset({False})): "default fused QK-norm/RoPE",
+    (frozenset({"mrope"}), frozenset({False})): "fused QK-norm/M-RoPE",
 }
 _DOCUMENTED_SLIDING_WINDOWS = {
     None: "",
@@ -786,10 +785,7 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     tp_sizes = _format_documented_values(constraints.tp_sizes)
     pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
     model_description = _DOCUMENTED_SCOPES[profile.transfer_scope].format(dtypes=dtypes)
-    rope_description = (
-        f"{_DOCUMENTED_ROPE_TYPES[constraints.rope_types]} "
-        f"{_DOCUMENTED_ROPE_FUSION[constraints.rope_fusion]}"
-    )
+    rope_description = _DOCUMENTED_ROPE[(constraints.rope_types, constraints.rope_fusion)]
     sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
     return (
         f"Single-node {model_description}, unquantized weights and KV cache, "
@@ -1382,6 +1378,23 @@ def test_mx_load_offers_post_transform_weights_only_for_the_registered_scope(
         assert loader._source_identity.transform_abi_id is None
         assert loader._call_load_weights.call_count == 1
         checkpoint_loader.post_load_publish.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_qualified_profiles_bind_published_transform_abis() -> None:
+    """Every ABI that a registered profile binds is exported by `weight_sharing`.
+
+    The `SourceIdentity` ABI tests iterate the exported constants, so an ABI
+    missing from `__all__` would otherwise escape them.
+    """
+    published = {
+        getattr(weight_sharing_mod, name)
+        for name in weight_sharing_mod.__all__
+        if re.fullmatch(r".*_POST_TRANSFORM_LAYOUT_ABI_V\d+", name)
+    }
+    profiles = ModelLoader._post_transform_profile_registry().profiles
+
+    assert {profile.transform_abi_id for profile in profiles} <= published
 
 
 def test_default_profile_qualifies_real_tiny_llama_lifecycle(

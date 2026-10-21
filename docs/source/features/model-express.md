@@ -30,7 +30,7 @@ profiles:
 | `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
-| `qwen3_5-for-conditional-generation-bf16-complete-v1` | `Qwen3_5VLModel` | `Qwen3_5ForConditionalGeneration` / `qwen3_5` | Complete model | 1 | `trtllm-qwen3_5-dense-vl-complete-layout-v1` | Single-node dense BF16 vision-language model with its local vision encoder, unquantized weights and KV cache, TRTLLM attention, M-RoPE fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3_5-for-conditional-generation-bf16-complete-v1` | `Qwen3_5VLModel` | `Qwen3_5ForConditionalGeneration` / `qwen3_5` | Complete model | 1 | `trtllm-qwen3_5-dense-vl-complete-layout-v1` | Single-node dense BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, the transfer scope that
@@ -101,7 +101,10 @@ FP8 and NVFP4 variants, the Qwen3.5 MoE vision-language root, the text-only
 `Qwen3_5ForCausalLM` root, and the Qwen3-VL roots do not match this profile.
 The root sizes its M-RoPE buffers by `max_num_tokens` (and the PP size), and
 `SourceIdentity` hashes every realized buffer shape, so a donor and a receiver
-must use the same `max_num_tokens` to share weights.
+must use the same `max_num_tokens` to share weights. The vision configuration
+is bound by the checkpoint artifact identity and the realized vision parameter
+shapes rather than by the model fingerprint, which hashes the text
+configuration.
 
 TensorRT LLM applies two independent compatibility gates:
 
@@ -158,10 +161,11 @@ Support for another model family requires a focused qualification change:
 3. Add an exact qualification profile only after the reusable harness in
    `tests/unittest/utils/post_transform_qualification.py` proves tensor,
    alias, transform-guard, derived-state, and deterministic output
-   equivalence. Include an unregistered-root negative control. The harness
-   calls `load_weights` only when the case sets `load_producer`; use it, or a
-   dedicated load-path test, when `load_weights` or the weight mapper sets
-   state that a staged receiver never computes.
+   equivalence. Include an unregistered-root negative control. Set the
+   case's `prepare_producer` so the producer runs the family's real
+   `load_weights()`; without it the harness cannot see state that only the
+   load path or the weight mapper sets, which a staged receiver never
+   computes.
 4. Cover compatible transfer, source-identity mismatch, unsupported layout or
    protocol/ABI, no-disk staged reception, and unqualified-profile fallback.
    Keep target-plus-draft loading disabled unless that combination has its own
@@ -189,10 +193,10 @@ Each role generates eight fixed prompts for exactly 32 greedy tokens
 (`end_id=-1`, so no sequence stops early), and the test requires exact
 token-ID equality of the donor and the receiver against the HF baseline.
 Vision-language rows use an image probe instead of token-ID prompts: each of
-two test images from `LLM_MODELS_ROOT/multimodals/test_data` is asked the same
-four questions, so every role also runs the vision encoder and M-RoPE
-positions, with the same 32-token greedy equality and the same engine limits
-for all roles.
+`seashore.png` and `inpaint.png` from `LLM_MODELS_ROOT/multimodals/test_data`
+is asked the same four questions, so every role also runs the vision encoder
+and M-RoPE positions, with the same 32-token greedy equality and the same
+engine limits for all roles.
 
 **Weight manifests.** Every rank also writes a SHA-256 manifest of all
 registered parameters and buffers
