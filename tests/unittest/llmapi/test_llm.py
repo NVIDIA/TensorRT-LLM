@@ -637,21 +637,24 @@ def test_generate_with_bad_words():
         kv_cache_config=global_kvcache_config,
     )
 
-    bad_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
+    # The model continues "A B C" with space-separated letters, so the tokens
+    # it generates are the space-prefixed ones (" N", " I", " J"); with BPE
+    # tokenizers (e.g. Qwen3) these differ from the tokens of bare "N" / "I J".
+    bad_id = llm.tokenizer.encode(" N", add_special_tokens=False)[-1]
 
     llm_check_output(llm,
-                     prompts, ["D E F G H I J K L M\n\nI hope this"],
+                     prompts, ["D E F G H I J K L M\nA B C D"],
                      sampling_params=SamplingParams(max_tokens=15,
                                                     bad_token_ids=[bad_id]))
 
     llm_check_output(llm,
                      prompts, ["D E F G H I K L M N O P Q R S"],
-                     sampling_params=SamplingParams(max_tokens=15, bad="I J"))
+                     sampling_params=SamplingParams(max_tokens=15, bad=" I J"))
 
     llm_check_output(llm,
                      prompts, ["D E F G H I K L M N O P Q R S"],
                      sampling_params=SamplingParams(max_tokens=15,
-                                                    bad=["F E", "I J"]))
+                                                    bad=[" F E", " I J"]))
 
 
 class MyLogitsProcessor(LogitsProcessor):
