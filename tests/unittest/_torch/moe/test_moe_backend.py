@@ -31,6 +31,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from _torch.moe.moe_test_utils import (
     IS_CI_MODE,
     MoeBackendType,
@@ -1779,6 +1780,35 @@ def test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass():
         ref_fused_moe.check_accuracy(cutedsl_output, cutlass_output)
         with pytest.raises(Exception, match="Mismatch percentage"):
             ref_fused_moe.check_accuracy(cutedsl_output, unsmoothed_ref_output)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "activation_type, expected",
+    [
+        pytest.param(ActivationType.Swiglu, lambda g, u: F.silu(g) * u, id="swiglu"),
+        pytest.param(ActivationType.Geglu, lambda g, u: F.gelu(g) * u, id="geglu"),
+    ],
+)
+def test_marlin_gated_activation_reads_the_cutlass_fc1_layout(activation_type, expected):
+    """Marlin inherits the CUTLASS loader, which packs FC1 as ``[w3; w1]`` (``w1`` is ``gate_proj``).
+
+    A plain matmul stands in for the Marlin GEMM, which keeps the row order.
+    """
+    torch.manual_seed(0)
+    inter, hidden, tokens = 8, 16, 5
+    w1 = torch.randn(inter, hidden)
+    w3 = torch.randn(inter, hidden)
+    x = torch.randn(tokens, hidden)
+
+    method = NVFP4MarlinFusedMoEMethod.__new__(NVFP4MarlinFusedMoEMethod)
+    w3_w1 = torch.zeros(2 * inter, hidden)
+    method._resolve_staged_w3_w1_weight({"w1": w1, "w3": w3, "dst": w3_w1})
+
+    impl = SimpleNamespace(intermediate_size_per_partition=inter, activation_type=activation_type)
+    out = MarlinFusedMoE._apply_activation(impl, x @ w3_w1.T)
+
+    torch.testing.assert_close(out, expected(x @ w1.T, x @ w3.T))
 
 
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
