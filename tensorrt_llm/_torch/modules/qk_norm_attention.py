@@ -20,23 +20,32 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
-from ..modules.attention import _Q35_ATTN_SEG_FUSE_GATE, Attention
+from ..modules import attention as _attention_module
+from ..modules.attention import Attention
 from ..modules.fused_ops.fused_qk_norm_rope_gate import (
     fused_qkv_gemma_rmsnorm_rope_gate, fused_sigmoid_mul_inplace,
     q35_fused_qkv_rope_gate_append)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 
-# TRTLLM_Q35_POSITIONS_HOIST=1 (see models/modeling_speculative.py): the one-model
-# speculative forward hands a contiguous position tensor down; here the fused
-# prologue makes a strided one contiguous once for both of its kernels instead
-# of once per kernel (no copy at all when the forward hoisted it).
-_Q35_POSITIONS_HOIST = os.environ.get("TRTLLM_Q35_POSITIONS_HOIST", "0") == "1"
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_POSITIONS_HOIST
+    # TRTLLM_Q35_POSITIONS_HOIST=1 (see models/modeling_speculative.py): the
+    # one-model speculative forward hands a contiguous position tensor down;
+    # here the fused prologue makes a strided one contiguous once for both of
+    # its kernels instead of once per kernel (no copy at all when the forward
+    # hoisted it).
+    _Q35_POSITIONS_HOIST = os.environ.get("TRTLLM_Q35_POSITIONS_HOIST",
+                                          "0") == "1"
 
 
 # Move out from this class
@@ -294,7 +303,7 @@ class QKNormRoPEAttention(Attention):
             # fused kernel reads the raw projection (backend: q35_fold_inputs). The gate must reach the backend
             # (SEG_FUSE_GATE offer) because the folded kernel always applies it.
             fold = None
-            if (plan is not None and _Q35_ATTN_SEG_FUSE_GATE
+            if (plan is not None and _attention_module._Q35_ATTN_SEG_FUSE_GATE
                     and self.sparse_attn_hooks is None):
                 fold = q35_fold_inputs(
                     self.attn, plan, qkv, self.q_norm.weight,

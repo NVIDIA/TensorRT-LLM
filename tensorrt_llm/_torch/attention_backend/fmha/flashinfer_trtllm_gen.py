@@ -53,6 +53,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -220,30 +221,63 @@ if IS_FLASHINFER_AVAILABLE:
 
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
-# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_ATTN_SEGMENTS=<S> (S >= 2): uniform-q_len generation
-# attention runs as S page-aligned context segments per request through the same trtllm-gen kernel plus a Triton
-# LSE merge (fmha/q35_segmented.py); cuts the split-KV reduction cost at batch 1-2.
-try:
-    _Q35_ATTN_SEGMENTS = int(os.environ.get("TRTLLM_Q35_ATTN_SEGMENTS", "0"))
-except ValueError:
-    _Q35_ATTN_SEGMENTS = 0
-# CP-lite (TRTLLM_Q35_ATTN_CP=1, see fmha/q35_cp.py): generation batches >= TRTLLM_Q35_ATTN_CP_MIN_BATCH (default 2)
-# read their KV page-strided across the TP ranks of the KV group; TRTLLM_Q35_ATTN_CP_SEGMENTS local segments per rank
-# ("auto", default: 2 at batch <= 2 or q_len 1, else 1 -- GB300 4-rank microbenchmark).
-_Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
-# Batches above TRTLLM_Q35_ATTN_CP_MAX_BATCH (default 8) keep the standard path (no gain there; the LL all-to-all
-# carries at most _Q35_CP_MAX_PAIR_BYTES per (source, destination) pair).
-# TRTLLM_Q35_ATTN_CP_MIN_BATCH (default 2 at every layout): the segmented path wins at b1 at TP8 and at TP16 (8-rank
-# microbenchmark seg16 31.5 vs CP 36.4 us/call at 196k; CP is also slower in-model at TEP16 b1).
-try:
-    _Q35_ATTN_CP_MIN_BATCH = (
-        int(os.environ["TRTLLM_Q35_ATTN_CP_MIN_BATCH"])
-        if "TRTLLM_Q35_ATTN_CP_MIN_BATCH" in os.environ
-        else None
-    )
-    _Q35_ATTN_CP_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_CP_MAX_BATCH", "8"))
-except ValueError:
-    _Q35_ATTN_CP_MIN_BATCH, _Q35_ATTN_CP_MAX_BATCH = None, 8
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_ATTN_SEGMENTS, _Q35_ATTN_CP, _Q35_ATTN_CP_MIN_BATCH, _Q35_ATTN_CP_MAX_BATCH
+    global _Q35_CP_MAX_PAIR_BYTES, _Q35_ATTN_SEG_MAX_BATCH, _Q35_ATTN_KV_APPEND
+    global _Q35_ATTN_FUSED_DECODE, _Q35_ATTN_FOLD
+    # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_ATTN_SEGMENTS=<S> (S >= 2): uniform-q_len generation
+    # attention runs as S page-aligned context segments per request through the same trtllm-gen kernel plus a Triton
+    # LSE merge (fmha/q35_segmented.py); cuts the split-KV reduction cost at batch 1-2.
+    try:
+        _Q35_ATTN_SEGMENTS = int(os.environ.get("TRTLLM_Q35_ATTN_SEGMENTS", "0"))
+    except ValueError:
+        _Q35_ATTN_SEGMENTS = 0
+    # CP-lite (TRTLLM_Q35_ATTN_CP=1, see fmha/q35_cp.py): generation batches >= TRTLLM_Q35_ATTN_CP_MIN_BATCH (default
+    # 2) read their KV page-strided across the TP ranks of the KV group; TRTLLM_Q35_ATTN_CP_SEGMENTS local segments per
+    # rank ("auto", default: 2 at batch <= 2 or q_len 1, else 1 -- GB300 4-rank microbenchmark).
+    _Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
+    # Batches above TRTLLM_Q35_ATTN_CP_MAX_BATCH (default 8) keep the standard path (no gain there; the LL all-to-all
+    # carries at most _Q35_CP_MAX_PAIR_BYTES per (source, destination) pair).
+    # TRTLLM_Q35_ATTN_CP_MIN_BATCH (default 2 at every layout): the segmented path wins at b1 at TP8 and at TP16
+    # (8-rank microbenchmark seg16 31.5 vs CP 36.4 us/call at 196k; CP is also slower in-model at TEP16 b1).
+    try:
+        _Q35_ATTN_CP_MIN_BATCH = (
+            int(os.environ["TRTLLM_Q35_ATTN_CP_MIN_BATCH"])
+            if "TRTLLM_Q35_ATTN_CP_MIN_BATCH" in os.environ
+            else None
+        )
+        _Q35_ATTN_CP_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_CP_MAX_BATCH", "8"))
+    except ValueError:
+        _Q35_ATTN_CP_MIN_BATCH, _Q35_ATTN_CP_MAX_BATCH = None, 8
+    # = TPGroupExchange's per-pair buffer (TRTLLM_Q35_CP_EXCHANGE_KB, default 256 KiB; b32 MTP6 needs ~463 KiB).
+    _Q35_CP_MAX_PAIR_BYTES = int(os.environ.get("TRTLLM_Q35_CP_EXCHANGE_KB", "256")) * 1024
+    # Largest generation batch that takes the segmented path (GB300 microbench: S=16 wins ~9 us/call at b1, ~1-2 us at
+    # b2, loses ~3 us at b4 where the trtllm-gen kernel is already bandwidth-bound).
+    try:
+        _Q35_ATTN_SEG_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_SEG_MAX_BATCH", "2"))
+    except ValueError:
+        _Q35_ATTN_SEG_MAX_BATCH = 2
+    # TRTLLM_Q35_ATTN_KV_APPEND=1: in a generation-only step the attention module's fused qk-norm / RoPE / gate kernel
+    # also writes the FP8 query, appends the FP8 K / V of the new tokens to the paged cache and prepares the FMHA
+    # scales (q35_kv_append_plan gives it the destination); run_generation then skips trtllm_gen_generation_preprocess,
+    # i.e. its QKV kernel and, at batch >= 2 with q_len > 1, BuildDecoderInfo. The bytes written are identical to the
+    # C++ path.
+    _Q35_ATTN_KV_APPEND = os.environ.get("TRTLLM_Q35_ATTN_KV_APPEND", "0") == "1"
+    # Fused decode attention (TRTLLM_Q35_ATTN_FUSED_DECODE=1, default off): one CuTe DSL launch
+    # (fmha/q35_fused_decode.py: TMA paged FP8 KV, tcgen05 QK / PV, online softmax with the causal draft block,
+    # in-kernel split reduction, output gate) replaces the segmented chain for generation-only batches of one KV head
+    # per rank up to TRTLLM_Q35_ATTN_FUSED_MAX_BATCH (default 4). CP-lite, when enabled and applicable, takes
+    # precedence.
+    _Q35_ATTN_FUSED_DECODE = os.environ.get("TRTLLM_Q35_ATTN_FUSED_DECODE", "0") == "1"
+    # Folded prologue (TRTLLM_Q35_ATTN_FOLD=1, default off; needs TRTLLM_Q35_ATTN_KV_APPEND=1,
+    # TRTLLM_Q35_ATTN_FUSED_DECODE=1 and TRTLLM_Q35_ATTN_SEG_FUSE_GATE=1): calls that take the fused decode path skip
+    # the module's qk-norm / RoPE / gate / KV append Triton kernel; the fused kernel reads the raw QKV projection and
+    # does that work itself (bit-identical; the attention kernel becomes the QKV GEMM's PDL dependent).
+    # q35_fold_inputs decides per call, before the prologue.
+    _Q35_ATTN_FOLD = os.environ.get("TRTLLM_Q35_ATTN_FOLD", "0") == "1"
 
 
 def _q35_cp_min_batch(cp_group_size: int) -> int:
@@ -263,8 +297,6 @@ def _q35_cp_segments(num_requests: int, q_len: int) -> int:
     return 2 if (num_requests <= 2 or q_len == 1) else 1
 
 
-# = TPGroupExchange's per-pair buffer (TRTLLM_Q35_CP_EXCHANGE_KB, default 256 KiB; b32 MTP6 needs ~463 KiB).
-_Q35_CP_MAX_PAIR_BYTES = int(os.environ.get("TRTLLM_Q35_CP_EXCHANGE_KB", "256")) * 1024
 # CP-lite exchanges: one-launch LL all-gather / all-to-all within the KV group (TPGroupExchange). Without peer memory
 # for it, CP-lite is skipped (the NCCL fallback is ~2x slower than not splitting: 94.7 vs 50.1 us/call at b4 196k);
 # TRTLLM_Q35_ATTN_CP_NCCL=1 forces the NCCL fallback (testing only).
@@ -274,19 +306,8 @@ _Q35_ATTN_CP_SKIP_MTP = os.environ.get("TRTLLM_Q35_ATTN_CP_SKIP_MTP", "0") == "1
 _Q35_ATTN_SEG_SKIP_MTP = os.environ.get("TRTLLM_Q35_ATTN_SEG_SKIP_MTP", "0") == "1"
 # Counter slots for segmented / CP-lite calls: >= max(b * segments * folded heads, #SMs) (<= 64 * 128 here).
 _Q35_COUNTER_SLOTS = 64 * 128
-# Largest generation batch that takes the segmented path (GB300 microbench: S=16 wins ~9 us/call at b1, ~1-2 us at b2,
-# loses ~3 us at b4 where the trtllm-gen kernel is already bandwidth-bound).
-try:
-    _Q35_ATTN_SEG_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_SEG_MAX_BATCH", "2"))
-except ValueError:
-    _Q35_ATTN_SEG_MAX_BATCH = 2
-# TRTLLM_Q35_ATTN_KV_APPEND=1: in a generation-only step the attention module's fused qk-norm / RoPE / gate kernel also
-# writes the FP8 query, appends the FP8 K / V of the new tokens to the paged cache and prepares the FMHA scales
-# (q35_kv_append_plan gives it the destination); run_generation then skips trtllm_gen_generation_preprocess, i.e. its
-# QKV kernel and, at batch >= 2 with q_len > 1, BuildDecoderInfo. The bytes written are identical to the C++ path.
 # TRTLLM_Q35_ATTN_KV_APPEND_CHECK=1 (eager calls only, testing): also runs the C++ preprocess on those calls and
 # compares the query, the scales and the appended K / V bytes (counts in Q35_KV_APPEND_CHECK_STATS, mismatches logged).
-_Q35_ATTN_KV_APPEND = os.environ.get("TRTLLM_Q35_ATTN_KV_APPEND", "0") == "1"
 _Q35_ATTN_KV_APPEND_CHECK = os.environ.get("TRTLLM_Q35_ATTN_KV_APPEND_CHECK", "0") == "1"
 Q35_KV_APPEND_CHECK_STATS = {"calls": 0, "mismatches": 0}
 
@@ -333,22 +354,11 @@ class Q35KvAppendPlan:
     fold: Optional[Q35FoldInputs] = None
 
 
-# Fused decode attention (TRTLLM_Q35_ATTN_FUSED_DECODE=1, default off): one CuTe DSL launch
-# (fmha/q35_fused_decode.py: TMA paged FP8 KV, tcgen05 QK / PV, online softmax with the causal draft block, in-kernel
-# split reduction, output gate) replaces the segmented chain for generation-only batches of one KV head per rank up to
-# TRTLLM_Q35_ATTN_FUSED_MAX_BATCH (default 4). CP-lite, when enabled and applicable, takes precedence.
-_Q35_ATTN_FUSED_DECODE = os.environ.get("TRTLLM_Q35_ATTN_FUSED_DECODE", "0") == "1"
 try:
     _Q35_ATTN_FUSED_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_FUSED_MAX_BATCH", "4"))
 except ValueError:
     _Q35_ATTN_FUSED_MAX_BATCH = 4
 _Q35_ATTN_FUSED_SKIP_MTP = os.environ.get("TRTLLM_Q35_ATTN_FUSED_SKIP_MTP", "0") == "1"
-# Folded prologue (TRTLLM_Q35_ATTN_FOLD=1, default off; needs TRTLLM_Q35_ATTN_KV_APPEND=1,
-# TRTLLM_Q35_ATTN_FUSED_DECODE=1 and TRTLLM_Q35_ATTN_SEG_FUSE_GATE=1): calls that take the fused decode path skip the
-# module's qk-norm / RoPE / gate / KV append Triton kernel; the fused kernel reads the raw QKV projection and does that
-# work itself (bit-identical; the attention kernel becomes the QKV GEMM's PDL dependent). q35_fold_inputs decides per
-# call, before the prologue.
-_Q35_ATTN_FOLD = os.environ.get("TRTLLM_Q35_ATTN_FOLD", "0") == "1"
 # TRTLLM_Q35_ATTN_FOLD_CHECK=1 (eager calls only, testing): after each folded call also run the prologue kernel and the
 # unfolded fused decode on the same inputs and compare the output and the new tokens' K / V bytes bit for bit
 # (counts in Q35_FOLD_CHECK_STATS; mismatches are logged).

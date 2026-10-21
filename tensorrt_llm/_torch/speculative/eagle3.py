@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -51,15 +52,19 @@ def _q35_uploaded_set(buffer: torch.Tensor, value) -> None:
     _q35_uploaded[id(buffer)] = (weakref.ref(buffer), value)
 
 
-# TRTLLM_Q35_DRAFT_SLICES=1: in the linear MTP draft loop, select the per-request rows of draft steps
-# >= 1 with the prefix slice [0, batch_size) (every request feeds exactly one token, in request
-# order, and batch_indices_cuda[:n] is arange(n)), gather the step's rows once for the LM head and
-# the next step, and skip building inputs after the last step (upstream ca37c9f725, #19785).
-_Q35_DRAFT_SLICES = os.environ.get("TRTLLM_Q35_DRAFT_SLICES", "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_DRAFT_SLICES, _Q35_CTX_MTP_GRAPH
+    # TRTLLM_Q35_DRAFT_SLICES=1: in the linear MTP draft loop, select the per-request rows of draft steps
+    # >= 1 with the prefix slice [0, batch_size) (every request feeds exactly one token, in request
+    # order, and batch_indices_cuda[:n] is arange(n)), gather the step's rows once for the LM head and
+    # the next step, and skip building inputs after the last step.
+    _Q35_DRAFT_SLICES = os.environ.get("TRTLLM_Q35_DRAFT_SLICES", "0") == "1"
+    # TRTLLM_Q35_CTX_MTP_GRAPH=1 (default off): the draft step of a context-only batch with draft length 1 runs on
+    # CUDA graphs captured during the piecewise CUDA-graph warmup (q35_ctx_mtp_graph.py).
+    _Q35_CTX_MTP_GRAPH = _q35_ctx_mtp.ctx_mtp_graph_enabled()
 
-# TRTLLM_Q35_CTX_MTP_GRAPH=1 (default off): the draft step of a context-only batch with draft length 1 runs on CUDA
-# graphs captured during the piecewise CUDA-graph warmup (q35_ctx_mtp_graph.py).
-_Q35_CTX_MTP_GRAPH = _q35_ctx_mtp.ctx_mtp_graph_enabled()
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig

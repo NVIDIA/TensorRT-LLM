@@ -34,6 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 LOG2E = 1.4426950408889634
 # TRTLLM_Q35_ATTN_FMHA_PDL=1 (default 0, A/B only): PDL-launch the trtllm-gen FMHA of the segmented path and of CP-lite
 # (fmha/q35_cp.py) right after its prep kernel. Unsafe, hence off: the FMHA may read the per-request KV lengths / page
@@ -44,10 +46,18 @@ _FMHA_PDL = os.environ.get("TRTLLM_Q35_ATTN_FMHA_PDL", "0") == "1"
 # (the outputs are zeroed first), and with _DEBUG_ENTRY_TRIGGER release the dependents at kernel entry.
 _DEBUG_SPIN_NS = int(os.environ.get("TRTLLM_Q35_ATTN_SEG_DEBUG_SPIN_NS", "0"))
 _DEBUG_ENTRY_TRIGGER = False
-# TRTLLM_Q35_PDL_EARLY_TRIGGER=1: the final kernel of the segmented / CP-lite attention (merge / combine) releases its
-# dependents (o_proj, or the separate output-gate kernel) at kernel entry instead of after its store; they read its
-# output only after griddepcontrol.wait.
-_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _PDL_EARLY_TRIGGER
+    # TRTLLM_Q35_PDL_EARLY_TRIGGER=1: the final kernel of the segmented / CP-lite attention (merge / combine) releases
+    # its dependents (o_proj, or the separate output-gate kernel) at kernel entry instead of after its store; they read
+    # its output only after griddepcontrol.wait.
+    _PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
+
+
 # TRTLLM_Q35_ATTN_DRAFT_PRE_WAIT=1: the merge kernels compute the causal draft block (q, draft K/V, scales and the
 # output gate: all produced by the QKV preprocessing / qk-norm kernels, which completed before this call's prep kernel
 # released its dependents -- the prep waits on its predecessor before triggering) ahead of griddepcontrol.wait,

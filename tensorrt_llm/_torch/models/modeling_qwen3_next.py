@@ -40,6 +40,7 @@ from tensorrt_llm._torch.modules.fused_shared_expert import \
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -130,22 +131,88 @@ def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
             and not enable_attention_dp)
 
 
-# Qwen3.5 low-latency comm flags (default off).
-# TRTLLM_Q35_AR_FP8_OUT=1: the fused all-reduce in front of a GDN / full-attention layer also emits
-#   that layer's FP8 (E4M3, static per-tensor scale) projection input, bitwise what
-#   static_quantize_e4m3_per_tensor makes of the BF16 norm output, so in_proj_qkvz / qkv_proj skip
-#   their quantize kernel (GDN keeps the BF16 output for in_proj_ba).
-# TRTLLM_Q35_AR_NORM_FUSE=1: fold the standalone RMSNorms that follow plain all-reduces into them
-#   (embedding + first input_layernorm; per MTP pass: embedding + pre_fc_norm_embedding, fc +
-#   input_layernorm, MoE + shared_head.norm).
-# TRTLLM_Q35_REPLICATED_EMBED=1: full embedding table on every rank (+~1.8 GB/GPU), no all-reduce.
-_Q35_AR_FP8_OUT = os.environ.get("TRTLLM_Q35_AR_FP8_OUT", "0") == "1"
-_Q35_AR_NORM_FUSE = os.environ.get("TRTLLM_Q35_AR_NORM_FUSE", "0") == "1"
-_Q35_REPLICATED_EMBED = os.environ.get("TRTLLM_Q35_REPLICATED_EMBED",
-                                       "0") == "1"
-# TRTLLM_Q35_EMBED_GATHER=1 (with TRTLLM_Q35_REPLICATED_EMBED): every target / MTP lookup of the full table
-# is one gather launch instead of the 9-kernel masked lookup (bitwise).
-_Q35_EMBED_GATHER = os.environ.get("TRTLLM_Q35_EMBED_GATHER", "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_AR_FP8_OUT, _Q35_AR_NORM_FUSE, _Q35_REPLICATED_EMBED
+    global _Q35_EMBED_GATHER, _Q35_FUSED_AR, _Q35_FIN_FOLD, _Q35_AR2
+    global _Q35_FUSED_AR_MAX_ROWS, _Q35_MTP_FC_CUTE_AR, _Q35_GEMM_AR
+    global _Q35_GEMM_AR_MIN_ROWS, _Q35_SE_AUX, Q35_MOE_FRONT_BIG
+    global Q35_MOE_ROUTER_GEMM, Q35_MOE_ROUTER_LOWM
+    # Qwen3.5 low-latency comm flags (default off).
+    # TRTLLM_Q35_AR_FP8_OUT=1: the fused all-reduce in front of a GDN / full-attention layer also emits
+    #   that layer's FP8 (E4M3, static per-tensor scale) projection input, bitwise what
+    #   static_quantize_e4m3_per_tensor makes of the BF16 norm output, so in_proj_qkvz / qkv_proj skip
+    #   their quantize kernel (GDN keeps the BF16 output for in_proj_ba).
+    _Q35_AR_FP8_OUT = os.environ.get("TRTLLM_Q35_AR_FP8_OUT", "0") == "1"
+    # TRTLLM_Q35_AR_NORM_FUSE=1: fold the standalone RMSNorms that follow plain all-reduces into them
+    #   (embedding + first input_layernorm; per MTP pass: embedding + pre_fc_norm_embedding, fc +
+    #   input_layernorm, MoE + shared_head.norm).
+    _Q35_AR_NORM_FUSE = os.environ.get("TRTLLM_Q35_AR_NORM_FUSE", "0") == "1"
+    # TRTLLM_Q35_REPLICATED_EMBED=1: full embedding table on every rank (+~1.8 GB/GPU), no all-reduce.
+    _Q35_REPLICATED_EMBED = os.environ.get("TRTLLM_Q35_REPLICATED_EMBED",
+                                           "0") == "1"
+    # TRTLLM_Q35_EMBED_GATHER=1 (with TRTLLM_Q35_REPLICATED_EMBED): every target / MTP lookup of the full
+    # table is one gather launch instead of the 9-kernel masked lookup (bitwise).
+    _Q35_EMBED_GATHER = os.environ.get("TRTLLM_Q35_EMBED_GATHER", "0") == "1"
+    # TRTLLM_Q35_FUSED_AR=se|all: as TRTLLM_Q35_TRITON_AR, on the CuTe DSL kernel (cute_dsl_kernels/blackwell/
+    #   q35_allreduce_norm.py: bitwise the library op, one-shot up to 64 rows); takes precedence.
+    _Q35_FUSED_AR = os.environ.get("TRTLLM_Q35_FUSED_AR", "")
+    # TRTLLM_Q35_FIN_FOLD=1 (with TRTLLM_Q35_FUSED_AR): the trtllm-gen NVFP4 MoE runs with
+    #   do_finalize=False and the CuTe all-reduce finalizes its permuted FC2 rows in-kernel (the finalize
+    #   kernel's arithmetic, bitwise), removing the finalize launch.
+    _Q35_FIN_FOLD = os.environ.get("TRTLLM_Q35_FIN_FOLD", "0") == "1"
+    # TRTLLM_Q35_AR2=fe|fp|fpm|sl|slm (with TRTLLM_Q35_FUSED_AR): the one-shot fused all-reduces on the ar2 kernel
+    #   (distributed/q35_ar2.py); two-shot calls (TP16 >= 12 rows) stay on the CuTe kernel (slot two-shot: opt-in
+    #   with TRTLLM_Q35_AR2_SLOT_TWOSHOT=1). fe / fp: same protocol and outputs as the CuTe
+    #   kernel (fp: buffer rotation inside the poll loop); sl: flag-free slot protocol on its own workspace (same
+    #   outputs); m: st.async + mbarrier norm exchange.
+    _Q35_AR2 = os.environ.get("TRTLLM_Q35_AR2", "")
+    # TRTLLM_Q35_FUSED_AR_MAX_ROWS=<n> (default 64; CuTe kernel only, i.e. with TRTLLM_Q35_FUSED_AR): largest call
+    # the fused all-reduces take. Above 64 rows (TEP8 b16 / b32 verify: 112 / 224 rows) the MoE-output all-reduce
+    # keeps the shared-expert combine and the finalize (TRTLLM_Q35_FIN_FOLD) in its launch instead of the library
+    # two-shot + Lamport RMSNorm pair behind separate finalize and combine kernels; pair it with
+    # TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS (the CuTe two-shot moves ~1/4 of the one-shot's NVLink ingress at TP8).
+    _Q35_FUSED_AR_MAX_ROWS = int(
+        os.environ.get("TRTLLM_Q35_FUSED_AR_MAX_ROWS", "64"))
+    # TRTLLM_Q35_MTP_FC_CUTE_AR=1 (with TRTLLM_Q35_FUSED_AR=all and TRTLLM_Q35_AR_NORM_FUSE): the MTP fc
+    #   all-reduce + input_layernorm (zero residual) runs on the CuTe kernel instead of the library MNNVL
+    #   one-shot, under the same policy as the other fold-free ARs (only where the library would be one-shot;
+    #   bitwise there).
+    _Q35_MTP_FC_CUTE_AR = os.environ.get("TRTLLM_Q35_MTP_FC_CUTE_AR",
+                                         "0") == "1"
+    # TRTLLM_Q35_GEMM_AR=1: the attention o_proj / GDN out_proj (FP8 per-tensor on the low-M kernel) and the
+    # following all-reduce + residual + post_attention_layernorm run as one CuTe launch
+    # (distributed/q35_allreduce.Q35GemmArNorm): the projection defers itself to the decoder layer's fused norm
+    # all-reduce. Same projection values; the RMSNorm sums its squares in another order.
+    _Q35_GEMM_AR = os.environ.get("TRTLLM_Q35_GEMM_AR", "0") == "1"
+    # TRTLLM_Q35_GEMM_AR_MIN_ROWS=N: the fused path only for calls of at least N rows (e.g. 21 = b4 only with MTP
+    # 6: b1 / b2 / b4 verify 7 / 14 / 28 rows); every batch size is its own CUDA graph, so this is a per-batch
+    # policy.
+    _Q35_GEMM_AR_MIN_ROWS = int(
+        os.environ.get("TRTLLM_Q35_GEMM_AR_MIN_ROWS", "1"))
+    # TRTLLM_Q35_SE_AUX=gate|prio|fp8, combined with '+' (default off): the shared expert's chain on the aux stream
+    #   (FP8 quant of x -> gate_up -> SwiGLU -> down, then the shared_expert_gate GEMV hidden -> 1 and its cuBLAS
+    #   split-K reduce) next to the routed MoE. With a short MoE front (TRTLLM_Q35_MOE_FRONT_BIG) the routed FC1
+    #   launches early (PDL) and fills the SMs: chain kernels launched after it wait for the FC1 / FC2 CTA queues
+    #   to drain, and the MoE-output all-reduce waits for the chain.
+    #   gate: the GEMV + reduce run on a second aux stream, in parallel with the rest of the chain (same kernels,
+    #     bitwise; CUDA-graph multi-stream only);
+    #   prio: the chain runs on its own aux stream(s) created at the highest stream priority, so its CTAs are
+    #     dispatched ahead of queued FC1 / FC2 CTAs (same kernels, bitwise; inside a CUDA graph this needs node
+    #     priorities);
+    #   fp8: the pre-MoE all-reduce + RMSNorm (library launch) also writes the shared expert's FP8 input, so the
+    #     chain starts at gate_up without its quantize kernel (the same arithmetic, bitwise).
+    #   Use gate. Same-job decode A/B (TEP8 MTP-6, TRTLLM_Q35_MOE_FRONT_BIG=1, step ms): gate b8 -0.13..-0.22, b16
+    #   -0.11, b32 -0.19..-0.21, greedy tokens identical; prio and gate+prio lose most of it (the high-priority
+    #   chain takes SMs from FC1 / the route launch); gate+fp8 is 0.02-0.07 slower than gate (gate_up then runs
+    #   next to the router GEMM).
+    _Q35_SE_AUX = frozenset(t for t in os.environ.get(
+        "TRTLLM_Q35_SE_AUX", "").replace("+", ",").split(",") if t)
+    # Copies from q35_fused_front (imported above); its reader runs first.
+    from ..modules.fused_moe.q35_fused_front import (Q35_MOE_FRONT_BIG,
+                                                     Q35_MOE_ROUTER_GEMM,
+                                                     Q35_MOE_ROUTER_LOWM)
 
 
 def _q35_mtp_fused_input() -> bool:
@@ -158,27 +225,15 @@ def _q35_mtp_fused_input() -> bool:
 #   folded into its input, removing the separate combine kernel; =all: additionally every other
 #   fused all-reduce + RMSNorm (PRE_MOE, folds) on that kernel (one-shot also at 28 rows).
 #   Decode shapes only (<= 64 rows, MNNVL); otherwise the library op.
-# TRTLLM_Q35_FUSED_AR=se|all: same, on the CuTe DSL kernel (cute_dsl_kernels/blackwell/
-#   q35_allreduce_norm.py: bitwise the library op, one-shot up to 64 rows); takes precedence.
 _Q35_TRITON_AR = os.environ.get("TRTLLM_Q35_TRITON_AR", "")
-_Q35_FUSED_AR = os.environ.get("TRTLLM_Q35_FUSED_AR", "")
-# TRTLLM_Q35_FIN_FOLD=1 (with TRTLLM_Q35_FUSED_AR): the trtllm-gen NVFP4 MoE runs with
-#   do_finalize=False and the CuTe all-reduce finalizes its permuted FC2 rows in-kernel (the finalize
-#   kernel's arithmetic, bitwise), removing the finalize launch. TRTLLM_Q35_FIN_CHECK=1: in eager
-#   calls, also run the MoE with do_finalize=True and compare (log once per layer).
-_Q35_FIN_FOLD = os.environ.get("TRTLLM_Q35_FIN_FOLD", "0") == "1"
 # TRTLLM_Q35_MTP_MOE_CALIB=<path> (debug, default off): MoE activation maxima for the NVFP4 MTP experts' activation
 # scales (modules/q35_mtp_moe_quant.py).
 _Q35_MTP_MOE_CALIB = bool(
     os.environ.get("TRTLLM_Q35_MTP_MOE_CALIB", "").strip())
+# TRTLLM_Q35_FIN_CHECK=1 (with TRTLLM_Q35_FIN_FOLD): in eager calls, also run the MoE with do_finalize=True and
+# compare (log once per layer).
 _Q35_FIN_CHECK = os.environ.get("TRTLLM_Q35_FIN_CHECK", "0") == "1"
-# TRTLLM_Q35_AR2=fe|fp|fpm|sl|slm (with TRTLLM_Q35_FUSED_AR): the one-shot fused all-reduces on the ar2 kernel
-#   (distributed/q35_ar2.py); two-shot calls (TP16 >= 12 rows) stay on the CuTe kernel (slot two-shot: opt-in with
-#   TRTLLM_Q35_AR2_SLOT_TWOSHOT=1). fe / fp: same protocol and outputs as the CuTe
-#   kernel (fp: buffer rotation inside the poll loop); sl: flag-free slot protocol on its own workspace (same
-#   outputs); m: st.async + mbarrier norm exchange. TRTLLM_Q35_AR2_SITES=all|moe|mixer limits it to the MoE-output
-#   (fold) or the other calls.
-_Q35_AR2 = os.environ.get("TRTLLM_Q35_AR2", "")
+# TRTLLM_Q35_AR2_SITES=all|moe|mixer (with TRTLLM_Q35_AR2): limits it to the MoE-output (fold) or the other calls.
 _Q35_AR2_SITES = os.environ.get("TRTLLM_Q35_AR2_SITES", "all")
 
 # TRTLLM_Q35_FUSED_AR=all also takes the ARs without a fold (PRE_MOE) only while the library's MNNVL path would
@@ -187,13 +242,6 @@ _Q35_AR2_SITES = os.environ.get("TRTLLM_Q35_AR2_SITES", "all")
 # overrides the bound (A/B).
 _Q35_FUSED_AR_PLAIN_MAX_ROWS = os.environ.get(
     "TRTLLM_Q35_FUSED_AR_PLAIN_MAX_ROWS")
-# TRTLLM_Q35_FUSED_AR_MAX_ROWS=<n> (default 64; CuTe kernel only, i.e. with TRTLLM_Q35_FUSED_AR): largest call the
-# fused all-reduces take. Above 64 rows (TEP8 b16 / b32 verify: 112 / 224 rows) the MoE-output all-reduce keeps the
-# shared-expert combine and the finalize (TRTLLM_Q35_FIN_FOLD) in its launch instead of the library two-shot +
-# Lamport RMSNorm pair behind separate finalize and combine kernels; pair it with TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS
-# (the CuTe two-shot moves ~1/4 of the one-shot's NVLink ingress at TP8).
-_Q35_FUSED_AR_MAX_ROWS = int(
-    os.environ.get("TRTLLM_Q35_FUSED_AR_MAX_ROWS", "64"))
 
 
 def _q35_triton_ar(allreduce, rows: int, is_post_moe: bool, hidden: int = 4096):
@@ -231,21 +279,6 @@ def _q35_fin_fold(decoder_layer, rows: int) -> bool:
             and isinstance(mlp, Qwen3NextSparseMoeBlock)
             and _q35_triton_ar(decoder_layer.allreduce, rows, True) is not None
             and mlp.q35_can_defer_finalize())
-
-
-# TRTLLM_Q35_MTP_FC_CUTE_AR=1 (with TRTLLM_Q35_FUSED_AR=all and TRTLLM_Q35_AR_NORM_FUSE): the MTP fc all-reduce +
-#   input_layernorm (zero residual) runs on the CuTe kernel instead of the library MNNVL one-shot, under the same
-#   policy as the other fold-free ARs (only where the library would be one-shot; bitwise there).
-_Q35_MTP_FC_CUTE_AR = os.environ.get("TRTLLM_Q35_MTP_FC_CUTE_AR", "0") == "1"
-
-# TRTLLM_Q35_GEMM_AR=1: the attention o_proj / GDN out_proj (FP8 per-tensor on the low-M kernel) and the
-# following all-reduce + residual + post_attention_layernorm run as one CuTe launch
-# (distributed/q35_allreduce.Q35GemmArNorm): the projection defers itself to the decoder layer's fused norm
-# all-reduce. Same projection values; the RMSNorm sums its squares in another order.
-_Q35_GEMM_AR = os.environ.get("TRTLLM_Q35_GEMM_AR", "0") == "1"
-# TRTLLM_Q35_GEMM_AR_MIN_ROWS=N: the fused path only for calls of at least N rows (e.g. 21 = b4 only with MTP 6:
-# b1 / b2 / b4 verify 7 / 14 / 28 rows); every batch size is its own CUDA graph, so this is a per-batch policy.
-_Q35_GEMM_AR_MIN_ROWS = int(os.environ.get("TRTLLM_Q35_GEMM_AR_MIN_ROWS", "1"))
 
 
 class _Q35DeferredProj:
@@ -566,25 +599,9 @@ class Qwen3NextGate(nn.Module):
                 f"Unsupported routing method: {self.routing_method_type}")
 
 
-# TRTLLM_Q35_SE_AUX=gate|prio|fp8, combined with '+' (default off): the shared expert's chain on the aux stream
-#   (FP8 quant of x -> gate_up -> SwiGLU -> down, then the shared_expert_gate GEMV hidden -> 1 and its cuBLAS split-K
-#   reduce) next to the routed MoE. With a short MoE front (TRTLLM_Q35_MOE_FRONT_BIG) the routed FC1 launches early
-#   (PDL) and fills the SMs: chain kernels launched after it wait for the FC1 / FC2 CTA queues to drain, and the
-#   MoE-output all-reduce waits for the chain.
-#   gate: the GEMV + reduce run on a second aux stream, in parallel with the rest of the chain (same kernels, bitwise;
-#     CUDA-graph multi-stream only);
-#   prio: the chain runs on its own aux stream(s) created at the highest stream priority, so its CTAs are dispatched
-#     ahead of queued FC1 / FC2 CTAs (same kernels, bitwise; inside a CUDA graph this needs node priorities);
-#   fp8: the pre-MoE all-reduce + RMSNorm (library launch) also writes the shared expert's FP8 input, so the chain
-#     starts at gate_up without its quantize kernel (the same arithmetic, bitwise).
-#   Use gate. Same-job decode A/B (TEP8 MTP-6, TRTLLM_Q35_MOE_FRONT_BIG=1, step ms): gate b8 -0.13..-0.22, b16 -0.11,
-#   b32 -0.19..-0.21, greedy tokens identical; prio and gate+prio lose most of it (the high-priority chain takes SMs
-#   from FC1 / the route launch); gate+fp8 is 0.02-0.07 slower than gate (gate_up then runs next to the router GEMM).
 # TRTLLM_Q35_SE_AUX_MIN_ROWS=<n> (default 1): only calls of at least n rows (e.g. 112: the TEP8 b16 / b32 verify).
 # TRTLLM_Q35_SE_AUX_CHECK=1 (debug, with fp8): eager calls compare the all-reduce's FP8 copy with the shared expert's
 #   own quantization of x (bitwise; logged once per layer and row count, and on every mismatch).
-_Q35_SE_AUX = frozenset(t for t in os.environ.get(
-    "TRTLLM_Q35_SE_AUX", "").replace("+", ",").split(",") if t)
 _Q35_SE_AUX_MIN_ROWS = int(os.environ.get("TRTLLM_Q35_SE_AUX_MIN_ROWS", "1"))
 _Q35_SE_AUX_CHECK = os.environ.get("TRTLLM_Q35_SE_AUX_CHECK", "0") == "1"
 _Q35_SE_STREAMS: Dict[tuple, torch.cuda.Stream] = {}

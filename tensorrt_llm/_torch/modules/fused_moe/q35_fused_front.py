@@ -53,6 +53,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 from ...autotuner import AutoTuner
 
 Q35_MOE_FUSED_FRONT = os.environ.get("TRTLLM_Q35_MOE_FUSED_FRONT", "0") == "1"
@@ -249,10 +251,6 @@ def _q35_moe_front_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-# TRTLLM_Q35_MOE_ROUTER_GEMM: "1"/"triton" = single Triton launch (split-K GEMM + NVFP4 quant CTAs);
-# "lowm" = the low-M BF16 GEMM (modules/lowm_linear.py) for the logits, with x quantized by a
-# separate Triton launch issued first (the low-M kernel prefetches its weights before griddepcontrol.wait, so it
-# overlaps the quant launch).
 # TRTLLM_Q35_MOE_EARLY_TRIGGER (default off): the Q35 router launch and / or the per-token route + tables launch release
 # their PDL dependents (trtllm-gen routing kernel, route launch, FC1) at kernel entry instead of at exit, so the
 # dependent's launch overlaps this kernel; the dependent still reads its inputs only after griddepcontrol.wait.
@@ -261,9 +259,63 @@ def _q35_moe_front_kernel(
 _Q35_EARLY_MODE = os.environ.get("TRTLLM_Q35_MOE_EARLY_TRIGGER", "0").lower()
 Q35_MOE_EARLY_TRIGGER = _Q35_EARLY_MODE in ("1", "all", "router")
 Q35_MOE_EARLY_TRIGGER_ROUTE = _Q35_EARLY_MODE in ("1", "all", "route")
-_Q35_ROUTER_MODE = os.environ.get("TRTLLM_Q35_MOE_ROUTER_GEMM", "0").lower()
-Q35_MOE_ROUTER_GEMM = _Q35_ROUTER_MODE in ("1", "triton", "lowm")
-Q35_MOE_ROUTER_LOWM = _Q35_ROUTER_MODE == "lowm"
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_ROUTER_MODE, Q35_MOE_ROUTER_GEMM, Q35_MOE_ROUTER_LOWM, Q35_MOE_PREROUTE
+    global Q35_MOE_PREROUTE_LOWM, Q35_MOE_FRONT_FUSED, _Q35_MOE_FRONT_BIG_MODE, Q35_MOE_FRONT_BIG
+    global Q35_MOE_FRONT_BIG_GEMM, Q35_MOE_FRONT_BIG_MS
+    # TRTLLM_Q35_MOE_ROUTER_GEMM: "1"/"triton" = single Triton launch (split-K GEMM + NVFP4 quant CTAs);
+    # "lowm" = the low-M BF16 GEMM (modules/lowm_linear.py) for the logits, with x quantized by a
+    # separate Triton launch issued first (the low-M kernel prefetches its weights before griddepcontrol.wait, so it
+    # overlaps the quant launch).
+    _Q35_ROUTER_MODE = os.environ.get("TRTLLM_Q35_MOE_ROUTER_GEMM", "0").lower()
+    Q35_MOE_ROUTER_GEMM = _Q35_ROUTER_MODE in ("1", "triton", "lowm")
+    Q35_MOE_ROUTER_LOWM = _Q35_ROUTER_MODE == "lowm"
+    # TRTLLM_Q35_MOE_PREROUTE=1 (default off; with TRTLLM_Q35_MOE_ROUTER_GEMM, TRTLLM-gen NVFP4 MoE, and a
+    # libth_common that has FP4BlockScaleMoERunner.run_moe_prerouted): one small Triton launch after the router
+    # turns the logits into the top-k ids / weights and trtllm-gen's routing tables for this rank's experts, and
+    # the MoE op skips its routing kernel (routingIndicesCluster) whenever its tactic uses the tables' tile.
+    Q35_MOE_PREROUTE = os.environ.get("TRTLLM_Q35_MOE_PREROUTE", "0") == "1"
+    # TRTLLM_Q35_MOE_PREROUTE_LOWM=1 (with PREROUTE, default off): the router is the plain BF16 GEMM on the low-M
+    # kernel (1.4-3.4 us vs 4.0-4.8 us for the Triton router + fused quant, bench), and the NVFP4 quantization of x
+    # moves into the route + tables launch (M extra programs). Same launch count; the logits come from another GEMM
+    # (within 1 bf16 ulp of cuBLAS like the Triton router's), so top-k ties can differ: validate accuracy and
+    # acceptance length.
+    Q35_MOE_PREROUTE_LOWM = os.environ.get("TRTLLM_Q35_MOE_PREROUTE_LOWM", "0") == "1"
+    # TRTLLM_Q35_MOE_FRONT_FUSED=1 (default off; acts only together with TRTLLM_Q35_MOE_PREROUTE=1 and
+    # TRTLLM_Q35_MOE_PREROUTE_LOWM=1, i.e. on the two-launch front): the low-M router GEMM, the per-token route +
+    # tables launch and the NVFP4 quantization of x become ONE CuTe DSL launch (cute_dsl_kernels/blackwell/
+    # q35_moe_front.py: the router CTAs count their arrival on a ticket and the last one routes every token and
+    # writes the tables). Its logits, top-k ids / weights, xq / xsf and tables are bitwise those of the two-launch
+    # front (the tables up to the row order inside an expert's block, which the per-token kernel leaves to atomics;
+    # the MoE output does not depend on it). Not for DEA (falls back to the two-launch front); falls back too when a
+    # shape was not compiled before CUDA graph capture.
+    Q35_MOE_FRONT_FUSED = os.environ.get("TRTLLM_Q35_MOE_FRONT_FUSED", "0") == "1"
+    # TRTLLM_Q35_MOE_FRONT_BIG (default off; TRTLLM-gen NVFP4 MoE whose C++ runner has run_moe_prerouted): the MoE
+    # front above 32 tokens, i.e. the MTP-6 target verify at b16 / b32 (112 / 224 tokens), where the stock path runs
+    # the router GEMM (cuBLAS), fp4_quantize and the op's routing kernel. Not for DEA; falls back to the stock path
+    # when a shape was not compiled before CUDA graph capture.
+    #   1 / route: the stock router GEMM (logits bitwise the stock path's), then the routing, the pre-routed tables
+    #      and the NVFP4 quantization of x in ONE CuTe DSL launch (q35_moe_front_big.Q35MoeRouteBigKernel: clusters
+    #      of 8, the routing CTAs combine their per-expert counts through distributed shared memory).
+    #   gemm: the router GEMM in the same launch too (q35_moe_front_big.Q35MoeFrontBigKernel: logits of the low-M
+    #      BF16 router GEMM, tactic (16, 1), not cuBLAS's: top-k near-ties can flip against the stock path). On
+    #      GB300 its split-K GEMM (mma.sync, partials through L2) is slower than cuBLAS, so it is the A/B variant,
+    #      not the default.
+    _Q35_MOE_FRONT_BIG_MODE = os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG", "0").lower()
+    Q35_MOE_FRONT_BIG = _Q35_MOE_FRONT_BIG_MODE in ("1", "route", "gemm")
+    Q35_MOE_FRONT_BIG_GEMM = _Q35_MOE_FRONT_BIG_MODE == "gemm"
+    # Token counts that take it (default 112 and 224: the target verify of CUDA-graph batches 16 and 32).
+    Q35_MOE_FRONT_BIG_MS = frozenset(
+        int(v)
+        for v in os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_MS", "112,224").split(",")
+        if v.strip()
+    )
+
+
 # TRTLLM_Q35_MOE_GATE_LOWM=1 (with TRTLLM_Q35_MOE_ROUTER_GEMM=1, default off): router calls without the NVFP4 quant
 # (the BF16 MTP layer's gate) run on the low-M BF16 GEMM (1.4-1.7 us vs ~4 us at M <= 7). Other logits rounding than
 # the Triton router: draft routing near-ties may differ (AL gate).
@@ -967,13 +1019,8 @@ class Q35RouterGemm:
         return out
 
 
-# TRTLLM_Q35_MOE_PREROUTE=1 (default off; with TRTLLM_Q35_MOE_ROUTER_GEMM, TRTLLM-gen NVFP4 MoE, and a
-# libth_common that has FP4BlockScaleMoERunner.run_moe_prerouted): one small Triton launch after the router
-# turns the logits into the top-k ids / weights and trtllm-gen's routing tables for this rank's experts, and
-# the MoE op skips its routing kernel (routingIndicesCluster) whenever its tactic uses the tables' tile.
-# TRTLLM_Q35_MOE_PREROUTE_TILE pins the tile (default: 8, then the tile of the tactic the op reports for the
-# shape, learned in the eager warmup before CUDA graph capture).
-Q35_MOE_PREROUTE = os.environ.get("TRTLLM_Q35_MOE_PREROUTE", "0") == "1"
+# TRTLLM_Q35_MOE_PREROUTE_TILE pins the tile of TRTLLM_Q35_MOE_PREROUTE (default: 8, then the tile of the tactic the
+# op reports for the shape, learned in the eager warmup before CUDA graph capture).
 Q35_MOE_PREROUTE_TILE = int(os.environ.get("TRTLLM_Q35_MOE_PREROUTE_TILE", "0"))
 # TRTLLM_Q35_MOE_PREROUTE_FOLD: route + tables in the router launch instead of a separate route + tables launch.
 #   1: one program routes all tokens (single-program core; slower in a unit microbenchmark: router + quant
@@ -981,13 +1028,7 @@ Q35_MOE_PREROUTE_TILE = int(os.environ.get("TRTLLM_Q35_MOE_PREROUTE_TILE", "0"))
 #   2: one program per token (the M quant programs, after their row, wait for every N block's logits, then do the
 #      per-token route kernel's work; the last token program writes the tables).
 Q35_MOE_PREROUTE_FOLD_MODE = int(os.environ.get("TRTLLM_Q35_MOE_PREROUTE_FOLD", "0") or 0)
-# TRTLLM_Q35_MOE_PREROUTE_LOWM=1 (with PREROUTE, default off): the router is the plain BF16 GEMM on the low-M
-# kernel (1.4-3.4 us vs 4.0-4.8 us for the Triton router + fused quant, bench), and the NVFP4 quantization of x
-# moves into the route + tables launch (M extra programs). Same launch count; the logits come from another GEMM
-# (within 1 bf16 ulp of cuBLAS like the Triton router's), so top-k ties can differ: validate accuracy and
-# acceptance length.
 Q35_MOE_PREROUTE_FOLD = Q35_MOE_PREROUTE_FOLD_MODE in (1, 2)
-Q35_MOE_PREROUTE_LOWM = os.environ.get("TRTLLM_Q35_MOE_PREROUTE_LOWM", "0") == "1"
 # Warps per program of the per-token route + tables kernel: 4 (microbenchmark: DEA tables 11.2-12.2 -> 5.2-5.8 us,
 # EP 4.9-6.4 -> 3.9-5.1 us, vs trtllm-gen routing 3.3-5.1 us; 1 warp leaves the last program's table phase serial).
 _Q35_ROUTE_WARPS = int(os.environ.get("TRTLLM_Q35_ROUTE_WARPS", "4"))
@@ -1482,15 +1523,6 @@ class Q35PreRoute:
         return res + (out[8], out[9]) if x is not None else res
 
 
-# TRTLLM_Q35_MOE_FRONT_FUSED=1 (default off; acts only together with TRTLLM_Q35_MOE_PREROUTE=1 and
-# TRTLLM_Q35_MOE_PREROUTE_LOWM=1, i.e. on the two-launch front): the low-M router GEMM, the per-token route +
-# tables launch and the NVFP4 quantization of x become ONE CuTe DSL launch (cute_dsl_kernels/blackwell/
-# q35_moe_front.py: the router CTAs count their arrival on a ticket and the last one routes every token and writes
-# the tables). Its logits, top-k ids / weights, xq / xsf and tables are bitwise those of the two-launch front (the
-# tables up to the row order inside an expert's block, which the per-token kernel leaves to atomics; the MoE output
-# does not depend on it). Not for DEA (falls back to the two-launch front); falls back too when a shape was not
-# compiled before CUDA graph capture.
-Q35_MOE_FRONT_FUSED = os.environ.get("TRTLLM_Q35_MOE_FRONT_FUSED", "0") == "1"
 # Hand-off of the router logits to the routing CTA (q35_moe_front.py): 1 = staging buffer polled by a dedicated
 # router CTA (default), 0 = arrival ticket (the last router CTA routes). Top-k: 1 = sorted lanes + pop (default),
 # 0 = per-round re-max of each lane's keys (ticket hand-off only).
@@ -1754,24 +1786,6 @@ def _q35_front_fused(moe, weight: torch.Tensor, x: torch.Tensor, global_scale: t
     return logits, xq, xsf
 
 
-# TRTLLM_Q35_MOE_FRONT_BIG (default off; TRTLLM-gen NVFP4 MoE whose C++ runner has run_moe_prerouted): the MoE front
-# above 32 tokens, i.e. the MTP-6 target verify at b16 / b32 (112 / 224 tokens), where the stock path runs the
-# router GEMM (cuBLAS), fp4_quantize and the op's routing kernel. Not for DEA; falls back to the stock path when a
-# shape was not compiled before CUDA graph capture.
-#   1 / route: the stock router GEMM (logits bitwise the stock path's), then the routing, the pre-routed tables
-#      and the NVFP4 quantization of x in ONE CuTe DSL launch (q35_moe_front_big.Q35MoeRouteBigKernel: clusters of
-#      8, the routing CTAs combine their per-expert counts through distributed shared memory).
-#   gemm: the router GEMM in the same launch too (q35_moe_front_big.Q35MoeFrontBigKernel: logits of the low-M BF16
-#      router GEMM, tactic (16, 1), not cuBLAS's: top-k near-ties can flip against the stock path). On GB300 its
-#      split-K GEMM (mma.sync, partials through L2) is slower than cuBLAS, so it is the A/B variant, not the
-#      default.
-_Q35_MOE_FRONT_BIG_MODE = os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG", "0").lower()
-Q35_MOE_FRONT_BIG = _Q35_MOE_FRONT_BIG_MODE in ("1", "route", "gemm")
-Q35_MOE_FRONT_BIG_GEMM = _Q35_MOE_FRONT_BIG_MODE == "gemm"
-# Token counts that take it (default 112 and 224: the target verify of CUDA-graph batches 16 and 32).
-Q35_MOE_FRONT_BIG_MS = frozenset(
-    int(v) for v in os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_MS", "112,224").split(",") if v.strip()
-)
 # Router n-tiles (8 columns) per MMA warp of =gemm (0: one per 64 columns of the CTA tile). A/B knob.
 Q35_MOE_FRONT_BIG_TN = int(os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_TN", "0"))
 # Threads per CTA of the route-only launch (1024: one warp per token up to 256 tokens). A/B knob.

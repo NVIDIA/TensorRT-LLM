@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
@@ -1977,13 +1978,29 @@ def _promote_mamba_state_triton(
     )
 
 
-# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_PROMOTE_FUSED=1: KV cache manager V2 promotes the accepted
-# convolution state of every local Mamba/GDN layer in ONE launch through a per-layer (base pointer, slot stride)
-# descriptor table, and folds the replay bookkeeping (PNAT / active history buffer advance, ~10 small torch ops in
-# _advance_replay_state) into the same launch -- instead of one promotion launch per layer (45 for Qwen3.5) plus the
-# torch ops. Same copies and same bookkeeping arithmetic as the default path (bitwise-identical caches).
-_Q35_GDN_PROMOTE_FUSED = os.environ.get("TRTLLM_Q35_GDN_PROMOTE_FUSED",
-                                        "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_GDN_PROMOTE_FUSED, _Q35_BRANCH_SNAPSHOT
+    # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_PROMOTE_FUSED=1: KV cache manager V2 promotes the
+    # accepted convolution state of every local Mamba/GDN layer in ONE launch through a per-layer (base pointer, slot
+    # stride) descriptor table, and folds the replay bookkeeping (PNAT / active history buffer advance, ~10 small
+    # torch ops in _advance_replay_state) into the same launch -- instead of one promotion launch per layer (45 for
+    # Qwen3.5) plus the torch ops. Same copies and same bookkeeping arithmetic as the default path (bitwise-identical
+    # caches).
+    _Q35_GDN_PROMOTE_FUSED = os.environ.get("TRTLLM_Q35_GDN_PROMOTE_FUSED",
+                                            "0") == "1"
+    # Qwen3.5 switch (default off). TRTLLM_Q35_BRANCH_SNAPSHOT=1: branch-point Mamba snapshots, enabled through the
+    # environment rather than kv_cache_config.mamba_state_config.enable_branch_snapshot. A request whose prefix lookup
+    # walks the radix tree deeper than its last reusable recurrent snapshot -- e.g. the first turn of a conversation
+    # that shares a long prompt template with an earlier sibling -- adds the block-aligned divergence point to its
+    # snapshot points. Its prefill then ends a chunk there and commits the recurrent state, so later siblings reuse up
+    # to the fork instead of re-prefilling the shared template. Needs the KV cache manager V2 C++ bindings that
+    # report the raw lookup depth (_KVCache._get_num_reusable_tokens_before_pruning); startup fails if they are
+    # missing.
+    _Q35_BRANCH_SNAPSHOT = os.environ.get("TRTLLM_Q35_BRANCH_SNAPSHOT",
+                                          "0") == "1"
+
 
 # Qwen3.5 switch (default off). TRTLLM_MAMBA_INFORWARD_SNAPSHOT=1: with hybrid block reuse the last reusable Mamba
 # snapshot point P = prompt_len - k (additional_snapshot_offsets_from_end, e.g. k = 2 for a '<think>\n' generation
@@ -2003,15 +2020,7 @@ _Q35_INFWD_MIB = int(
 _Q35_INFWD_MAX_TAIL = int(
     os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MAX_TAIL", "16"))
 
-# Qwen3.5 switch (default off). TRTLLM_Q35_BRANCH_SNAPSHOT=1: branch-point Mamba snapshots (upstream #18272 + #18724),
-# enabled through the environment rather than kv_cache_config.mamba_state_config.enable_branch_snapshot. A request whose
-# prefix lookup walks the radix tree deeper than its last reusable recurrent snapshot -- e.g. the first turn of a
-# conversation that shares a long prompt template with an earlier sibling -- adds the block-aligned divergence point to
-# its snapshot points. Its prefill then ends a chunk there and commits the recurrent state, so later siblings reuse up
-# to the fork instead of re-prefilling the shared template. Needs the KV cache manager V2 C++ bindings that report the
-# raw lookup depth (_KVCache._get_num_reusable_tokens_before_pruning); startup fails if they are missing.
 # TRTLLM_Q35_BRANCH_SNAPSHOT_LOG_S (default 60): rank 0 logs the branch snapshot counters at most this often.
-_Q35_BRANCH_SNAPSHOT = os.environ.get("TRTLLM_Q35_BRANCH_SNAPSHOT", "0") == "1"
 _Q35_BRANCH_SNAPSHOT_LOG_S = float(
     os.environ.get("TRTLLM_Q35_BRANCH_SNAPSHOT_LOG_S", "60"))
 # Fingerprints of the blocks that end at a branch snapshot (for the hit counter only); the oldest are dropped first.

@@ -39,24 +39,34 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 from . import q35_segmented as _seg
-from .q35_segmented import _PDL_EARLY_TRIGGER, _gdc_wait_with_memory_clobber
+from .q35_segmented import _gdc_wait_with_memory_clobber
 
 # TRTLLM_Q35_ATTN_CP_A2A=merge (default; when the exchange provides it): one-launch all-to-all + LSE merge (+ gate)
 # (TPGroupExchange.alltoall_merge, channel 1); =combine: TPGroupExchange.alltoall (channel 2) +
 # q35_cp_combine.
 _CP_A2A = os.environ.get("TRTLLM_Q35_ATTN_CP_A2A", "merge")
-# TRTLLM_Q35_ATTN_CP_DRAFT_EARLY=1 (merge-free path only): the q all-gather releases its dependents right after its
-# own wait on the QKV preprocessing (TPGroupExchange trigger="after_wait"), so the prep kernel's own-head draft programs
-# read the local q / draft K/V before their griddepcontrol.wait and overlap the exchange. Relies on the predecessor's
-# completion flush being device-wide; default off.
-_CP_DRAFT_EARLY = os.environ.get("TRTLLM_Q35_ATTN_CP_DRAFT_EARLY", "0") == "1"
-# TRTLLM_Q35_ATTN_CP_FUSED=1 (merge-free exchanges only; default off): one fused CP partial kernel
-# (fmha/q35_cp_fused.py: q35_cp_fused_partial) replaces the prep + FMHA + LSE (+ own-head draft) launches of the
-# merge-free path. It streams the pages this rank owns (page p belongs to CP rank p % cp) for all group heads and
-# writes one (O, LSE) partial per (row, group head) straight into alltoall_merge's input layout. The contract is
-# q35_cp_fused_partial_ref below. Without that module, or for an unsupported shape, the merge-free path runs.
-_CP_FUSED = os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED", "0") == "1"
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _CP_DRAFT_EARLY, _CP_FUSED
+    # TRTLLM_Q35_ATTN_CP_DRAFT_EARLY=1 (merge-free path only): the q all-gather releases its dependents right after its
+    # own wait on the QKV preprocessing (TPGroupExchange trigger="after_wait"), so the prep kernel's own-head draft
+    # programs read the local q / draft K/V before their griddepcontrol.wait and overlap the exchange. Relies on the
+    # predecessor's completion flush being device-wide; default off.
+    _CP_DRAFT_EARLY = os.environ.get("TRTLLM_Q35_ATTN_CP_DRAFT_EARLY", "0") == "1"
+    # TRTLLM_Q35_ATTN_CP_FUSED=1 (merge-free exchanges only; default off): one fused CP partial kernel
+    # (fmha/q35_cp_fused.py: q35_cp_fused_partial) replaces the prep + FMHA + LSE (+ own-head draft) launches of the
+    # merge-free path. It streams the pages this rank owns (page p belongs to CP rank p % cp) for all group heads and
+    # writes one (O, LSE) partial per (row, group head) straight into alltoall_merge's input layout. The contract is
+    # q35_cp_fused_partial_ref below. Without that module, or for an unsupported shape, the merge-free path runs.
+    _CP_FUSED = os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED", "0") == "1"
+
+
 # The partial-kernel entry the fused branch calls; None: resolved from fmha/q35_cp_fused.py at first use (tests
 # assign q35_cp_fused_partial_ref or the kernel).
 _CP_FUSED_FN = None
@@ -1138,7 +1148,7 @@ def q35_cp_combine(
         D=D,
         HAS_GATE=gate is not None,
         LAUNCH_WITH_PDL=enable_pdl,
-        EARLY_TRIGGER=_PDL_EARLY_TRIGGER,
+        EARLY_TRIGGER=_seg._PDL_EARLY_TRIGGER,
         num_warps=4,
         launch_pdl=enable_pdl,
     )

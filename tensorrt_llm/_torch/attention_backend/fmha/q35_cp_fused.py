@@ -30,19 +30,35 @@ from typing import Dict, Optional, Union
 
 import torch
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 PAGE = 64
 HEAD_DIM = 256
 MAX_ROWS = 128
-# Largest batch of one call (default 8). TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH=<n> (<= 32) admits larger batches: fewer
-# splits per request (SMs // b: 9 / 4 on GB300's 152 SMs at b16 / b32), so a CTA's combine chunk spans more rows and
-# granules (the kernel then loops over them; with 112 rows: 14 / 29 rows per chunk, <= _MAX_COMB_ROWS).
-MAX_BATCH = max(1, min(32, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH", "8"))))
-# Same bound for single-token (MTP draft) calls, default 8. In isolation the fused kernel is slower at q_len 1 (b16, 98k
-# contexts: 42.4 us per call vs 39.1 us for prep + trtllm-gen FMHA + LSE; at q_len 7: 44.5 vs 68.6 us), yet in-model
-# (TEP8, MAX_BATCH=32) MAX_BATCH_Q1=32 shortened the b16 decode step, with b8 / b32 unchanged.
-MAX_BATCH_Q1 = max(
-    1, min(MAX_BATCH, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH_Q1", "8")))
-)
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global MAX_BATCH, MAX_BATCH_Q1, _BALANCED
+    # Largest batch of one call (default 8). TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH=<n> (<= 32) admits larger batches:
+    # fewer splits per request (SMs // b: 9 / 4 on GB300's 152 SMs at b16 / b32), so a CTA's combine chunk spans more
+    # rows and granules (the kernel then loops over them; with 112 rows: 14 / 29 rows per chunk, <= _MAX_COMB_ROWS).
+    MAX_BATCH = max(1, min(32, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH", "8"))))
+    # Same bound for single-token (MTP draft) calls, default 8. In isolation the fused kernel is slower at q_len 1
+    # (b16, 98k contexts: 42.4 us per call vs 39.1 us for prep + trtllm-gen FMHA + LSE; at q_len 7: 44.5 vs 68.6 us),
+    # yet in-model (TEP8, MAX_BATCH=32) MAX_BATCH_Q1=32 shortened the b16 decode step, with b8 / b32 unchanged.
+    MAX_BATCH_Q1 = max(
+        1, min(MAX_BATCH, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH_Q1", "8")))
+    )
+    # TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1 (default off): balanced split (q35_cp_partial_attn.py docstring). The grid
+    # is SMs - reserve CTAs for every batch and an in-kernel plan shares them among the requests by their owned KV,
+    # instead of (SMs - reserve) // b CTAs per request whatever its length. On ragged decode batches (longest request
+    # ~2x the mean) the equal split runs 1.2-1.5x the time of a uniform batch with the same total KV; balanced closes
+    # that gap.
+    _BALANCED = os.environ.get("TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT", "0") == "1"
+
+
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
 _MAX_COMB_ROWS = 32
 LOG2E = 1.4426950408889634
@@ -66,11 +82,6 @@ _DBG_SLOTS = int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_DBG_SLOTS", "0"))
 _SM_RESERVE = int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_SM_RESERVE", "0"))
 _DBG_DIR = os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_DBG_DIR", ".")
 _DBG_RING_CTAS = 256
-# TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1 (default off): balanced split (q35_cp_partial_attn.py docstring). The grid is
-# SMs - reserve CTAs for every batch and an in-kernel plan shares them among the requests by their owned KV, instead of
-# (SMs - reserve) // b CTAs per request whatever its length. On ragged decode batches (longest request ~2x the
-# mean) the equal split runs 1.2-1.5x the time of a uniform batch with the same total KV; balanced closes that gap.
-_BALANCED = os.environ.get("TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT", "0") == "1"
 
 # Declared alignment (bytes) of each pointer argument, used at compile and call time (make_ptr checks the address):
 # q and the KV pool are TMA sources and the workspace takes 16-byte stores / bulk copies; tables, seq_lens and the

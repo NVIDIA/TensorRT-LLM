@@ -30,6 +30,8 @@ try:
         flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -60,20 +62,27 @@ def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
     return position_ids[..., :num_tokens]
 
 
-# TRTLLM_Q35_POSITIONS_HOIST=1 (default off): the position input of a one-model
-# speculative forward is a strided view of the engine's static buffer (MRoPE:
-# [3, 1, max_num_tokens][..., :n]), and the Qwen3.5 fused qk-norm / RoPE / gate
-# (+ KV append) prologue makes it contiguous with a copy kernel per attention
-# call (two when the folded-input offer runs first): 32 small copies per MTP-6
-# step at TEP8. With this knob the forward makes one contiguous copy up front
-# and the target layers and the draft passes take it as is. Same values, so
-# bitwise the same outputs.
-_Q35_POSITIONS_HOIST = os.environ.get("TRTLLM_Q35_POSITIONS_HOIST", "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_POSITIONS_HOIST
+    # TRTLLM_Q35_POSITIONS_HOIST=1 (default off): the position input of a
+    # one-model speculative forward is a strided view of the engine's static
+    # buffer (MRoPE: [3, 1, max_num_tokens][..., :n]), and the Qwen3.5 fused
+    # qk-norm / RoPE / gate (+ KV append) prologue makes it contiguous with a
+    # copy kernel per attention call (two when the folded-input offer runs
+    # first): 32 small copies per MTP-6 step at TEP8. With this knob the forward
+    # makes one contiguous copy up front and the target layers and the draft
+    # passes take it as is. Same values, so bitwise the same outputs.
+    _Q35_POSITIONS_HOIST = os.environ.get("TRTLLM_Q35_POSITIONS_HOIST",
+                                          "0") == "1"
+    if _Q35_POSITIONS_HOIST:
+        logger.info(
+            "TRTLLM_Q35_POSITIONS_HOIST=1: one contiguous copy of the position "
+            "input per one-model speculative forward")
+
+
 _q35_positions_hoist_logged: set = set()
-if _Q35_POSITIONS_HOIST:
-    logger.info(
-        "TRTLLM_Q35_POSITIONS_HOIST=1: one contiguous copy of the position "
-        "input per one-model speculative forward")
 
 
 def _q35_hoist_positions(

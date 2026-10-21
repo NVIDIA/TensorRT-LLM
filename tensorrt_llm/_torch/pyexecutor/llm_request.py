@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
@@ -16,9 +17,16 @@ SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
 
-# See kv_cache_manager_v2._Q35_CTX_LEAN_TOKENS.
-_Q35_CTX_LEAN_TOKENS = os.environ.get("TRTLLM_Q35_CTX_LEAN_TOKENS",
-                                      "0") not in ("", "0")
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_CTX_LEAN_TOKENS
+    # See kv_cache_manager_v2._Q35_CTX_LEAN_TOKENS.
+    _Q35_CTX_LEAN_TOKENS = os.environ.get("TRTLLM_Q35_CTX_LEAN_TOKENS",
+                                          "0") not in ("", "0")
+
+
 '''
 CONTEXT_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.CONTEXT_INIT: 2>
 ENCODER_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.ENCODER_INIT: 1>

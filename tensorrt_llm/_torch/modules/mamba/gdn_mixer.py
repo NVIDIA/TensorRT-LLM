@@ -47,6 +47,7 @@ from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ...q35_env import register as _q35_register
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
@@ -73,35 +74,6 @@ from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
 from .mamba2_mixer import _cached_arange
-
-# Qwen3.5 low-latency switches (default off).
-# TRTLLM_Q35_GDN_ARANGE_CACHE=1: build the verify-path intermediate-state row indices once per step from the
-# cache manager's persistent arange (a view, no kernel) instead of one torch.arange launch per GDN layer
-# (port of upstream 1374e96c89).
-_Q35_GDN_ARANGE_CACHE = os.environ.get("TRTLLM_Q35_GDN_ARANGE_CACHE", "0") == "1"
-# TRTLLM_Q35_GDN_FUSED_CONV_REPLAY=1: on the small-batch cached-replay target-verify path, run the causal conv1d
-# update and the cached replay as one kernel (modules/fla/q35_conv_replay.py; bitwise-equal outputs).
-_Q35_GDN_FUSED_CONV_REPLAY = os.environ.get("TRTLLM_Q35_GDN_FUSED_CONV_REPLAY", "0") == "1"
-# TRTLLM_Q35_GDN_CONV_PDL=1: launch the target-verify conv1d update as a PDL dependent of the in_proj GEMM (reads
-# in_proj output and intermediate row indices only after griddepcontrol.wait).
-_Q35_GDN_CONV_PDL = os.environ.get("TRTLLM_Q35_GDN_CONV_PDL", "0") == "1"
-# TRTLLM_Q35_GDN_FUSE (default 0): on the decode-only MTP target-verify cached-replay path (fewer than 16 requests),
-# fuse the GDN chain between in_proj and out_proj (modules/fla/q35_gdn_fused.py):
-#   1 = conv1d update + cached replay in one launch, then the gated-RMSNorm kernel;
-#   2 = conv1d update + cached replay + gated RMSNorm (+ FP8 quantization for out_proj) in one launch;
-#   3 = the conv1d update kernel, then cached replay + gated RMSNorm (+ FP8) in one launch;
-#   4 = the conv1d update in the low-M in_proj's epilogue (TRTLLM_Q35_LOWM_GDN_BA path), then the fused replay +
-#       gated RMSNorm (+ FP8); steps whose in_proj does not take the low-M kernel run as 3.
-# TRTLLM_Q35_GDN_FUSE_OPTS (b < LARGE_FROM) / TRTLLM_Q35_GDN_FUSE_OPTS_LARGE (b >= LARGE_FROM, default: the same):
-# launch options; TRTLLM_Q35_GDN_FUSE_LARGE_FROM (default 3) is the first decode batch size that takes the LARGE set.
-# Options are "_"-separated: bv16 / bv32 / bv64 / bv128 (value tile), w2 / w4 / w8 (warps), p (SSM state fetched
-# before the PDL wait), s (both history buffers fetched by slot, no dependent round trip), t0 / t1 / t2 (PDL
-# dependents released at exit / after the wait / at entry), x2 (forward substitution on row-vector tuples, FMA-only
-# serial chain), z (gate rows fetched right after the wait), n (with bv128: the norm reloads the stored rows, i.e. the
-# norm kernel's summation order). TRTLLM_Q35_GDN_FUSE_MAX_BATCH (default 15): larger decode batches keep the separate
-# kernels.
-_Q35_GDN_FUSE = int(os.environ.get("TRTLLM_Q35_GDN_FUSE", "0"))
-_Q35_GDN_FUSE_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_GDN_FUSE_MAX_BATCH", "15"))
 
 
 def _q35_gdn_fuse_opts(spec: str) -> dict:
@@ -139,62 +111,102 @@ def _q35_gdn_fuse_opts(spec: str) -> dict:
     return opts
 
 
-_Q35_GDN_FUSE_OPTS = (
-    _q35_gdn_fuse_opts(os.environ.get("TRTLLM_Q35_GDN_FUSE_OPTS", "")) if _Q35_GDN_FUSE else {}
-)
-_Q35_GDN_FUSE_OPTS_LARGE = (
-    _q35_gdn_fuse_opts(
-        os.environ.get(
-            "TRTLLM_Q35_GDN_FUSE_OPTS_LARGE", os.environ.get("TRTLLM_Q35_GDN_FUSE_OPTS", "")
-        )
-    )
-    if _Q35_GDN_FUSE
-    else {}
-)
-_Q35_GDN_FUSE_LARGE_FROM = int(os.environ.get("TRTLLM_Q35_GDN_FUSE_LARGE_FROM", "3"))
-# TRTLLM_Q35_GDN_CORE (with TRTLLM_Q35_GDN_FUSE=4): the fused replay + gated RMSNorm (+ FP8) on convolved q|k|v rows
-# runs as the CUDA kernel of modules/fla/q35_gdn_core.py (one CTA per (request, value head), in-CTA norm, checkpoint
-# commit computed before the PDL wait) instead of the Triton kernel; shapes it does not cover (T > 8, history != 16,
-# FP32 state) keep the Triton kernel. 1 = on the FUSE=4 path only (conv in the low-M in_proj epilogue: the kernel
-# launches at the in_proj's entry and its prefetch / commit run during the in_proj); 2 = also on the FUSE=3 path and
-# the FUSE=4 fallback (separate conv kernel, e.g. TEP8 b4 with the nvjet in_proj: there the pre-wait window is only
-# the conv kernel, and it was measurably slower at TEP8 b4). TRTLLM_Q35_GDN_CORE_TRIGGER: when its
-# PDL dependents are released (2: at entry, as FUSE_OPTS t2; 3: after the final CTA barrier; 0: at exit).
-_Q35_GDN_CORE = int(os.environ.get("TRTLLM_Q35_GDN_CORE", "0"))
-_Q35_GDN_CORE_TRIGGER = int(os.environ.get("TRTLLM_Q35_GDN_CORE_TRIGGER", "2"))
-# TRTLLM_Q35_GDN_CORE_MIN_BATCH=N (with TRTLLM_Q35_GDN_CORE=1; default 0 = off): also take the CUDA core kernel on the
-# FUSE=3 path and the FUSE=4 fallback (separate conv kernel) for decode batches of at least N requests, i.e. the
-# TRTLLM_Q35_GDN_CORE=2 policy above a batch threshold. At TEP8 the in_proj leaves the low-M kernel from b5 on, so b5-b8
-# run the Triton fused kernel between the b <= 4 (FUSE=4) and b >= 9 (GDN_CORE_LARGE) CUDA-core ranges; standalone
-# (microbenchmark, GB300) Triton is 6.8 / 7.0 / 7.2 / 11.0 us at b5-b8 and the core 2.7-2.8 us.
-_Q35_GDN_CORE_MIN_BATCH = int(os.environ.get("TRTLLM_Q35_GDN_CORE_MIN_BATCH", "0"))
-# TRTLLM_Q35_GDN_CORE_LARGE=1 (with TRTLLM_Q35_GDN_FUSE=3/4, TRTLLM_Q35_GDN_FUSE_MAX_BATCH and
-# TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH above the batch): decode batches beyond the Triton fused kernel (more than
-# 64 (request, value head) pairs, i.e. b > 8 at TP8) run the separate conv1d update and then the CUDA core kernel
-# (replay + in-layer checkpoint commit + gated RMSNorm + FP8 in one launch, one CTA per pair) instead of the stock
-# conv -> replay -> gated-norm chain (+ the all-layer commit at b >= 16).
-_Q35_GDN_CORE_LARGE = os.environ.get("TRTLLM_Q35_GDN_CORE_LARGE", "0") == "1"
 _q35_core_min_batch_logged: set = set()
-if _Q35_GDN_CORE_MIN_BATCH:
-    logger.info(
-        f"TRTLLM_Q35_GDN_CORE_MIN_BATCH={_Q35_GDN_CORE_MIN_BATCH} (TRTLLM_Q35_GDN_CORE={_Q35_GDN_CORE}): "
-        f"CUDA core kernel on the separate-conv GDN verify path from b{_Q35_GDN_CORE_MIN_BATCH}"
-        + ("" if _Q35_GDN_CORE == 1 else " [inactive: needs TRTLLM_Q35_GDN_CORE=1]")
-    )
-# TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (default off; with TRTLLM_Q35_GDN_FUSE=3/4): when in_proj_ba runs on the aux stream next
-# to the in_proj_qkvz GEMM (the stock projections, i.e. decode batches above the low-M in_proj's rows: TEP8 b >= 5),
-# the main stream joins the aux stream right before the first consumer of a / b (the fused replay kernel, or the stock
-# chain when the fused path does not apply) instead of right after the qkvz GEMM, so the separate target-verify conv1d
-# update (it reads q|k|v only) no longer waits for the BF16 ba GEMM + split-K reduce. Stream order only: bitwise the
-# same outputs. Only while multi-stream is on (CUDA graph capture), as maybe_execute_in_parallel.
-_Q35_GDN_BA_LATE_JOIN = os.environ.get("TRTLLM_Q35_GDN_BA_LATE_JOIN", "0") == "1"
 _q35_ba_late_join_logged: set = set()
-if _Q35_GDN_BA_LATE_JOIN:
-    logger.info(
-        f"TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (TRTLLM_Q35_GDN_FUSE={_Q35_GDN_FUSE}): GDN in_proj_ba (aux stream) "
-        f"joined after the separate target-verify conv1d update"
-        + ("" if _Q35_GDN_FUSE in (3, 4) else " [inactive: needs TRTLLM_Q35_GDN_FUSE=3 or 4]")
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_GDN_ARANGE_CACHE, _Q35_GDN_FUSED_CONV_REPLAY, _Q35_GDN_CONV_PDL, _Q35_GDN_FUSE
+    global _Q35_GDN_FUSE_MAX_BATCH, _Q35_GDN_FUSE_OPTS, _Q35_GDN_FUSE_OPTS_LARGE
+    global _Q35_GDN_FUSE_LARGE_FROM, _Q35_GDN_CORE, _Q35_GDN_CORE_TRIGGER, _Q35_GDN_CORE_MIN_BATCH
+    global _Q35_GDN_CORE_LARGE, _Q35_GDN_BA_LATE_JOIN, CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    # Qwen3.5 low-latency switches (default off).
+    # TRTLLM_Q35_GDN_ARANGE_CACHE=1: build the verify-path intermediate-state row indices once per step from the
+    # cache manager's persistent arange (a view, no kernel) instead of one torch.arange launch per GDN layer.
+    _Q35_GDN_ARANGE_CACHE = os.environ.get("TRTLLM_Q35_GDN_ARANGE_CACHE", "0") == "1"
+    # TRTLLM_Q35_GDN_FUSED_CONV_REPLAY=1: on the small-batch cached-replay target-verify path, run the causal conv1d
+    # update and the cached replay as one kernel (modules/fla/q35_conv_replay.py; bitwise-equal outputs).
+    _Q35_GDN_FUSED_CONV_REPLAY = os.environ.get("TRTLLM_Q35_GDN_FUSED_CONV_REPLAY", "0") == "1"
+    # TRTLLM_Q35_GDN_CONV_PDL=1: launch the target-verify conv1d update as a PDL dependent of the in_proj GEMM (reads
+    # in_proj output and intermediate row indices only after griddepcontrol.wait).
+    _Q35_GDN_CONV_PDL = os.environ.get("TRTLLM_Q35_GDN_CONV_PDL", "0") == "1"
+    # TRTLLM_Q35_GDN_FUSE (default 0): on the decode-only MTP target-verify cached-replay path (fewer than 16
+    # requests), fuse the GDN chain between in_proj and out_proj (modules/fla/q35_gdn_fused.py):
+    #   1 = conv1d update + cached replay in one launch, then the gated-RMSNorm kernel;
+    #   2 = conv1d update + cached replay + gated RMSNorm (+ FP8 quantization for out_proj) in one launch;
+    #   3 = the conv1d update kernel, then cached replay + gated RMSNorm (+ FP8) in one launch;
+    #   4 = the conv1d update in the low-M in_proj's epilogue (TRTLLM_Q35_LOWM_GDN_BA path), then the fused replay +
+    #       gated RMSNorm (+ FP8); steps whose in_proj does not take the low-M kernel run as 3.
+    _Q35_GDN_FUSE = int(os.environ.get("TRTLLM_Q35_GDN_FUSE", "0"))
+    # TRTLLM_Q35_GDN_FUSE_MAX_BATCH (default 15): larger decode batches keep the separate kernels.
+    _Q35_GDN_FUSE_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_GDN_FUSE_MAX_BATCH", "15"))
+    # TRTLLM_Q35_GDN_FUSE_OPTS (b < LARGE_FROM) / TRTLLM_Q35_GDN_FUSE_OPTS_LARGE (b >= LARGE_FROM, default: the
+    # same): launch options; TRTLLM_Q35_GDN_FUSE_LARGE_FROM (default 3) is the first decode batch size that takes the
+    # LARGE set. Options are "_"-separated: bv16 / bv32 / bv64 / bv128 (value tile), w2 / w4 / w8 (warps), p (SSM
+    # state fetched before the PDL wait), s (both history buffers fetched by slot, no dependent round trip), t0 / t1 /
+    # t2 (PDL dependents released at exit / after the wait / at entry), x2 (forward substitution on row-vector
+    # tuples, FMA-only serial chain), z (gate rows fetched right after the wait), n (with bv128: the norm reloads the
+    # stored rows, i.e. the norm kernel's summation order).
+    _Q35_GDN_FUSE_OPTS = (
+        _q35_gdn_fuse_opts(os.environ.get("TRTLLM_Q35_GDN_FUSE_OPTS", "")) if _Q35_GDN_FUSE else {}
     )
+    _Q35_GDN_FUSE_OPTS_LARGE = (
+        _q35_gdn_fuse_opts(
+            os.environ.get(
+                "TRTLLM_Q35_GDN_FUSE_OPTS_LARGE", os.environ.get("TRTLLM_Q35_GDN_FUSE_OPTS", "")
+            )
+        )
+        if _Q35_GDN_FUSE
+        else {}
+    )
+    _Q35_GDN_FUSE_LARGE_FROM = int(os.environ.get("TRTLLM_Q35_GDN_FUSE_LARGE_FROM", "3"))
+    # TRTLLM_Q35_GDN_CORE (with TRTLLM_Q35_GDN_FUSE=4): the fused replay + gated RMSNorm (+ FP8) on convolved q|k|v
+    # rows runs as the CUDA kernel of modules/fla/q35_gdn_core.py (one CTA per (request, value head), in-CTA norm,
+    # checkpoint commit computed before the PDL wait) instead of the Triton kernel; shapes it does not cover (T > 8,
+    # history != 16, FP32 state) keep the Triton kernel. 1 = on the FUSE=4 path only (conv in the low-M in_proj
+    # epilogue: the kernel launches at the in_proj's entry and its prefetch / commit run during the in_proj); 2 = also
+    # on the FUSE=3 path and the FUSE=4 fallback (separate conv kernel, e.g. TEP8 b4 with the nvjet in_proj: there
+    # the pre-wait window is only the conv kernel, and it was measurably slower at TEP8 b4).
+    _Q35_GDN_CORE = int(os.environ.get("TRTLLM_Q35_GDN_CORE", "0"))
+    # TRTLLM_Q35_GDN_CORE_TRIGGER: when its PDL dependents are released (2: at entry, as FUSE_OPTS t2; 3: after the
+    # final CTA barrier; 0: at exit).
+    _Q35_GDN_CORE_TRIGGER = int(os.environ.get("TRTLLM_Q35_GDN_CORE_TRIGGER", "2"))
+    # TRTLLM_Q35_GDN_CORE_MIN_BATCH=N (with TRTLLM_Q35_GDN_CORE=1; default 0 = off): also take the CUDA core kernel on
+    # the FUSE=3 path and the FUSE=4 fallback (separate conv kernel) for decode batches of at least N requests, i.e.
+    # the TRTLLM_Q35_GDN_CORE=2 policy above a batch threshold. At TEP8 the in_proj leaves the low-M kernel from b5
+    # on, so b5-b8 run the Triton fused kernel between the b <= 4 (FUSE=4) and b >= 9 (GDN_CORE_LARGE) CUDA-core
+    # ranges; standalone (microbenchmark, GB300) Triton is 6.8 / 7.0 / 7.2 / 11.0 us at b5-b8 and the core 2.7-2.8 us.
+    _Q35_GDN_CORE_MIN_BATCH = int(os.environ.get("TRTLLM_Q35_GDN_CORE_MIN_BATCH", "0"))
+    # TRTLLM_Q35_GDN_CORE_LARGE=1 (with TRTLLM_Q35_GDN_FUSE=3/4, TRTLLM_Q35_GDN_FUSE_MAX_BATCH and
+    # TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH above the batch): decode batches beyond the Triton fused kernel (more
+    # than 64 (request, value head) pairs, i.e. b > 8 at TP8) run the separate conv1d update and then the CUDA core
+    # kernel (replay + in-layer checkpoint commit + gated RMSNorm + FP8 in one launch, one CTA per pair) instead of the
+    # stock conv -> replay -> gated-norm chain (+ the all-layer commit at b >= 16).
+    _Q35_GDN_CORE_LARGE = os.environ.get("TRTLLM_Q35_GDN_CORE_LARGE", "0") == "1"
+    if _Q35_GDN_CORE_MIN_BATCH:
+        logger.info(
+            f"TRTLLM_Q35_GDN_CORE_MIN_BATCH={_Q35_GDN_CORE_MIN_BATCH} (TRTLLM_Q35_GDN_CORE={_Q35_GDN_CORE}): "
+            f"CUDA core kernel on the separate-conv GDN verify path from b{_Q35_GDN_CORE_MIN_BATCH}"
+            + ("" if _Q35_GDN_CORE == 1 else " [inactive: needs TRTLLM_Q35_GDN_CORE=1]")
+        )
+    # TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (default off; with TRTLLM_Q35_GDN_FUSE=3/4): when in_proj_ba runs on the aux
+    # stream next to the in_proj_qkvz GEMM (the stock projections, i.e. decode batches above the low-M in_proj's rows:
+    # TEP8 b >= 5), the main stream joins the aux stream right before the first consumer of a / b (the fused replay
+    # kernel, or the stock chain when the fused path does not apply) instead of right after the qkvz GEMM, so the
+    # separate target-verify conv1d update (it reads q|k|v only) no longer waits for the BF16 ba GEMM + split-K
+    # reduce. Stream order only: bitwise the same outputs. Only while multi-stream is on (CUDA graph capture), as
+    # maybe_execute_in_parallel.
+    _Q35_GDN_BA_LATE_JOIN = os.environ.get("TRTLLM_Q35_GDN_BA_LATE_JOIN", "0") == "1"
+    if _Q35_GDN_BA_LATE_JOIN:
+        logger.info(
+            f"TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (TRTLLM_Q35_GDN_FUSE={_Q35_GDN_FUSE}): GDN in_proj_ba (aux stream) "
+            f"joined after the separate target-verify conv1d update"
+            + ("" if _Q35_GDN_FUSE in (3, 4) else " [inactive: needs TRTLLM_Q35_GDN_FUSE=3 or 4]")
+        )
+    # A copy of the cached_replay switch (imported above); its reader runs first.
+    from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
@@ -351,45 +363,51 @@ def _q35_direct_call(fn, *args, **kwargs):
     return fn(*args, **kwargs)
 
 
-# TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook off.
-# The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers, Triton
-# launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
-_q35_op_call = (
-    torch._dynamo.disable(_q35_direct_call, recursive=True)
-    if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1"
-    else _q35_direct_call
-)
+@_q35_register
+def _q35_read_graph_switches() -> None:
+    """The TRTLLM_Q35_* graph switches; q35_env.activate() re-reads them."""
+    global _q35_op_call, _Q35_GDN_PREFILL_GRAPH, _Q35_GDN_PREFILL_GRAPH_WARMUP
+    global _Q35_GDN_PREFILL_GRAPH_MAX_TOKENS, _Q35_GDN_PREFILL_GRAPH_STATS, _Q35_GDN_GRAPH_LEAN
+    global _Q35_GDN_GRAPH_DIRECT
+    # TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook
+    # off. The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers,
+    # Triton launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
+    _q35_op_call = (
+        torch._dynamo.disable(_q35_direct_call, recursive=True)
+        if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1"
+        else _q35_direct_call
+    )
+    # TRTLLM_Q35_GDN_PREFILL_GRAPH=1: under the piecewise torch.compile path the GDN core (state reset, conv1d,
+    # post-conv, FlashInfer chunked prefill) runs eagerly between the captured pieces, and its ~8 Python-launched
+    # kernels cost ~1 ms of host time per layer. For context-only batches of up to
+    # TRTLLM_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS (padded) tokens the core is captured as one CUDA graph per (layer,
+    # padded token count, number of context requests) and replayed:
+    # - Token inputs and the output go through static buffers shared by all layers (copied in / out around each
+    #   replay): the piece outputs that feed the op do not keep fixed addresses on every rank.
+    # - The graph bakes in the addresses of the Mamba metadata buffers (has_initial_states, state_indices,
+    #   query_start_loc(_long)) and of the layer's state pools; a replay requires them unchanged, otherwise the key
+    #   is re-warmed and re-captured (e.g. a graph captured during the engine warmup on dummy-request buffers).
+    # The graph runs on the padded token count: cu_seqlens / query_start_loc bound the work to the real tokens, as on
+    # the eager path. The first call of each key runs eagerly (Triton / FlashInfer specializations, workspaces), the
+    # second captures. Mixed and generation batches stay eager.
+    _Q35_GDN_PREFILL_GRAPH = os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH", "0") == "1"
+    _Q35_GDN_PREFILL_GRAPH_WARMUP = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_WARMUP", "1"))
+    _Q35_GDN_PREFILL_GRAPH_MAX_TOKENS = int(
+        os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS", "8192")
+    )
+    # TRTLLM_Q35_GDN_PREFILL_GRAPH_STATS=N logs the replay / capture counters every N calls.
+    _Q35_GDN_PREFILL_GRAPH_STATS = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_STATS", "0"))
+    # TRTLLM_Q35_GDN_GRAPH_LEAN=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): the per-call key check reads the layer's state
+    # pool addresses from the hybrid manager's per-layer state lists instead of building a mamba_layer_cache()
+    # dataclass (two tensor selects and a frozen dataclass per GDN layer and iteration).
+    _Q35_GDN_GRAPH_LEAN = os.environ.get("TRTLLM_Q35_GDN_GRAPH_LEAN", "0") == "1"
+    # TRTLLM_Q35_GDN_GRAPH_DIRECT=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): a key whose token inputs and output have the
+    # same addresses and strides in its warm-up call and in its capture call is captured on those tensors and
+    # replayed without the four copies through the static buffers while they keep them; a call on other addresses
+    # uses the static-buffer graph of the key (captured on first need), as without the switch.
+    _Q35_GDN_GRAPH_DIRECT = os.environ.get("TRTLLM_Q35_GDN_GRAPH_DIRECT", "0") == "1"
 
 
-# TRTLLM_Q35_GDN_PREFILL_GRAPH=1: under the piecewise torch.compile path the GDN core (state reset, conv1d,
-# post-conv, FlashInfer chunked prefill) runs eagerly between the captured pieces, and its ~8 Python-launched
-# kernels cost ~1 ms of host time per layer. For context-only batches of up to
-# TRTLLM_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS (padded) tokens the core is captured as one CUDA graph per (layer, padded
-# token count, number of context requests) and replayed:
-# - Token inputs and the output go through static buffers shared by all layers (copied in / out around each
-#   replay): the piece outputs that feed the op do not keep fixed addresses on every rank.
-# - The graph bakes in the addresses of the Mamba metadata buffers (has_initial_states, state_indices,
-#   query_start_loc(_long)) and of the layer's state pools; a replay requires them unchanged, otherwise the key is
-#   re-warmed and re-captured (e.g. a graph captured during the engine warmup on dummy-request buffers).
-# The graph runs on the padded token count: cu_seqlens / query_start_loc bound the work to the real tokens, as on
-# the eager path. The first call of each key runs eagerly (Triton / FlashInfer specializations, workspaces), the
-# second captures. Mixed and generation batches stay eager.
-# TRTLLM_Q35_GDN_PREFILL_GRAPH_STATS=N logs the replay / capture counters every N calls.
-_Q35_GDN_PREFILL_GRAPH = os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH", "0") == "1"
-_Q35_GDN_PREFILL_GRAPH_WARMUP = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_WARMUP", "1"))
-_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS = int(
-    os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS", "8192")
-)
-_Q35_GDN_PREFILL_GRAPH_STATS = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_STATS", "0"))
-# TRTLLM_Q35_GDN_GRAPH_LEAN=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): the per-call key check reads the layer's state pool
-# addresses from the hybrid manager's per-layer state lists instead of building a mamba_layer_cache() dataclass (two
-# tensor selects and a frozen dataclass per GDN layer and iteration).
-_Q35_GDN_GRAPH_LEAN = os.environ.get("TRTLLM_Q35_GDN_GRAPH_LEAN", "0") == "1"
-# TRTLLM_Q35_GDN_GRAPH_DIRECT=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): a key whose token inputs and output have the same
-# addresses and strides in its warm-up call and in its capture call is captured on those tensors and replayed without
-# the four copies through the static buffers while they keep them; a call on other addresses uses the static-buffer
-# graph of the key (captured on first need), as without the switch.
-_Q35_GDN_GRAPH_DIRECT = os.environ.get("TRTLLM_Q35_GDN_GRAPH_DIRECT", "0") == "1"
 _q35_gdn_prefill_graphs = {}
 _q35_gdn_prefill_graph_pool = None
 _q35_gdn_prefill_static = {}

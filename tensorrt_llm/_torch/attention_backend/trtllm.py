@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend.fmha import (
     Fmha, FmhaParams, get_enabled_fmha_lib_classes)
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -45,19 +46,25 @@ from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 
-# TRTLLM_Q35_CTX_ATTN_PLAN=1 (default off): a context-only forward on the FlashInfer trtllm-gen FMHA path works out
-# its attention plan once -- the FMHA library check, the workspace sizing, the batch's max query / KV lengths and the
-# forward-invariant launch arguments -- and every attention layer of the forward (Qwen3.5 CTX: 15 layers + the MTP
-# draft layer) goes straight to the library's run_context with it. Per layer only the tensors and the layer's own
-# window / KV scales / rotary tables change. The plan is tied to the forward by the identity of the per-forward tensors
-# prepare() binds (host / device length views, block offsets, pool pointers; the host length tensors are inference
-# tensors, without version counters) and to the call by the attention geometry and the forward-argument fields that
-# steer the library choice; anything else takes the regular path.
-_Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN",
-                                    "0") in ("1", "2")
-# TRTLLM_Q35_CTX_ATTN_PLAN=2: in addition the plan path calls FlashInferTrtllmGenFmha.q35_run_context_lean (the same
-# launches; the layer's constant scalars worked out once and the processed query re-typed with one view).
-_Q35_CTX_ATTN_PLAN_LEAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN", "0") == "2"
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_CTX_ATTN_PLAN, _Q35_CTX_ATTN_PLAN_LEAN
+    # TRTLLM_Q35_CTX_ATTN_PLAN=1 (default off): a context-only forward on the FlashInfer trtllm-gen FMHA path works
+    # out its attention plan once -- the FMHA library check, the workspace sizing, the batch's max query / KV lengths
+    # and the forward-invariant launch arguments -- and every attention layer of the forward (Qwen3.5 CTX: 15 layers +
+    # the MTP draft layer) goes straight to the library's run_context with it. Per layer only the tensors and the
+    # layer's own window / KV scales / rotary tables change. The plan is tied to the forward by the identity of the
+    # per-forward tensors prepare() binds (host / device length views, block offsets, pool pointers; the host length
+    # tensors are inference tensors, without version counters) and to the call by the attention geometry and the
+    # forward-argument fields that steer the library choice; anything else takes the regular path.
+    _Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN",
+                                        "0") in ("1", "2")
+    # TRTLLM_Q35_CTX_ATTN_PLAN=2: in addition the plan path calls FlashInferTrtllmGenFmha.q35_run_context_lean (the
+    # same launches; the layer's constant scalars worked out once and the processed query re-typed with one view).
+    _Q35_CTX_ATTN_PLAN_LEAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN",
+                                             "0") == "2"
 
 
 class _Q35CtxAttnPlan:

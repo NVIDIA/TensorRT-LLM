@@ -19,6 +19,7 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -34,10 +35,17 @@ PP_COMM_TAG_AUTOTUNING = 30000
 _Q35_AUTOTUNE_TRACE = os.environ.get("TRTLLM_Q35_AUTOTUNE_TRACE", "0") == "1"
 _q35_autotune_trace_seen: Set[Tuple] = set()
 
-# TRTLLM_Q35_AUTOTUNE_DUMP=1 (default off): at the end of every autotune() session, log the
-# profiling-cache entries that are new or changed since the last dump: op, runner, shape key,
-# chosen runner / tactic and the measured time ([Q35ATD] lines; one grep names a run's tactics).
-_Q35_AUTOTUNE_DUMP = os.environ.get("TRTLLM_Q35_AUTOTUNE_DUMP", "0") == "1"
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_AUTOTUNE_DUMP
+    # TRTLLM_Q35_AUTOTUNE_DUMP=1 (default off): at the end of every autotune() session, log the
+    # profiling-cache entries that are new or changed since the last dump: op, runner, shape key,
+    # chosen runner / tactic and the measured time ([Q35ATD] lines; one grep names a run's tactics).
+    _Q35_AUTOTUNE_DUMP = os.environ.get("TRTLLM_Q35_AUTOTUNE_DUMP", "0") == "1"
+
+
 _q35_autotune_dumped: Dict[Tuple, Tuple] = {}
 
 

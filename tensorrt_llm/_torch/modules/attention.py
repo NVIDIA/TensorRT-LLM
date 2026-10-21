@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -79,12 +80,33 @@ def _q35_direct_call(fn, *args, **kwargs):
     return fn(*args, **kwargs)
 
 
-# TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook off.
-# The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers, Triton
-# launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
-_q35_op_call = (torch._dynamo.disable(
-    _q35_direct_call, recursive=True) if os.environ.get(
-        "TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _q35_op_call, _Q35_ATTN_SEG_FUSE_GATE, _Q35_ATTN_CP
+    global _Q35_CTX_ATTN_PLAN, _Q35_ATTN_KV_APPEND
+    # TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook
+    # off. The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers,
+    # Triton launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
+    _q35_op_call = (torch._dynamo.disable(
+        _q35_direct_call, recursive=True) if os.environ.get(
+            "TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
+    # Qwen3.5 low-latency switch (default off), see Attention.forward / fmha/q35_segmented.py.
+    _Q35_ATTN_SEG_FUSE_GATE = os.environ.get("TRTLLM_Q35_ATTN_SEG_FUSE_GATE",
+                                             "0") == "1"
+    # TRTLLM_Q35_ATTN_CP=1: CP-lite generation attention inside each TP KV group (fmha/q35_cp.py); see
+    # FlashInferTrtllmGenFmha.run_generation for the batch-size selection.
+    _Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
+    # TRTLLM_Q35_CTX_ATTN_PLAN=1|2: see attention_backend/trtllm.py; here it only caches the layer's quantization
+    # constants.
+    _Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN",
+                                        "0") in ("1", "2")
+    # TRTLLM_Q35_ATTN_KV_APPEND=1: the fused qk-norm / RoPE / gate preprocessing of a generation-only step also
+    # writes the FP8 query and appends the FP8 K / V (QKNormRoPEAttention.preprocess_qkv); the attention metadata is
+    # exposed to it for that call only (_q35_attn_metadata) and the hand-over to the backend (attn.q35_kv_appended)
+    # is cleared after it.
+    _Q35_ATTN_KV_APPEND = os.environ.get("TRTLLM_Q35_ATTN_KV_APPEND",
+                                         "0") == "1"
 
 
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
@@ -136,20 +158,6 @@ def attn_custom_op_inplace(
 # Under a breakable prefill CUDA graph (TRTLLM_PREFILL_BCG) the attention op runs eagerly between the captured
 # segments; outside a capture the wrapper is a plain call.
 maybe_bcg_attn_custom_op_inplace = eager_on_graph(attn_custom_op_inplace)
-
-# Qwen3.5 low-latency switch (default off), see Attention.forward / fmha/q35_segmented.py.
-_Q35_ATTN_SEG_FUSE_GATE = os.environ.get("TRTLLM_Q35_ATTN_SEG_FUSE_GATE",
-                                         "0") == "1"
-# TRTLLM_Q35_ATTN_CP=1: CP-lite generation attention inside each TP KV group (fmha/q35_cp.py); see
-# FlashInferTrtllmGenFmha.run_generation for the batch-size selection.
-_Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
-# TRTLLM_Q35_CTX_ATTN_PLAN=1|2: see attention_backend/trtllm.py; here it only caches the layer's quantization constants.
-_Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN",
-                                    "0") in ("1", "2")
-# TRTLLM_Q35_ATTN_KV_APPEND=1: the fused qk-norm / RoPE / gate preprocessing of a generation-only step also writes the
-# FP8 query and appends the FP8 K / V (QKNormRoPEAttention.preprocess_qkv); the attention metadata is exposed to it
-# for that call only (_q35_attn_metadata) and the hand-over to the backend (attn.q35_kv_appended) is cleared after it.
-_Q35_ATTN_KV_APPEND = os.environ.get("TRTLLM_Q35_ATTN_KV_APPEND", "0") == "1"
 
 
 def _helix_zero_kv_mask(

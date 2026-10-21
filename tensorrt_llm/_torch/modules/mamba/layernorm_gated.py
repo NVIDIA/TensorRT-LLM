@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
 
@@ -130,15 +132,21 @@ _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
 
-# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_NORM_PDL=1: launch the GDN token-major gated RMSNorm as a
-# PDL dependent (port of the layernorm_gated part of upstream 3933f62170): the norm weight is read before
-# griddepcontrol.wait (it is not produced in-step), X and Z only after it, and dependents are released after the
-# output store. Only used when the grid cannot fill the GPU by itself.
-_Q35_GDN_NORM_PDL = os.environ.get("TRTLLM_Q35_GDN_NORM_PDL", "0") == "1"
-# TRTLLM_Q35_PDL_EARLY_TRIGGER=1: release the dependents (out_proj) at kernel entry instead of after the store, so a
-# PDL-launched GEMM can prefetch its weights while the norm runs (it reads Y only after its griddepcontrol.wait).
-_Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER",
-                                        "0") == "1"
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_GDN_NORM_PDL, _Q35_PDL_EARLY_TRIGGER
+    # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_NORM_PDL=1: launch the GDN token-major gated RMSNorm
+    # as a PDL dependent: the norm weight is read before griddepcontrol.wait (it is not produced in-step), X and Z
+    # only after it, and dependents are released after the output store. Only used when the grid cannot fill the GPU
+    # by itself.
+    _Q35_GDN_NORM_PDL = os.environ.get("TRTLLM_Q35_GDN_NORM_PDL", "0") == "1"
+    # TRTLLM_Q35_PDL_EARLY_TRIGGER=1: release the dependents (out_proj) at kernel entry instead of after the store, so
+    # a PDL-launched GEMM can prefetch its weights while the norm runs (it reads Y only after its
+    # griddepcontrol.wait).
+    _Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER",
+                                            "0") == "1"
 
 
 @functools.lru_cache(maxsize=None)

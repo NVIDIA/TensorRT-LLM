@@ -11,6 +11,7 @@ import triton.language.extra.libdevice as tldevice
 
 from tensorrt_llm._torch.modules.fla.op import exp
 from tensorrt_llm._torch.modules.fla.utils import input_guard
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version
 
 _SMALL_GRID_HEAD_TILES = 512
@@ -22,18 +23,25 @@ _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
-# Decode batches from this size use the partitioned replay + one all-layer checkpoint commit per step; smaller ones
-# commit inside each layer's replay. TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH=<n> moves the switch (e.g. 33 with
-# TRTLLM_Q35_GDN_CORE_LARGE=1, whose CUDA core kernel commits in-layer at b16 / b32).
-CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = int(
-    os.environ.get("TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH", "16")
-)
 
-# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_REPLAY_TILE=1: use the tuned fine-grained value tiling
-# (BV=16, 2 warps for <= 64 head tiles) for every T in [2, 8], not only T == 4. Measured on GB300 at the Qwen3.5 TP8
-# shape (H=2, HV=8, K=V=128, history 16, BF16 state) for T=7/8, N=1/2/4: e.g. N=1 T=7 8.5 -> 6.3 us (no commit),
-# 10.4 -> 6.8 us (commit), cold L2; outputs, histories and committed states bitwise equal to the BV=128 launch.
-_Q35_GDN_REPLAY_TILE = os.environ.get("TRTLLM_Q35_GDN_REPLAY_TILE", "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, _Q35_GDN_REPLAY_TILE
+    # Decode batches from this size use the partitioned replay + one all-layer checkpoint commit per step; smaller
+    # ones commit inside each layer's replay. TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH=<n> moves the switch (e.g. 33
+    # with TRTLLM_Q35_GDN_CORE_LARGE=1, whose CUDA core kernel commits in-layer at b16 / b32).
+    CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = int(
+        os.environ.get("TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH", "16")
+    )
+    # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_REPLAY_TILE=1: use the tuned fine-grained value tiling
+    # (BV=16, 2 warps for <= 64 head tiles) for every T in [2, 8], not only T == 4. Measured on GB300 at the Qwen3.5
+    # TP8 shape (H=2, HV=8, K=V=128, history 16, BF16 state) for T=7/8, N=1/2/4: e.g. N=1 T=7 8.5 -> 6.3 us (no
+    # commit), 10.4 -> 6.8 us (commit), cold L2; outputs, histories and committed states bitwise equal to the BV=128
+    # launch.
+    _Q35_GDN_REPLAY_TILE = os.environ.get("TRTLLM_Q35_GDN_REPLAY_TILE", "0") == "1"
+
+
 # TRTLLM_Q35_GDN_REPLAY_T16=1: allow the cached replay for up to 16 tokens per verify step (MTP k <= 15) instead of 8.
 # Nothing in the kernel needs T <= 8: the token tile is next_pow2(T) and the history stays 16 >= T. Without it k=8
 # (T=9) falls back to the FlashInfer/Triton verify path with intermediate SSM states (~+0.8 ms/step at TEP8 b1).

@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 
 @triton.jit
 def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
@@ -779,10 +781,14 @@ def q35_fused_qkv_rope_gate_append(
     )
 
 
-# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_PDL_EARLY_TRIGGER=1: the output-gate kernel is launched as a
-# PDL dependent (attention output and gate read only after griddepcontrol.wait) and releases its own dependents
-# (o_proj) at kernel entry, so a PDL-launched GEMM can prefetch its weights meanwhile.
-_Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_PDL_EARLY_TRIGGER
+    # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_PDL_EARLY_TRIGGER=1: the output-gate kernel is launched as
+    # a PDL dependent (attention output and gate read only after griddepcontrol.wait) and releases its own dependents
+    # (o_proj) at kernel entry, so a PDL-launched GEMM can prefetch its weights meanwhile.
+    _Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
 
 
 def _q35_sigmoid_mul_pdl(device: torch.device) -> bool:

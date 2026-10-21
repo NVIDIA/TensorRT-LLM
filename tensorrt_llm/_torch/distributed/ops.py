@@ -13,6 +13,7 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -37,25 +38,35 @@ _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 # TRTLLM_Q35_AR_LOG=1: log which path every AllReduce construction site and call shape takes
 # (MNNVL one-shot / two-shot, C++ AUTO / NCCL) and every all-gather call site.
 _Q35_AR_LOG: bool = os.environ.get("TRTLLM_Q35_AR_LOG", "0") == "1"
-# TRTLLM_Q35_AR_NORM_FUSE=1: MNNVL serves RMS_NORM as RESIDUAL_RMS_NORM with a zero residual, so the
-# callers can fold their standalone RMSNorms into the all-reduce (see q35_zero_residual).
-_Q35_AR_NORM_FUSE: bool = os.environ.get("TRTLLM_Q35_AR_NORM_FUSE", "0") == "1"
+_Q35_AR_NORM_FUSE: bool
+_Q35_MNNVL_PRESIZE: bool
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_AR_NORM_FUSE, _Q35_MNNVL_PRESIZE
+    # TRTLLM_Q35_AR_NORM_FUSE=1: MNNVL serves RMS_NORM as RESIDUAL_RMS_NORM with a zero residual, so the
+    # callers can fold their standalone RMSNorms into the all-reduce (see q35_zero_residual).
+    _Q35_AR_NORM_FUSE = os.environ.get("TRTLLM_Q35_AR_NORM_FUSE", "0") == "1"
+    # TRTLLM_Q35_MNNVL_PRESIZE=1: the MNNVL all-reduce workspace of a TP group is created once, at its first
+    # use (model construction), large enough for the model's allreduce_max_num_tokens rows, and is never
+    # re-created afterwards; a call that would need more takes the C++ / NCCL fallback instead. Without it the
+    # workspace grows lazily, i.e. at the first long prefill (KV-cache profiling), and every McastGPUBuffer
+    # construction is a collective fabric allocation. The one construction left per TP group is fenced
+    # (_q35_fenced_mcast_buffer): a workaround for a known staging-buffer overrun in the multicast handle
+    # exchange; a no-op once the library fix is present.
+    _Q35_MNNVL_PRESIZE = os.environ.get("TRTLLM_Q35_MNNVL_PRESIZE", "0") == "1"
+
+
 # TRTLLM_Q35_PROBE_NO_AR=1: ATTRIBUTION PROBE ONLY, WRONG OUTPUTS. Every all-reduce is replaced by
 # its local epilogue (residual add + RMSNorm [+ FP8 quant]) without any communication, to bound
 # the exposed all-reduce cost of a decode step against the stock step.
 _Q35_PROBE_NO_AR: bool = os.environ.get("TRTLLM_Q35_PROBE_NO_AR", "0") == "1"
-# TRTLLM_Q35_MNNVL_PRESIZE=1: the MNNVL all-reduce workspace of a TP group is created once, at its first
-# use (model construction), large enough for the model's allreduce_max_num_tokens rows, and is never
-# re-created afterwards; a call that would need more takes the C++ / NCCL fallback instead. Without it the
-# workspace grows lazily, i.e. at the first long prefill (KV-cache profiling), and every McastGPUBuffer
-# construction is a collective fabric allocation. The one construction left per TP group is fenced
-# (_q35_fenced_mcast_buffer): a workaround for a known staging-buffer overrun in the multicast handle exchange;
-# a no-op once the library fix is present.
-_Q35_MNNVL_PRESIZE: bool = os.environ.get("TRTLLM_Q35_MNNVL_PRESIZE",
-                                          "0") == "1"
-# TRTLLM_Q35_MCAST_STRAY_LOG=1: DIAGNOSTIC for the same workaround. Before every McastGPUBuffer construction on
-# ranks > 0, log which live pinned torch tensors (and which driver allocation) sit next to the handle-exchange
-# staging buffer; constructions where that memory is not mapped are fenced instead.
+# TRTLLM_Q35_MCAST_STRAY_LOG=1: DIAGNOSTIC for the fenced construction of TRTLLM_Q35_MNNVL_PRESIZE
+# (_q35_fenced_mcast_buffer). Before every McastGPUBuffer construction on ranks > 0, log which live pinned torch
+# tensors (and which driver allocation) sit next to the handle-exchange staging buffer; constructions where that
+# memory is not mapped are fenced instead.
 _Q35_MCAST_STRAY_LOG: bool = os.environ.get("TRTLLM_Q35_MCAST_STRAY_LOG",
                                             "0") == "1"
 # Largest token count for which the zero-residual buffer is used (decode / spec-verify shapes).

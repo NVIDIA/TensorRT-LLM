@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from .. import q35_env
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -1402,6 +1403,9 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        # Qwen3.5 on GB300: apply the TRTLLM_Q35_PROFILE switch values before
+        # any layer is built.
+        q35_env.activate(config)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[

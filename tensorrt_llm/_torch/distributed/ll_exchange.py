@@ -50,18 +50,35 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm.logger import logger
 
 ENV_LL_ARGMAX_EXCHANGE = "TRTLLM_Q35_LL_ARGMAX_EXCHANGE"
 
-# Rows (keys) per rank and launch: decode batch <= 64 at 1 key per request. TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS=<n>
-# (rounded up to a power of two, <= 1024) raises the bound, e.g. 256 for the vocabulary-sharded target sampling of an
-# MTP-6 verify at b16 / b32 (112 / 224 rows), which otherwise takes the stock all-gather + cat + cast + argmax.
-_MAX_ROWS = min(
-    1024,
-    triton.next_power_of_2(max(64, int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS", "64")))),
-)
-_WORDS = 2 * _MAX_ROWS  # 32-bit words per rank: (lo, hi) per key
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _MAX_ROWS, _WORDS, _MERGE_MAX_ROWS, _PDL_EARLY_TRIGGER
+    # Rows (keys) per rank and launch: decode batch <= 64 at 1 key per request. TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS=<n>
+    # (rounded up to a power of two, <= 1024) raises the bound, e.g. 256 for the vocabulary-sharded target sampling of
+    # an MTP-6 verify at b16 / b32 (112 / 224 rows), which otherwise takes the stock all-gather + cat + cast + argmax.
+    _MAX_ROWS = min(
+        1024,
+        triton.next_power_of_2(
+            max(64, int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS", "64")))
+        ),
+    )
+    _WORDS = 2 * _MAX_ROWS  # 32-bit words per rank: (lo, hi) per key
+    # TRTLLM_Q35_CP_MERGE_MAX_ROWS=<n> (default 1024): rows (tokens x heads x partials) one merge may carry. TEP8
+    # MTP-6 verify needs 896 at b32, 1344 at b48 and 1792 at b64; a larger cap also needs TRTLLM_Q35_CP_EXCHANGE_KB >=
+    # (rows x D/2 + cap) x 4 B / 1024 (b64: 1024) and TRTLLM_Q35_ATTN_CP_MAX_BATCH above the batch.
+    _MERGE_MAX_ROWS = int(os.environ.get("TRTLLM_Q35_CP_MERGE_MAX_ROWS", "1024"))
+    _PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
+    if "TPKeyExchange" in globals():  # defined below; refreshed after import
+        TPKeyExchange.MAX_ROWS = _MAX_ROWS
+
+
 _NUM_CHANNELS = int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_CHANNELS", "16"))
 # Constants read inside the Triton kernels must be constexpr globals.
 _LO_MASK = tl.constexpr(0xFFFFFFFF)
@@ -1001,11 +1018,6 @@ def _ll_group_kernel(
 
 # alltoall_merge receive layout inside each (parity, source) slot of a channel: row r's O words at
 # [r * D/2, (r + 1) * D/2), its LSE word at _MERGE_LSE_BASE(slot) + r; one epoch per row position.
-# TRTLLM_Q35_CP_MERGE_MAX_ROWS=<n> (default 1024): rows (tokens x heads x partials) one merge may carry. TEP8 MTP-6
-# verify needs 896 at b32, 1344 at b48 and 1792 at b64; a larger cap also needs TRTLLM_Q35_CP_EXCHANGE_KB >=
-# (rows x D/2 + cap) x 4 B / 1024 (b64: 1024) and TRTLLM_Q35_ATTN_CP_MAX_BATCH above the batch.
-_MERGE_MAX_ROWS = int(os.environ.get("TRTLLM_Q35_CP_MERGE_MAX_ROWS", "1024"))
-_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
 
 
 @triton.jit

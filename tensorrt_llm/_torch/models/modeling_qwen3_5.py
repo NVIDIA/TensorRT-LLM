@@ -21,6 +21,7 @@ from typing import Dict, List, Literal
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantAlgo
@@ -653,11 +654,15 @@ _QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
-# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_SKIP_MROPE_COS_SIN=1: do not build the packed mrope cos/sin
-# table in prepare_mrope_config every forward. The Qwen3.5 decoder never reads mrope_config (Qwen3NextModel.forward
-# drops it; the attention applies RoPE in its fused qk-norm/rope/gate kernel from position_ids), so the ~8 graph
-# kernels per target forward are dead work. Position-delta bookkeeping is unchanged.
-_Q35_SKIP_MROPE_COS_SIN = os.environ.get("TRTLLM_Q35_SKIP_MROPE_COS_SIN", "0") == "1"
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_SKIP_MROPE_COS_SIN
+    # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_SKIP_MROPE_COS_SIN=1: do not build the packed mrope cos/sin
+    # table in prepare_mrope_config every forward. The Qwen3.5 decoder never reads mrope_config (Qwen3NextModel.forward
+    # drops it; the attention applies RoPE in its fused qk-norm/rope/gate kernel from position_ids), so the ~8 graph
+    # kernels per target forward are dead work. Position-delta bookkeeping is unchanged.
+    _Q35_SKIP_MROPE_COS_SIN = os.environ.get("TRTLLM_Q35_SKIP_MROPE_COS_SIN", "0") == "1"
 
 
 class _Qwen3_5VLModel(Qwen3VLModelBase):

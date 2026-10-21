@@ -38,6 +38,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 _SENTINEL = tl.constexpr(-2147483648)  # 0x80000000: Lamport "not written" (two BF16: +0.0, -0.0)
 _HI_MASK = tl.constexpr(-65536)  # 0xFFFF0000
 
@@ -433,11 +435,16 @@ def _ctas_per_token(rows: int, hidden: int) -> int:
 
 import functools  # noqa: E402
 
-# Rows from which the CuTe kernel uses its fused two-shot mode (0: never). Default by group size from GB300
-# microbenchmarks: TP16 from 12 rows (one-shot ingress doubles: 14 rows one-shot 6.68 / two-shot 6.51 us, 28 rows
-# 9.65 / 7.52), never at TP8 and below (28 rows: one-shot 6.93 / two-shot 7.28). TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS
-# overrides.
-_TWO_SHOT_ROWS_ENV = os.environ.get("TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS")
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _TWO_SHOT_ROWS_ENV
+    # Rows from which the CuTe kernel uses its fused two-shot mode (0: never). Default by group size from GB300
+    # microbenchmarks: TP16 from 12 rows (one-shot ingress doubles: 14 rows one-shot 6.68 / two-shot 6.51 us, 28 rows
+    # 9.65 / 7.52), never at TP8 and below (28 rows: one-shot 6.93 / two-shot 7.28). TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS
+    # overrides.
+    _TWO_SHOT_ROWS_ENV = os.environ.get("TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS")
 
 
 def _two_shot_rows(nranks: int) -> int:

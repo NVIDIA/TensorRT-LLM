@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version
 
 
@@ -563,13 +564,19 @@ def causal_conv1d_fn(
 # When calculating token 3's convolution, it should conv to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's convolution, it should conv to token 0 (parent)
 # This kernel is a fused kernel which will also produce retrieve_parent_token based on retrieve_next_token & retrieve_next_sibling
-# Qwen3.5 low-latency switch (default off; recommended on): TRTLLM_Q35_GDN_CONV_BARRIER=1 restores the conv_state
-# ordering barrier of the conv1d update kernel (port of upstream d928429083, intra-CTA read-before-in-place-write race).
-_Q35_GDN_CONV_BARRIER = os.environ.get("TRTLLM_Q35_GDN_CONV_BARRIER", "0") == "1"
-# TRTLLM_Q35_GDN_CONV_HOIST=1: in the update kernel, load the x rows of all tokens right after the conv-state reads
-# (before any store). Without it every token's load sits behind the previous token's stores (ptxas cannot prove
-# they do not alias), so a T-token verify step pays T dependent L2 round trips. Same values, same arithmetic.
-_Q35_GDN_CONV_HOIST = os.environ.get("TRTLLM_Q35_GDN_CONV_HOIST", "0") == "1"
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_GDN_CONV_BARRIER, _Q35_GDN_CONV_HOIST
+    # Qwen3.5 low-latency switch (default off; recommended on): TRTLLM_Q35_GDN_CONV_BARRIER=1 restores the conv_state
+    # ordering barrier of the conv1d update kernel (intra-CTA read-before-in-place-write race).
+    _Q35_GDN_CONV_BARRIER = os.environ.get("TRTLLM_Q35_GDN_CONV_BARRIER", "0") == "1"
+    # TRTLLM_Q35_GDN_CONV_HOIST=1: in the update kernel, load the x rows of all tokens right after the conv-state
+    # reads (before any store). Without it every token's load sits behind the previous token's stores (ptxas cannot
+    # prove they do not alias), so a T-token verify step pays T dependent L2 round trips. Same values, same arithmetic.
+    _Q35_GDN_CONV_HOIST = os.environ.get("TRTLLM_Q35_GDN_CONV_HOIST", "0") == "1"
 
 
 @triton.jit

@@ -26,6 +26,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -107,14 +108,20 @@ from .scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
-# TRTLLM_Q35_CTX_LEAN_TOKENS=1 (default off): for text-only requests, the first context chunk's block-reuse lookup
-# takes the prompt list built at intake (executor_request_to_llm_request) instead of rebuilding it from the C++
-# request with get_tokens(0) and slicing it, and block commits fetch only the tokens they commit (get_tokens_range)
-# instead of the whole prompt. Same tokens, fewer O(prompt) Python list builds per request. =2 also checks the
-# lookup tokens against get_tokens(0) (validation runs only). =3: the lookup reads the tokens in C++ from the
-# request (KVCacheManager.create_kv_cache_for_request, no Python list and no per-token cast) and the radix tree
-# hashes a block's tokens in 512-byte writes; needs the matching C++ libs, else behaves as =1.
-_Q35_CTX_LEAN_TOKENS = int(os.environ.get("TRTLLM_Q35_CTX_LEAN_TOKENS", "0") or 0)
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_CTX_LEAN_TOKENS
+    # TRTLLM_Q35_CTX_LEAN_TOKENS=1 (default off): for text-only requests, the first context chunk's block-reuse
+    # lookup takes the prompt list built at intake (executor_request_to_llm_request) instead of rebuilding it from the
+    # C++ request with get_tokens(0) and slicing it, and block commits fetch only the tokens they commit
+    # (get_tokens_range) instead of the whole prompt. Same tokens, fewer O(prompt) Python list builds per request. =2
+    # also checks the lookup tokens against get_tokens(0) (validation runs only). =3: the lookup reads the tokens in
+    # C++ from the request (KVCacheManager.create_kv_cache_for_request, no Python list and no per-token cast) and the
+    # radix tree hashes a block's tokens in 512-byte writes; needs the matching C++ libs, else behaves as =1.
+    _Q35_CTX_LEAN_TOKENS = int(os.environ.get("TRTLLM_Q35_CTX_LEAN_TOKENS", "0") or 0)
+
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (

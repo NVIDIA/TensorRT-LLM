@@ -27,17 +27,26 @@ from typing import Dict, Optional, Union
 
 import torch
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import prefer_pinned
 
 # Grid splits per request: SMs // batch (one CTA per SM, all CTAs co-resident for the in-kernel grid barrier).
 _SPLITS_OVERRIDE = int(os.environ.get("TRTLLM_Q35_ATTN_FUSED_SPLITS", "0"))
-# Where the grid releases its dependents (o_proj): "entry" (safe with the in-kernel grid barrier: the dependent grid
-# launches only after every CTA of this grid ran the trigger, i.e. after all of them are resident) or "end". Follows
-# TRTLLM_Q35_PDL_EARLY_TRIGGER unless TRTLLM_Q35_ATTN_FUSED_TRIGGER is set.
-_TRIGGER = os.environ.get(
-    "TRTLLM_Q35_ATTN_FUSED_TRIGGER",
-    "entry" if os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1" else "end",
-)
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _TRIGGER
+    # Where the grid releases its dependents (o_proj): "entry" (safe with the in-kernel grid barrier: the dependent
+    # grid launches only after every CTA of this grid ran the trigger, i.e. after all of them are resident) or "end".
+    # Follows TRTLLM_Q35_PDL_EARLY_TRIGGER unless TRTLLM_Q35_ATTN_FUSED_TRIGGER is set.
+    _TRIGGER = os.environ.get(
+        "TRTLLM_Q35_ATTN_FUSED_TRIGGER",
+        "entry" if os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1" else "end",
+    )
+
+
 _KV_PRE_WAIT = os.environ.get("TRTLLM_Q35_ATTN_FUSED_KV_PRE_WAIT", "1") == "1"
 _STAGES = int(os.environ.get("TRTLLM_Q35_ATTN_FUSED_STAGES", "2"))
 # Pages below the new tokens that are still read only after griddepcontrol.wait (default 1).
