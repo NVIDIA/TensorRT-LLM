@@ -350,14 +350,33 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         # Config-driven expert range fields are forwarded from DwdpConfig.
         self.assertEqual(kwargs["num_experts_per_worker"], 4)
         self.assertEqual(kwargs["num_prefetch_experts"], 4)
+        self.assertEqual(kwargs["num_prefetch_slots"], 2)
         self.assertIs(result, fake_weight_manager)
         self.assertIs(mgr._weight_manager, fake_weight_manager)
+        self.assertEqual(kwargs["repeated_layer_indices"], [])
+
+    def test_setup_forwards_repeated_dwdp_layers(self, mock_comm_world, _rank, _setup):
+        """Repeated layers reach setup_dwdp; layers without a DWDP MoE are dropped."""
+        mgr, _ = self._set_up_manager(
+            mock_comm_world,
+            _setup,
+            before_setup=lambda m: (
+                m.add_layer(3),
+                m.add_layer(61),
+                m.add_repeated_layer(61),
+                m.add_repeated_layer(61),
+                m.add_repeated_layer(62),
+            ),
+        )
+        _, kwargs = _setup.call_args
+        self.assertEqual(kwargs["layer_indices"], [3, 61])
+        self.assertEqual(kwargs["repeated_layer_indices"], [61])
 
     # ------------------------------------------------------------------
     # Runtime forwards require setup()
     # ------------------------------------------------------------------
 
-    def _set_up_manager(self, mock_comm_world, mock_setup):
+    def _set_up_manager(self, mock_comm_world, mock_setup, before_setup=None):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -368,6 +387,8 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             dist=MagicMock(spec=MPIDist),
             mapping=_make_mapping(),
         )
+        if before_setup is not None:
+            before_setup(mgr)
         with patch(
             "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
             return_value=0,

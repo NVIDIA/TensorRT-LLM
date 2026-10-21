@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -72,9 +72,6 @@ _CopyBatch = Tuple[List[int], List[int], List[int]]
 # destination, source, 16-byte-line-count and group-boundary tensors, plus the
 # number of blocks each group gets.
 _GatherPlan = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
-
-# Number of prefetch buffer slots (``WeightBuffer`` double buffer).
-_NUM_SLOTS = 2
 
 
 class DWDPWeightManager:
@@ -131,6 +128,7 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         contention_opt: bool = False,
+        repeated_layer_indices: Sequence[int] = (),
     ) -> None:
         """Initialize the DWDPWeightManager.
 
@@ -161,10 +159,13 @@ class DWDPWeightManager:
                 to reduce single-NVLink-link contention.  Plans are cached
                 per layer since peer ``data_ptr()`` and destination
                 ``data_ptr()`` are stable after initialization.
+            repeated_layer_indices: MoE layers that run several times in a row
+                within a forward pass; their repeats bind the copy still in
+                the slot (see ``PrefetchSchedule``).
 
         Raises:
-            ValueError: If dwdp_rank is out of range, dwdp_size is invalid or
-                there are no MoE layers.
+            ValueError: If dwdp_rank is out of range, dwdp_size is invalid,
+                there are no MoE layers or a repeated layer is not one of them.
         """
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
@@ -191,9 +192,17 @@ class DWDPWeightManager:
         device = torch.device("cuda", weight_buffer.device_id)
         self._copy_stream = torch.cuda.Stream(device=device)
 
-        num_slots = _NUM_SLOTS
+        num_slots = weight_buffer.num_slots
         self._layer_order = {layer: order for order, layer in enumerate(self._moe_layer_indices)}
-        self._schedule = PrefetchSchedule(len(self._moe_layer_indices), num_slots)
+        # The weight buffer owns the slot mapping; the schedule and the event
+        # indices below both read it from there.
+        unknown = set(repeated_layer_indices) - self._moe_layer_set
+        if unknown:
+            raise ValueError(f"repeated layers {sorted(unknown)} are not DWDP MoE layers")
+        self._schedule = PrefetchSchedule(
+            [weight_buffer.buffer_index_for_layer(layer) for layer in self._moe_layer_indices],
+            repeated_orders=[self._layer_order[layer] for layer in repeated_layer_indices],
+        )
         self._reported_restarts = 0
 
         # Buffer-slot events: one pair per slot.
@@ -307,7 +316,7 @@ class DWDPWeightManager:
                 f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
             )
 
-        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        buf_idx = self._schedule.slot(self._order_of(layer_idx))
 
         with torch.cuda.stream(self._copy_stream):
             # WAR hazard: wait until compute finishes reading this buffer slot
@@ -551,9 +560,10 @@ class DWDPWeightManager:
             KeyError: If layer_idx is not a valid MoE layer.
             AttributeError: If backend_module lacks a required weight attribute.
         """
-        self._apply(self._schedule.bind(self._order_of(layer_idx)))
+        order = self._order_of(layer_idx)
+        self._apply(self._schedule.bind(order))
 
-        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        buf_idx = self._schedule.slot(order)
         compute_stream = torch.cuda.current_stream(
             torch.device("cuda", self._weight_buffer.device_id)
         )

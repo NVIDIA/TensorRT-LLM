@@ -24,6 +24,11 @@ from tensorrt_llm._torch.modules.dwdp.prefetch_schedule import PrefetchSchedule,
 pytestmark = pytest.mark.cpu_only
 
 
+def _schedule(num_layers: int, num_slots: int, repeated=()) -> PrefetchSchedule:
+    """The weight buffer's mapping: MoE order ``o`` uses slot ``o % num_slots``."""
+    return PrefetchSchedule([order % num_slots for order in range(num_layers)], repeated)
+
+
 def _run_pass(schedule: PrefetchSchedule, num_layers: int) -> None:
     """One complete forward pass in MoE order."""
     schedule.start_forward()
@@ -35,7 +40,7 @@ def _run_pass(schedule: PrefetchSchedule, num_layers: int) -> None:
 @pytest.mark.parametrize("num_slots", [2, 3, 4])
 @pytest.mark.parametrize("num_layers", list(range(1, 13)) + [92])
 def test_each_layer_is_gathered_once_per_pass(num_layers, num_slots):
-    schedule = PrefetchSchedule(num_layers, num_slots)
+    schedule = _schedule(num_layers, num_slots)
     first = schedule.start_forward()
     assert first.prefetch == list(range(min(num_layers, num_slots)))
     issued = list(first.prefetch)
@@ -67,7 +72,7 @@ def test_each_layer_is_gathered_once_per_pass(num_layers, num_slots):
 )
 def test_finish_issues_the_layer_num_slots_ahead_and_wraps(num_slots, wrap):
     num_layers = 92
-    schedule = PrefetchSchedule(num_layers, num_slots)
+    schedule = _schedule(num_layers, num_slots)
     _run_pass(schedule, num_layers)
     assert schedule.start_forward().prefetch == []
     for order in range(num_layers):
@@ -78,7 +83,7 @@ def test_finish_issues_the_layer_num_slots_ahead_and_wraps(num_slots, wrap):
 
 def test_two_slots_wrap_explicitly():
     # 5 layers, 2 slots: slots 0 1 0 1 0 | 0 1 0 1 0.
-    schedule = PrefetchSchedule(5, 2)
+    schedule = _schedule(5, 2)
     assert schedule.start_forward().prefetch == [0, 1]
     expected_after_finish = {0: [2], 1: [3], 2: [4], 3: [], 4: [0, 1]}
     for order in range(5):
@@ -86,7 +91,7 @@ def test_two_slots_wrap_explicitly():
         assert schedule.finish(order).prefetch == expected_after_finish[order]
     assert schedule.start_forward().prefetch == []
     # 4 layers, 3 slots: slots 0 1 2 0 | 0 1 2 0.
-    schedule = PrefetchSchedule(4, 3)
+    schedule = _schedule(4, 3)
     assert schedule.start_forward().prefetch == [0, 1, 2]
     expected_after_finish = {0: [3], 1: [], 2: [], 3: [0, 1, 2]}
     for order in range(4):
@@ -96,7 +101,7 @@ def test_two_slots_wrap_explicitly():
 
 
 def test_pass_without_start_forward_issues_on_first_bind():
-    schedule = PrefetchSchedule(4, 2)
+    schedule = _schedule(4, 2)
     step = schedule.bind(0)
     assert step == ScheduleStep(False, None, [0, 1])
     schedule.finish(0)
@@ -104,7 +109,7 @@ def test_pass_without_start_forward_issues_on_first_bind():
 
 
 def test_out_of_order_bind_restarts_at_that_layer():
-    schedule = PrefetchSchedule(6, 2)
+    schedule = _schedule(6, 2)
     _ = schedule.start_forward()
     schedule.bind(0)
     schedule.finish(0)
@@ -115,7 +120,7 @@ def test_out_of_order_bind_restarts_at_that_layer():
 
 
 def test_pass_stopped_inside_the_sequence_restarts_at_start_forward():
-    schedule = PrefetchSchedule(6, 2)
+    schedule = _schedule(6, 2)
     schedule.start_forward()
     for order in range(3):
         schedule.bind(order)
@@ -126,7 +131,7 @@ def test_pass_stopped_inside_the_sequence_restarts_at_start_forward():
 
 
 def test_abandoned_bind_requests_a_device_sync():
-    schedule = PrefetchSchedule(4, 2)
+    schedule = _schedule(4, 2)
     schedule.start_forward()
     schedule.bind(0)
     # The MoE of layer 0 raised before finish: its slot may still be read.
@@ -137,7 +142,7 @@ def test_abandoned_bind_requests_a_device_sync():
 
 
 def test_finish_without_matching_bind_raises():
-    schedule = PrefetchSchedule(4, 2)
+    schedule = _schedule(4, 2)
     with pytest.raises(RuntimeError):
         schedule.finish(0)
     schedule.bind(0)
@@ -148,7 +153,7 @@ def test_finish_without_matching_bind_raises():
 
 
 def test_invalidate_reissues_the_first_layers():
-    schedule = PrefetchSchedule(4, 2)
+    schedule = _schedule(4, 2)
     _run_pass(schedule, 4)
     assert schedule.invalidate() == ScheduleStep(False, None, [])
     assert schedule.start_forward().prefetch == [0, 1]
@@ -159,9 +164,87 @@ def test_invalidate_reissues_the_first_layers():
 
 def test_constructor_validates_arguments():
     with pytest.raises(ValueError):
-        PrefetchSchedule(0, 2)
+        PrefetchSchedule([])
     with pytest.raises(ValueError):
-        PrefetchSchedule(4, 1)
+        PrefetchSchedule([0, -1])
+    with pytest.raises(ValueError):
+        PrefetchSchedule([0, 1], repeated_orders=[2])
+
+
+@pytest.mark.parametrize("num_slots", [2, 3])
+@pytest.mark.parametrize("repeats", [1, 2, 4])
+def test_repeated_layer_rebinds_its_resident_copy(num_slots, repeats):
+    """MTP-Eagle pattern ``..., N, N, N``: every repeat reads the copy still in the slot."""
+    num_layers = 5
+    last = num_layers - 1
+    schedule = _schedule(num_layers, num_slots, repeated=[last])
+    model = _SlotModel(num_layers, num_slots)
+    copies = []
+    for _ in range(4):
+        step = schedule.start_forward()
+        model.apply(step)
+        copies += step.prefetch
+        for order in list(range(num_layers)) + [last] * (repeats - 1):
+            step = schedule.bind(order)
+            model.apply(step)
+            model.read(order)
+            copies += step.prefetch
+            step = schedule.finish(order)
+            if order == last:
+                # The slot stays held: no release and no copy until a different layer runs.
+                assert step == ScheduleStep(False, None, [])
+            model.apply(step)
+            copies += step.prefetch
+    assert copies[: 4 * num_layers] == list(range(num_layers)) * 4
+    assert schedule.num_restarts == 0
+
+
+def test_held_slot_is_released_by_the_next_call():
+    # 5 layers, 2 slots: order 4 holds slot 0 after it finishes.
+    schedule = _schedule(5, 2, repeated=[4])
+    schedule.start_forward()
+    for order in range(5):
+        schedule.bind(order)
+        schedule.finish(order)
+    assert schedule.bind(4) == ScheduleStep(False, None, [])
+    assert schedule.finish(4) == ScheduleStep(False, None, [])
+    # The next pass releases slot 0 before it reissues the slot.
+    assert schedule.start_forward() == ScheduleStep(False, 0, [0, 1])
+    # A bind of the next layer releases it too (pass without start_forward).
+    for order in range(5):
+        schedule.bind(order)
+        schedule.finish(order)
+    assert schedule.bind(0) == ScheduleStep(False, 0, [0, 1])
+    schedule.finish(0)
+    # An abandoned repeat still synchronizes before its slot is reused.
+    for order in range(1, 5):
+        schedule.bind(order)
+        schedule.finish(order)
+    schedule.bind(4)
+    assert schedule.start_forward() == ScheduleStep(True, 0, [0, 1])
+    assert schedule.num_restarts == 1
+
+
+def test_undeclared_repeat_restarts():
+    """Without the declaration a repeat is out of sequence and gathers the layer again."""
+    schedule = _schedule(5, 2)
+    schedule.start_forward()
+    for order in range(5):
+        schedule.bind(order)
+        schedule.finish(order)
+    assert schedule.bind(4).prefetch == [4]
+    assert schedule.num_restarts == 1
+
+
+def test_slots_come_from_the_given_mapping():
+    """The schedule uses the slot table it is given, not a formula of its own."""
+    slots = [1, 0, 2, 1, 0, 2]
+    schedule = PrefetchSchedule(slots)
+    assert [schedule.slot(order) for order in range(len(slots))] == slots
+    assert schedule.start_forward().prefetch == [0, 1, 2]
+    for order in range(len(slots)):
+        schedule.bind(order)
+        assert schedule.finish(order).release == slots[order]
 
 
 class _SlotModel:
@@ -198,12 +281,14 @@ class _SlotModel:
         self.unreleased[slot].add(order)
 
 
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", range(40))
 def test_randomized_passes_keep_raw_and_war(seed):
     rng = random.Random(seed)
     num_layers = rng.randint(1, 9)
     num_slots = rng.randint(2, 4)
-    schedule = PrefetchSchedule(num_layers, num_slots)
+    # Half of the seeds repeat the last layer of each pass, as one-model MTP-Eagle does.
+    repeated = [num_layers - 1] if seed % 2 else []
+    schedule = _schedule(num_layers, num_slots, repeated)
     model = _SlotModel(num_layers, num_slots)
     for _ in range(40):
         kind = rng.random()
@@ -218,6 +303,8 @@ def test_randomized_passes_keep_raw_and_war(seed):
         orders = list(range(stop))
         if kind > 0.95 and orders:
             orders = sorted(rng.sample(orders, rng.randint(1, len(orders))))
+        if repeated and orders and orders[-1] == repeated[0]:
+            orders += repeated * rng.randint(0, 3)
         for order in orders:
             model.apply(schedule.bind(order))
             model.read(order)

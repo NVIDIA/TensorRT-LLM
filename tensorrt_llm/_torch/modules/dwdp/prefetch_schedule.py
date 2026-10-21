@@ -15,12 +15,13 @@
 """Issue order of the DWDP expert prefetch.
 
 The MoE layers of consecutive forward passes form one cyclic sequence of positions: position
-``p`` is MoE order ``p % num_layers`` and uses the prefetch slot ``order % num_slots`` (the slot
-its composite VA maps).  A position is issued (its copy enqueued) once every earlier position is
-issued and its slot no longer holds a position that has not finished.  A slot is released right
-after the MoE that read it is enqueued, so each MoE layer is gathered once per pass, the copy into
-a slot overlaps everything up to the next MoE that reads the slot, and the last MoE layers of a
-pass already gather the first layers of the next pass, through the gap between executor steps.
+``p`` is MoE order ``p % num_layers`` and uses that order's prefetch slot (the slot its composite
+VA maps, ``WeightBuffer.buffer_index_for_layer``).  A position is issued (its copy enqueued) once
+every earlier position is issued and its slot no longer holds a position that has not finished.
+A slot is released right after the MoE that read it is enqueued, so each MoE layer is gathered
+once per pass, the copy into a slot overlaps everything up to the next MoE that reads the slot,
+and the last MoE layers of a pass already gather the first layers of the next pass, through the
+gap between executor steps.
 
 ``PrefetchSchedule`` only does the host bookkeeping.  Each MoE layer goes through ``bind`` (before
 its MoE reads the slot) and ``finish`` (right after the MoE is enqueued); a pass starts with
@@ -28,11 +29,16 @@ its MoE reads the slot) and ``finish`` (right after the MoE is enqueued); a pass
 A pass that stops inside the sequence, or a bind out of sequence, restarts the sequence at that
 layer; a pass without ``start_forward`` (e.g. a warmup forward) issues its copies on the first
 bind.
+
+A repeated MoE order runs several times in a row within a pass (the one-model MTP-Eagle layer,
+reused for every draft step).  Its slot is held after each finish and released only by the next
+call that is not a bind of the same order, so every repeat binds the copy that is still in the
+slot instead of gathering the layer again.
 """
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional
+from typing import Iterable, List, NamedTuple, Optional, Sequence
 
 
 class ScheduleStep(NamedTuple):
@@ -54,17 +60,24 @@ class PrefetchSchedule:
     """Host-side issue order of the DWDP expert prefetch over consecutive forward passes.
 
     Args:
-        num_layers: Number of MoE layers of one forward pass.
-        num_slots: Number of prefetch buffer slots; MoE order ``o`` uses slot ``o % num_slots``.
+        slots: Prefetch slot of each MoE order of a forward pass, as the weight buffer maps it.
+        repeated_orders: MoE orders that may be bound several times in a row within a pass.
+
+    Raises:
+        ValueError: If ``slots`` is empty or negative, or a repeated order is out of range.
     """
 
-    def __init__(self, num_layers: int, num_slots: int) -> None:
-        if num_layers <= 0:
-            raise ValueError(f"num_layers must be positive, got {num_layers}")
-        if num_slots < 2:
-            raise ValueError(f"num_slots must be at least 2, got {num_slots}")
-        self._num_layers = num_layers
-        self._num_slots = num_slots
+    def __init__(self, slots: Sequence[int], repeated_orders: Iterable[int] = ()) -> None:
+        if not slots:
+            raise ValueError("a prefetch schedule needs at least one MoE layer")
+        if min(slots) < 0:
+            raise ValueError(f"negative prefetch slot in {list(slots)}")
+        self._slots = list(slots)
+        self._num_layers = len(self._slots)
+        self._repeated = frozenset(repeated_orders)
+        for order in self._repeated:
+            self._check_order(order)
+        num_slots = max(self._slots) + 1
         # Next position to bind and number of positions issued so far.
         self._next_bind = 0
         self._issued = 0
@@ -72,6 +85,8 @@ class PrefetchSchedule:
         self._slot_owner: List[Optional[int]] = [None] * num_slots
         # Position bound and not finished yet.
         self._bound: Optional[int] = None
+        # Finished position of a repeated order whose slot is still held for a repeat.
+        self._held: Optional[int] = None
         self._num_restarts = 0
 
     @property
@@ -81,25 +96,35 @@ class PrefetchSchedule:
 
     def slot(self, order: int) -> int:
         """Prefetch slot of MoE order ``order``."""
-        return order % self._num_slots
+        return self._slots[order]
 
     def start_forward(self) -> ScheduleStep:
         """Start a forward pass: issue its first layers unless they are already in flight."""
+        release = self._release_held()
         if self._bound is None and self._next_bind % self._num_layers == 0:
-            return ScheduleStep(False, None, self._issue())
+            return ScheduleStep(False, release, self._issue())
         self._num_restarts += 1
         synchronize = self._restart(0)
-        return ScheduleStep(synchronize, None, self._issue())
+        return ScheduleStep(synchronize, release, self._issue())
 
     def bind(self, order: int) -> ScheduleStep:
         """Bind MoE order ``order``; its MoE reads the slot only after the returned step.
 
-        A bind out of sequence restarts the sequence at ``order``.
+        A bind out of sequence restarts the sequence at ``order``.  A repeated order bound again
+        right after its finish reads the copy still held in its slot.
 
         Raises:
             ValueError: If ``order`` is out of range.
         """
         self._check_order(order)
+        if (
+            self._bound is None
+            and self._held is not None
+            and order == self._held % self._num_layers
+        ):
+            self._bound = self._held
+            return ScheduleStep(False, None, [])
+        release = self._release_held()
         synchronize = False
         if self._bound is not None or order != self._next_bind % self._num_layers:
             self._num_restarts += 1
@@ -110,7 +135,7 @@ class PrefetchSchedule:
                 f"DWDP prefetch schedule: MoE order {order} bound before its copy was issued"
             )
         self._bound = self._next_bind
-        return ScheduleStep(synchronize, None, prefetch)
+        return ScheduleStep(synchronize, release, prefetch)
 
     def finish(self, order: int) -> ScheduleStep:
         """Finish the bound MoE order ``order`` (its MoE has just been enqueued).
@@ -127,6 +152,10 @@ class PrefetchSchedule:
                 f"(bound={bound})"
             )
         self._next_bind = self._bound + 1
+        if order in self._repeated:
+            self._held = self._bound
+            self._bound = None
+            return ScheduleStep(False, None, [])
         self._bound = None
         slot = self.slot(order)
         self._slot_owner[slot] = None
@@ -134,16 +163,26 @@ class PrefetchSchedule:
 
     def invalidate(self) -> ScheduleStep:
         """Forget every issued prefetch; the next pass issues its first layers again."""
-        return ScheduleStep(self._restart(0), None, [])
+        release = self._release_held()
+        return ScheduleStep(self._restart(0), release, [])
 
     def _check_order(self, order: int) -> None:
         if not 0 <= order < self._num_layers:
             raise ValueError(f"MoE order {order} out of range [0, {self._num_layers})")
 
+    def _release_held(self) -> Optional[int]:
+        """Release the slot held for a repeat, if any; returns the slot."""
+        if self._held is None:
+            return None
+        slot = self.slot(self._held % self._num_layers)
+        self._slot_owner[slot] = None
+        self._held = None
+        return slot
+
     def _restart(self, order: int) -> bool:
         """Restart the sequence at ``order``; returns whether a bound layer was abandoned."""
         abandoned = self._bound is not None
-        self._slot_owner = [None] * self._num_slots
+        self._slot_owner = [None] * len(self._slot_owner)
         self._bound = None
         self._next_bind = order
         self._issued = order
