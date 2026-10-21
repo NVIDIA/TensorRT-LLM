@@ -62,6 +62,33 @@ def _unsupported_reason(
     return None
 
 
+def use_prims_ts_indexer(params: QSASparseParams, q: torch.Tensor) -> bool:
+    """Whether the indexer scoring runs on the PrimTS kernel instead of Triton.
+
+    Follows ``sparse_core_backend``: ``triton`` never, ``prims_ts`` always
+    (raising if unsupported), ``auto`` when the device and inputs qualify.
+    """
+    backend = params.sparse_core_backend
+    if backend == "triton":
+        return False
+    reason = None
+    if not q.is_cuda:
+        reason = "requires CUDA tensors"
+    elif torch.cuda.get_device_capability(q.device) not in _SUPPORTED_CAPABILITIES:
+        reason = "requires an SM100, SM103 or SM107 GPU"
+    elif q.dtype != torch.bfloat16:
+        reason = f"requires BF16 index queries, got {q.dtype}"
+    if reason is None:
+        return True
+    if backend == "prims_ts":
+        raise RuntimeError(f"QSA PrimTS indexer {reason}")
+    logger.warning_once(
+        f"QSA PrimTS indexer unavailable ({reason}); using the Triton scorer",
+        key="qsa_prims_ts_indexer_fallback",
+    )
+    return False
+
+
 def resolve_sparse_core_backend(
     params: QSASparseParams,
     *,
