@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """PrimTS QToken-KvBlock-Sparse core attention for QSA."""
 
+import bisect
 import functools
 import os
 import threading
@@ -16,7 +17,10 @@ _PREFILL_GROUP_SIZE = 4
 # A plan miss costs ~40 ms per layer; padding prefill rows to a bucket bounds
 # the plan keys to max_num_tokens / bucket per layer.
 _PREFILL_ROW_BUCKET = 256
-_MIN_DECODE_ROWS = 64
+# Decode rows below which Triton is faster under CUDA graphs (Rubin SM107,
+# 32K context, TP2): the core ties at one row, the indexer until ~32 rows.
+_MIN_DECODE_ROWS = 2
+_MIN_INDEXER_DECODE_ROWS = 32
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -66,15 +70,19 @@ def _unsupported_reason(
     return None
 
 
-def use_prims_ts_indexer(params: QSASparseParams, q: torch.Tensor) -> bool:
+def use_prims_ts_indexer(
+    params: QSASparseParams, q: torch.Tensor, *, is_decode: bool = False
+) -> bool:
     """Whether the indexer scoring runs on the PrimTS kernel instead of Triton.
 
     Follows ``sparse_core_backend`` unless ``TLLM_QSA_INDEXER`` overrides it:
     ``triton`` never, ``prims_ts`` always (raising if unsupported), ``auto``
-    when the device and inputs qualify.
+    when the device and inputs qualify and decode batches are large enough.
     """
     backend = os.environ.get("TLLM_QSA_INDEXER", params.sparse_core_backend)
     if backend == "triton":
+        return False
+    if backend == "auto" and is_decode and q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
         return False
     reason = None
     if not q.is_cuda:
@@ -124,16 +132,10 @@ def resolve_sparse_core_backend(
     return "prims_ts"
 
 
-def _request_boundaries(request_indices: torch.Tensor) -> torch.Tensor:
+def _request_boundaries(request_indices: torch.Tensor) -> tuple[int, ...]:
     req = request_indices.to(torch.int64).cpu()
     change = torch.nonzero(req[1:] != req[:-1]).flatten() + 1
-    return torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int32),
-            change.to(torch.int32),
-            torch.tensor([req.numel()], dtype=torch.int32),
-        )
-    )
+    return (0, *change.tolist(), req.numel())
 
 
 def _pad_rows(t: torch.Tensor, rows: int, fill: float) -> torch.Tensor:
@@ -142,16 +144,21 @@ def _pad_rows(t: torch.Tensor, rows: int, fill: float) -> torch.Tensor:
     return padded
 
 
-def slice_request_boundaries(cu_seq_lens: torch.Tensor, start: int, end: int) -> torch.Tensor:
+def align_prefill_chunk(rows: int) -> int:
+    """Largest bucket multiple not above ``rows``, so full chunks need no padding."""
+    return max(rows // _PREFILL_ROW_BUCKET * _PREFILL_ROW_BUCKET, min(rows, _PREFILL_ROW_BUCKET))
+
+
+def slice_request_boundaries(cu_seq_lens: list[int], start: int, end: int) -> tuple[int, ...]:
     """Request boundaries of packed rows ``[start, end)`` from host cumulative lengths."""
-    inner = cu_seq_lens[(cu_seq_lens > start) & (cu_seq_lens < end)] - start
-    return torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int32),
-            inner.to(torch.int32),
-            torch.tensor([end - start], dtype=torch.int32),
-        )
-    )
+    inner = cu_seq_lens[
+        bisect.bisect_right(cu_seq_lens, start) : bisect.bisect_left(cu_seq_lens, end)
+    ]
+    return (0, *(offset - start for offset in inner), end - start)
+
+
+def _run_abi(run_args) -> tuple:
+    return tuple((name, tuple(t.shape), tuple(t.stride()), t.dtype) for name, t in run_args)
 
 
 class _PrimsTSSparseCore:
@@ -159,6 +166,9 @@ class _PrimsTSSparseCore:
         self._plans: dict[tuple, object] = {}
         self._last_abi: dict[tuple, tuple] = {}
         self._workspace: torch.Tensor | None = None
+        self._qo_indptr: dict[tuple, torch.Tensor] = {}
+        self._qo_indptr_key: tuple | None = None
+        self._qo_indptr_buffer_key: tuple | None = None
         self._lock = threading.Lock()
 
     def _workspace_for(self, nbytes: int, device: torch.device) -> torch.Tensor:
@@ -169,6 +179,38 @@ class _PrimsTSSparseCore:
             ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
             self._workspace = ws
         return ws
+
+    def _route_offsets(
+        self,
+        make_qo_indptr,
+        request_boundaries: tuple[int, ...],
+        rows: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # The FlashInfer wrapper re-prepares, with host readbacks, whenever the
+        # qo_indptr storage changes. All QSA layers of a forward share one
+        # request layout, so offsets live in a persistent buffer per route count
+        # that is rewritten, stream-ordered, only when the layout changes.
+        layout = (device.index, rows, request_boundaries)
+        if layout == self._qo_indptr_key:
+            return self._qo_indptr[self._qo_indptr_buffer_key]
+        host = make_qo_indptr(
+            torch.tensor(request_boundaries, dtype=torch.int32),
+            rows,
+            group_size=_PREFILL_GROUP_SIZE,
+            device="cpu",
+        )
+        buffer_key = (device.index, host.numel())
+        buffer = self._qo_indptr.get(buffer_key)
+        if buffer is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("QSA PrimTS route offsets must be allocated before capture")
+            buffer = torch.empty(host.numel(), dtype=torch.int32, device=device)
+            self._qo_indptr[buffer_key] = buffer
+        buffer.copy_(host, non_blocking=True)
+        self._qo_indptr_key = layout
+        self._qo_indptr_buffer_key = buffer_key
+        return buffer
 
     def run(
         self,
@@ -184,7 +226,8 @@ class _PrimsTSSparseCore:
         max_seq_len_kv: int,
         softmax_scale: float,
         is_decode: bool,
-        request_boundaries: torch.Tensor | None = None,
+        request_boundaries: tuple[int, ...] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         wrapper_cls, workspace_size, make_qo_indptr = _prims_ts_api()
         rows, num_qo_heads, head_dim = q.shape
@@ -226,12 +269,8 @@ class _PrimsTSSparseCore:
                 # Host readback; callers with host sequence lengths pass the
                 # boundaries to keep the stream running.
                 request_boundaries = _request_boundaries(request_indices)
-            qo_indptr = make_qo_indptr(
-                request_boundaries,
-                rows,
-                group_size=_PREFILL_GROUP_SIZE,
-                device=q.device,
-            )
+            with self._lock:
+                qo_indptr = self._route_offsets(make_qo_indptr, request_boundaries, rows, q.device)
             group_size = _PREFILL_GROUP_SIZE
             num_routes = qo_indptr.numel() - 1
             split_kv = False
@@ -257,7 +296,9 @@ class _PrimsTSSparseCore:
             page_size,
             block_topk,
         )
-        out = torch.empty((rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device)
+        result = out
+        if out is None or rows != num_rows:
+            out = torch.empty((rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device)
         with self._lock:
             wrapper = self._plans.get(key)
             if wrapper is None:
@@ -297,17 +338,14 @@ class _PrimsTSSparseCore:
                 )
                 self._plans[key] = wrapper
             run_out = out.view_as(route_q) if is_decode else out
-            abi = tuple(
-                (name, tuple(t.shape), tuple(t.stride()), t.dtype)
-                for name, t in (
-                    ("q", route_q),
-                    ("block_ids", block_ids),
-                    ("block_table", block_table),
-                    ("request_indices", request_indices),
-                    ("query_positions", query_positions),
-                    ("out", run_out),
-                )
-            ) + (("k_ptr", k_cache.data_ptr()), ("v_ptr", v_cache.data_ptr()))
+            run_args = (
+                ("q", route_q),
+                ("block_ids", block_ids),
+                ("block_table", block_table),
+                ("request_indices", request_indices),
+                ("query_positions", query_positions),
+                ("out", run_out),
+            )
             try:
                 wrapper.run(
                     route_q,
@@ -323,13 +361,18 @@ class _PrimsTSSparseCore:
             except RuntimeError as error:
                 previous = self._last_abi.get(key)
                 changed = (
-                    [(a, b) for a, b in zip(previous or (), abi) if a != b]
+                    [(a, b) for a, b in zip(previous, _run_abi(run_args)) if a != b]
                     if previous
                     else [("no eager run for this plan key", None)]
                 )
-                raise RuntimeError(f"{error}; ABI changes vs last eager run: {changed}") from error
-            self._last_abi[key] = abi
-        return out[:num_rows]
+                raise RuntimeError(f"{error}; ABI changes vs first eager run: {changed}") from error
+            if key not in self._last_abi:
+                self._last_abi[key] = _run_abi(run_args)
+        if result is None:
+            return out[:num_rows]
+        if result is not out:
+            result.copy_(out[:num_rows])
+        return result
 
 
 _CORE = _PrimsTSSparseCore()
@@ -348,14 +391,16 @@ def prims_ts_sparse_gqa(
     max_seq_len_kv: int,
     softmax_scale: float,
     is_decode: bool,
-    request_boundaries: torch.Tensor | None = None,
+    request_boundaries: tuple[int, ...] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse GQA over HND paged K/V from compact indexer block IDs.
 
     ``block_ids`` is the ``[rows, block_topk]`` Int32 Top-K output; the causal
     tail is added by the kernel. Decode rows use the fixed ``[rows,1,1,Hq,D]``
     layout with split-KV; prefill packs rows into request-safe groups of four,
-    using host ``request_boundaries`` (Int32 offsets into the rows) when given.
+    using host ``request_boundaries`` (row offsets of request starts plus the
+    row count) when given. ``out``, when given, receives the result in place.
     """
     return _CORE.run(
         q,
@@ -370,12 +415,14 @@ def prims_ts_sparse_gqa(
         softmax_scale=softmax_scale,
         is_decode=is_decode,
         request_boundaries=request_boundaries,
+        out=out,
     )
 
 
 __all__ = [
     "prims_ts_available",
     "prims_ts_sparse_gqa",
+    "align_prefill_chunk",
     "resolve_sparse_core_backend",
     "slice_request_boundaries",
 ]

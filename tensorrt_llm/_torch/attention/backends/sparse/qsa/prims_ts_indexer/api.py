@@ -166,7 +166,6 @@ def prepare_qsa_index_scores(
     )
     fn = _compiled(blocks_per_page, compress_ratio)
     import cuda.bindings.driver as cuda_driver
-    import cutlass
 
     block_table = _aligned(block_table)
     q = _aligned(q)
@@ -181,23 +180,25 @@ def prepare_qsa_index_scores(
         positions,
         scores,
     )
+    # The TVM-FFI entry takes raw addresses and Python scalars; building
+    # cutlass pointer and numeric objects here would cost ~11 us per call.
     args = (
-        _ptr(q, cutlass.BFloat16),
-        _ptr(index_cache, cutlass.BFloat16),
-        _ptr(block_table, cutlass.Int32),
-        _ptr(request_indices, cutlass.Int32),
-        _ptr(tile_meta, cutlass.Int32),
-        _ptr(positions, cutlass.Int32),
-        _ptr(scores, cutlass.Float32),
-        cutlass.Int32(num_requests),
-        cutlass.Int32(block_table.shape[1]),
-        cutlass.Int32(max_blocks),
-        cutlass.Int32(index_cache.shape[0]),
-        cutlass.Int32(index_cache.stride(0)),
-        cutlass.Int32(rows),
-        cutlass.Int32(n_splits),
-        cutlass.Float32(head_dim**-0.5),
-        cutlass.Int32(grid_size),
+        q.data_ptr(),
+        index_cache.data_ptr(),
+        block_table.data_ptr(),
+        request_indices.data_ptr(),
+        tile_meta.data_ptr(),
+        positions.data_ptr(),
+        scores.data_ptr(),
+        num_requests,
+        block_table.shape[1],
+        max_blocks,
+        index_cache.shape[0],
+        index_cache.stride(0),
+        rows,
+        n_splits,
+        head_dim**-0.5,
+        grid_size,
     )
 
     def launch():
