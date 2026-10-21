@@ -325,6 +325,7 @@ def sonarScan()
 
                 // Examples and tooling
                 "examples/**",
+                "scripts/**",
                 "agent-flow/**",
                 ".claude/**",
 
