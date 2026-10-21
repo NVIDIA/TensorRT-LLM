@@ -489,6 +489,56 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nv
     torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
 
 
+@pytest.mark.cpu_only
+def test_msa_cache_views_do_not_specialize_compiled_graph_on_pool_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staged cache views feed the compiled forward. The KV-cache
+    estimation pass and the final executor size the pool differently, so
+    their page dimension must stay symbolic: a graph traced with one pool
+    serves the other without recompiling."""
+    import torch._dynamo.testing
+
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    def stage(num_pages: int):
+        metadata = _buffer_metadata(sparse_layer_ids=[3], layer_offsets={3: 0})
+        manager = metadata.kv_cache_manager
+        manager.get_buffers = Mock(return_value=torch.zeros(num_pages, 2, 1, 4, 8))
+        manager.is_nvfp4_layer = lambda layer_idx: True
+        manager.get_block_scale_buffers = Mock(
+            return_value=torch.zeros(num_pages, 2, 1, 4, 2, dtype=torch.uint8)
+        )
+        manager.get_index_k_buffer = Mock(return_value=torch.zeros(num_pages, 1, 4, 8))
+        monkeypatch.setattr(
+            metadata,
+            "get_empty",
+            lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+        )
+        monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+        metadata._create_msa_buffers()
+        return metadata.msa_layer_cache_tensors[3]
+
+    @torch.library.custom_op("trtllm_test::msa_pool_view_reader", mutates_args=())
+    def read(kv: torch.Tensor, index: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(1)
+
+    @read.register_fake
+    def _(kv, index, scales):
+        return kv.new_empty((1,))
+
+    torch._dynamo.reset()
+    counter = torch._dynamo.testing.CompileCounter()
+
+    @torch.compile(backend=counter, fullgraph=True)
+    def forward(views):
+        return read(*views)
+
+    forward(stage(6))
+    forward(stage(45))
+    assert counter.frame_count == 1
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("factors", "expected"),
