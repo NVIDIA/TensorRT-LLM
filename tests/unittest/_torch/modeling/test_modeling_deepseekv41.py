@@ -2340,8 +2340,12 @@ def test_empty_decoder_moe_runs_expert_communication_without_local_gemms():
     module.shared_experts = Mock(side_effect=AssertionError("empty shared expert GEMM"))
     module.event_dict = {EventType.Main: None, EventType.MoeShared: None}
     module.aux_stream = None
-    with patch(
-        "torch.ops.trtllm.dsv3_router_gemm_op", side_effect=AssertionError("empty router GEMM")
+    # SM120 pads attention-DP inputs to the largest rank; this checks the unpadded path.
+    with (
+        patch(
+            "torch.ops.trtllm.dsv3_router_gemm_op", side_effect=AssertionError("empty router GEMM")
+        ),
+        patch("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", return_value=100),
     ):
         result = module(hidden, all_rank_num_tokens=[0, 7])
     assert result.shape == hidden.shape
