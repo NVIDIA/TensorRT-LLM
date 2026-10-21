@@ -13,8 +13,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
-
 if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
@@ -26,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
+    _host_slots_to_device,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
@@ -171,16 +170,6 @@ def _kda_replay_bytes_per_slot(
         return 0
     layer_bytes = sum(dtype.itemsize * math.prod(shape) for dtype, shape in layout.values())
     return num_local_layers * layer_bytes + _KDA_REPLAY_COUNT_BYTES
-
-
-def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
-    """Copy host slot IDs without synchronizing queued GPU work.
-
-    Each copy uses fresh pinned storage so later host writes cannot race it.
-    """
-    return torch.tensor(
-        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
-    ).to(device, non_blocking=True)
 
 
 def _kda_beta_cache_padded_heads(num_heads: int) -> int:
@@ -775,7 +764,7 @@ class KDAReplayState:
                 num_accepted,
                 state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
             )
-        self.prev_num_accepted_tokens[slot] = 0
+        self.prev_num_accepted_tokens[slot].zero_()
 
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
