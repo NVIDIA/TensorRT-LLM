@@ -551,12 +551,14 @@ class Attention(nn.Module):
         """
         B, S, D = qkv.shape
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-        # Under tensor parallelism the packed projection holds this rank's heads. A
-        # per-head norm weight ([head_dim]) is the same on every rank; a full-dim
-        # weight ([num_heads * head_dim]) would need this rank's slice of it.
-        if self.tp_size > 1 and self.norm_q.weight.numel() != self.head_dim:
+        # Under tensor parallelism the packed projection holds this rank's heads. Per-head
+        # norm is local to a head; full-dim norm takes its variance over every head, across
+        # ranks, which the fused kernel does not reduce. The constructor refuses that
+        # combination for fuse_qk_norm_rope; this also covers a model calling here directly.
+        if self.tp_size > 1 and self.qk_norm_mode == "full":
             raise NotImplementedError(
-                "fused_dit_qk_norm_rope under tensor parallelism needs per-head norm weights"
+                "fused QK norm + RoPE with qk_norm_mode='full' under TP>1: the fused kernel lacks "
+                "the cross-rank all-reduce for the cross-head RMSNorm variance"
             )
         torch.ops.trtllm.fused_dit_qk_norm_rope(
             qkv.view(B * S, D),
