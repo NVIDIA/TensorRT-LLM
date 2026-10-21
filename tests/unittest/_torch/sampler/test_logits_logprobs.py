@@ -1477,6 +1477,22 @@ class TestLogsprobsInBatchedSampling:
             sampler, "_collect_new_requests_for_setup", _eager_collect_new_requests_for_setup
         )
 
+        sample_batched = sampler._sample_batched_by_strategy
+
+        def _check_logprobs_capacity(logits_cuda, requests, model_outputs, **kwargs):
+            result = sample_batched(logits_cuda, requests, model_outputs, **kwargs)
+            if any(req.py_return_log_probs for req in requests):
+                expected_rows = sum(
+                    get_draft_token_length(req) + 1
+                    for req in requests
+                    if req.py_return_log_probs and req.py_beam_width == 1
+                )
+                assert result.logprobs_cuda.shape == (expected_rows, vocab_size)
+            else:
+                assert result.logprobs_cuda is None
+            return result
+
+        monkeypatch.setattr(sampler, "_sample_batched_by_strategy", _check_logprobs_capacity)
         sampler.setup_sampler_step(mock_requests)
 
         sample_state = sampler.sample_async(
