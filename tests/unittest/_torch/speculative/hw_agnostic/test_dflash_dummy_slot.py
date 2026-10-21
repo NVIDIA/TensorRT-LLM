@@ -81,3 +81,24 @@ def test_windowed_arena_dummy_slot_is_empty_with_its_base():
     torch.cuda.synchronize()
     assert worker._ctx_len.tolist() == [44, 300, 0]
     assert worker._ctx_base.tolist() == [8, 100, 0]
+
+
+def test_warmup_reseeds_generation_slots_from_this_batch():
+    # Slot 0 still holds an earlier warmup batch's length for a reused id; the
+    # padding row (no slot of its own) is left alone.
+    worker = _worker([500, 7, 0, 0])
+    worker._req_to_slot = {11: 0, 12: 1}
+    worker._ctx_len_host = [500, 7, 0, 0]
+    worker._write_ctx_len = partial(DFlashWorker._write_ctx_len, worker)
+    meta = SimpleNamespace(
+        request_ids=[11, 12, 1 << 62],
+        num_generations=3,
+        seq_lens=[8, 8, 8],
+        host_position_ids=[20] * 8 + [30] * 8 + [0] * 8,
+    )
+
+    DFlashWorker._reseed_warmup_generation_slots(worker, meta)
+    torch.cuda.synchronize()
+
+    assert worker._ctx_len.tolist() == [20, 30, 0, 0]
+    assert worker._ctx_len_host == [20, 30, 0, 0]

@@ -1598,6 +1598,25 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
+    def _reseed_warmup_generation_slots(self, spec_metadata: "DFlashSpecMetadata") -> None:
+        """Seed every generation row's slot from this batch's positions; warmup only.
+
+        Only CUDA-graph warmup runs a graph batch eagerly. Its dummy requests reuse
+        ids across batches, so a slot keeps the previous batch's length -- which the
+        replay after each capture advances for good -- while this batch may give the
+        same id far fewer pages. A unified cache's allocation check then traps.
+        """
+        request_ids = spec_metadata.request_ids or []
+        num_contexts = max(0, len(request_ids) - spec_metadata.num_generations)
+        updates = {}
+        for request_idx, rid in enumerate(request_ids[num_contexts:], num_contexts):
+            slot = self._req_to_slot.get(rid)
+            if slot is None or rid == ATTENTION_DP_DUMMY_REQUEST_ID:
+                continue
+            token_offset = sum(spec_metadata.seq_lens[:request_idx])
+            updates[slot] = min(int(spec_metadata.host_position_ids[token_offset]), self._max_ctx)
+        self._write_ctx_len(updates)
+
     def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
         """Add this step's accepted tokens to the context lengths of ``slots``, on the device.
 
@@ -1924,6 +1943,12 @@ class DFlashWorker(SpecWorkerBase):
         ):
             # New buffers clear request slots; seed them before generation.
             spec_metadata.prepare()
+        if (
+            self._ctx_unified_cache
+            and spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._reseed_warmup_generation_slots(spec_metadata)
         # Before any store: prefill and decode both address pages through it.
         # Returning False here means an empty batch -- the missing-offsets case
         # raises inside, with the metadata type in the message.
