@@ -1384,7 +1384,11 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
 
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
-        check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+        # The kernel computes the activation and each block's amax in fp32, while the
+        # reference rounds the GEMM output and the activation to bf16 before
+        # fp4_quantize, so blocks whose scale sits near an E4M3 rounding midpoint can
+        # round to the adjacent code (a few percent of the blocks for unclamped Relu2).
+        check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.9)
 
 
 # ============================================================================

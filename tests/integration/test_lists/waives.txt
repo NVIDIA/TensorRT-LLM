@@ -225,7 +225,6 @@ unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_a
 unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::test_reducescatter_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modules/mamba/test_flashinfer_gdn_decode.py SKIP (https://nvbugs/6842831)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
-unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_nvfp4_gather_grouped_gemm_act_fusion_blackwell SKIP (https://nvbugs/6966263)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-relu2-8-separated_routing] SKIP (https://nvbugs/6778221)
 unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=TTP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.float16-backend=CUTLASS-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/6843482)
