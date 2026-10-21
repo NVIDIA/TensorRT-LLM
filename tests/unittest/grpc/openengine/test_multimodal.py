@@ -4,7 +4,9 @@
 """Unit tests for OpenEngine multimodal input mapping and discovery."""
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 
@@ -278,10 +280,59 @@ def test_decoded_video_bytes_include_frames_and_audio():
 def test_decoded_media_budget_settles_peak_to_retained_bytes():
     budget = request_mapping._DecodedMediaBudget(20)
 
-    first = budget.reserve(15)
+    first = budget.reserve(15, 5)
     first.commit(5)
-    second = budget.reserve(15)
+    second = budget.reserve(15, 5)
     second.release()
+
+
+def test_video_retained_limit_does_not_reject_1080p_conversion_peak():
+    budget = request_mapping._DecodedMediaBudget(512 * 1024 * 1024)
+    values = 10 * 1080 * 1920 * 3
+    reservation = budget.reserve(values * 9, values * 4)
+    reservation.commit(values * 4)
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_three_720p_videos_fit_independently_of_load_concurrency(workers):
+    budget = request_mapping._DecodedMediaBudget(512 * 1024 * 1024)
+    values = 10 * 720 * 1280 * 3
+
+    def decode(_index):
+        reservation = budget.reserve(values * 9, values * 4)
+        reservation.commit(values * 4)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(decode, range(3)))
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_video_peak_reservation_waits_for_settlement_or_cancellation(cancel, monkeypatch):
+    budget = request_mapping._DecodedMediaBudget(20, peak_limit=20)
+    first = budget.reserve(15, 5)
+    waiting = threading.Event()
+    wait = budget._condition.wait
+
+    def observed_wait():
+        waiting.set()
+        return wait()
+
+    monkeypatch.setattr(budget._condition, "wait", observed_wait)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        second = pool.submit(budget.reserve, 15, 5)
+        try:
+            assert waiting.wait(timeout=5)
+            assert not second.done()
+            if cancel:
+                budget.cancel()
+                with pytest.raises(ValueError, match="cancelled"):
+                    second.result(timeout=5)
+            else:
+                first.commit(5)
+                second.result(timeout=5).commit(5)
+        finally:
+            budget.cancel()
+            first.release()
 
 
 def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, monkeypatch):
@@ -656,7 +707,7 @@ async def test_concurrent_video_loads_share_budget_before_allocation(image_video
             return cls(runtime["decoded_memory_reserver"])
 
         async def async_load_bytes(self, data):
-            reservation = self._reserver(12)
+            reservation = self._reserver(12, 12)
             allocations.append(bytes(data))
             try:
                 await asyncio.Future()

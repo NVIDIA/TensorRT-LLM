@@ -57,7 +57,7 @@ class _DecodedMemoryReservation(Protocol):
     def release(self) -> None: ...
 
 
-_DecodedMemoryReserver = Callable[[int], _DecodedMemoryReservation]
+_DecodedMemoryReserver = Callable[[int, int], _DecodedMemoryReservation]
 
 
 def _decoded_video_bytes(video: Any) -> int:
@@ -155,7 +155,7 @@ async def _get_aiohttp_session() -> aiohttp.ClientSession:
     return _global_aiohttp_session
 
 
-# Maximum allowed response size for remote fetches (200 MB).
+# Maximum allowed response size and encoded video input size (200 MiB).
 _MAX_RESPONSE_BYTES = 200 * 1024 * 1024
 
 # Chunk size used while enforcing the response size cap.
@@ -806,7 +806,8 @@ def _load_video_by_cv2(
     counted peak frame buffers are sized from the first decoded frame and
     checked before the frame stack is allocated. This covers buffers allocated
     here, not codec state, compressed input, Python overhead, or the process's
-    complete memory peak.
+    complete memory peak. The reserver receives peak and retained byte estimates
+    and may wait for sibling conversions to release their temporary buffers.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -882,6 +883,7 @@ def _load_video_by_cv2(
                     if stacked_rgb is None:
                         H, W = fh, fw
                         frame_values = num_frames_to_sample * H * W * 3
+                        retained_frame_bytes = frame_values * (4 if format == "pt" else 1)
                         if format == "pt":
                             # uint8 RGB stack + float32 NumPy normalization
                             # buffer + contiguous float32 CHW tensor. A
@@ -895,7 +897,8 @@ def _load_video_by_cv2(
                                 else 0
                             )
                         else:
-                            peak_item_size = np.dtype(np.uint8).itemsize
+                            # RGB stack plus PIL copies or a compact truncated ndarray.
+                            peak_item_size = 2 * np.dtype(np.uint8).itemsize
                         peak_decoded_frame_bytes = frame_values * peak_item_size
                         if (
                             max_decoded_frame_bytes is not None
@@ -908,7 +911,7 @@ def _load_video_by_cv2(
                             )
                         if decoded_memory_reserver is not None:
                             decoded_memory_reservation = decoded_memory_reserver(
-                                peak_decoded_frame_bytes
+                                peak_decoded_frame_bytes, retained_frame_bytes
                             )
                         stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
                     if (fh, fw) == (H, W):
@@ -934,7 +937,10 @@ def _load_video_by_cv2(
 
         if stacked_rgb is None or not valid_indices:
             raise ValueError("Video has no readable frames.")
-        stacked_rgb = stacked_rgb[: len(valid_indices)]
+        if format == "np" and len(valid_indices) < num_frames_to_sample:
+            stacked_rgb = stacked_rgb[: len(valid_indices)].copy()
+        else:
+            stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
             stacked_f32 = stacked_rgb.astype(np.float32)
@@ -950,6 +956,7 @@ def _load_video_by_cv2(
             loaded_frames = stacked_rgb
         else:  # "pil"
             loaded_frames = [Image.fromarray(frame) for frame in stacked_rgb]
+            del stacked_rgb
 
         metadata = {
             "total_num_frames": frame_count,
@@ -1015,7 +1022,24 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
-def _safe_read_local_file(location: str) -> bytes:
+def _check_media_size(size: int, max_bytes: int) -> None:
+    if size > max_bytes:
+        raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")
+
+
+def _decode_base64_with_limit(data: str) -> bytes:
+    """Decode base64 media under the shared encoded-input size limit."""
+    max_encoded_chars = 4 * ((_MAX_RESPONSE_BYTES + 2) // 3)
+    if len(data) > max_encoded_chars:
+        raise ValueError(
+            f"Base64 media input exceeds maximum allowed size of {_MAX_RESPONSE_BYTES} decoded bytes."
+        )
+    decoded = base64.b64decode(data)
+    _check_media_size(len(decoded), _MAX_RESPONSE_BYTES)
+    return decoded
+
+
+def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
     """Read a local file, refusing anything that has no end.
 
     Takes a bare path or a ``file://`` URI.
@@ -1026,10 +1050,9 @@ def _safe_read_local_file(location: str) -> bytes:
     turns a caller into a denial of service. A regular file is finite, which is
     the property required here.
 
-    Size is deliberately not capped: naming a large file of one's own is the
-    normal case for a local caller, and no threshold separates that from an
-    abusive one. This bounds the shape of what may be read, then, not its size
-    or its reach — any regular file the process can read is still readable.
+    When ``max_bytes`` is set, check the file size before reading and bound
+    the read to one byte beyond the limit in case the file grows. Other
+    callers retain the uncapped default.
     """
     path = Path(_normalize_file_uri(location))
     try:
@@ -1042,10 +1065,19 @@ def _safe_read_local_file(location: str) -> bytes:
             f"path is not a regular file: {location!r}. Character devices, "
             "FIFOs and directories cannot be read as media."
         )
+    if max_bytes is not None:
+        _check_media_size(stat.st_size, max_bytes)
     try:
-        return path.read_bytes()
+        with path.open("rb") as source:
+            # Allocate for the observed size; use the remaining budget only if the file grows.
+            data = source.read(-1 if max_bytes is None else stat.st_size + 1)
+            if max_bytes is not None and len(data) > stat.st_size:
+                data += source.read(max_bytes + 1 - len(data))
     except OSError as exc:
         raise ValueError(f"file could not be read: {exc}") from exc
+    if max_bytes is not None:
+        _check_media_size(len(data), max_bytes)
+    return data
 
 
 _MediaT = TypeVar("_MediaT")
@@ -1252,7 +1284,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
-    """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
+    """Video I/O with a 200 MiB encoded-input limit and coupled sampling kwargs."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
 
@@ -1301,6 +1333,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return merged
 
     def load_bytes(self, data: bytes) -> VideoData:
+        _check_media_size(len(data), _MAX_RESPONSE_BYTES)
         # In-memory fast path when cv2 has a stream-buffered backend; spill
         # to a tempfile otherwise so cv2 can open it by path. The tempfile
         # is unlinked on context exit; the inode survives until cv2 closes
@@ -1337,10 +1370,10 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        return self.load_bytes(_safe_read_local_file(url, max_bytes=_MAX_RESPONSE_BYTES))
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(
