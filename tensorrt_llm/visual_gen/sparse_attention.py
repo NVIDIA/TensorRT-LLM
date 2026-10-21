@@ -301,6 +301,18 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         ),
     )
 
+    token_order: Literal["native", "morton"] = PydanticField(
+        "native",
+        description=(
+            "Order of the video tokens seen by the routing blocks. 'morton' applies "
+            "a Z-order permutation over the (frames, height, width) latent grid "
+            "around the transformer block stack so that each 64-token block covers "
+            "a compact 3D neighborhood instead of a run along width. Dense math is "
+            "unchanged; only the block routing sees a different order. Honored by "
+            "models that wire tensorrt_llm._torch.visual_gen.token_order (WAN)."
+        ),
+    )
+
     @field_validator("dense_layers")
     @classmethod
     def _validate_dense_layers(cls, layers: Optional[list[int]]) -> Optional[list[int]]:

@@ -257,6 +257,57 @@ class TestWanUnit:
         assert out.shape == hs.shape
 
     @torch.no_grad()
+    @pytest.mark.parametrize("expand_timesteps", [False, True])
+    def test_morton_token_order_matches_native(self, expand_timesteps):
+        """Dense attention is permutation-equivariant, so token_order=morton
+        must reproduce the native-order output (2 layers, random weights).
+        Both layers are forced dense so the check is backend-exact, not routing-dependent."""
+        from tensorrt_llm._torch.visual_gen.token_order import TokenReorder
+        from tensorrt_llm.visual_gen.args import AttentionConfig, SolAttentionConfig
+
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 2,
+            "hidden_size": WAN_1_3B_CONFIG["num_attention_heads"]
+            * WAN_1_3B_CONFIG["attention_head_dim"],
+            "expand_timesteps": expand_timesteps,
+        }
+        model_config = _make_model_config(cfg)
+        model_config.attention = AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=SolAttentionConfig(
+                tau=2.0, token_order="morton", dense_layers=[0, 1]
+            ),
+        )
+        model = (
+            WanTransformer3DModel(model_config=model_config)
+            .to(self.DEVICE, dtype=torch.bfloat16)
+            .eval()
+        )
+        assert model._token_reorder.active
+        # Parameters are allocated uninitialized; give them finite values.
+        torch.manual_seed(0)
+        for param in model.parameters():
+            param.normal_(0.0, 0.02)
+
+        hs, ts, enc = _transformer_inputs(str(self.DEVICE))
+        ts = _normalize_wan_timestep(ts)
+        if expand_timesteps:
+            # Wan2.2 TI2V-5B style per-patch timestep: [B, S] with a distinct
+            # value on the first frame row so the permutation is exercised.
+            seq_len = (hs.shape[3] // 2) * (hs.shape[4] // 2)
+            ts = ts.reshape(1, 1).expand(1, seq_len).clone()
+            ts[:, : hs.shape[4] // 2] = 0.0
+
+        with torch.inference_mode():
+            morton_out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+            model._token_reorder = TokenReorder("native")
+            native_out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+
+        assert _cosine_similarity(morton_out, native_out) > 0.999
+        torch.testing.assert_close(morton_out.float(), native_out.float(), atol=0.1, rtol=0.05)
+
+    @torch.no_grad()
     def test_allclose_to_hf(self):
         """TRT-LLM output matches HuggingFace when weights are shared (2 layers, random init)."""
         cfg = {

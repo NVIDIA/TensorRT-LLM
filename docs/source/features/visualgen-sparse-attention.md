@@ -278,6 +278,7 @@ attention_config:
     disabled_until_timestep: 0.6  # dense while the normalized timestep >= cutoff
     dense_layers: [0, 2, 3, 4]    # optional: layer indices forced dense
     thresh_type: diag             # block threshold policy: "diag" or "exact"
+    token_order: native           # or "morton" (Wan): Z-order tokens for 3D-local blocks
 ```
 
 - `tau` is the routing threshold in standard deviations above the mean block
@@ -292,6 +293,16 @@ attention_config:
   `diag` treats every key channel independently, `exact` uses the full key
   covariance. Both backends implement both policies from the same per-block
   statistics.
+- `token_order: morton` permutes the video tokens (and their RoPE tables) into
+  Morton / Z-order once before the transformer blocks and restores the raster
+  order after them, so each 64-token routing block covers a compact 3D
+  neighborhood instead of a run along width. Dense attention is
+  permutation-equivariant, so only the block routing changes. Wan honors this
+  knob; other models ignore it. It is opt-in and not recommended for
+  Wan2.2-T2V-A14B at the recipe above: with torch.compile and CUDA graphs on
+  it is slower than the native order at the same `tau` and raises the
+  worst-prompt LPIPS over the 0.25 gate, so it does not move the
+  speed-vs-quality frontier.
 
 The TRTLLM envelope is full-mask BF16 self-attention on SM100 or SM103 with 4-D
 BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The predictor is
