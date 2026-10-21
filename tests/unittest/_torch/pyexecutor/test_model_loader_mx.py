@@ -1426,6 +1426,11 @@ _MX_E2E_ROWS = {
         "qwen3-moe",
         "TRTLLM_MX_QWEN3_MOE_MODEL",
     ),
+    "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
+        "qwen3-fp8-block",
+        "qwen3-fp8-block",
+        "TRTLLM_MX_QWEN3_FP8_MODEL",
+    ),
 }
 
 
@@ -1536,7 +1541,7 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    case_id_pattern = r"\b[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*?-bf16-tp\d+(?:-ep\d+)?\b"
+    case_id_pattern = r"\b[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*?-(?:bf16|fp8-block)-tp\d+(?:-ep\d+)?\b"
     assert set(re.findall(case_id_pattern, qualification_test)) == set(cases)
     assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
