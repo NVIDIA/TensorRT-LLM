@@ -229,6 +229,7 @@ def _qwen3_5_vl_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
