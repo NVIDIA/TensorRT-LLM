@@ -12,13 +12,14 @@ from transformers import PretrainedConfig
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
-from ...functional import RotaryScalingType
+from ...functional import AllReduceFusionOp, AllReduceParams, RotaryScalingType
 from ..attention.rotary_embedding import RotaryEmbedding
 
 try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..distributed import AllReduce
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
@@ -577,6 +578,18 @@ class DFlashForCausalLM(nn.Module):
         # and validates the managed pool against this, so a drafter that stores
         # a single tensor must override it (see MLADSparkForCausalLM).
         self._kv_factor = 2
+        # Plain TP (tp > 1, no attention DP) decides both TP fusions of the
+        # drafter: fc keeps only this rank's input features and sums the
+        # partial projections in an all-reduce fused with hidden_norm
+        # (_project_features), and a drafter's block decode may fuse its
+        # all-reduces with the residual add and the following RMSNorm.
+        mapping = self.model_config.mapping
+        self._tp_split = mapping.tp_size > 1 and not mapping.enable_attention_dp
+        # This rank's input features of fc and the all-reduce that sums the
+        # partial projections, set by _load_target_projection under _tp_split
+        # when the fc input width splits over tp_size.
+        self._fc_input_slice: Optional[slice] = None
+        self._fc_all_reduce: Optional[AllReduce] = None
         self._has_qk_norm = False
         self._use_fused_qk_norm_rope = False
         # Laguna-specific draft-layer behaviors, disabled by default so generic
@@ -708,8 +721,27 @@ class DFlashForCausalLM(nn.Module):
         Generic DFlash: fc then hidden_norm. Subclasses (e.g. Laguna) may
         normalize the per-aux features first by overriding this method.
         """
-        hidden_states = hidden_states.to(self.fc.weight.dtype)
-        return self.hidden_norm(self.fc(hidden_states))
+        return self._project_features(hidden_states.to(self.fc.weight.dtype))
+
+    def _project_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm(fc(hidden_states))`` for ``[N, in_features]`` features.
+
+        Under plain TP every rank holds the same features, so each multiplies
+        its slice of them by its slice of the ``fc`` columns and one all-reduce
+        sums the partials with ``hidden_norm`` fused in: every rank reads
+        ``1 / tp`` of the ``fc`` weight.
+        """
+        if self._fc_input_slice is None:
+            return self.hidden_norm(self.fc(hidden_states))
+        partial = self.fc(hidden_states[:, self._fc_input_slice])
+        return self._fc_all_reduce(
+            partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.hidden_norm.weight,
+                eps=self.hidden_norm.eps,
+            ),
+        )
 
     def _validate_dflash2_config(self) -> None:
         """Require the full DFlash 2 recipe; a partial one would silently
@@ -877,6 +909,22 @@ class DFlashForCausalLM(nn.Module):
         if "fc.weight" not in weights:
             return
         weight = weights.pop("fc.weight")
+        # A drafter under plain TP keeps only its rank's slice of the input
+        # features (see _project_features); a width that does not split over
+        # tp_size keeps the whole fc.
+        mapping = self.model_config.mapping
+        if self._tp_split and weight.shape[1] % mapping.tp_size != 0:
+            logger.info(
+                f"{type(self).__name__}: fc input width {weight.shape[1]} does not split "
+                f"over tp_size={mapping.tp_size}; keeping the unsplit context projection."
+            )
+        elif self._tp_split:
+            width = weight.shape[1] // mapping.tp_size
+            self._fc_input_slice = slice(mapping.tp_rank * width, (mapping.tp_rank + 1) * width)
+            self._fc_all_reduce = AllReduce(
+                mapping, strategy=self.model_config.allreduce_strategy, dtype=weight.dtype
+            )
+            weight = weight[:, self._fc_input_slice]
         self.fc = nn.Linear(
             weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
         )
@@ -1980,7 +2028,7 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         if fc_norm is not None:
             chunks = hidden_states.chunk(len(fc_norm), dim=-1)
             hidden_states = torch.cat([norm(chunk) for norm, chunk in zip(fc_norm, chunks)], dim=-1)
-        return self.hidden_norm(self.fc(hidden_states))
+        return self._project_features(hidden_states)
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Apply Laguna's per-head softplus output gate (``g_proj``) to the

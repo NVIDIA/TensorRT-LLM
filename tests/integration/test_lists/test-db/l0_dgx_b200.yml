@@ -25,6 +25,9 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
+  # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
+  # vs the single-GPU drafter.
+  - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam2-reuse]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam4-no-reuse]
