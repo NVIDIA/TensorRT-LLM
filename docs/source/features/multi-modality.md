@@ -36,6 +36,27 @@ pip install opencv-python-headless
 
 Image-only and text-only workflows do not require this package.
 
+## Qwen3-VL video frame sampling
+
+Qwen3-VL preserves frames already sampled by the video loader, together with
+their original source timestamps. With the default video loader settings this
+normally encodes all 10 sampled frames; the VideoMME harness supplies 8 frames.
+Previously, a second sampling pass could reduce these inputs to 4 frames and
+compress their timestamps. Preserving 10 or 8 frames can increase visual token
+counts, encoder work, and prompt lengths, and can change model outputs. Token
+counts also depend on spatial resizing and temporal padding; review encoder
+and context token budgets, including for disaggregated serving.
+
+Use `media_io_kwargs["video"]["num_frames"]` to control the loader's frame
+budget. Set `num_frames` or `fps` in `mm_processor_kwargs` (flat or under
+`videos_kwargs`) to request another sampling pass. When both are supplied,
+the adapter uses the smaller of the decoded count, `num_frames`, and
+`floor(source_duration * fps)`, with at least one frame, matching VideoIO's
+coupled target semantics. A nonpositive value disables that target when both
+are supplied. Explicit `do_sample_frames=False` disables this
+resampling. Fully decoded videos and decoded frame prefixes, which may result
+from a decoding failure, retain Hugging Face's default sampling and frame cap.
+
 ## Examples
 
 The following examples demonstrate how to use TensorRT LLM's multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.
