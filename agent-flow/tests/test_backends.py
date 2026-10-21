@@ -851,6 +851,13 @@ class TestClaudeBackendCreateClient:
         options = await self._capture_options(monkeypatch)
         assert options.sandbox == {"enabled": False}
 
+    async def test_create_client_forwards_the_clis_stderr(self, monkeypatch):
+        # Printed, and handed to the listener of the context the CLI started in.
+        from agent_flow.backends import claude_code
+
+        options = await self._capture_options(monkeypatch)
+        assert options.stderr is claude_code._forward_stderr
+
     async def test_create_client_uses_bypass_permission_mode(self, monkeypatch):
         # ``bypassPermissions`` is the SDK setting that suppresses every
         # permission prompt the CLI would otherwise raise.
@@ -955,6 +962,26 @@ class TestResolveCodexBin:
         )
         monkeypatch.setattr(codex_mod.shutil, "which", lambda _: "/some/system/codex")
 
+        assert codex_mod._resolve_codex_bin() == str(bundled)
+
+    def test_prefers_a_newer_codex_on_path(self, tmp_path, monkeypatch):
+        """A login offers a new model only to a client that knows it."""
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+
+        def cli(name: str, version: str) -> Path:
+            path = tmp_path / name
+            path.write_text(f"#!/bin/sh\necho 'codex-cli {version}'\n")
+            path.chmod(0o755)
+            return path
+
+        bundled = cli("bundled-codex", "0.154.0")
+        newer, older = cli("newer-codex", "0.162.1"), cli("older-codex", "0.150.0-alpha.1")
+        monkeypatch.setitem(
+            sys.modules, "codex_cli_bin", SimpleNamespace(bundled_codex_path=lambda: bundled)
+        )
+        monkeypatch.setattr(codex_mod.shutil, "which", lambda _: str(newer))
+        assert codex_mod._resolve_codex_bin() == str(newer)
+        monkeypatch.setattr(codex_mod.shutil, "which", lambda _: str(older))
         assert codex_mod._resolve_codex_bin() == str(bundled)
 
     def test_falls_back_to_path_when_bundle_missing(self, monkeypatch):
@@ -1137,3 +1164,70 @@ class TestSystemPromptSpill:
         cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
         cc_mod.spill_system_prompt(prompt + "y", tmp_path, threshold=1024)
         assert len(list((tmp_path / ".agent-flow").glob("system-prompt-*.md"))) == 2
+
+
+def test_a_named_claude_cli_is_the_one_every_layer_launches(monkeypatch):
+    from agent_flow.backends import claude_code
+
+    monkeypatch.setenv(claude_code.CLI_PATH_ENV, "/opt/claude/bin/claude")
+    assert claude_code._cli_override() == "/opt/claude/bin/claude"
+    assert claude_code._find_claude_cli() == "/opt/claude/bin/claude"
+
+
+def test_the_cli_on_path_wins_only_when_newer_than_the_bundled_one(monkeypatch, tmp_path):
+    from agent_flow.backends import claude_code
+
+    monkeypatch.delenv(claude_code.CLI_PATH_ENV, raising=False)
+    monkeypatch.setattr(claude_code.shutil, "which", lambda name: "/usr/local/bin/claude")
+    versions = {"/usr/local/bin/claude": (2, 1, 296)}
+    monkeypatch.setattr(claude_code, "_version_of", lambda path: versions.get(path, (2, 1, 259)))
+    monkeypatch.setattr(claude_code.Path, "is_file", lambda self: True)
+    monkeypatch.setattr(claude_code, "_CLI_OVERRIDE_CACHE", None)
+    assert claude_code._cli_override() == "/usr/local/bin/claude"
+    versions["/usr/local/bin/claude"] = (2, 1, 100)
+    monkeypatch.setattr(claude_code, "_CLI_OVERRIDE_CACHE", None)
+    assert claude_code._cli_override() is None
+
+
+def test_cli_stderr_reaches_the_listeners_of_the_context_it_started_in(capsys):
+    from agent_flow.backends import claude_code
+
+    outer: list[str] = []
+    inner: list[str] = []
+    with claude_code.cli_stderr_to(outer.append):
+        claude_code._forward_stderr("one")
+        with claude_code.cli_stderr_to(inner.append):
+            claude_code._forward_stderr("two")
+    claude_code._forward_stderr("three")
+    assert outer == ["one", "two"] and inner == ["two"]
+    err = capsys.readouterr().err
+    assert "[claude-cli stderr] one" in err and "[claude-cli stderr] three" in err
+
+
+def test_a_cli_stderr_listener_is_its_own_threads_and_cannot_fail_the_reader():
+    import threading
+
+    from agent_flow.backends import claude_code
+
+    mine: list[str] = []
+
+    def broken(line: str) -> None:
+        raise OSError("disk full")
+
+    def elsewhere() -> None:
+        claude_code._forward_stderr("from another turn")
+
+    with claude_code.cli_stderr_to(mine.append), claude_code.cli_stderr_to(broken):
+        thread = threading.Thread(target=elsewhere)
+        thread.start()
+        thread.join()
+        claude_code._forward_stderr("mine")
+    assert mine == ["mine"]
+
+
+def test_the_launched_cli_is_the_override_with_its_version(monkeypatch):
+    from agent_flow.backends import claude_code
+
+    monkeypatch.setenv(claude_code.CLI_PATH_ENV, "/opt/claude/bin/claude")
+    monkeypatch.setattr(claude_code, "_claude_cli_version", lambda: "2.1.296")
+    assert claude_code.launched_cli() == ("/opt/claude/bin/claude", "2.1.296")
