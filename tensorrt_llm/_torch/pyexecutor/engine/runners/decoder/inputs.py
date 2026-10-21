@@ -16,14 +16,21 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
+)
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -311,6 +318,9 @@ class DecoderInputPreparer:
     path overrides ``_new_extra_inputs`` and ``_prepare_inputs_fast_path``.
     """
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+
     def __init__(
         self,
         *,
@@ -332,6 +342,7 @@ class DecoderInputPreparer:
         self.mapping = mapping
         self.dist = dist
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self.iter_states = iter_states
         self._lora = lora
@@ -836,9 +847,9 @@ class DecoderInputPreparer:
         self._copy_position_ids_to_device(host)
 
         if enable_spec_decode:
-            self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)].copy_(
+            copy_h2d_if_changed(
+                self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)],
                 torch.tensor(host.lists.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                non_blocking=True,
             )
 
         self._prepare_attn_metadata(
@@ -1692,7 +1703,7 @@ class DecoderInputPreparer:
                 previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
             )
             previous_slots = self._buffers.previous_batch_indices_cuda[:previous_batch_len]
-            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            copy_h2d_if_changed(previous_slots, previous_batch_indices_host)
             return previous_slots
 
         if scheduled_requests.is_attention_dp_phase_idle:
@@ -1719,17 +1730,68 @@ class DecoderInputPreparer:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
-            self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
-                num_accepted_draft_tokens, non_blocking=True
+            copy_h2d_if_changed(
+                self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)],
+                num_accepted_draft_tokens,
             )
+        step_fold = self.runtime_hooks.spec_step_fold if self._config.is_spec_decode else None
+        fold_rows = None
+        fold_staged = False
+        if step_fold is not None:
+            # A decode-only step's generation rows; the model's forward may stage the next
+            # step's inputs for exactly these rows (see SpecStepFold).
+            fold_rows = (
+                [request.py_seq_slot for request in extend_requests]
+                if scheduled_requests.num_context_requests == 0
+                else None
+            )
+            if fold_rows is not None and any(slot is None for slot in fold_rows):
+                fold_rows = None
+            fold_staged = step_fold.begin_step(fold_rows, len(extend_requests))
         if next_draft_tokens_device is not None:
-            # Initialize these two values to zeros
-            self._buffers.previous_pos_id_offsets_cuda.zero_()
-            self._buffers.previous_kv_lens_offsets_cuda.zero_()
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+            # The previous forward already staged this step's inputs when it ran for exactly
+            # these rows and this step adds nothing of its own.
+            inputs_staged = (
+                fold_staged
+                and len(extend_dummy_requests) == 0
+                and num_tokens == 0
+                and num_draft_tokens == 0
+                and previous_batch_len == len(extend_requests)
+                and previous_batch_indices == fold_rows
+            )
+            if not inputs_staged and step_fold is not None and previous_batch_len > 0:
+                previous_slots = previous_seq_slots_device()
+                previous_pos_indices_host = torch.tensor(
+                    previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                copy_h2d_if_changed(
+                    self._buffers.previous_pos_indices_cuda[
+                        : previous_batch_len * runtime_tokens_per_gen_step
+                    ],
+                    previous_pos_indices_host,
+                )
+                num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+                inputs_staged = step_fold.gather(
+                    new_tokens_device,
+                    next_draft_tokens_device,
+                    new_tokens_lens_device,
+                    previous_slots,
+                    self._buffers.previous_pos_indices_cuda,
+                    previous_batch_len,
+                    runtime_tokens_per_gen_step,
+                    runtime_draft_token_buffer_width,
+                    num_tokens,
+                    num_draft_tokens,
+                    num_extend_reqeust_wo_dummy - previous_batch_len,
+                )
+            if not inputs_staged:
+                # Initialize these two values to zeros
+                self._buffers.previous_pos_id_offsets_cuda.zero_()
+                self._buffers.previous_kv_lens_offsets_cuda.zero_()
 
-            if previous_batch_len > 0:
+            if previous_batch_len > 0 and not inputs_staged:
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
                 previous_batch_tokens = previous_batch_len * runtime_tokens_per_gen_step
@@ -1756,8 +1818,9 @@ class DecoderInputPreparer:
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
-                self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
-                    previous_pos_indices_host, non_blocking=True
+                copy_h2d_if_changed(
+                    self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens],
+                    previous_pos_indices_host,
                 )
 
                 # The order of requests in a batch: [context requests, generation requests]
@@ -1871,9 +1934,7 @@ class DecoderInputPreparer:
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
         else:
-            self._buffers.position_ids_cuda[:total_num_tokens].copy_(
-                host_position_ids, non_blocking=True
-            )
+            step_inputs.copy_(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
 
         host.host_position_ids = host_position_ids
 
