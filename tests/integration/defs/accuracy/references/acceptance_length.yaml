@@ -157,12 +157,12 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
 # test_mtp3_cutedsl_fp8_kv_bf16_state, over gsm8k: three drafts with the trunk's experts on
 # CuteDSL over an fp8 KV cache and a bf16 recurrent state.
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_fp8_kv_bf16_state:
-  # PENDING: modeling_v2's own full-gsm8k reading on GB300 (1319 samples); there is no built-in
-  # reading for this combination (the built-in model has no CuteDSL trunk).
-  ref_al: 3.705
+  # modeling_v2's own full-gsm8k reading on GB300 (1319 samples); there is no built-in reading
+  # for this combination (the built-in model has no CuteDSL trunk). 3.705 over bf16 KV.
+  ref_al: 3.509
   # 95% of ref_al, above the two-draft reading (~2.8): a third draft position that is never
   # accepted fails it.
-  min_al: 3.520
+  min_al: 3.334
 
 # test_mtp3_long_context_passkey: three drafts with IndexShare on, bf16 KV, over
 # 13 prompts of 3k-6k tokens (the sparse attention path). Most of the output is a copy of the
@@ -180,17 +180,17 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_long_context:
 # test_mtp3_cutedsl_fp8_kv_bf16_state, over the pass keys of mtp3_long_context with IndexShare
 # off.
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_fp8_kv_bf16_state_long_context:
-  # PENDING
-  ref_al: 3.981
+  # 3.962 here, against 4.000 over bf16 KV.
+  ref_al: 3.962
   # 2.5% below ref_al, as for mtp3_long_context.
-  min_al: 3.88
+  min_al: 3.86
 
 # test_mtp7_long_context_passkey: seven drafts with IndexShare on, over an NVFP4 KV cache and a
 # bf16 recurrent state, over 12 prompts of 3k-12k tokens (the sparse attention path), whose
-# output mostly copies the document's section headings: the readings sit near the range's
-# ceiling of 8 (7.857 over bf16 KV, 7.774 over bf16 KV and an fp32 state).
+# output mostly copies the document's section headings. The KV dtype sets the reading, and seven
+# chained drafts amplify it: 7.857 over bf16 KV, 7.500 over fp8, 6.867 over NVFP4 (6.961 with
+# IndexShare off, 7.003 over an fp32 state).
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_nvfp4_kv_bf16_state_long_context:
-  # PENDING
-  ref_al: 7.857
+  ref_al: 6.867
   # 2.5% below ref_al, as for mtp3_long_context.
-  min_al: 7.661
+  min_al: 6.69
