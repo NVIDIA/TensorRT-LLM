@@ -1899,30 +1899,54 @@ class MiniMaxM3VLInputProcessor:
         return [value]
 
     @staticmethod
-    def _as_uint8_hwc(media: Any) -> Any:
-        """Float [0, 1] tensors (media_io's ``pt`` format) as uint8 HWC arrays.
+    def _is_float_media(media: Any) -> bool:
+        return isinstance(media, torch.Tensor) and media.is_floating_point()
+
+    @classmethod
+    def _prepare_media(
+        cls, items: Sequence[Any], modality: str
+    ) -> Tuple[List[Any], Dict[str, Any]]:
+        """One modality's media items as the HF processor takes them, plus its kwargs.
 
         The checkpoint's image and video processors rescale by 1/255
-        themselves, so a float [0, 1] input would be rescaled twice. The only
+        themselves. Float [0, 1] tensors (media_io's ``pt`` format) are
+        therefore handed over as they are with ``do_rescale=False``, and the
+        processor normalizes them directly; uint8 tensors, arrays and PIL
+        images keep the default rescale. One call serves a whole modality, so
+        when a request mixes the two forms the float items are converted to
+        uint8 HWC arrays and the default rescale serves all of them. The only
         float layout accepted is the one media_io produces, ``[C, H, W]`` with
-        1 or 3 channels and values in [0, 1]; any other float input is
-        rejected rather than guessed at. uint8 tensors, arrays and PIL images
-        pass through unchanged.
+        1 or 3 channels and finite values in [0, 1]: anything else would be
+        normalized silently wrong, so it is rejected instead.
         """
-        if isinstance(media, torch.Tensor) and media.is_floating_point():
+        items = list(items)
+        float_items = [m for m in items if cls._is_float_media(m)]
+        if not float_items:
+            return items, {}
+        for media in float_items:
             if media.dim() != 3 or media.shape[0] not in (1, 3):
                 raise ValueError(
                     "MiniMax-M3 VL: float media must be a [C, H, W] tensor with 1 or 3 "
                     f"channels (media_io's 'pt' format), got shape {tuple(media.shape)}."
                 )
-            media = media.detach().cpu()
-            if float(media.min()) < 0.0 or float(media.max()) > 1.0:
+            lo, hi = torch.aminmax(media)
+            if (
+                not (torch.isfinite(lo) and torch.isfinite(hi))
+                or float(lo) < 0.0
+                or float(hi) > 1.0
+            ):
                 raise ValueError(
-                    "MiniMax-M3 VL: float media must be scaled to [0, 1]; pass uint8 data "
-                    "for [0, 255] values."
+                    "MiniMax-M3 VL: float media must hold finite values scaled to [0, 1]; "
+                    "pass uint8 data for [0, 255] values."
                 )
-            return (media.permute(1, 2, 0) * 255.0).round().to(torch.uint8).numpy()
-        return media
+        if len(float_items) == len(items):
+            return items, {"do_rescale": False}
+        return [cls._as_uint8_hwc(m) if cls._is_float_media(m) else m for m in items], {}
+
+    @staticmethod
+    def _as_uint8_hwc(media: torch.Tensor) -> np.ndarray:
+        """A validated float [0, 1] ``[C, H, W]`` tensor as the uint8 HWC array it came from."""
+        return (media.detach().cpu().permute(1, 2, 0) * 255.0).round().to(torch.uint8).numpy()
 
     # ----- tokenized + MM fast-path hooks ---------------------------------
     # Implementing these lets the runtime accept
@@ -2001,13 +2025,12 @@ class MiniMaxM3VLInputProcessor:
         return int((grid[:, 0] * per_patch).sum().item())
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC arrays for both modalities. The checkpoint's image and
-        # video processors rescale by 1/255 themselves (``do_rescale``);
-        # media_io's default "pt" format delivers float [0, 1] tensors, which
-        # they rescale a second time, and the vision tower then sees an
-        # almost black input. trtllm-serve seeds its media_io defaults from
-        # this method, so no --media_io_kwargs flag is needed; an explicit
-        # flag still wins.
+        # uint8 HWC arrays for both modalities: the form the checkpoint's
+        # processors rescale themselves, at a quarter of the bytes of
+        # media_io's default "pt" float tensors (which ``_prepare_media``
+        # also accepts). trtllm-serve seeds its media_io defaults from this
+        # method, so no --media_io_kwargs flag is needed; an explicit flag
+        # still wins.
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     @staticmethod
@@ -2122,7 +2145,7 @@ class MiniMaxM3VLInputProcessor:
         text_prompt = inputs.get("prompt") if isinstance(inputs, Mapping) else None
         mm_data = (inputs.get("multi_modal_data") if isinstance(inputs, Mapping) else None) or {}
 
-        images = [self._as_uint8_hwc(m) for m in self._coerce_to_list(mm_data.get("image"))]
+        images = self._coerce_to_list(mm_data.get("image"))
         video_inputs = self._coerce_to_list(mm_data.get("video"))
         if not images and not video_inputs:
             ids = self._encode_with_tokenization_cache(text_prompt or "", sampling_params)
@@ -2144,9 +2167,7 @@ class MiniMaxM3VLInputProcessor:
         # The HF MiniMaxVLProcessor expects video frames as nested lists
         # of frames (one list per video). Accept either pre-extracted
         # frames or wrapper objects with a ``frames`` attribute.
-        videos: List[Any] = [
-            [self._as_uint8_hwc(frame) for frame in self._video_frames(v)] for v in video_inputs
-        ]
+        videos: List[List[Any]] = [self._video_frames(v) for v in video_inputs]
 
         # The ``MiniMaxVLProcessor`` expands each ``IMAGE_TOKEN`` /
         # ``VIDEO_TOKEN`` marker in place into
@@ -2228,10 +2249,20 @@ class MiniMaxM3VLInputProcessor:
         # frames arrive here as is, so let the processor resize them: frame
         # sides must be multiples of ``patch_size * merge_size`` for its
         # patch view, and its ``max_pixels`` bounds the token count. Images
-        # are resized by default.
+        # are resized by default. The kwargs are per-modality dicts so each
+        # modality is rescaled for its own format (``_prepare_media``).
         processor_kwargs: Dict[str, Any] = {}
+        if images:
+            images, image_kwargs = self._prepare_media(images, "image")
+            if image_kwargs:
+                processor_kwargs["images_kwargs"] = image_kwargs
         if videos:
-            processor_kwargs["videos_kwargs"] = {"do_resize": True}
+            flat_frames, video_kwargs = self._prepare_media(
+                [frame for frames in videos for frame in frames], "video"
+            )
+            frame_iter = iter(flat_frames)
+            videos = [[next(frame_iter) for _ in frames] for frames in videos]
+            processor_kwargs["videos_kwargs"] = {"do_resize": True, **video_kwargs}
         processed = self.processor(
             text=[templated_text],
             images=images if images else None,

@@ -1856,6 +1856,62 @@ def test_real_checkpoint_video_fast_path_matches_processor_input_ids(num_frames:
     )
 
 
+def _smooth_uint8_image(side: int) -> np.ndarray:
+    """A gradient picture: resizing it as float or as uint8 agrees to within rounding."""
+    y = np.broadcast_to(np.linspace(0, 255, side)[:, None], (side, side))
+    x = np.broadcast_to(np.linspace(0, 255, side)[None, :], (side, side))
+    return np.stack([(x + y) / 2, x, y], axis=-1).astype(np.uint8)
+
+
+@pytest.mark.parametrize("side", [224, 230])
+def test_real_checkpoint_float_media_match_uint8_pixels(side: int):
+    """Float [0, 1] media (media_io's ``pt`` format) yield the uint8 picture's pixels.
+
+    The same picture goes through the checkpoint's processor as a uint8 HWC
+    array (the preferred media_io format, rescaled by the processor) and as
+    the ``ToTensor`` float tensor the LLM API default delivers (handed over
+    with the processor's rescale turned off). Ids and grids must be identical
+    and the pixels must agree to within the float-vs-uint8 rounding of the
+    processor's resize plus the model dtype's, a few hundredths after
+    normalization and far from the near-black result of rescaling twice. 224
+    is already a multiple of the patch grid; 230 puts the resize on the path.
+    """
+    from torchvision.transforms import ToTensor
+
+    proc, _ = _real_checkpoint_input_processor()
+    array = _smooth_uint8_image(side)
+    as_pt = ToTensor()(Image.fromarray(array))
+    assert as_pt.dtype == torch.float32 and as_pt.shape == (3, side, side)
+    sampling = SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=None)
+
+    def run(media):
+        return proc.call_with_text_prompt(
+            {
+                "prompt": "Look: ]<]image[>[ and watch: ]<]video[>[ then compare.",
+                "multi_modal_data": {"image": [media], "video": [[media, media, media]]},
+                "chat_template_applied": True,
+            },
+            sampling,
+        )
+
+    u8_ids, u8_extra = run(array)
+    pt_ids, pt_extra = run(as_pt)
+    assert pt_ids == u8_ids
+    for modality, grid_key, pixel_key in (
+        ("image", "image_grid_thw", "pixel_values"),
+        ("video", "video_grid_thw", "pixel_values_videos"),
+    ):
+        u8 = u8_extra["multimodal_data"][modality]
+        pt = pt_extra["multimodal_data"][modality]
+        assert torch.equal(torch.as_tensor(u8[grid_key]), torch.as_tensor(pt[grid_key]))
+        u8_pixels = u8[pixel_key].float()
+        pt_pixels = pt[pixel_key].float()
+        assert pt_pixels.shape == u8_pixels.shape
+        assert (pt_pixels - u8_pixels).abs().max().item() < 0.05, modality
+        # Rescaling twice would put every value near -mean/std (about -1.7).
+        assert abs(pt_pixels.mean().item() - u8_pixels.mean().item()) < 0.01, modality
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="processor parity smoke needs CUDA")
 def test_real_checkpoint_processor_full_pipeline_merge_and_pad_parity():
@@ -2721,13 +2777,13 @@ class _MediaRecordingProcessor(_ValidImageProcessor):
 
 
 @pytest.mark.cpu_only
-def test_float_tensor_media_reach_the_processor_as_uint8_hwc(monkeypatch):
-    """media_io's ``pt`` format (float [0, 1] CHW) is handed over as uint8 HWC.
+def test_float_tensor_media_turn_off_the_processor_rescale(monkeypatch):
+    """media_io's ``pt`` format (float [0, 1] CHW) goes in as is with ``do_rescale=False``.
 
     The checkpoint's processors rescale by 1/255 themselves, so a float
     [0, 1] input would be rescaled a second time and normalize to an almost
-    black image. ``ToTensor`` divides by 255, so the conversion restores the
-    uint8 source exactly; uint8 arrays and PIL images pass through untouched.
+    black image. The kwarg is set per modality: uint8 arrays and PIL images
+    keep the default rescale, and the video kwargs keep ``do_resize``.
     """
     from torchvision.transforms import ToTensor
 
@@ -2739,32 +2795,49 @@ def test_float_tensor_media_reach_the_processor_as_uint8_hwc(monkeypatch):
     assert as_pt.dtype == torch.float32 and as_pt.shape == (3, 28, 42)
 
     proc.call_with_text_prompt(
-        {"prompt": "look", "multi_modal_data": {"image": [as_pt, array, pil]}},
-        SimpleNamespace(),
+        {"prompt": "look", "multi_modal_data": {"image": [as_pt]}}, SimpleNamespace()
     )
-    converted, passed_array, passed_pil = recorder.images[0]
-    assert isinstance(converted, np.ndarray) and converted.dtype == np.uint8
-    np.testing.assert_array_equal(converted, array)
-    assert passed_array is array and passed_pil is pil
+    assert recorder.images[0][0] is as_pt
+    assert recorder.call_kwargs[0] == {"images_kwargs": {"do_rescale": False}}
+
+    proc.call_with_text_prompt(
+        {"prompt": "look", "multi_modal_data": {"image": [array, pil]}}, SimpleNamespace()
+    )
+    assert recorder.images[1][0] is array and recorder.images[1][1] is pil
+    assert recorder.call_kwargs[1] == {}
 
     frames = [ToTensor()(Image.fromarray(array)) for _ in range(2)]
     proc.call_with_text_prompt(
         {"prompt": "watch", "multi_modal_data": {"video": [SimpleNamespace(frames=frames)]}},
         SimpleNamespace(),
     )
-    (video_frames,) = recorder.videos[1]
-    assert len(video_frames) == 2
-    for frame in video_frames:
-        assert isinstance(frame, np.ndarray) and frame.dtype == np.uint8
-        np.testing.assert_array_equal(frame, array)
+    (video_frames,) = recorder.videos[2]
+    assert len(video_frames) == 2 and all(a is b for a, b in zip(video_frames, frames))
+    assert recorder.call_kwargs[2] == {"videos_kwargs": {"do_resize": True, "do_rescale": False}}
+
+    proc.call_with_text_prompt(
+        {"prompt": "watch", "multi_modal_data": {"video": [SimpleNamespace(frames=[array] * 2)]}},
+        SimpleNamespace(),
+    )
+    assert recorder.call_kwargs[3] == {"videos_kwargs": {"do_resize": True}}
+
+    proc.call_with_text_prompt(
+        {
+            "prompt": "look watch",
+            "multi_modal_data": {"image": [pil], "video": [SimpleNamespace(frames=frames)]},
+        },
+        SimpleNamespace(),
+    )
+    assert recorder.call_kwargs[4] == {"videos_kwargs": {"do_resize": True, "do_rescale": False}}
 
 
 @pytest.mark.cpu_only
 def test_float_media_outside_the_pt_contract_is_rejected(monkeypatch):
-    """Only ``[C, H, W]`` float tensors in [0, 1] are converted; anything else fails loudly.
+    """Only ``[C, H, W]`` float tensors with finite values in [0, 1] are accepted.
 
-    An HWC float image or a float tensor holding [0, 255] values would be
-    converted silently into a garbage image, so both are rejected.
+    An HWC float image, a float tensor holding [0, 255] values or one holding
+    NaNs would be normalized silently into a garbage image, so all of them
+    are rejected, for images and for video frames alike.
     """
     proc, _ = _tokenizer_only_processor(monkeypatch, _MediaRecordingProcessor())
     hwc = torch.rand(28, 42, 3)
@@ -2777,8 +2850,62 @@ def test_float_media_outside_the_pt_contract_is_rejected(monkeypatch):
         proc.call_with_text_prompt(
             {"prompt": "look", "multi_modal_data": {"image": [unscaled]}}, SimpleNamespace()
         )
+    with_nan = torch.rand(3, 28, 42)
+    with_nan[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match=r"finite values"):
+        proc.call_with_text_prompt(
+            {"prompt": "look", "multi_modal_data": {"image": [with_nan]}}, SimpleNamespace()
+        )
     with pytest.raises(ValueError, match=r"\[C, H, W\] tensor"):
         proc.call_with_text_prompt(
             {"prompt": "watch", "multi_modal_data": {"video": [[torch.rand(3, 3, 28, 42)]]}},
             SimpleNamespace(),
         )
+    with pytest.raises(ValueError, match=r"scaled to \[0, 1\]"):
+        proc.call_with_text_prompt(
+            {"prompt": "watch", "multi_modal_data": {"video": [[unscaled]]}}, SimpleNamespace()
+        )
+
+
+@pytest.mark.cpu_only
+def test_mixed_format_media_fall_back_to_uint8(monkeypatch):
+    """A request mixing float and uint8 items in one modality is served by one call.
+
+    The processor takes one ``do_rescale`` per modality, so the float items
+    are converted back to the uint8 HWC arrays they came from (``ToTensor``
+    divides by 255, so the conversion is exact) and the default rescale
+    serves every item; the uint8 and PIL items pass through untouched.
+    """
+    from torchvision.transforms import ToTensor
+
+    recorder = _MediaRecordingProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, recorder)
+    array = np.random.default_rng(1).integers(0, 256, size=(28, 42, 3), dtype=np.uint8)
+    pil = Image.fromarray(array)
+    as_pt = ToTensor()(pil)
+
+    proc.call_with_text_prompt(
+        {"prompt": "look", "multi_modal_data": {"image": [as_pt, array, pil]}},
+        SimpleNamespace(),
+    )
+    converted, passed_array, passed_pil = recorder.images[0]
+    assert isinstance(converted, np.ndarray) and converted.dtype == np.uint8
+    np.testing.assert_array_equal(converted, array)
+    assert passed_array is array and passed_pil is pil
+    assert recorder.call_kwargs[0] == {}
+
+    proc.call_with_text_prompt(
+        {
+            "prompt": "watch watch",
+            "multi_modal_data": {
+                "video": [SimpleNamespace(frames=[as_pt, as_pt]), SimpleNamespace(frames=[array])]
+            },
+        },
+        SimpleNamespace(),
+    )
+    first, second = recorder.videos[1]
+    assert len(first) == 2 and len(second) == 1 and second[0] is array
+    for frame in first:
+        assert isinstance(frame, np.ndarray) and frame.dtype == np.uint8
+        np.testing.assert_array_equal(frame, array)
+    assert recorder.call_kwargs[1] == {"videos_kwargs": {"do_resize": True}}
