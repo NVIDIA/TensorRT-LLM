@@ -197,7 +197,7 @@ class KvCacheConfigV2:
     disk_cache_path: Optional[str] = None
     onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
@@ -2063,7 +2063,7 @@ def _offload_cycle_manager(
             enable_partial_reuse=enable_block_reuse,
             copy_on_partial_reuse=False,
             host_cache_size=host_cache_size,
-            secondary_offload_min_priority=0,
+            cold_tier_offload_min_priority=0,
         ),
         CacheTypeCpp.SELF,
         num_layers=NUM_LAYERS,
