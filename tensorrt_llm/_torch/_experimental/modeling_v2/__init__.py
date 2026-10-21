@@ -31,7 +31,9 @@ from ._router_index import (
     MODELING_V2_VALIDATE_ENV,
     ModelingV2Mode,
     NoTarget,
+    RuntimeFacts,
     modeling_v2_resolve,
+    resolved_mode,
     step_contract_enabled,
 )
 
@@ -40,6 +42,8 @@ __all__ = [
     "MODELING_V2_VALIDATE_ENV",
     "ModelingV2Mode",
     "NoTarget",
+    "RuntimeFacts",
     "modeling_v2_resolve",
+    "resolved_mode",
     "step_contract_enabled",
 ]

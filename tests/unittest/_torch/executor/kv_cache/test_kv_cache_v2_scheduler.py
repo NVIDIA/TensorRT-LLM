@@ -5008,6 +5008,162 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
     manager.try_allocate_generation.assert_called_with(decoding)
 
 
+# ===========================================================================
+# Context append reserve: shortest-first order behind the first request
+# ===========================================================================
+
+
+class TestAppendReserveShortestFirst:
+    """The first context request keeps its place and its max_num_tokens - R chunk; the requests behind it share the
+    reserve shortest-uncached-first (TLLM_CTX_APPEND_RESERVE_SJF=0 keeps arrival order)."""
+
+    @pytest.fixture(autouse=True)
+    def _reserve_env(self, monkeypatch):
+        for name in (
+            "TLLM_CTX_APPEND_RESERVE",
+            "TLLM_CTX_APPEND_RESERVE_ADAPTIVE",
+            "TLLM_CTX_APPEND_RESERVE_SJF",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "2048")
+
+    def _schedule(self, mgr, reqs):
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        return sched.schedule_request(reqs, set())
+
+    def test_reserve_is_opt_in(self, monkeypatch):
+        """Without TLLM_CTX_APPEND_RESERVE the scheduler keeps the full max_num_tokens chunk and arrival order."""
+        monkeypatch.delenv("TLLM_CTX_APPEND_RESERVE")
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        assert sched._ctx_append_reserve == 0
+        assert not sched._ctx_append_reserve_adaptive and not sched._ctx_append_reserve_sjf
+        head = make_ctx_request(0, context_remaining_length=20000)
+        short = make_ctx_request(1, context_remaining_length=1000)
+        out = sched.schedule_request([head, short], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 8192
+
+    def test_short_request_takes_the_reserve_ahead_of_a_second_long_one(self):
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, long_second, short])
+        assert sorted(ids(out.context_requests)) == [0, 1, 2]
+        assert head.context_chunk_size == 8192 - 2048
+        assert short.context_chunk_size == 1000
+        assert long_second.context_chunk_size == 1024
+
+    def test_kill_switch_keeps_arrival_order(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF", "0")
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, long_second, short])
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert long_second.context_chunk_size == 2048
+
+    def test_order_uses_the_uncached_length_from_the_reuse_probe(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.probe_context_reuse.side_effect = lambda req: 5900 if req.py_request_id == 3 else None
+        head = make_ctx_request(0, context_remaining_length=20000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        mostly_cached = make_ctx_request(3, context_remaining_length=6000)
+        out = self._schedule(mgr, [head, short, mostly_cached])
+        assert 3 in ids(out.context_requests)
+        assert 2 not in ids(out.context_requests)
+
+    def test_head_keeps_its_place(self):
+        head = make_ctx_request(0, context_remaining_length=20000)
+        short = make_ctx_request(1, context_remaining_length=500)
+        shorter = make_ctx_request(2, context_remaining_length=100)
+        self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, short, shorter])
+        assert head.context_chunk_size == 8192 - 2048
+
+    def test_started_continuation_keeps_its_place_ahead_of_new_requests(self):
+        """A started prefill holds pages; reordering it behind new short requests could preempt it."""
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        head = make_ctx_request(0, context_remaining_length=20000)
+        started = make_ctx_request(1, context_remaining_length=12000, is_first_context_chunk=False)
+        new_long = make_ctx_request(2, context_remaining_length=6000)
+        new_short = make_ctx_request(3, context_remaining_length=500)
+        pending = [head, new_long, started, new_short]
+        sched._order_reserve_shortest_first(pending)
+        assert ids(pending) == [0, 1, 3, 2]
+
+    def test_joint_draft_pool_orders_by_the_common_claim_depth(self):
+        """With a paired draft pool, the reuse that will be claimed is min(draft, target)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.probe_context_reuse.side_effect = lambda req: 5900
+        draft_mgr.probe_context_reuse.side_effect = (
+            lambda req: 1000 if req.py_request_id == 1 else 5900
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64), draft_kv_cache_manager=draft_mgr
+        )
+        draft_short = make_ctx_request(1, context_remaining_length=6000)
+        both_deep = make_ctx_request(2, context_remaining_length=6000)
+        assert sched._uncached_context_tokens(draft_short) == 5000
+        assert sched._uncached_context_tokens(both_deep) == 100
+        pending = [make_ctx_request(0, context_remaining_length=20000), draft_short, both_deep]
+        sched._order_reserve_shortest_first(pending)
+        assert ids(pending) == [0, 2, 1]
+
+    def test_uncached_count_is_memoized_between_reprobes(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "3")
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        reqs = [make_ctx_request(i, context_remaining_length=1000 * (i + 1)) for i in range(3)]
+        for _ in range(3):
+            sched._order_reserve_shortest_first(list(reqs))
+        assert mgr.probe_context_reuse.call_count == 2  # requests 1 and 2, probed once in 3 passes
+        sched._order_reserve_shortest_first(list(reqs))
+        assert mgr.probe_context_reuse.call_count == 4  # re-probed on the 4th pass
+
+    def test_memo_drops_requests_that_left(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        reqs = [make_ctx_request(i, context_remaining_length=1000 * (i + 1)) for i in range(4)]
+        sched._order_reserve_shortest_first(list(reqs))
+        sched._order_reserve_shortest_first([reqs[0], reqs[1], reqs[2]])
+        assert set(sched._uncached_context_memo) == {1, 2}
+
+    def test_a_request_deferred_behind_a_contributor_is_reprobed_next_pass(self):
+        """Its reuse jumps once the contributor commits the shared block, so its memo must not keep it 'long'."""
+        reuse = {}
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64,
+            enable_block_reuse=True,
+            block_reuse_policy=BlockReusePolicy.ALL_REUSABLE,
+            first_new_block_fn=lambda req: {0: b"blockA", 1: b"blockA", 2: b"blockB"}.get(
+                req.request_id
+            ),
+        )
+        mgr.probe_context_reuse.side_effect = lambda req: reuse.get(req.py_request_id)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0, req1, req2 = (
+            make_ctx_request(0, 5000),
+            make_ctx_request(1, 3000),
+            make_ctx_request(2, 2000),
+        )
+        out = sched.schedule_request([req0, req1, req2], set())
+        assert 1 not in ids(out.context_requests)  # deferred behind request 0's block
+        assert 1 not in sched._uncached_context_memo and 2 in sched._uncached_context_memo
+        reuse[1] = 2900  # request 0 committed the shared prefix
+        req3 = make_ctx_request(3, 1500)
+        pending = [req0, req3, req1]
+        sched._order_reserve_shortest_first(pending)
+        assert ids(pending) == [0, 1, 3]
+
+
 @pytest.mark.parametrize("prompt_len", [0, 8])
 def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     prompt_len: int,

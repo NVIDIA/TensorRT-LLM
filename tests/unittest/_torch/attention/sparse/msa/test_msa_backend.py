@@ -18,9 +18,13 @@ from unittest.mock import Mock, create_autospec
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+    msa_backend as msa_backend_module,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
     fused_write_layer_caches,
@@ -28,6 +32,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatte
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
+    build_kv_page_indices,
     msa_paged_kv,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
@@ -39,22 +44,30 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
     MsaDecodeSpan,
+    gather_page_ranges,
+    proxy_segment_page_ranges,
+    proxy_segment_rows,
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tail_in_forward", [True, False], ids=["tail_in_forward", "tail_in_prepare"]
+)
 @pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
 def test_msa_metadata_clears_padded_cache_slot_tail(
-    monkeypatch: pytest.MonkeyPatch, empty_state: str
+    monkeypatch: pytest.MonkeyPatch, empty_state: str, tail_in_forward: bool
 ) -> None:
     """A smaller replay must not reuse the previous step's live cache slots."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    monkeypatch.setattr(msa_backend, "TAIL_FILL_IN_FORWARD", tail_in_forward)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._msa_buffers_ready = True
@@ -80,6 +93,8 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         # live count off it.
         metadata._num_tokens = count
         metadata._build_msa_fields()
+        # TAIL_FILL_IN_FORWARD: the forward (on_update_kv_lens) fills the tail before anything reads it.
+        metadata._fill_tail_in_forward()
         assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
             4 - count
         )
@@ -258,7 +273,7 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
     block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
     global_scale = torch.ones(1)
 
-    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103/SM107"):
         minimax_m3_sparse_attn_decode(
             q,
             kv,
@@ -273,6 +288,34 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
             v_block_scale=block_scale,
             k_global_scale=global_scale,
             v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_nvfp4_sparse_decode_admits_the_sm100_family(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """SM100-family devices, Rubin included, pass the device check and reach
+    input validation, which here rejects the missing scales."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="needs all four"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=torch.empty((1, 1, 128, 8), dtype=torch.uint8),
         )
     get_capability.assert_called_once_with(q.device)
 
@@ -487,6 +530,45 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nv
     index.fill_(3)
     torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
     torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("kv_dtype", "expect_lengths"),
+    [
+        (DataType.FP8, False),
+        (DataType.NVFP4, True),
+    ],
+)
+def test_msa_buffers_reserve_cumulative_lengths_for_csr_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: DataType,
+    expect_lengths: bool,
+) -> None:
+    """The NVFP4 CSR kernel reads graph-stable cumulative lengths, so only an
+    NVFP4 cache reserves them."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(dtype=kv_dtype, sparse_layer_ids=[], layer_offsets={})
+    reserved = {}
+
+    def get_empty(buffers, shape, **kwargs):
+        reserved[kwargs["cache_name"]] = tuple(shape)
+        return torch.empty(shape, dtype=kwargs["dtype"])
+
+    monkeypatch.setattr(metadata, "get_empty", get_empty)
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+
+    names = ("msa_qo_lens_cuda", "msa_cu_q_lens", "msa_cu_kv_lens")
+    if expect_lengths:
+        assert reserved["msa_qo_lens_cuda"] == (MAX_NUM_SEQUENCES,)
+        assert reserved["msa_cu_q_lens"] == (MAX_NUM_SEQUENCES + 1,)
+        assert reserved["msa_cu_kv_lens"] == (MAX_NUM_SEQUENCES + 1,)
+        assert all(getattr(metadata, name) is not None for name in names)
+    else:
+        assert not set(names) & set(reserved)
+        assert all(getattr(metadata, name) is None for name in names)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -803,8 +885,11 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         # indexer takes the proxy path and needs no decode span.
         msa_decode_span = None
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
+        _msa_prefill_identity = None
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
         msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        # Unsegmented proxy plan: the proxy indexes the plain page table.
+        msa_proxy_page_table = msa_kv_indices
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
@@ -920,10 +1005,14 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
             return torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
 
     class FakeMetadata:
+        _msa_prefill_identity = None
+
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
         msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
+        # Unsegmented proxy plan: the proxy indexes the plain page table.
+        msa_proxy_page_table = msa_kv_indices
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
@@ -1380,6 +1469,9 @@ def test_plan_rows_narrow_to_the_rows_fmha_sm100_still_runs():
 def test_nvfp4_step_plans_skip_the_sparse_attention_plan(monkeypatch, dtype):
     """NVFP4 sparse layers run the CSR kernel, so only FP8 caches plan sparse GQA."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    # The dense layers plan fmha_sm100 here; with FA4 dense prefill (SM107) they plan nothing.
+    monkeypatch.setattr(msa_prefill, "dense_prefill_fa4_enabled", lambda *_: False)
 
     planned = []
 
@@ -1949,6 +2041,122 @@ def test_on_update_kv_lens_is_a_noop_without_speculative_decoding(monkeypatch):
     assert metadata.msa_n_valid_blocks.tolist() == [0] * 5
 
 
+class _RecordingKvUpdate:
+    """A model's one-launch KV update (MsaKvUpdate) that takes or declines every step."""
+
+    def __init__(self, taken: bool) -> None:
+        self._taken = taken
+        self.calls = []
+
+    def __call__(
+        self,
+        kv_lens,
+        kv_lens_staged,
+        seq_lens,
+        q_batch_row,
+        q_intra,
+        block_table,
+        tokens_per_block,
+        batch,
+        total_q,
+        msa_seq_lens,
+        cu_kv_lens,
+        out_cache_loc,
+        n_valid_blocks,
+    ) -> bool:
+        self.calls.append(
+            dict(
+                kv_lens=kv_lens,
+                kv_lens_staged=kv_lens_staged,
+                seq_lens=seq_lens,
+                q_batch_row=q_batch_row,
+                q_intra=q_intra,
+                block_table=block_table,
+                tokens_per_block=tokens_per_block,
+                batch=batch,
+                total_q=total_q,
+                msa_seq_lens=msa_seq_lens,
+                cu_kv_lens=cu_kv_lens,
+                out_cache_loc=out_cache_loc,
+                n_valid_blocks=n_valid_blocks,
+            )
+        )
+        return self._taken
+
+
+def test_default_msa_policy_has_no_kv_update(monkeypatch):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1,), kv_staged=(5,), kv_corrected=(5,), page_size=4
+    )
+
+    assert metadata.msa_policy == MsaRuntimePolicy()
+    assert metadata.msa_policy.kv_update is None
+
+
+@pytest.mark.parametrize("prefill_counts", [False, True])
+def test_a_taken_kv_update_replaces_the_rederivation(monkeypatch, prefill_counts):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch,
+        qo_lens=(2, 3),
+        kv_staged=(9, 12),
+        kv_corrected=(8, 12),
+        page_size=4,
+        prefill_counts=prefill_counts,
+    )
+    kv_update = _RecordingKvUpdate(taken=True)
+    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+
+    metadata.on_update_kv_lens()
+
+    # The hook owns the update: the metadata's own re-derivation does not run.
+    assert metadata.msa_seq_lens_cuda.tolist() == [9, 12]
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 8
+    assert metadata.msa_n_valid_blocks.tolist() == [0] * 8
+    assert len(kv_update.calls) == 1
+    call = kv_update.calls[0]
+    assert call["kv_lens"] is metadata.kv_lens_cuda
+    assert call["kv_lens_staged"] is metadata.msa_kv_lens_staged
+    assert call["q_batch_row"] is metadata.msa_q_batch_row
+    assert call["q_intra"] is metadata.msa_q_intra
+    assert call["block_table"] is metadata.msa_block_table
+    assert call["msa_seq_lens"] is metadata.msa_seq_lens_cuda
+    assert call["out_cache_loc"] is metadata.msa_out_cache_loc
+    assert call["seq_lens"].tolist() == [2, 3]
+    assert (call["tokens_per_block"], call["batch"], call["total_q"]) == (4, 2, 5)
+    assert call["cu_kv_lens"] is None
+    counts = metadata._msa_prefill_n_valid_blocks if prefill_counts else metadata.msa_n_valid_blocks
+    assert call["n_valid_blocks"].data_ptr() == counts.data_ptr()
+    assert call["n_valid_blocks"].numel() == 5
+
+
+def test_a_declined_kv_update_falls_back_to_the_rederivation(monkeypatch):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
+    )
+    kv_update = _RecordingKvUpdate(taken=False)
+    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+
+    metadata.on_update_kv_lens()
+
+    assert len(kv_update.calls) == 1
+    assert metadata.msa_seq_lens_cuda.tolist() == [8, 12]
+    assert metadata.msa_out_cache_loc[:5].tolist() == [6, 7, 109, 110, 111]
+    assert metadata.msa_n_valid_blocks[:5].tolist() == [2, 2, 3, 3, 3]
+
+
+def test_kv_update_is_not_called_without_dynamic_kv_lens(monkeypatch):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 1), kv_staged=(4, 6), kv_corrected=(3, 5), page_size=4
+    )
+    metadata._msa_kv_lens_dynamic = False
+    kv_update = _RecordingKvUpdate(taken=True)
+    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+
+    metadata.on_update_kv_lens()
+
+    assert kv_update.calls == []
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("src_dtype", "cache_dtype"),
@@ -2230,3 +2438,48 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     for backing in (k_backing, v_backing, ksf_backing, vsf_backing):
         assert torch.count_nonzero(backing[0]).item() == 0
         assert torch.count_nonzero(backing[-1]).item() == 0
+
+
+@pytest.mark.parametrize(
+    "sm_version,enabled,expected",
+    [(107, True, True), (107, False, False), (103, True, False), (100, True, False)],
+)
+def test_proxy_segmented_only_on_sm107(monkeypatch, sm_version, enabled, expected):
+    """The segmented, split indexer proxy runs on SM107 only, behind its constant."""
+    monkeypatch.setattr(msa_backend_module, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(msa_backend_module, "_SM107_PROXY_AUTO_KV_SPLITS", enabled)
+    assert msa_backend_module._proxy_segmented() is expected
+
+
+def test_proxy_segment_rows_keep_each_tokens_causal_range():
+    """Segments tile each request's query tokens in order and keep every token's key range."""
+    # A 300-token chunk over 1000 cached tokens, an empty row, and a 5-token chunk.
+    qo = torch.tensor([300, 0, 5], dtype=torch.int32)
+    kv = torch.tensor([1300, 40, 85], dtype=torch.int32)
+    off = kv - qo
+    seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(qo, kv, off, 128)
+    assert seg_qo.tolist() == [128, 128, 44, 5]
+    assert seg_kv.tolist() == [1128, 1256, 1300, 85]
+    assert seg_off.tolist() == [1000, 1128, 1256, 80]
+    assert seg_src.tolist() == [0, 0, 0, 2]
+    assert seg_qo.dtype == seg_kv.dtype == seg_off.dtype == torch.int32
+    # Each segment sees exactly its own tokens beyond its offset (causal key range kept).
+    assert (seg_kv - seg_off).tolist() == seg_qo.tolist()
+    assert int(seg_qo.sum()) == int(qo.sum())
+
+
+def test_proxy_segment_page_table_matches_per_segment_build():
+    """The device-gathered segmented page table equals a per-segment host build."""
+    page = 128
+    qo = torch.tensor([300, 0, 5, 130], dtype=torch.int32)
+    kv = torch.tensor([1300, 40, 85, 600], dtype=torch.int32)
+    seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(qo, kv, kv - qo, page)
+    block_ids = torch.randperm(4 * 16, dtype=torch.int32).view(4, 16)
+    flat = build_kv_page_indices(block_ids, kv, page)
+    expected = build_kv_page_indices(block_ids.index_select(0, seg_src), seg_kv, page)
+    starts, counts = proxy_segment_page_ranges(kv, seg_kv, seg_src, page)
+    total = int(counts.sum())
+    out = torch.full((total + 7,), -1, dtype=flat.dtype)
+    gather_page_ranges(flat, starts, counts, total, out)
+    assert torch.equal(out[:total], expected)
+    assert (out[total:] == -1).all()

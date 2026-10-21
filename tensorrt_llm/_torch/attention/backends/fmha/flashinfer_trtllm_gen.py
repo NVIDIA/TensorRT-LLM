@@ -62,6 +62,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
+from .msa_decode import dense_decode_max_seq_len
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
@@ -1028,28 +1029,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            bmm1_scale=ctx_bmm1_scale,
-            bmm2_scale=ctx_bmm2_scale,
-            batch_size=params.batch_size,
-            cum_seq_lens_q=cu_q_seqlens,
-            cum_seq_lens_kv=cu_kv_seqlens,
-            window_left=window_left,
-            out=params.output,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            sinks=fwd.attention_sinks,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            causal=causal,
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+        self._run_context_attention(
+            params,
+            q_processed,
+            kv_pool,
+            block_tables,
+            kv_scale_pool,
+            fmha_workspace,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            max_q_len,
+            max_kv_len,
+            window_left,
+            ctx_bmm1_scale,
+            ctx_bmm2_scale,
+            causal,
         )
 
         if params.is_cross:
@@ -1093,6 +1087,48 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.is_mla_enable,  # is_mla_enable
             attention_chunk_size,  # attention_chunk_size
             self._multi_processor_count,  # multi_processor_count
+        )
+
+    def _run_context_attention(
+        self,
+        params: FmhaParams,
+        q_processed: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_scale_pool: Optional[torch.Tensor],
+        fmha_workspace: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        window_left: int,
+        bmm1_scale,
+        bmm2_scale,
+        causal: bool,
+    ) -> None:
+        """The context attention of ``run_context``, between its preprocess and its postprocess."""
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=params.batch_size,
+            cum_seq_lens_q=cu_q_seqlens,
+            cum_seq_lens_kv=cu_kv_seqlens,
+            window_left=window_left,
+            out=params.output,
+            kv_layout=self._layout,
+            enable_pdl=self._enable_pdl,
+            sinks=params.fwd.attention_sinks,
+            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            causal=causal,
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
     def run_generation(
@@ -1188,6 +1224,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
+        # A layer may cap the KV split's max_seq_len per request count (a no-op unless it sets the cap).
+        max_kv_len = dense_decode_max_seq_len(attn, max_kv_len, batch_beam)
 
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,

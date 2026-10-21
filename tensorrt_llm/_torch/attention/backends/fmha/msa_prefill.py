@@ -21,12 +21,83 @@ module-scope import here would close a cycle.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import functools
+import os
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import triton
+import triton.language as tl
+
+from tensorrt_llm._utils import get_sm_version, mpi_rank, prefer_pinned
+from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+
+# SM107: the NVFP4 sparse prefill's combine writes the layer's attention output buffer directly instead of a fresh
+# tensor that is then copied over (same kernel, same values). Kill switch: False restores the copy.
+_SM107_NVFP4_SPARSE_OUT_IN_PLACE = os.environ.get("TRTLLM_MSA_NVFP4_OUT_IN_PLACE", "1") == "1"
+
+# FP8 dense prefill (MiniMax-M3's dense layers) runs FA4 (flash_attn.cute) over the paged FP8 cache in place of
+# fmha_sm100, about 1.6x faster at long context. The image's FA4 carries rescale_threshold 0.0 for FP8, so the
+# row max is refreshed on every increase and P stays <= 2^8 (FA4's FP8 offset), inside E4M3's 448, instead of the
+# lazy rescale that lets P saturate. Deterministic, and inside fmha_sm100's own 16-seed fp64 error band (numerics
+# rule 1b). An FA4 without that change is never used. Kill switch: TRTLLM_MSA_DISABLE_DENSE_FA4=1 restores
+# fmha_sm100.
+_DENSE_PREFILL_FA4 = os.environ.get("TRTLLM_MSA_DISABLE_DENSE_FA4", "0") != "1"
+# The FA4 shape this path serves: TMA page loads need the page to equal FA4's 128-wide n tile.
+_DENSE_FA4_HEAD_DIM = 128
+_DENSE_FA4_PAGE_SIZE = 128
+# FA4 loads whole V pages and masks only the scores, so P @ V still multiplies the rows past kv_len on a partial
+# last page by zero: finite stale bytes add nothing, but an FP8 NaN byte (0x7F / 0xFF) left in a recycled page
+# turns the tile's output NaN. Zeroing those rows first leaves every finite result bitwise unchanged. Kill switch:
+# TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO=0.
+_DENSE_FA4_V_TAIL_ZERO = os.environ.get("TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO", "1") != "0"
+# What the patched flash_fwd_sm100 holds for the FP8 rescale threshold.
+_DENSE_FA4_PATCH_MARKER = "0.0 if const_expr(self.q_dtype.width == 8) else"
+# SM107: the FP8-KV prefill's E4M3 query is cast from the strided query rows of the fused QKV output by one Triton pass
+# (row by row, 16-byte accesses) instead of the aten dtype-converting copy, whose strided path runs at ~1.2 TB/s. The
+# cast rounds to nearest even and saturates to +-448: the bits of the aten cast wherever that is finite. Kill:
+# TRTLLM_CTX_Q_E4M3_ROWS=0 in the deployment env (read once at import) restores the aten cast.
+_SM107_Q_E4M3_ROWS = os.environ.get("TRTLLM_CTX_Q_E4M3_ROWS", "1") == "1"
+_SM107_Q_E4M3_ROWS_LOGGED = []
+
+
+@triton.jit
+def _rows_to_e4m3_kernel(x_ptr, y_ptr, row_stride, width, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width
+    x = tl.load(x_ptr + row * row_stride + cols, mask=mask)
+    tl.store(y_ptr + row * width + cols, x.to(tl.float32).to(tl.float8e4nv), mask=mask)
+
+
+def _q_to_e4m3(q: torch.Tensor) -> torch.Tensor:
+    """``q.to(torch.float8_e4m3fn)`` (contiguous); BF16 ``[rows, heads, head_dim]`` views whose rows are
+    contiguous take the Triton row cast."""
+    if not (
+        _SM107_Q_E4M3_ROWS
+        and q.is_cuda
+        and q.dtype == torch.bfloat16
+        and q.dim() == 3
+        and q.stride(2) == 1
+        and q.stride(1) == q.shape[2]
+        and q.shape[0] > 0
+        and get_sm_version() == 107
+    ):
+        return q.to(torch.float8_e4m3fn)
+    rows, width = q.shape[0], q.shape[1] * q.shape[2]
+    out = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+    if not _SM107_Q_E4M3_ROWS_LOGGED:
+        _SM107_Q_E4M3_ROWS_LOGGED.append(True)
+        logger.info(f"[M3 dispatch] rank {mpi_rank()}: q_e4m3_rows taken at {rows} rows")
+    block = 1024
+    _rows_to_e4m3_kernel[(rows, triton.cdiv(width, block))](
+        q, out, q.stride(0), width, BLOCK=block, num_warps=4
+    )
+    return out
+
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -155,6 +226,160 @@ def _aligned_nvfp4_dequant_scales(
     return k_global_scale, v_global_scale
 
 
+def _nvfp4_sparse_out_kwargs(sparse: Any, out: torch.Tensor) -> dict[str, torch.Tensor]:
+    """``out=`` for sparse_atten_nvfp4_kv_func when its combine can write ``out`` in place (see the kill switch)."""
+    if (
+        not _SM107_NVFP4_SPARSE_OUT_IN_PLACE
+        or get_sm_version() != 107
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or not _nvfp4_sparse_takes_out(sparse)
+    ):
+        return {}
+    logger.info_once(
+        "MSA NVFP4 sparse prefill: combine writes the attention output in place (SM107)",
+        key="minimax_m3_sm107_nvfp4_sparse_out_in_place",
+    )
+    return {"out": out}
+
+
+def _nvfp4_sparse_takes_out(sparse: Any) -> bool:
+    """Whether the installed fmha_sm100 sparse_atten_nvfp4_kv_func accepts ``out`` (resolved once)."""
+    takes = getattr(_nvfp4_sparse_takes_out, "_cached", None)
+    if takes is None:
+        import inspect
+
+        takes = "out" in inspect.signature(sparse.sparse_atten_nvfp4_kv_func).parameters
+        _nvfp4_sparse_takes_out._cached = takes
+    return takes
+
+
+# Every sparse layer of a step builds its k2q CSR with the same sizes, so the
+# non-identity build keeps one set of buffers keyed on the full step shape (reallocated when any size
+# changes) and calls the fmha_sm100 extension directly, skipping the two Python validation layers and
+# their six allocations. Same kernels in the same order on the same stream, and the stock builder also
+# hands the kernels torch.empty buffers, so the CSR and schedule are unchanged. Eager only: a capturing
+# stream takes the stock builder, and so does any stream other than the one the buffers were first built on
+# (stream order is what keeps a step's later build from overwriting buffers an earlier attention still reads).
+# SM107 only. Kill switch: TRTLLM_MSA_K2Q_WS=0.
+_K2Q_WS = os.environ.get("TRTLLM_MSA_K2Q_WS", "1") != "0"
+_K2Q_WS_BLK_KV = 128
+_K2Q_WS_TOPK = (4, 8, 16, 32)
+_k2q_ws: Optional[tuple] = None  # (key, q2k, row_ptr, q_idx, schedule)
+_k2q_ws_stream: Optional[int] = None  # the CUDA stream the buffers belong to
+
+
+def _k2q_csr_ws(
+    kv_block_indexes: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_kv: torch.Tensor,
+    page_size: int,
+    *,
+    max_seqlen_k: int,
+    max_seqlen_q: int,
+    total_rows: int,
+    qhead_per_kv: int,
+) -> Optional[tuple]:
+    """(k2q_row_ptr, k2q_q_indices, schedule) from per-shape buffers, or None for the stock builder."""
+    global _k2q_ws, _k2q_ws_stream
+    total_q, head_kv, topk = (int(v) for v in kv_block_indexes.shape)
+    if (
+        not _K2Q_WS
+        or get_sm_version() != 107
+        or page_size != _K2Q_WS_BLK_KV
+        or topk not in _K2Q_WS_TOPK
+        or kv_block_indexes.dtype != torch.int32
+        or total_q == 0
+        or head_kv == 0
+        or total_rows <= 0
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    import sys
+
+    utils = sys.modules.get("sparse_index_utils")
+    sched_mod = sys.modules.get("src.sm100.prepare_scheduler")
+    if utils is None or sched_mod is None:
+        return None
+    stream = torch.cuda.current_stream(kv_block_indexes.device).cuda_stream
+    if _k2q_ws_stream is not None and stream != _k2q_ws_stream:
+        return None
+    builder = utils._K2Q_CSR_BUILDER
+    max_kv_blocks = (max(max_seqlen_k, _K2Q_WS_BLK_KV) + _K2Q_WS_BLK_KV - 1) // _K2Q_WS_BLK_KV
+    device = kv_block_indexes.device
+    key = (
+        device.index,
+        head_kv,
+        total_q,
+        topk,
+        total_rows,
+        max_kv_blocks,
+        max_seqlen_q,
+        qhead_per_kv,
+    )
+    if _k2q_ws is None or _k2q_ws[0] != key:
+        model = sched_mod.SPARSE_SCHEDULE_MODEL
+        target = model.balanced_target_q_per_cta(
+            total_q=total_q,
+            topk=topk,
+            blk_kv=_K2Q_WS_BLK_KV,
+            head_kv=head_kv,
+            qhead_per_kv=qhead_per_kv,
+            device=device,
+        )
+        capacity = model.flat_schedule_capacity(
+            total_rows=total_rows,
+            total_q=total_q,
+            topk=topk,
+            head_kv=head_kv,
+            target_q_per_cta=target,
+        )
+        q_idx = torch.empty((head_kv, total_q * topk), dtype=torch.int32, device=device)
+        schedule = sched_mod.SparseAttentionSchedule(
+            enabled=True,
+            scheduler_metadata=torch.empty((capacity, 6), dtype=torch.int32, device=device),
+            work_count=torch.empty((1,), dtype=torch.int32, device=device),
+            qsplit_indices=torch.empty_like(q_idx),
+            split_counts=torch.empty((total_q, head_kv), dtype=torch.int32, device=device),
+            target_q_per_cta=target,
+        )
+        q2k = torch.empty((head_kv, total_q, topk), dtype=torch.int32, device=device)
+        row_ptr = torch.empty((head_kv, total_rows + 1), dtype=torch.int32, device=device)
+        _k2q_ws = (key, q2k, row_ptr, q_idx, schedule)
+        _k2q_ws_stream = stream
+    _, q2k_buf, row_ptr, q_idx, schedule = _k2q_ws
+    # The indexer's storage is already head-major on pure-context steps, where the stock .contiguous() is a
+    # no-op; only a strided (mixed-step) view is copied, into the reused buffer.
+    q2k = kv_block_indexes.permute(1, 0, 2)
+    if not q2k.is_contiguous():
+        q2k = q2k_buf.copy_(q2k)
+    builder._ensure_loaded()
+    with torch.cuda.nvtx.range("SparseK2qCsr_Pipeline"):
+        builder._run_with_schedule(
+            q2k,
+            cu_q,
+            cu_kv,
+            row_ptr,
+            q_idx,
+            schedule.scheduler_metadata,
+            schedule.work_count,
+            schedule.qsplit_indices,
+            schedule.split_counts,
+            topk,
+            _K2Q_WS_BLK_KV,
+            total_rows,
+            max_kv_blocks,
+            schedule.target_q_per_cta,
+            schedule.work_capacity,
+            max_seqlen_q,
+        )
+    logger.info_once(
+        "MSA NVFP4 sparse prefill: k2q CSR build reuses per-shape buffers (TRTLLM_MSA_K2Q_WS)",
+        key="minimax_m3_msa_k2q_ws",
+    )
+    return row_ptr, q_idx, schedule
+
+
 def run_msa_nvfp4_sparse_gqa(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -228,24 +453,61 @@ def run_msa_nvfp4_sparse_gqa(
             )
     cu_q = metadata.msa_cu_q_lens[: batch + 1]
     cu_kv = metadata.msa_cu_kv_lens[: batch + 1]
-    q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
-    topk = int(q2k.shape[-1])
+    topk = int(kv_block_indexes.shape[-1])
     page_size = int(k_paged.shape[2])
     if topk != MSA_REQUIRED_TOPK:
         raise ValueError(f"MiniMax-M3 MSA NVFP4 requires topK={MSA_REQUIRED_TOPK}, got {topk}")
 
-    k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
-        q2k,
-        cu_q,
-        cu_kv,
-        page_size,
-        total_k=total_k,
-        max_seqlen_k=max_kv_len,
-        max_seqlen_q=max_q_len,
-        total_rows=total_k_rows,
-        qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
-        return_schedule=True,
-    )
+    # A short pure-prefill step hands every layer the same identity selection (staged once per step by the
+    # backend), so its k2q CSR worklist is layer-invariant: build it for the first layer and reuse it.
+    identity = metadata._msa_prefill_identity
+    csr_key = (batch, int(kv_block_indexes.shape[0]))
+    cached = metadata._msa_identity_csr
+    if (
+        identity is not None
+        and cached is not None
+        and cached[0] is identity
+        and cached[1] == csr_key
+    ):
+        k2q_row_ptr, k2q_q_indices, schedule = cached[2]
+    elif (
+        identity is None
+        and (
+            built := _k2q_csr_ws(
+                kv_block_indexes,
+                cu_q,
+                cu_kv,
+                page_size,
+                max_seqlen_k=max_kv_len,
+                max_seqlen_q=max_q_len,
+                total_rows=total_k_rows,
+                qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
+            )
+        )
+        is not None
+    ):
+        k2q_row_ptr, k2q_q_indices, schedule = built
+    else:
+        q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
+        k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
+            q2k,
+            cu_q,
+            cu_kv,
+            page_size,
+            total_k=total_k,
+            max_seqlen_k=max_kv_len,
+            max_seqlen_q=max_q_len,
+            total_rows=total_k_rows,
+            qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
+            return_schedule=True,
+        )
+        if identity is not None:
+            metadata._msa_identity_csr = (identity, csr_key, (k2q_row_ptr, k2q_q_indices, schedule))
+    from .msa_combine_mxfp8 import combine_kwargs, publish
+
+    out_kwargs = _nvfp4_sparse_out_kwargs(sparse, out)
+    # Host CTX (b): the combine also writes the o_proj input as MXFP8 when the attention module armed it.
+    mxfp8_kwargs = combine_kwargs(sparse, out, metadata, in_place=bool(out_kwargs))
     result = sparse.sparse_atten_nvfp4_kv_func(
         q,
         k_paged.view(torch.uint8),
@@ -269,8 +531,190 @@ def run_msa_nvfp4_sparse_gqa(
         page_table=metadata.msa_block_table[:batch],
         seqused_k=metadata.msa_seq_lens_cuda[:batch],
         schedule=schedule,
+        **out_kwargs,
+        **(mxfp8_kwargs or {}),
     )
-    out.copy_(result)
+    if result is not out:
+        out.copy_(result)
+    if mxfp8_kwargs is not None:
+        publish(out, mxfp8_kwargs)
+
+
+@functools.lru_cache(maxsize=None)
+def _dense_fa4_forward():
+    """Return FA4's forward entry point, or None where the path is off or the FA4 lacks the FP8 rescale change."""
+    if not _DENSE_PREFILL_FA4:
+        return None
+    try:
+        import inspect
+
+        from ..sparse.minimax_m3.kernels.msa_utils import _install_msa_cutlass_compatibility
+
+        # flash_attn.cute (via quack) still names cute.core.ThrMma / ThrCopy, which this CUTLASS DSL moved to the
+        # top level. The MSA import path installs those aliases; install them here too, so the import does not
+        # depend on fmha_sm100 having been loaded first.
+        _install_msa_cutlass_compatibility()
+        from flash_attn.cute import flash_fwd_sm100
+        from flash_attn.cute.interface import _flash_attn_fwd
+    except Exception as exc:  # noqa: BLE001 - any import failure keeps fmha_sm100
+        logger.warning(f"MiniMax-M3 dense prefill: FA4 unavailable ({exc!r}); keeping fmha_sm100")
+        return None
+    if _DENSE_FA4_PATCH_MARKER not in inspect.getsource(flash_fwd_sm100):
+        logger.warning(
+            "MiniMax-M3 dense prefill: FA4 lacks the FP8 rescale_threshold 0.0 change; keeping fmha_sm100"
+        )
+        return None
+    return _flash_attn_fwd
+
+
+def dense_prefill_fa4_enabled(use_fp8: bool, head_dim: int, page_size: int) -> bool:
+    """Whether FP8 dense prefill runs FA4 rather than fmha_sm100.
+
+    prepare() asks too, to skip the dense fmha_sm100 plan the FA4 path never reads.
+    """
+    return (
+        use_fp8
+        and head_dim == _DENSE_FA4_HEAD_DIM
+        and page_size == _DENSE_FA4_PAGE_SIZE
+        # Rubin only: FA4 rounds differently from fmha_sm100 (deterministic, not bitwise), so other SM10x keep it.
+        and get_sm_version() == 107
+        and _dense_fa4_forward() is not None
+    )
+
+
+def _v_tail_zero_safe(kv_cache_manager: Any) -> bool:
+    """Whether every row's partial last page is its own, so zeroing past kv_len cannot touch another row's tokens.
+
+    True without block reuse or partial reuse, or when a partially matched block is copied on reuse:
+    KVCacheManagerV2 always copies it, and KVCacheManager does with copy_on_partial_reuse.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    if not getattr(kv_cache_manager, "enable_block_reuse", True) or not getattr(
+        kv_cache_manager, "enable_partial_reuse", True
+    ):
+        return True
+    if isinstance(kv_cache_manager, KVCacheManagerV2):
+        return True
+    return bool(getattr(kv_cache_manager, "copy_on_partial_reuse", False))
+
+
+def _zero_partial_page_v_tail(
+    v_paged: torch.Tensor, page_table: torch.Tensor, kv_rows: torch.Tensor
+) -> None:
+    """Zero the V rows at and past each row's kv_len on its partial last page.
+
+    v_paged is the cache's HND V [pages, heads, page, d]; page_table the rows' block table; kv_rows the host
+    kv_len per row. Those slots hold no token of the row yet and are rewritten when the sequence grows into them.
+    """
+    page_size = int(v_paged.shape[2])
+    tails = [(row, n) for row, n in enumerate(kv_rows.tolist()) if n % page_size]
+    if not tails:
+        return
+    host = torch.empty(3, len(tails), dtype=torch.int64, pin_memory=prefer_pinned())
+    for i, (row, n) in enumerate(tails):
+        host[0, i] = row
+        host[1, i] = n // page_size
+        host[2, i] = n % page_size
+    dev = host.to(v_paged.device, non_blocking=True)
+    pages = page_table[dev[0], dev[1]].long()
+    v_bytes = v_paged.view(torch.uint8)
+    tail_pages = v_bytes[pages]
+    past = torch.arange(page_size, device=v_paged.device)[None, :] >= dev[2][:, None]
+    tail_pages.masked_fill_(past[:, None, :, None], 0)
+    v_bytes[pages] = tail_pages
+
+
+_dense_fa4_warm: set = set()
+
+
+def _run_dense_fa4(
+    q_view: torch.Tensor,
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    metadata: "TrtllmAttentionMetadata",
+    *,
+    row_first: int,
+    num_rows: int,
+    sm_scale: float,
+    out_view: torch.Tensor,
+) -> bool:
+    """Run FP8 dense causal prefill with FA4 into out_view; False (nothing run) where it cannot serve the rows.
+
+    K/V are the cache's HND pages viewed as FA4's (pages, page, heads, d), so nothing is gathered. Each row
+    attends its first kv_len tokens through the 2-D block table, with its queries the last qo_len of them
+    (FA4's bottom-right causal, the same alignment as the qo_offset = kv_len - qo_len the plans take).
+    """
+    qo_lens = metadata.msa_qo_lens_cpu
+    kv_lens = metadata.msa_kv_lens_cpu
+    if qo_lens is None or kv_lens is None or out_view.dtype != torch.bfloat16:
+        return False
+    if _DENSE_FA4_V_TAIL_ZERO and not _v_tail_zero_safe(metadata.kv_cache_manager):
+        logger.warning_once(
+            "MiniMax-M3 dense prefill: FA4 needs a private partial last page to zero its V tail, but this KV cache "
+            "can share a partially reused page without copying it; keeping fmha_sm100 "
+            "(TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO=0 runs FA4 without the zeroing)",
+            key="minimax_m3_dense_prefill_fa4_v_tail_unsafe",
+        )
+        return False
+    qo_rows = qo_lens[row_first : row_first + num_rows]
+    kv_rows = kv_lens[row_first : row_first + num_rows]
+    # One pinned host staging for both length tensors: cu_seqlens_q then seqused_k.
+    host = torch.empty(2 * num_rows + 1, dtype=torch.int32, pin_memory=prefer_pinned())
+    host[0] = 0
+    torch.cumsum(qo_rows, 0, dtype=torch.int32, out=host[1 : num_rows + 1])
+    if int(host[num_rows]) != int(q_view.shape[0]):
+        return False
+    host[num_rows + 1 :].copy_(kv_rows)
+    lens = host.to(q_view.device, non_blocking=True)
+    max_seqlen_q = int(qo_rows.max())
+    fwd = _dense_fa4_forward()
+    k = k_paged.permute(0, 2, 1, 3)
+    v = v_paged.permute(0, 2, 1, 3)
+    num_kv_heads = int(k_paged.shape[1])
+    warm_key = (int(q_view.shape[1]), num_kv_heads, q_view.device.index)
+    if warm_key not in _dense_fa4_warm:
+        # FA4 compiles per variant on first use, and the variant depends on whether a row's packed queries
+        # (max_seqlen_q x the GQA group) fill more than one 128-row tile. The first call is the server warmup,
+        # so compile both there, on one-token requests over the first page, rather than in a served step.
+        group = int(q_view.shape[1]) // num_kv_heads
+        for rows_q in (1, 128 // group + 1):
+            fwd(
+                q_view.new_zeros(rows_q, q_view.shape[1], q_view.shape[2]),
+                k,
+                v,
+                cu_seqlens_q=torch.tensor([0, rows_q], dtype=torch.int32, device=q_view.device),
+                seqused_k=torch.tensor([rows_q], dtype=torch.int32, device=q_view.device),
+                max_seqlen_q=rows_q,
+                page_table=torch.zeros(1, 1, dtype=torch.int32, device=q_view.device),
+                softmax_scale=sm_scale,
+                causal=True,
+            )
+        _dense_fa4_warm.add(warm_key)
+    logger.info_once(
+        "MiniMax-M3 dense prefill: FA4 (flash_attn.cute, FP8 P without lazy rescale) over the paged FP8 KV cache",
+        key="minimax_m3_dense_prefill_fa4",
+    )
+    page_table = metadata.msa_block_table[row_first : row_first + num_rows]
+    if _DENSE_FA4_V_TAIL_ZERO:
+        _zero_partial_page_v_tail(v_paged, page_table, kv_rows)
+        logger.info_once(
+            "MiniMax-M3 dense prefill: FA4 V tail past kv_len zeroed on partial pages",
+            key="minimax_m3_dense_prefill_fa4_v_tail",
+        )
+    fwd(
+        q_view,
+        k,
+        v,
+        cu_seqlens_q=lens[: num_rows + 1],
+        seqused_k=lens[num_rows + 1 :],
+        max_seqlen_q=max_seqlen_q,
+        page_table=page_table,
+        softmax_scale=sm_scale,
+        causal=True,
+        out=out_view,
+    )
+    return True
 
 
 def run_msa_prefill_gqa(
@@ -335,7 +779,7 @@ def run_msa_prefill_gqa(
     # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast.
     use_fp8 = k_paged.dtype == torch.float8_e4m3fn
     if use_fp8:
-        q_view = q_view.to(torch.float8_e4m3fn)
+        q_view = _q_to_e4m3(q_view)
 
     def rows_of(lens: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Narrow a per-request host length tensor to this phase's rows.
@@ -346,6 +790,22 @@ def run_msa_prefill_gqa(
         if lens is None:
             return None
         return lens[row_first : row_first + num_rows]
+
+    if (
+        kv_block_indexes is None
+        and dense_prefill_fa4_enabled(use_fp8, head_dim, int(k_paged.shape[2]))
+        and _run_dense_fa4(
+            q_view,
+            k_paged,
+            v_paged,
+            metadata,
+            row_first=row_first,
+            num_rows=num_rows,
+            sm_scale=sm_scale,
+            out_view=out_view,
+        )
+    ):
+        return
 
     run_msa_sparse_gqa(
         q_view,
@@ -439,4 +899,9 @@ class MsaPrefillFmha(PhasedFmha):
         )
 
 
-__all__ = ["MsaPrefillFmha", "run_msa_prefill_gqa", "run_msa_sparse_gqa"]
+__all__ = [
+    "MsaPrefillFmha",
+    "dense_prefill_fa4_enabled",
+    "run_msa_prefill_gqa",
+    "run_msa_sparse_gqa",
+]

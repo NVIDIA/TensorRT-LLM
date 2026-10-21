@@ -841,6 +841,7 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        self.copy_on_partial_reuse = kv_cache_config.copy_on_partial_reuse
         # Keep unused block offsets as safe block index 0.
         self.host_kv_cache_block_offsets = torch.zeros(
             self.num_pools,

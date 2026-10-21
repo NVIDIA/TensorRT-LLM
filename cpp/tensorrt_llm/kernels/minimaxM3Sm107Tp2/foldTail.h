@@ -1,0 +1,72 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "tensorrt_llm/common/config.h"
+
+#include <cstdint>
+#include <cuda_runtime.h>
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
+{
+namespace minimaxM3Sm107Tp2
+{
+
+//! Operands of the speculative step's forward-tail store and next-step staging (kernels/m3_fold_tail.py). Every tensor
+//! is int32 except `slots` (int64); strides are in elements. The store views are [slots, width], the sources
+//! [rows, width].
+struct FoldTailParams
+{
+    int32_t const* ctrl; // ctrl[0]: the rows the step armed (0: write nothing)
+    int64_t const* slots;
+    int32_t const* srcNew;
+    int64_t sn0, sn1;
+    int32_t snW;
+    int32_t* dstNew;
+    int64_t dn0, dn1;
+    int32_t dnW;
+    int32_t const* srcNext;
+    int64_t sx0, sx1;
+    int32_t sxW;
+    int32_t* dstNext;
+    int64_t dx0, dx1;
+    int32_t dxW;
+    int32_t const* srcDraft;
+    int64_t sd0, sd1;
+    int32_t sdW;
+    int32_t* dstDraft;
+    int64_t dd0, dd1;
+    int32_t ddW;
+    int32_t const* srcLens;
+    int32_t* dstLens;
+    int32_t* ids;      // [rows * T]
+    int32_t* draftIds; // [rows * (T - 1)]
+    int32_t* posOff;   // [rows * T]
+    int32_t* kvOff;    // [rows]
+    int32_t tokensPerStep;
+};
+
+//! One CTA of 32 lanes per row, `rows` CTAs; the first ctrl[0] rows write. Widths and tokensPerStep must be <= 32.
+cudaError_t invokeFoldTail(FoldTailParams const& p, int32_t rows, cudaStream_t stream);
+
+} // namespace minimaxM3Sm107Tp2
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

@@ -854,6 +854,11 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(self._runner, DecoderRunner):
             self._runner.init_cuda_graph_lora_manager(lora_config)
 
+    def drop_greedy_only_outputs(self) -> None:
+        """Have every batch return logits, for an executor-side guided decoder that reads them."""
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.keep_greedy_only_outputs = False
+
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
         if hasattr(self.model, "set_guided_decoder"):

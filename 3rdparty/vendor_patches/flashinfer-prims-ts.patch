@@ -1,3 +1,132 @@
+diff --git a/__init__.py b/__init__.py
+index e40d8ce0d41c48ad17099e097c64a70e1f6d7a4b..c49ad2fc908d8794105d7340d7614347db123c53 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -14,6 +14,8 @@
+ 
+ """Experimental task-scheduled attention entry points."""
+ 
++from . import _worktile_scope  # noqa: F401  (first: scopes task scheduling's WorkTileInfo rebind)
++
+ from .block_sparse import (
+     BlockSparsePagedTSWrapper,
+     BlockSparseTSWrapper,
+diff --git a/_block_sparse/compiler.py b/_block_sparse/compiler.py
+index 1a9d42857f94459f8d2bb8bb523080c0b6bf1ea7..d557504e26512148da732a891692e9c5ea295b90 100644
+--- a/_block_sparse/compiler.py
++++ b/_block_sparse/compiler.py
+@@ -14,6 +14,7 @@
+ 
+ """Compilation and caching for PrimTS block-sparse attention adapters."""
+ 
++from .._worktile_scope import with_scalar_work_tile_info
+ from collections.abc import Callable
+ import functools
+ 
+@@ -29,6 +30,7 @@ from .config import _BlockSparseCompileKey, _make_block_sparse_config
+ _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+ 
+ 
++@with_scalar_work_tile_info
+ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
+     """Compile one contiguous or paged attention adapter for ``key``.
+ 
+diff --git a/_worktile_scope.py b/_worktile_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a54e0d6f9893a27db336dda5852c26aa75055b21
+--- /dev/null
++++ b/_worktile_scope.py
+@@ -0,0 +1,90 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Keep CuTe DSL task scheduling's WorkTileInfo rebind inside PrimTS.
++
++Importing ``cutlass.experimental.task_scheduling`` rebinds six attributes of CUTLASS'
++``WorkTileInfo`` (``__init__``, the two MLIR value hooks, ``tile_idx``, ``is_valid_tile`` and
++``update_from``) to a scalar three-axis form, for every kernel in the process. Kernels that
++subclass ``WorkTileInfo`` with a different tile shape (FA4's four-axis tile) then fail to trace.
++
++This module is imported first by the package. It snapshots the original attributes, imports
++the task scheduling resources (which apply the rebind), snapshots the scalar set, and puts the
++originals back. ``scalar_work_tile_info`` installs the scalar set only while a PrimTS kernel
++traces and compiles; compiled kernels do not call these Python methods. Nothing about the
++generated code changes. Kill switch: TRTLLM_PRIMS_TS_SCOPED_WORKTILE=0 keeps the global rebind.
++"""
++
++import contextlib
++import functools
++import os
++import sys
++import threading
++
++from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo as _WorkTileInfo
++
++_ATTRS = (
++    "__init__",
++    "__extract_mlir_values__",
++    "__new_from_mlir_values__",
++    "tile_idx",
++    "is_valid_tile",
++    "update_from",
++)
++_MISSING = object()
++_RESOURCES = "cutlass.experimental.task_scheduling.resources"
++
++
++def _snapshot() -> dict:
++    return {name: _WorkTileInfo.__dict__.get(name, _MISSING) for name in _ATTRS}
++
++
++def _install(attrs: dict) -> None:
++    for name, value in attrs.items():
++        if value is _MISSING:
++            if name in _WorkTileInfo.__dict__:
++                delattr(_WorkTileInfo, name)
++        else:
++            setattr(_WorkTileInfo, name, value)
++
++
++# Only scope the rebind when this module saw the originals, i.e. task scheduling was not imported
++# before PrimTS. Otherwise keep whatever is installed (the previous global behavior).
++_ORIGINAL = None if _RESOURCES in sys.modules else _snapshot()
++import cutlass.experimental.task_scheduling.resources  # noqa: E402,F401  (applies the scalar rebind)
++
++_SCALAR = _snapshot()
++SCOPED = _ORIGINAL is not None and os.environ.get("TRTLLM_PRIMS_TS_SCOPED_WORKTILE", "1") != "0"
++_LOCK = threading.RLock()
++_DEPTH = 0
++if SCOPED:
++    _install(_ORIGINAL)
++
++
++@contextlib.contextmanager
++def scalar_work_tile_info():
++    """Install the task scheduling WorkTileInfo form while a PrimTS kernel traces (re-entrant)."""
++    global _DEPTH
++    if not SCOPED:
++        yield
++        return
++    with _LOCK:
++        if _DEPTH == 0:
++            _install(_SCALAR)
++        _DEPTH += 1
++        try:
++            yield
++        finally:
++            _DEPTH -= 1
++            if _DEPTH == 0:
++                _install(_ORIGINAL)
++
++
++def with_scalar_work_tile_info(fn):
++    """Decorator form of ``scalar_work_tile_info`` for the PrimTS compile functions."""
++
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        with scalar_work_tile_info():
++            return fn(*args, **kwargs)
++
++    return wrapper
 diff --git a/block_sparse.py b/block_sparse.py
 index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea063f9e6e4 100644
 --- a/block_sparse.py
@@ -61,10 +190,18 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415450369df 100644
+index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..171c02224d12fd7d0481a7ba1d905fc8281b1ec4 100644
 --- a/context.py
 +++ b/context.py
-@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
+@@ -35,6 +35,7 @@ now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators d
+ register trace templates.
+ """
+ 
++from ._worktile_scope import with_scalar_work_tile_info
+ from dataclasses import dataclass
+ import functools
+ import importlib.metadata
+@@ -46,7 +47,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
  
  import torch
  
@@ -73,7 +210,7 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415
  
  
  if TYPE_CHECKING:
-@@ -488,7 +488,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -488,7 +489,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -82,8 +219,24 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415
  
          require_cute_dsl_arch(device_index)
      return device_index
+@@ -1753,6 +1754,7 @@ def _paged_context_compile_spec(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_context(
+     compile_spec: _ContextCompileSpec,
+ ):
+@@ -1973,6 +1975,7 @@ def _get_compiled_context(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_paged_context(
+     compile_spec: _PagedContextCompileSpec,
+ ):
 diff --git a/decode.py b/decode.py
-index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa6d76a609 100644
+index 41479a386d72c27eb0df76107318dc09256aff06..a161190007f4a661035d3e555db2d4a497e5228e 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -91,7 +244,15 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -24,11 +25,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
+@@ -14,6 +15,7 @@
+ 
+ """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
+ 
++from ._worktile_scope import with_scalar_work_tile_info
+ from collections.abc import Callable, Sequence
+ from dataclasses import dataclass
+ import functools
+@@ -24,11 +26,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
  
  import torch
  
@@ -104,7 +265,7 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  
  from . import _q_token_kv_block_sparse_policy as _sparse_policy
  from ._block_sparse.common import _num_sparse_pattern_heads
-@@ -789,7 +786,7 @@ def _validate_runtime_device(device: torch.device) -> None:
+@@ -789,7 +787,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -113,7 +274,15 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  
          require_cute_dsl_arch(device_index)
  
-@@ -4046,7 +4043,7 @@ class BatchDecodePagedTSWrapper:
+@@ -1513,6 +1511,7 @@ def _make_decode_compile_spec(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_decode(
+     compile_spec: _DecodeCompileSpec,
+ ):
+@@ -4046,7 +4045,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -122,7 +291,7 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
      def run(
          self,
          q: torch.Tensor,
-@@ -4228,7 +4225,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4228,7 +4227,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
@@ -200,8 +369,36 @@ index c4d1b5512f9209793e42ec12bc269ac612c4703f..c21b2c9f5ab8d4f52d02024dcba15fdb
 +    _load_runtime_seq_len_kv,
 +    _resolve_kv_tile_idx_context,
 +)
+diff --git a/kernels/fmha_decode/block_sparse_inspect.py b/kernels/fmha_decode/block_sparse_inspect.py
+index 5728a7c6d373ddd694fa0c740dd01f672a65f648..e5f8de86571f54af313adcc0493bc65e4c9ce055 100644
+--- a/kernels/fmha_decode/block_sparse_inspect.py
++++ b/kernels/fmha_decode/block_sparse_inspect.py
+@@ -26,6 +26,7 @@ Both publish one validation status plus the maximum row width in one Int64
+ summary; no route payload is constructed.
+ """
+ 
++from ..._worktile_scope import with_scalar_work_tile_info
+ import functools
+ from collections.abc import Callable
+ 
+@@ -450,6 +451,7 @@ def _fake_compact(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def compile_block_sparse_inspection(
+     *,
+     device_index: int,
+@@ -495,6 +497,7 @@ def compile_block_sparse_inspection(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def compile_paged_block_sparse_metadata_inspection(
+     *,
+     device_index: int,
 diff --git a/mla_decode.py b/mla_decode.py
-index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..3d5fb159a3298d1edf72935b43d9a2eef74a1a4b 100644
+index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..0e82e5330728f78aa93709145382be5f2a015feb 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -209,7 +406,15 @@ index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..3d5fb159a3298d1edf72935b43d9a2ee
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -21,10 +22,9 @@ from typing import Any, Literal, Optional, cast
+@@ -14,6 +15,7 @@
+ 
+ """Task-scheduled paged MLA decode with a plan/run lifecycle."""
+ 
++from ._worktile_scope import with_scalar_work_tile_info
+ from collections.abc import Callable
+ from dataclasses import dataclass, field
+ import functools
+@@ -21,10 +23,9 @@ from typing import Any, Literal, Optional, cast
  
  import torch
  
@@ -221,7 +426,15 @@ index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..3d5fb159a3298d1edf72935b43d9a2ee
  )
  
  from .decode import (
-@@ -1576,7 +1576,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1044,6 +1045,7 @@ def _make_mla_decode_compile_spec(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_mla_decode(
+     compile_spec: _MLADecodeCompileSpec,
+ ):
+@@ -1576,7 +1578,7 @@ class BatchMLADecodePagedTSWrapper:
              split_kv=int(dict(policy)["split_kv"]),
          )
  

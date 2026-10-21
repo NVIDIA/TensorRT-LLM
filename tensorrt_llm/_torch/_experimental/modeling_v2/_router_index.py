@@ -18,7 +18,9 @@ Two levels, on purpose:
 * The routing module's ``route`` owns the rest of the decision as one
   forward-reading tree over the facts that fix which code runs: the
   checkpoint's config, the parallel mapping, the GPU's compute capability and
-  the speculative-decoding config. It returns the target class, or raises
+  the speculative-decoding config (and, for a module that sets
+  ``ROUTES_ON_RUNTIME``, the engine arguments in :class:`RuntimeFacts`). It
+  returns the target class, or raises
   :class:`NoTarget` with the reason in words. Reading that one file tells you
   where any configuration lands.
 
@@ -36,8 +38,9 @@ from __future__ import annotations
 
 import enum
 import os
+from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -51,6 +54,7 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
+    "MiniMaxM3SparseForConditionalGeneration": "models.minimax_m3.routing",
     # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
     # config loader's composite branch writes the same name back.
     "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
@@ -102,6 +106,50 @@ class NoTarget(Exception):
     ``auto`` the resolver logs it and falls back to the built-in implementation;
     under ``require`` it becomes the error the user sees.
     """
+
+
+@dataclass(frozen=True)
+class RuntimeFacts:
+    """Engine arguments that fix which code runs but are not in the checkpoint.
+
+    A routing module that sets ``ROUTES_ON_RUNTIME = True`` receives them as
+    ``route(..., runtime=RuntimeFacts)`` and declines (``NoTarget``) a runtime
+    its targets are not written for, so ``auto`` falls back to the built-in
+    implementation instead of the target refusing at construction.
+    """
+
+    # ``ModelConfig.sparse_attention_config`` (the LLM API's sparse_attention_config), or None.
+    sparse_attention_config: Any
+    # The main KV cache quantization the engine will run with (a ``QuantAlgo`` value, None for the
+    # unquantized cache): ``kv_cache_config.dtype``, or the checkpoint's under ``auto``.
+    kv_cache_quant_algo: Optional[str]
+
+    @classmethod
+    def of(cls, config: "ModelConfig", llm_args: "TorchLlmArgs") -> "RuntimeFacts":
+        # The resolver runs before the loader applies kv_cache_config.dtype to the quant config
+        # (validate_and_set_kv_cache_quant); this is the value that function will set.
+        from tensorrt_llm._torch.pyexecutor.model_loader import _KV_CACHE_MAP
+
+        dtype = llm_args.kv_cache_config.dtype
+        checkpoint = config.quant_config.kv_cache_quant_algo if config.quant_config else None
+        return cls(
+            sparse_attention_config=config.sparse_attention_config,
+            kv_cache_quant_algo=checkpoint if dtype == "auto" else _KV_CACHE_MAP.get(dtype),
+        )
+
+
+# The mode each target class was last resolved under (the loader builds the class right after resolving it).
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
 
 
 def tp_reaches_across_nodes(mapping) -> bool:
@@ -189,12 +237,18 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise NoTarget(
                 f"no routing module for this architecture; routed architectures: {known}"
             )
-        return routing.route(
+        runtime = (
+            {"runtime": RuntimeFacts.of(config, llm_args)}
+            if getattr(routing, "ROUTES_ON_RUNTIME", False)
+            else {}
+        )
+        target = routing.route(
             pretrained_config,
             config.mapping,
             _device_compute_capability(),
             config.spec_config,
             _kv_cache_quant_algo(config, llm_args),
+            **runtime,
         )
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
@@ -203,3 +257,6 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
+    if target is not None:
+        _RESOLVED_MODES[target] = mode
+    return target
