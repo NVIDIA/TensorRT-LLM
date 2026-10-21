@@ -48,6 +48,11 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for the Qwen3 dense layout above when `lm_head.weight` is an
+# alias of `model.embed_tokens.weight`. The shared table is one transferred
+# tensor, named `model.embed_tokens.weight`; no `lm_head.weight` tensor is
+# transferred, and the receiver's constructor rebuilds the alias.
+QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-tied-target-layout-v1"
 # Stable contract for Qwen3 dense rows with FP8 block-scale (128x128) weights:
 # every Linear the realized quant config quantizes holds E4M3 weights [N, K],
 # FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim FP32 `input_scale`
