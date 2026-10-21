@@ -34,6 +34,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def _make_model_config(
@@ -302,6 +304,7 @@ class _FakeNcclEP:
         self.max_num_tokens = max_num_tokens
         self.moe_max_num_tokens = moe_max_num_tokens
         self.top_k = top_k
+        self.quant_config = quant_config
         self.use_low_precision_combine = use_low_precision_combine
 
 
@@ -522,6 +525,81 @@ def test_auto_selection_uses_nccl_ep_with_missing_moe_max_num_tokens(
     assert isinstance(strategy, _FakeNcclEP)
     assert strategy.max_num_tokens == model_config.max_num_tokens
     assert strategy.moe_max_num_tokens is None
+
+
+def _nvfp4_quant_config() -> QuantConfig:
+    return QuantConfig(quant_algo=QuantAlgo.NVFP4, kv_cache_quant_algo=QuantAlgo.FP8)
+
+
+def _unquantized_layer_quant_config() -> QuantConfig:
+    # How DeepSeek-V3 builds the MTP layer that the NVFP4 checkpoint excludes.
+    return QuantConfig(quant_algo=None, kv_cache_quant_algo=QuantAlgo.FP8)
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_nccl_ep_uses_the_layer_quant_config(
+    monkeypatch: pytest.MonkeyPatch,
+    forced: bool,
+):
+    """An unquantized layer of an NVFP4 model must not get an NVFP4 dispatch."""
+    _mock_nccl_ep_v02(monkeypatch)
+    model_config = _make_model_config(torch.bfloat16, 1024)
+    model_config.quant_config = _nvfp4_quant_config()
+    layer_quant_config = _unquantized_layer_quant_config()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    if forced:
+        monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "NCCL_EP")
+    else:
+        monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+        quant_config=layer_quant_config,
+    )
+
+    assert isinstance(strategy, _FakeNcclEP)
+    assert strategy.quant_config is layer_quant_config
+
+
+def test_nccl_ep_defaults_to_the_model_quant_config(monkeypatch: pytest.MonkeyPatch):
+    _mock_nccl_ep_v02(monkeypatch)
+    model_config = _make_model_config(torch.bfloat16, 1024)
+    model_config.quant_config = _nvfp4_quant_config()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert strategy.quant_config is model_config.quant_config
+
+
+def test_unquantized_layer_nccl_ep_dispatches_before_quantization():
+    """The NcclEP built for an unquantized layer takes BF16 tokens (pre-quant dispatch)."""
+    strategy = object.__new__(NcclEP)
+    strategy.quant_config = _unquantized_layer_quant_config()
+    assert not strategy._has_nvfp4()
+    assert not strategy._has_fp8_qdq()
+
+    strategy.quant_config = _nvfp4_quant_config()
+    assert strategy._has_nvfp4()
 
 
 @pytest.mark.parametrize(

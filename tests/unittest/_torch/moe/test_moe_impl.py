@@ -1509,6 +1509,7 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         use_flashinfer=False,
         hidden_size=128,
         communication_method=method if force_source == "model" else None,
+        quant_config=None,
     )
     with override_moe_environment(MoEEnvironment(sm=90, oss_cutlass_moe=is_oss)):
         if not is_oss and method == "NVLINK_ONE_SIDED":

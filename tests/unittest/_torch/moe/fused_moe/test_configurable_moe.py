@@ -172,6 +172,31 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     backend.create_weights.assert_called_once_with()
 
 
+def test_comm_strategy_follows_the_layer_quant_config() -> None:
+    """An unquantized layer of a quantized model selects its comm for BF16 tokens.
+
+    DeepSeek-V3 builds its MTP layer with an unquantized override when the NVFP4
+    checkpoint excludes it. A quantization-aware strategy chosen from the
+    model-wide NVFP4 config would then expect NVFP4 payloads that this layer's
+    backend never produces.
+    """
+    wrapper = _wrapper()
+    wrapper.quant_config = QuantConfig(quant_algo=None)
+    wrapper.model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4))
+    wrapper.backend = Mock()
+    wrapper.enable_dwdp = False
+    wrapper.expert_size_per_partition = 8
+    wrapper.use_flashinfer = False
+    wrapper.communication_method = None
+
+    with patch(
+        "tensorrt_llm._torch.moe.fused_moe.configurable_moe.CommunicationFactory.create_strategy"
+    ) as create_strategy:
+        wrapper._create_comm_strategy_auto()
+
+    assert create_strategy.call_args.kwargs["quant_config"] is wrapper.quant_config
+
+
 @pytest.mark.parametrize("missing", ["gate_softcap", "linear_softcap"])
 def test_situ_activation_rejects_a_missing_soft_cap(missing: str) -> None:
     """Absence is a rejection for a soft cap, unlike for a clamp.

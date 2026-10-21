@@ -663,6 +663,9 @@ class ConfigurableMoE(MoE):
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
             allow_alltoall=self.backend.supports_alltoall,
+            # The strategy dispatches the activations this layer quantizes, so
+            # it follows the layer's quant config, not the model-wide one.
+            quant_config=self.quant_config,
         )
 
     def forward_impl(
