@@ -285,7 +285,7 @@ def _abs_max_bf16x32(words, *, loc=None, ip=None):
     """|x| max of 32 BF16 values (16 packed words) as two packed BF16 magnitudes.
 
     ``max.xorsign.abs`` returns ``max(|a|, |b|)`` with a garbage sign bit, which
-    ``_ue8m0_of_amax`` masks off.
+    ``ue8m0_of_amax`` masks off.
     """
     body = "".join(f"max.xorsign.abs.bf16x2 m{i}, ${2 * i + 1}, ${2 * i + 2};\n" for i in range(8))
     body += (
@@ -310,7 +310,7 @@ def _abs_max_bf16x32(words, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ue8m0_of_amax(packed_amax, *, loc=None, ip=None):
+def ue8m0_of_amax(packed_amax, *, loc=None, ip=None):
     """Biased exponent of ``2^ceil(log2(amax / 448))`` from two packed BF16 magnitudes.
 
     For ``amax = 2^E * (1 + f)``: ``amax / 448 <= 2^(E - 8)`` iff ``1 + f <= 1.75``,
@@ -343,7 +343,7 @@ def _ue8m0_of_amax(packed_amax, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _bf16x2_inv_scale(ue8m0, *, loc=None, ip=None):
+def bf16x2_inv_scale(ue8m0, *, loc=None, ip=None):
     """Packed BF16x2 ``2^(127 - ue8m0)``."""
     return Int32(
         _asm(
@@ -364,7 +364,7 @@ def _bf16x2_inv_scale(ue8m0, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _quant_bf16x8_to_e4m3(w0, w1, w2, w3, inv_scale, *, loc=None, ip=None):
+def quant_bf16x8_to_e4m3(w0, w1, w2, w3, inv_scale, *, loc=None, ip=None):
     """Scale eight BF16 values by the packed BF16x2 ``inv_scale`` and round to E4M3.
 
     The scale is a power of two, so the BF16 multiply is exact and the only rounding
@@ -562,6 +562,61 @@ def _s2t_partition_sf(sSF: cute.Tensor, tSF: cute.Tensor):
     tCsSF_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy, thr_copy.partition_S(tCsSF_compact))
     tCtSF_s2t = thr_copy.partition_D(tCtSF_compact)
     return tiled_copy, tCsSF_s2t, tCtSF_s2t
+
+
+# ---------------------------------------------------------------------------
+# The low-M kernel's MXFP8 quantization, for producers of a prequantized operand: per 1x32
+# group, the UE8M0 exponent of ``2^ceil(log2(amax / 448))`` (amax floored at ~1e-4) and the
+# E4M3 codes ``satfinite_rn(x * 2^(127 - e))``.
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def amax_bf16x8(w0, w1, w2, w3, *, loc=None, ip=None):
+    """|x| max of eight BF16 values (four packed words) as a packed BF16 pair (garbage sign,
+    which :func:`ue8m0_of_amax` masks off)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(w, loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+            "{\n.reg .b32 m0, m1;\n"
+            "max.xorsign.abs.bf16x2 m0, $1, $2;\n"
+            "max.xorsign.abs.bf16x2 m1, $3, $4;\n"
+            "max.xorsign.abs.bf16x2 $0, m0, m1;\n}",
+            "=r,r,r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def amax_pair(a, b, *, loc=None, ip=None):
+    """|x| max of two packed BF16 pairs."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def mxfp8_quantize_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference of the MXFP8 quantization above: ``(xq, xs)`` of a BF16 ``[M, K]``
+    activation, E4M3 ``xq [M, K]`` and row-major UE8M0 exponents ``xs [M, K / 32]``."""
+    m, k = x.shape
+    g = x.view(m, k // SF_VEC, SF_VEC)
+    bits = g.abs().view(torch.int16).to(torch.int32) & 0x7FFF
+    amax = bits.amax(dim=-1).clamp_min(_AMAX_FLOOR_BF16)
+    e = (amax >> 7) - 8 + ((amax & 0x7F) > 0x60).to(torch.int32)
+    inv = torch.pow(2.0, (127 - e).float()).to(torch.bfloat16)
+    scaled = (g * inv.unsqueeze(-1)).float()
+    xq = scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(m, k)
+    return xq, e.to(torch.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -1164,13 +1219,13 @@ class Fp8BlockScaleLowMGemmKernel:
                     for v in cutlass.range_constexpr(4):
                         ws[v] = _gate_mul_bf16x8(*ws[v], *_lds_v4_b32(grow + ((v + rot) & 3) * 16))
                 amax = _abs_max_bf16x32([w for quad in ws for w in quad])
-                e_a = _ue8m0_of_amax(amax)
-                inv = _bf16x2_inv_scale(e_a)
+                e_a = ue8m0_of_amax(amax)
+                inv = bf16x2_inv_scale(e_a)
                 brow = bs + r * CTA_K
                 swz = r & 7
                 for v in cutlass.range_constexpr(4):
                     sub = (v + rot) & 3
-                    p0, p1 = _quant_bf16x8_to_e4m3(*ws[v], inv)
+                    p0, p1 = quant_bf16x8_to_e4m3(*ws[v], inv)
                     unit = g * 2 + (sub >> 1)
                     _sts_v2_b32(brow + ((unit ^ swz) << 4) + (sub & 1) * 8, p0, p1)
                 _sts_scale(ss + (r & 31) * 16 + (r >> 5) * 4 + g, e_a, e_w)
@@ -1585,11 +1640,11 @@ class MxFp8QuantKernel:
                 sf_addr = xs_ptr.toint() + Int64(sf_off)
                 if r < m:
                     ws = [rX[it * 16 + i] for i in range(16)]
-                    e_a = _ue8m0_of_amax(_abs_max_bf16x32(ws))
-                    inv = _bf16x2_inv_scale(e_a)
+                    e_a = ue8m0_of_amax(_abs_max_bf16x32(ws))
+                    inv = bf16x2_inv_scale(e_a)
                     packed = []
                     for v in cutlass.range_constexpr(4):
-                        p0, p1 = _quant_bf16x8_to_e4m3(*ws[4 * v : 4 * v + 4], inv)
+                        p0, p1 = quant_bf16x8_to_e4m3(*ws[4 * v : 4 * v + 4], inv)
                         packed.extend((p0, p1))
                     dst = xq_ptr.toint() + Int64(r * self.k + g * SF_VEC)
                     _stg_v4_b32(dst, *packed[:4])
@@ -2938,15 +2993,21 @@ __all__ = [
     "N_ALIGN",
     "LowMTactic",
     "MidMTactic",
+    "amax_bf16x8",
+    "amax_pair",
+    "bf16x2_inv_scale",
+    "check_gate",
     "check_inputs",
     "default_mid_tactic",
-    "check_gate",
     "default_tactic",
     "gate_fits",
     "gated_tactic",
     "kernel_max_m_for",
     "low_m_max_for",
     "max_m_for",
+    "mxfp8_quantize_reference",
     "pack_block_scale_from_mxfp8_layout",
+    "quant_bf16x8_to_e4m3",
     "run_low_m_gemm",
+    "ue8m0_of_amax",
 ]
