@@ -57,6 +57,9 @@ class MixedPrecisionKVStaging:
             )
         self.staging_bytes = self.page_starts[-1] * self.max_page_bytes
         storage = buffers.get_buffer([self.staging_bytes], torch.uint8, "mixed_kv_staging", True)
+        # Zero once: the per-batch gather only writes real tokens, and attention
+        # may load the padding of a request's last page before masking it.
+        storage.zero_()
         self.pools: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {
             layer_idx: (Buffers._view_as(storage, shape, high.dtype), low, high)
             for layer_idx, (shape, low, high) in pools.items()

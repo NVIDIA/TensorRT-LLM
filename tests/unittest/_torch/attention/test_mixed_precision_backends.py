@@ -586,8 +586,8 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     restored = _reference_dequant(packed, block_scales, factor)
     if dtype == torch.float8_e4m3fn:
         restored = restored.to(torch.bfloat16).float().clamp(-448, 448)
-    expected = torch.zeros_like(values)
-    expected[:128] = values[:128]
+    # Positions past the length stay untouched: the read never writes padding.
+    expected = values.clone()
     expected[128:130] = restored[128:130].to(dtype)
     lengths[0].fill_(130)
     convert_mixed_precision_kv(
@@ -765,6 +765,8 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
         assert view.staging_bytes == rows * (1024 // 32) * page_bytes
         staging = view.get_buffers(0)
         assert staging.shape[0] == rows * (1024 // 32)
+        # Never-written positions are zero; attention may load them before masking.
+        assert not staging.any()
         # Allocated once from the shared metadata buffer pool as a reserved block,
         # and reused by later metadata objects (the final engine after profiling).
         blocks = get_memory_buffers().buffers["mixed_kv_staging"]

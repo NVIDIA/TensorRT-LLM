@@ -182,8 +182,6 @@ class _PagedMixedPrecisionKV:
                             group,
                             view_tile,
                         )
-            elif cutlass.const_expr(not self.write):
-                cute.recast_tensor(view_tile, cutlass.Uint8).fill(0)
 
 
 _LOW_PRECISION_CODECS = {DataType.NVFP4: _NVFP4Codec}
