@@ -1633,8 +1633,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module, "weight_scale",
                 nn.Parameter(transformed_scale, requires_grad=False),
                 module.rebuild_tensor_metadata)
-            module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
-                *weight.shape)
+            # On SM107 the low-M GEMM's limits are cross-overs with the CuTe
+            # MXFP8 GEMM, not with fp8_swap_ab_gemm, which this layout runs.
+            if get_sm_version() != 107:
+                module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
+                    *weight.shape)
 
 
 class NVFP4LinearMethod(LinearMethodBase):

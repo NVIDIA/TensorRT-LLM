@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 block-scale weight GEMM for few-row, weight-bandwidth-bound projections (SM100/SM103).
+"""FP8 block-scale weight GEMM for few-row, weight-bandwidth-bound projections (SM100/103/107).
 
 Computes ``out[M, N] = x[M, K] @ (W[N, K] * S)^T`` where ``W`` is FP8 E4M3 with one
 power-of-two (UE8M0) scale per 128x128 block and ``x`` is BF16 with ``M <= MAX_M``. It takes
@@ -47,7 +47,9 @@ Both kernels launch one non-persistent grid (``N/128`` weight tiles x ``split_k`
 ranks). Tactics, the low-/mid-M cut-over and the largest M for which this GEMM is selected
 (:func:`max_m_for`, the measured cross-over against the architecture's default FP8
 block-scale GEMM) come from per-architecture tables keyed by ``(N, K)``; shapes without an
-entry use a heuristic split-K and a conservative M limit.
+entry use a heuristic split-K and a conservative M limit. On SM107, whose default GEMM reads
+the weight scale in the CuTe MXFP8 layout, :func:`pack_block_scale_from_mxfp8_layout` derives
+the DeepGEMM-packed scale this GEMM reads.
 """
 
 from __future__ import annotations
@@ -2125,6 +2127,192 @@ _SM100_TABLES = _ShapeTables(
     },
 )
 
+# SM107, tuned on Rubin (212 SMs) for the Kimi-K3 decode projections with cold weights (rotated
+# over 1.5 GiB): each tactic scores the mean CUDA-graph per-call time of back-to-back launches
+# with and without PDL. Low-M kernel, per mma_n bucket timed at M = mma_n: a split_k sweep with
+# the heuristic ring sizes, then quant warps / groups and x / b ring depths around the three
+# best splits; mid-M kernel, per mma_n bucket: split_k x b_stages. With 212 SMs the best split
+# is larger than on GB300 for the small-N weights. The M limits are the largest M up to which
+# this GEMM ran at least 5% faster than ``fp8_quantize_1x128_cutedsl_ue8m0`` + the autotuned
+# ``cute_dsl_mxfp8_gemm_rubin`` at every measured M (and, for the helix weights, not slower on
+# the mean of the times with and without PDL); other shapes stop at 32 tokens.
+_SM107_TABLES = _ShapeTables(
+    low_m_tuned={
+        # KDA fused q/k/v/g (dep16)
+        (49152, 7168, 8): (1, 8, 4, 4, 4),
+        (49152, 7168, 16): (1, 8, 4, 8, 4),
+        (49152, 7168, 32): (1, 8, 4, 8, 4),
+        (49152, 7168, 64): (1, 4, 4, 8, 4),
+        # KDA / MLA o_proj (dep16)
+        (7168, 12288, 8): (3, 8, 4, 4, 4),
+        (7168, 12288, 16): (3, 8, 4, 8, 4),
+        (7168, 12288, 32): (3, 8, 4, 8, 4),
+        (7168, 12288, 64): (3, 4, 4, 8, 4),
+        # MLA output gate / shared-expert gate_up (dep16)
+        (12288, 7168, 8): (2, 8, 4, 4, 4),
+        (12288, 7168, 16): (2, 8, 4, 8, 4),
+        (12288, 7168, 32): (2, 8, 4, 8, 4),
+        (12288, 7168, 64): (2, 4, 4, 8, 4),
+        # shared-expert down (dep16)
+        (7168, 6144, 8): (6, 8, 4, 4, 4),
+        (7168, 6144, 16): (3, 8, 4, 8, 4),
+        (7168, 6144, 32): (3, 8, 4, 8, 4),
+        (7168, 6144, 64): (3, 4, 4, 8, 4),
+        # MLA q_b
+        (18432, 1536, 8): (2, 4, 4, 4, 4),
+        (18432, 1536, 16): (2, 4, 4, 8, 4),
+        (18432, 1536, 32): (1, 8, 4, 8, 4),
+        (18432, 1536, 64): (1, 4, 4, 8, 4),
+        # MoE latent down
+        (3584, 7168, 8): (8, 7, 4, 4, 4),
+        (3584, 7168, 16): (8, 4, 4, 8, 4),
+        (3584, 7168, 32): (5, 8, 4, 8, 4),
+        (3584, 7168, 64): (6, 4, 4, 8, 2),
+        # MoE latent up
+        (7168, 3584, 8): (7, 4, 4, 4, 4),
+        (7168, 3584, 16): (6, 4, 4, 8, 4),
+        (7168, 3584, 32): (6, 5, 4, 8, 4),
+        (7168, 3584, 64): (3, 4, 4, 8, 4),
+        # KDA fused q/k/v/g (helix16 shard)
+        (3072, 7168, 8): (7, 8, 4, 4, 4),
+        (3072, 7168, 16): (7, 4, 4, 8, 4),
+        (3072, 7168, 32): (6, 8, 4, 8, 4),
+        (3072, 7168, 64): (6, 4, 4, 8, 2),
+        # MLA fused q_a / kv_a (2112 rows)
+        (2176, 7168, 8): (10, 4, 4, 4, 4),
+        (2176, 7168, 16): (7, 8, 4, 8, 4),
+        (2176, 7168, 32): (8, 4, 4, 8, 4),
+        (2176, 7168, 64): (8, 7, 4, 8, 4),
+        # MLA output gate (helix16 shard)
+        (768, 7168, 8): (14, 4, 4, 4, 4),
+        (768, 7168, 16): (14, 4, 4, 8, 4),
+        (768, 7168, 32): (10, 6, 4, 8, 4),
+        (768, 7168, 64): (16, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix16 shard)
+        (7168, 768, 8): (3, 2, 2, 4, 4),
+        (7168, 768, 16): (3, 2, 2, 8, 4),
+        (7168, 768, 32): (1, 6, 4, 8, 4),
+        (7168, 768, 64): (2, 3, 3, 8, 4),
+        # KDA fused q/k/v/g (helix8 shard)
+        (6144, 7168, 8): (3, 4, 4, 4, 4),
+        (6144, 7168, 16): (3, 8, 4, 8, 4),
+        (6144, 7168, 32): (3, 8, 4, 8, 4),
+        (6144, 7168, 64): (3, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix8 shard)
+        (7168, 1536, 8): (4, 3, 3, 4, 4),
+        (7168, 1536, 16): (4, 3, 3, 8, 4),
+        (7168, 1536, 32): (2, 6, 4, 8, 4),
+        (7168, 1536, 64): (2, 4, 4, 8, 4),
+        # MLA output gate (helix8 shard)
+        (1536, 7168, 8): (12, 5, 4, 4, 4),
+        (1536, 7168, 16): (7, 8, 4, 8, 4),
+        (1536, 7168, 32): (8, 7, 4, 8, 4),
+        (1536, 7168, 64): (12, 5, 4, 8, 2),
+    },
+    mid_m_tuned={
+        (49152, 7168, 64): (1, 4),
+        (49152, 7168, 96): (1, 4),
+        (49152, 7168, 128): (1, 4),
+        (7168, 12288, 64): (3, 4),
+        (7168, 12288, 96): (3, 4),
+        (7168, 12288, 128): (3, 4),
+        (12288, 7168, 64): (2, 4),
+        (12288, 7168, 96): (2, 4),
+        (12288, 7168, 128): (2, 4),
+        (7168, 6144, 64): (2, 4),
+        (7168, 6144, 96): (2, 4),
+        (7168, 6144, 128): (2, 4),
+        (18432, 1536, 64): (1, 4),
+        (18432, 1536, 96): (1, 4),
+        (18432, 1536, 128): (1, 4),
+        (18432, 1536, 160): (1, 4),
+        (3584, 7168, 64): (5, 4),
+        (3584, 7168, 96): (5, 4),
+        (3584, 7168, 128): (4, 4),
+        (3584, 7168, 160): (4, 4),
+        (7168, 3584, 64): (2, 4),
+        (7168, 3584, 96): (2, 4),
+        (7168, 3584, 128): (2, 4),
+        (3072, 7168, 64): (6, 4),
+        (3072, 7168, 96): (6, 4),
+        (3072, 7168, 128): (5, 4),
+        (3072, 7168, 160): (6, 4),
+        (2176, 7168, 64): (7, 4),
+        (2176, 7168, 96): (7, 4),
+        (2176, 7168, 128): (7, 4),
+        (2176, 7168, 160): (8, 4),
+        (2176, 7168, 192): (8, 4),
+        (768, 7168, 64): (12, 4),
+        (768, 7168, 96): (8, 4),
+        (768, 7168, 128): (8, 4),
+        (768, 7168, 160): (10, 4),
+        (768, 7168, 192): (8, 4),
+        (768, 7168, 224): (7, 4),
+        (768, 7168, 256): (8, 3),
+        (7168, 768, 64): (3, 3),
+        (7168, 768, 96): (1, 4),
+        (7168, 768, 128): (1, 4),
+        (6144, 7168, 64): (3, 4),
+        (6144, 7168, 96): (3, 4),
+        (6144, 7168, 128): (3, 4),
+        (6144, 7168, 160): (3, 4),
+        (7168, 1536, 64): (4, 3),
+        (7168, 1536, 96): (1, 4),
+        (7168, 1536, 128): (1, 4),
+        (1536, 7168, 64): (8, 4),
+        (1536, 7168, 96): (7, 4),
+        (1536, 7168, 128): (8, 4),
+        (1536, 7168, 160): (10, 3),
+        (1536, 7168, 192): (10, 3),
+        (1536, 7168, 224): (10, 3),
+    },
+    mid_m_default={
+        (49152, 7168): (1, 4),
+        (7168, 12288): (3, 4),
+        (12288, 7168): (2, 4),
+        (7168, 6144): (2, 4),
+        (18432, 1536): (1, 4),
+        (3584, 7168): (4, 4),
+        (7168, 3584): (2, 4),
+        (3072, 7168): (5, 4),
+        (2176, 7168): (7, 4),
+        (768, 7168): (8, 4),
+        (7168, 768): (1, 4),
+        (6144, 7168): (3, 4),
+        (7168, 1536): (1, 4),
+        (1536, 7168): (8, 4),
+    },
+    max_m={
+        (49152, 7168): 32,
+        (7168, 12288): 96,
+        (12288, 7168): 96,
+        (7168, 6144): 128,
+        (18432, 1536): 160,
+        (3584, 7168): 160,
+        (7168, 3584): 96,
+        (3072, 7168): 160,
+        (2176, 7168): 192,
+        (768, 7168): 256,
+        (7168, 768): 128,
+        (6144, 7168): 160,
+        (7168, 1536): 96,
+        (1536, 7168): 224,
+    },
+    default_max_m=0,
+    low_m_cutover={
+        (49152, 7168): 32,
+        (7168, 12288): 32,
+        (12288, 7168): 32,
+        (7168, 6144): 32,
+        (18432, 1536): 32,
+        (3584, 7168): LOW_M_MAX,
+        (7168, 3584): 32,
+        (3072, 7168): 32,
+        (2176, 7168): 32,
+        (6144, 7168): 32,
+    },
+)
+
 #: Minimum weight-ring depth the heuristic keeps when growing the activation ring.
 _MIN_A_STAGES = 6
 #: Rule for the cluster split-K of shapes without measured tactics: the largest split whose
@@ -2135,12 +2323,24 @@ _MID_M_GRID_FRACTION, _MID_M_MIN_K_TILES = 0.75, 8
 
 
 @functools.cache
+def _device_capability(device_index: int) -> tuple:
+    return torch.cuda.get_device_capability(device_index)
+
+
 def _is_supported_device(device_index: int) -> bool:
-    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
+    """SM100 / SM103; SM107 only with a Rubin-capable CuTe DSL."""
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    capability = _device_capability(device_index)
+    return capability in ((10, 0), (10, 3)) or (
+        capability == (10, 7) and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    )
 
 
 def _tables() -> _ShapeTables:
-    """Tables of the current device."""
+    """Tables of the current device: SM107 or SM100 / SM103."""
+    if _device_capability(torch.cuda.current_device()) == (10, 7):
+        return _SM107_TABLES
     return _SM100_TABLES
 
 
@@ -2411,6 +2611,32 @@ def run_low_m_gemm(
     return out
 
 
+def pack_block_scale_from_mxfp8_layout(sf: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """DeepGEMM-packed UE8M0 scale of an ``[N, K]`` weight from its CuTe MXFP8 GEMM scale.
+
+    ``sf`` is the R128c4 K32 UE8M0 tensor ``transform_k128_scales_to_cutedsl_mxfp8_layout``
+    builds from 128x128 block scales: each block exponent replicated over its 128 rows and 4
+    K32 slots, so the first byte of every 512-byte atom is the exponent of block
+    ``(r // 128, c // 4)``. The result equals ``transform_sf_into_required_layout`` of the
+    original FP32 block scales: one UE8M0 byte per (row, K block), four K blocks per int32
+    word, MN-major ``int32 [N, ceil(K / 512)]`` with strides ``(1, N)``.
+    """
+    if k % CTA_K:
+        raise ValueError(f"K={k} must be a multiple of {CTA_K}")
+    nb, kb = _ceil_div(n, MMA_M), k // CTA_K
+    flat = sf.reshape(-1)
+    if sf.dtype != torch.uint8 or flat.numel() != nb * kb * 512:
+        raise ValueError(f"sf must be the uint8 R128c4 scale of an [{n}, {k}] weight")
+    exponents = flat.view(nb, kb, 512)[:, :, 0]
+    rows = exponents.repeat_interleave(MMA_M, dim=0)[:n]
+    padded = torch.zeros((n, _ceil_div(kb, 4) * 4), dtype=torch.uint8, device=sf.device)
+    padded[:, :kb] = rows
+    words = padded.view(torch.int32)
+    packed = torch.empty((words.shape[1], n), dtype=torch.int32, device=sf.device).t()
+    packed.copy_(words)
+    return packed
+
+
 def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> None:
     """Raise ``ValueError`` unless :func:`run_low_m_gemm` accepts these operands."""
     if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_contiguous():
@@ -2448,5 +2674,6 @@ __all__ = [
     "kernel_max_m_for",
     "low_m_max_for",
     "max_m_for",
+    "pack_block_scale_from_mxfp8_layout",
     "run_low_m_gemm",
 ]
