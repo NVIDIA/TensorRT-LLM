@@ -214,10 +214,17 @@ class KimiK3MoEGate(nn.Module):
         config: Any,
         *,
         logits_gemm_dtype: torch.dtype | None = None,
+        logits_kernel: bool = False,
         device: torch.device | None = None,
     ) -> None:
+        """``logits_kernel``: compute the logits of up to ``kimi_k3_router_logits.MAX_M`` BF16
+        tokens with that CuTe kernel (bit-identical to ``dsv3_router_gemm_op``; it reads the
+        weight before its programmatic-dependent-launch wait)."""
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
         super().__init__()
         self.config = config
+        self.logits_kernel = logits_kernel and IS_CUTLASS_DSL_AVAILABLE
         self.top_k = config.num_experts_per_token
         self.num_experts = config.num_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -245,6 +252,12 @@ class KimiK3MoEGate(nn.Module):
         """Compute fp32 routing logits shaped ``[num_tokens, num_experts]``."""
         hidden_2d = hidden_states.reshape(-1, self.gating_dim)
         if self.weight.dtype == torch.bfloat16 and hidden_2d.dtype == torch.bfloat16:
+            if self.logits_kernel and not torch.compiler.is_compiling():
+                from ..moe.kernels.blackwell import kimi_k3_router_logits
+
+                x = hidden_2d.contiguous()
+                if kimi_k3_router_logits.can_run(x, self.weight):
+                    return torch.ops.trtllm.kimi_k3_router_logits(x, self.weight)
             return torch.ops.trtllm.dsv3_router_gemm_op(
                 hidden_2d.contiguous(),
                 self.weight.t(),
@@ -1375,6 +1388,8 @@ class KimiK3MoERuntime(nn.Module):
         cfg,
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        *,
+        follows_kda_attention: bool = False,
     ):
         """Build the routed experts and the shared expert for one MoE layer.
 
@@ -1385,6 +1400,9 @@ class KimiK3MoERuntime(nn.Module):
         ``aux_stream_dict`` is shared across every layer of the model, so the
         streams reached through it are borrowed and must not be synchronized
         or reassigned here.
+
+        ``follows_kda_attention``: the layer's attention is KDA (selects the router-logits
+        kernel, see below).
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -1417,7 +1435,14 @@ class KimiK3MoERuntime(nn.Module):
             if _router_bf16_env is not None
             else model_config.mapping.tp_group_shares_requests
         )
-        self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
+        # The router-logits kernel serves the MoE blocks after KDA attention: there the earlier
+        # routing shortens the MoE front, while after MLA attention it lands in the burst of
+        # latent_down and the shared expert's first GEMM and the front gets longer.
+        self.gate = KimiK3MoEGate(
+            cfg,
+            logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None,
+            logits_kernel=follows_kda_attention,
+        )
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
         routed_quant_config = self._resolve_routed_quant_config(model_config, layer_idx)
@@ -2366,7 +2391,13 @@ class KimiLinearDecoderLayer(nn.Module):
             )
 
         if self.is_moe:
-            self.block_sparse_moe = KimiK3MoERuntime(model_config, cfg, layer_idx, aux_stream_dict)
+            self.block_sparse_moe = KimiK3MoERuntime(
+                model_config,
+                cfg,
+                layer_idx,
+                aux_stream_dict,
+                follows_kda_attention=self.is_kda,
+            )
         else:
             situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
             situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)

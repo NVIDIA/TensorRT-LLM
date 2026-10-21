@@ -723,7 +723,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..kernels.blackwell.utils import make_ptr
-    from ..moe.kernels.blackwell import kimi_k3_routing
+    from ..moe.kernels.blackwell import kimi_k3_router_logits, kimi_k3_routing
     from ..moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
         BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
@@ -5840,6 +5840,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
             i32(1),
             i32(1),
         )
+
+    # Router logits of ``M <= 16`` BF16 tokens and the 896 x 7168 BF16 router
+    # weight, bit-identical to ``dsv3_router_gemm_op(hidden_states, weight.t())``
+    # (``kimi_k3_router_logits.py``); inputs as ``kimi_k3_router_logits.can_run``
+    # accepts them.
+    @torch.library.custom_op("trtllm::kimi_k3_router_logits",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_router_logits_op(hidden_states: torch.Tensor,
+                                 weight: torch.Tensor) -> torch.Tensor:
+        if not kimi_k3_router_logits.can_run(hidden_states, weight):
+            raise ValueError("kimi_k3_router_logits: unsupported router inputs")
+        logits = torch.empty(
+            (hidden_states.shape[0], kimi_k3_router_logits.NUM_EXPERTS),
+            dtype=torch.float32,
+            device=hidden_states.device)
+        kimi_k3_router_logits.run_router_logits(hidden_states, weight, logits)
+        return logits
+
+    @torch.library.register_fake("trtllm::kimi_k3_router_logits")
+    def _(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return hidden_states.new_empty(
+            (hidden_states.shape[0], kimi_k3_router_logits.NUM_EXPERTS),
+            dtype=torch.float32)
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
