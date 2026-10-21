@@ -117,13 +117,31 @@ inputs are shared one request owner's scheduled batch at a time; CUDA payloads
 stay on the GPU, and only the owner keeps the returned embeddings in its cache.
 
 Explicit encoder TP is supported by the native Qwen2.5-VL, Qwen3-VL, Mistral3,
-Gemma4, and EXAONE 4.5 integrations. The Hugging Face Qwen2-VL and encoder-free
-Gemma4 Unified integrations support encoder DP but do not shard their front ends.
+EXAONE 4.5, and Gemma4 vision integrations. Gemma4 audio, Hugging Face Qwen2-VL,
+and the encoder-free Gemma4 Unified front ends support encoder DP but do not
+shard their weights. When a model enables multiple encoders, each must support
+the requested configuration. For example, a Gemma4 model with audio enabled
+rejects explicit encoder TP even though its vision encoder supports TP.
 Encoder DP currently excludes encoder-only execution, encoder CUDA graphs, and
 side-stream prefetch. Encoder TP with LLM attention DP requires item scheduling
 and also excludes encoder CUDA graphs and side-stream prefetch. Models without
 item scheduling, including Gemma4, reject shared encoder TP with attention DP
 at startup.
+
+Model integrations declare these capabilities through
+`MultimodalModelMixin.get_multimodal_encoder_parallel_modes(model_config)`.
+The method returns supported modes for each encoder enabled by that config,
+including its projector. Image and video can share a `vision` entry:
+
+```python
+{"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}
+```
+
+The model loader validates each encoder before constructing weights. A hybrid
+encoder TP/DP configuration requires both modes. An empty mapping means explicit
+encoder parallelism has not been integrated; omitting the setting continues to
+use the existing model path. These declarations describe implemented capabilities;
+model-specific accuracy and performance validation are separate requirements.
 
 ### FFN Module
 

@@ -966,19 +966,16 @@ class ModelLoader:
                                                 checkpoint_loader)
         encoder_dp_size = (config.multimodal_config.encoder_data_parallel_size
                            if config.multimodal_config is not None else None)
-        if encoder_dp_size is not None:
+        if encoder_dp_size is not None and not config.disable_mm_encoder:
+            from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+
             model_cls = AutoModelForCausalLM._resolve_class(config)
             if model_cls is not None:
-                if not getattr(model_cls, "supports_encoder_data_parallel",
-                               False):
+                if not issubclass(model_cls, MultimodalModelMixin):
                     raise NotImplementedError(
                         f"{model_cls.__name__} does not support explicit multimodal encoder parallelism."
                     )
-                if (encoder_dp_size < config.mapping.tp_size and not getattr(
-                        model_cls, "supports_encoder_tensor_parallel", False)):
-                    raise NotImplementedError(
-                        f"{model_cls.__name__} does not support multimodal encoder tensor parallelism."
-                    )
+                model_cls.validate_multimodal_encoder_parallelism(config)
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked

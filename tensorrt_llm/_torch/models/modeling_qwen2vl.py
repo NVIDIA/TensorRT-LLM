@@ -72,7 +72,8 @@ from ..modules.gated_mlp import GatedMLP
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
-    MultimodalModelMixin, make_multimodal_encoder_model_config,
+    EncoderParallelMode, MultimodalModelMixin,
+    make_multimodal_encoder_model_config,
     reorder_multimodal_embeddings_by_modality)
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -2156,8 +2157,13 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
-    supports_encoder_data_parallel = True
     supports_mm_encoder_item_scheduling = True
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+            cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"dp"})}
 
     def __init__(
         self,
@@ -2584,7 +2590,11 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
-    supports_encoder_tensor_parallel = True
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+            cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"tp", "dp"})}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):

@@ -28,6 +28,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
     Tuple,
@@ -70,6 +71,9 @@ from .multimodal_encoder_data_parallel import (
 
 class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
+
+
+EncoderParallelMode = Literal["tp", "dp"]
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -524,12 +528,6 @@ class MultimodalModelMixin:
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
-    supports_encoder_data_parallel: ClassVar[bool] = False
-    """Whether the model constructs a replicated encoder for encoder DP."""
-
-    supports_encoder_tensor_parallel: ClassVar[bool] = False
-    """Whether explicit encoder mappings can shard the model's encoder weights."""
-
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
     """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
     forward and pairs with a processor that overrides
@@ -538,6 +536,59 @@ class MultimodalModelMixin:
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        """Declare supported parallel modes for each enabled encoder front end.
+
+        Keys identify logical encoders, including their projectors. Image and
+        video may share one encoder; audio may use another with different modes.
+        Return only encoders constructed for this config. An empty mapping means
+        the model has not integrated explicit encoder parallelism.
+
+        ``tp`` promises weight sharding with the configured encoder mapping;
+        ``dp`` promises independent replicas and the shared item encode contract.
+        These are implementation capabilities, not validation or benchmark status.
+        """
+        return {}
+
+    @classmethod
+    def validate_multimodal_encoder_parallelism(cls, model_config: ModelConfig) -> None:
+        """Validate explicit encoder parallelism before model construction."""
+        mm_config = model_config.multimodal_config
+        if (
+            mm_config is None
+            or mm_config.encoder_data_parallel_size is None
+            or model_config.disable_mm_encoder
+        ):
+            return
+        encoder_modes = cls.get_multimodal_encoder_parallel_modes(model_config)
+        if not encoder_modes:
+            raise NotImplementedError(
+                f"{cls.__name__} does not support explicit multimodal encoder parallelism."
+            )
+        dp_size = mm_config.encoder_data_parallel_size
+        tp_size = model_config.mapping.tp_size // dp_size
+        required_modes: set[EncoderParallelMode] = set()
+        if dp_size > 1:
+            required_modes.add("dp")
+        if tp_size > 1:
+            required_modes.add("tp")
+        for encoder_name, modes in encoder_modes.items():
+            for mode in sorted(required_modes - modes):
+                parallelism = "tensor" if mode == "tp" else "data"
+                raise NotImplementedError(
+                    f"{cls.__name__} encoder '{encoder_name}' does not support "
+                    f"multimodal encoder {parallelism} parallelism."
+                )
+        if (
+            model_config.mapping.enable_attention_dp
+            and tp_size > 1
+            and not cls.supports_mm_encoder_item_scheduling
+        ):
+            raise ValueError("Encoder TP with attention DP requires MM encoder item scheduling.")
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
