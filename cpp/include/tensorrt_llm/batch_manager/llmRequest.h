@@ -1169,6 +1169,19 @@ public:
         return mReturnContextLogits;
     }
 
+    //! \brief Allocate the whole prompt afresh instead of claiming a cached prefix.
+    //! \details Outputs computed per prompt token, such as context logits, exist only for tokens the
+    //!          forward pass computes. The request's blocks are still stored for reuse by others.
+    void setSkipPrefixReuse(bool const skipPrefixReuse)
+    {
+        mSkipPrefixReuse = skipPrefixReuse;
+    }
+
+    [[nodiscard]] bool getSkipPrefixReuse() const
+    {
+        return mSkipPrefixReuse;
+    }
+
     void setReturnGenerationLogits(bool const returnGenerationLogits)
     {
         TLLM_CHECK_WITH_INFO(!(mIsStreaming && mSamplingConfig.getBeamWidth() > 1 && returnGenerationLogits),
@@ -1810,6 +1823,7 @@ protected:
     bool mReturnContextLogits;
     bool mReturnGenerationLogits;
     bool mReturnLogProbs{false};
+    bool mSkipPrefixReuse{false};
     TensorPtr mContextLogitsHost;    // [mPromptLen, vocabSizePadded]
     TensorPtr mGenerationLogitsHost; // [beamSize, mMaxNewTokens, vocabSizePadded]
 

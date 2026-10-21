@@ -182,6 +182,13 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
             disaggregated_params = disaggregated_params_from_request(request)
+            if (
+                disaggregated_params is not None
+                and disaggregated_params.request_type == "generation_only"
+            ):
+                # Prompt scores are the context_only leg's PromptOutput; this
+                # leg receives the prompt KV and never computes its logits.
+                sampling_params.prompt_logprobs = None
             parent_affinity_id = validate_parent_affinity(
                 self.subagent_affinity_auth_key,
                 request,
@@ -360,6 +367,11 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                             code=error_pb2.ERROR_CODE_OVERLOADED,
                             retryable=True,
                         )
+                        return
+                    if resp.HasField("error") and not result.error:
+                        # An error event ends the stream; unless the request
+                        # already finished, the finally below aborts it.
+                        engine_terminal = result.finished
                         return
                 if result.error:
                     engine_terminal = True

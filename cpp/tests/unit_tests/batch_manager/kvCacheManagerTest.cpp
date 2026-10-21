@@ -8536,6 +8536,51 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalContextTokenAfterReuse)
     EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
 }
 
+TEST_F(KVCacheManagerTest, AddSequenceBatchSkipPrefixReuseClaimsNothingButStoresItsBlocks)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr promptLen = 9;
+    auto const cachedTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto const freshTokens = std::make_shared<VecTokens>(VecTokens{9, 10, 11, 12, 13, 14, 15, 16, 17});
+
+    auto makeRequest = [&](LlmRequest::RequestIdType requestId, std::shared_ptr<VecTokens> const& tokens)
+    {
+        return std::make_shared<LlmRequest>(
+            requestId, /*maxNewTokens=*/2, tokens, tle::SamplingConfig{beamWidth}, /*isStreaming=*/false);
+    };
+    auto addThenRemove = [&](std::shared_ptr<LlmRequest> const& req)
+    {
+        mgr->addSequenceBatch({{{req->mRequestId, promptLen, beamWidth}}}, {std::ref(*req)});
+        auto const prepopulated = req->getPrepopulatedPromptLen();
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+        (void) mgr->removeSequence(req->mRequestId, req);
+        return prepopulated;
+    };
+
+    // A cached prompt is neither credited to the scheduler nor claimed.
+    seedAndRelease(*mgr, /*reqId=*/0, cachedTokens);
+    auto skipping = makeRequest(1, cachedTokens);
+    skipping->setSkipPrefixReuse(true);
+    auto const summary = mgr->analyzePrefixReuse(skipping->getUniqueTokens(0), *skipping);
+    EXPECT_EQ(summary.reusableBlocksAll, 0);
+    EXPECT_EQ(summary.reusableBlocksAllocated, 0);
+    EXPECT_FALSE(summary.firstNewBlock.has_value());
+    mgr->addSequenceBatch({{{1, promptLen, beamWidth}}}, {std::ref(*skipping)});
+    EXPECT_EQ(skipping->getPrepopulatedPromptLen(), 0);
+    EXPECT_EQ(skipping->getContextCurrentPosition(), 0);
+    EXPECT_EQ(skipping->getReusedBlocksPerRequest(), 0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*skipping);
+    (void) mgr->removeSequence(1, skipping);
+
+    // The skipping request's own blocks are stored, so a later request reuses them.
+    auto freshSkipping = makeRequest(2, freshTokens);
+    freshSkipping->setSkipPrefixReuse(true);
+    EXPECT_EQ(addThenRemove(freshSkipping), 0);
+    EXPECT_EQ(addThenRemove(makeRequest(3, freshTokens)), promptLen - 1);
+}
+
 TEST_F(KVCacheManagerTest, AddSequenceBatchPreservesDraftTokensOnFinalContextAfterReuse)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -10529,6 +10574,33 @@ std::vector<std::vector<SizeType32>> driveDecode(
     return trace;
 }
 } // namespace
+
+// A request that skips prefix reuse is not offered an externally matched prefix
+// either; a plain request still is.
+TEST_F(KVCacheManagerTest, KvCacheConnector_SkipPrefixReuseIsNotQueried)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(/*numNewMatchedTokens=*/4);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector);
+
+    auto constexpr beamWidth = 1;
+    auto tokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto const promptLen = static_cast<SizeType32>(tokens->size());
+    tle::SamplingConfig const samplingConfig{beamWidth};
+
+    auto skipping = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{0}, /*maxNewTokens=*/2, tokens, samplingConfig, /*isStreaming=*/false);
+    skipping->setSkipPrefixReuse(true);
+    mgr->addSequenceBatch({{{skipping->mRequestId, promptLen, beamWidth}}}, {std::ref(*skipping)});
+    EXPECT_EQ(connector->getCallCount(), 0);
+    EXPECT_EQ(skipping->getPrepopulatedPromptLen(), 0);
+
+    auto plain = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, /*maxNewTokens=*/2, tokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch({{{plain->mRequestId, promptLen, beamWidth}}}, {std::ref(*plain)});
+    EXPECT_EQ(connector->getCallCount(), 1);
+    EXPECT_GT(plain->getPrepopulatedPromptLen(), 0);
+}
 
 // Test 1: connector attached but reports zero external matches. Decode-time
 // boundary allocation must still fire; this is the simplest possible

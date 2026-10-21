@@ -1099,6 +1099,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return None
+        if req.skip_prefix_reuse:
+            return 0
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:

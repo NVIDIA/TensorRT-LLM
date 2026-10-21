@@ -1225,6 +1225,28 @@ def _spec_recompute_claim_limit(
     return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
+def _skip_prefix_reuse_claim_limit(req: LlmRequest) -> int | None:
+    """Reuse-claim cap for a request that skips prefix reuse.
+
+    Such a request, for example one returning context logits (which exist only
+    for tokens that pass through the forward pass), claims no prefix. Its
+    computed blocks are still committed, so later requests keep reusing them.
+
+    Returns None for no cap, else 0. Applies to the draft pool too: both pools
+    settle the same request cursor.
+    """
+    return 0 if req.skip_prefix_reuse else None
+
+
+def _tighter_claim_limit(first: int | None, second: int | None) -> int | None:
+    """The stricter of two reuse-claim caps, where None means no cap."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return min(first, second)
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
@@ -3890,14 +3912,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # at the matched endpoint are onboarded; a cursor rewound below that
         # endpoint would read and write spans with no pages behind them). The
         # tail check runs first: partially constructed managers carry only the
-        # class-level zero tail.
-        limit = None
+        # class-level zero tail. Requests that skip prefix reuse claim nothing.
+        limit = _skip_prefix_reuse_claim_limit(req)
         if self._spec_recompute_tail:
-            limit = _spec_recompute_claim_limit(
-                req,
-                tail=self._spec_recompute_tail,
-                tokens_per_block=self.tokens_per_block,
-                is_draft=self.is_draft,
+            limit = _tighter_claim_limit(
+                limit,
+                _spec_recompute_claim_limit(
+                    req,
+                    tail=self._spec_recompute_tail,
+                    tokens_per_block=self.tokens_per_block,
+                    is_draft=self.is_draft,
+                ),
             )
         reused = self.prepare_context_cache(req, limit)
         if reused is None:
@@ -4410,12 +4435,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # A connector-served prefix starves a hidden-state drafter exactly like
         # local reuse does. Cap the reservation at the same claim limit, so
         # the recomputed tail stays local by construction; a full-re-prefill
-        # tail (-1) caps to zero and releases the reservation below.
-        limit = _spec_recompute_claim_limit(
-            req,
-            tail=self._spec_recompute_tail,
-            tokens_per_block=self.tokens_per_block,
-            is_draft=self.is_draft,
+        # tail (-1) caps to zero and releases the reservation below. Requests
+        # that skip prefix reuse cap to zero as well.
+        limit = _tighter_claim_limit(
+            _skip_prefix_reuse_claim_limit(req),
+            _spec_recompute_claim_limit(
+                req,
+                tail=self._spec_recompute_tail,
+                tokens_per_block=self.tokens_per_block,
+                is_draft=self.is_draft,
+            ),
         )
         if limit is not None:
             end = min(end, limit)

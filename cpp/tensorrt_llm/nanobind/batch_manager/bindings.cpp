@@ -200,6 +200,7 @@ void initBindings(nb::module_& m)
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(
             "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
+        .def_prop_rw("skip_prefix_reuse", &GenLlmReq::getSkipPrefixReuse, &GenLlmReq::setSkipPrefixReuse)
         .def_prop_rw(
             "expect_snapshot_points", &GenLlmReq::getExpectedSnapshotPoints, &GenLlmReq::setExpectedSnapshotPoints)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)

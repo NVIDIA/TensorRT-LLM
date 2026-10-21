@@ -32,11 +32,7 @@ global_kvcache_config = KvCacheConfig(
 
 global_kvcache_config_prompt_logprobs = KvCacheConfig(
     max_tokens=10000,
-    # FIXME: block reuse is disabled for prompt logprobs
-    # because prompt logprobs are computed from context logits
-    # and context logits may not be calculated when using block reuse
-    # See https://nvbugs/5577178
-    enable_block_reuse=False,
+    enable_block_reuse=True,
 )
 
 
@@ -180,9 +176,6 @@ def test_generation_with_return_logits(
 ):
     if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
-    if reuse_cache and gather_context_logits:
-        pytest.skip("nvbugs/5577178")
-
     sampling_params = SamplingParams(
         max_tokens=8,
         return_context_logits=gather_context_logits,
@@ -376,6 +369,106 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
                     )
 
         print(f"{'=' * 80}\n")
+
+
+_REUSE_TOKENS_PER_BLOCK: Final = 32
+
+
+@pytest.fixture(scope="module", params=["kvcm_v1", "kvcm_v2", "kvcm_v1_swa"])
+def reuse_llm(request) -> Generator[LLM, None, None]:
+    extra_kv_cache_args = {}
+    if request.param == "kvcm_v1_swa":
+        # A window shorter than the test prompts, so their early blocks fall out of it.
+        extra_kv_cache_args["max_attention_window"] = [4 * _REUSE_TOKENS_PER_BLOCK]
+    llm = LLM(
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
+        max_batch_size=8,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=10000,
+            enable_block_reuse=True,
+            tokens_per_block=_REUSE_TOKENS_PER_BLOCK,
+            use_kv_cache_manager_v2=request.param == "kvcm_v2",
+            **extra_kv_cache_args,
+        ),
+    )
+    with llm:
+        yield llm
+
+
+def _reuse_prompt(num_tokens: int, seed: int) -> list[int]:
+    return [1000 + (seed * 7919 + i * 104729) % 30000 for i in range(num_tokens)]
+
+
+def _generate_one(llm: LLM, prompt: list[int], params: SamplingParams, salt: str, streaming: bool):
+    if not streaming:
+        [output] = llm.generate([prompt], sampling_params=params, cache_salt=[salt])
+        return output
+    output = None
+    for output in llm.generate_async(
+        prompt, sampling_params=params, streaming=True, cache_salt=salt
+    ):
+        pass
+    return output
+
+
+def _assert_prompt_logprobs_match(warm, cold, prompt: list[int], top_k: int) -> None:
+    # Entry i scores prompt token i + 1; the first prompt token has no context.
+    targets = prompt[1:]
+    warm_logprobs = warm.outputs[0].prompt_logprobs
+    cold_logprobs = cold.outputs[0].prompt_logprobs
+    assert len(warm_logprobs) >= len(targets)
+    for position, token_id in enumerate(targets, start=1):
+        warm_entry = warm_logprobs[position - 1]
+        cold_entry = cold_logprobs[position - 1]
+        assert token_id in warm_entry, f"position {position} lacks its selected-token logprob"
+        assert len(warm_entry) >= top_k, f"position {position} lacks its top-{top_k} candidates"
+        assert warm_entry[token_id].logprob == pytest.approx(
+            cold_entry[token_id].logprob, abs=1e-2
+        ), f"position {position} disagrees with the cold-cache score"
+        warm_top = {tid for tid, lp in warm_entry.items() if lp.rank <= top_k}
+        cold_top = {tid for tid, lp in cold_entry.items() if lp.rank <= top_k}
+        assert warm_top == cold_top, f"position {position} top-{top_k} candidates differ"
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["non_streaming", "streaming"])
+@pytest.mark.threadleak(enabled=False)
+def test_prompt_logprobs_complete_with_kv_cache_reuse(reuse_llm: LLM, streaming: bool):
+    """A cached prefix must not leave prompt positions unscored or misaligned.
+
+    Context logits exist only for tokens the forward pass computes, so a request
+    asking for prompt logprobs re-prefills its whole prompt; requests that do not
+    ask keep reusing the cache.
+    """
+    top_k = 2
+    num_tokens = 8 * _REUSE_TOKENS_PER_BLOCK
+    salt = CacheSalter.get_salt_unique()
+    prompt = _reuse_prompt(num_tokens, seed=int(salt))
+    logprob_params = SamplingParams(max_tokens=8, temperature=0.0, prompt_logprobs=top_k)
+    plain_params = SamplingParams(max_tokens=8, temperature=0.0)
+
+    cold = _generate_one(reuse_llm, prompt, logprob_params, salt, streaming)
+    assert cold.cached_tokens == 0
+
+    # A request without prompt logprobs still reuses the cache.
+    plain = _generate_one(reuse_llm, prompt, plain_params, salt, streaming)
+    assert plain.cached_tokens > 0
+
+    # Prompt logprobs need every position computed, so the request claims no prefix.
+    warm = _generate_one(reuse_llm, prompt, logprob_params, salt, streaming)
+    assert warm.cached_tokens == 0
+    _assert_prompt_logprobs_match(warm, cold, prompt, top_k)
+
+    # Partial prefix hit: keep 3/4 of the prompt and replace the rest.
+    shared = num_tokens * 3 // 4
+    partial = prompt[:shared] + _reuse_prompt(num_tokens - shared, seed=int(salt) + 10_000)
+    plain_partial = _generate_one(reuse_llm, partial, plain_params, salt, streaming)
+    assert 0 < plain_partial.cached_tokens < len(partial) - 1
+    partial = prompt[:shared] + _reuse_prompt(num_tokens - shared, seed=int(salt) + 20_000)
+    partial_cold = _generate_one(
+        reuse_llm, partial, logprob_params, CacheSalter.get_salt_unique(), streaming
+    )
+    partial_warm = _generate_one(reuse_llm, partial, logprob_params, salt, streaming)
+    _assert_prompt_logprobs_match(partial_warm, partial_cold, partial, top_k)
 
 
 @pytest.mark.threadleak(enabled=False)

@@ -167,12 +167,20 @@ class _StopPrefixTracker:
         return len(text) - max(self._states, default=0)
 
 
+def _missing_prompt_logprobs(result: Any) -> int:
+    """How many scoreable prompt positions (all but the first) have no logprob."""
+    prompt_logprobs = result.outputs[0].prompt_logprobs if result.outputs else None
+    return max(0, len(result.prompt_token_ids or ()) - 1 - len(prompt_logprobs or ()))
+
+
 def _prompt_output(
     tokenizer: Any, result: Any, candidate_limit: int
 ) -> generation_pb2.PromptOutput:
     token_ids = list(result.prompt_token_ids)
     prompt_logprobs = result.outputs[0].prompt_logprobs if result.outputs else None
     prompt_logprobs = prompt_logprobs or []
+    # The first prompt token has no preceding context, so it never carries a
+    # logprob; entry i scores prompt token i + 1.
     aligned_logprobs = [None, *prompt_logprobs[: max(0, len(token_ids) - 1)]]
     return generation_pb2.PromptOutput(
         tokens=_token_infos(tokenizer, token_ids, aligned_logprobs, candidate_limit)
