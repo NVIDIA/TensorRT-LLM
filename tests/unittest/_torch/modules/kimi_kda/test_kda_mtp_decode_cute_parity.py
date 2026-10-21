@@ -1454,9 +1454,51 @@ def test_two_cta_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, monkeypa
         assert torch.equal(new[name], ref[name]), f"{name}: two-CTA kernel differs from v1"
 
 
+def _valid_mxfp8_scales(output_scale, rows, heads):
+    """The R128c4 UE8M0 scale bytes of the ``rows`` output rows (four copies per (row, head));
+    the padding rows of the layout are not written."""
+    r = torch.arange(rows, device=output_scale.device)
+    h = torch.arange(heads, device=output_scale.device)
+    base = (
+        (r // 128)[:, None] * heads * 512
+        + h[None, :] * 512
+        + ((r % 32) * 16 + ((r % 128) // 32) * 4)[:, None]
+    )
+    return output_scale[base[..., None] + torch.arange(4, device=output_scale.device)]
+
+
+@pytest.mark.parametrize(
+    "B,H,num_spec",
+    [(1, 96, 7), (8, 96, 7), (16, 96, 5), (8, 12, 7), (32, 12, 5), (8, 6, 7), (4, 96, 3)],
+    ids=lambda v: str(v),
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_two_cta_mxfp8_output_matches_v1_bitwise(B, H, num_spec, state_dtype, monkeypatch):
+    """MXFP8-output verify calls run the two-CTA kernel at every grid size, with the E4M3 values,
+    valid-row scales, committed state, conv windows and replay caches of
+    ``kda_decode_mtp_kernel``'s quantization epilogue bit for bit (helix and dep16 head counts)."""
+    packed = _packed_fused_norm_inputs(B, H, num_spec, state_dtype)
+
+    def run():
+        return cute_run(packed, packed_token_layout=True, quantize_output=True)
+
+    ref = _run_with_verify_kernel(monkeypatch, "v1", run)
+    new = _run_with_verify_kernel(monkeypatch, "two_cta", run, expected_selection="two_cta")
+    rows = B * (num_spec + 1)
+    assert new["out"].dtype == torch.float8_e4m3fn
+    assert torch.equal(new["out"].view(torch.uint8), ref["out"].view(torch.uint8))
+    assert torch.equal(
+        _valid_mxfp8_scales(new["output_scale"], rows, H),
+        _valid_mxfp8_scales(ref["output_scale"], rows, H),
+    )
+    for name in _VERIFY_RESULTS[1:]:
+        assert torch.equal(new[name], ref[name]), f"{name}: two-CTA kernel differs from v1"
+
+
 def test_verify_kernel_selection():
     """v2 and the two-CTA kernel serve only the runtime verify contract, the two-CTA kernel
-    for grids of more tiles than SMs; every other variant stays on v1."""
+    for MXFP8 output and for grids of more tiles than SMs; the contract requires its operands;
+    every other variant stays on v1."""
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import _select_verify_kernel
 
     contract = dict(
@@ -1468,27 +1510,25 @@ def test_verify_kernel_selection():
         num_spec=7,
         num_tiles=148,
         num_sms=148,
-        v2_operands_ok=lambda: True,
-        two_cta_operands_ok=lambda: True,
+        operands_ok=lambda: True,
     )
     assert _select_verify_kernel(**contract) == "v2"
     assert _select_verify_kernel(**{**contract, "num_tiles": 149}) == "two_cta"
-    assert (
-        _select_verify_kernel(
-            **{**contract, "num_tiles": 149, "two_cta_operands_ok": lambda: False}
-        )
-        == "v2"
-    )
+    # MXFP8 output: the two-CTA kernel at every grid size
+    assert _select_verify_kernel(**{**contract, "quantize_output": True}) == "two_cta"
+    for quantize_output in (False, True):
+        with pytest.raises(ValueError, match="packed, fused-norm verify"):
+            _select_verify_kernel(
+                **{**contract, "quantize_output": quantize_output, "operands_ok": lambda: False}
+            )
     for name, value in (
         ("packed_token_layout", False),
         ("fuse_output_norm", False),
-        ("quantize_output", True),
         ("bf16_math", True),
         ("replay_only", True),
         ("num_spec", 8),
-        ("v2_operands_ok", lambda: False),
     ):
-        assert _select_verify_kernel(**{**contract, name: value}) == "v1", name
+        assert _select_verify_kernel(**{**contract, name: value, "operands_ok": None}) == "v1", name
 
 
 if __name__ == "__main__":

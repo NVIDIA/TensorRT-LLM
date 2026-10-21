@@ -51,14 +51,20 @@ Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 ``HV == H``, one V pass (TILE_V=128, 512 threads). ``num_spec`` is a
 compile-time constant per cache allocation.
 
-Kernel selection (``_select_verify_kernel``): calls on the runtime verify
-contract (packed token rows, fused gated RMSNorm with a bf16 output, 3xTF32
-recurrence, vector-aligned operands) run ``kda_decode_mtp_v2_kernel``
-(``kda_mtp_decode_v2.py``: the same arithmetic in the same order, bitwise
-identical results, shorter critical path), or with more ``(head, request)``
-tiles than SMs ``kda_decode_mtp_2cta_kernel`` (``kda_mtp_decode_2cta.py``: the
-same arithmetic sized for two CTAs per SM); every other variant runs
-``kda_decode_mtp_kernel``.
+Kernel selection (``_select_verify_kernel``). The runtime verify contract is
+packed token rows, the fused gated RMSNorm and the 3xTF32 recurrence (at most
+``MAX_NUM_SPEC`` drafts, vector-aligned bf16 operands). The three kernels have
+the same arithmetic in the same order and bitwise identical results:
+
+* ``kda_decode_mtp_kernel``: every call off the contract (replay-only commits,
+  the shifted-metadata layout, the raw output, the BF16 recurrence of
+  ``TRTLLM_KDA_MTP_BF16_MATH=1``). Its MXFP8 epilogue serves only that BF16
+  recurrence and is the bitwise reference of the two-CTA kernel's.
+* ``kda_decode_mtp_2cta_kernel`` (``kda_mtp_decode_2cta.py``, two CTAs per
+  SM): contract calls with more ``(head, request)`` tiles than SMs or with the
+  MXFP8 output.
+* ``kda_decode_mtp_v2_kernel`` (``kda_mtp_decode_v2.py``, one CTA or a cluster
+  pair per tile): the other contract calls (BF16 output, one wave).
 """
 
 import os
@@ -513,6 +519,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         beta_cache: cute.Tensor,
         ssm_state_indices: cute.Tensor,
         num_accepted_tokens: cute.Tensor,
+        o8: cute.Tensor,
+        osf: cute.Tensor,
         N: cutlass.Int32,
         scale: cutlass.Constexpr[float],
         HV: cutlass.Constexpr[int],
@@ -523,6 +531,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         lower_bound: cutlass.Constexpr[float],
         onorm_eps: cutlass.Constexpr[float],
         USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+        MXFP8_OUT: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
         """Host side of ``kda_decode_mtp_2cta_kernel`` (fp32 or bf16 state), launched for two
@@ -553,6 +562,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             beta_cache,
             ssm_state_indices,
             num_accepted_tokens,
+            o8,
+            osf,
             mma.tiled_mma1,
             mma.tiled_mma3,
             mma.tiled_mma1k,
@@ -580,6 +591,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             lower_bound,
             onorm_eps,
             USE_FLAT_LAYOUT,
+            MXFP8_OUT,
         )
         _launch_verify(launched, HV, N, 1, stream, min_blocks_per_mp=_TWO_CTA_BLOCKS_PER_SM)
 
@@ -816,10 +828,15 @@ def _vec4_rows(tensor: torch.Tensor, dim: int = -1) -> bool:
     )
 
 
-def _v2_operands_ok(*, w_q, w_k, w_v, rows, conv_caches) -> bool:
-    """Operand layouts / dtypes the v2 kernel's vector accesses support (see `_vec4_rows`):
-    token rows and replay caches vectorized along their last dimension, the dim-contiguous conv
-    caches along the channel dimension, conv weights as contiguous [channel][4] rows."""
+def _verify_operands_ok(*, w_q, w_k, w_v, state, projections, rows, conv_caches, g_cache) -> bool:
+    """Operands of the runtime verify contract that ``kda_decode_mtp_v2_kernel`` and
+    ``kda_decode_mtp_2cta_kernel`` take.
+
+    Layouts for their vector accesses (see `_vec4_rows`): token rows and replay caches
+    vectorized along their last dimension, the dim-contiguous conv caches along the channel
+    dimension, conv weights as contiguous [channel][4] rows. Dtypes: fp32 or bf16 state, bf16
+    new-token projections and conv caches, fp32 replay gates.
+    """
     weights_ok = all(
         w.dtype == w_q.dtype and w.is_contiguous() and w.shape[1] == 4 and _vec4_rows(w)
         for w in (w_q, w_k, w_v)
@@ -828,15 +845,8 @@ def _v2_operands_ok(*, w_q, w_k, w_v, rows, conv_caches) -> bool:
         weights_ok
         and all(_vec4_rows(t) for t in rows)
         and all(_vec4_rows(t, dim=1) for t in conv_caches)
-    )
-
-
-def _two_cta_operands_ok(*, state, rows, conv_caches, g_cache) -> bool:
-    """Operand dtypes of ``kda_decode_mtp_2cta_kernel``: fp32 or bf16 state, bf16 new-token
-    projections and conv caches (staged as bf16), fp32 replay gates."""
-    return (
-        state.dtype in (torch.float32, torch.bfloat16)
-        and all(t.dtype == torch.bfloat16 for t in (*rows, *conv_caches))
+        and state.dtype in (torch.float32, torch.bfloat16)
+        and all(t.dtype == torch.bfloat16 for t in (*projections, *conv_caches))
         and g_cache.dtype == torch.float32
     )
 
@@ -862,30 +872,26 @@ def _select_verify_kernel(
     num_spec: int,
     num_tiles: int,
     num_sms: int,
-    v2_operands_ok: Callable[[], bool],
-    two_cta_operands_ok: Callable[[], bool],
+    operands_ok: Callable[[], bool],
 ) -> Literal["v1", "v2", "two_cta"]:
-    """The verify kernel a call runs (see the module docstring).
-
-    The runtime verify contract is packed token rows, the fused gated RMSNorm with a bf16
-    output, the 3xTF32 recurrence and vector-aligned operands (``v2_operands_ok``). On it,
-    ``two_cta`` (``kda_decode_mtp_2cta_kernel``, two CTAs per SM) serves grids of more
-    ``(head, request)`` tiles than SMs with the operand dtypes it stages
-    (``two_cta_operands_ok``), and ``v2`` (``kda_decode_mtp_v2_kernel``) serves the rest. ``v1``
-    (``kda_decode_mtp_kernel``) serves every other variant. All compute bitwise the same results
-    where they apply. The operand checks are evaluated last.
-    """
+    """The verify kernel a call runs, by the rule in the module docstring. A call on the
+    contract whose operands fail ``operands_ok`` (`_verify_operands_ok`, evaluated last) is
+    rejected."""
     if not (
         packed_token_layout
         and fuse_output_norm
-        and not quantize_output
         and not bf16_math
         and not replay_only
         and num_spec <= MAX_NUM_SPEC
-        and v2_operands_ok()
     ):
         return "v1"
-    if num_tiles > num_sms and two_cta_operands_ok():
+    if not operands_ok():
+        raise ValueError(
+            "KDA MTP verify: the packed, fused-norm verify takes 16-byte-vectorizable bf16 "
+            "projections and conv caches, contiguous conv weights, fp32 replay gates and an fp32 "
+            "or bf16 state"
+        )
+    if quantize_output or num_tiles > num_sms:
         return "two_cta"
     return "v2"
 
@@ -991,8 +997,10 @@ def kda_mtp_decode_impl(
             or packed uniformly by request.
         w_q/w_k/w_v: conv weights ``[H*128, W]`` fp32, width-contiguous.
         cs_q/cs_k/cs_v: extended conv caches ``[pool, H*128, >= W-1+M]``
-            fp32, dim-contiguous. Columns ``[0, W-1)`` are the committed
-            window; tail columns hold raw pending-draft inputs. Mutated.
+            of raw projection inputs, bf16 (the runtime's caches; the packed
+            fused-norm verify requires bf16), dim-contiguous. Columns
+            ``[0, W-1)`` are the committed window; tail columns hold raw
+            pending-draft inputs. Mutated.
         g, beta: raw gate ``[1, T, H, 128]`` and beta ``[1, T, H]`` bf16.
         A_log, dt_bias: fp32 ``[H]`` / ``[H*128]``.
         recurrent_state: pool ``[pool, H, V, K]`` fp32 or bf16, **V-first** layout
@@ -1185,16 +1193,13 @@ def kda_mtp_decode_impl(
         num_spec=num_spec,
         num_tiles=HV * N,
         num_sms=_num_sms(x_q.device),
-        v2_operands_ok=lambda: _v2_operands_ok(
+        operands_ok=lambda: _verify_operands_ok(
             w_q=w_q,
             w_k=w_k,
             w_v=w_v,
-            rows=(x_q_arg, x_k_arg, x_v_arg, g, onorm_g, k_cache, g_cache, v_cache),
-            conv_caches=(cs_q, cs_k, cs_v),
-        ),
-        two_cta_operands_ok=lambda: _two_cta_operands_ok(
             state=h0_arg,
-            rows=(x_q, x_k, x_v),
+            projections=(x_q, x_k, x_v),
+            rows=(x_q_arg, x_k_arg, x_v_arg, g, onorm_g, k_cache, g_cache, v_cache),
             conv_caches=(cs_q, cs_k, cs_v),
             g_cache=g_cache,
         ),
@@ -1228,7 +1233,9 @@ def kda_mtp_decode_impl(
         ]
         if kernel == "two_cta":
             runner = _run_kda_decode_mtp_2cta
-            variant = {}
+            # E4M3 values and R128c4 UE8M0 scales of the MXFP8 output (placeholders without it)
+            args += [(out, 16), (output_scale if quantize_output else out, 16)]
+            variant = {"MXFP8_OUT": bool(quantize_output)}
         else:
             runner = _run_kda_decode_mtp_v2
             variant = {"SPLIT_V": split_v}
@@ -1259,6 +1266,8 @@ def kda_mtp_decode_impl(
                 stream=stream,
             )
         _compiled_cache[key](*[_dlpack_arg(t, assumed_align=a) for t, a in args], N, stream)
+        if quantize_output:
+            return out, output_scale
         return out
 
     key = (

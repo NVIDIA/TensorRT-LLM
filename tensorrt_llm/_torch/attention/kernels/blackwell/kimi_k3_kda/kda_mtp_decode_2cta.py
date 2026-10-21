@@ -44,9 +44,15 @@ than SMs:
 * **Named barriers: ids <= 4, all compile-time constants** (see ``BAR_WG0``), which SM107 needs
   to co-schedule two CTAs.
 
-Alone on an SM a tile is not faster than in the v2 kernel (the precompute reads bf16 and GEMM1's
-two A operands are serialized), while two tiles per SM finish sooner than two waves of v2 tiles,
-so the kernel pays off for grids with more tiles than SMs.
+The epilogue writes the BF16 output or, with ``MXFP8_OUT``, its MXFP8 quantization with the
+scale layout and the arithmetic of ``kda_decode_mtp_kernel``'s ``QUANTIZE_OUTPUT`` epilogue (the
+operand of the Rubin o_proj GEMM).
+
+A tile alone on an SM is in general not faster than in the v2 kernel (the precompute reads bf16
+and GEMM1's two A operands are serialized), while two tiles per SM finish sooner than two waves
+of v2 tiles, so the kernel pays off for grids with more tiles than SMs. With the MXFP8 output a
+tile alone on an SM also finishes sooner than in ``kda_decode_mtp_kernel`` (one CTA or a cluster
+pair).
 """
 
 import cutlass
@@ -241,6 +247,8 @@ def kda_decode_mtp_2cta_kernel(
     beta_cache: cute.Tensor,
     ssm_state_indices: cute.Tensor,
     num_accepted_tokens: cute.Tensor,
+    o8: cute.Tensor,
+    osf: cute.Tensor,
     tiled_mma1: cute.TiledMma,
     tiled_mma3: cute.TiledMma,
     tiled_mma1k: cute.TiledMma,
@@ -268,8 +276,14 @@ def kda_decode_mtp_2cta_kernel(
     lower_bound: cutlass.Constexpr[float],
     onorm_eps: cutlass.Constexpr[float],
     USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+    MXFP8_OUT: cutlass.Constexpr[bool],
 ):
-    """See the module docstring. Grid ``(HV, N, 1)``, one (head, request) tile per CTA."""
+    """See the module docstring. Grid ``(HV, N, 1)``, one (head, request) tile per CTA.
+
+    ``MXFP8_OUT``: instead of the BF16 output ``o``, write the MXFP8 operand of the Rubin CuTe
+    o_proj GEMM with the arithmetic of ``kda_decode_mtp_kernel``'s ``QUANTIZE_OUTPUT`` epilogue:
+    ``o8`` (E4M3 ``[T, HV * V]``) and ``osf`` (uint8, UE8M0 1x128 scales in the R128c4 layout:
+    four copies per (row, head)). Without it ``o8`` and ``osf`` are not accessed."""
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % 32
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1171,6 +1185,7 @@ def kda_decode_mtp_2cta_kernel(
     if ((warp_idx % 4) // 2 == 1) & (token_idx < NEW_TOK):
         pre_values = cute.make_rmem_tensor(cute.make_layout((V // 32,)), cutlass.Float32)
         rms_partial = cutlass.Float32(0.0)
+        pre_max = cutlass.Float32(0.0)
         for i in cutlass.range(V // 32, unroll_full=True):
             v_idx = i * 32 + in_warp_tid
             value = sVall[token_idx * V + v_idx]
@@ -1178,19 +1193,54 @@ def kda_decode_mtp_2cta_kernel(
             sigmoid_gate = cute.arch.rcp_approx(
                 cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
             )
-            pre_values[i] = value * r_ow[i] * sigmoid_gate
+            p_v = value * r_ow[i] * sigmoid_gate
+            pre_values[i] = p_v
             rms_partial += value * value
+            if cutlass.const_expr(MXFP8_OUT):
+                pre_max = cute.arch.fmax(pre_max, cute.arch.fmax(p_v, -p_v))
         for offset in [16, 8, 4, 2, 1]:
             rms_partial += cute.arch.shuffle_sync_bfly(
                 rms_partial, offset=offset, mask=-1, mask_and_clamp=31
             )
+            if cutlass.const_expr(MXFP8_OUT):
+                pre_max = cute.arch.fmax(
+                    pre_max,
+                    cute.arch.shuffle_sync_bfly(pre_max, offset=offset, mask=-1, mask_and_clamp=31),
+                )
         inv_rms = cute.math.rsqrt(
             rms_partial / cutlass.Float32(V) + cutlass.Float32(onorm_eps), fastmath=True
         )
         output_row = i_n * NEW_TOK + token_idx
-        for i in cutlass.range(V // 32, unroll_full=True):
-            v_idx = i * 32 + in_warp_tid
-            o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(pre_values[i] * inv_rms)
+        if cutlass.const_expr(MXFP8_OUT):
+            # kda_decode_mtp_kernel's QUANTIZE_OUTPUT epilogue: BF16-rounded normalized values,
+            # UE8M0 scale of bf16(max |p_v| * inv_rms) / 448 (bf16 rounding is monotonic), E4M3
+            # values, the scale byte replicated four times in the R128c4 layout
+            output_amax = cutlass.Float32(cutlass.BFloat16(pre_max * inv_rms))
+            output_amax = cute.arch.fmax(output_amax, cutlass.Float32(1.0e-10))
+            output_sf = (output_amax * cutlass.Float32(1.0 / 448.0)).to(cutlass.Float8E8M0FNU)
+            quant_scale = cute.arch.rcp_approx(cutlass.Float32(output_sf))
+            for i in cutlass.range(V // 32, unroll_full=True):
+                normalized = cutlass.Float32(cutlass.BFloat16(pre_values[i] * inv_rms))
+                o8[output_row, hv_off + i * 32 + in_warp_tid] = cutlass.Float8E4M3FN(
+                    normalized * quant_scale
+                )
+            if in_warp_tid == 0:
+                scale_bytes = cute.make_tensor(
+                    cute.recast_ptr(osf.iterator, dtype=cutlass.Float8E8M0FNU),
+                    cute.make_layout(osf.shape),
+                )
+                scale_offset = (
+                    (output_row // 128) * HV * 512
+                    + i_hv * 512
+                    + (output_row % 32) * 16
+                    + ((output_row % 128) // 32) * 4
+                )
+                for replica in cutlass.range_constexpr(4):
+                    scale_bytes[scale_offset + replica] = output_sf
+        else:
+            for i in cutlass.range(V // 32, unroll_full=True):
+                v_idx = i * 32 + in_warp_tid
+                o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(pre_values[i] * inv_rms)
     # the state stores must have read their smem boxes before the CTA exits
     if (tidx == 0) | (tidx == 256):
         cute.arch.cp_async_bulk_wait_group(0, read=True)

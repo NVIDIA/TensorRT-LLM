@@ -154,8 +154,9 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
     S = W - 1 + M
 
     def _conv_cache(section):
-        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
+        # Raw bf16 projection inputs, dim-contiguous.
+        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.bfloat16).transpose(-1, -2)
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d]
         return cache
 
     return SimpleNamespace(
@@ -507,12 +508,6 @@ def test_fused_verify_multi_wave_runs_two_cta_kernel(monkeypatch, state_dtype):
     runtime.finalize_decode_weights()
     conv_pool, ssm_pool = _make_pools(batch, seed=2)
     cache = _make_fused_layer_cache(batch, conv_pool)
-    for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v"):
-        # The runtime's conv caches are bf16 (dim-contiguous).
-        src = getattr(cache, name)
-        dst = torch.empty_like(src.transpose(-1, -2), dtype=torch.bfloat16).transpose(-1, -2)
-        dst.copy_(src)
-        setattr(cache, name, dst)
     worlds = []
     for _ in range(2):
         worlds.append(
