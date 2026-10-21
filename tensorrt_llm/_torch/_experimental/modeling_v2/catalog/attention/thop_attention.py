@@ -131,6 +131,16 @@ _ULTRA_BF16_8_1_128 = dict(
     quant_mode=0,
 )
 
+#: Nemotron-3 Ultra BF16 at tp8ep2 / tep8 with an fp8-e4m3 KV pool (`kv_cache_config.dtype: fp8`):
+#: the bf16 checkpoint's 8 q / 1 kv heads per rank over the pool the NVFP4 checkpoint declares --
+#: e4m3 at unit scales, both passed as None. Long agentic contexts are where the pool's bytes
+#: decide the decode batch, and an fp8 pool halves both them and the decode KV reads.
+_ULTRA_BF16_FP8KV_8_1_128 = dict(
+    _ULTRA_FP8_16_1_128,
+    num_heads=8,
+    num_kv_heads=1,
+)
+
 #: The 32 histories of the batch-32 decode cells: every one past its first page,
 #: from 33 (one row into the second page) up to 512, with page fills that differ.
 _ULTRA_DECODE_HISTORIES = tuple(33 + (i * 97) % 480 for i in range(32))
@@ -674,6 +684,75 @@ class ThopAttention(OpWrapper):
                 local_layer_idx=55,
                 cached=(0, 0, 100, 37, 300),
                 new=(1, 1100, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra fp8KV tp8 packed prefill: GQA 8q/1kv d128, e4m3 pool at "
+            "unit scales; fresh contexts of 1, 1100, 77 and 300 rows",
+            spec=dict(
+                _ULTRA_BF16_FP8KV_8_1_128,
+                cached=(0, 0, 0, 0),
+                new=(1, 1100, 77, 300),
+                num_contexts=4,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra fp8KV tp8 decode, batch 1: one row over an 1100-token "
+            "history of 35 pages",
+            spec=dict(
+                _ULTRA_BF16_FP8KV_8_1_128,
+                cached=(1100,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra fp8KV tp8 decode, batch 32: histories 33..512, every "
+            "one past its first page",
+            spec=dict(
+                _ULTRA_BF16_FP8KV_8_1_128,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra fp8KV tp8 decode, batch 256, the serving envelope's "
+            "CUDA-graph ceiling: histories 33..1500",
+            spec=dict(
+                _ULTRA_BF16_FP8KV_8_1_128,
+                max_num_requests=256,
+                num_blocks=6400,
+                cached=_ULTRA_DECODE_HISTORIES_256,
+                new=(1,) * 256,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra fp8KV tp8 mixed step, packed: fresh 1- and 1031-row "
+            "contexts ahead of six decode rows over histories 33..700",
+            spec=dict(
+                _ULTRA_BF16_FP8KV_8_1_128,
+                cached=(0, 0, 33, 64, 65, 200, 511, 700),
+                new=(1, 1031, 1, 1, 1, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra fp8KV tp8 paged-context prefill (chunked prefill / block "
+            "reuse): 512 rows over a 640-token cached prefix beside a fresh 1-row context",
+            spec=dict(
+                _ULTRA_BF16_FP8KV_8_1_128,
+                use_paged_context_fmha=True,
+                cached=(640, 0),
+                new=(512, 1),
                 num_contexts=2,
                 predicted_tokens_per_seq=1,
             ),

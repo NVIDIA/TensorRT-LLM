@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The BF16 tp8ep2 target refuses a cache pool dtype it was not gated on.
+"""The BF16 tp8ep2 target binds the cache pool dtypes it was gated on and refuses the rest.
 
-The attention call passes `quant_mode` 0 and no scales, and the SSM kernels read an fp32 state, so a
+The KV pool may be bf16 (`quant_mode` 0) or fp8-e4m3 at unit scales (`QM_FP8_KV_CACHE`, no scale
+tensors), and the attention calls follow the bound pool; the SSM kernels read an fp32 state. A
 runtime configured otherwise (`kv_cache_config.dtype`, `mamba_ssm_cache_dtype`) would be read and
 written in the wrong width without a shape error anywhere. The pools are the runtime's to size; the
 target's job is to notice the mismatch when it takes them, which is what `_bind_cache_manager` does.
@@ -15,6 +16,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    QM_FP8_KV_CACHE,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.nemotron3_ultra_bf16__sm_100__tp8ep2 import (  # noqa: E501
     modeling as M,
 )
@@ -51,14 +55,16 @@ def _bind(kv=DataType.BF16, conv=torch.bfloat16, ssm=torch.float32):
     return core, cm
 
 
-def test_the_certified_dtypes_bind():
-    core, cm = _bind()
+@pytest.mark.parametrize("kv, quant_mode", [(DataType.BF16, 0), (DataType.FP8, QM_FP8_KV_CACHE)])
+def test_the_certified_dtypes_bind(kv, quant_mode):
+    core, cm = _bind(kv=kv)
     assert core._bound.cm is cm and core._bound.pool_row == {2: 0}
+    assert core._bound.kv_quant_mode == quant_mode
 
 
-@pytest.mark.parametrize("kv", [DataType.FP8, DataType.NVFP4, DataType.HALF])
-def test_a_kv_pool_that_is_not_bf16_is_refused(kv):
-    with pytest.raises(AssertionError, match="bf16 KV cache"):
+@pytest.mark.parametrize("kv", [DataType.NVFP4, DataType.HALF])
+def test_a_kv_pool_that_is_neither_bf16_nor_fp8_is_refused(kv):
+    with pytest.raises(AssertionError, match="bf16 or fp8 KV cache"):
         _bind(kv=kv)
 
 

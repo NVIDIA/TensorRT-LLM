@@ -6907,9 +6907,13 @@ def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 def _e4m3_compare_for(spec) -> Callable[[torch.Tensor, torch.Tensor], None]:
     """The band a cell's e4m3 rows are gated in: `_compare_split_softmax` at the
-    16:1 d128 geometry whose kernel schedule was measured, `_compare` elsewhere."""
+    Nemotron-3 Ultra d128 geometries -- 16:1 (NVFP4 tep4), whose kernel schedule was
+    measured, and 8:1 (the BF16 checkpoint at tp8 over an fp8 pool), the same
+    `QkvE4m3` decode kernels rounding the probabilities the same way -- and `_compare`
+    elsewhere."""
     geometry = (spec["num_heads"], spec["num_kv_heads"], spec["head_size"])
-    return _compare_split_softmax if geometry == (ULTRA_HQ, ULTRA_HKV, ULTRA_D) else _compare
+    split = geometry in ((ULTRA_HQ, ULTRA_HKV, ULTRA_D), (8, ULTRA_HKV, ULTRA_D))
+    return _compare_split_softmax if split else _compare
 
 
 class _UltraHybridEnv(_MultiLayerPagedAttnEnv):

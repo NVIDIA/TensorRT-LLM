@@ -470,6 +470,24 @@ and 6.6 us per call in the model against 11.2, 6.5 and 4.5 us in isolation: the 
 for its predecessor before it loads weights and releases its dependents only after its stores,
 which an earlier PDL trigger would overlap.
 
+#### An fp8 KV pool for long contexts (tp8ep2)
+
+Agentic sessions run tens of thousands of tokens of context, and at TP8 each rank stores a
+whole kv head for every token (the checkpoint's 2 kv heads are replicated four ways): 6 KB per
+token per rank in bf16, so at a 42k-token context the bf16 pool holds only ~106 decoding
+requests per instance and the decode step reads 4.5 ms of KV at 122 rows. `tp8ep2` therefore
+binds an fp8-e4m3 pool as well (`kv_cache_config.dtype: fp8`), at unit kv scales -- what the
+NVFP4 checkpoint of the same model declares -- and passes `QM_FP8_KV_CACHE` to the attention
+calls when it does; anything but bf16 or fp8 is still refused when the pools are taken. The
+`thop_attention` entry certifies the 8 q / 1 kv d128 geometry over that pool (packed and
+paged-context prefill, decode at 1, 32 and 256 rows, a mixed step), gated in the same e4m3 band
+as the 16:1 NVFP4 geometry: the decode kernels round the softmax probabilities in e4m3 the
+same way. Gen-only at a 42k-token context on two GB200 nodes (output tok/s / TPOT): 3191.9 /
+19.21 ms at 64 requests, 4608.4 / 26.05 at 128 and 5830.5 / 30.29 at 192, against 2678.0 /
+22.95 and 3518.6 / 28.83 over the bf16 pool (+19% and +31%) and 1-4% ahead of the built-in
+implementation over the same fp8 pool. GSM8K on tp8ep2 over the fp8 pool: 94.731 (built-in over
+the same pool 94.655, reference 94.769).
+
 ### What replaced the version pin
 
 Out of tree each target hard-asserted a pinned `tensorrt_llm` version at
