@@ -252,13 +252,14 @@ def test_helix_quota_fallback_sets_rank_local_bytes(monkeypatch: pytest.MonkeyPa
 
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
-    def creator(max_gpu_total_bytes, max_tokens):
+    def creator(max_gpu_total_bytes, max_tokens, *, is_disagg=False, fraction=0.5):
         return SimpleNamespace(
+            _is_disagg=is_disagg,
             _mapping=SimpleNamespace(cp_size=4),
             _kv_cache_config=SimpleNamespace(
                 max_gpu_total_bytes=max_gpu_total_bytes,
                 max_tokens=max_tokens,
-                free_gpu_memory_fraction=0.5,
+                free_gpu_memory_fraction=fraction,
             ),
         )
 
@@ -278,6 +279,14 @@ def test_helix_quota_fallback_sets_rank_local_bytes(monkeypatch: pytest.MonkeyPa
     assert KvCacheCreator._configure_helix_kv_cache_capacity(c) is None
     assert c._kv_cache_config.max_gpu_total_bytes == 500_000
     assert c._kv_cache_config.max_tokens is None
+    # Default fraction: aggregated helix lowers it to leave room for prefill
+    # activations; disaggregated helix keeps it.
+    c = creator(0, None, fraction=0.9)
+    KvCacheCreator._configure_helix_kv_cache_capacity(c)
+    assert c._kv_cache_config.max_gpu_total_bytes == 600_000
+    c = creator(0, None, is_disagg=True, fraction=0.9)
+    KvCacheCreator._configure_helix_kv_cache_capacity(c)
+    assert c._kv_cache_config.max_gpu_total_bytes == 900_000
     # Degenerate free memory: actionable error instead of a deep assert.
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 2_000_000))
     with pytest.raises(ValueError, match="free memory"):
