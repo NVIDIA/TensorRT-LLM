@@ -242,6 +242,8 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
     manager._augment_tokens_for_block_reuse = Mock(wraps=manager._augment_tokens_for_block_reuse)
     manager.local_num_mamba_layers = 0
     manager._mark_context_position_as_history = Mock()
+    # Prompt-only commit: the cache stops at the last context chunk.
+    manager._can_commit_generation_blocks = lambda request: False
 
     request = SimpleNamespace(
         py_request_id=req.py_request_id,

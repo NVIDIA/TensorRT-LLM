@@ -36,13 +36,15 @@ l0_b200:
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[False]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[True]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_block_reuse_is_disabled_for_v2
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_bf16_split_matches_fp32_router
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
@@ -170,9 +172,9 @@ l0_b200:
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
-  - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
-  - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
-  - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -194,6 +196,8 @@ l0_b200:
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
@@ -266,9 +270,11 @@ l0_b200:
   - unittest/_torch/speculative/test_chain_speculative_sampling_op.py
   - unittest/_torch/speculative/test_dynamic_tree_rejection_op.py
   - unittest/_torch/speculative/test_dynamic_tree_sampling_dispatch.py
-  - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/thop/parallel
+  - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_afmoe.py
@@ -276,6 +282,7 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
+  - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[256]
@@ -289,6 +296,16 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
+  - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
+  - unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
+  - unittest/_torch/executor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
+  - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_capacity_only_connector_accepts_multigroup_retention[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them[True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them[False]
   # ------------- KV Cache V2 Scheduler IT ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited
@@ -321,7 +338,7 @@ l0_b200:
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
-  - unittest/_torch/cute_dsl_kernels/test_nvfp4_conv3d.py
+  - unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
   - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
@@ -513,6 +530,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_lpips_against_golden
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4-static]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4-static-mha-quantize]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cuda-graph]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4]

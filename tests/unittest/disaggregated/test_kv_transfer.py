@@ -55,8 +55,9 @@ except ImportError as e:
 else:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -93,7 +94,7 @@ class KvCacheConfigV2:
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
 

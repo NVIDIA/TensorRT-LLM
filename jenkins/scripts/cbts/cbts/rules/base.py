@@ -42,12 +42,19 @@ def format_reason(reason: object) -> str:
 
 @dataclass
 class PRInputs:
-    """PR data rules query. `post_merge` reflects /bot run --post-merge."""
+    """PR data, with executable selection diffs and verified docstring facts.
+
+    ``raw_diffs`` preserves source reconstruction input. ``post_merge``
+    reflects /bot run --post-merge.
+    """
 
     changed_files: list[str]
     diffs: dict[str, str]
     post_merge: bool = False
     raw_diffs: dict[str, str] = field(default_factory=dict)
+    # Documentation contributions can coexist with executable edits in one file.
+    docstring_files: set[str] = field(default_factory=set)
+    docstring_only_files: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -78,11 +85,14 @@ class Rule(ABC):
 
     `name`: log/reason identifier.
     `needs_diff_for`: file paths/globs whose diffs the rule consumes.
+    `handles_docstrings`: receives documentation-only Python file paths;
+    other rules receive only files with remaining non-docstring changes.
     `apply(pr)`: return RuleResult or None (not applicable).
     """
 
     name: str = ""
     needs_diff_for: tuple[str, ...] = ()
+    handles_docstrings: bool = False
 
     @abstractmethod
     def apply(self, pr: PRInputs) -> Optional[RuleResult]: ...
