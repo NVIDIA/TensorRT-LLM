@@ -2817,13 +2817,17 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     assert preparation_calls == []
 
 
-@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream", "too_many_tokens"])
 def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
-    """Without an aux stream, NVFP4, or with the kill switch off, the async
-    quantization is the synchronous one and hands back no event to join."""
+    """Without an aux stream, NVFP4, with the kill switch off, or for a batch
+    above the token cap (prefill), the async quantization is the synchronous
+    one and hands back no event to join."""
     from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
 
     monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    monkeypatch.setattr(
+        fused_moe_cute_dsl, "ASYNC_INPUT_QUANT_MAX_TOKENS", 1 if reason == "too_many_tokens" else 2
+    )
     calls = []
     backend = SimpleNamespace(
         has_nvfp4=reason != "not_nvfp4",
