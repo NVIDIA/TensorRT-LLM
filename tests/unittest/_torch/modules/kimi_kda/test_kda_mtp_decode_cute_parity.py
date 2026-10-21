@@ -1324,9 +1324,17 @@ def test_commit_pending_drafts_replays_the_per_token_records():
 def _packed_fused_norm_inputs(B, H, num_spec, state_dtype):
     """Runtime-contract inputs for the packed / fused-norm path: section-strided q / k / v /
     output-gate views of one fused projection, the bf16 beta tail of [f_a | beta], replay caches
-    and conv windows chained from a CPU-golden round 1, mixed acceptance 0..num_spec and
+    and bf16 conv windows chained from a CPU-golden round 1, mixed acceptance 0..num_spec and
     non-identity state slots."""
     data, _ = _round2_inputs(B, H, num_spec)
+    for name in ("cs_q", "cs_k", "cs_v"):
+        # The runtime's conv caches are bf16; round 1 wrote bf16 values into them.
+        src = data[name]
+        dst = torch.empty(
+            src.shape[0], src.shape[2], src.shape[1], dtype=torch.bfloat16, device=src.device
+        ).transpose(1, 2)
+        dst.copy_(src)
+        data[name] = dst
     packed, _ = _pack_new_token_projection_views(data)
     slots = torch.arange(B - 1, -1, -1, dtype=torch.int32, device="cuda")
     packed["ssm_state_indices"] = slots
@@ -1367,9 +1375,9 @@ _VERIFY_RESULTS = (
 )
 
 
-def _run_with_verify_kernel(monkeypatch, kernel, run):
-    """``run()`` with the verify kernel forced to ``kernel``; asserts the selection would have
-    picked it on its own unless ``kernel`` is ``"v1"`` (the reference)."""
+def _run_with_verify_kernel(monkeypatch, kernel, run, expected_selection=None):
+    """``run()`` with the verify kernel forced to ``kernel``; with ``expected_selection``, also
+    asserts the kernel ``_select_verify_kernel`` picks for the call on its own."""
     from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp_ops
 
     select = mtp_ops._select_verify_kernel
@@ -1383,9 +1391,13 @@ def _run_with_verify_kernel(monkeypatch, kernel, run):
         patch.setattr(mtp_ops, "_select_verify_kernel", forced)
         result = run()
     assert selected, "the call did not reach the verify kernel selection"
-    if kernel != "v1":
-        assert selected == [kernel], f"selection picked {selected}, not {kernel}"
+    if expected_selection is not None:
+        assert selected == [expected_selection], f"selection picked {selected}"
     return result
+
+
+def _multi_wave(B, H):
+    return B * H > torch.cuda.get_device_properties(0).multi_processor_count
 
 
 @pytest.mark.parametrize(
@@ -1414,13 +1426,37 @@ def test_v2_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, strided_state
         )
 
     ref = _run_with_verify_kernel(monkeypatch, "v1", run)
-    new = _run_with_verify_kernel(monkeypatch, "v2", run)
+    expected = "two_cta" if _multi_wave(B, H) else "v2"
+    new = _run_with_verify_kernel(monkeypatch, "v2", run, expected_selection=expected)
     for name in _VERIFY_RESULTS:
         assert torch.equal(new[name], ref[name]), f"{name}: v2 differs from v1"
 
 
+@pytest.mark.parametrize(
+    "B,H,num_spec",
+    [(26, 6, 2), (32, 6, 6), (32, 6, 7), (64, 6, 5), (128, 6, 6), (4, 6, 7), (8, 96, 7)],
+    ids=lambda v: str(v),
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_two_cta_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, monkeypatch):
+    """The two-CTAs-per-SM verify kernel performs v2's arithmetic in v2's order: outputs,
+    committed state, conv windows and replay caches match ``kda_decode_mtp_kernel`` bit for bit,
+    for single- and multi-wave grids (selected for multi-wave grids only)."""
+    packed = _packed_fused_norm_inputs(B, H, num_spec, state_dtype)
+
+    def run():
+        return cute_run(packed, packed_token_layout=True, fuse_output_norm=True)
+
+    ref = _run_with_verify_kernel(monkeypatch, "v1", run)
+    expected = "two_cta" if _multi_wave(B, H) else "v2"
+    new = _run_with_verify_kernel(monkeypatch, "two_cta", run, expected_selection=expected)
+    for name in _VERIFY_RESULTS:
+        assert torch.equal(new[name], ref[name]), f"{name}: two-CTA kernel differs from v1"
+
+
 def test_verify_kernel_selection():
-    """v2 serves only the runtime verify contract; every other variant stays on v1."""
+    """v2 and the two-CTA kernel serve only the runtime verify contract, the two-CTA kernel
+    for grids of more tiles than SMs; every other variant stays on v1."""
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import _select_verify_kernel
 
     contract = dict(
@@ -1430,9 +1466,19 @@ def test_verify_kernel_selection():
         bf16_math=False,
         replay_only=False,
         num_spec=7,
+        num_tiles=148,
+        num_sms=148,
         v2_operands_ok=lambda: True,
+        two_cta_operands_ok=lambda: True,
     )
     assert _select_verify_kernel(**contract) == "v2"
+    assert _select_verify_kernel(**{**contract, "num_tiles": 149}) == "two_cta"
+    assert (
+        _select_verify_kernel(
+            **{**contract, "num_tiles": 149, "two_cta_operands_ok": lambda: False}
+        )
+        == "v2"
+    )
     for name, value in (
         ("packed_token_layout", False),
         ("fuse_output_norm", False),

@@ -75,7 +75,7 @@ OFF_B3HI = 24576  # 16 x 128   Kb hi
 OFF_B3LO = 26624  # 16 x 128   Kb lo
 
 
-def _asm_words(n, asm, constraints, operands, *, loc, ip):
+def asm_words(n, asm, constraints, operands, *, loc, ip):
     res = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * n),
         operands,
@@ -94,7 +94,7 @@ def _asm_words(n, asm, constraints, operands, *, loc, ip):
 def ld_global_b32x2(addr: Int64, *, loc=None, ip=None):
     """Two 32-bit words (8 B, 8-byte aligned) from global memory, unconverted: the load has no
     consumer until its value is placed, so a warp keeps all of its loads in flight."""
-    return _asm_words(
+    return asm_words(
         2,
         "ld.global.v2.b32 {$0, $1}, [$2];",
         "=r,=r,l",
@@ -107,7 +107,7 @@ def ld_global_b32x2(addr: Int64, *, loc=None, ip=None):
 @dsl_user_op
 def ld_global_b32x4(addr: Int64, *, loc=None, ip=None):
     """Four 32-bit words (16 B, 16-byte aligned) from global memory, unconverted."""
-    return _asm_words(
+    return asm_words(
         4,
         "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
@@ -120,7 +120,7 @@ def ld_global_b32x4(addr: Int64, *, loc=None, ip=None):
 @dsl_user_op
 def ld_shared_f32x4(addr: cutlass.Int32, *, loc=None, ip=None):
     """Four consecutive fp32 (16-byte aligned) from shared memory."""
-    words = _asm_words(
+    words = asm_words(
         4,
         "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,r",
@@ -132,7 +132,7 @@ def ld_shared_f32x4(addr: cutlass.Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _st_asm(asm, constraints, operands, *, loc=None, ip=None):
+def st_asm(asm, constraints, operands, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
         operands,
@@ -147,7 +147,7 @@ def _st_asm(asm, constraints, operands, *, loc=None, ip=None):
 
 
 def st_global_b32x2(addr, a, b):
-    _st_asm(
+    st_asm(
         "st.global.v2.b32 [$0], {$1, $2};",
         "l,r,r",
         [Int64(addr).ir_value(), cutlass.Int32(a).ir_value(), cutlass.Int32(b).ir_value()],
@@ -155,7 +155,7 @@ def st_global_b32x2(addr, a, b):
 
 
 def st_global_b32x4(addr, a, b, c, d):
-    _st_asm(
+    st_asm(
         "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
         "l,r,r,r,r",
         [Int64(addr).ir_value()] + [cutlass.Int32(x).ir_value() for x in (a, b, c, d)],
@@ -163,7 +163,7 @@ def st_global_b32x4(addr, a, b, c, d):
 
 
 def st_shared_f32x4(addr, a, b, c, d):
-    _st_asm(
+    st_asm(
         "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
         "r,f,f,f,f",
         [cutlass.Int32(addr).ir_value()] + [cutlass.Float32(x).ir_value() for x in (a, b, c, d)],
