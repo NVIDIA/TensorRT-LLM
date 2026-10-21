@@ -68,6 +68,9 @@ l0_gb300_multi_gpus:
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
+  # Vocab-parallel token selection over TP2/TP4 vocab shards, MNNVL and
+  # default all-reduce.
+  - unittest/_torch/multi_gpu/test_vocab_parallel_selection.py
   # Kimi K3 truncated-model (first 4 layers) e2e SA spec-dec logits parity;
   # resolves <LLM_MODELS_ROOT>/Kimi-K3 and FAILS if the checkpoint is not
   # staged (deliberate: a skipped post-merge entry is indistinguishable

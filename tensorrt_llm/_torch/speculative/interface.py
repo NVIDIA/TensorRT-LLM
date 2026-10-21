@@ -47,6 +47,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 
 def rejection_sampling_one_model(
@@ -1844,6 +1845,21 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
 
+    def set_target_model(self, target_model: nn.Module) -> None:
+        """Called at construction with the target model that owns this worker.
+
+        Workers that select target tokens from a vocab-sharded head override
+        this and decide after loading; see :attr:`target_vocab_parallel_head`.
+        """
+        del target_model
+
+    @property
+    def target_vocab_parallel_head(self) -> Optional[VocabParallelHead]:
+        """The head whose vocab-shard logits this worker's
+        :meth:`target_logits` returns, as :class:`VocabShardedLogits`, in
+        place of the gathered target logits. None to receive gathered logits."""
+        return None
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         """
         Prepare attention metadata before speculative decoding draft token generation.
@@ -1996,7 +2012,8 @@ class SpecWorkerBase(nn.Module, ABC):
         acceptance is disabled).
 
         Args:
-            logits: [num_tokens, vocab_size] - Target model logits
+            logits: [num_tokens, vocab_size] - Target model logits, or their
+                vocab shard as ``VocabShardedLogits``
             draft_tokens: [num_gens, runtime_draft_len] - Previously predicted draft tokens
             num_contexts: Number of context requests
             batch_size: Total number of requests
@@ -2012,7 +2029,7 @@ class SpecWorkerBase(nn.Module, ABC):
         runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
+        if isinstance(logits, torch.Tensor) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
         # Allocate return buffers
@@ -3231,7 +3248,9 @@ class SpecWorkerBase(nn.Module, ABC):
         Supports both greedy and non-greedy sampling.
 
         Args:
-            logits: [num_tokens, vocab_size] - Logits to sample from
+            logits: [num_tokens, vocab_size] - Logits to sample from, or their
+                vocab shard as ``VocabShardedLogits`` when the worker selects
+                tokens vocab-parallel for this batch's sampling mode
             spec_metadata: Metadata containing sampling parameters
             num_contexts: Number of context requests in the batch
             batch_size: Number of requests in the batch
@@ -3239,6 +3258,8 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        if isinstance(logits, VocabShardedLogits):
+            return logits.select_tokens(spec_metadata)
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
