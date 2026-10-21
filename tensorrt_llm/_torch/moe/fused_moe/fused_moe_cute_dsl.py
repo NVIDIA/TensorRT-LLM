@@ -1038,9 +1038,19 @@ class CuteDslFusedMoE(MoEImplBase):
         - x_sf is reshaped from 1D to 2D: [num_elements] -> [batch_size, ceil_div(hidden_size, scaling_vector_size)]
         - The 2D shape is required for proper handling in alltoall/allgather operations
         - scaling_vector_size is typically the group size for block-wise quantization
+
+        An AWQ-style NVFP4 checkpoint (NVFP4_AWQ / NVFP4_ARC) carries a
+        per-channel pre-quant scale, which ``load_quant_scales`` turns into
+        ``fc31_act_scale``; the input is multiplied by it before quantization.
         """
         x_sf = None
         if self.has_nvfp4:
+            fc31_act_scale = getattr(self, "fc31_act_scale", None)
+            if fc31_act_scale is not None:
+                assert not isinstance(
+                    x, Fp4QuantizedTensor
+                ), "Fp4QuantizedTensor is not expected for AWQ quantization."
+                x = x * fc31_act_scale
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]

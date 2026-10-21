@@ -297,9 +297,18 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
 
         The 2D shape ``[num_tokens, ceil(hidden / scaling_vector_size)]`` is
         what alltoall / allgather expect for the scaling factors.
+
+        An AWQ-style checkpoint's per-channel pre-quant scale
+        (``fc31_act_scale``) is applied to the input before quantization.
         """
         del post_quant_comm  # single path: always quantized ahead of comm
         assert self.has_nvfp4
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            assert not isinstance(x, Fp4QuantizedTensor), (
+                "Fp4QuantizedTensor is not expected for AWQ quantization."
+            )
+            x = x * fc31_act_scale
         if isinstance(x, Fp4QuantizedTensor):
             assert not x.is_sf_swizzled, (
                 "Fp4QuantizedTensor should not be swizzled before communication"

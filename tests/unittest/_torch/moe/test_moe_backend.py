@@ -134,7 +134,12 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
-from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+    is_gated_activation,
+)
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -1506,6 +1511,195 @@ def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
     else:
         with pytest.raises(ValueError, match="pre-quant activation scale"):
             method.transform_weights(module)
+
+
+# The CuteDSL NVFP4 leaves serve NVFP4_AWQ / NVFP4_ARC layers too
+# (``canonical_quant`` folds both into ``nvfp4``), so ``quantize_input`` has to
+# apply the ``fc31_act_scale`` that ``load_quant_scales`` builds from the
+# checkpoint's pre_quant_scale, as the CUTLASS and TRTLLM-Gen leaves do.
+_CUTEDSL_NVFP4_LEAVES = pytest.mark.parametrize(
+    "leaf_cls", [CuteDslFusedMoE, CuteDslFc12FusedMoE], ids=["grouped_gemm", "fused_fc12"]
+)
+
+
+def _cutedsl_nvfp4_input_quantizer(leaf_cls, act_scale, hidden_size=32):
+    """A CuteDSL NVFP4 leaf carrying only what ``quantize_input`` reads.
+
+    ``__new__`` without ``__init__``: a real constructor allocates expert
+    weights on a GPU, and ``quantize_input`` reads none of them.
+    """
+    module = leaf_cls.__new__(leaf_cls)
+    torch.nn.Module.__init__(module)
+    module.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ)
+    module._weights_created = True
+    module.hidden_size = hidden_size
+    module.scaling_vector_size = 16
+    module.fc31_input_scale = torch.ones(())
+    module.fc31_act_scale = act_scale
+    return module
+
+
+@_CUTEDSL_NVFP4_LEAVES
+@pytest.mark.parametrize("has_act_scale", [False, True], ids=["no_act_scale", "act_scale"])
+def test_cutedsl_nvfp4_quantizes_the_smoothed_input(leaf_cls, has_act_scale, monkeypatch):
+    """What reaches ``fp4_quantize`` is ``x * fc31_act_scale`` when the scale is set.
+
+    The quantize op is stubbed to record its input, so this runs without a GPU.
+    """
+    hidden_size = 32
+    act_scale = None
+    if has_act_scale:
+        act_scale = torch.linspace(0.5, 2.0, hidden_size, dtype=torch.bfloat16).view(1, -1)
+    module = _cutedsl_nvfp4_input_quantizer(leaf_cls, act_scale, hidden_size)
+    quantized_inputs = []
+
+    def fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        quantized_inputs.append(x)
+        num_rows, k = x.shape
+        return (
+            torch.zeros(num_rows, k // 2, dtype=torch.uint8),
+            torch.zeros(num_rows * k // sf_vec_size, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fake_fp4_quantize)
+    x = torch.randn(4, hidden_size, dtype=torch.bfloat16)
+    _, x_sf = module.quantize_input(x, post_quant_comm=False)
+
+    assert len(quantized_inputs) == 1
+    expected = x * act_scale if has_act_scale else x
+    torch.testing.assert_close(quantized_inputs[0], expected, rtol=0, atol=0)
+    assert x_sf.shape == (4, hidden_size // 16)
+
+
+@_CUTEDSL_NVFP4_LEAVES
+def test_cutedsl_nvfp4_refuses_a_prequantized_input_under_a_pre_quant_scale(leaf_cls):
+    """An input quantized upstream never had the pre-quant scale applied."""
+    module = _cutedsl_nvfp4_input_quantizer(leaf_cls, torch.ones(1, 32, dtype=torch.bfloat16))
+    x = Fp4QuantizedTensor(
+        fp4_tensor=torch.zeros(4, 16, dtype=torch.uint8),
+        scaling_factor=torch.zeros(4, 2, dtype=torch.uint8),
+        is_sf_swizzled=False,
+    )
+    with pytest.raises(AssertionError, match="AWQ"):
+        module.quantize_input(x, post_quant_comm=False)
+
+
+@skip_pre_blackwell
+def test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass():
+    """CuteDSL and CUTLASS agree on an NVFP4_AWQ layer, and both match the reference.
+
+    The checkpoint is calibrated on ``x * pre_quant_scale``, which is what the
+    reference runs FC1 on. The last check is the control: the same output
+    against the reference on the unsmoothed input must fail, or this test could
+    not tell a dropped scale apart.
+    """
+    model_config = MoeModelConfig(8, 2, 512, 512)
+    seq_len = 16
+    dtype = torch.bfloat16
+    verdict = CuteDslFusedMoE.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=model_config.hidden_size,
+            intermediate_size=model_config.intermediate_size,
+            num_experts=model_config.num_experts,
+            top_k=model_config.top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=model_config.num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+        x = torch.randn((seq_len, model_config.hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, model_config.num_experts), dtype=dtype, device="cuda")
+        # Per-channel factors in [1/e, e]: dropping them moves FC1's input far
+        # past the comparison tolerance.
+        pre_quant_scale = (
+            torch.empty(model_config.hidden_size, device="cuda").uniform_(-1, 1).exp().to(dtype)
+        )
+        x_smoothed = x * pre_quant_scale
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x_smoothed, MoeBackendType.CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=model_config.num_experts,
+            dtype=dtype,
+            intermediate_size=model_config.intermediate_size,
+            hidden_size=model_config.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=ActivationType.Swiglu,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        for expert_id in range(model_config.num_experts):
+            weights[f"{expert_id}.w1.pre_quant_scale"] = pre_quant_scale
+            weights[f"{expert_id}.w3.pre_quant_scale"] = pre_quant_scale
+
+        outputs = {}
+        for backend_type in (MoeBackendType.CUTLASS, MoeBackendType.CUTEDSL):
+            backend = create_test_backend(
+                backend_type=backend_type,
+                routing_method=routing_method,
+                num_experts=model_config.num_experts,
+                hidden_size=model_config.hidden_size,
+                intermediate_size=model_config.intermediate_size,
+                dtype=dtype,
+                quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ),
+                mapping=mapping,
+            )
+            backend.load_weights([weights])
+            backend.post_load_weights()
+            backend.cuda()
+            assert backend.fc31_act_scale is not None
+            with torch.inference_mode():
+                token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+                x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+                outputs[backend_type] = run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x_smoothed, router_logits)
+            unsmoothed_ref_output = ref_fused_moe.forward(x, router_logits)
+
+        cutlass_output = outputs[MoeBackendType.CUTLASS]
+        cutedsl_output = outputs[MoeBackendType.CUTEDSL]
+        ref_fused_moe.check_accuracy(cutlass_output, ref_output)
+        ref_fused_moe.check_accuracy(cutedsl_output, ref_output)
+        ref_fused_moe.check_accuracy(cutedsl_output, cutlass_output)
+        with pytest.raises(Exception, match="Mismatch percentage"):
+            ref_fused_moe.check_accuracy(cutedsl_output, unsmoothed_ref_output)
 
 
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
