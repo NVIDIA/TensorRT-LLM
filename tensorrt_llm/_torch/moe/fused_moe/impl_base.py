@@ -33,6 +33,7 @@ from .impl_contract import (
     MoEEplbBinding,
     MoEProblem,
     MoERunContext,
+    MoESortTables,
     identity_quant_of,
     require_layer_quant_format,
 )
@@ -297,6 +298,32 @@ class MoEImplBase(
         that itself. Overriding this is how a backend opts in.
         """
         return None
+
+    def consumes_sort_tables(self) -> bool:
+        """Whether ``run_moe`` runs on ``MoERunContext.sort_tables`` (the
+        ``moe_sort`` outputs a routing kernel wrote) instead of sorting itself.
+
+        A fixed property of the configured backend (quantization, expert
+        layout), read once by ``ConfigurableMoE``. Declining is the default;
+        overriding this is how a backend opts in.
+        """
+        return False
+
+    def try_route_with_sort(
+        self, router_logits: "torch.Tensor"
+    ) -> "tuple[torch.Tensor, torch.Tensor, MoESortTables] | None":
+        """Route with a kernel that also writes this rank's ``moe_sort`` tables.
+
+        Returns ``routing_method.apply``'s selected experts and scales plus
+        the tables, which reach ``run_moe`` as ``MoERunContext.sort_tables``,
+        or ``None`` when the routing method has no such kernel for these
+        logits. The scheduler asks only a backend that
+        :meth:`consumes_sort_tables`, and only when the routed ids reach this
+        rank unchanged (``ConfigurableMoE.sort_routing_applies``).
+        """
+        return self.routing_method.apply_with_sort(
+            router_logits, self.slot_start, self.expert_size_per_partition
+        )
 
     # ---- impl-owned resources: produced here, never passed in -------------
     def get_workspaces(self, *args: object, **kwargs: object) -> "list[dict] | None":

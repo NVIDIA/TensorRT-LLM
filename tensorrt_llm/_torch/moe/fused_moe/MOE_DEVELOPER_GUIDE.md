@@ -121,7 +121,7 @@ comprehensive early-validation layer for every incompatible feature.
 `ExternalCommMoEScheduler._forward_chunk_impl` runs per chunk:
 
 ```text
-[EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
+[EPLB start_wait_gpu] → routing (or backend.try_route_with_sort) → [EPLB done_wait_gpu + update_statistic + route]
   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
   → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
   → comm.combine → [EPLB done_set_cpu]
@@ -132,6 +132,8 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 ```
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`, unless the backend declares `input_requirement.run_moe_reuses_buffers`: its `run_moe` returns a view of a buffer the next call overwrites and keeps scratch across calls (the B12x leaves, whose `B12xMoEWrapper` output buffer is also shared across layers). `ExternalCommMoEScheduler` then runs its chunks on one stream and copies every chunk but the last out before the next chunk runs — the trailing `torch.cat` copies the last one. `FusedCommMoEScheduler` copies no chunk output at all, so it refuses a backend that declares the field rather than aliasing its chunks.
+
+Routing may come from one kernel that also writes the backend's `moe_sort` tables. When the routed ids reach the rank unchanged (no comm strategy, EPLB, `apply_router_weight_on_input` or `routing_aux`), the scheduler first asks `backend.try_route_with_sort(router_logits)`. A backend that consumes `moe_sort` tables opts in by forwarding to `routing_method.apply_with_sort(...)` for its expert range; the tables reach `run_moe` as `MoERunContext.sort_tables`. `DeepSeekV3MoeRoutingMethod` serves it with the Kimi-K3 decode routing kernel (`moe/kernels/blackwell/kimi_k3_routing.py`: ungrouped top-16 of 896 experts, at most 256 tokens, SM100/SM103/SM107, bitwise `noaux_tc_op` + `moe_sort`); the CuteDSL NVFP4 grouped GEMM (`TrtllmCutedslGroupedGemmNvfp4Impl`) runs on the tables when their tile is the tuned one.
 
 `unfinalized_combine_fn` is a constructor argument (`create_moe(..., unfinalized_combine_fn=...)`) for a model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum. Once registered it runs on **every** `do_finalize=False` forward, with or without a comm strategy, so the forward's return type (dense tensor vs. unfinalized triple) depends only on static config. Under a comm strategy the scheduler runs it on the dispatched rows and the combine reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. That reordering is only sound for a combine that is an unweighted row sum over a dense per-token tensor; `DeepEPLowLatency.combine` is not one (it consumes expert-major rows and applies the routing weights itself), which is what `Communication.supports_finalize_before_combine()` declares. `ConfigurableMoE.validate_backend` rejects at construction: a backend without `supports_unfinalized_output()`, a comm without `supports_finalize_before_combine()`, and `apply_router_weight_on_input`. With no hook registered, `do_finalize=False` plus a comm strategy stays a named runtime refusal instead of a crash inside the comm layer.
 
