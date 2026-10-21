@@ -368,7 +368,7 @@ def test_configuration_is_the_fixed_scope() -> None:
     assert model_module.LAYER_TYPES == tuple(CONFIG["layer_types"])
     assert model_module.MLP_LAYER_TYPES == tuple(CONFIG["mlp_layer_types"])
     assert model_module.ATTENTION_WINDOWS == (512,) * 5 + (1024,)
-    assert model_module.MAX_TOKENS == max(LENGTHS)
+    assert model_module.MAX_TOKENS == model_module.KV_CACHE["max_seq_len"] == 1024
     for field, value in model_module.SUPPORTED_CONFIG.items():
         assert CONFIG[field] == value, field
     schema = model_module.weight_schema(model_config())
@@ -573,8 +573,8 @@ def test_rejects_unsupported_inputs_before_dispatch(case, monkeypatch) -> None:
     elif case == "empty":
         ids, positions = ids[:, :0], positions[:, :0]
     elif case == "too_long":
-        ids = generate_ids(17, 129).repeat(1, 2)[:, :130]
-        positions = positions_of(130)
+        ids = generate_ids(17, 129).repeat(1, 8)[:, : model_module.MAX_TOKENS + 1].contiguous()
+        positions = positions_of(model_module.MAX_TOKENS + 1)
     elif case == "host_ids":
         ids = ids.cpu()
     elif case == "non_contiguous_ids":

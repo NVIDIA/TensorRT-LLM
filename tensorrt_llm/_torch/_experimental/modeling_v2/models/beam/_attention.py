@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The attention sublayer of the Beam decoder block components, one fresh context.
+"""The attention sublayer of the Beam decoder block components, one request step.
 
 Shared by the dense and sparse block components. It holds no parameters, cache or
 configuration: each block passes its own tensors and geometry, its layer's position
@@ -19,6 +19,17 @@ before the block's post-attention norm::
 A full-attention layer has no position embedding: neither q nor k is rotated, and its
 only position dependence is the per-token query scale above.
 
+One call is one step of one request: a context call (``num_contexts == 1``) appends its
+T new tokens after the ``past`` tokens the cache already holds for the request -- none for
+a fresh context, a reused or earlier-computed prefix otherwise -- and a generation call
+(``num_contexts == 0``) appends exactly one token. Every position is absolute: the new
+tokens sit at ``past .. past + T - 1``, where ``past + T`` is the request's KV length in
+the metadata, and the positions the block receives must be exactly those. A context call
+over a cached prefix must use paged-context FMHA, the path that reads the prefix's keys and
+values from the pool; without it the context kernel would attend to the new rows only.
+The keys and values the op appends are the transformed k (normalized, rotated on a sliding
+layer) and the projected v of the new tokens, written to the request's own pages.
+
 Logical layer and cache slot. A block's ``layer_idx`` is its depth in the model: it fixes
 the block's semantics (its residual coefficients, its attention and feed-forward kind).
 The KV cache it appends to is a ``KVCacheManagerV2`` that holds that layer, so its storage
@@ -29,8 +40,9 @@ such as ``get_buffers`` take the logical one and translate it. The slot is resol
 each call's metadata, never stored, and a manager that does not hold the block's logical
 layer is rejected before any kernel runs.
 
-Host synchronization: the position check compares the positions with ``arange(T)`` on the
-device and reads the answer back, once per call. The metadata checks read host tensors only.
+Host synchronization: the position check compares the positions with
+``arange(past, past + T)`` on the device and reads the answer back, once per call. The
+metadata checks read host tensors only.
 """
 
 from __future__ import annotations
@@ -163,10 +175,11 @@ def check_step(
     """Raise ValueError on any call input a block would otherwise compute wrongly.
 
     Accepted: ``hidden_states`` contiguous ``[1, T, hidden_size]`` bf16 on ``device``,
-    1 <= T <= ``max_tokens``; integer ``position_ids`` ``[1, T]`` equal to ``arange(T)``
-    on that device; a prepared ``TrtllmAttentionMetadata`` holding one fresh context
-    request of T tokens on a BF16 ``KVCacheManagerV2`` that holds logical layer
-    ``layer_idx`` with ``num_kv_heads`` kv heads of ``head_dim``.
+    1 <= T <= ``max_tokens``; integer ``position_ids`` ``[1, T]`` equal to
+    ``arange(past, past + T)`` on that device; a prepared ``TrtllmAttentionMetadata``
+    holding one step of one request on a BF16 ``KVCacheManagerV2`` that holds logical
+    layer ``layer_idx`` with ``num_kv_heads`` kv heads of ``head_dim`` (``check_metadata``
+    states the steps and returns ``past``).
     """
     if not isinstance(hidden_states, torch.Tensor) or hidden_states.dtype != torch.bfloat16:
         raise ValueError("hidden_states must be a torch.bfloat16 tensor")
@@ -182,7 +195,7 @@ def check_step(
         raise ValueError("hidden_states must be contiguous on the block's device")
     num_tokens = hidden_states.shape[1]
     if not 1 <= num_tokens <= max_tokens:
-        raise ValueError(f"supported context lengths are 1..{max_tokens}, got {num_tokens}")
+        raise ValueError(f"supported token counts per call are 1..{max_tokens}, got {num_tokens}")
     if (
         not isinstance(position_ids, torch.Tensor)
         or position_ids.is_floating_point()
@@ -192,12 +205,17 @@ def check_step(
         raise ValueError(
             f"position_ids must be an integer [1, {num_tokens}] tensor on the block's device"
         )
-    expected = torch.arange(num_tokens, dtype=position_ids.dtype, device=position_ids.device)
-    if not torch.equal(position_ids[0], expected):
-        raise ValueError("a fresh context must have positions 0..T-1")
-    check_metadata(
+    past = check_metadata(
         md, num_tokens, layer_idx=layer_idx, num_kv_heads=num_kv_heads, head_dim=head_dim
     )
+    expected = torch.arange(
+        past, past + num_tokens, dtype=position_ids.dtype, device=position_ids.device
+    )
+    if not torch.equal(position_ids[0], expected):
+        raise ValueError(
+            f"the call appends tokens {past}..{past + num_tokens - 1} after {past} cached "
+            "tokens; its positions must be exactly those"
+        )
 
 
 def check_metadata(
@@ -207,33 +225,73 @@ def check_metadata(
     layer_idx: int,
     num_kv_heads: int,
     head_dim: int,
-) -> None:
-    """Raise ValueError unless ``md`` is one prepared fresh context request of ``num_tokens``
-    tokens on a BF16 ``KVCacheManagerV2`` holding logical layer ``layer_idx`` with
-    ``num_kv_heads`` kv heads of ``head_dim``. Reads host-side state only.
+) -> int:
+    """Raise ValueError unless ``md`` is one prepared step of one request; return ``past``.
+
+    Accepted on a BF16 ``KVCacheManagerV2`` holding logical layer ``layer_idx`` with
+    ``num_kv_heads`` kv heads of ``head_dim``, beam width 1, no cross attention or
+    speculative decoding, one sequence whose KV length L fits the manager's
+    ``max_seq_len``, and either
+
+    * a context step of ``num_tokens`` new tokens: ``num_contexts == 1``, context length
+      ``num_tokens``, ``past = L - num_tokens >= 0`` tokens already cached, and
+      paged-context FMHA whenever ``past > 0``; or
+    * a generation step: ``num_contexts == 0``, one new token after ``past = L - 1 >= 1``.
+
+    ``past`` is the absolute position of the step's first new token. Reads host-side
+    state only.
     """
     if not isinstance(md, TrtllmAttentionMetadata):
         raise ValueError(f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}")
     mgr = md.kv_cache_manager
     if mgr is None:
         raise ValueError("attn_metadata needs a KV cache manager for the paged append")
-    if md.num_seqs != 1 or md.num_contexts != 1 or md.num_ctx_tokens != num_tokens:
+    if md.is_cross or md.is_spec_decoding_enabled or md.beam_width != 1:
+        raise ValueError("cross attention, speculative decoding and beams are not supported")
+    if md.num_seqs != 1:
+        raise ValueError(f"one request per call is supported; metadata has {md.num_seqs}")
+    if md.kv_cache_params is None or md.kv_cache_params.num_extra_kv_tokens:
+        raise ValueError("the metadata must use the KV cache without extra KV tokens")
+    if num_tokens > md.max_num_tokens:
         raise ValueError(
-            f"one context request of {num_tokens} tokens is supported; metadata has "
-            f"{md.num_seqs} sequences, {md.num_contexts} contexts, {md.num_ctx_tokens} context tokens"
+            f"the call has {num_tokens} tokens; the metadata holds {md.max_num_tokens} per call"
         )
-    if int(md.kv_lens_runtime[0]) != num_tokens or int(md.prompt_lens_cpu_runtime[0]) != num_tokens:
+    kv_len = int(md.kv_lens_runtime[0])
+    request_type = int(md.host_request_types_runtime[0])
+    past = kv_len - num_tokens
+    if md.num_contexts == 1:
+        if (
+            md.num_ctx_tokens != num_tokens
+            or int(md.prompt_lens_cpu_runtime[0]) != num_tokens
+            or request_type != 0
+        ):
+            raise ValueError(
+                f"a context step of {num_tokens} tokens needs {num_tokens} context tokens and "
+                f"context length {num_tokens}; metadata has {md.num_ctx_tokens} context tokens "
+                f"and context length {int(md.prompt_lens_cpu_runtime[0])}"
+            )
+        if past < 0:
+            raise ValueError(
+                f"the KV length {kv_len} is shorter than the call's {num_tokens} tokens"
+            )
+        if past and not md.use_paged_context_fmha:
+            raise ValueError(
+                f"a context step after {past} cached tokens must read them from the pool: "
+                "paged-context FMHA is required"
+            )
+    elif md.num_contexts == 0:
+        if num_tokens != 1 or md.num_ctx_tokens != 0 or request_type != 1:
+            raise ValueError(f"a generation step appends exactly one token, got {num_tokens}")
+        if past < 1:
+            raise ValueError("a generation step needs the request's earlier tokens in the cache")
+    else:
         raise ValueError(
-            "a cached prefix is not supported: the request must start at an empty cache"
+            f"one request per call is supported; metadata has {md.num_contexts} contexts"
         )
-    if (
-        md.use_paged_context_fmha
-        or md.is_cross
-        or md.is_spec_decoding_enabled
-        or md.beam_width != 1
-    ):
+    if kv_len > mgr.max_seq_len or md.max_seq_len != mgr.max_seq_len:
         raise ValueError(
-            "paged-context FMHA, cross attention, speculative decoding and beams are not supported"
+            f"the request reaches {kv_len} tokens; the cache holds {mgr.max_seq_len} per sequence "
+            f"and the metadata states {md.max_seq_len}"
         )
     local = local_layer_index(md, layer_idx)
     heads = getattr(mgr, "num_kv_heads_per_layer", None) or []
@@ -243,6 +301,7 @@ def check_metadata(
             f"the KV cache must be BF16 with {num_kv_heads} kv heads of {head_dim}; "
             f"got {mgr.dtype}, {heads}, head_dim {mgr.head_dim}"
         )
+    return past
 
 
 def step_args(md: TrtllmAttentionMetadata, layer_idx: int) -> dict:

@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam six-block small model / sm_103 / tp1: token ids to prefill logits, constructed directly.
+"""Beam six-block small model / sm_103 / tp1: token ids to logits, one request step per call.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no registered architecture: nothing in the engine builds this class, and it serves no
-request. A caller constructs it from a six-block configuration of the checkpoint -- the
-checkpoint's own fields with ``num_hidden_layers = 6`` and the first six entries of its
-two layer schedules -- loads its 2394 tensors and runs one fresh BF16 context through it,
-with the attention batch state prepared on a six-layer ``KVCacheManagerV2``
-(``prefill_context`` builds one). It does not call the built-in Beam modeling.
+request on its own. A caller constructs it from a six-block configuration of the
+checkpoint -- the checkpoint's own fields with ``num_hidden_layers = 6`` and the first six
+entries of its two layer schedules -- loads its 2394 tensors and runs one step of one BF16
+request through it, with the attention batch state prepared on a six-layer
+``KVCacheManagerV2``: ``prefill_context`` builds a fresh one for a single context, and the
+stateful generator in ``generation.py`` keeps one across requests for cached decoding and
+prefix reuse. It does not call the built-in Beam modeling.
 
 The model, all blocks with their own parameters and logical index::
 
@@ -23,28 +25,42 @@ The model, all blocks with their own parameters and logical index::
 The blocks are the dense and sparse block components, built for logical layers 0-2 and
 3-5; each block's residual coefficients, attention kind and router are its own layer's.
 
+Steps. A call is one step of one request: a context step computes the T tokens of the
+request's prompt that are not yet in its cache, after the ``past`` tokens that are (none
+for a fresh context; a prefix reused from another request or computed by an earlier step
+otherwise), and a generation step appends one token. The tokens sit at absolute positions
+``past .. past + T - 1``; the returned rows are those tokens' logits.
+
 Cache. One call appends every layer's keys and values to one ``KVCacheManagerV2`` that
 holds exactly logical layers 0-5, each in its own local slot: ``layer_offsets`` maps
 logical layer i to slot i, and slot i's rows in the pool tables belong to it alone. The
-five sliding layers keep a 512-token window and layer 5 keeps the whole context; the
-manager states this as its per-layer window vector ``[512] * 5 + [None]`` (``None`` is
+five sliding layers attend through a 512-token window and layer 5 to the whole history;
+the manager states this as its per-layer window vector ``[512] * 5 + [None]`` (``None`` is
 the full ``max_seq_len``), and the attention op of each layer is called with that layer's
-window. ``check_cache`` verifies all of it before the first layer runs, including that
-the host pool tables the attention op reads address each slot's own key and value pages
-as the manager allocated them. Cache contents are written as the backend requires; they
-are not read back, reused or shared between calls.
+window. Before the first layer runs, ``check_cache`` verifies the manager, its slots and
+the host pool tables the attention op reads -- that they address each slot's own key and
+value pages as the manager allocated them -- and ``check_request`` verifies the request:
+that the manager holds an active cache for it whose history ends exactly where the step
+begins (a step never rewrites a cached token) and with the capacity the step needs, that
+every page the step reads or writes is a valid page of its pool, and that the block-offset
+table the op reads holds exactly the manager's addresses of those pages. Earlier tokens' keys
+and values are read from the pool on a cached context step (paged-context FMHA) and on
+every generation step.
 
-Host synchronization per call: one for the model's token-id range and position check,
-one for each block's position check, and each sparse block's MoE dispatch (two, plus two
-per selected expert). A call is therefore not capturable in a CUDA graph.
+Host synchronization per call: one for the model's token-id range, position and
+block-offset check, one for each block's position check, and each sparse block's MoE
+dispatch (two, plus two per selected expert). A call is therefore not capturable in a CUDA
+graph.
 """
 
 from __future__ import annotations
 
 import contextlib
+import weakref
 from collections import OrderedDict
 from typing import Iterator, Mapping
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -59,7 +75,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
 from .. import _attention
 from ..dense_block_bf16__sm_103__tp1 import block as dense_block
@@ -86,13 +102,14 @@ SUPPORTED_CONFIG = {
     "final_logit_softcapping": 30.0,
 }
 
-#: The longest fresh context the model was measured at; longer ones are rejected.
-MAX_TOKENS = 129
-
 #: The KV cache ``prefill_context`` builds: bf16, 32-token pages, a 1024-token sequence
 #: capacity and one request. A window equal to ``max_seq_len`` is the whole context.
 KV_CACHE = {"tokens_per_block": 32, "max_seq_len": 1024, "max_tokens": 1024}
 ATTENTION_WINDOWS = (512,) * 5 + (KV_CACHE["max_seq_len"],)
+
+#: The most tokens one call may compute: the sequence capacity. A request's whole KV
+#: length is bounded by its cache's ``max_seq_len``.
+MAX_TOKENS = KV_CACHE["max_seq_len"]
 
 _SM = (10, 3)
 
@@ -149,16 +166,17 @@ def weight_schema(config) -> "OrderedDict[str, tuple[tuple[int, ...], torch.dtyp
     return schema
 
 
-def check_cache(md: TrtllmAttentionMetadata, num_tokens: int) -> None:
+def check_cache(md: TrtllmAttentionMetadata, kv_len: int) -> None:
     """Raise ValueError unless the call's cache holds the six layers in distinct valid slots.
 
     Required, before any layer writes: a ``KVCacheManagerV2`` holding exactly logical
     layers 0-5, mapped one-to-one onto its six local slots; 8 bf16 kv heads of 128 in
     every slot; a 512-token window on the sliding layers and the whole context on layer
-    5, the full window holding the call's tokens; keys and values in one shared page
-    table per pool; and host pool tables that address, for every slot, exactly the key
-    and value pages the manager allocated to that slot, so that no two slots share
-    storage (``_check_pool_tables``). Reads host-side manager state and host tensors only.
+    5, the full window holding the request's ``kv_len`` tokens; keys and values in one
+    shared page table per pool; host pool tables that address, for every slot, exactly
+    the key and value pages the manager allocated to that slot, so that no two slots
+    share storage (``_check_pool_tables``); and an int32 CUDA block-offset table of the
+    shape the attention op indexes. Reads host-side manager state and tensor metadata only.
     """
     mgr = getattr(md, "kv_cache_manager", None)
     if not isinstance(mgr, KVCacheManagerV2):
@@ -199,12 +217,113 @@ def check_cache(md: TrtllmAttentionMetadata, num_tokens: int) -> None:
                 f"full-attention layer {layer_idx} must keep the whole context in slot {slot}; "
                 f"the manager keeps a {window}-token window"
             )
-    if mgr.max_seq_len < num_tokens or md.max_seq_len != mgr.max_seq_len:
+    if mgr.max_seq_len < kv_len or md.max_seq_len != mgr.max_seq_len:
         raise ValueError(
             f"the cache holds {mgr.max_seq_len} tokens per sequence and the metadata states "
-            f"{md.max_seq_len}; the call has {num_tokens}"
+            f"{md.max_seq_len}; the request reaches {kv_len}"
         )
     _check_pool_tables(md, mgr, slots)
+    offsets = md.kv_cache_block_offsets
+    if (
+        not isinstance(offsets, torch.Tensor)
+        or offsets.device.type != "cuda"
+        or offsets.dtype != torch.int32
+        or offsets.dim() != 4
+        or tuple(offsets.shape[i] for i in (0, 2, 3))
+        != (mgr.num_attention_op_pools, 2, mgr.max_blocks_per_seq)
+        or offsets.shape[1] < 1
+    ):
+        raise ValueError(
+            "the block-offset table must be a CUDA torch.int32 [pools, sequences, 2, "
+            f"{mgr.max_blocks_per_seq}] tensor with {mgr.num_attention_op_pools} pools"
+        )
+
+
+def _pool_windows(mgr: KVCacheManagerV2) -> dict:
+    """Each pool's attention window, from the windows of the slots it holds (``None``: full)."""
+    windows: dict = {}
+    for slot in range(NUM_LAYERS):
+        pool = int(mgr.impl.get_layer_group_id(LayerId(slot)))
+        window = mgr.max_attention_window_vec[slot]
+        if windows.setdefault(pool, window) != window:
+            raise ValueError(f"pool {pool} holds slots with windows {windows[pool]} and {window}")
+    return windows
+
+
+def check_request(md: TrtllmAttentionMetadata, num_tokens: int, kv_len: int):
+    """Raise ValueError unless the call continues its request's cache on valid pages.
+
+    The call reads keys and values of earlier tokens and writes its own ``num_tokens``
+    after ``kv_len - num_tokens`` cached ones. Required, from the manager's own state: one
+    request id, whose cache in the manager is active, holds exactly those ``kv_len -
+    num_tokens`` tokens (its ``history_length``: the call appends right after them, so it
+    never rewrites a token the cache holds -- committed or reused prefix pages included,
+    which the manager keeps within the history -- and leaves no unwritten gap) and has
+    capacity for ``kv_len`` tokens; and for every pool, a valid page of that pool -- not
+    ``BAD_PAGE_INDEX``, inside the pool -- at every block ordinal a token of the call can
+    read or write: on the full layer's pool every ordinal below ``kv_len``, on the sliding
+    layers' pool those from the oldest key the call's first query attends to. Ordinals
+    older than that may carry the manager's out-of-window sentinel.
+
+    Returns ``(expected, live)``: host int32 ``[pools, 2, n]`` block-offset entries the op
+    must read for those pages (the manager's page-to-offset conversion of each page) and
+    a bool ``[pools, n]`` mask of the ordinals checked, ``n = ceil(kv_len / tokens_per_block)``.
+    The caller compares them with the CUDA table. Reads host-side manager state only.
+    """
+    mgr = md.kv_cache_manager
+    request_ids = list(md.request_ids or ())
+    if len(request_ids) != 1:
+        raise ValueError(f"one request per call is supported; metadata names {request_ids}")
+    (request_id,) = request_ids
+    kv_cache = mgr.kv_cache_map.get(request_id)
+    if kv_cache is None or not kv_cache.is_active:
+        raise ValueError(f"request {request_id} holds no active cache in this manager")
+    history = int(kv_cache.history_length)
+    if history != kv_len - num_tokens:
+        raise ValueError(
+            f"request {request_id}'s cache holds {history} tokens; the call writes tokens "
+            f"{kv_len - num_tokens}..{kv_len - 1}, but a step must append right after the tokens "
+            "the cache holds"
+        )
+    if kv_cache.capacity < kv_len:
+        raise ValueError(
+            f"request {request_id} has capacity for {kv_cache.capacity} tokens; the call reaches "
+            f"{kv_len}"
+        )
+    tokens_per_block = mgr.tokens_per_block
+    num_blocks = -(-kv_len // tokens_per_block)
+    held = int(kv_cache.num_blocks)
+    if held < num_blocks:
+        raise ValueError(f"request {request_id} holds {held} blocks; the call needs {num_blocks}")
+    first_query = kv_len - num_tokens
+    pools = _pool_windows(mgr)
+    num_pools = len(mgr.impl.layer_grouping)
+    if sorted(pools) != list(range(num_pools)):
+        raise ValueError(f"the six slots occupy pools {sorted(pools)} of {num_pools}")
+    expected = torch.zeros((num_pools, 2, num_blocks), dtype=torch.int32)
+    live = torch.zeros((num_pools, num_blocks), dtype=torch.bool)
+    for pool, window in sorted(pools.items()):
+        oldest = 0 if window is None else max(0, first_query - window + 1)
+        pages = np.frombuffer(kv_cache.get_base_page_indices(pool), dtype=np.int32, count=held)
+        layer = next(
+            LayerId(slot)
+            for slot in range(NUM_LAYERS)
+            if int(mgr.impl.get_layer_group_id(LayerId(slot))) == pool
+        )
+        scale, value_offset = int(mgr.index_scales[pool]), int(mgr.kv_offset[pool])
+        bound = int(mgr.impl.get_page_index_upper_bound(layer, Role.KEY))
+        for ordinal in range(oldest // tokens_per_block, num_blocks):
+            page = int(pages[ordinal])
+            if page == BAD_PAGE_INDEX or page < 0 or scale * page + value_offset >= bound:
+                raise ValueError(
+                    f"request {request_id} has page {page} at block {ordinal} of pool {pool}; "
+                    f"the call reads or writes that block and the pool holds pages below "
+                    f"{bound // scale}"
+                )
+            expected[pool, 0, ordinal] = scale * page
+            expected[pool, 1, ordinal] = scale * page + value_offset
+            live[pool, ordinal] = True
+    return expected, live
 
 
 def _overlap(spans) -> bool:
@@ -354,15 +473,22 @@ class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
     loads all 2394 tensors by checkpoint name; the model runs only after that succeeded.
 
     ``forward(input_ids [1, T] int32/int64, position_ids [1, T], attn_metadata)`` returns
-    ``[1, T, 151936]`` ``torch.float32`` on the model's device: row t, entry v is token t's
-    softcapped logit for vocabulary id v. Accepted: 1 <= T <= 129 token ids in
-    ``[0, 151936)``, contiguous on the model's device; integer positions equal to
-    ``arange(T)``; and the prepared ``TrtllmAttentionMetadata`` of one fresh context
-    request of T tokens on the six-layer cache ``check_cache`` describes, such as
-    ``prefill_context(T)`` yields. Anything else is rejected with ValueError before the
-    embedding lookup or any other kernel runs, including an id outside the vocabulary.
-    Inputs and parameters are never modified. Decode, cached prefixes, chunked prefill,
-    batches, padding and contexts longer than 129 tokens are not computed here.
+    ``[1, T, 151936]`` ``torch.float32`` on the model's device: row t, entry v is the
+    softcapped logit for vocabulary id v of the t-th token of the call. Accepted:
+    1 <= T <= ``MAX_TOKENS`` token ids in ``[0, 151936)``, contiguous on the model's device;
+    the prepared ``TrtllmAttentionMetadata`` of one step of one request -- a context step
+    of T tokens after ``past`` cached ones (paged-context FMHA when ``past > 0``) or a
+    one-token generation step -- on the six-layer cache ``check_cache`` describes, its
+    request's pages valid as ``check_request`` describes and its KV length at most the
+    cache's ``max_seq_len``; and integer positions equal to ``arange(past, past + T)``.
+    ``prefill_context(T)`` yields such metadata for a fresh context; the generator in
+    ``generation.py`` for every step of its requests. Anything else is rejected with
+    ValueError before the embedding lookup or any other kernel runs, including an id
+    outside the vocabulary. Inputs and parameters are never modified. Batches of several
+    requests and padding are not computed here.
+
+    Weights cannot change under a cache built from them: ``load_weights`` raises while a
+    generator holding this model's cache is open (``close`` it first).
     """
 
     def __init__(self, config, device: str | torch.device = "cuda"):
@@ -393,6 +519,8 @@ class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
         self.norm = empty(NORM)
         self.lm_head = empty(HEAD)
         self._loaded = False
+        #: Generators whose KV cache holds keys and values computed with these weights.
+        self._cache_holders: "weakref.WeakSet" = weakref.WeakSet()
 
     @property
     def device(self) -> torch.device:
@@ -427,7 +555,17 @@ class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
         was. The model runs only after a load completed: a failure while copying leaves it
         unloaded until a later load succeeds. Copies proceed one tensor (one expert, one
         block's attention tensors) at a time; no copy of a whole bank is made.
+
+        Raises RuntimeError, before checking or copying anything, while an open generator
+        holds a KV cache computed with the current weights: its cached and reusable keys
+        and values would no longer match them.
         """
+        holders = [holder for holder in self._cache_holders if not holder.closed]
+        if holders:
+            raise RuntimeError(
+                f"{len(holders)} open generator(s) hold KV caches computed with these weights; "
+                "close them before loading new weights"
+            )
         self.check_weights(weights)
         self._loaded = False
         for name, param in ((EMBED, self.embed_tokens), (NORM, self.norm), (HEAD, self.lm_head)):
@@ -438,6 +576,14 @@ class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
                 {name[len(prefix) :]: w for name, w in weights.items() if name.startswith(prefix)}
             )
         self._loaded = True
+
+    def register_cache_holder(self, holder) -> None:
+        """Record a generator whose KV cache holds keys and values computed with these weights.
+
+        ``holder`` must expose a ``closed`` attribute; while it is False ``load_weights``
+        raises. Holders are referenced weakly.
+        """
+        self._cache_holders.add(holder)
 
     def _check_call(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor, md: TrtllmAttentionMetadata
@@ -455,7 +601,9 @@ class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
             raise ValueError(f"input_ids must be [1, T], got {tuple(input_ids.shape)}")
         num_tokens = input_ids.shape[1]
         if not 1 <= num_tokens <= MAX_TOKENS:
-            raise ValueError(f"supported context lengths are 1..{MAX_TOKENS}, got {num_tokens}")
+            raise ValueError(
+                f"supported token counts per call are 1..{MAX_TOKENS}, got {num_tokens}"
+            )
         if input_ids.device != self.device or not input_ids.is_contiguous():
             raise ValueError(f"input_ids must be contiguous on the model's device {self.device}")
         if (
@@ -472,18 +620,45 @@ class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
             raise ValueError(
                 f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}"
             )
-        check_cache(md, num_tokens)
-        for layer_idx in range(NUM_LAYERS):
+        mgr = getattr(md, "kv_cache_manager", None)
+        if not isinstance(mgr, KVCacheManagerV2):
+            raise ValueError(f"the KV cache must be a KVCacheManagerV2, got {type(mgr).__name__}")
+        pasts = {
             _attention.check_metadata(
                 md, num_tokens, layer_idx=layer_idx, num_kv_heads=8, head_dim=128
             )
-        expected = torch.arange(num_tokens, dtype=position_ids.dtype, device=self.device)
+            for layer_idx in range(NUM_LAYERS)
+        }
+        (past,) = pasts
+        kv_len = past + num_tokens
+        check_cache(md, kv_len)
+        expected_table, live = check_request(md, num_tokens, kv_len)
+        table = md.kv_cache_block_offsets[:, 0, :, : expected_table.shape[-1]]
+        table_ok = (
+            (table == expected_table.to(table.device, non_blocking=True))
+            | ~live.to(table.device, non_blocking=True)[:, None, :]
+        ).all()
+        expected = torch.arange(
+            past, past + num_tokens, dtype=position_ids.dtype, device=self.device
+        )
         low, high = torch.aminmax(input_ids)
-        positions_ok, ids_ok = torch.stack(
-            ((position_ids[0] == expected).all(), (low >= 0) & (high < self.vocab_size))
+        positions_ok, ids_ok, table_ok = torch.stack(
+            (
+                (position_ids[0] == expected).all(),
+                (low >= 0) & (high < self.vocab_size),
+                table_ok,
+            )
         ).tolist()
         if not positions_ok:
-            raise ValueError("a fresh context must have positions 0..T-1")
+            raise ValueError(
+                f"the call appends tokens {past}..{kv_len - 1} after {past} cached tokens; its "
+                "positions must be exactly those"
+            )
+        if not table_ok:
+            raise ValueError(
+                "the block-offset table does not address the pages the manager allocated to "
+                "the request"
+            )
         if not ids_ok:
             raise ValueError(
                 f"token ids must be in [0, {self.vocab_size}); got values in "

@@ -5,8 +5,9 @@
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration for one of the dense blocks
-0, 1 or 2, loads the block's fifteen tensors and runs one fresh BF16 context through it,
-with the attention batch state prepared on a ``KVCacheManagerV2``. The forward is
+0, 1 or 2, loads the block's fifteen tensors and runs one step of one BF16 request through
+it -- a context step after any cached prefix, or a one-token generation step -- with the
+attention batch state prepared on a ``KVCacheManagerV2``. The forward is
 assembled from catalog entries, with the attention sublayer shared with the sparse block
 component in ``../_attention.py``, and it does not call the built-in Beam modeling.
 
@@ -68,8 +69,9 @@ SUPPORTED_LAYER_IDX = 0
 SUPPORTED_LAYER_INDICES = (0, 1, 2)
 SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 
-#: The longest fresh context the block was measured at; longer ones are rejected.
-MAX_TOKENS = 129
+#: The most tokens one call may append: the six-layer model's sequence capacity. Longer
+#: calls are rejected; the request's whole KV length is bounded by its cache's capacity.
+MAX_TOKENS = 1024
 
 _SM = (10, 3)
 
@@ -146,15 +148,16 @@ def check_config(config, layer_idx: int) -> None:
 
 
 class BeamDenseBlockBf16Sm103Tp1(nn.Module):
-    """Beam dense decoder block 0, 1 or 2: BF16 weights and activations, one GPU, one fresh context.
+    """Beam dense decoder block 0, 1 or 2: BF16 weights and activations, one GPU, one request step.
 
     ``forward(hidden_states [1, T, 5120] bf16, position_ids [1, T], attn_metadata)``
-    returns ``[1, T, 5120]`` bf16 for 1 <= T <= 129, positions ``arange(T)`` and a
-    prepared ``TrtllmAttentionMetadata`` holding exactly that one context request on a
-    BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that holds the
-    block's logical layer ``layer_idx``. Inputs outside that are rejected before any
-    kernel runs; decode, cached prefixes, chunked prefill, batches and other blocks are
-    not computed here.
+    returns ``[1, T, 5120]`` bf16 for 1 <= T <= ``MAX_TOKENS``, a prepared
+    ``TrtllmAttentionMetadata`` holding one step of one request on a BF16
+    ``KVCacheManagerV2`` (8 kv heads of 128) that holds the block's logical layer
+    ``layer_idx`` -- a context step of T tokens after ``past`` cached ones (paged-context
+    FMHA when ``past > 0``) or a one-token generation step -- and positions
+    ``arange(past, past + T)``. Inputs outside that are rejected before any kernel runs;
+    batches of several requests and other blocks are not computed here.
     """
 
     def __init__(

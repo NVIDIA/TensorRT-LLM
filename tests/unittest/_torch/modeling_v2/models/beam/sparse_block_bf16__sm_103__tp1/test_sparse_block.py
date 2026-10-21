@@ -899,7 +899,7 @@ def test_configuration_is_the_fixed_scope() -> None:
     assert BLOCK_CONFIG["layer_types"][LAYER_IDX] == "sliding_attention"
     assert BLOCK_CONFIG["mlp_layer_types"][LAYER_IDX] == "sparse"
     assert len(BLOCK_CONFIG["layer_types"]) == len(BLOCK_CONFIG["mlp_layer_types"]) == NUM_LAYERS
-    assert block_module.MAX_TOKENS == max(LENGTHS) == reference.MAX_TOKENS
+    assert block_module.MAX_TOKENS == 1024 and max(LENGTHS) == reference.MAX_TOKENS
     own = block_module.weight_shapes(block_config())
     assert list(own.items()) == list(reference.own_shapes().items())
     assert (reference.HEADS, reference.KV_HEADS, reference.HEAD_DIM) == (48, 8, 128)

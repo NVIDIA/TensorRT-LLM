@@ -797,7 +797,7 @@ def test_configuration_is_the_fixed_scope() -> None:
     for field, value in block_module.SUPPORTED_CONFIG.items():
         assert BLOCK_CONFIG[field] == value, field
     assert BLOCK_CONFIG["rope_parameters"]["sliding_attention"] == block_module.SUPPORTED_ROPE
-    assert block_module.MAX_TOKENS == max(LENGTHS)
+    assert block_module.MAX_TOKENS == 1024 >= max(LENGTHS)
     assert reference.BLOCK0.hidden == BLOCK_CONFIG["hidden_size"]
     assert reference.BLOCK0.intermediate == BLOCK_CONFIG["intermediate_size"]
     assert (reference.BLOCK0.heads, reference.BLOCK0.kv_heads, reference.BLOCK0.head_dim) == (

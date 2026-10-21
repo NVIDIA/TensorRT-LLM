@@ -5,9 +5,10 @@
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration for one of the sparse blocks
-3, 4 or 5, loads the block's 782 tensors and runs one fresh BF16 context through it, with
-the attention batch state prepared on a ``KVCacheManagerV2`` that holds the block's
-logical layer. The forward is assembled from catalog entries, the attention sublayer
+3, 4 or 5, loads the block's 782 tensors and runs one step of one BF16 request through it
+-- a context step after any cached prefix, or a one-token generation step -- with the
+attention batch state prepared on a ``KVCacheManagerV2`` that holds the block's logical
+layer. The forward is assembled from catalog entries, the attention sublayer
 shared with the dense block component (``../_attention.py``) and the MoE component
 (``../moe_bf16__sm_103__tp1``); it does not call the built-in Beam modeling and owns no
 dense MLP.
@@ -37,8 +38,9 @@ does not hold the layer -- a default one-layer manager holds layer 0 -- is rejec
 before any kernel runs.
 
 Host synchronization per call: one for the position check, and the MoE's dispatch
-synchronizations (two, plus two per selected expert). Lengths up to 129 tokens never
-reach the 512-token window, so behaviour at or beyond the window is not exercised here.
+synchronizations (two, plus two per selected expert). Positions are absolute: a sliding
+layer attends to the newest 512 keys of the request's history up to each query, the
+full-attention layer to all of them.
 """
 
 from __future__ import annotations
@@ -82,8 +84,9 @@ SUPPORTED_LAYER_INDICES = tuple(ATTENTION_TYPES)
 #: RoPE of the sliding layers; the full-attention layers have none.
 SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 
-#: The longest fresh context the block was measured at; longer ones are rejected.
-MAX_TOKENS = 129
+#: The most tokens one call may append: the six-layer model's sequence capacity. Longer
+#: calls are rejected; the request's whole KV length is bounded by its cache's capacity.
+MAX_TOKENS = 1024
 
 _SM = (10, 3)
 
@@ -159,18 +162,19 @@ def check_config(config, layer_idx: int) -> None:
 
 class BeamSparseBlockBf16Sm103Tp1(nn.Module):
     """Beam sparse decoder block 3, 4 or 5: BF16 weights and activations, an FP32 router, one GPU,
-    one fresh context.
+    one request step.
 
     State: the twelve BF16 attention and norm tensors of ``weight_shapes`` and ``mlp``, the
     MoE component with its router and 256 experts; ``load_weights`` loads all 782.
 
     ``forward(hidden_states [1, T, 5120] bf16, position_ids [1, T], attn_metadata)``
-    returns ``[1, T, 5120]`` bf16 for 1 <= T <= 129, positions ``arange(T)`` and a
-    prepared ``TrtllmAttentionMetadata`` holding exactly that one context request on a
-    BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that holds the
-    block's logical layer. Inputs outside that are rejected before any kernel runs;
-    decode, cached prefixes, chunked prefill, batches and other blocks are not computed
-    here. Inputs and parameters are never modified.
+    returns ``[1, T, 5120]`` bf16 for 1 <= T <= ``MAX_TOKENS``, a prepared
+    ``TrtllmAttentionMetadata`` holding one step of one request on a BF16
+    ``KVCacheManagerV2`` (8 kv heads of 128) that holds the block's logical layer -- a
+    context step of T tokens after ``past`` cached ones (paged-context FMHA when
+    ``past > 0``) or a one-token generation step -- and positions ``arange(past, past + T)``.
+    Inputs outside that are rejected before any kernel runs; batches of several requests
+    and other blocks are not computed here. Inputs and parameters are never modified.
     """
 
     def __init__(
