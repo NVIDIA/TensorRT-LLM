@@ -636,6 +636,7 @@ def make_kv_cache_manager(
     # Default: no request contributes a full new block, so the prefix-aware
     # skip never fires and tests that don't care about it are unaffected.
     mgr.probe_first_new_block_key.side_effect = first_new_block_fn or (lambda req: None)
+    mgr.plan_context_waits.return_value = {}
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
     mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
@@ -917,6 +918,34 @@ class TestTokenBudget:
 # ===========================================================================
 # Draft Token Budget Interaction (Non-Chunked)
 # ===========================================================================
+
+
+class TestInflightPrefixWait:
+    def test_waiting_request_stays_queued(self):
+        mgr = make_kv_cache_manager()
+        mgr.plan_context_waits.return_value = {1: None}
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 2]
+        mgr.plan_context_waits.assert_called_once_with(reqs)
+
+    def test_request_waits_for_a_new_request_admitted_ahead_of_it(self):
+        mgr = make_kv_cache_manager()
+        mgr.plan_context_waits.return_value = {1: 0, 2: 0}
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_request_does_not_wait_for_a_new_request_left_queued(self):
+        # Request 0 does not get its pages, so it prefills nothing this pass.
+        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: req.py_request_id != 0)
+        mgr.plan_context_waits.return_value = {1: 0}
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(2)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [1]
 
 
 class TestDraftTokenBudget:

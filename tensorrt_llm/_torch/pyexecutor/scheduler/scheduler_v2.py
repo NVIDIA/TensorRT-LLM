@@ -565,10 +565,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+        # New requests that wait for a prefix another request is prefilling.
+        prefix_waits = self.kv_cache_manager.plan_context_waits(pending_ctx) if pending_ctx else {}
 
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            if req.py_request_id in prefix_waits:
+                # A request new in this pass only prefills the prefix if it was
+                # admitted ahead of this one.
+                owner_id = prefix_waits[req.py_request_id]
+                if owner_id is None or any(r.py_request_id == owner_id for r in scheduled_ctx):
+                    continue
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
             if (

@@ -3146,6 +3146,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _ple_ngram_context_shape: list[int] = []
     # Set per instance on a disaggregated context server of a KDA model.
     kda_context_only = False
+    # Request id -> snapshot points requested by requests waiting for its
+    # prefix (KVCacheManagerV2.plan_context_waits). Set per instance.
+    _requested_snapshot_points: Optional[Dict[int, set[int]]] = None
 
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # The incoming recurrent state overwrites the whole local slot and summarizes the
@@ -3274,6 +3277,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # overwrites the per-request list on every scheduler pass, so the point
         # has to be re-merged from here rather than stored only on the request.
         self._branch_snapshot_points: Dict[int, int] = {}
+        self._requested_snapshot_points = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
@@ -3912,11 +3916,38 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
-        if (not self.enable_block_reuse or not self.kv_cache_config.
-                block_reuse_config.enable_branch_snapshot):
+        if (self.enable_block_reuse and
+                self.kv_cache_config.block_reuse_config.enable_branch_snapshot):
+            for request in requests:
+                self._apply_branch_snapshot_point(request)
+        if self._requested_snapshot_points:
+            for request in requests:
+                self._apply_requested_snapshot_points(request)
+
+    def _request_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Snapshot ``owner`` at ``point`` for a request waiting for that prefix.
+
+        Returns False when ``owner`` cannot take it anymore (already past it, or
+        the point is not inside its prompt).
+        """
+        point = point // self.tokens_per_block * self.tokens_per_block
+        if not owner.context_current_position < point < owner.prompt_len:
+            return False
+        points = self._requested_snapshot_points.setdefault(
+            owner.py_request_id, set())
+        if point not in points:
+            points.add(point)
+            self._apply_requested_snapshot_points(owner)
+        return True
+
+    def _apply_requested_snapshot_points(self, request: LlmRequest) -> None:
+        requested = self._requested_snapshot_points.get(request.py_request_id)
+        if not requested:
             return
-        for request in requests:
-            self._apply_branch_snapshot_point(request)
+        start = request.context_current_position
+        points = set(request.expect_snapshot_points)
+        points.update(point for point in requested if point > start)
+        request.expect_snapshot_points = sorted(points)
 
     def _apply_branch_snapshot_point(
         self,
@@ -4679,6 +4710,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        if self._requested_snapshot_points is not None:
+            self._requested_snapshot_points.pop(request.py_request_id, None)
         self._kda_replay_suspended.discard(request.py_request_id)
         self._kda_replay_acceptance_pending.discard(request.py_request_id)
         self._kda_replay_unseeded.discard(request.py_request_id)
@@ -5136,6 +5169,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.old_dt = None
         self.old_dA_cumsum = None
         self._branch_snapshot_points.clear()
+        if self._requested_snapshot_points is not None:
+            self._requested_snapshot_points.clear()
         self._kda_replay_layers = []
         self._kda_replay_suspended.clear()
         self._kda_replay_acceptance_pending.clear()
