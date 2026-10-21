@@ -574,6 +574,9 @@ _KF_BF16_INPUTS = (
     "v_cache",
     "beta_cache",
 )
+# The constants the kernel reads as float32. The mixer casts its parameters to BF16 (A_log and dt_bias among them), so
+# it passes FP32 copies of those two (see mtp_verify).
+_KF_FP32_INPUTS = ("w_q", "w_k", "w_v", "A_log", "dt_bias", "onorm_weight")
 # Tensors read through tensor maps or bulk copies: (name, stride dims that must be whole 16-byte units).
 _KF_ROW_ALIGNED = (
     ("x_q", (1,)),
@@ -707,6 +710,9 @@ def _kf_verify_ineligibility(kwargs: dict, mxfp8_output: bool) -> Optional[str]:
         return "dtype"
     if kwargs["g_cache"].dtype != torch.float32:
         return "dtype"
+    for name in _KF_FP32_INPUTS:
+        if kwargs[name].dtype != torch.float32:
+            return f"{name} is {kwargs[name].dtype}, not torch.float32"
     if not _kf_layout_ok(kwargs, num_heads, kwargs["num_spec"]):
         return "layout"
     for name, dims in _KF_ROW_ALIGNED:
@@ -717,6 +723,21 @@ def _kf_verify_ineligibility(kwargs: dict, mxfp8_output: bool) -> Optional[str]:
         ):
             return f"{name} alignment"
     return None
+
+
+def _with_fp32_gate_constants(
+    kwargs: dict, A_log_f32: Optional[torch.Tensor], dt_bias_f32: Optional[torch.Tensor]
+) -> dict:
+    """The verify arguments with FP32 copies of ``A_log`` / ``dt_bias``, which the KF kernel reads as float32.
+
+    The copies hold the same values as the parameters (BF16 -> FP32 is exact). Without them, or with other shapes,
+    the arguments stay as they are and the eligibility check names a parameter that is not float32.
+    """
+    if A_log_f32 is None or dt_bias_f32 is None:
+        return kwargs
+    if A_log_f32.shape != kwargs["A_log"].shape or dt_bias_f32.shape != kwargs["dt_bias"].shape:
+        return kwargs
+    return {**kwargs, "A_log": A_log_f32, "dt_bias": dt_bias_f32}
 
 
 def _kf_mtp_verify(
@@ -870,7 +891,12 @@ class KDAKernelDispatch:
                 )
 
     def mtp_verify(
-        self, *, mxfp8_output: bool = False, **kwargs
+        self,
+        *,
+        mxfp8_output: bool = False,
+        A_log_f32: Optional[torch.Tensor] = None,
+        dt_bias_f32: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
@@ -882,6 +908,10 @@ class KDAKernelDispatch:
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
         per-step loop with intermediate-buffer promotion.
+
+        ``A_log_f32`` / ``dt_bias_f32``: FP32 copies of ``A_log`` / ``dt_bias``
+        (the mixer casts those parameters to BF16), read only by the Kernel
+        Factory verify kernel; the CuTe DSL kernels read ``A_log`` / ``dt_bias``.
         """
         if self.verify_kernel_path != "optimized":
             raise RuntimeError(
@@ -889,9 +919,10 @@ class KDAKernelDispatch:
                 "sequential FLA verify fallback instead."
             )
         if self._kf_verify:
-            reason = _kf_verify_ineligibility(kwargs, mxfp8_output)
+            kf_kwargs = _with_fp32_gate_constants(kwargs, A_log_f32, dt_bias_f32)
+            reason = _kf_verify_ineligibility(kf_kwargs, mxfp8_output)
             if reason is None:
-                route = (kwargs["A_log"].shape[0], kwargs["num_spec"])
+                route = (kf_kwargs["A_log"].shape[0], kf_kwargs["num_spec"])
                 _log_kf_once(
                     f"route {route}",
                     f"{_KF_VERIFY_ENV}: Kernel Factory verify kernel for {route[0]} heads, "
@@ -900,7 +931,7 @@ class KDAKernelDispatch:
                 # PDL follows the stack-wide TRTLLM_ENABLE_PDL switch. The kernel waits for its
                 # producer before its first global access and never triggers early.
                 enable_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-                return _kf_mtp_verify(enable_pdl=enable_pdl, **kwargs)
+                return _kf_mtp_verify(enable_pdl=enable_pdl, **kf_kwargs)
             _log_kf_once(
                 reason,
                 f"{_KF_VERIFY_ENV}: CuTe DSL verify kernels for an ineligible call ({reason})",

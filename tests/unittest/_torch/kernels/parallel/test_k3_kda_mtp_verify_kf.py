@@ -27,7 +27,13 @@ buffer. This also holds for batches large enough that the kernel runs more than 
 the two ops drift apart only by rounding, either op continues from the other's state and caches, requests that share a
 padding slot do not disturb the others, CUDA graph replay (with and without PDL) reproduces the eager bytes, unsupported
 inputs are rejected, and the dispatch routes only eligible calls, only when enabled, keeping the others (route, dtype,
-layout) on the CuTe DSL kernels.
+layout) on the CuTe DSL kernels. Built the way the engine builds them (KimiKDALinearAttention.forward_verify with its
+BF16 A_log / dt_bias parameters, on a real KDAHybridCacheManagerV2), the verify calls take the Kernel Factory route and
+pass the same checker against the CuTe DSL op, without touching other slots or layers.
+
+In images whose libraries bring their own C++ exception-handling runtime (seen with cuRAND in the Kimi K3 images), a
+TORCH_CHECK failing inside a trtllm op aborts the process instead of raising RuntimeError, which ends the session at
+test_rejects_unsupported_inputs; preload the system libstdc++ and libgcc_s there (LD_PRELOAD).
 """
 
 import pytest
@@ -592,6 +598,17 @@ def test_eligibility_policy():
     assert reason(96, 3, packed_token_layout=False) is not None
     state = _case(96, 3, 4, seed=1)["recurrent_state"]
     assert reason(96, 3, recurrent_state=state.float()) == "dtype"
+    # The engine keeps A_log and dt_bias as BF16 parameters: those calls need the mixer's FP32 copies.
+    params = _case(96, 3, 4, seed=1)
+    a_bf16, dt_bf16 = params["A_log"].to(BF16), params["dt_bias"].to(BF16)
+    assert reason(96, 3, A_log=a_bf16) == "A_log is torch.bfloat16, not torch.float32"
+    assert reason(96, 3, dt_bias=dt_bf16) == "dt_bias is torch.bfloat16, not torch.float32"
+    engine = dict(_dispatch_kwargs(params), A_log=a_bf16, dt_bias=dt_bf16)
+    with_copies = kk._with_fp32_gate_constants(engine, a_bf16.float(), dt_bf16.float())
+    assert kk._kf_verify_ineligibility(with_copies, True) is None
+    assert with_copies["A_log"].dtype == torch.float32 and engine["A_log"] is a_bf16
+    assert kk._with_fp32_gate_constants(engine, None, None) is engine
+    assert kk._with_fp32_gate_constants(engine, a_bf16[:8].float(), dt_bf16.float()) is engine
     # Layouts the CuTe DSL kernels may take but the Kernel Factory op rejects stay on the CuTe DSL kernels.
     assert reason(96, 3, recurrent_state=state.transpose(2, 3)) == "layout"
     slots = _case(96, 3, 4, seed=1)["ssm_state_indices"]
@@ -630,3 +647,227 @@ def test_switch_parsing(monkeypatch):
     monkeypatch.setenv("TRTLLM_K3_KDA_VERIFY_KF", "yes")
     with pytest.raises(ValueError):
         kk.KDAKernelDispatch()
+
+
+# The verify call as the engine builds it: KimiKDALinearAttention.forward_verify on a real KDAHybridCacheManagerV2.
+ENGINE_BUFFERS = {
+    "cs_q": "kda_conv_q",
+    "cs_k": "kda_conv_k",
+    "cs_v": "kda_conv_v",
+    "recurrent_state": "temporal",
+    "k_cache": "kda_k_cache",
+    "g_cache": "kda_g_cache",
+    "v_cache": "kda_v_cache",
+    "beta_cache": "kda_beta_cache",
+}
+
+
+class _PrequantizedProjection(torch.nn.Module):
+    """o_proj stand-in for the resident MXFP8 projection of SM107: returns the verify kernel's codes and scales."""
+
+    supports_prequantized_input = True
+
+    def forward_prequantized(self, activation, activation_scale):
+        return activation, activation_scale
+
+
+def _engine_buffers(layer_cache):
+    return {name: getattr(layer_cache, attr) for name, attr in ENGINE_BUFFERS.items()}
+
+
+def _engine_setup(heads, num_spec, batch, seed, num_layers=3, max_batch=None):
+    """(runtime, manager, slots, hidden rows) for KimiKDALinearAttention.forward_verify as the engine runs it.
+
+    The mixer keeps A_log / dt_bias as BF16 parameters, projects q | k | v | output gate as sections of one GEMM
+    output (the kernel reads strided views at offsets 0, D, 2D, 3D) and beta as a slice of [f_a | b] (row stride
+    ceil8(128 + H), offset 128). The state, conv windows, replay caches and accepted counts are the views of a
+    KDAHybridCacheManagerV2 with num_layers KDA layers: per-slot blocks, a BF16 state, counts at stride 4. o_proj is the
+    stand-in above, so a call returns the MXFP8 codes and scales. Every slot of every layer holds finite values.
+    """
+    try:
+        from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import KDAHybridCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+        from tensorrt_llm.mapping import Mapping
+    except ImportError as e:
+        pytest.skip(f"mixer or KV cache manager v2 unavailable: {e}")
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    dim = heads * 128
+    max_batch = batch if max_batch is None else max_batch
+
+    def rn(*shape, scale=1.0):
+        return torch.randn(*shape, generator=gen, device="cuda") * scale
+
+    manager = KDAHybridCacheManagerV2(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=heads,
+        mamba_n_groups=heads,
+        mamba_head_dim=128,
+        mamba_num_layers=num_layers,
+        mamba_layer_mask=[True] * num_layers,
+        mamba_cache_dtype=BF16,
+        mamba_ssm_cache_dtype=BF16,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=max(128, 32 * max_batch),
+            host_cache_size=64 << 20,
+            enable_block_reuse=False,
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=0,
+        num_kv_heads=0,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=64,
+        max_batch_size=max_batch,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.BF16,
+        spec_config=MTPDecodingConfig(max_draft_len=num_spec),
+        layer_mask=[False] * num_layers,
+        conv_state_layout="q_k_v",
+        kda_replay_num_spec=num_spec,
+    )
+    request_ids = list(range(101, 101 + batch))
+    manager.add_dummy_requests(request_ids, token_nums=[32] * batch, is_gen=False)
+    slots = torch.tensor(manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda")
+    for layer in range(num_layers):
+        bufs = _engine_buffers(manager.mamba_layer_cache(layer))
+        pool = bufs["recurrent_state"].shape[0]
+        bufs["recurrent_state"].copy_(rn(pool, heads, 128, 128, scale=0.5))
+        for name in ("cs_q", "cs_k", "cs_v"):
+            bufs[name].copy_(rn(pool, dim, 3 + num_spec, scale=0.5))
+        k = rn(pool, num_spec, heads, 128)
+        bufs["k_cache"].copy_((k / k.norm(dim=-1, keepdim=True)).reshape(pool, num_spec, dim))
+        bufs["g_cache"].copy_(-5.0 * torch.sigmoid(rn(pool, num_spec, dim)))
+        bufs["v_cache"].copy_(torch.nn.functional.silu(rn(pool, num_spec, dim)))
+        bufs["beta_cache"].copy_(torch.sigmoid(rn(pool, num_spec, heads)))
+    counts = manager.mamba_layer_cache(0).prev_num_accepted_tokens
+    counts.copy_(torch.randint(0, num_spec + 1, counts.shape, generator=gen, device="cuda"))
+
+    cfg = KimiLinearConfig(
+        hidden_size=512,
+        rms_norm_eps=1e-5,
+        linear_attn_config=dict(
+            kda_layers=[1],
+            full_attn_layers=[],
+            num_heads=heads,
+            head_dim=128,
+            short_conv_kernel_size=4,
+            use_full_rank_gate=True,
+            gate_lower_bound=-5.0,
+        ),
+    )
+    runtime = KimiKDALinearAttention(cfg, layer_idx=0, model_config=ModelConfig()).to("cuda")
+    with torch.no_grad():
+        for name, p in runtime.named_parameters():
+            if name.endswith("A_log"):
+                p.copy_(rn(*p.shape, scale=0.5))
+            elif name.endswith("dt_bias"):
+                p.copy_(rn(*p.shape, scale=0.1))
+            elif name.endswith("o_norm.weight"):
+                p.copy_(1.0 + rn(*p.shape, scale=0.1))
+            else:
+                p.copy_(rn(*p.shape, scale=0.03))
+    runtime.finalize_decode_weights()  # fused projections and the FP32 decode constants, as after the weight load
+    runtime._fp8_resident_projections = True  # the SM107 deployment: the verify kernel emits MXFP8
+    runtime.o_proj = _PrequantizedProjection()
+    hidden = rn(batch * (num_spec + 1), 512, scale=0.5).to(BF16)
+    return runtime, manager, slots, hidden
+
+
+@pytest.mark.parametrize("heads,num_spec,batch", [(96, 3, 5), (96, 5, 3), (12, 3, 7)])
+@torch.no_grad()
+def test_engine_layout_takes_the_kf_route(heads, num_spec, batch, monkeypatch):
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
+
+    kk = _dispatch_module()
+    # beta: a slice of [f_a | b], as deployed
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_FAB_FUSED", False)
+    monkeypatch.setenv("TRTLLM_K3_KDA_VERIFY_KF", "1")
+    runtime, manager, slots, hidden = _engine_setup(heads, num_spec, batch, seed=7 * heads + batch)
+    try:
+        dispatch = runtime._dispatch
+        if dispatch.verify_kernel_path != "optimized":
+            pytest.skip("optimized verify path unavailable")
+        assert dispatch._kf_verify
+        # The mixer casts its parameters to BF16; the FP32 copies hold the same values.
+        assert runtime.A_log.dtype == BF16 and runtime.dt_bias.dtype == BF16
+        assert torch.equal(runtime._A_log_f32, runtime.A_log.float())
+        assert torch.equal(runtime._dt_bias_f32, runtime.dt_bias.float())
+
+        calls, routed = [], []
+        mtp_verify, kf_verify = dispatch.mtp_verify, kk._kf_mtp_verify
+
+        def recording_mtp_verify(**kwargs):
+            calls.append(kwargs)
+            return mtp_verify(**kwargs)
+
+        def recording_kf_verify(**kwargs):
+            routed.append(kwargs)
+            return kf_verify(**kwargs)
+
+        dispatch.mtp_verify = recording_mtp_verify
+        monkeypatch.setattr(kk, "_kf_mtp_verify", recording_kf_verify)
+
+        caches = [manager.mamba_layer_cache(layer) for layer in range(3)]
+        cache = caches[0]
+        bufs = _engine_buffers(cache)
+        before = {name: t.clone() for name, t in bufs.items()}
+        others = [{name: t.clone() for name, t in _engine_buffers(c).items()} for c in caches[1:]]
+        counts = cache.prev_num_accepted_tokens.clone()
+        steps, rows = num_spec + 1, batch * (num_spec + 1)
+
+        def verify():
+            return runtime.forward_verify(hidden, steps, cache, cache.conv, cache.temporal, slots)
+
+        dispatch._kf_verify = False
+        ref_out = verify()
+        torch.cuda.synchronize()
+        ref = {name: t.clone() for name, t in bufs.items()}
+        assert not routed
+        for name, t in bufs.items():
+            t.copy_(before[name])
+        dispatch._kf_verify = True
+        kf_out = verify()
+        torch.cuda.synchronize()
+        kf = {name: t.clone() for name, t in bufs.items()}
+        assert len(routed) == 1, "the call stayed on the CuTe DSL kernels"
+
+        # The engine's layouts reached both ops: q | k | v | output-gate sections of one projection, beta a slice of
+        # [f_a | b], per-slot state blocks, counts at stride 4; the CuTe DSL op read the BF16 parameters. These pin
+        # what a deployed engine passes (the sections come from _project_verify_inputs; the counts are the per-slot
+        # view KDAHybridCacheManagerV2._get_state_buffer gives DataRole("prev_num_accepted_tokens")): a manager or
+        # projection change that moves them fails here, and the eligibility check has to follow it.
+        for call in calls:
+            x_q = call["x_q"]
+            assert x_q.stride(1) == 4 * heads * 128
+            for i, name in enumerate(("x_k", "x_v", "onorm_g"), start=1):
+                t = call[name]
+                assert t.untyped_storage().data_ptr() == x_q.untyped_storage().data_ptr()
+                assert t.storage_offset() - x_q.storage_offset() == i * heads * 128
+            assert call["beta"].stride(1) == (128 + heads + 7) // 8 * 8
+            assert call["beta"].storage_offset() == 128
+            assert call["recurrent_state"].stride(0) > heads * 128 * 128
+            assert call["num_accepted_tokens"].stride(0) == 4
+            assert call["A_log"].dtype == BF16 and call["dt_bias"].dtype == BF16
+        assert routed[0]["A_log"].dtype == torch.float32
+        assert torch.equal(routed[0]["A_log"], calls[-1]["A_log"].float())
+        assert torch.equal(routed[0]["dt_bias"], calls[-1]["dt_bias"].float())
+
+        _check_out(ref_out, kf_out, rows, heads)
+        _check_mutated(ref, kf, slots)
+        unused = torch.ones(bufs["recurrent_state"].shape[0], dtype=torch.bool, device="cuda")
+        unused[slots.long()] = False
+        for name in MUTATED:
+            assert torch.equal(kf[name][unused], before[name][unused]), (
+                f"{name}: other slots changed"
+            )
+        for layer, old in enumerate(others, start=1):
+            for name, t in _engine_buffers(caches[layer]).items():
+                assert torch.equal(t, old[name]), f"layer {layer} {name} changed"
+        assert torch.equal(cache.prev_num_accepted_tokens, counts)
+    finally:
+        manager.shutdown()
