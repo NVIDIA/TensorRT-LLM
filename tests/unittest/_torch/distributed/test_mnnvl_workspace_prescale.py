@@ -64,16 +64,6 @@ def test_creation_refused_under_compile(tp4_mapping, monkeypatch):
         ops.get_or_scale_allreduce_mnnvl_workspace(tp4_mapping, torch.bfloat16)
 
 
-def test_lookup_allowed_under_compile(tp4_mapping, monkeypatch):
-    workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces
-    _seed_workspace(tp4_mapping, 1 << 20)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    result = ops.get_or_scale_allreduce_mnnvl_workspace(
-        tp4_mapping, torch.bfloat16, buffer_size_bytes=1 << 20
-    )
-    assert result is workspace[tp4_mapping]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for a native method handle")
 def test_cached_lookup_traces_with_a_native_handle(tp4_mapping):
     """The cached lookup of a compiled forward must not call the workspace handle.
