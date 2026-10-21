@@ -457,6 +457,14 @@ def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     return H == 7168 and 2 <= N <= 9
 
 
+def _persistent_sm_reserve() -> int:
+    """SMs the persistent attn_res grid leaves free: those a step-resident kernel holds (the DWDP
+    weight gather reserves them for every persistent grid)."""
+    from ..cute_dsl_utils import sm_reserve
+
+    return sm_reserve()
+
+
 def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
     """Pick between the two fused kernels for this call site.
 
@@ -634,6 +642,7 @@ def _apply_attn_res_rmsnorm_fused(
             output_norm.weight.to(torch.bfloat16).contiguous(),
             float(norm.eps),
             _rms_norm_eps(output_norm),
+            _persistent_sm_reserve(),
         )
         _note_attn_res_fusion("attn_res+norm/persistent", True, M, H, N)
         return output.reshape(M, H)
@@ -706,6 +715,7 @@ def _apply_attn_res_add_rmsnorm_fused(
             output_norm.weight.to(torch.bfloat16).contiguous(),
             float(norm.eps),
             _rms_norm_eps(output_norm),
+            _persistent_sm_reserve(),
         )
         _note_attn_res_fusion("add+attn_res+norm/persistent", True, M, H, N)
         return updated_prefix_sum.reshape(M, H), output.reshape(M, H)

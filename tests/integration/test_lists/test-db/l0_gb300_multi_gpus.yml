@@ -72,6 +72,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
