@@ -38,6 +38,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAtten
 from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -55,13 +56,15 @@ GEOMETRY = dict(
 )
 
 
-def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY):
+def make_cache(
+    tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY, num_layers=1, dtype=DTYPE
+):
     """A cache whose pool is sized for ``geometry`` with up to ``pin_tokens`` pinned."""
     return BlockCausalKVCacheManager(
-        num_layers=1,
+        num_layers=num_layers,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
-        dtype=DTYPE,
+        dtype=dtype,
         tokens_per_page=tokens_per_page,
         pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=tokens_per_page, pin_tokens=pin_tokens, **geometry
@@ -81,21 +84,21 @@ def cache(request):
         mgr.shutdown()
 
 
-def make_backend(name):
+def make_backend(name, layer_idx=0, dtype=DTYPE):
     if name == "cudnn":
         return CuDNNAttention(
-            layer_idx=0,
+            layer_idx=layer_idx,
             num_heads=NUM_HEADS,
             head_dim=HEAD_DIM,
             num_kv_heads=NUM_KV_HEADS,
-            dtype=DTYPE,
+            dtype=dtype,
         )
     return TrtllmAttention(
-        layer_idx=0,
+        layer_idx=layer_idx,
         num_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         num_kv_heads=NUM_KV_HEADS,
-        dtype=DTYPE,
+        dtype=dtype,
         max_seq_len=PROMPT_CAPACITY + WINDOW + CHUNK + 32,
         attention_metadata_state={},
     )
@@ -124,9 +127,9 @@ def read_kv(cache, layer, positions):
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
-def rand_qkv(n):
-    q = torch.randn(n, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
-    k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+def rand_qkv(n, dtype=DTYPE):
+    q = torch.randn(n, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
     return q, k, torch.randn_like(k)
 
 
@@ -144,9 +147,11 @@ def open_with_prompt(cache, prompt_len, geometry=GEOMETRY):
 BACKENDS = ["cudnn", "trtllm"]
 
 
-def lacks_kernel(backend, cache):
+def lacks_kernel(backend, cache, dtype=DTYPE):
     """Whether this build has no attention kernel for the cache's page size on this GPU."""
-    return not make_backend(backend).support_kv_cache_page_size(cache.tokens_per_page)
+    return not make_backend(backend, dtype=dtype).support_kv_cache_page_size(
+        cache.tokens_per_page, dtype
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -221,6 +226,105 @@ def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_bloc
     torch.testing.assert_close(v_back, v)
     with pytest.raises(ValueError):
         run(attn, cache, q, k, v, causal_block_size=7)
+
+
+def expected_fmha_library(dtype, num_causal_blocks):
+    """The FMHA library the TRTLLM backend should pick for a cached forward. On
+    SM100/SM103 FlashInfer's TRTLLM-Gen kernels serve it, except a BF16 context batch
+    of at most 4 requests (one per causal block), which goes to the fallback for LLM
+    time to first token. Elsewhere only the fallback is available."""
+    if get_sm_version() not in (100, 103):
+        return "FallbackFmha"
+    if dtype == torch.bfloat16 and num_causal_blocks <= 4:
+        return "FallbackFmha"
+    return "FlashInferTrtllmGenFmha"
+
+
+def record_fmha_libraries(attn, served):
+    """Wrap the backend's FMHA selection so every library it picks lands in ``served``."""
+    manager = attn._fmha_manager
+    select = manager.select
+
+    def recording_select(*args, **kwargs):
+        fmha = select(*args, **kwargs)
+        served.add(type(fmha).__name__)
+        return fmha
+
+    manager.select = recording_select
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("num_causal_blocks", [1, 4, 8])
+@pytest.mark.parametrize("tokens_per_page", [32, 64], ids=["tpb32", "tpb64"])
+def test_every_layer_and_library_over_a_multi_layer_cache(
+    backend, dtype, num_causal_blocks, tokens_per_page
+):
+    """A 3-layer cache with different K/V in every layer, attended on every layer
+    through a rotating table, with 1, 4 and 8 causal blocks in BF16 and FP16. Each
+    layer must read its own pages. For TRTLLM the cases also cross the FMHA library
+    boundary on SM100/SM103, and the library that served each one is checked."""
+    torch.manual_seed(11)
+    num_layers, prompt_len = 3, 17
+    geometry = dict(
+        window_tokens=WINDOW, max_staged_tokens=CHUNK, causal_block_sizes=(CHUNK, 10, 5)
+    )
+    cache = make_cache(tokens_per_page, geometry=geometry, num_layers=num_layers, dtype=dtype)
+    try:
+        if lacks_kernel(backend, cache, dtype):
+            pytest.skip("no paged context kernel for this page size in this build")
+        cache.open(pin_tokens=prompt_len, **geometry)
+        prompt = [rand_qkv(prompt_len, dtype)[1:] for _ in range(num_layers)]
+        for layer, (pk, pv) in enumerate(prompt):
+            cache.write_range(layer, 0, pk, pv)
+        cache.commit(prompt_len)
+        attns = [make_backend(backend, layer, dtype) for layer in range(num_layers)]
+        served = set()
+        if backend == "trtllm":
+            if get_sm_version() in (100, 103):
+                names = {type(lib).__name__ for lib in attns[0]._fmha_manager.fmha_libs}
+                assert "FlashInferTrtllmGenFmha" in names, f"FMHA libraries built: {names}"
+            for attn in attns:
+                record_fmha_libraries(attn, served)
+        history = [([], []) for _ in range(num_layers)]
+        empty = prompt[0][0].new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        size = CHUNK // num_causal_blocks
+        saw_stale = False
+        for step in range(4):  # rotates the table and leaves stale tokens
+            saw_stale |= cache.history_tokens > WINDOW
+            for layer, attn in enumerate(attns):
+                q, k, v = rand_qkv(CHUNK, dtype)
+                out = attn.forward(
+                    q[None],
+                    k[None],
+                    v[None],
+                    batch_size=1,
+                    seq_len=CHUNK,
+                    kv_cache=cache,
+                    causal_block_size=size,
+                ).reshape(CHUNK, NUM_HEADS, HEAD_DIM)
+                torch.cuda.synchronize()
+                hk = torch.cat(history[layer][0]) if history[layer][0] else empty
+                hv = torch.cat(history[layer][1]) if history[layer][1] else empty
+                pk, pv = prompt[layer]
+                for i in range(num_causal_blocks):
+                    lo, hi = i * size, (i + 1) * size
+                    expected = exact_reference(q, pk, pv, hk, hv, k, v, lo, hi)
+                    torch.testing.assert_close(
+                        out[lo:hi],
+                        expected,
+                        rtol=2e-2,
+                        atol=2e-2,
+                        msg=f"step {step} layer {layer} causal block {i}",
+                    )
+                history[layer][0].append(k)
+                history[layer][1].append(v)
+            cache.commit(CHUNK)
+        assert saw_stale, "test geometry should hold stale tokens at some step"
+        if backend == "trtllm":
+            assert served == {expected_fmha_library(dtype, num_causal_blocks)}
+    finally:
+        cache.shutdown()
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
