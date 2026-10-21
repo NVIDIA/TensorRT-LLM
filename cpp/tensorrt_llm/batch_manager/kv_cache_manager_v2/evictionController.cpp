@@ -78,7 +78,7 @@ LRUEvictionPolicy& PrioritizedEvictionPolicy::getOrCreate(Priority p)
 
 NodeRef PrioritizedEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 {
-    Priority p = page->priority;
+    Priority p = page->priority();
     LRUEvictionPolicy& policy = getOrCreate(p);
     return policy.push(std::move(page), evictFirst);
 }
@@ -99,7 +99,7 @@ SharedPtr<Page> PrioritizedEvictionPolicy::pop()
 SharedPtr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
 {
     auto page = *node;
-    Priority p = page->priority;
+    Priority p = page->priority();
     auto it = mPolicies.find(p);
     TLLM_CHECK_DEBUG(it != mPolicies.end());
     it->second.remove(node);
