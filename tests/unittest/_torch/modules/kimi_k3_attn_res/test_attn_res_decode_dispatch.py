@@ -4,9 +4,12 @@
 
 Decode-sized fused attention-residual calls go to the CuTe DSL kernel
 (``trtllm::kimi_k3_attn_res_*``) and stay within its declared tolerance of the C++ per-token
-path; a MoE layer's residual update deferred into the next layer's mix gives the same prefix and
-normalized mix, bit for bit, as materializing it first.
+ops; one selector (``_attn_res_kernel``) decides both the mixes' kernel and whether a MoE layer
+defers its residual update; a MoE layer's residual update deferred into the next layer's mix
+gives the same prefix and normalized mix, bit for bit, as materializing it first.
 """
+
+import functools
 
 import pytest
 import torch
@@ -69,7 +72,7 @@ def _close_to_cpp(actual: torch.Tensor, expected: torch.Tensor, what=None):
 @pytest.mark.parametrize("snapshots", [1, 3, 4, 8, 11])
 @pytest.mark.parametrize("m", [1, 7, 32, 64])
 @torch.no_grad()
-def test_dispatch_matches_cpp(m: int, snapshots: int, monkeypatch):
+def test_dispatch_matches_cpp(m: int, snapshots: int):
     proj, norm, out_norm = _modules(m + snapshots)
     prefix, addend, block = _rows(m, HIDDEN), _rows(m, HIDDEN), _rows(snapshots, m, HIDDEN)
     out = mkl._apply_attn_res_and_rmsnorm(prefix, block, proj, norm, out_norm)
@@ -77,23 +80,48 @@ def test_dispatch_matches_cpp(m: int, snapshots: int, monkeypatch):
     w = (proj.weight.reshape(-1), norm.weight, out_norm.weight, EPS, EPS)
     assert torch.equal(out, torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(prefix, block, *w))
 
-    # The C++ per-token kernels as the reference.
-    monkeypatch.setattr(mkl, "_attn_res_decode_kernel", lambda *args: None)
-    monkeypatch.setattr(mkl, "_ATTN_RES_TOPOLOGY", "per_token")
-    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", _max_tokens())
-    ref_out = mkl._apply_attn_res_and_rmsnorm(prefix, block, proj, norm, out_norm)
-    ref_upd, ref_add_out = mkl._apply_attn_res_add_and_rmsnorm(
-        prefix, addend, block, proj, norm, out_norm
+    # The C++ per-token ops as the reference.
+    block4 = block.view(snapshots, m, 1, HIDDEN)
+    ref_out = torch.ops.trtllm.attn_res_rmsnorm_fwd(prefix.view(m, 1, HIDDEN), block4, *w)
+    ref_upd, ref_add_out = torch.ops.trtllm.attn_res_add_rmsnorm_fwd(
+        prefix.view(m, 1, HIDDEN), addend.view(m, 1, HIDDEN), block4, *w
     )
-    _close_to_cpp(out, ref_out, "mix")
-    _close_to_cpp(add_out, ref_add_out, "add+mix")
-    assert torch.equal(upd, ref_upd)
+    _close_to_cpp(out, ref_out.view(m, HIDDEN), "mix")
+    _close_to_cpp(add_out, ref_add_out.view(m, HIDDEN), "add+mix")
+    assert torch.equal(upd, ref_upd.view(m, HIDDEN))
 
 
-def test_moe_residual_deferred_up_to_the_kernel_limit():
-    assert mkl._defers_moe_residual(1)
-    assert mkl._defers_moe_residual(_max_tokens())
-    assert not mkl._defers_moe_residual(_max_tokens() + 1)
+def test_one_selector_for_mixes_and_moe_residual_deferral(monkeypatch):
+    """The decode kernel up to its token and candidate limits, the persistent kernel above them
+    only where it is switched on; a MoE layer defers its residual exactly where the next mix runs
+    on the decode kernel."""
+    kernel = mkl._AttnResKernel
+
+    def pick(m: int, n: int):
+        rows = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        return mkl._attn_res_kernel(rows, n), mkl._defers_moe_residual(rows, n)
+
+    assert pick(1, 2) == (kernel.DECODE, True)
+    assert pick(_max_tokens(), 12) == (kernel.DECODE, True)
+    assert pick(_max_tokens() + 1, 4) == (kernel.UNFUSED, False)
+    assert pick(8, 13) == (kernel.UNFUSED, False)
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", True)
+    assert pick(8, 4) == (kernel.DECODE, True)
+    assert pick(_max_tokens() + 1, 4) == (kernel.PERSISTENT, False)
+    assert pick(_max_tokens() + 1, 10) == (kernel.UNFUSED, False)
+    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_ENABLED", False)
+    assert pick(8, 4) == (kernel.UNFUSED, False)
+
+
+class _PlainKdaMixer:
+    """Stands in for the KDA mixer without an MXFP8 input."""
+
+    def takes_prequantized_input(self, num_rows, attn_metadata):
+        return False
+
+    def __call__(self, h, attn_metadata, prequantized_input=None):
+        assert prequantized_input is None
+        return (h.float() * 0.75).to(torch.bfloat16)
 
 
 class _FakeMoE(nn.Module):
@@ -113,33 +141,122 @@ def _fake_layer(layer_idx: int, seed: int):
     layer.is_kda = True
     layer.is_moe = True
     layer.token_sliced = False
-    layer.linear_attn = lambda h, metadata: (h.float() * 0.75).to(torch.bfloat16)
+    layer.linear_attn = _PlainKdaMixer()
     layer.block_sparse_moe = _FakeMoE()
     proj_a, norm_a, layer.input_layernorm = _modules(seed)
     proj_b, norm_b, layer.post_attention_layernorm = _modules(seed + 1)
     layer.self_attention_res_proj, layer.self_attention_res_norm = proj_a, norm_a
     layer.mlp_res_proj, layer.mlp_res_norm = proj_b, norm_b
+    # Each fake layer's result goes on to another decoder layer.
+    layer.forward = functools.partial(
+        mkl.KimiLinearDecoderLayer.forward, layer, defer_moe_residual=True
+    )
     return layer
 
 
 @pytest.mark.parametrize("m", [7, 32, 64])
 @torch.no_grad()
-def test_decoder_layers_with_deferred_moe_residual(m: int, monkeypatch):
+def test_decoder_layers_with_deferred_moe_residual(m: int):
     """Two decoder layers: the MoE residual update folded into the next mix equals materializing
-    it first, bit for bit."""
+    it first, bit for bit. Without ``defer_moe_residual`` a layer returns a tensor."""
     layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
     bank = _rows(8, m, HIDDEN)
     hidden = _rows(m, HIDDEN)
 
-    def run():
+    def run(defer: bool):
         h, snaps = hidden, 3
         for layer in layers:
-            h, snaps = layer(h, bank, snaps, None)
+            h, snaps = layer(h, bank, snaps, None, defer_moe_residual=defer)
         return h
 
-    deferred = run()
+    deferred = run(defer=True)
     assert isinstance(deferred, mkl._DeferredMoEResidual)
-    monkeypatch.setattr(mkl, "_defers_moe_residual", lambda num_tokens: False)
-    materialized = run()
+    materialized = run(defer=False)
     assert isinstance(materialized, torch.Tensor)
     assert torch.equal(deferred.materialize(), materialized)
+
+
+class _FakeKdaMixer:
+    """Stands in for the KDA mixer: records the MXFP8 hand-off it is given for each call."""
+
+    def __init__(self):
+        self.seen = []
+
+    def takes_prequantized_input(self, num_rows, attn_metadata):
+        return attn_metadata.num_contexts == 0
+
+    def __call__(self, h, attn_metadata, prequantized_input=None):
+        self.seen.append((h, prequantized_input))
+        return (h.float() * 0.75).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("m", [7, 32])
+@torch.no_grad()
+def test_decoder_layers_mxfp8_handoff(m: int):
+    """A KDA layer whose pre-attention mix folds in the previous MoE residual hands the mixer the
+    MXFP8 form of the normed mix, bitwise the FP8 low-M GEMM's quantization of the BF16 rows; the
+    layer outputs do not change, and context batches get no hand-off."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
+
+    layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    for layer in layers:
+        layer.linear_attn = _FakeKdaMixer()
+    bank = _rows(8, m, HIDDEN)
+    hidden = _rows(m, HIDDEN)
+
+    def run(num_contexts):
+        metadata = SimpleNamespace(num_contexts=num_contexts)
+        for layer in layers:
+            layer.linear_attn.seen.clear()
+        h, snaps = hidden, 3
+        for layer in layers:
+            h, snaps = layer(h, bank, snaps, metadata)
+        return h.materialize()
+
+    ref = run(num_contexts=1)
+    assert all(x is None for layer in layers for _, x in layer.linear_attn.seen)
+    assert torch.equal(run(num_contexts=0), ref)
+    # The first layer's input is a plain row (no deferred MoE update), the second one's is not.
+    (_, first), (rows, handoff) = layers[0].linear_attn.seen[0], layers[1].linear_attn.seen[0]
+    assert first is None and handoff is not None
+    ref_q, ref_s = low_m.mxfp8_quantize_reference(rows)
+    xq, xs = handoff
+    assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+    r = torch.arange(m, device="cuda").unsqueeze(1)
+    c = torch.arange(HIDDEN // 32, device="cuda").unsqueeze(0)
+    offsets = (c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
+    assert torch.equal(xs[offsets], ref_s)
+
+
+def _kda_mixer_taking_mxfp8(max_rows: int):
+    from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+
+    mixer = KimiKDALinearAttention.__new__(KimiKDALinearAttention)
+    nn.Module.__init__(mixer)
+    mixer.register_to_config = False
+    mixer._qkvg_takes_prequantized = None
+    return mixer, lambda num_rows: 1 <= num_rows <= max_rows
+
+
+def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
+    """The producer predicate and the verify routing share one batch condition: plain
+    single-token decode and context batches get no MXFP8 input, and neither does a mixer whose
+    fused q/k/v/g projection was not declared to take one."""
+    from types import SimpleNamespace
+
+    mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
+
+    def metadata(num_contexts: int, num_tokens: int, num_requests: int):
+        return SimpleNamespace(
+            num_contexts=num_contexts, num_tokens=num_tokens, seq_lens=torch.empty(num_requests)
+        )
+
+    verify = metadata(0, 16, 4)
+    assert not mixer.takes_prequantized_input(16, verify)
+    mixer.accept_prequantized_qkvg_input(takes)
+    assert mixer.takes_prequantized_input(16, verify)
+    assert not mixer.takes_prequantized_input(64, metadata(0, 64, 8))
+    assert not mixer.takes_prequantized_input(4, metadata(0, 4, 4))
+    assert not mixer.takes_prequantized_input(16, metadata(1, 16, 4))

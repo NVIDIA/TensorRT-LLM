@@ -96,7 +96,7 @@ class _AddConstant(nn.Module):
         super().__init__()
         self.value = value
 
-    def forward(self, hidden_states: torch.Tensor, *_args) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *_args, **_kwargs) -> torch.Tensor:
         return hidden_states + self.value
 
 

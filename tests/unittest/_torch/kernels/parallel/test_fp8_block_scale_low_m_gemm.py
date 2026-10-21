@@ -323,7 +323,7 @@ def test_partial_n_tile_mid_m_tactics(m, mma_n, split_k):
 def test_partial_n_tile_limits_follow_whole_tiles():
     mod = _kernel_module()
     k = 7168
-    assert mod.max_m_for(2112, k) == mod.max_m_for(2176, k) == (192 if _is_sm107() else 224)
+    assert mod.max_m_for(2112, k) == mod.max_m_for(2176, k) == 192
     assert mod.low_m_max_for(2112, k) == mod.low_m_max_for(2176, k)
 
 
@@ -870,3 +870,95 @@ def test_weight_read_linear_forward_gated_and_sigmoid(m, n, k):
     torch.cuda.synchronize()
     assert torch.equal(gated, linear(x * gate))
     assert torch.equal(sigmoid, linear(x).sigmoid())
+
+
+# ---------------------------------------------------------------------------
+# Prequantized low-M kernel: the MXFP8 operand a producer hands over (E4M3 + UE8M0 1x32 scales
+# in the R128c4 layout), bitwise the low-M kernel on the BF16 rows it quantizes.
+# ---------------------------------------------------------------------------
+
+
+def _mxfp8_operand(x):
+    """``(xq, xs)`` of ``x`` with the scales in the R128c4 layout (rows padded to 128)."""
+    mod = _kernel_module()
+    m, k = x.shape
+    xq, xs_rows = mod.mxfp8_quantize_reference(x)
+    xs = torch.full((-(-m // 128) * 128 * (k // 32),), 0x7F, dtype=torch.uint8, device="cuda")
+    r = torch.arange(m, device="cuda").unsqueeze(1)
+    c = torch.arange(k // 32, device="cuda").unsqueeze(0)
+    offsets = ((r // 128) * (k // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
+    xs[offsets] = xs_rows
+    return xq, xs
+
+
+@pytest.mark.parametrize("n, k", [(3072, 7168), (7168, 768), (2112, 7168), (384, 1280)])
+@pytest.mark.parametrize("m", [1, 7, 8, 14, 32, 56, 64])
+def test_prequantized_matches_bf16_kernel(m, n, k):
+    mod = _kernel_module()
+    if m > mod.low_m_max_for(n, k):
+        pytest.skip("above the low-M kernel's range")
+    w_pad, scale = _make_weight(n, k, seed=n + k)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    x = _make_activation(m, k, seed=m)
+    xq, xs = _mxfp8_operand(x)
+    out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed)
+    ref = _run(x, w, packed, mod.default_tactic(m, n, k))
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 4])
+@pytest.mark.parametrize("m", [5, 16, 40])
+def test_prequantized_split_k_tactics(m, split_k):
+    mod = _kernel_module()
+    n, k = 336, 1280
+    w_pad, scale = _make_weight(n, k, seed=11)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    x = _make_activation(m, k, seed=5)
+    xq, xs = _mxfp8_operand(x)
+    mma_n = mod.mma_n_for(m)
+    tactic = mod.PrequantizedLowMTactic(mma_n=mma_n, split_k=split_k, a_stages=2, b_stages=2)
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_low_m_gemm_prequantized(xq, xs, w, packed, out, tactic=tactic)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _mxfp8_emulated_reference(x, w_pad[:n], scale)) < 5e-3
+
+
+@pytest.mark.parametrize("m", [7, 64])
+def test_prequantized_cuda_graph(m):
+    mod = _kernel_module()
+    n, k = 7168, 768
+    w, scale = _make_weight(n, k, seed=7)
+    packed = _pack(scale, n, k)
+    xq, xs = _mxfp8_operand(_make_activation(m, k, seed=1))
+    eager = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed)
+    out = torch.empty_like(eager)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mod.run_low_m_gemm_prequantized(xq, xs, w, packed, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mod.run_low_m_gemm_prequantized(xq, xs, w, packed, out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+@pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168)])
+@pytest.mark.parametrize("m", [1, 7, 32, 64, 65])
+def test_weight_read_linear_forward_prequantized(m, n, k):
+    """``forward_prequantized`` on the MXFP8 form of the rows is bitwise ``forward`` where
+    ``takes_prequantized_input``."""
+    linear = _bf16_weight_read_linear(n, k)
+    x = _make_activation(m, k, seed=m)
+    takes = linear.takes_prequantized_input(m)
+    mod = _kernel_module()
+    assert takes == (m <= min(mod.max_m_for(n, k), mod.low_m_max_for(n, k)))
+    if not takes:
+        return
+    out = linear.forward_prequantized(*_mxfp8_operand(x))
+    torch.cuda.synchronize()
+    assert torch.equal(out, linear(x))
