@@ -1777,6 +1777,17 @@ class TestMultimodalConfig:
                                                    **encoder_options),
             )
 
+    def test_encoder_only_rejects_attention_dp_with_shared_encoder_tp(self):
+        with pytest.raises(ValueError, match="Encoder TP with attention DP"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                tensor_parallel_size=2,
+                enable_attention_dp=True,
+                mm_encoder_only=True,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=1),
+            )
+
     def test_disable_mm_encoder_disables_encoder_cache(self):
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
         args = TorchLlmArgs(

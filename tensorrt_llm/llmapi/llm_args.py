@@ -7078,9 +7078,12 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
             )
         if self.enable_attention_dp and size < self.tensor_parallel_size:
-            if self.multimodal_config.encoder_scheduling_policy == MultimodalEncoderSchedulingPolicy.DISABLED:
+            if (self.mm_encoder_only
+                    or self.multimodal_config.encoder_scheduling_policy
+                    == MultimodalEncoderSchedulingPolicy.DISABLED):
                 raise ValueError(
-                    "Encoder TP with attention DP requires MM item scheduling.")
+                    "Encoder TP with attention DP requires MM item scheduling "
+                    "in aggregated LLM execution.")
             if (self.multimodal_config.encoder_cuda_graph is not None or
                     self.multimodal_config.encoder_side_stream_max_ahead > 0):
                 raise ValueError(
