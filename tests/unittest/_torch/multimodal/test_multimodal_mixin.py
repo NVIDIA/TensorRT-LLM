@@ -15,7 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -415,6 +415,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
     )
 
 
+@pytest.mark.cpu_only
 def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -423,11 +424,15 @@ def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     )
     first = make_keyed_multimodal_param()
     second = make_keyed_multimodal_param()
+    model._encoder_forward_context = MagicMock()
 
     first_embeddings = model._get_or_encode_multimodal_embeddings([first])
     second_embeddings = model._get_or_encode_multimodal_embeddings([second])
 
     assert model.encode_calls == 1
+    model._encoder_forward_context.assert_called_once_with()
+    model._encoder_forward_context.return_value.__enter__.assert_called_once_with()
+    model._encoder_forward_context.return_value.__exit__.assert_called_once()
     torch.testing.assert_close(second_embeddings, first_embeddings)
 
 
