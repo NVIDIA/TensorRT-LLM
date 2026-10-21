@@ -28,6 +28,7 @@ profiles:
 | `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3-for-causal-lm-bf16-tied-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-tied-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, tied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
@@ -41,6 +42,19 @@ The Qwen2 identity includes Qwen2 and Qwen2.5 dense checkpoints that resolve to
 the exact `Qwen2ForCausalLM` / `qwen2` pair and satisfy the constraints above.
 Other Qwen roots and variants, including checkpoints with tied embeddings, do
 not match this profile.
+
+The Qwen3 identity has two sibling profiles that differ only in
+`tie_word_embeddings`. Untied checkpoints match
+`qwen3-for-causal-lm-bf16-target-v1`; Qwen3-8B is the untied canary. Tied
+checkpoints match `qwen3-for-causal-lm-bf16-tied-target-v1`; Qwen3-4B is the
+tied canary, and Qwen3-0.6B, Qwen3-1.7B, and Qwen3-4B-Instruct-2507 are also
+tied. A tied model makes `lm_head.weight` an alias of
+`model.embed_tokens.weight` at construction on both sides, so MX registers and
+transfers the shared table once, as `model.embed_tokens.weight`, and the
+`lm_head.weight` tensor that some tied checkpoints also store is never loaded.
+Because the two profiles transfer different tensor sets, the tied profile has
+its own transform-layout ABI, and a tied source never pairs with an untied
+receiver, even under the `ENFORCE` identity policy.
 
 The Mistral identity covers dense Hugging Face-format checkpoints that resolve
 to the exact `MistralForCausalLM` / `mistral` pair and whose realized attention

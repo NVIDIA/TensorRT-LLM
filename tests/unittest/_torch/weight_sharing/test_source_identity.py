@@ -39,6 +39,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
@@ -83,6 +84,7 @@ def test_from_model_config_requires_one_artifact_source() -> None:
         PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
     ],
 )
 def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
@@ -358,6 +360,34 @@ def test_transform_abi_mismatch_is_never_bypassed():
     assert not result.matched
     assert result.mismatched_fields == ["transform_abi_id"]
     assert decision.should_share is False
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [IdentityCheckPolicy.WARN_FALLBACK, IdentityCheckPolicy.ENFORCE],
+    ids=["warn_fallback", "enforce"],
+)
+@pytest.mark.parametrize(
+    "source_abi, shares",
+    [
+        pytest.param(QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1, True, id="same-tied"),
+        pytest.param(QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="qwen3-untied"),
+        pytest.param(None, False, id="missing"),
+    ],
+)
+def test_qwen3_tied_transform_abi_shares_only_with_the_same_abi(
+    policy: IdentityCheckPolicy, source_abi: str | None, shares: bool
+) -> None:
+    local = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    source = identity_from(FakeModelConfig(), transform_abi_id=source_abi)
+
+    decision = check_weight_sharing_compatibility(local, source, policy)
+
+    assert decision.should_share is shares
+    assert decision.match_result.mismatched_fields == ([] if shares else ["transform_abi_id"])
 
 
 def test_transform_abi_participates_in_global_fingerprint():

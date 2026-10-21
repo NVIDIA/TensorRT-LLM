@@ -48,6 +48,11 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for the Qwen3 dense layout above when `lm_head.weight` is an
+# alias of `model.embed_tokens.weight`. The shared table is one transferred
+# tensor, named `model.embed_tokens.weight`; no `lm_head.weight` tensor is
+# transferred, and the receiver's constructor rebuilds the alias.
+QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-tied-target-layout-v1"
 # Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
