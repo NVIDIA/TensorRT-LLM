@@ -356,21 +356,17 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     def _rows(
         self,
         state: _GlmKpoolCacheState,
-        rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select generation tables, or all tables for per-row request IDs.
 
         Rows with request_ids (packed context, or verification rows given their
-        tables' batch rows) index all tables; otherwise verification repeats
-        generation tables per token. Callers supply each query's visible length
-        for verification and packed context rows.
+        tables' batch rows) index all tables and supply each query's visible
+        length; single-token decode rows use the generation tables and live lengths.
         """
         if request_ids is not None:
             return state.block_tables, None
         gen = slice(state.num_contexts, None)
-        if rows_per_request > 1:
-            return state.block_tables[gen].repeat_interleave(rows_per_request, dim=0), None
         return state.block_tables[gen], state.kv_lens[gen]
 
     def update_pool_keys(
@@ -473,10 +469,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     ) -> torch.Tensor:
         """Score complete pools into FP32 [rows, pool_capacity].
 
-        q is [rows, heads, head_dim], weights is [rows, heads]. Packed context uses
-        request_ids; verification either does too or repeats generation tables
-        rows_per_request times.
-        Both supply per-query kv_lens. Single-token decode uses live metadata lengths.
+        q is [rows, heads, head_dim], weights is [rows, heads]. Packed context and
+        verification (rows_per_request rows per request) use request_ids and
+        per-query kv_lens. Single-token decode uses live metadata lengths.
         Incomplete/invisible pools receive the FP32 minimum before top-k. Eager
         callers that know a host bound on the visible lengths pass max_kv_len so
         only reachable pools are scored; columns past it are left unwritten and
@@ -485,11 +480,14 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         may be a strided view. table_range, from :meth:`plan_context_scores`,
         names the context tables those rows' request_ids fall in.
         """
+        if rows_per_request > 1 and request_ids is None:
+            raise ValueError("glm_kpool verification rows need request_ids")
         state = self._cache_state(metadata)
-        tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
+        tables, gen_lens = self._rows(state, request_ids)
         capacity = state.block_tables.shape[1] * state.tokens_per_block
         kpool = self.sparse_params.index_kpool
-        if self._indexer_fp8 and request_ids is not None and max_kv_len is not None:
+        packed_context = request_ids is not None and rows_per_request == 1
+        if self._indexer_fp8 and packed_context and max_kv_len is not None:
             # Packed context rows only reference the context requests' tables.
             first, last = (0, state.num_contexts) if table_range is None else table_range
             scores = kpool_score_fp8(
@@ -538,7 +536,6 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         metadata,
         *,
         kv_lens: torch.Tensor | None = None,
-        rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Selected pools ``[N, select_k]`` -> latent row ids for the kernel.
@@ -549,7 +546,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         row addressing as :meth:`score_pools`.
         """
         state = self._cache_state(metadata)
-        tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
+        tables, gen_lens = self._rows(state, request_ids)
         _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
         return kpool_expand(
             selected,

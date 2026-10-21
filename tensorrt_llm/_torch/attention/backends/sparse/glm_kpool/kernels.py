@@ -512,10 +512,6 @@ def kpool_score(
     return out
 
 
-# Largest FP8 logits transient (elements) kpool_score_fp8 allocates.
-_FP8_SCORE_MAX_ELEMENTS = 1 << 29
-
-
 def kpool_score_fp8(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -539,15 +535,15 @@ def kpool_score_fp8(
     :func:`kpool_score`. ``max_kv_len`` bounds every row's ``kv_lens``. Row ``r``
     scores only the first ``kv_lens[r] // kpool`` pools of table ``request_ids[r]``;
     later columns are not meaningful, so readers must stop there. The result may be
-    a strided view with an aligned row stride. Returns ``None`` when the logits
-    transient would exceed ``_FP8_SCORE_MAX_ELEMENTS``.
+    a strided view with an aligned row stride. Returns ``None`` when there are no
+    rows or no complete pools.
     """
     from tensorrt_llm.deep_gemm import fp8_mqa_logits
 
     n = q.shape[0]
     pools = max(0, int(max_kv_len)) // kpool
     tables = block_tables.shape[0]
-    if n == 0 or pools == 0 or n * tables * pools > _FP8_SCORE_MAX_ELEMENTS:
+    if n == 0 or pools == 0:
         return None
     positions = torch.arange(pools, device=q.device) * kpool
     page = positions // tokens_per_block
