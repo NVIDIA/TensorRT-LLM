@@ -56,6 +56,13 @@ MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-mistral-dense-target-layout
 # tensors plus target-only receiver finalization. Phi3 checkpoints store both
 # projections pre-fused and the root splits them per TP rank while loading.
 PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
+# Stable contract for unquantized Qwen3 MoE fused-QKV tensors, Q/K norm state,
+# the replicated router weight, CUTLASS routed-expert tensors (`w3_w1_weight`
+# with the up projection before the gate projection, and `w2_weight`)
+# partitioned by MoE TP or EP, and target-only receiver finalization. Routed
+# expert layouts differ per MoE implementation, so another implementation
+# needs its own ID.
+QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
 _MISSING = object()
 
 
