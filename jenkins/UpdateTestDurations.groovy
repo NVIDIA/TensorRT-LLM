@@ -25,10 +25,13 @@ DURATION_FILE_PATH = "${TEST_DURATIONS_DIR}/.general"
 // Target repository the updated duration file is committed straight back into.
 TARGET_REPO = "NVIDIA/TensorRT-LLM"
 
+// Returns true when newPath is safe to adopt. On a failed check it warns and marks
+// the build UNSTABLE instead of failing the pipeline, and returns false so the
+// caller can skip adopting (and auto-committing) the suspect file.
 def sanityCheckItemCount(String oldPath, String newPath, boolean requireOld = true) {
     if (!requireOld && !fileExists(oldPath)) {
         echo "No existing duration file at ${oldPath}; treating as a new cluster, skipping sanity gate."
-        return
+        return true
     }
     def countItems = { path ->
         sh(script: "python3 -c \"import json; print(len(json.load(open('${path}'))))\"",
@@ -38,15 +41,19 @@ def sanityCheckItemCount(String oldPath, String newPath, boolean requireOld = tr
     def newCount = countItems(newPath)
     echo "Duration-file item counts -> old: ${oldCount}, new: ${newCount}"
     if (oldCount == 0) {
-        error("Existing duration file is empty or missing; aborting.")
+        unstable("WARNING: existing duration file ${oldPath} is empty or missing; " +
+                 "not adopting ${newPath}.")
+        return false
     }
     def diffPct = Math.abs(newCount - oldCount) * 100.0 / oldCount
     echo "Item-count difference: ${String.format('%.1f', diffPct)}%"
     if (diffPct >= 50.0) {
-        error("Item-count difference ${String.format('%.1f', diffPct)}% " +
-              ">= 50%; refusing to auto-commit. Download the archived " +
-              "new_test_durations.json, review, and upload manually.")
+        unstable("WARNING: item-count difference ${String.format('%.1f', diffPct)}% " +
+                 ">= 50% for ${newPath}; not auto-committing it. Download the archived " +
+                 "new_test_durations.json, review, and upload manually.")
+        return false
     }
+    return true
 }
 
 def createKubernetesPodConfig(image, arch = "amd64")
@@ -231,7 +238,8 @@ pipeline {
                             """
                             // generate_duration.py skips writing the file entirely when
                             // OpenSearch has no records for the cluster (i.e. it's not
-                            // currently in use); nothing to archive or commit for those.
+                            // currently in use), or too few remain after filtering against
+                            // the test-db lists; nothing to archive or commit for those.
                             if (fileExists("${LLM_ROOT}/${outFile}")) {
                                 archiveArtifacts(artifacts: "${LLM_ROOT}/${outFile}", fingerprint: true)
                             } else {
@@ -280,11 +288,11 @@ pipeline {
 
                                 // Sanity gate against the authoritative TARGET_REPO baseline
                                 // (post-reset workspace, not SOURCE_REPO or a separate HTTP fetch).
-                                sanityCheckItemCount(
-                                    "${LLM_ROOT}/${DURATION_FILE_PATH}",
-                                    "${LLM_ROOT}/new_test_durations.json")
-
-                                sh "mkdir -p \$(dirname ${LLM_ROOT}/${DURATION_FILE_PATH}) && cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
+                                if (sanityCheckItemCount(
+                                        "${LLM_ROOT}/${DURATION_FILE_PATH}",
+                                        "${LLM_ROOT}/new_test_durations.json")) {
+                                    sh "mkdir -p \$(dirname ${LLM_ROOT}/${DURATION_FILE_PATH}) && cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
+                                }
 
                                 // Same reset-then-overlay treatment for each per-cluster file that
                                 // was generated (clusters with no OpenSearch records were skipped
@@ -297,10 +305,12 @@ pipeline {
                                     if (!fileExists("${LLM_ROOT}/${newFile}")) {
                                         continue
                                     }
-                                    sanityCheckItemCount(
-                                        "${LLM_ROOT}/${clusterDurationPath}",
-                                        "${LLM_ROOT}/${newFile}",
-                                        false)
+                                    if (!sanityCheckItemCount(
+                                            "${LLM_ROOT}/${clusterDurationPath}",
+                                            "${LLM_ROOT}/${newFile}",
+                                            false)) {
+                                        continue
+                                    }
                                     sh "mkdir -p \$(dirname ${LLM_ROOT}/${clusterDurationPath}) && cp ${LLM_ROOT}/${newFile} ${LLM_ROOT}/${clusterDurationPath}"
                                     trackedPaths << clusterDurationPath
                                 }

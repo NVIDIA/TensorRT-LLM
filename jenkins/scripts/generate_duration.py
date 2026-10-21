@@ -36,6 +36,15 @@ _TURTLE_DIRECTIVE_RE = re.compile(r"(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_TEST_LIST_DIR = os.path.join(_REPO_ROOT, "tests", "integration", "test_lists", "test-db")
 
+# Per-cluster duration files live at <TEST_DURATIONS_DIR>/.<clusterKey>, relative
+# to the repo root. Keep in sync with TEST_DURATIONS_DIR in
+# jenkins/UpdateTestDurations.groovy.
+TEST_DURATIONS_DIR = "tests/integration/defs/test_durations"
+
+# A per-cluster file with fewer tests than this (after filtering) gives sharding
+# about as little timing data as no file at all, so it is not written.
+MIN_CLUSTER_TESTS = 10
+
 
 def normalize_test_spec(name):
     """Strip trailing turtle directives (TIMEOUT/ISOLATION), keep -k/-m flags."""
@@ -161,7 +170,7 @@ def main():
         type=str,
         default=None,
         help="Path to the output duration file. Defaults to "
-        "tests/integration/defs/.test_durations_<cluster> (relative to the "
+        f"{TEST_DURATIONS_DIR}/.<cluster> (relative to the "
         "repo root) when --cluster is set, otherwise new_test_duration.json.",
     )
     parser.add_argument(
@@ -194,15 +203,13 @@ def main():
     args = parser.parse_args()
 
     # Resolve output path. clusterKey mirrors the sanitization L0_Test.groovy
-    # applies to SlurmPartition.clusterName when it reads
-    # ".test_durations_<clusterKey>" (non-alphanumeric chars -> "_").
+    # applies to SlurmPartition.clusterName when it names the per-cluster file
+    # (non-alphanumeric chars -> "_").
     if args.duration_file:
         NEW_TEST_DURATION = args.duration_file
     elif args.cluster:
         cluster_key = re.sub(r"[^a-zA-Z0-9]", "_", args.cluster)
-        NEW_TEST_DURATION = os.path.join(
-            _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{cluster_key}"
-        )
+        NEW_TEST_DURATION = os.path.join(_REPO_ROOT, TEST_DURATIONS_DIR, f".{cluster_key}")
     else:
         NEW_TEST_DURATION = "new_test_duration.json"
 
@@ -242,6 +249,17 @@ def main():
             }
             dropped = raw_count - len(filtered)
             test_durations = filtered
+
+    # Check what will actually reach disk: the filter above can empty (or nearly
+    # empty) a cluster whose raw OpenSearch records are all stale or unscheduled.
+    # Callers treat an existing file as a live cluster, so skip writing instead.
+    if args.cluster and len(test_durations) < MIN_CLUSTER_TESTS:
+        print(
+            f"Only {len(test_durations)} test(s) remain for cluster '{args.cluster}' "
+            f"after filtering ({raw_count} from query, {dropped} dropped); "
+            f"need at least {MIN_CLUSTER_TESTS}. Skipping file generation."
+        )
+        return
 
     with open(NEW_TEST_DURATION, "w") as file:
         json.dump(test_durations, file, indent=3)
