@@ -18,6 +18,7 @@ try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..modules.logits_processor import scale_and_soft_cap_logits
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
@@ -327,6 +328,23 @@ class DFlash2CandidateSelector(nn.Module):
         )
 
 
+def resolve_draft_logit_transform(dflash_config: Dict) -> tuple[float, Optional[float]]:
+    """Return the ``(multiplier, softcap)`` a drafter's ``dflash_config`` declares.
+
+    A DFlash drafter scores tokens through the target's lm_head. When the target
+    scales and soft-caps its own logits (``output_multiplier``, then
+    ``final_logit_softcapping``), its drafters are trained on logits transformed
+    the same way, and their ``dflash_config`` repeats the two values, as vLLM and
+    SGLang read them. ``(1.0, None)`` means no transform; a softcap of 0 means none.
+    """
+    multiplier = dflash_config.get("output_multiplier")
+    softcap = dflash_config.get("final_logit_softcapping")
+    return (
+        1.0 if multiplier is None else float(multiplier),
+        float(softcap) if softcap else None,
+    )
+
+
 class DFlashForCausalLM(nn.Module):
     """Draft model wrapper for DFlash speculative decoding.
 
@@ -474,6 +492,7 @@ class DFlashForCausalLM(nn.Module):
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        self.logit_multiplier, self.logit_softcap = resolve_draft_logit_transform(dflash_config)
         if dflash_attention_backend == "AUTO":
             dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
@@ -519,7 +538,8 @@ class DFlashForCausalLM(nn.Module):
         logger.info(
             f"DFlash draft model initialized with mask_token_id: {self.mask_token_id}, "
             f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}, "
-            f"attention_backend: {self.dflash_attention_backend}"
+            f"attention_backend: {self.dflash_attention_backend}, "
+            f"logit_multiplier: {self.logit_multiplier}, logit_softcap: {self.logit_softcap}"
         )
 
         # Sliding-window block decode (use_swa / swa_window_size). Kept in the
@@ -768,6 +788,18 @@ class DFlashForCausalLM(nn.Module):
     @property
     def has_candidate_selector(self) -> bool:
         return self.candidate_selector is not None
+
+    def apply_draft_logit_transform(self, logits: torch.Tensor) -> torch.Tensor:
+        """Scale and soft-cap draft logits the way the drafter was trained.
+
+        The same epilogue as the target's (:func:`scale_and_soft_cap_logits`), in
+        FP32 and in place. Neither step changes a position's argmax, but the
+        DFlash 2 selector adds these logits to its pairwise scores and draft
+        sampling reads them as a distribution, so both depend on the scale.
+        """
+        if self.logit_multiplier == 1.0 and self.logit_softcap is None:
+            return logits
+        return scale_and_soft_cap_logits(logits, self.logit_multiplier, self.logit_softcap)
 
     def select_candidate_path(
         self,
