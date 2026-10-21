@@ -386,7 +386,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         self.mapping = mapping
         self.num_slots = num_slots
         self.num_local_slots = num_slots // ep_size
-        self.auxiliary_sms = int(getattr(config, "auxiliary_sms", 8))
+        self.auxiliary_sms = int(getattr(config, "auxiliary_sms", 4))
         if self.auxiliary_sms <= 0:
             raise ValueError("auxiliary_sms must be positive")
         helper_slot_mode = getattr(config, "helper_slot_mode", "per_layer_resident")
