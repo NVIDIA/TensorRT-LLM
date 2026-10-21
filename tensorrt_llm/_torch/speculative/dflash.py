@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -24,10 +25,12 @@ from torch import nn
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -38,6 +41,7 @@ from .dflash_attention import (
     validate_dflash_trtllm_gen_runtime,
 )
 from .interface import SpecMetadata, SpecWorkerBase
+from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
@@ -676,6 +680,35 @@ class DFlashSpecMetadata(SpecMetadata):
         ]
 
 
+# Greedy draft tokens from ``[num_gens, K, shard]`` shard block logits:
+# ``(draft_model, local_block, inputs) -> [num_gens, K]`` int32.
+VocabParallelDraftTokens = Callable[[nn.Module, torch.Tensor, dict], torch.Tensor]
+
+
+@dataclass
+class VocabParallelSelection:
+    """The tokens a DFlash worker selects from this rank's vocab shard of the
+    target LM head instead of from the gathered logits.
+
+    It exists when the target LM head is an evenly vocab-sharded, gathered TP
+    head (:meth:`VocabParallelHead.supports`) and the deployment has neither
+    occurrence penalties nor a guided decoder, which both edit the full target
+    logits. The target tokens of greedy batches, and of temperature-only
+    batches when :attr:`samples`, then come from the shard, and so do greedy
+    draft tokens when :attr:`draft_tokens` is set.
+    """
+
+    head: VocabParallelHead
+    # Temperature-only sampling verified by exact match (no rejection
+    # sampling, no top-k/top-p) is drawn from the shard too.
+    samples: bool
+    # How greedy draft tokens come from the shard; None when the drafter does
+    # not draft through the target's head. Set by
+    # :meth:`DFlashWorker.bind_draft_lm_head` after loading, once the drafter
+    # has taken over the target's head.
+    draft_tokens: Optional[VocabParallelDraftTokens] = None
+
+
 class DFlashWorker(SpecWorkerBase):
     """
     Worker for DFlash speculative decoding.
@@ -759,6 +792,11 @@ class DFlashWorker(SpecWorkerBase):
         # _lazy_init_ctx_buffers; read by _store_prefill_context.
         self._ctx_reuse_addressable = False
         self._dflash_attention_backend = spec_config.attention_backend
+        # Set by bind_target_lm_head.
+        self._vocab_parallel: Optional[VocabParallelSelection] = None
+        # Set by set_target_model and set_draft_model.
+        self._target_model_ref: Optional[weakref.ref] = None
+        self._draft_model_ref: Optional[weakref.ref] = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -822,6 +860,8 @@ class DFlashWorker(SpecWorkerBase):
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
+        # Non-owning: the draft model is a sibling module of this worker.
+        self._draft_model_ref = weakref.ref(draft_model)
         # The DFlash 2 selector indexes full-vocab codebooks by draft-token
         # id, so a d2t-remapped draft vocab would score the wrong tokens.
         if self._d2t is not None and getattr(draft_model, "is_dflash2", False):
@@ -843,6 +883,113 @@ class DFlashWorker(SpecWorkerBase):
                 raise ValueError(
                     "LiLiCorr requires nonempty target_layer_ids to capture target hidden states."
                 )
+
+    def set_target_model(self, target_model: nn.Module) -> None:
+        # Non-owning: the target model owns this worker.
+        self._target_model_ref = weakref.ref(target_model)
+
+    def bind_target_lm_head(self, lm_head: nn.Module, logits_processor: nn.Module) -> None:
+        """Decide the :class:`VocabParallelSelection` over the target LM head.
+
+        The shard logits are ``lm_head(hidden_states)``, which are the target's
+        logits only when its logits processor is the plain
+        :class:`LogitsProcessor`; a custom one (a final norm or head transform
+        before the LM head) keeps the gathered logits. Binding the same head
+        again keeps its selection.
+        """
+        if (
+            self.guided_decoder is not None
+            or self.spec_config.enable_penalty
+            or type(logits_processor) is not LogitsProcessor
+            or not VocabParallelHead.supports(lm_head)
+        ):
+            self._vocab_parallel = None
+            return
+        if self._vocab_parallel is not None and self._vocab_parallel.head.lm_head is lm_head:
+            return
+        self._vocab_parallel = VocabParallelSelection(
+            head=VocabParallelHead(lm_head),
+            samples=(
+                not self.spec_config.use_rejection_sampling
+                and self.spec_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK_NO_TOPP
+            ),
+        )
+
+    def bind_draft_lm_head(self, draft_model) -> None:
+        """Decide the draft side of the :class:`VocabParallelSelection`."""
+        if self._vocab_parallel is not None:
+            self._vocab_parallel.draft_tokens = self._vocab_parallel_draft_tokens(draft_model)
+
+    def setup_aliases(self) -> None:
+        """Post-load hook: decide the vocab-parallel selection, the target side
+        and then the draft side.
+
+        The model loader runs it after loading: the target model's logits
+        processor is final (models install a custom one after the base
+        constructor), and the drafter has taken over the target modules it
+        shares (``load_weights_from_target_model``).
+        """
+        target_model = None if self._target_model_ref is None else self._target_model_ref()
+        if target_model is not None:
+            self.bind_target_lm_head(target_model.lm_head, target_model.logits_processor)
+        if self._draft_model_ref is not None:
+            self.bind_draft_lm_head(self._draft_model_ref())
+
+    def post_load_weights(self) -> None:
+        self.setup_aliases()
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        # The guided decoder masks the full target logits.
+        self._vocab_parallel = None
+        return super().set_guided_decoder(guided_decoder)
+
+    @property
+    def target_vocab_parallel_head(self) -> Optional[VocabParallelHead]:
+        return None if self._vocab_parallel is None else self._vocab_parallel.head
+
+    def target_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head,
+        logits_processor,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """This rank's vocab shard (``VocabShardedLogits``) once the target
+        head is bound for vocab-parallel selection, the gathered logits
+        otherwise."""
+        head = self.target_vocab_parallel_head
+        if head is not None:
+            return head.shard_logits(hidden_states)
+        return super().target_logits(
+            hidden_states, lm_head, logits_processor, attn_metadata, spec_metadata, draft_model
+        )
+
+    def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
+        """How greedy draft tokens come from the vocab shard, or None.
+
+        The drafter must draft through the target's head object, without a d2t
+        vocab map or a LiLiCorr / DFlash 2 path selector. Plain DFlash takes the
+        per-position argmax of the block logits.
+        """
+        if (
+            draft_model.lm_head is not self._vocab_parallel.head.lm_head
+            or self._d2t is not None
+            or getattr(draft_model, "lilicorr", None) is not None
+            or draft_model.has_candidate_selector
+        ):
+            return None
+        return self._argmax_block_tokens
+
+    def _argmax_block_tokens(
+        self, draft_model, local_block: torch.Tensor, inputs: dict
+    ) -> torch.Tensor:
+        del draft_model, inputs
+        num_gens, block_len, shard = local_block.shape
+        return self._vocab_parallel.head.argmax(
+            local_block.reshape(-1, shard), out_dtype=torch.int32
+        ).view(num_gens, block_len)
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -1623,7 +1770,17 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
+        logits_vocab_shard = False
         K = spec_metadata.runtime_draft_len
+        if isinstance(logits, VocabShardedLogits):
+            if K > 0 and (spec_metadata.is_all_greedy_sample or self._vocab_parallel.samples):
+                # The target tokens come from the shard: this step returns
+                # the shard, which the engine gathers only for a logits
+                # post-processor.
+                raw_logits = logits.local
+                logits_vocab_shard = True
+            else:
+                logits = raw_logits = logits.gather()
 
         if K == 0:
             return self.skip_drafting(
@@ -1753,44 +1910,60 @@ class DFlashWorker(SpecWorkerBase):
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
                 gen_hidden_states = hidden_states_out[gen_gather_ids]
-                gen_logits = draft_model.logits_processor(
-                    gen_hidden_states, draft_model.lm_head, attn_metadata, True
-                )
-
-                vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
-
-                gen_logits = self._refine_block_logits(
-                    draft_model, gen_logits, inputs, spec_metadata
-                )
-
-                # DFlash 2: replace the independent per-position picks with one
-                # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "lilicorr", None) is not None:
-                    gen_logits = self._apply_lilicorr(
-                        draft_model,
-                        gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["lilicorr_anchor"],
-                        spec_metadata,
+                vocab_parallel = self._vocab_parallel
+                if (
+                    vocab_parallel is not None
+                    and vocab_parallel.draft_tokens is not None
+                    and not spec_metadata.wants_advanced_draft_sampling
+                ):
+                    # Greedy draft tokens straight from this rank's vocab shard
+                    # of the block logits, bit-identical to refining the
+                    # gathered logits and taking the per-position argmax.
+                    local_block = vocab_parallel.head.local_logits(gen_hidden_states)
+                    gen_draft_tokens = vocab_parallel.draft_tokens(
+                        draft_model, local_block.view(num_gens, K, -1), inputs
                     )
-                    vocab_size = gen_logits.shape[-1]
-                elif getattr(draft_model, "has_candidate_selector", False):
-                    gen_logits = self._apply_dflash2_selector(
-                        draft_model,
-                        gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["first_prev_tokens"],
-                        spec_metadata,
+                    vocab_size = vocab_parallel.head.vocab_size
+                else:
+                    gen_logits = draft_model.logits_processor(
+                        gen_hidden_states, draft_model.lm_head, attn_metadata, True
                     )
-                    vocab_size = gen_logits.shape[-1]
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                    vocab_size = gen_logits.shape[-1]
+                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+
+                    gen_logits = self._refine_block_logits(
+                        draft_model, gen_logits, inputs, spec_metadata
+                    )
+
+                    # DFlash 2: replace the independent per-position picks with
+                    # one coherent path through the block (absent for plain
+                    # DFlash).
+                    if getattr(draft_model, "lilicorr", None) is not None:
+                        gen_logits = self._apply_lilicorr(
+                            draft_model,
+                            gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["lilicorr_anchor"],
+                            spec_metadata,
+                        )
+                        vocab_size = gen_logits.shape[-1]
+                    elif getattr(draft_model, "has_candidate_selector", False):
+                        gen_logits = self._apply_dflash2_selector(
+                            draft_model,
+                            gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["first_prev_tokens"],
+                            spec_metadata,
+                        )
+                        vocab_size = gen_logits.shape[-1]
+
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits,
+                        spec_metadata,
+                        batch_size,
+                        num_contexts=num_contexts,
+                    )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -1851,7 +2024,10 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len_restore_pending = False
 
         return {
+            # The gathered float32 target logits, or this rank's vocab shard
+            # when the target tokens were selected from it.
             "logits": raw_logits,
+            "logits_vocab_shard": logits_vocab_shard,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,

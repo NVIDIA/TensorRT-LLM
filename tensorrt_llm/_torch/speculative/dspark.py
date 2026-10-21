@@ -31,9 +31,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from .dflash import DFlashWorker, dflash_draft_slot_ids
+from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
+from .vocab_parallel import VocabShardedLogits
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
@@ -979,6 +980,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         raw_logits = logits
+        logits_vocab_shard = False
+        if isinstance(logits, VocabShardedLogits):
+            if spec_metadata.is_all_greedy_sample or self._vocab_parallel.samples:
+                # The target tokens come from the shard: this step returns
+                # the shard, which the engine gathers only for a logits
+                # post-processor.
+                raw_logits = logits.local
+                logits_vocab_shard = True
+            else:
+                logits = raw_logits = logits.gather()
         K = self.max_draft_len
 
         self._lazy_init(draft_model, spec_metadata, attn_metadata)
@@ -1142,6 +1153,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         outputs = {
             "logits": raw_logits,
+            "logits_vocab_shard": logits_vocab_shard,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
@@ -1233,6 +1245,20 @@ class DSparkWorker(DFlashWorker):
         shift_label = getattr(draft_model, "_dspark_shift_label", False)
         return dflash_draft_slot_ids(
             num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+        )
+
+    def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
+        """A drafter with a Markov head chains the greedy block through it."""
+        draft_tokens = super()._vocab_parallel_draft_tokens(draft_model)
+        if draft_tokens is None or not getattr(draft_model, "has_markov_head", False):
+            return draft_tokens
+        return self._markov_block_tokens
+
+    def _markov_block_tokens(
+        self, draft_model, local_block: torch.Tensor, inputs: dict
+    ) -> torch.Tensor:
+        return self._vocab_parallel.head.markov_tokens(
+            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 
     def _refine_block_logits(
