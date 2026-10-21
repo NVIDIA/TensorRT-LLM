@@ -48,7 +48,7 @@ Why the window is not V2's:
   page table stays at ``num_pages`` pages.
 
 The fixed region is the first ``pin_tokens`` tokens of the sequence, declared
-by ``open``: every frame sees them for the whole rollout and they are never
+by ``open``: every causal block sees them for the whole rollout and they are never
 evicted. Tokens become fixed when they are committed, so nothing can be pinned
 after it was evicted. What those tokens are is the model's business. The
 rolling history slides: ``commit`` turns the staged tokens (written by forwards, not
@@ -109,16 +109,18 @@ class RolloutSpec:
     forward of the rollout may ask for. The cache keeps device state per spec, so CUDA
     graphs captured over a spec replay whenever it is opened again.
 
+    Every causal block sees the fixed region, the ``window_tokens`` tokens before its own
+    start, and itself. The window is the same for every causal block and every forward
+    of a rollout; a window that changes between forwards of one rollout is not
+    supported.
+
     Args:
-        window_tokens: history each causal block may see before itself, in tokens
-            (``(window_frames - 1) * tokens_per_frame``).
-        max_staged_tokens: most tokens a forward may write before a commit
-            (``chunk_frames * tokens_per_frame``); a forward may write fewer.
+        window_tokens: history tokens each causal block sees before its own start.
+        max_staged_tokens: most tokens a forward may write before a commit; a forward
+            may write fewer.
         causal_blocks: every causal block size a forward may use, mapped to the most
-            causal blocks of that size one forward cuts its tokens into. A denoising
-            step over a whole chunk is one causal block of ``max_staged_tokens``; the
-            clean pass is ``chunk_frames`` causal blocks of ``tokens_per_frame``. Each
-            size gets private pages for that many causal blocks.
+            causal blocks of that size one forward cuts its tokens into. Each size gets
+            private pages for that many causal blocks.
         max_pin_tokens: most tokens any ``open`` of this spec pins.
     """
 
