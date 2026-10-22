@@ -792,7 +792,7 @@ def test_flashinfer_mxfp8_graph_tuning_runs_once_per_shape(
     TLLM_AUTOTUNER_CACHE_PATH, whose reload in the next pass replaces the
     in-memory tactics."""
     for name, value in (
-        ("TLLM_JIT_PREFETCH", prefetch),
+        ("TLLM_JIT_AHEAD", prefetch),
         ("TLLM_WARMUP_JIT_COVERAGE", coverage),
         ("TLLM_AUTOTUNER_CACHE_PATH", cache_path),
     ):
@@ -800,6 +800,7 @@ def test_flashinfer_mxfp8_graph_tuning_runs_once_per_shape(
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
     runner = object.__new__(DecoderRunner)
     runner._flashinfer_mxfp8_tuned_graph_shapes = set()
     runner._tuning_flashinfer_mxfp8_graphs = False
@@ -1159,10 +1160,11 @@ class TestWarmupCleanup(unittest.TestCase):
             for prefetch in (True, False):
                 with self.subTest(prefetch=prefetch):
                     events.clear()
-                    env = {"TLLM_JIT_PREFETCH": "1"} if prefetch else {}
+                    env = {"TLLM_JIT_AHEAD": "1"} if prefetch else {}
                     with patch.dict(os.environ, env, clear=False):
+                        os.environ.pop("TLLM_JIT_PREFETCH", None)
                         if not prefetch:
-                            os.environ.pop("TLLM_JIT_PREFETCH", None)
+                            os.environ.pop("TLLM_JIT_AHEAD", None)
                         model_engine._warmup_impl(resource_manager)
                     warmup = ["sampling", "engram", "csa2", "forwards"]
                     if prefetch:
@@ -2016,13 +2018,14 @@ def test_attention_warmup_skips_gen_fmha_grid_on_context_workers(
 
     for name, value in (
         ("TRTLLM_DISAGG_ROLE", role),
-        ("TLLM_JIT_PREFETCH", prefetch),
+        ("TLLM_JIT_AHEAD", prefetch),
         ("TLLM_WARMUP_JIT_COVERAGE", coverage),
     ):
         if value is None:
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
     runner = object.__new__(DecoderRunner)
     runner._config = SimpleNamespace(
         attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
@@ -2094,9 +2097,10 @@ def test_load_time_deep_gemm_limits_lead_with_the_warmup_token_counts(
     engine.batch_size = 2
     engine.max_num_tokens = 14
     engine.llm_args = SimpleNamespace(cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
+    monkeypatch.delenv("TLLM_JIT_AHEAD", raising=False)
     monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
     assert engine._load_time_deep_gemm_limits() is None
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     # Graph batch sizes above max_batch_size are dropped, as the engine does.
     assert engine._load_time_deep_gemm_limits() == {
         "max_num_tokens": 14,
@@ -2150,3 +2154,36 @@ def test_warmup_joins_the_sampling_build_the_model_loader_started(
         if pending
         else ["start", "forwards(helper=True)", "cancel"]
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("per_iter", [True, False])
+def test_plan_jit_prefetch_binds_the_executor_and_plans_only_with_plan_per_iter(
+    per_iter: bool,
+) -> None:
+    """The engine's per-batch hook binds the executor thread for every
+    scheduled batch, so the JIT stats and the waits on helper compiles see its
+    launches; it plans the batch (DeepGEMM, CuTe DSL, Triton providers) only
+    with TLLM_JIT_PLAN_PER_ITER on. Warmup batches are never planned."""
+    prefetcher = Mock(plan_per_iter=per_iter)
+    engine = object.__new__(PyTorchModelEngine)
+    engine._jit_prefetcher = prefetcher
+    engine._is_warmup = False
+    engine._runner = object()  # not a DecoderRunner: no CUDA graph runner, every batch eager
+    ctx = SimpleNamespace(context_chunk_size=5, context_current_position=0,
+                          py_num_compressed_tokens=0)  # fmt: skip
+    scheduled = SimpleNamespace(context_requests=[ctx], generation_requests=[])
+
+    engine._plan_jit_prefetch(scheduled, Mock())
+
+    prefetcher.bind_executor_thread.assert_called_once_with()
+    planned = [prefetcher.plan_deep_gemm, prefetcher.plan_cute_dsl, prefetcher.plan]
+    assert [m.called for m in planned] == [per_iter] * 3
+    if per_iter:
+        prefetcher.plan_deep_gemm.assert_called_once_with(5)
+        prefetcher.plan_cute_dsl.assert_called_once_with([5])
+
+    prefetcher.reset_mock()
+    engine._is_warmup = True
+    engine._plan_jit_prefetch(scheduled, Mock())
+    assert not prefetcher.bind_executor_thread.called and not prefetcher.plan.called

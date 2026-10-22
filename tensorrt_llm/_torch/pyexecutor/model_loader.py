@@ -974,7 +974,7 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
-            # With JIT prefetch on (TLLM_JIT_PREFETCH=1), JIT kernels the
+            # With JIT compile ahead on (TLLM_JIT_AHEAD=1), JIT kernels the
             # model's layers build in warmup (FlashInfer modules, CuTe DSL
             # FP8 GEMM tactics, MiniMax-M3's MSA kernels) are built in
             # CPU-only helpers while the weights load.

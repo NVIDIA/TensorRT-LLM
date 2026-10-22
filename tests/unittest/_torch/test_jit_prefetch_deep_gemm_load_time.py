@@ -125,6 +125,7 @@ def test_provider_plans_the_shapes_a_model_creates_while_loading():
 
 @pytest.mark.cpu_only
 def test_start_deep_gemm_builds_is_off_without_prefetch(monkeypatch):
+    monkeypatch.delenv("TLLM_JIT_AHEAD", raising=False)
     monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
     assert not jp.start_deep_gemm_builds(torch.nn.Module(), 0, max_num_tokens=64)
     assert not jp.start_weight_load_builds(

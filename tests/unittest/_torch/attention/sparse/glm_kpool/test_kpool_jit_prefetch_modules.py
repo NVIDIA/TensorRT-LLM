@@ -106,7 +106,7 @@ def test_model_without_kpool_layers_selects_nothing(sm):
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_start_model_builds_starts_a_helper_only_with_prefetch(sm, monkeypatch, prefetch):
     sm(100)
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1" if prefetch else "0")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1" if prefetch else "0")
     with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
         started = jp.start_model_builds(_Model())
     assert started is prefetch

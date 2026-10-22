@@ -654,11 +654,11 @@ def test_start_model_builds_queues_the_gemm_tactics_before_warmup(monkeypatch):
         def enable_cute_dsl(self, p):
             return False
 
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     monkeypatch.setattr(jp.JitPrefetcher, "init", classmethod(lambda cls, rank: _Prefetcher()))
     assert jp.start_model_builds(model)
     assert queued == provider.specs
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "0")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "0")
     queued.clear()
     assert not jp.start_model_builds(model)
     assert queued == [] and ops.fp8_gemm_loader is None

@@ -1216,8 +1216,9 @@ class PyTorchModelEngine(ModelEngine):
         if prefetcher is None:
             return
         if not prefetch_enabled():
-            # Tune ahead alone: no helpers, no planning; only the providers
-            # that tune ahead, whose candidates compile in this process.
+            # Tune ahead alone (TLLM_JIT_TUNE_AHEAD=1 without TLLM_JIT_AHEAD):
+            # no helpers, no planning; only the providers that tune ahead,
+            # whose candidates compile in this process.
             if tune_ahead_enabled():
                 self._register_tune_ahead_providers(prefetcher)
                 prefetcher.tune()
@@ -1320,7 +1321,7 @@ class PyTorchModelEngine(ModelEngine):
         # Benchmark the untuned autotune keys the providers reach on the
         # GPU now (their candidates compiled by the helpers), before the
         # background enumeration fills the helpers' queue. A no-op unless
-        # tune ahead is on (TLLM_JIT_TUNE_AHEAD, default: on with prefetch).
+        # tune ahead is on (TLLM_JIT_TUNE_AHEAD, default: TLLM_JIT_AHEAD).
         prefetcher.tune()
         prefetcher.start_background()
 
@@ -1341,8 +1342,10 @@ class PyTorchModelEngine(ModelEngine):
         prefetcher = getattr(self, "_jit_prefetcher", None)
         if prefetcher is None or self.is_warmup:
             return
+        # Bound even without per-batch planning: the JIT stats and the waits
+        # on helper compiles count the executor thread's launches.
         prefetcher.bind_executor_thread()
-        if not prefetcher.prefetch:
+        if not prefetcher.plan_per_iter:
             return
         from .. import jit_prefetch_deep_gemm as jdg
         prefetcher.plan_deep_gemm(jdg.batch_tokens(scheduled_requests))

@@ -14,7 +14,14 @@
 # limitations under the License.
 """Compile JIT kernel variants ahead of the forward pass that needs them.
 
-Experimental. Enabled by ``TLLM_JIT_PREFETCH=1``.
+Experimental. Two switches:
+
+- ``TLLM_JIT_AHEAD=1``: compile ahead and tune ahead. CPU-only helpers build
+  every variant the providers can reach, from model load to the end of
+  warmup, and the untuned autotune keys are benchmarked at the end of warmup.
+- ``TLLM_JIT_PLAN_PER_ITER``: also plan each scheduled batch before its
+  forward, queuing its variants ahead of the background enumeration. Needs
+  ``TLLM_JIT_AHEAD=1``; unset, it follows it.
 
 A kernel variant that warmup never produced compiles synchronously at its
 first launch, on the executor thread, stalling the GPU. This module compiles
@@ -28,10 +35,11 @@ tensors under :func:`shadow_launches`, which records each ``run`` instead of
 executing it, so the recorded arguments are exactly those of the real launch.
 At the end of warmup a background thread plans one batch per kernel-signature
 class each provider can reach within the engine limits, so a process that
-has never run this model before is covered; a scheduled batch is planned too,
-ahead of that. Some providers take the batch-independent part of a launch
-(pool layouts, fixed scalars) from the launches warmup made; they are
-enumerated again after each warmup. DeepGEMM and CuTe DSL providers do the
+has never run this model before is covered; with ``TLLM_JIT_PLAN_PER_ITER`` a
+scheduled batch is planned too, ahead of that. Some providers take the
+batch-independent part of a launch (pool layouts, fixed scalars) from the
+launches warmup made; they are enumerated again after each warmup. DeepGEMM
+and CuTe DSL providers do the
 same through those libraries' compile-only entry points
 (``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``). MiniMax-M3's
 MSA ``fmha_sm100`` kernels follow from the engine's geometry alone, so they
@@ -63,14 +71,14 @@ that config is planned; otherwise every candidate config is compiled, so the
 benchmark at first launch times cached cubins. The benchmark itself runs on
 the GPU, unchanged. Which config runs is always the autotuner's own choice.
 
-Tune ahead (``TLLM_JIT_TUNE_AHEAD``, independent of prefetch) uses the
-providers that list ``tune_batches``: at the end of each warmup the candidate
-configs of every autotune key those batches reach that is still untuned are
-compiled, then the autotuner's own benchmark for that key runs on the GPU,
-through the kernel's real launcher on scratch tensors. The first batch to
-need the key then finds its config chosen. With prefetch on, the helpers
-compile the candidates; without it, a thread pool in this process does
-(``TLLM_JIT_TUNE_AHEAD_THREADS``), still inside warmup.
+Tune ahead (part of ``TLLM_JIT_AHEAD``; ``TLLM_JIT_TUNE_AHEAD`` overrides it)
+uses the providers that list ``tune_batches``: at the end of each warmup the
+candidate configs of every autotune key those batches reach that is still
+untuned are compiled, then the autotuner's own benchmark for that key runs on
+the GPU, through the kernel's real launcher on scratch tensors. The first
+batch to need the key then finds its config chosen. With compile ahead on, the
+helpers compile the candidates; with tune ahead alone, a thread pool in this
+process does (``TLLM_JIT_TUNE_AHEAD_THREADS``), still inside warmup.
 
 Measurement hooks (always on when the module is enabled, or alone with
 ``TLLM_JIT_STATS=1``) log every compile and every autotune benchmark that
@@ -91,7 +99,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
-_ENABLE_ENV = "TLLM_JIT_PREFETCH"
+_AHEAD_ENV = "TLLM_JIT_AHEAD"
+# The earlier single switch, read when TLLM_JIT_AHEAD is unset.
+_LEGACY_AHEAD_ENV = "TLLM_JIT_PREFETCH"
+_PER_ITER_ENV = "TLLM_JIT_PLAN_PER_ITER"
 _STATS_ENV = "TLLM_JIT_STATS"
 _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
 _TUNE_ENV = "TLLM_JIT_TUNE_AHEAD"
@@ -127,15 +138,50 @@ def _default_workers() -> int:
 
 
 def prefetch_enabled() -> bool:
-    return os.environ.get(_ENABLE_ENV, "0") == "1"
+    """Whether variants are compiled ahead (``TLLM_JIT_AHEAD=1``): the CPU-only
+    helpers, the builds started at model load and before warmup's forwards,
+    and the background enumeration of every reachable variant at the end of
+    warmup. Tune ahead and skipping warmup's compile-only passes default to
+    this too. ``TLLM_JIT_PREFETCH`` is read as ``TLLM_JIT_AHEAD`` when that is
+    unset (deprecated)."""
+    v = os.environ.get(_AHEAD_ENV)
+    if v is None:
+        v = os.environ.get(_LEGACY_AHEAD_ENV)
+        if v is not None:
+            logger.warning_once(
+                f"[JIT prefetch] {_LEGACY_AHEAD_ENV} is deprecated; use {_AHEAD_ENV} "
+                f"(compile and tune ahead) and {_PER_ITER_ENV} (per-batch planning)",
+                key="jitp_legacy_env",
+            )
+    return v == "1"
+
+
+def plan_per_iter_enabled() -> bool:
+    """Whether each scheduled batch is also planned before its forward
+    (``TLLM_JIT_PLAN_PER_ITER``), queuing the variants it needs ahead of the
+    background enumeration.
+
+    Needs compile ahead, whose helpers do the compiling; ignored without it.
+    Unset, it follows ``TLLM_JIT_AHEAD``.
+    """
+    if not prefetch_enabled():
+        if os.environ.get(_PER_ITER_ENV) == "1":
+            logger.warning_once(
+                f"[JIT prefetch] {_PER_ITER_ENV}=1 needs {_AHEAD_ENV}=1; ignored",
+                key="jitp_per_iter_without_ahead",
+            )
+        return False
+    return os.environ.get(_PER_ITER_ENV, "1") == "1"
 
 
 def tune_ahead_enabled() -> bool:
     """Whether the end of warmup runs the autotune benchmark of the untuned
     keys the tune-ahead providers reach (see ``JitPrefetcher.tune``).
 
-    Independent of prefetch. ``TLLM_JIT_TUNE_AHEAD`` decides; unset, it
-    follows ``TLLM_JIT_PREFETCH``, so prefetch's default keeps tuning ahead.
+    Part of compile ahead: unset, ``TLLM_JIT_TUNE_AHEAD`` follows
+    ``TLLM_JIT_AHEAD``. Set, it overrides that either way; tune ahead alone
+    compiles the candidates with a thread pool in this process, without
+    helpers.
     """
     v = os.environ.get(_TUNE_ENV)
     if v is not None:
@@ -1094,6 +1140,10 @@ class JitPrefetcher:
     def __init__(self, rank: int):
         self.rank = rank
         self.prefetch = prefetch_enabled()
+        # Each scheduled batch is planned too (TLLM_JIT_PLAN_PER_ITER); the
+        # bound executor thread, the waits on helper compiles and the stats
+        # do not depend on it.
+        self.plan_per_iter = plan_per_iter_enabled()
         # The executor-side JIT stats (on with prefetch or TLLM_JIT_STATS);
         # tune ahead alone records only its own counters.
         self.stats_on = stats_enabled()
@@ -1531,7 +1581,7 @@ class JitPrefetcher:
 
     def plan_deep_gemm(self, num_tokens: int) -> None:
         """Queue the DeepGEMM variants a batch of ``num_tokens`` will run."""
-        if self._dg is None:
+        if self._dg is None or not self.plan_per_iter:
             return
         from . import jit_prefetch_deep_gemm as jdg
 
@@ -1766,7 +1816,7 @@ class JitPrefetcher:
 
     def plan_cute_dsl(self, ctx_chunk_lens) -> None:
         """Move the K123 variant this batch needs to the front of the queue."""
-        if self._cd is None:
+        if self._cd is None or not self.plan_per_iter:
             return
         from . import jit_prefetch_cute_dsl as jcd
 
@@ -1824,7 +1874,7 @@ class JitPrefetcher:
     def plan(self, batch_ctx: Any) -> None:
         """Called once a batch is scheduled, before its inputs are prepared."""
         self.bind_executor_thread()
-        if not self.prefetch or not self._providers:
+        if not self.plan_per_iter or not self._providers:
             return
         if not self._bg_started:
             self.start_background()
@@ -2337,6 +2387,7 @@ class JitPrefetcher:
         s = self.stats
         return (
             f"[JIT stats] rank {self.rank} SUMMARY prefetch={int(self.prefetch)}"
+            f" plan_per_iter={int(self.plan_per_iter)}"
             f" executor_compiles={s.compiles} executor_compile_s={s.compile_s:.3f}"
             f" executor_disk_hits={s.disk_hits} disk_hit_s={s.disk_hit_s:.3f}"
             f" executor_autotunes={s.tunes} executor_autotune_s={s.tune_s:.3f}"

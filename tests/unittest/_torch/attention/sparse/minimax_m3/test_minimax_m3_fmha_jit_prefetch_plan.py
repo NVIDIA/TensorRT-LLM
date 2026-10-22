@@ -197,7 +197,7 @@ def test_start_model_builds_starts_fmha_gen_for_m3_only_with_prefetch(monkeypatc
     from tensorrt_llm._torch import jit_prefetch as jp
 
     model = _fi_model(monkeypatch, 60)
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1" if prefetch else "0")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1" if prefetch else "0")
     with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
         started = jp.start_model_builds(model)
     assert started is prefetch
@@ -223,7 +223,7 @@ def test_mxfp8_tune_modules_start_only_when_the_pass_runs(
 
     from tensorrt_llm._torch import jit_prefetch as jp
 
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1" if prefetch else "0")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1" if prefetch else "0")
     monkeypatch.setattr("tensorrt_llm._utils.is_sm_100f", lambda *a: sm_100f)
     with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
         assert jp.start_mxfp8_tune_builds(tunes) is started
@@ -343,7 +343,7 @@ def test_mxfp8_tune_modules_predicted_at_load_as_warmup_decides(
         )
         assert DecoderRunner._tunes_flashinfer_mxfp8(runner) is tunes
 
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     monkeypatch.setattr("tensorrt_llm._utils.is_sm_100f", lambda *a: True)
     with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
         jp.start_model_builds(SimpleNamespace(modules=model.modules), llm_args=None)
@@ -456,7 +456,7 @@ def test_sampling_module_starts_after_the_layer_modules_at_load(monkeypatch, arg
     model.modules = _fi_model(monkeypatch, 60).modules
     llm_args = _mxfp8_llm_args(**args_kw)
     assert jp.warmup_builds_sampling_module(model, llm_args) is sampling
-    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     with (
         patch.object(jp, "start_flashinfer_build", return_value=True) as start,
         patch.object(jp, "tunes_flashinfer_mxfp8_at_load", return_value=False),

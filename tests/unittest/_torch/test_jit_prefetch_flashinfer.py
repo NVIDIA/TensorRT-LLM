@@ -280,9 +280,10 @@ _MXFP8_CASE = textwrap.dedent(
 
 def _env(tmp_path, prefetch: bool):
     env = dict(os.environ, FLASHINFER_WORKSPACE_BASE=str(tmp_path / "fi"), PYTHONNOUSERSITE="1")
-    env.pop("TLLM_JIT_PREFETCH", None)
+    for var in ("TLLM_JIT_AHEAD", "TLLM_JIT_PREFETCH"):
+        env.pop(var, None)
     if prefetch:
-        env["TLLM_JIT_PREFETCH"] = "1"
+        env["TLLM_JIT_AHEAD"] = "1"
     return env
 
 
