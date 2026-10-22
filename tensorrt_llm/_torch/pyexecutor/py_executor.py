@@ -201,6 +201,17 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 # content waits for decoding iteration stream_interval.
 DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME = "TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP"
 
+# With "1", the overlap loop of a speculative-decoding executor runs with
+# ``execution_stream``, the stream every forward runs on, as its current stream.
+# The sampler's work and the next step's input preparation then follow each
+# forward in stream order instead of across two cross-stream waits per step (the
+# current stream waits for the forward after it, the forward for the current
+# stream before the next). The order of the work does not change: everything
+# the loop issues on its current stream already runs between two consecutive
+# forwards.
+OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME = (
+    "TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM")
+
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
 # max_input_len truncation.
@@ -5729,11 +5740,36 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    def _overlap_loop_stream(self):
+        """The current-stream context of the overlap loop.
+
+        ``execution_stream`` for a speculative-decoding executor with
+        ``TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM=1``; otherwise the thread's
+        current stream is left as it is.
+        """
+        if (os.environ.get(OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME, "0") == "1"
+                and self.model_engine.spec_config is not None):
+            return torch.cuda.stream(self.execution_stream)
+        return nullcontext()
+
+    def _forward_on_current_stream(self) -> bool:
+        """Whether the forward already runs on the caller's current stream.
+
+        True when the overlap loop runs on the execution stream
+        (``TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM=1``) and the caller's
+        current stream is that stream, so the forward needs no cross-stream
+        ordering.
+        """
+        if os.environ.get(OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME, "0") != "1":
+            return False
+        return torch.cuda.current_stream() == self.execution_stream
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        with self._profiler() as profile_step, self.hang_detector, \
+                self._overlap_loop_stream():
             iter_start_time = time.time()
             iter_stats = None
             previous_tensors_device = None
@@ -8368,8 +8404,12 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
-            # with KVCacheTransferManager's onboard/offload operations.
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            # with KVCacheTransferManager's onboard/offload operations. With the
+            # overlap loop on the execution stream the forward already runs on
+            # the current stream, and the two stream-ordering waits are skipped.
+            same_stream = self._forward_on_current_stream()
+            if not same_stream:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -8383,7 +8423,8 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if not same_stream:
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:
