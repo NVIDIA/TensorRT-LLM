@@ -213,6 +213,13 @@ DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME = "TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP"
 OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME = (
     "TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM")
 
+# TRTLLM_Q35_CACHED_STREAM_EVENTS=1: _forward_step orders the execution stream
+# after the current stream and back with two CUDA events created once and
+# re-recorded every step, instead of Stream.wait_stream (which creates, and
+# later destroys, a new event per call). A stream wait captures the event's
+# record at the time of the wait, so re-recording later is harmless.
+CACHED_STREAM_EVENTS_ENV_VAR_NAME = "TRTLLM_Q35_CACHED_STREAM_EVENTS"
+
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
 # max_input_len truncation.
@@ -5803,6 +5810,17 @@ class PyExecutor:
             return torch.cuda.stream(self.execution_stream)
         return nullcontext()
 
+    def _cached_stream_events(
+            self) -> Optional[tuple[torch.cuda.Event, torch.cuda.Event]]:
+        """The two reusable stream-ordering events of _forward_step, or None (flag off)."""
+        if os.environ.get(CACHED_STREAM_EVENTS_ENV_VAR_NAME, "0") != "1":
+            return None
+        events = getattr(self, "_stream_ordering_events", None)
+        if events is None:
+            events = self._stream_ordering_events = (torch.cuda.Event(),
+                                                     torch.cuda.Event())
+        return events
+
     def _forward_on_current_stream(self) -> bool:
         """Whether the forward already runs on the caller's current stream.
 
@@ -8533,8 +8551,15 @@ class PyExecutor:
             # overlap loop on the execution stream the forward already runs on
             # the current stream, and the two stream-ordering waits are skipped.
             same_stream = self._forward_on_current_stream()
-            if not same_stream:
+            stream_events = (None
+                             if same_stream else self._cached_stream_events())
+            if same_stream:
+                pass
+            elif stream_events is None:
                 self.execution_stream.wait_stream(torch.cuda.current_stream())
+            else:
+                stream_events[0].record(torch.cuda.current_stream())
+                self.execution_stream.wait_event(stream_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -8548,8 +8573,13 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            if not same_stream:
+            if same_stream:
+                pass
+            elif stream_events is None:
                 torch.cuda.current_stream().wait_stream(self.execution_stream)
+            else:
+                stream_events[1].record(self.execution_stream)
+                torch.cuda.current_stream().wait_event(stream_events[1])
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:

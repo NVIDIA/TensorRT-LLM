@@ -2211,8 +2211,17 @@ class DecoderInputPreparer:
         self.iter_states["num_generation_tokens"] = scheduled_requests.num_generation_requests
 
     def record_input_copy(self) -> None:
-        """Mark the end of this pass's host-to-device input copies."""
-        self._prepare_inputs_event = torch.cuda.Event()
+        """Mark the end of this pass's host-to-device input copies.
+
+        With ``TRTLLM_Q35_CACHED_STREAM_EVENTS=1`` one event is re-recorded every
+        pass instead of a new one: ``wait_for_input_copy`` always waits on the
+        latest record, as with a new event per pass.
+        """
+        if os.environ.get("TRTLLM_Q35_CACHED_STREAM_EVENTS", "0") == "1":
+            if self._prepare_inputs_event is None:
+                self._prepare_inputs_event = torch.cuda.Event()
+        else:
+            self._prepare_inputs_event = torch.cuda.Event()
         self._prepare_inputs_event.record()
 
     def wait_for_input_copy(self) -> None:
