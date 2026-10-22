@@ -250,6 +250,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 "model features. To use V1, select transceiver_runtime='CPP' "
                 "with use_kv_cache_manager_v2=False for a model that supports V1."
             )
+        bounce_size_mb = int(os.environ.get("TRTLLM_KV_CACHE_BOUNCE_SIZE_MB", "0") or 0)
+        if bounce_size_mb > 0 and cache_transceiver_config.kv_cache_bounce_size_mb == 0:
+            # For launchers that cannot pass extra cache_transceiver_config fields.
+            logger.info(f"TRTLLM_KV_CACHE_BOUNCE_SIZE_MB={bounce_size_mb}: kv_cache_bounce_size_mb")
+            cache_transceiver_config = cache_transceiver_config.model_copy(
+                update={"kv_cache_bounce_size_mb": bounce_size_mb}
+            )
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
@@ -420,10 +427,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
         self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
-        # Idle receive-status skip: _gen_idle_agreed is set from the gathered
-        # outcome of a status round in which no rank held a receive session,
-        # and cleared by every receive request; while it is set no rank holds
-        # a session and the status poll skips its collectives on all ranks.
+        # _gen_idle_agreed: set from a gathered status round in which no rank held a
+        # receive session, cleared by every receive request; while set, every rank
+        # skips the status-poll collectives.
         self._gen_idle_poll_skip = self._gen_idle_poll_skip_applies(m, self._gen_need_sync)
         self._gen_idle_agreed = False
         pp_allgather: Callable = getattr(self._dist, "pp_allgather")
@@ -1363,10 +1369,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not self._ever_had_recv_session and not self._gen_need_sync:
             return GenTransferStatus([], [], [])
         if getattr(self, "_gen_idle_agreed", False):
-            # The last status round gathered zero receive sessions from every
-            # rank and no rank has requested a receive since (that clears the
-            # flag on every rank in the same iteration), so this round's
-            # consensus would be empty everywhere.
+            # Zero sessions on every rank last round and no receive requested
+            # since (that clears the flag on all ranks in the same iteration):
+            # this round's consensus would be empty everywhere.
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
