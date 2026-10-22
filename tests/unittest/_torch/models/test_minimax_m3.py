@@ -1619,8 +1619,11 @@ def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("replicate_index_q", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: int) -> None:
+def test_minimax_m3_five_way_projection_shards_index_rows(
+    monkeypatch, tp_size: int, replicate_index_q: bool
+) -> None:
     def init_linear(self, in_features, out_features, **kwargs) -> None:
         nn.Module.__init__(self)
         self.tp_size = kwargs["mapping"].tp_size
@@ -1655,16 +1658,18 @@ def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: 
             use_custom_cublas_mm=False,
             use_cute_dsl_bf16_gemm=False,
             use_cute_dsl_blockscaling_mm=False,
+            replicate_index_q=replicate_index_q,
         )
         kv_heads = max(4 // tp_size, 1)
+        index_heads = 4 if replicate_index_q else kv_heads
         assert projection.local_output_sizes == (
             64 // tp_size * 128,
             kv_heads * 128,
             kv_heads * 128,
-            kv_heads * 128,
+            index_heads * 128,
             128,
         )
-        assert projection.local_num_index_heads == kv_heads
+        assert projection.local_num_index_heads == index_heads
         assert projection.out_features == sum(projection.local_output_sizes)
         shards = {
             name: {"weight": torch.arange(heads * 128 * 2).reshape(heads * 128, 2)}
@@ -1680,9 +1685,12 @@ def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: 
         packed = loaded[0]["weight"].split(projection.local_output_sizes)
         torch.testing.assert_close(packed[4], shards["index_k"]["weight"])
         kv_rank = tp_rank // max(tp_size // 4, 1)
-        torch.testing.assert_close(
-            packed[3], shards["index_q"]["weight"].chunk(min(tp_size, 4))[kv_rank]
-        )
+        index_q = shards["index_q"]["weight"]
+        if replicate_index_q:
+            assert projection._shard_geometry("index_q") == (1, 0)
+            torch.testing.assert_close(packed[3], index_q)
+        else:
+            torch.testing.assert_close(packed[3], index_q.chunk(min(tp_size, 4))[kv_rank])
         torch.testing.assert_close(packed[1], shards["k"]["weight"].chunk(min(tp_size, 4))[kv_rank])
         assert projection.tp_size == tp_size and projection.tp_rank == tp_rank
 

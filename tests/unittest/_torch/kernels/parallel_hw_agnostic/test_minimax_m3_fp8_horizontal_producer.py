@@ -327,6 +327,7 @@ def test_minimax_m3_horizontal_producer_ignores_out_of_range_cache_slot():
 
 def test_minimax_m3_horizontal_producer_more_index_heads_than_kv_heads():
     """Each of 4 index-Q heads with 1 KV head (the TP-split indexer) matches a 1-head run."""
+    torch.manual_seed(1234)
     num_heads_q, num_tokens, width = 8, 16, (8 + 2) * 128
     packed = torch.randn(num_tokens, width + 5 * 128, device="cuda").bfloat16()
     weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]

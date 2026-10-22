@@ -78,7 +78,7 @@ class IndexTpSplit:
     emptied the set.
     """
 
-    _instances: dict[tuple[int, int, int], "IndexTpSplit"] = {}
+    _instances: dict[tuple[int, int, int, tuple[int, ...], int], "IndexTpSplit"] = {}
     # Every split stays allocated: CUDA graphs captured with it address its slots.
     _alive: list["IndexTpSplit"] = []
 
@@ -92,7 +92,7 @@ class IndexTpSplit:
         max_tokens: int,
     ) -> "IndexTpSplit":
         """The process's split of this TP group; created, collectively, on first use or growth."""
-        key = (mapping.pp_rank, mapping.tp_rank, mapping.tp_size)
+        key = (mapping.pp_rank, mapping.tp_rank, mapping.tp_size, tuple(layer_ids), num_heads)
         split = cls._instances.get(key)
         if split is None or split.recv.shape[3] < max_tokens or split.recv.shape[4] < max_blocks:
             split = cls._instances[key] = cls(mapping, layer_ids, num_heads, max_blocks, max_tokens)
