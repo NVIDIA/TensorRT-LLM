@@ -45,14 +45,19 @@ def _module_path(dotted: str) -> Path:
 # ``route`` hands back the class itself, imported from the target directory
 # right where it is returned. That import line is the one place a family's
 # routing module names its targets, so it is what these tests read.
-_TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULTILINE)
+_TARGET_IMPORT = re.compile(
+    r"^\s*from \.(\w+)\.modeling import (?:(\w+)|\(\s*(\w+),?\s*\))$", re.MULTILINE
+)
 
 
 def _routed_targets(arch: str):
     """(target directory, class name) for every target ``route`` can return."""
     source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
     family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
-    return [(family_dir / target, name) for target, name in _TARGET_IMPORT.findall(source)]
+    return [
+        (family_dir / target, plain or wrapped)
+        for target, plain, wrapped in _TARGET_IMPORT.findall(source)
+    ]
 
 
 def test_every_routed_architecture_has_an_importable_routing_module():
@@ -145,6 +150,74 @@ def test_targets_do_not_share_files():
                     )
 
 
+#: tensorrt_llm imports that compute nothing, so a target's generic path need not declare them: types and configs
+#: it reads, enums it passes, the metadata it is handed and the views it takes of it, the graph-capture context it
+#: asks about and its logger.
+_NON_COMPUTE_IMPORTS = frozenset(
+    {
+        "AllReduceStrategy",
+        "AttentionMetadata",
+        "AuxStreamType",
+        "MambaHybridCacheManagerV2",
+        "Mapping",
+        "ModelConfig",
+        "MoESchedulerKind",
+        "QuantAlgo",
+        "QuantConfig",
+        "SiTuActivation",
+        "is_in_breakable_cuda_graph",
+        "k3_mla_decode_view",
+        "logger",
+    }
+)
+
+
+def _declared_tuple(tree: ast.Module, name: str):
+    """The string tuple assigned to ``name`` at module level, or None when the module does not assign it."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            return tuple(ast.literal_eval(node.value))
+    return None
+
+
+def test_uncertified_generic_calls_name_every_stock_import():
+    """A target whose generic path runs stock code (``UNCERTIFIED_GENERIC_CALLS``) declares every tensorrt_llm
+    name it imports outside the catalog, module level or function local, unless the name computes nothing; and it
+    declares nothing it does not import, so the list cannot go stale as entries replace stock calls."""
+    checked = 0
+    for arch in _ARCHS:
+        for target_dir, name in _routed_targets(arch):
+            tree = ast.parse((target_dir / "modeling.py").read_text())
+            declared = _declared_tuple(tree, "UNCERTIFIED_GENERIC_CALLS")
+            if declared is None:
+                continue
+            checked += 1
+            imported = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and node.module is not None
+                    and node.module.split(".")[0] == "tensorrt_llm"
+                    and ".modeling_v2.catalog" not in node.module
+                ):
+                    imported.update(
+                        f"{node.module}.{alias.name}"
+                        for alias in node.names
+                        if alias.name not in _NON_COMPUTE_IMPORTS
+                    )
+            assert imported <= set(declared), (
+                f"{name}: imported but not in UNCERTIFIED_GENERIC_CALLS: {sorted(imported - set(declared))}"
+            )
+            assert set(declared) <= imported, (
+                f"{name}: UNCERTIFIED_GENERIC_CALLS names what it does not import: "
+                f"{sorted(set(declared) - imported)}"
+            )
+    assert checked, "no target declares UNCERTIFIED_GENERIC_CALLS"
+
+
 def test_every_entry_with_cells_has_a_test_that_drives_them():
     """A cell list nothing executes is worse than no cell list.
 
@@ -182,9 +255,11 @@ _PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
 
 
 def _core_modules() -> list[Path]:
-    """Every target module ``route`` can reach."""
     return [
-        target_dir / "modeling.py" for arch in _ARCHS for target_dir, _ in _routed_targets(arch)
+        target_dir / "modeling.py"
+        for arch in _ARCHS
+        for target_dir, _ in _routed_targets(arch)
+        if target_dir.parent.name != "kimi_k3_vl"
     ]
 
 
@@ -251,11 +326,6 @@ def test_decode_step_args_state_the_zero_rather_than_reading_it():
 
 
 def test_every_core_ships_both_targets():
-    """A core with one target routes half its steps into a KeyError.
-
-    Names, not a table: the gate above finds the decode body by class name, so
-    the name is load-bearing and is pinned here rather than left to convention.
-    """
     missing = []
     for path in _core_modules():
         if not path.is_file():

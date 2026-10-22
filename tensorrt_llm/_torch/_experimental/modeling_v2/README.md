@@ -136,7 +136,8 @@ tests/unittest/_torch/modeling_v2/
   comm/_<entry>_op_matrix.py   the collectives' rank bodies: allgather, reducescatter
                                and allreduce at 2/4/8 ranks in one node, mnnvl_allreduce
                                at 8 ranks over two trays (srun only, see its docstring)
-  comm/_rank_job.py            starts one of those and asserts on its exit code
+  comm/_lockstep.py            the stateful matrices' launcher and shared reference
+  comm/_rank_job.py            starts one at a world size and asserts on its exit code
 ```
 
 That split is not a preference; it is where this repo's CI collects from, and
@@ -151,7 +152,11 @@ not import `tensorrt_llm`, because that calls `MPI_Init` and an
 MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
 by absolute import -- so neither needs a package to live in. Neither those
 file names nor their `check_*` bodies match pytest's collection patterns:
-each is one fixed 4-rank sequence that cannot run as independent cases.
+each is one fixed sequence over one job's ranks that cannot run as
+independent cases. CI runs them at 4 ranks on one node. A stateful entry's
+launcher also takes `--world-size N --launcher srun`, which runs the same
+body as one of N ranks started across nodes: that is how its multi-node
+receipt is recorded.
 
 Identity is the directory name, and it carries all three segments:
 `gpt_oss_120b__sm_10x__default`. They were three nested directories once, which
@@ -279,7 +284,9 @@ Perf is measured, never gated.
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
 sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
-and the entries it owns are certified on sm_103.
+and the entries it owns are certified on sm_103. Kimi K3's sm_100 operation
+receipts remain in its adjacent records; its generic-operation regressions
+exercise the relocated entries.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
