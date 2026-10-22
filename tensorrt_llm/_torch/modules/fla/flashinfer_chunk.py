@@ -28,6 +28,7 @@ This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -37,7 +38,17 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
     gather_cast_vk_to_fp32_vk,
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import is_sm_100f
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switch; q35_env.activate() re-reads it."""
+    global _Q35_GDN_FI_POOL
+    # TRTLLM_Q35_GDN_FI_POOL=1: hand FlashInfer the SSM state pool plus slot ids (indexed-pool mode) instead of
+    # gathering the rows into a packed buffer and scattering them back.
+    _Q35_GDN_FI_POOL = os.environ.get("TRTLLM_Q35_GDN_FI_POOL", "0") == "1"
 
 
 # Mirror the @torch.compiler.disable on the legacy Triton wrapper
@@ -116,6 +127,46 @@ def chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
+
+    # --- Step 3b: indexed-pool mode (TRTLLM_Q35_GDN_FI_POOL=1) ------------
+    # FlashInfer updates pool rows initial_state_indices[i] in place; it requires
+    # unique slot ids per batch (allocator invariant).
+    # Its 32-bit element offsets overflow on pools spanning >= 2**31 elements (the V2
+    # manager's per-layer view spans all GDN layers of a slot): those take the gather path.
+    if (
+        _Q35_GDN_FI_POOL
+        and inplace_indexed_state_update
+        and initial_state_indices is not None
+        and is_sm_100f()
+        and initial_state.shape[0] * initial_state.stride(0) < 2**31
+    ):
+        num_o_heads = max(q3.shape[1], v3.shape[1])
+        output_buf = (
+            output.squeeze(0)
+            if output is not None
+            else q3.new_empty(q3.shape[0], num_o_heads, q3.shape[2])
+        )
+        slot_ids = (
+            initial_state_indices
+            if initial_state_indices.dtype == torch.int32
+            else initial_state_indices.to(torch.int32)
+        )
+        out_packed, _ = flashinfer.chunk_gated_delta_rule(
+            q=q3,
+            k=k3,
+            v=v3,
+            g=g2,
+            beta=beta2,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output_buf,
+            output_state=initial_state,
+            state_indices=slot_ids,
+        )
+        return out_packed.unsqueeze(0), None
 
     # --- Step 4: gather initial state (+ cast dtype only when required) ---
     # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.

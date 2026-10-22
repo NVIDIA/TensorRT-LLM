@@ -606,6 +606,60 @@ def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
     torch.testing.assert_close(output[:, 2:], torch.zeros_like(output[:, 2:]))
 
 
+@skip_no_cuda
+def test_q35_gdn_prefill_graph_clears_padded_qkv_rows(monkeypatch):
+    """The graphed context GDN core sees the padded batch with zeroed q|k|v rows past the real tokens."""
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
+
+    num_real, num_padded = 5, 8
+    seen = {}
+
+    class FakeLayer:
+        layer_idx = 0
+
+        def forward_core(
+            self, mixed_qkv, a, b, attn_metadata, mamba_metadata, spec_metadata, output
+        ):
+            seen["qkv"] = mixed_qkv.clone()
+
+    def buf(n, dtype=torch.int32):
+        return torch.zeros(n, dtype=dtype, device="cuda")
+
+    cache = SimpleNamespace(conv=buf(1), temporal=buf(1))
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        seq_lens=torch.tensor([num_real]),
+        num_tokens=num_real,
+        mamba_metadata=SimpleNamespace(
+            has_initial_states=buf(1, torch.bool),
+            state_indices=buf(1),
+            query_start_loc=buf(2),
+            query_start_loc_long=buf(2, torch.int64),
+        ),
+        kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda layer_idx: cache),
+    )
+    monkeypatch.setattr(
+        gdn_mixer, "_extract_gdn_extra_attrs", lambda layer_idx: (metadata, FakeLayer(), None)
+    )
+    monkeypatch.setattr(gdn_mixer, "_Q35_GDN_PREFILL_GRAPH", True)
+    monkeypatch.setattr(gdn_mixer, "_Q35_GDN_GRAPH_LEAN", False)
+    monkeypatch.setattr(gdn_mixer, "_Q35_GDN_GRAPH_DIRECT", False)
+    monkeypatch.setattr(gdn_mixer, "_q35_gdn_prefill_graphs", {})
+    # A row of the q|k|v|z projection; q|k|v are the leading columns.
+    projected = torch.randn(num_padded, 24, dtype=torch.bfloat16, device="cuda")
+    projected[num_real:] = float("nan")
+    mixed_qkv = projected[:, :16]
+    expected_real = mixed_qkv[:num_real].clone()
+    a = torch.zeros(num_padded, 2, device="cuda")
+    output = torch.zeros(1, num_padded, 2, 2, device="cuda")
+
+    gdn_mixer.gdn_custom_op_inplace(mixed_qkv, a, a.clone(), "0", output)
+
+    assert seen["qkv"].shape[0] == num_padded
+    torch.testing.assert_close(seen["qkv"][:num_real], expected_real, rtol=0, atol=0)
+    assert torch.count_nonzero(seen["qkv"][num_real:]) == 0
+
+
 def test_gdn_attaches_only_static_fp8_scale():
     from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
     from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
