@@ -1746,6 +1746,60 @@ def test_gpt_oss_excluded_experts_are_built_unquantized(monkeypatch):
     assert modeling_gpt_oss.create_moe.call_args.kwargs["override_quant_config"] is None
 
 
+def test_gpt_oss_keeps_a_regex_experts_exclusion_a_regex(monkeypatch):
+    """A ``re:`` exclusion is left alone: its body spells dots its own way and
+    the marker has to stay in front, or ``QuantConfig`` reads the entry as a
+    glob and the experts are no longer excluded."""
+    from tensorrt_llm._torch.models import modeling_gpt_oss
+
+    class _Built(Exception):
+        pass
+
+    def transformer(model_config):
+        raise _Built
+
+    monkeypatch.setattr(modeling_gpt_oss, "Transformer", transformer)
+    for name in ("create_moe", "Linear", "RMSNorm"):
+        monkeypatch.setattr(modeling_gpt_oss, name, MagicMock())
+    experts_exclude = r"re:model[.]block[.]0[.]mlp[.]experts"
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=8,
+            intermediate_size=16,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            torch_dtype=torch.bfloat16,
+        ),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.W4A8_MXFP4_FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            exclude_modules=[experts_exclude, "block.*.attn.qkv"],
+        ),
+    )
+
+    with pytest.raises(_Built):
+        modeling_gpt_oss.GptOssForCausalLM(model_config)
+
+    # The regex survives verbatim; the glob entry is still translated.
+    assert model_config.quant_config.exclude_modules == [
+        experts_exclude,
+        "model.block.*.attn.qkv_proj",
+    ]
+    assert model_config.quant_config.is_module_excluded_from_quantization(
+        "model.block.0.mlp.experts"
+    )
+
+    # ... so the excluded experts layer is built unquantized.
+    modeling_gpt_oss.MLPBlock(model_config, layer_idx=0)
+    excluded = modeling_gpt_oss.create_moe.call_args.kwargs["override_quant_config"]
+    assert excluded.quant_algo is None
+    assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
+
+    modeling_gpt_oss.MLPBlock(model_config, layer_idx=1)
+    assert modeling_gpt_oss.create_moe.call_args.kwargs["override_quant_config"] is None
+
+
 _HOPPER_FP8_BLOCK_SCALES_ID = "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales"
 _TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
 

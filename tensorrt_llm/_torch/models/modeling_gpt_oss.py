@@ -635,7 +635,15 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
     @classmethod
     def _translate_exclude_modules(cls, quant_config: QuantConfig) -> None:
         """Rewrite ``exclude_modules`` from GPT-OSS checkpoint names to TRT-LLM
-        module names, in place."""
+        module names, in place.
+
+        ``re:`` entries are passed through untouched: a regex body spells its
+        dots in its own way (``\\.``, ``[.]``, ``.``), so splitting it on a
+        literal ``.`` would corrupt the pattern, and prefixing the entry would
+        move the ``re:`` marker into the middle and demote the whole pattern to
+        a glob that matches nothing. A producer writing a regex already names
+        the runtime module path.
+        """
         if not quant_config.exclude_modules:
             return
         if quant_config.quant_algo == "NVFP4":
@@ -649,6 +657,8 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
         params_map_reverse = {v: k for k, v in cls.params_map.items()}
         for i, module in enumerate(quant_config.exclude_modules):
+            if module.startswith("re:"):
+                continue
             names = module.split(".")
             if names[-1] in params_map_reverse:
                 names[-1] = params_map_reverse[names[-1]]
