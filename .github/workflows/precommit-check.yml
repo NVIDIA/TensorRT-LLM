@@ -55,6 +55,10 @@ jobs:
           echo "count=$count" >> $GITHUB_OUTPUT
 
       - name: Run pre-commit checks
+        env:
+          # Schema generation imports the compiled TensorRT-LLM package, which
+          # is unavailable on this runner. Build environments run the schema tests.
+          SKIP: trtllm-serve-schemas-check
         run: |
           args=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
