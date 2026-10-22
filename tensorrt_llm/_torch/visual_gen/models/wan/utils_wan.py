@@ -18,6 +18,7 @@ Keeps kernel selection, eligibility, tensor contracts, and dispatch behind
 model-level normalization operations used by WanBlock.
 """
 
+from enum import IntEnum
 from typing import NamedTuple, Optional, Sequence, Union
 
 import torch
@@ -275,6 +276,57 @@ def apply_fused_layernorm_adaln_quant(
         x, None, None, scale_msa, shift_msa, seq_len_per_batch, eps
     )
     return out
+
+
+class ResidualNormMode(IntEnum):
+    """Modes of residual_norm_quant (values match the C++ ResidualNormMode)."""
+
+    RESIDUAL_ONLY = 0
+    LAYER_NORM = 1
+    ADA_LAYER_NORM = 2
+
+
+def residual_norm_quant(
+    x: torch.Tensor,
+    mode: ResidualNormMode,
+    rows_per_batch: int,
+    *,
+    y: Optional[torch.Tensor] = None,
+    y_bias: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    inv_out_scale: Optional[torch.Tensor] = None,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Gated residual and LayerNorm / AdaLN + static FP8 quant of [..., hidden] rows in one pass.
+
+    RESIDUAL_ONLY returns (x + gate * (y + y_bias), None).
+    LAYER_NORM: affine weight / bias [hidden]; ADA_LAYER_NORM: weight (scale) / bias (shift) of
+    shape [batch, hidden]. Returns (updated x or None without y, e4m3 normalized rows).
+    """
+    shape = x.shape
+    hidden = shape[-1]
+
+    def rows(t, dtype=None):
+        return None if t is None else t.to(dtype or t.dtype).reshape(-1, hidden).contiguous()
+
+    x_out, normed = torch.ops.trtllm.fused_residual_norm_quant(
+        rows(x),
+        rows(y),
+        y_bias,
+        rows(gate, torch.float32),
+        mode,
+        rows(weight, torch.float32),
+        rows(bias, torch.float32),
+        rows_per_batch,
+        eps,
+        None if inv_out_scale is None else inv_out_scale.reshape(1).to(torch.float32),
+    )
+    return (
+        x_out.view(shape) if y is not None else None,
+        normed.view(shape) if mode != ResidualNormMode.RESIDUAL_ONLY else None,
+    )
 
 
 def apply_fused_layernorm_affine_quant(

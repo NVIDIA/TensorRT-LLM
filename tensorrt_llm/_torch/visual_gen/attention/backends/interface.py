@@ -138,6 +138,36 @@ class AttentionBackend(ABC):
     def support_fused_qkv(cls) -> bool:
         return False
 
+    def accepts_fp8_qkv(self) -> bool:
+        """Whether ``forward_fp8`` serves per-tensor e4m3 Q/K/V with the softmax scale in Q/K."""
+        return False
+
+    def fp8_v_amax(self, qkv: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor | None:
+        """|V| maximum that sets the V quantization scale of packed QKV [T, 3*H*D].
+
+        ``None`` lets the quantizer use the local maximum; sequence-parallel backends return the
+        maximum over the group so every rank quantizes V with one scale.
+        """
+        return None
+
+    def forward_fp8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        v_descale: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        out_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Attention on e4m3 Q/K/V [B, S, H, D] quantized with the softmax scale folded into Q/K.
+
+        Q and K carry ``x * sqrt(softmax_scale * log2(e))`` and V carries ``x / v_descale``.
+        Returns [B, S, H, D] in BF16, or e4m3 quantized with ``out_scale`` (the dequant scale of
+        the consumer's input) when given. Only called when ``accepts_fp8_qkv()`` is True.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not accept FP8 Q/K/V.")
+
     @classmethod
     def support_lse(cls) -> bool:
         """Whether the backend supports returning the softmax log-sum-exp (LSE) of the attention weights."""

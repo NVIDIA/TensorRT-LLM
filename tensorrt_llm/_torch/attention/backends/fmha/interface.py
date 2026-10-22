@@ -119,6 +119,29 @@ class Fmha(ABC):
         """
         return True
 
+    def supports_prequantized_fp8(self) -> bool:
+        """Whether ``run_prequantized`` serves this layer's head layout on this device."""
+        return False
+
+    def run_prequantized(
+        self,
+        q8: torch.Tensor,
+        k8: torch.Tensor,
+        v8: torch.Tensor,
+        v_descale: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        out_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Dense attention on e4m3 Q/K/V [B*S, H, D] whose Q/K scales fold the softmax scale.
+
+        Q and K are quantized as ``x * sqrt(softmax_scale * log2(e))``, so the kernel runs with a
+        unit softmax scale. Returns BF16 [B*S, H, D], or e4m3 quantized with ``out_scale`` (the
+        dequant scale of the consumer's input) when given. Only for libraries whose
+        ``supports_prequantized_fp8()`` is True.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not serve pre-quantized FP8 Q/K/V.")
+
     @final
     def is_supported(
         self,
