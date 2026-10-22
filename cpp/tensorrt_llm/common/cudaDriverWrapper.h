@@ -160,8 +160,10 @@ void checkDriver(T result, CUDADriverWrapper const& wrap, char const* const func
         char const* errorString = nullptr;
         wrap.cuGetErrorName(result, &errorName);
         wrap.cuGetErrorString(result, &errorString);
+        // cuGetErrorName/cuGetErrorString leave the pointer null for unrecognized codes.
         throw TllmException(location,
-            std::format("[TensorRT-LLM][ERROR] CUDA driver error in {}: {}: {}.", func, errorName, errorString));
+            std::format("[TensorRT-LLM][ERROR] CUDA driver error in {}: {}: {}.", func,
+                errorName ? errorName : "unknown", errorString ? errorString : "unknown"));
     }
 }
 
