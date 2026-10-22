@@ -1086,8 +1086,8 @@ SMEM_BUDGET = 100 << 10
 
 #: Measured plans (GB300, 152 SMs, CUDA-graph chain with PDL, weights rotated over > L2) for the
 #: qwen3.8-flash-next-nvfp4 tp1 decode projections: (N, K) -> ((largest M, Plan fields), ...).
-#: `grid` 0 is "auto" (one CTA per 16-row tile up to 9/8 x SMs, else one per SM); -2 is half the
-#: tiles (two tiles a CTA).
+#: `grid` 0 is "auto" (one CTA per 16-row tile up to 9/8 x SMs, else one per SM); -t is t tiles a
+#: CTA (-2: half the tiles).
 _TABLE: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
     # GDN in_proj (q|k|v|z|a|b)
     (16480, 2560): (
@@ -1113,7 +1113,14 @@ _TABLE: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
     (1280, 2560): ((32, dict(grid=0, kw=20, tw=1, slots=1, xreg=1)),),
     # shared expert down
     (2560, 640): ((32, dict(grid=0, kw=5, tw=1, slots=1, xreg=1)),),
+    # vocab projection (MTP draft head / verify head): 15520 tiles, 7 a CTA -> 2218 CTAs (about
+    # 15 a multiprocessor over the launch, ~66 KB shared memory each)
+    (248320, 2560): ((32, dict(grid=-7, kw=2, tw=4, slots=2, l2_ahead=1, xreg=2)),),
 }
+
+#: Most 16-row tiles a CTA takes in the heuristic plan: a ring slot holds `kw` k-blocks of each of
+#: them, so a larger N gets more CTAs (several per multiprocessor over the launch) instead.
+MAX_TILES_PER_CTA = 7
 
 
 def default_plan(n: int, k: int, m: int, sms: int) -> Plan:
@@ -1129,6 +1136,9 @@ def default_plan(n: int, k: int, m: int, sms: int) -> Plan:
             return Plan(grid=grid, **f)
     grid = auto_grid
     rt = -(-n_tiles // grid)
+    if rt > MAX_TILES_PER_CTA:
+        grid = -(-n_tiles // MAX_TILES_PER_CTA)
+        rt = -(-n_tiles // grid)
     divs = [d for d in range(1, nkb + 1) if nkb % d == 0]
     if rt >= 4:
         kw = max(d for d in divs if d <= 2)
@@ -1275,6 +1285,7 @@ class Fp8Gemv(OpWrapper):
         _gemv_cell("GDN out / attention o, 4 rows", 2560, 6144, 4),
         _gemv_cell("shared expert gate|up, 16 rows", 1280, 2560, 16),
         _gemv_cell("shared expert down, 8 rows", 2560, 640, 8),
+        _gemv_cell("vocab projection (draft / verify head), 4 rows", 248320, 2560, 4),
     )
 
     note = """

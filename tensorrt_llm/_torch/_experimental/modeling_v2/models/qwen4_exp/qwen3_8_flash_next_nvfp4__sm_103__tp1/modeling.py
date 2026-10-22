@@ -174,6 +174,7 @@ from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.embedding.ngram_hash import ngram_hash
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
+from .ops.gemm.fp8_gemv import MAX_ROWS as _FP8_GEMV_HEAD_ROWS
 from .ops.gemm.fp8_gemv import fp8_gemv_conv1d_op, fp8_gemv_op, pack_from_bf16
 from .ops.gemm.fp8_per_tensor_mm import fp8_per_tensor_mm, fp8_per_tensor_weight
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
@@ -602,12 +603,14 @@ def _dense_fp8_enabled() -> bool:
     return mode == "1"
 
 
-#: Rows up to which a projection with a packed FP8 decode copy runs `fp8_gemv` (FP8 weights,
-#: bf16 activations, one PDL launch), per projection kind: GB300 micro-bench against the bf16
-#: GEMV / low-M entries -- input projections 1.6-1.8x through 16 rows, the K=6144 output
-#: projections 1.1-1.4x through 8 (slower from 16), the shared expert's gate|up ~2x through 32,
-#: its down projection ~2x from 2 through 8 rows (even at one).
-_FP8_GEMV_MAX_ROWS = {"in": 16, "out": 8, "sh_gu": 32, "sh_dn": 8}  # capacity: fixed: dispatch
+#: Row ranges `(lo, hi)` in which a projection with a packed FP8 decode copy runs `fp8_gemv`
+#: (FP8 weights, bf16 activations, one PDL launch), per projection kind. The input projections
+#: from one row (1.6-1.8x the bf16 GEMV through 16 rows, in the step as in isolation); the
+#: output and shared-expert projections from two: at one row the bf16 `bf16_gemv_pdl` hides
+#: more of itself behind its PDL neighbours (STP con1 capture: 1.7 us of exclusive time a call
+#: against 2.4 for fp8_gemv), from two rows the bf16 entry is the slower low-M GEMM (micro:
+#: out/o 5.8 vs 4.3 us, gate|up 4.4 vs 2.1, down 3.2 vs 1.5 at 4 rows).
+_FP8_GEMV_ROWS = {"in": (1, 16), "out": (2, 8), "sh_gu": (2, 32), "sh_dn": (2, 8)}  # dispatch
 
 
 def _gemv_ready(x: torch.Tensor) -> bool:
@@ -619,11 +622,12 @@ def _dense_mm(
     x: torch.Tensor, weight_t: torch.Tensor, fp8, gemm, kind: str, packed=None
 ) -> torch.Tensor:
     """A dense projection under the dense FP8 mode: `fp8_gemv` over the packed decode copy
-    (`packed`) up to `_FP8_GEMV_MAX_ROWS[kind]` rows, the per-tensor FP8 GEMM (`fp8` =
+    (`packed`) within `_FP8_GEMV_ROWS[kind]` rows, the per-tensor FP8 GEMM (`fp8` =
     `(codes_t, scale)`) from `_DENSE_FP8_MIN_ROWS[kind]` rows, else the step's bf16 entry
     `gemm` -- which is every call with the mode off (both copies None)."""
     rows = x.shape[0]
-    if packed is not None and rows <= _FP8_GEMV_MAX_ROWS[kind] and _gemv_ready(x):
+    lo, hi = _FP8_GEMV_ROWS[kind]
+    if packed is not None and lo <= rows <= hi and _gemv_ready(x):
         return fp8_gemv_op(x, packed)
     if fp8 is not None and rows >= _DENSE_FP8_MIN_ROWS[kind]:
         return fp8_per_tensor_mm(x, *fp8)
@@ -1598,6 +1602,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._mtp_fused: "_MtpFused | None" = None
         # (e4m3 [vocab, hidden], fp32 [1, vocab] row scales) when the draft head reads FP8.
         self._mtp_head_fp8: "tuple[torch.Tensor, torch.Tensor] | None" = None
+        # A packed block-scaled e4m3 copy of lm_head for decode rows (`fp8_gemv`): the draft
+        # head's when it reads FP8, and the target head's under the dense FP8 mode.
+        self._lm_head_g = None
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
@@ -6665,7 +6672,7 @@ class MTPLayer:
             )
             final, _ = qwen4_exp_gated_residual(normed, M.fhc_down, M.fhc_up, None, core.hc_count)
         if core._mtp_head_fp8 is not None:
-            lm_head = _Fp8DraftHead(*core._mtp_head_fp8)
+            lm_head = _Fp8DraftHead(*core._mtp_head_fp8, core._lm_head_g)
         return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
 
     def forward(
@@ -6945,14 +6952,22 @@ class _WidenedHead:
 
 
 class _Fp8DraftHead:
-    """The draft head's projection over an FP8 copy of `lm_head`: per-token e4m3 activations
-    (`quantize_e4m3_activation`) times the per-row e4m3 weight, scaled in cuBLASLt's epilogue,
-    bf16 out (`_WidenedHead` widens it as it does the bf16 head's)."""
+    """The draft head's projection over an FP8 copy of `lm_head`: up to `fp8_gemv`'s rows on
+    the packed block-scaled copy (bf16 activations, one launch at HBM rate), more rows as
+    per-token e4m3 activations (`quantize_e4m3_activation`) times the per-row e4m3 weight,
+    scaled in cuBLASLt's epilogue; bf16 out (`_WidenedHead` widens it as it does the bf16
+    head's)."""
 
-    def __init__(self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor) -> None:
-        self.weight_fp8, self.weight_scale = weight_fp8, weight_scale
+    def __init__(self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, packed=None) -> None:
+        self.weight_fp8, self.weight_scale, self.packed = weight_fp8, weight_scale, packed
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            self.packed is not None
+            and hidden_states.shape[0] <= _FP8_GEMV_HEAD_ROWS
+            and _gemv_ready(hidden_states)
+        ):
+            return fp8_gemv_op(hidden_states, self.packed)
         x8, xs = torch.ops.tensorrt_llm.quantize_e4m3_activation(hidden_states)
         return torch._scaled_mm(
             x8,
@@ -6976,12 +6991,30 @@ def _fp8_rowwise(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return w8, scale.reshape(1, -1).contiguous()
 
 
+class _Fp8VerifyHead:
+    """The target's `lm_head` under the dense FP8 mode: decode rows (up to `fp8_gemv`'s) on the
+    packed block-scaled copy, other calls on the bf16 head."""
+
+    def __init__(self, lm_head, packed) -> None:
+        self.lm_head, self.packed = lm_head, packed
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.shape[0] <= _FP8_GEMV_HEAD_ROWS and _gemv_ready(hidden_states):
+            return fp8_gemv_op(hidden_states, self.packed)
+        return self.lm_head(hidden_states)
+
+
 class _WideningLogitsProcessor(LogitsProcessor):
-    """The shell's logits processor (its row gather, its fp32 logits) over `_WidenedHead`."""
+    """The shell's logits processor (its row gather, its fp32 logits) over `_WidenedHead`;
+    with `fp8_head` set (the dense FP8 mode) the target's own head runs `_Fp8VerifyHead`."""
+
+    fp8_head = None
 
     def forward(
         self, hidden_states, lm_head, attn_metadata, return_context_logits: bool = False
     ) -> torch.Tensor:
+        if self.fp8_head is not None and not isinstance(lm_head, _Fp8DraftHead):
+            lm_head = _Fp8VerifyHead(lm_head, self.fp8_head)
         return super().forward(
             hidden_states, _WidenedHead(lm_head), attn_metadata, return_context_logits
         )
@@ -7437,5 +7470,12 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()
-        if self.model.mtp_enabled and _mtp_draft_head_mode() == "fp8":
+        draft_fp8 = self.model.mtp_enabled and _mtp_draft_head_mode() == "fp8"
+        if draft_fp8:
             self.model._mtp_head_fp8 = _fp8_rowwise(self.lm_head.weight.data)
+        # One packed block-scaled copy serves the draft head's decode rows and, under the dense
+        # FP8 mode, the target's own head's.
+        if draft_fp8 or _dense_fp8_enabled():
+            self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
+        if _dense_fp8_enabled():
+            self.logits_processor.fp8_head = self.model._lm_head_g
