@@ -1,6 +1,4 @@
-#!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+bin/bash
 #SBATCH --partition=${partition}
 #SBATCH --account=${account}
 #SBATCH --job-name=${job_name}
@@ -13,11 +11,7 @@ enable_etcd="${enable_etcd:-0}"
 disagg_port="8000"
 ctx_port="8001"
 gen_port="8002"
-internal_request_auth_key=$(python3 -c 'import secrets; print(secrets.token_hex(32))') || exit 1
-# Keep generated configs available for workers joining this deployment later.
-work_path=$(mktemp -d "${work_path:?Set work_path to the shared configuration directory}/.trtllm-disagg.XXXXXX") || exit 1
-umask 077
-
+internal_request_auth_key="${internal_request_auth_key:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 
 # use the first node as the disaggregated server node
 disagg_server_node=$(head -n 1 <(scontrol show hostnames $SLURM_JOB_NODELIST))

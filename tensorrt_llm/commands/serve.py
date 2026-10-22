@@ -1551,6 +1551,8 @@ def serve(
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
+                "internal_request_auth_key":
+                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1564,9 +1566,6 @@ def serve(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            if internal_disagg_auth_key is not None:
-                _set_rank_info_auth_key(
-                    llm_args, internal_disagg_auth_key.encode("utf-8"))
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
                     raise ValueError(

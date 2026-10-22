@@ -256,11 +256,10 @@ generation_servers:
       - "localhost:8003"
 ```
 
-The supplied SLURM benchmark, simple-example, service-discovery, and local Ray/MPI
-launch scripts generate a fresh shared authentication key for each deployment.
-They provision it in private worker/proxy configuration files; users do not need
-to supply a key. The service-discovery script retains its generated configuration
-directory so additional workers can reuse that deployment's configuration.
+The supplied SLURM benchmark, simple-example, and local Ray/MPI launch scripts
+generate a fresh shared authentication key for each deployment and provision it
+in private worker/proxy configuration files; users do not need to supply a key.
+The service-discovery script already generates a shared key when none is supplied.
 The shared `disaggregated_mpi_worker` job uses the launcher's key when present;
 otherwise rank 0 generates a native RankInfo key and broadcasts it before the
 job splits into context and generation groups. The generated MPI key is internal
