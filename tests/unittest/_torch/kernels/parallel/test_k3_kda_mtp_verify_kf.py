@@ -558,6 +558,27 @@ def test_rejects_unsupported_inputs():
     misaligned.copy_(base["x_q"])
     with pytest.raises(RuntimeError):
         _kf(dict(base, x_q=misaligned))
+    # beta and the beta cache are read through tensor maps with 8-head boxes: their rows must be padded to a multiple
+    # of 8 heads (16 bytes), as the [f_a | b] projection and the cache manager do.
+    narrow = _case(12, 3, 8, seed=18)
+    rows12 = narrow["x_q"].shape[1]
+    unpadded = torch.empty(rows12, 12, dtype=BF16, device="cuda")
+    unpadded.copy_(narrow["beta"].view(rows12, 12))
+    with pytest.raises(RuntimeError):
+        _kf(dict(narrow, beta=unpadded.view(1, rows12, 12)))  # row stride 12
+    pool12 = narrow["beta_cache"].shape[0]
+    tight_cache = _in_place(narrow["beta_cache"][..., :12].contiguous(), (3 * 12, 12, 1))
+    assert tight_cache.shape == (pool12, 3, 12)
+    with pytest.raises(RuntimeError):
+        _kf(dict(narrow, beta_cache=tight_cache))  # row stride 12
+    shifted = torch.zeros(rows12 * 144 + 8, dtype=BF16, device="cuda")[1 : 1 + rows12 * 144].view(
+        rows12, 144
+    )
+    shifted[:, 128:140].copy_(narrow["beta"].view(rows12, 12))
+    with pytest.raises(RuntimeError):
+        _kf(
+            dict(narrow, beta=shifted[:, 128:140].unsqueeze(0))
+        )  # row stride 144, base 2 bytes off a 16-byte boundary
 
 
 def _dispatch_module():
@@ -593,6 +614,16 @@ def test_eligibility_policy():
     assert reason(96, 5) is None
     assert reason(12, 3) is None
     assert reason(12, 5) is not None  # TP8 with 5 drafts stays on the CuTe DSL kernels
+    # beta and the beta cache are read through 8-head tensor-map boxes: unpadded rows stay on the CuTe DSL kernels.
+    heads12 = _case(12, 3, 4, seed=1)
+    rows = heads12["x_q"].shape[1]
+    assert reason(12, 3, beta=heads12["beta"].reshape(1, rows, 12).clone()) == "beta alignment"
+    wide = heads12["beta_cache"]
+    tight = _in_place(wide[..., :12].contiguous(), (3 * 12, 12, 1))
+    assert reason(12, 3, beta_cache=tight) == "beta_cache alignment"
+    assert (
+        reason(96, 3, beta=_case(96, 3, 4, seed=1)["beta"].reshape(1, -1, 96).clone()) is None
+    )  # stride 96 = 12 x 8
     assert reason(96, 3, mxfp8=False) == "BF16 output"
     assert reason(96, 3, onorm_eps=1e-6) == "constants"
     assert reason(96, 3, packed_token_layout=False) is not None

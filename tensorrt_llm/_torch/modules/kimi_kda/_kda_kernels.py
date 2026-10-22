@@ -577,12 +577,15 @@ _KF_BF16_INPUTS = (
 # The constants the kernel reads as float32. The mixer casts its parameters to BF16 (A_log and dt_bias among them), so
 # it passes FP32 copies of those two (see mtp_verify).
 _KF_FP32_INPUTS = ("w_q", "w_k", "w_v", "A_log", "dt_bias", "onorm_weight")
-# Tensors read through tensor maps or bulk copies: (name, stride dims that must be whole 16-byte units).
+# Tensors read through tensor maps or bulk copies: (name, stride dims that must be whole 16-byte units). beta and the
+# beta cache are read through tensor maps with boxes of 8 heads, so their rows must be padded to a multiple of 8 heads
+# (the [f_a | b] projection and the cache manager do; a separate [T, 12] beta output at TP8 is not eligible).
 _KF_ROW_ALIGNED = (
     ("x_q", (1,)),
     ("x_k", (1,)),
     ("x_v", (1,)),
     ("g", (1,)),
+    ("beta", (1,)),
     ("onorm_g", (1,)),
     ("cs_q", (0, 2)),
     ("cs_k", (0, 2)),
@@ -590,6 +593,7 @@ _KF_ROW_ALIGNED = (
     ("k_cache", (0, 1)),
     ("g_cache", (0, 1)),
     ("v_cache", (0, 1)),
+    ("beta_cache", (0, 1)),
     ("recurrent_state", (0,)),
     ("w_q", ()),
     ("w_k", ()),

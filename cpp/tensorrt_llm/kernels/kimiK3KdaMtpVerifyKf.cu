@@ -18,23 +18,30 @@
 // Kimi K3 KDA multi-token speculative verify with a BF16 recurrent state, fused with the gated output RMSNorm and the
 // 1x128 MXFP8 quantization of its output (trtllm::kda_mtp_decode_fp8, packed token layout).
 //
-// Origin: NVIDIA Kernel Factory campaign on the P1b package (KDA MTP verify, BF16 state, MXFP8 output), cuda_cpp
-// candidate 9a414576 with the padded state-slot-stride patch (the state tensor map spans [pool][H * 128][2][64] with
-// the pool's slot stride), validated on Rubin against the campaign package. The code between the "Kernel Factory
-// candidate" markers is the candidate's (KdaParams, KdaMaps, Cfg, the kernel), kept as retrieved so that a later
-// candidate with the same interface drops in, apart from an SM10x guard and one added instruction: the kernel waits on
-// its programmatic-launch predecessor (griddepcontrol.wait) before anything else, so that it can be launched with PDL.
-// Around it: the tensor maps are encoded through CUDADriverWrapper (the candidate's encode calls, with their checks),
-// the launch goes through cudaLaunchKernelEx with the PDL attribute, the dynamic shared memory limit is set per launch.
+// Origin: NVIDIA Kernel Factory campaigns on the P1b package (KDA MTP verify, BF16 state, MXFP8 output). This is the
+// round-2 winner, cuda_cpp candidate ab18acf7 (an extension of round 1's 9a414576, which the previous version of this
+// file integrated), with the two layout changes the integration needs: the num_accepted_tokens slot stride and the
+// wave-quantized grid of launchNs (the candidate's launch_ns, with these two changes, is the "plus" variant of the
+// campaign archive). Validated on Rubin against the campaign package, with the deployed KV cache manager v2 layouts and
+// poisoned padding. The code between the "Kernel Factory candidate" markers is the candidate's (KdaParams, KdaMaps,
+// Cfg, the kernel), kept as retrieved so that a later candidate with the same interface drops in, apart from an SM10x
+// guard and one added instruction: the kernel waits on its programmatic-launch predecessor (griddepcontrol.wait)
+// before anything else, so that it can be launched with PDL. Around it: the tensor maps are encoded through
+// CUDADriverWrapper (the candidate's encode calls, with their checks), the launch goes through cudaLaunchKernelEx with
+// the PDL attribute, the dynamic shared memory limit is set per launch.
 //
 // Design: CTAs of 256 threads, 2 per SM, each walking a strided list of up to 64 (request, head) items (more items run
 // whole waves of such CTAs, see launchNs). The BF16 state S0 [V = 128, K = 128] is TMA-loaded (128B swizzle) one item
 // ahead into a double buffer and is the A operand of P = S0 [Kd | Qd]^T on tcgen05 (Kd = k * C, Qd = q * C, C the
-// cumulative decay; hi/lo BF16 split of the token side). The token couplings come from a small Gram MMA, the per-row
-// forward substitution runs on CUDA cores (thread = value row), and the committed state S0 * C_a + U Kc^T (a
-// rank-(a + 1) MMA) is rounded to nearest even BF16 in place and TMA-stored. Token rows and conv history arrive by TMA,
-// the replay caches by bulk copies; each CTA holds 128 TMEM columns. The kernel encodes 12 tensor maps per launch on
-// the host (paid at capture under CUDA graphs).
+// cumulative decay; hi/lo BF16 split of the token side). The token couplings (Gram) are computed in FP32 on CUDA cores
+// by the value warps at NS = 3 and by one M = 64 MMA chain at NS = 5, the per-row forward substitution runs on CUDA
+// cores (thread = value row), and the committed state (S0 + U Ku^T) * C_a comes from a rank-(a + 1) MMA whose
+// accumulator is seeded with S0 by eight identity MMAs; it is rounded to nearest even BF16 in place and TMA-stored.
+// Warps 0-3 (q / k conv, norms, MMA operands) and warps 4-7 (gates, decay, v conv, solve, gated RMSNorm + MXFP8
+// epilogue) split the work; the latter run one item ahead of the commit epilogue. Token rows, conv history, betas and
+// replay caches arrive by TMA (the replay caches of the first item by bulk copies); each CTA holds 256 TMEM columns, so
+// two CTAs fill the 512 columns of an SM. The kernel encodes 17 tensor maps per launch on the host (paid at capture
+// under CUDA graphs).
 //
 // Programmatic dependent launch: the kernel waits before reading anything and never triggers early (a CTA counts as
 // triggered when it exits), so it is safe after any predecessor and before any dependent.
@@ -59,7 +66,7 @@ namespace kernels
 namespace
 {
 
-// ===================================== Kernel Factory candidate (P1b 9a414576) =====================================
+// ===================================== Kernel Factory candidate (P1b ab18acf7) =====================================
 
 #pragma nv_diag_suppress 177 // the candidate's unused helpers and locals
 
@@ -92,12 +99,22 @@ struct KdaMaps
     CUtensorMap g;      // 2D {D, T}, box {128, NT}
     CUtensorMap csl[3]; // conv caches (load): 3D {D, S, POOL}, box {128, 3, 1}
     CUtensorMap css[3]; // conv caches (store): 3D {D, S, POOL}, box {128, 3 + NS, 1}
+    CUtensorMap bnew;   // beta: 2D {H, T} (row stride BS), box {8, NT}
+    CUtensorMap brep;   // beta_cache: 3D {H, NS, POOL}, box {8, NS, 1}
+    CUtensorMap
+        cf[3]; // k_cache, v_cache (bf16), g_cache (f32): 3D {D, NS, POOL}, box {128, NS, 1} (item 0: all positions)
 };
 
 template <int NS>
 struct Cfg
 {
     static constexpr int NT = NS + 1;              // new tokens
+    static constexpr int PROD = (NS <= 3) ? 1 : 3; // warp issuing the conv-window store + raw refill (NS=5: warp 3,
+                                                   // which also owns the state loads and reaches S2 early)
+    static constexpr bool ID = true;      // commit accumulator seeded with S0 by identity MMAs (else FMA epilogue)
+    static constexpr bool CG = (NS <= 3); // token Gram in FP32 on CUDA cores by group V (else M=64 MMA chain)
+    static constexpr int GE = (2 * NS + 1) * (2 * NS) / 2 + (NS + 1) * (NS + 1) + (NS + 1) * NS / 2; // Gram entries
+    static constexpr int GE_PAD = (GE <= 64) ? 64 : 128;
     static constexpr int NROWS = 3 * NS + 2;       // X rows: replay Kd [0,NS), new Kd [NS,2NS+1), Qd [2NS+1,3NS+2)
     static constexpr int NP = (NROWS + 7) / 8 * 8; // MMA1 N (16 / 24)
     static constexpr int XH = NP * 128;            // bytes per (split, k-half) SW128 region (multiple of 1024)
@@ -121,24 +138,32 @@ struct Cfg
     static constexpr int R_XV = R_CV + 3 * 256;
     static constexpr int R_OG = R_CV + (3 + NT) * 256;
     static constexpr int R_GR = R_OG + NT * 256;
-    static constexpr int R_KC = R_GR + NT * 256; // replay caches (a positions)
+    static constexpr int R_BN = R_GR + NT * 256; // beta of the new tokens: [NT][8 heads] bf16 (box at h & ~7)
+    static constexpr int R_BR = R_BN + 128;      // beta_cache of the replay tokens: [NS][8 heads] bf16
+    static constexpr int R_KC = R_BR + 128;      // replay caches (a positions)
     static constexpr int R_VC = R_KC + NS * 256;
     static constexpr int R_GC = R_VC + NS * 256;
     static constexpr int RAW_BYTES = R_GC + NS * 512;
-    static constexpr int RAW_FIXED = R_KC;         // bytes always loaded; + a * 1024 for replay caches
-    static constexpr int NRAW = (NS <= 3) ? 2 : 1; // raw staging buffers (double-buffered when smem allows)
+    static constexpr int RAW_FIXED = R_BN + NT * 16 + NS * 16; // bytes always loaded; + a * 1024 for replay caches
+    static constexpr int RAW_TOK = 5 * NT * 256 + NT * 16;     // slot-independent part: token rows + new-token betas
+    static constexpr int NRAW = (NS <= 3) ? 2 : 1;             // raw staging buffers (double-buffered when smem allows)
     static constexpr int OFF_MISC = OFF_RAW + NRAW * RAW_BYTES;
     // misc (bytes, relative to OFF_MISC)
-    static constexpr int M_CA = 0;                    // 128 f32
-    static constexpr int M_GRAM = 512;                // [NP][16] f32
-    static constexpr int M_GN = M_GRAM + NP * 64;     // [NT][128] f32 new-token gates
-    static constexpr int M_SOG = M_GN + NT * 512;     // [NT][128] f32 sigmoid(onorm_g)
-    static constexpr int M_BETA = M_SOG + NT * 512;   // [16] f32: beta of new tokens [0,NT), replay [8,8+NS)
-    static constexpr int M_RED = M_BETA + 64;         // 3 scratch areas of [4][16] f32
-    static constexpr int M_SCHED = M_RED + 3 * 256;   // [MAXN] int4 (slot, a, request, head)
-    static constexpr int M_BAR = M_SCHED + MAXN * 16; // st0, st1, m1, m2, raw0, raw1
+    static constexpr int M_CA = 0;                 // [2][128] f32 C_a (by item parity: group V runs one item ahead)
+    static constexpr int M_GRAM = 1024;            // [NP][16] f32
+    static constexpr int M_GN
+        = M_GRAM + (NROWS * 64 + 127) / 128 * 128; // [NT][128] f32 cumulative decay C of the new tokens
+    static constexpr int M_SOG = M_GN + NT * 512;  // [NT][128] f32 sigmoid(onorm_g)
+    static constexpr int M_GP = M_GN;             // [2NP][16] f32 Gram partials (hi rows, lo rows); gates dead after S1
+    static_assert(2 * NP * 64 <= NT * 512, "Gram partials must fit in the gate table");
+    static constexpr int M_KR = M_SOG + NT * 512; // [NS][128] f32 commit-B values of the replay tokens (group V -> QK)
+    static constexpr int M_BETA = M_KR + NS * 512;              // [16] f32: beta of new tokens [0,NT), replay [8,8+NS)
+    static constexpr int M_RED = M_BETA + 64;                   // 3 scratch areas of [4][16] f32
+    static constexpr int M_SCHED = M_RED + 3 * 256;             // [MAXN] int4 (slot, a, request, head)
+    static constexpr int M_BAR = M_SCHED + MAXN * 16;           // st0, st1, m1, m2, raw0, raw1
     static constexpr int M_TMEM = M_BAR + 48;
-    static constexpr int SMEM_BYTES = OFF_MISC + M_TMEM + 8 + 1024;
+    static constexpr int M_ID = (M_TMEM + 8 + 127) / 128 * 128; // 16x16 BF16 identity (no-swizzle K-major), 512 B
+    static constexpr int SMEM_BYTES = OFF_MISC + M_ID + (ID ? 512 : 0) + 1024;
 };
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100) // SM10x
@@ -160,17 +185,28 @@ __device__ __forceinline__ void mbar_arrive_expect_tx(uint32_t bar, uint32_t byt
                  : "memory");
 }
 
+__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes)
+{
+    asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
+}
+
 __device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t phase)
 {
     asm volatile(
         "{\n\t.reg .pred P1;\n\t"
         "WAIT_%=:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\n\t"
         "@P1 bra DONE_%=;\n\t"
         "bra WAIT_%=;\n\t"
         "DONE_%=:\n\t}" ::"r"(bar),
-        "r"(phase)
+        "r"(phase), "r"(0x989680) // suspend-time hint: park the warp until the phase flips instead of re-issuing
         : "memory");
+}
+
+__device__ __forceinline__ void mbar_wait_w(uint32_t bar, uint32_t phase)
+{
+    mbar_wait(bar, phase);
+    __syncwarp();
 }
 
 __device__ __forceinline__ void bulk_g2s(uint32_t dst, void const* src, uint32_t bytes, uint32_t bar)
@@ -304,6 +340,76 @@ __device__ __forceinline__ void mma_bf16(uint32_t dtmem, uint64_t ad, uint64_t b
         "l"(ad), "l"(bd), "r"(idesc), "r"(acc));
 }
 
+__device__ __forceinline__ void mma_bf16_w(uint32_t dtmem, uint64_t ad, uint64_t bd, uint32_t idesc, uint32_t acc)
+{
+    asm volatile(
+        "{\n\t.reg .pred e, p;\n\t"
+        "elect.sync _|e, 0xffffffff;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "@e tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}" ::"r"(dtmem),
+        "l"(ad), "l"(bd), "r"(idesc), "r"(acc));
+}
+
+// D[tmem] (+)= A B^T over K = 128 as 8 K16 steps, A and B SW128 K-major with K halves AH / BH bytes apart. One elect,
+// descriptor offsets as immediates (uniform-datapath adds), first step overwrites unless ACC.
+#define KSTEP_OFF(H, i) ((((i) >> 2) * (H) + ((i) &3) * 32) >> 4)
+
+template <int AH, int BH, bool ACC>
+__device__ __forceinline__ void mma_chain8(uint32_t dtmem, uint64_t ad, uint64_t bd, uint32_t idesc)
+{
+    asm volatile(
+        "{\n\t.reg .pred e, p0, p1;\n\t.reg .b64 a, b;\n\t"
+        "elect.sync _|e, 0xffffffff;\n\t"
+        "setp.ne.b32 p0, %4, 0;\n\t"
+        "setp.eq.b32 p1, %4, %4;\n\t"
+        "@e tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p0;\n\t"
+        "add.s64 a, %1, %5;\n\tadd.s64 b, %2, %12;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, p1;\n\t"
+        "add.s64 a, %1, %6;\n\tadd.s64 b, %2, %13;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, p1;\n\t"
+        "add.s64 a, %1, %7;\n\tadd.s64 b, %2, %14;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, p1;\n\t"
+        "add.s64 a, %1, %8;\n\tadd.s64 b, %2, %15;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, p1;\n\t"
+        "add.s64 a, %1, %9;\n\tadd.s64 b, %2, %16;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, p1;\n\t"
+        "add.s64 a, %1, %10;\n\tadd.s64 b, %2, %17;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, p1;\n\t"
+        "add.s64 a, %1, %11;\n\tadd.s64 b, %2, %18;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [%0], a, b, %3, "
+        "p1;\n\t}" ::"r"(dtmem),
+        "l"(ad), "l"(bd), "r"(idesc), "r"(ACC ? 1 : 0), "n"(KSTEP_OFF(AH, 1)), "n"(KSTEP_OFF(AH, 2)),
+        "n"(KSTEP_OFF(AH, 3)), "n"(KSTEP_OFF(AH, 4)), "n"(KSTEP_OFF(AH, 5)), "n"(KSTEP_OFF(AH, 6)),
+        "n"(KSTEP_OFF(AH, 7)), "n"(KSTEP_OFF(BH, 1)), "n"(KSTEP_OFF(BH, 2)), "n"(KSTEP_OFF(BH, 3)),
+        "n"(KSTEP_OFF(BH, 4)), "n"(KSTEP_OFF(BH, 5)), "n"(KSTEP_OFF(BH, 6)), "n"(KSTEP_OFF(BH, 7)));
+}
+
+// S0 copy: D[:, 16 i + n] = S0[:, 16 i + n] for the 8 K16 slices of S0 (B = one 16x16 identity tile, D column step 16)
+__device__ __forceinline__ void mma_identity8(uint32_t dtmem, uint64_t ad, uint64_t bd, uint32_t idesc)
+{
+    asm volatile(
+        "{\n\t.reg .pred e, p0;\n\t.reg .b64 a;\n\t.reg .b32 d;\n\t"
+        "elect.sync _|e, 0xffffffff;\n\t"
+        "setp.ne.b32 p0, %3, %3;\n\t"
+        "@e tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 2;\n\tadd.u32 d, %0, 16;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 4;\n\tadd.u32 d, %0, 32;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 6;\n\tadd.u32 d, %0, 48;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 1024;\n\tadd.u32 d, %0, 64;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 1026;\n\tadd.u32 d, %0, 80;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 1028;\n\tadd.u32 d, %0, 96;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, p0;\n\t"
+        "add.s64 a, %1, 1030;\n\tadd.u32 d, %0, 112;\n\t@e tcgen05.mma.cta_group::1.kind::f16 [d], a, %2, %3, "
+        "p0;\n\t}" ::"r"(dtmem),
+        "l"(ad), "l"(bd), "r"(idesc));
+}
+
+__device__ __forceinline__ void mma_commit_w(uint32_t bar)
+{
+    asm volatile(
+        "{\n\t.reg .pred e;\n\t"
+        "elect.sync _|e, 0xffffffff;\n\t"
+        "@e tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n\t}" ::"r"(bar)
+        : "memory");
+}
+
+__device__ __forceinline__ void prefetch_tmap(void const* map)
+{
+    asm volatile("prefetch.tensormap [%0];" ::"l"(map) : "memory");
+}
+
 __device__ __forceinline__ void mma_commit(uint32_t bar)
 {
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(bar) : "memory");
@@ -395,6 +501,13 @@ __device__ __forceinline__ uint64_t f2pk(float lo, float hi)
     return r;
 }
 
+__device__ __forceinline__ uint64_t fmul2(uint64_t a, uint64_t b)
+{
+    uint64_t d;
+    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(d) : "l"(a), "l"(b));
+    return d;
+}
+
 __device__ __forceinline__ uint64_t ffma2(uint64_t a, uint64_t b, uint64_t c)
 {
     uint64_t d;
@@ -425,6 +538,30 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b)
 __device__ __forceinline__ uint32_t pack2(bf16 a, bf16 b)
 {
     return (uint32_t) (*(unsigned short*) &a) | ((uint32_t) (*(unsigned short*) &b) << 16);
+}
+
+// In-warp reduce-scatter of P2 (>= 32, power of two) values: afterwards lane holds the warp sums of entries idx + i,
+// i < P2 / 32 (halving exchange, P2 - P2/32 shuffles in total)
+template <int P2>
+__device__ __forceinline__ void warp_reduce_scatter(float (&w)[P2], int lane, int& idx)
+{
+    idx = 0;
+#pragma unroll
+    for (int st = 0; st < 5; ++st)
+    {
+        int const off = 16 >> st;
+        int const half = P2 >> (st + 1);
+        bool const upper = (lane & off) != 0;
+        if (upper)
+            idx += half;
+#pragma unroll
+        for (int i = 0; i < half; ++i)
+        {
+            float const send = upper ? w[i] : w[i + half];
+            float const keep = upper ? w[i + half] : w[i];
+            w[i] = keep + __shfl_xor_sync(0xffffffffu, send, off);
+        }
+    }
 }
 
 // Sum / max of N per-thread values over 128 threads (4 warps): reduce-scatter inside the warp (halving exchange),
@@ -495,6 +632,8 @@ __device__ __forceinline__ void issue_raw(
         tma_load_2d(rbase + C::R_XV, &m.x[2], h * 128, row0, bar);
         tma_load_2d(rbase + C::R_OG, &m.x[3], h * 128, row0, bar);
         tma_load_2d(rbase + C::R_GR, &m.g, h * 128, row0, bar);
+        tma_load_2d(rbase + C::R_BN, &m.bnew, h & ~7, row0, bar);
+        tma_load_3d(rbase + C::R_BR, &m.brep, h & ~7, 0, slot, bar);
     }
     __syncwarp();
     if (lane < 3 * a)
@@ -555,8 +694,20 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (warp == 0)
     {
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(smem_u32(tmem_slot)), "r"(256));
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+        tc_fence_before();
+    }
+    else if (warp == 1)
+    {
+        // item 0 on the latency path (one lane): token rows right away, the state as soon as the slot is known, then
+        // the conv window / replay caches once the accepted count is known
         if (lane == 0)
         {
+            int const item0 = blockIdx.x;
+            int const b0 = item0 / H, h0 = item0 - b0 * H;
+            int const s0 = __ldg(p.slots + b0); // longest dependency chain first
             mbar_init(bar_raw0, 1);
             mbar_init(bar_raw0 + 8, 1);
             mbar_init(bar_st0, 1);
@@ -564,42 +715,79 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             mbar_init(bar_m1, 1);
             mbar_init(bar_m2, 1);
             fence_mbar_init();
+            prefetch_tmap(&maps.state);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                prefetch_tmap(&maps.x[i]);
+            prefetch_tmap(&maps.g);
+#pragma unroll
+            for (int i = 0; i < 3; ++i)
+            {
+                prefetch_tmap(&maps.csl[i]);
+                prefetch_tmap(&maps.css[i]);
+                prefetch_tmap(&maps.cf[i]);
+            }
+            prefetch_tmap(&maps.bnew);
+            prefetch_tmap(&maps.brep);
+            const uint32_t rb0 = sb + C::OFF_RAW;
+            mbar_expect_tx(bar_raw0, C::RAW_TOK);
+            tma_load_2d(rb0 + C::R_XQ, &maps.x[0], h0 * 128, b0 * NT, bar_raw0);
+            tma_load_2d(rb0 + C::R_XK, &maps.x[1], h0 * 128, b0 * NT, bar_raw0);
+            tma_load_2d(rb0 + C::R_XV, &maps.x[2], h0 * 128, b0 * NT, bar_raw0);
+            tma_load_2d(rb0 + C::R_OG, &maps.x[3], h0 * 128, b0 * NT, bar_raw0);
+            tma_load_2d(rb0 + C::R_GR, &maps.g, h0 * 128, b0 * NT, bar_raw0);
+            tma_load_2d(rb0 + C::R_BN, &maps.bnew, h0 & ~7, b0 * NT, bar_raw0);
+            int const nacc0 = __ldg(p.nacc + (long long) s0 * p.snacc);
+            mbar_arrive_expect_tx(bar_st0, 32768);
+            tma_load_4d(sb + C::OFF_ST, &maps.state, 0, h0 * 128, 0, s0, bar_st0);
+            // replay caches: all NS positions (no wait on the accepted count)
+            mbar_expect_tx(bar_raw0, NS * 1024);
+            tma_load_3d(rb0 + C::R_KC, &maps.cf[0], h0 * 128, 0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_VC, &maps.cf[1], h0 * 128, 0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_GC, &maps.cf[2], h0 * 128, 0, s0, bar_raw0);
+            int const a0 = min(max(nacc0, 0), NS);
+            sched[0] = make_int4(s0, a0, b0, h0);
+            mbar_arrive_expect_tx(bar_raw0, C::RAW_FIXED - C::RAW_TOK);
+            tma_load_3d(rb0 + C::R_CQ, &maps.csl[0], h0 * 128, a0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_CK, &maps.csl[1], h0 * 128, a0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_CV, &maps.csl[2], h0 * 128, a0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_BR, &maps.brep, h0 & ~7, 0, s0, bar_raw0);
         }
-        __syncwarp();
-        asm volatile(
-            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(smem_u32(tmem_slot)), "r"(128));
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
-        tc_fence_before();
     }
-    else if (warp == 1)
+    else if (warp == 2)
     {
-        // schedule: (slot, accepted count, request, head) of every item of this CTA
-        for (int n = lane; n < cnt; n += 32)
+        // schedule of the remaining items: (slot, accepted count, request, head)
+        for (int n = 1 + lane; n < cnt; n += 32)
         {
             int const item = blockIdx.x + n * G;
             int const b = item / H;
             int const s = __ldg(p.slots + b);
-            int const a = min(max(__ldg(p.nacc + s * p.snacc), 0), NS);
+            int const a = min(max(__ldg(p.nacc + (long long) s * p.snacc), 0), NS);
             sched[n] = make_int4(s, a, b, item - b * H);
         }
+    }
+    if (C::ID && tid >= 128)
+    {
+        // 16x16 identity, element (n, k) at (n>>3)*256 + (n&7)*16 + (k>>3)*128 + (k&7)*2
+        int const i = tid - 128;
+        uint16_t* idt = (uint16_t*) (smem + C::OFF_MISC + C::M_ID);
+        for (int e = i; e < 256; e += 128)
+        {
+            int const nn = e >> 4, kk = e & 15;
+            idt[((nn >> 3) * 256 + (nn & 7) * 16 + (kk >> 3) * 128 + (kk & 7) * 2) >> 1] = (nn == kk) ? 0x3F80 : 0;
+        }
+        fence_proxy_async();
     }
     __syncthreads();
     tc_fence_after();
     const uint32_t tmem = *(uint32_t volatile*) tmem_slot;
 
-    // prologue loads: state of item 0, raw of the first NRAW items, L2 prefetch of item 1's state
-    if (warp == 1)
+    // prologue: raw of item 1 (double buffering), L2 prefetch of item 1's state
+    if (warp == 2 && cnt > 1)
     {
-        issue_raw<NS>(p, maps, sb + C::OFF_RAW, bar_raw0, sched[0], lane);
-        if (C::NRAW == 2 && cnt > 1)
+        if (C::NRAW == 2)
             issue_raw<NS>(p, maps, sb + C::OFF_RAW + C::RAW_BYTES, bar_raw0 + 8, sched[1], lane);
-    }
-    else if (tid == 96)
-    {
-        const int4 it = sched[0];
-        mbar_arrive_expect_tx(bar_st0, 32768);
-        tma_load_4d(sb + C::OFF_ST, tmap, 0, it.w * 128, 0, it.x, bar_st0);
-        if (cnt > 1)
+        if (lane == 0)
         {
             const int4 i1 = sched[1];
             prefetch_l2(p.state + (long long) i1.x * p.sstate0 + (long long) i1.w * 16384, 32768);
@@ -623,17 +811,6 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             dtb = __ldg(p.dt_bias + chx);
             eA = __ldg(p.A_log + itx.w);
             bet = 0.f;
-            if (cch < NT)
-            {
-                bet = __uint_as_float(
-                    (uint32_t) __ldg((const unsigned short*) p.beta + (long long) (itx.z * NT + cch) * p.sbeta + itx.w)
-                    << 16);
-            }
-            else if (cch >= 8 && cch < 8 + NS && cch - 8 < itx.y)
-            {
-                bet = __uint_as_float(
-                    (uint32_t) ((const unsigned short*) p.bc)[itx.x * p.bc_s + (cch - 8) * p.bc_p + itx.w] << 16);
-            }
         }
     };
     float4 cw0 = make_float4(0.f, 0.f, 0.f, 0.f), cw1 = cw0;
@@ -655,7 +832,7 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
         bf16 const* sraw = (bf16 const*) (smem + C::OFF_RAW + rb * C::RAW_BYTES);
 
         float vR[NS], vN[NT]; // group V: values carried into the solve
-        float kcv[NT];        // group QK: commit-MMA B row (Kc)
+        float kc0 = 0.f;      // group QK: commit-MMA B value of the first new token (Ku, or k without ID)
         float kn[NT];         // group QK: normalized new-token keys (k cache)
         float gn[NT];         // group V: new-token gates (g cache)
 
@@ -667,6 +844,8 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             const float4 w4q = cw0;
             const float4 w4k = cw1;
             mbar_wait(bar_raw, raw_phase);
+            if (tid == C::PROD * 32)
+                store_conv_windows<NS>(maps, rbase, it); // committed windows straight from the raw rows
             float rq[3 + NT], rk[3 + NT];
 #pragma unroll
             for (int i = 0; i < 3; ++i)
@@ -705,41 +884,31 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                 qn[j] = sq[j] * (rsqrtf(fmaxf(red[j], 1e-24f)) * 0.08838834764831845f);
                 kn[j] = sk[j] * rsqrtf(fmaxf(red[NT + j], 1e-24f));
             }
-            named_bar(5, 256); // new-token gates from group V
-            // cumulative decay over the chunk; X rows (Kd/Qd) and Ku rows, [k-half][hi|lo][rows] SW128
-            float Cc = 1.0f;
-            float kuR[NS];
-            float const* sgc = (float const*) ((uint8_t const*) sraw + C::R_GC);
-#pragma unroll
-            for (int s = 0; s < NS; ++s)
+            if (C::CG)
             {
-                kuR[s] = 0.f;
-                if (s < a)
+                float* ex = (float*) (smem + C::OFF_KU); // [k | q][NT][128] f32 for group V's token Gram
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
                 {
-                    float const kk = bf2f(sraw[(C::R_KC >> 1) + s * 128 + c]);
-                    Cc *= expa(sgc[s * 128 + c]);
-                    float const kd = kk * Cc, ku = kk * rcpa(Cc);
-                    st_split(smem, C::OFF_X, C::XH, 2 * C::XH, s, c, kd);
-                    st_split(smem, C::OFF_KU, C::KUH, 2 * C::KUH, s, c, ku);
-                    kuR[s] = ku;
+                    ex[j * 128 + c] = kn[j];
+                    ex[(NT + j) * 128 + c] = qn[j];
                 }
+                named_arrive(7, 256);
             }
-            float Ca = 1.f;
+            named_bar(5, 256); // cumulative decay of the new tokens from group V
+            // X rows Kd / Qd and Ku rows of the new tokens, [k-half][hi|lo][rows] SW128 (replay rows: group V)
 #pragma unroll
             for (int j = 0; j < NT; ++j)
             {
-                Cc *= expa(sgn[j * 128 + c]);
-                float const kd = kn[j] * Cc, ku = kn[j] * rcpa(Cc), qd = qn[j] * Cc;
+                float const Cj = sgn[j * 128 + c];
+                float const kd = kn[j] * Cj, ku = kn[j] * rcpa(Cj), qd = qn[j] * Cj;
                 st_split(smem, C::OFF_X, C::XH, 2 * C::XH, NS + j, c, kd);
                 st_split(smem, C::OFF_X, C::XH, 2 * C::XH, 2 * NS + 1 + j, c, qd);
-                st_split(smem, C::OFF_KU, C::KUH, 2 * C::KUH, NS + j, c, ku);
+                if (!C::CG)
+                    st_split(smem, C::OFF_KU, C::KUH, 2 * C::KUH, NS + j, c, ku);
                 if (j == 0)
-                    Ca = Cc;
+                    kc0 = C::ID ? ku : kn[0]; // commit-B value of the first new token
             }
-            sca[c] = Ca;
-#pragma unroll
-            for (int s = 0; s < NT; ++s)
-                kcv[s] = (s < NS) ? kuR[s] * Ca : kn[0];
             fence_proxy_async();
         }
         else
@@ -750,19 +919,70 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             const float4 w4v = cw0;
             float const dtb = cdtb;
             float const eA = expa(ceA);
-            if (c < NT)
-                sbeta[c] = sigm(cbet);
-            else if (c >= 8 && c < 8 + NS)
-                sbeta[c] = cbet;
             mbar_wait(bar_raw, raw_phase);
+            if (c < NT)
+                sbeta[c] = sigm(bf2f(sraw[(C::R_BN >> 1) + c * 8 + (h & 7)]));
+            else if (c >= 8 && c < 8 + NS)
+                sbeta[c] = bf2f(sraw[(C::R_BR >> 1) + (c - 8) * 8 + (h & 7)]);
+            float const* sgc = (float const*) ((uint8_t const*) sraw + C::R_GC);
+            float er[NS], en[NT];
+#pragma unroll
+            for (int s = 0; s < NS; ++s)
+                er[s] = (s < a) ? expa(sgc[s * 128 + c]) : 1.0f;
 #pragma unroll
             for (int j = 0; j < NT; ++j)
             {
                 float const graw = bf2f(sraw[(C::R_GR >> 1) + j * 128 + c]);
                 gn[j] = -5.0f * sigm((graw + dtb) * eA);
-                sgn[j * 128 + c] = gn[j];
+                en[j] = expa(gn[j]);
             }
+            // cumulative decay over the chunk (same product order as a sequential scan)
+            float Cr[NS];
+            float Cc = 1.0f;
+#pragma unroll
+            for (int s = 0; s < NS; ++s)
+            {
+                Cc *= er[s];
+                Cr[s] = Cc;
+            }
+            float Ca = 1.f;
+            float Cn[NT];
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+            {
+                Cc *= en[j];
+                sgn[j * 128 + c] = Cc;
+                Cn[j] = Cc;
+                if (j == 0)
+                    Ca = Cc;
+            }
+            sca[(n & 1) * 128 + c] = Ca;
             named_arrive(5, 256);
+            // the replay X rows alias the previous item's commit operands: wait for its MMA2
+            if (n > 0)
+                mbar_wait(bar_m2, (n - 1) & 1);
+            // replay X / Ku rows and their commit-B values
+            float rKd[NS], rKu[NS];
+#pragma unroll
+            for (int s = 0; s < NS; ++s)
+            {
+                float kr = 0.f;
+                rKd[s] = 0.f;
+                rKu[s] = 0.f;
+                if (s < a)
+                {
+                    float const kk = bf2f(sraw[(C::R_KC >> 1) + s * 128 + c]);
+                    float const kd = kk * Cr[s], ku = kk * rcpa(Cr[s]);
+                    st_split(smem, C::OFF_X, C::XH, 2 * C::XH, s, c, kd);
+                    if (!C::CG)
+                        st_split(smem, C::OFF_KU, C::KUH, 2 * C::KUH, s, c, ku);
+                    kr = C::ID ? ku : ku * Ca;
+                    rKd[s] = kd;
+                    rKu[s] = ku;
+                }
+                misc[(C::M_KR >> 2) + s * 128 + c] = kr;
+            }
+            fence_proxy_async();
             float rv[3 + NT];
 #pragma unroll
             for (int i = 0; i < 3; ++i)
@@ -783,6 +1003,85 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
 #pragma unroll
             for (int s = 0; s < NS; ++s)
                 vR[s] = (s < a) ? bf2f(sraw[(C::R_VC >> 1) + s * 128 + c]) : 0.f;
+            if (C::CG)
+            {
+                // ============ token Gram in FP32: G[row][tau] = sum_c X_row[c] Ku_tau[c] (rows: Kd of every token, Qd
+                // of the new tokens; tau over earlier tokens), per-channel products reduced over the 128 channels of
+                // group V
+                named_bar(7, 256); // kn / qn of group QK published
+                float const* ex = (float const*) (smem + C::OFF_KU);
+                float tKd[2 * NS + 1], tKu[2 * NS + 1], tQd[NT];
+#pragma unroll
+                for (int s = 0; s < NS; ++s)
+                {
+                    tKd[s] = rKd[s];
+                    tKu[s] = rKu[s];
+                }
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
+                {
+                    float const knj = ex[j * 128 + c], qnj = ex[(NT + j) * 128 + c];
+                    tKd[NS + j] = knj * Cn[j];
+                    tKu[NS + j] = knj * rcpa(Cn[j]);
+                    tQd[j] = qnj * Cn[j];
+                }
+                float gv[C::GE_PAD];
+                {
+                    int e = 0;
+#pragma unroll
+                    for (int t = 1; t < 2 * NS + 1; ++t)
+#pragma unroll
+                        for (int tau = 0; tau < t; ++tau)
+                            gv[e++] = tKd[t] * tKu[tau];
+#pragma unroll
+                    for (int j = 0; j < NT; ++j)
+#pragma unroll
+                        for (int tau = 0; tau <= NS + j; ++tau)
+                            gv[e++] = tQd[j] * tKu[tau];
+#pragma unroll
+                    for (; e < C::GE_PAD; ++e)
+                        gv[e] = 0.f;
+                }
+                int gidx;
+                warp_reduce_scatter<C::GE_PAD>(gv, lane, gidx);
+                named_bar(1, 128); // every group-V thread has read kn / qn: reuse the region as scratch [entry][warp]
+                float* gs = (float*) (smem + C::OFF_KU);
+                int const wq = warp - 4;
+#pragma unroll
+                for (int i = 0; i < C::GE_PAD / 32; ++i)
+                    gs[(gidx + i) * 4 + wq] = gv[i];
+                named_bar(1, 128);
+                if (c < C::GE)
+                {
+                    int row = 0, col = 0, e = 0;
+#pragma unroll
+                    for (int t = 1; t < 2 * NS + 1; ++t)
+#pragma unroll
+                        for (int tau = 0; tau < t; ++tau)
+                        {
+                            if (e == c)
+                            {
+                                row = t;
+                                col = tau;
+                            }
+                            ++e;
+                        }
+#pragma unroll
+                    for (int j = 0; j < NT; ++j)
+#pragma unroll
+                        for (int tau = 0; tau <= NS + j; ++tau)
+                        {
+                            if (e == c)
+                            {
+                                row = 2 * NS + 1 + j;
+                                col = tau;
+                            }
+                            ++e;
+                        }
+                    const float4 t4 = *(float4 const*) (gs + c * 4);
+                    misc[(C::M_GRAM >> 2) + row * 16 + col] = (t4.x + t4.y) + (t4.z + t4.w);
+                }
+            }
         }
         float4 nw0 = cw0, nw1 = cw1;
         float ndtb = cdtb, neA = ceA, nbet = cbet;
@@ -790,51 +1089,43 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             load_item(sched[n + 1], nw0, nw1, ndtb, neA, nbet);
         __syncthreads(); // S1: X/Ku written, raw values consumed into registers / smem
 
-        if (tid == 0)
+        if (warp == 0)
         {
-            // ============ MMA1: P = S0 [X_hi; X_lo]^T (M=128, N=2NP); Gram: D[n][r] = X_n . Ku_r (M=64, N=KUR)
-            mbar_wait(bar_st0 + 8 * stage, (n >> 1) & 1);
+            // ============ Gram (state independent, M=64 over the stacked X_hi | X_lo rows): D[r][c] = X_r . [Ku_hi |
+            // Ku_lo]_c
+            __syncwarp();
             tc_fence_after();
-            const uint64_t dS = desc_sw128(sb + st_off);
             const uint64_t dX = desc_sw128(sb + C::OFF_X);
             const uint64_t dK = desc_sw128(sb + C::OFF_KU);
+            constexpr uint32_t idg = idesc_bf16(64, 2 * C::KUR);
+            if (!C::CG)
+                mma_chain8<2 * C::XH, 2 * C::KUH, false>(tmem + 64, dX, dK, idg);
+            // ============ MMA1: P = S0 [X_hi; X_lo]^T (M=128, N=2NP)
+            mbar_wait_w(bar_st0 + 8 * stage, (n >> 1) & 1);
+            tc_fence_after();
+            const uint64_t dS = desc_sw128(sb + st_off);
             constexpr uint32_t id1 = idesc_bf16(128, 2 * C::NP);
-#pragma unroll
-            for (int kh = 0; kh < 2; ++kh)
-#pragma unroll
-                for (int ks = 0; ks < 4; ++ks)
-                    mma_bf16(tmem, dS + ((kh * 16384 + ks * 32) >> 4), dX + ((kh * 2 * C::XH + ks * 32) >> 4), id1,
-                        (kh | ks) ? 1u : 0u);
-            // Gram (M=64): X_hi . [Ku_hi; Ku_lo] -> cols [64, 64+2KUR), X_lo . Ku_hi -> cols [64+2KUR, 64+3KUR)
-            constexpr uint32_t idg2 = idesc_bf16(64, 2 * C::KUR);
-            constexpr uint32_t idg1 = idesc_bf16(64, C::KUR);
-#pragma unroll
-            for (int kh = 0; kh < 2; ++kh)
-#pragma unroll
-                for (int ks = 0; ks < 4; ++ks)
-                    mma_bf16(tmem + 64, dX + ((kh * 2 * C::XH + ks * 32) >> 4), dK + ((kh * 2 * C::KUH + ks * 32) >> 4),
-                        idg2, (kh | ks) ? 1u : 0u);
-#pragma unroll
-            for (int kh = 0; kh < 2; ++kh)
-#pragma unroll
-                for (int ks = 0; ks < 4; ++ks)
-                    mma_bf16(tmem + 64 + 2 * C::KUR, dX + ((kh * 2 * C::XH + C::XH + ks * 32) >> 4),
-                        dK + ((kh * 2 * C::KUH + ks * 32) >> 4), idg1, (kh | ks) ? 1u : 0u);
-            mma_commit(bar_m1);
-        }
-        else if (warp == 1)
-        {
-            // committed conv windows straight from the raw buffer, then refill it with item n + NRAW
-            if (lane == 0)
+            mma_chain8<16384, 2 * C::XH, false>(tmem, dS, dX, id1);
+            mma_commit_w(bar_m1);
+            if (C::ID)
             {
-                store_conv_windows<NS>(maps, rbase, it);
-                bulk_wait_read0();
+                // S0 copy into the commit accumulator: D'' = S0 I (M=128, N=16 per K step), exact; U Ku^T is added by
+                // MMA2
+                const uint64_t dI = desc_noswz(sb + C::OFF_MISC + C::M_ID, 128, 256);
+                constexpr uint32_t idI = idesc_bf16(128, 16);
+                mma_identity8(tmem + 128, dS, dI, idI);
             }
+        }
+        if (C::PROD == 1 && warp == 1)
+        {
+            // refill the raw buffer with item n + NRAW once the window store (issued at item start) has read it
+            if (lane == 0)
+                bulk_wait_read0();
             __syncwarp();
             if (n + C::NRAW < cnt)
                 issue_raw<NS>(p, maps, rbase, bar_raw, sched[n + C::NRAW], lane);
         }
-        else if (tid == 96)
+        else if (C::PROD == 1 && tid == 96)
         {
             // next state into the other stage (its previous TMA store has finished reading); L2 prefetch of the one
             // after
@@ -851,6 +1142,31 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                 const int4 i2 = sched[n + 2];
                 prefetch_l2(p.state + (long long) i2.x * p.sstate0 + (long long) i2.w * 16384, 32768);
             }
+        }
+        else if (C::PROD == 3 && warp == 3)
+        {
+            // producer warp (reaches S2 early): its lane 0 issued the previous state store and this item's window
+            // store; once both have read shared memory: next state into the other stage, L2 prefetch of the one after,
+            // raw refill
+            if (lane == 0)
+            {
+                bulk_wait_read0();
+                if (n + 1 < cnt)
+                {
+                    const int4 itn = sched[n + 1];
+                    const uint32_t bs = bar_st0 + 8 * (stage ^ 1);
+                    mbar_arrive_expect_tx(bs, 32768);
+                    tma_load_4d(sb + C::OFF_ST + (stage ^ 1) * 32768, tmap, 0, itn.w * 128, 0, itn.x, bs);
+                }
+                if (n + 2 < cnt)
+                {
+                    const int4 i2 = sched[n + 2];
+                    prefetch_l2(p.state + (long long) i2.x * p.sstate0 + (long long) i2.w * 16384, 32768);
+                }
+            }
+            __syncwarp();
+            if (n + C::NRAW < cnt)
+                issue_raw<NS>(p, maps, rbase, bar_raw, sched[n + C::NRAW], lane);
         }
         else if (tid == 128)
         {
@@ -878,8 +1194,9 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
 #pragma unroll
             for (int s = 0; s < NT; ++s)
             {
-                const bf16 hi = __float2bfloat16_rn(kcv[s]);
-                const bf16 lo = __float2bfloat16_rn(kcv[s] - __bfloat162float(hi));
+                float const kv = (s < NS) ? misc[(C::M_KR >> 2) + s * 128 + c] : kc0;
+                const bf16 hi = __float2bfloat16_rn(kv);
+                const bf16 lo = __float2bfloat16_rn(kv - __bfloat162float(hi));
                 e[s] = hi;
                 e[NT + s] = lo;
                 e[2 * NT + s] = hi;
@@ -912,7 +1229,7 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                 }
             }
             // ============ solve (thread = value row v)
-            mbar_wait(bar_m1, n & 1);
+            mbar_wait_w(bar_m1, n & 1);
             tc_fence_after();
             float Pf[C::NP];
             const uint32_t tl = tmem + ((uint32_t) (wq * 32) << 16);
@@ -928,38 +1245,36 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                     Pf[i * 8 + e] = __uint_as_float(hi8[e]) + __uint_as_float(lo8[e]);
             }
             float* Gm = misc + (C::M_GRAM >> 2);
-            if (wq < 2)
+            float* Gp = misc + (C::M_GP >> 2);
+            if (!C::CG)
             {
-                uint32_t G0[16], G1[16], G2[16];
-                if (C::KUR == 16)
+                if (wq * 16 < 2 * C::NP)
                 {
+                    uint32_t G0[32];
                     tmem_ld16(tl + 64, G0);
-                    tmem_ld16(tl + 64 + 16, G1);
-                    tmem_ld16(tl + 64 + 32, G2);
-                }
-                else
-                {
-                    tmem_ld8(tl + 64, G0);
-                    tmem_ld8(tl + 64 + 8, G1);
-                    tmem_ld8(tl + 64 + 16, G2);
-                }
-                tmem_wait_ld();
-                int const nr = wq * 16 + lane;
-                if (lane < 16 && nr < C::NROWS)
-                {
-#pragma unroll
-                    for (int r = 0; r < C::KUR; r += 4)
+                    if (2 * C::KUR > 16)
+                        tmem_ld16(tl + 80, G0 + 16);
+                    tmem_wait_ld();
+                    int const r = wq * 16 + lane; // stacked row: hi rows [0, NP), lo rows [NP, 2NP)
+                    if (lane < 16 && r < 2 * C::NP)
                     {
-                        float4 g4;
-                        g4.x = __uint_as_float(G0[r + 0]) + __uint_as_float(G1[r + 0]) + __uint_as_float(G2[r + 0]);
-                        g4.y = __uint_as_float(G0[r + 1]) + __uint_as_float(G1[r + 1]) + __uint_as_float(G2[r + 1]);
-                        g4.z = __uint_as_float(G0[r + 2]) + __uint_as_float(G1[r + 2]) + __uint_as_float(G2[r + 2]);
-                        g4.w = __uint_as_float(G0[r + 3]) + __uint_as_float(G1[r + 3]) + __uint_as_float(G2[r + 3]);
-                        *(float4*) (Gm + nr * 16 + r) = g4;
+#pragma unroll
+                        for (int q = 0; q < C::KUR; q += 4)
+                        {
+                            float4 g4;
+                            g4.x = __uint_as_float(G0[q + 0]) + __uint_as_float(G0[C::KUR + q + 0]);
+                            g4.y = __uint_as_float(G0[q + 1]) + __uint_as_float(G0[C::KUR + q + 1]);
+                            g4.z = __uint_as_float(G0[q + 2]) + __uint_as_float(G0[C::KUR + q + 2]);
+                            g4.w = __uint_as_float(G0[q + 3]) + __uint_as_float(G0[C::KUR + q + 3]);
+                            *(float4*) (Gp + r * 16 + q) = g4;
+                        }
                     }
                 }
+                named_bar(1, 128);
+                for (int i = v; i < C::NROWS * 16; i += 128)
+                    Gm[i] = Gp[i] + Gp[C::NP * 16 + i];
+                named_bar(1, 128);
             }
-            named_bar(1, 128);
             float uR[NS], uN[NT];
 #pragma unroll
             for (int s = 0; s < NS; ++s)
@@ -1034,22 +1349,23 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
         if (warp < 4)
         {
             // ============ MMA2: D' = U Kc^T  (M=128, N=128, K=K2)
-            if (tid == 0)
+            if (warp == 0)
             {
+                __syncwarp();
                 tc_fence_after();
                 const uint64_t dA = desc_noswz(sb + C::OFF_A2, 128, C::SBO2);
                 const uint64_t dB = desc_noswz(sb + C::OFF_B2, 128, C::SBO2);
                 constexpr uint32_t id2 = idesc_bf16(128, 128);
 #pragma unroll
                 for (int ks = 0; ks < C::K2 / 16; ++ks)
-                    mma_bf16(tmem, dA + ks * 16, dB + ks * 16, id2, ks > 0 ? 1u : 0u);
-                mma_commit(bar_m2);
+                    mma_bf16_w(tmem + 128, dA + ks * 16, dB + ks * 16, id2, (C::ID || ks > 0) ? 1u : 0u);
+                mma_commit_w(bar_m2);
             }
             // ============ commit epilogue (group QK, thread = state row): S = S0 * C_a + D' -> BF16 in place
             int const v = tid;
-            mbar_wait(bar_m2, n & 1);
+            mbar_wait_w(bar_m2, n & 1);
             tc_fence_after();
-            const uint32_t tl = tmem + ((uint32_t) (warp * 32) << 16);
+            const uint32_t tl = tmem + ((uint32_t) (warp * 32) << 16) + 128;
 #pragma unroll
             for (int hb = 0; hb < 4; ++hb)
             {
@@ -1063,19 +1379,29 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                     int const cc = (hb & 1) * 4 + c4; // 16-byte chunk inside the 128-column half
                     int const half = hb >> 1;
                     uint8_t* sp = smem + st_off + half * 16384 + v * 128 + (((cc ^ v) & 7) << 4);
-                    const uint4 s = *(uint4 const*) sp;
-                    const ulonglong2 c0 = *(ulonglong2 const*) (sca + hb * 32 + c4 * 8);
-                    const ulonglong2 c1 = *(ulonglong2 const*) (sca + hb * 32 + c4 * 8 + 4);
+                    const ulonglong2 c0 = *(ulonglong2 const*) (sca + (n & 1) * 128 + hb * 32 + c4 * 8);
+                    const ulonglong2 c1 = *(ulonglong2 const*) (sca + (n & 1) * 128 + hb * 32 + c4 * 8 + 4);
                     uint32_t const* dd = d + c4 * 8;
                     uint4 r;
-                    r.x = pk_bf16x2(
-                        ffma2(bf16x2_to_f2(s.x), c0.x, f2pk(__uint_as_float(dd[0]), __uint_as_float(dd[1]))));
-                    r.y = pk_bf16x2(
-                        ffma2(bf16x2_to_f2(s.y), c0.y, f2pk(__uint_as_float(dd[2]), __uint_as_float(dd[3]))));
-                    r.z = pk_bf16x2(
-                        ffma2(bf16x2_to_f2(s.z), c1.x, f2pk(__uint_as_float(dd[4]), __uint_as_float(dd[5]))));
-                    r.w = pk_bf16x2(
-                        ffma2(bf16x2_to_f2(s.w), c1.y, f2pk(__uint_as_float(dd[6]), __uint_as_float(dd[7]))));
+                    if (C::ID)
+                    {
+                        r.x = pk_bf16x2(fmul2(f2pk(__uint_as_float(dd[0]), __uint_as_float(dd[1])), c0.x));
+                        r.y = pk_bf16x2(fmul2(f2pk(__uint_as_float(dd[2]), __uint_as_float(dd[3])), c0.y));
+                        r.z = pk_bf16x2(fmul2(f2pk(__uint_as_float(dd[4]), __uint_as_float(dd[5])), c1.x));
+                        r.w = pk_bf16x2(fmul2(f2pk(__uint_as_float(dd[6]), __uint_as_float(dd[7])), c1.y));
+                    }
+                    else
+                    {
+                        const uint4 s = *(uint4 const*) sp;
+                        r.x = pk_bf16x2(
+                            ffma2(bf16x2_to_f2(s.x), c0.x, f2pk(__uint_as_float(dd[0]), __uint_as_float(dd[1]))));
+                        r.y = pk_bf16x2(
+                            ffma2(bf16x2_to_f2(s.y), c0.y, f2pk(__uint_as_float(dd[2]), __uint_as_float(dd[3]))));
+                        r.z = pk_bf16x2(
+                            ffma2(bf16x2_to_f2(s.z), c1.x, f2pk(__uint_as_float(dd[4]), __uint_as_float(dd[5]))));
+                        r.w = pk_bf16x2(
+                            ffma2(bf16x2_to_f2(s.w), c1.y, f2pk(__uint_as_float(dd[6]), __uint_as_float(dd[7]))));
+                    }
                     *(uint4*) sp = r;
                 }
             }
@@ -1124,7 +1450,9 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                 }
             }
         }
-        __syncthreads(); // S3
+        // S3 (group A only): committed rows in place; group B's RMSNorm / MXFP8 overlaps the store and the next item
+        if (warp < 4)
+            named_bar(6, 128);
         if (tid == 96)
         {
             tma_store_4d(tmap, sb + st_off, 0, h * 128, 0, slot);
@@ -1140,13 +1468,13 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
     if (warp == 3 || warp == 1)
     {
         if (lane == 0)
-            bulk_wait0();
+            bulk_wait_read0();
         __syncwarp();
     }
     if (warp == 0)
     {
         tc_fence_after();
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem), "r"(128));
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem), "r"(256));
     }
 #endif // SM10x
 }
@@ -1162,15 +1490,14 @@ constexpr float kLowerBound = -5.0f;
 constexpr float kQScale = 0.08838834764831845f;
 constexpr float kOnormEps = 1e-5f;
 
-// The candidate's encode: BF16, unit element strides, no interleave, L2 promotion 256 B, no OOB fill.
+// The candidate's encode: unit element strides, no interleave, L2 promotion 256 B, no OOB fill (BF16 unless stated).
 void encodeMap(CUtensorMap* map, void const* ptr, int rank, cuuint64_t const* dims, cuuint64_t const* strides,
-    cuuint32_t const* box, CUtensorMapSwizzle swizzle)
+    cuuint32_t const* box, CUtensorMapSwizzle swizzle, CUtensorMapDataType dataType = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16)
 {
     cuuint32_t const elementStrides[5] = {1, 1, 1, 1, 1};
-    TLLM_CU_CHECK(tensorrt_llm::common::CUDADriverWrapper::getInstance()->cuTensorMapEncodeTiled(map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, static_cast<cuuint32_t>(rank), const_cast<void*>(ptr), dims, strides, box,
-        elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    TLLM_CU_CHECK(tensorrt_llm::common::CUDADriverWrapper::getInstance()->cuTensorMapEncodeTiled(map, dataType,
+        static_cast<cuuint32_t>(rank), const_cast<void*>(ptr), dims, strides, box, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 }
 
 // The candidate's tensor maps (kda_launch).
@@ -1215,6 +1542,37 @@ KdaMaps makeMaps(KdaParams const& p, int numSpec)
         cuuint32_t const storeBox[3] = {128, static_cast<cuuint32_t>(window), 1};
         encodeMap(&maps.csl[i], conv[i], 3, dims, strides, loadBox, CU_TENSOR_MAP_SWIZZLE_NONE);
         encodeMap(&maps.css[i], conv[i], 3, dims, strides, storeBox, CU_TENSOR_MAP_SWIZZLE_NONE);
+    }
+    {
+        // Replay caches k / v (BF16) and g (FP32): [POOL][NS][H * 128] views, boxes of the NS rows of one slot.
+        void const* const caches[3] = {p.kc, p.vc, p.gc};
+        long long const rowStrides[3] = {p.kc_p, p.vc_p, p.gc_p};
+        long long const slotStrides[3] = {p.kc_s, p.vc_s, p.gc_s};
+        cuuint64_t const elementBytes[3] = {2, 2, 4};
+        for (int i = 0; i < 3; ++i)
+        {
+            cuuint64_t const dims[3] = {dim, static_cast<cuuint64_t>(numSpec), static_cast<cuuint64_t>(p.POOL)};
+            cuuint64_t const strides[2] = {static_cast<cuuint64_t>(rowStrides[i]) * elementBytes[i],
+                static_cast<cuuint64_t>(slotStrides[i]) * elementBytes[i]};
+            cuuint32_t const box[3] = {128, static_cast<cuuint32_t>(numSpec), 1};
+            encodeMap(&maps.cf[i], caches[i], 3, dims, strides, box, CU_TENSOR_MAP_SWIZZLE_NONE,
+                i == 2 ? CU_TENSOR_MAP_DATA_TYPE_FLOAT32 : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+        }
+    }
+    {
+        // beta of the new tokens: [T][H] with row stride sbeta, boxes of 8 heads x (NS + 1) rows.
+        cuuint64_t const dims[2] = {static_cast<cuuint64_t>(p.H), static_cast<cuuint64_t>(p.T)};
+        cuuint64_t const strides[1] = {static_cast<cuuint64_t>(p.sbeta) * 2};
+        cuuint32_t const box[2] = {8, newTokens};
+        encodeMap(&maps.bnew, p.beta, 2, dims, strides, box, CU_TENSOR_MAP_SWIZZLE_NONE);
+    }
+    {
+        // beta cache: [POOL][NS][H] view, boxes of 8 heads x the NS rows of one slot.
+        cuuint64_t const dims[3]
+            = {static_cast<cuuint64_t>(p.H), static_cast<cuuint64_t>(numSpec), static_cast<cuuint64_t>(p.POOL)};
+        cuuint64_t const strides[2] = {static_cast<cuuint64_t>(p.bc_p) * 2, static_cast<cuuint64_t>(p.bc_s) * 2};
+        cuuint32_t const box[3] = {8, static_cast<cuuint32_t>(numSpec), 1};
+        encodeMap(&maps.brep, p.bc, 3, dims, strides, box, CU_TENSOR_MAP_SWIZZLE_NONE);
     }
     return maps;
 }
@@ -1309,9 +1667,11 @@ bool isKimiK3KdaMtpVerifyKfSupported(KimiK3KdaMtpVerifyKfParams const& p, char c
             return fail("null tensor");
         }
     }
-    // Tensor maps, bulk copies and float4 weight loads: bases 16-byte aligned, strides whole 16-byte units.
+    // Tensor maps, bulk copies and float4 weight loads: bases 16-byte aligned, strides whole 16-byte units (beta and
+    // the beta cache are read through tensor maps with 8-head boxes: rows padded to a multiple of 8 heads, as the [f_a
+    // | b] projection and the cache manager do).
     void const* rows16[] = {p.xQ, p.xK, p.xV, p.g, p.onormG, p.convQ, p.convK, p.convV, p.kCache, p.gCache, p.vCache,
-        p.state, p.wQ, p.wK, p.wV};
+        p.state, p.wQ, p.wK, p.wV, p.beta, p.betaCache};
     for (void const* ptr : rows16)
     {
         if (!aligned(ptr, 16))
@@ -1321,7 +1681,8 @@ bool isKimiK3KdaMtpVerifyKfSupported(KimiK3KdaMtpVerifyKfParams const& p, char c
     }
     int64_t const bf16Strides[] = {p.xQRowStride, p.xKRowStride, p.xVRowStride, p.gRowStride, p.onormGRowStride,
         p.convQSlotStride, p.convQPosStride, p.convKSlotStride, p.convKPosStride, p.convVSlotStride, p.convVPosStride,
-        p.kCacheSlotStride, p.kCacheRowStride, p.vCacheSlotStride, p.vCacheRowStride, p.stateSlotStride};
+        p.kCacheSlotStride, p.kCacheRowStride, p.vCacheSlotStride, p.vCacheRowStride, p.stateSlotStride,
+        p.betaRowStride, p.betaCacheSlotStride, p.betaCacheRowStride};
     for (int64_t s : bf16Strides)
     {
         if (s <= 0 || s % 8 != 0)
@@ -1333,9 +1694,9 @@ bool isKimiK3KdaMtpVerifyKfSupported(KimiK3KdaMtpVerifyKfParams const& p, char c
     {
         return fail("g_cache stride not a positive multiple of 4 elements");
     }
-    if (!aligned(p.beta, 2) || !aligned(p.betaCache, 2) || !aligned(p.outScale, 4))
+    if (!aligned(p.outScale, 4))
     {
-        return fail("beta / beta_cache not 2-byte aligned or out_scale not 4-byte aligned");
+        return fail("out_scale not 4-byte aligned");
     }
     return true;
 }
