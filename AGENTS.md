@@ -28,7 +28,10 @@ Python and C++ codebase with a PyTorch execution path.
   bump, `python3 scripts/generate_trtllm_serve_schemas.py --sync-version` updates only
   that metadata without importing TensorRT-LLM or requiring a matching build.
   `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
-  reject missing or stale snapshots. Wheels and HTML docs publish these same files.
+  reject missing or stale snapshots. The `trtllm-serve-schemas-check` pre-commit hook
+  runs this check for package Python, schema, generator, and dependency changes using the
+  active Python environment; it requires a TensorRT-LLM build matching the checkout.
+  Wheels and HTML docs publish these same files.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
