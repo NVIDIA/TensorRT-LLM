@@ -1564,6 +1564,8 @@ class _RowMergeKernel:
 # ---------------------------------------------------------------------------------------
 
 _COMPILED: dict = {}
+#: Geometries whose every reachable launch plan is compiled (`_compile_plans`).
+_PLANNED: set = set()
 
 
 @functools.lru_cache(maxsize=None)
@@ -1595,6 +1597,16 @@ def plan_launch(n_groups: int, kv_heads: int, width: int, num_sms: int):
     return tail_splits, units - tail
 
 
+def reachable_plans(max_groups: int, kv_heads: int, width: int, num_sms: int) -> list:
+    """Every `(splits, tail)` pair `plan_launch` returns for `MIN_GROUPS..max_groups` groups,
+    `tail` whether the last wave is split: the kernel variants a geometry can need."""
+    plans = set()
+    for n_groups in range(MIN_GROUPS, max(MIN_GROUPS, max_groups) + 1):
+        splits, n_whole = plan_launch(n_groups, kv_heads, width, num_sms)
+        plans.add((max(1, min(MAX_SPLITS, int(splits))), n_whole is not None))
+    return sorted(plans)
+
+
 def _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request):
     """(splits, layout) of the grouped kernel for this call, or None where the per-row kernel
     takes it: fewer than `MIN_GROUPS` groups, one row a request, not SM103, or no shared-memory
@@ -1622,6 +1634,31 @@ def takes_grouped(q, k_cache, block_table, selected_tokens, tokens_per_block, ro
     """
     plan = _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request)
     return plan is not None
+
+
+def _compile_verify(key: tuple, kern_kw: dict, compile_args: tuple):
+    """The grouped kernel of `key` (its `splits` and `tail` at positions 5 and 6), compiled
+    once."""
+    fn = _COMPILED.get(key)
+    if fn is None:
+        kern = _VerifyKernel(splits=key[5], tail=key[6], **kern_kw)
+        fn = cute.compile(kern, *compile_args, options="--opt-level 2 --enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def _compile_merge(heads: int, splits: int, gated: bool, pdl: bool, merge_args: tuple):
+    """The row merge of `splits` partials, compiled once."""
+    mkey = ("rowmerge", heads, splits, gated, pdl, MERGE_PARTS)
+    mfn = _COMPILED.get(mkey)
+    if mfn is None:
+        mfn = cute.compile(
+            _RowMergeKernel(heads=heads, splits=splits, gated=gated, pdl=pdl, parts=MERGE_PARTS),
+            *merge_args,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+        _COMPILED[mkey] = mfn
+    return mfn
 
 
 def nvfp4_sparse_gqa_verify_grouped(
@@ -1666,6 +1703,7 @@ def nvfp4_sparse_gqa_verify_grouped(
     n_groups = -(-rows // rpr)
     units = n_groups * num_kv_heads
     n_whole = None
+    splits_given = splits
     if splits is None:
         splits, n_whole = plan_launch(n_groups, num_kv_heads, width, _num_sms(q.device.index or 0))
     n_splits = max(1, min(MAX_SPLITS, int(splits)))
@@ -1715,52 +1753,75 @@ def nvfp4_sparse_gqa_verify_grouped(
         part, lse = out, out
     gate_t = output_gate if gated else q
     gate_stride = output_gate.stride(0) if gated else 0
-    fn = _COMPILED.get(key)
-    if fn is None:
-        kern = _VerifyKernel(
-            rpr=rpr,
-            group=group,
-            kv_heads=num_kv_heads,
-            width=width,
-            tpb=tpb,
-            splits=n_splits,
-            tail=tail,
-            scale=float(softmax_scale),
-            num_pages=num_pages,
-            bt_width=block_table.shape[1],
-            num_requests=block_table.shape[0],
-            k_strides=tuple(k_cache.stride()[:3]),
-            ks_strides=tuple(k_scale_cache.stride()[:2]),
-            q_strides=tuple(q.stride()[:2]),
-            req64=req64,
-            gated=gated,
-            pdl=use_pdl,
-        )
-        fn = cute.compile(
-            kern,
-            # read with scalar loads: a row slice of the selection needs no copy
-            from_dlpack(selected_tokens, assumed_align=4).mark_layout_dynamic(leading_dim=1),
-            _ptr(q, cutlass.BFloat16),
-            _ptr(k_cache, cutlass.Uint8),
-            _ptr(v_cache, cutlass.Uint8),
-            _ptr(k_scale_cache, cutlass.Uint8),
-            _ptr(v_scale_cache, cutlass.Uint8),
-            _ptr(kv_scale_quant_orig, cutlass.Float32, 4),
-            _ptr(block_table, cutlass.Int32, 4),
-            _ptr(request_indices, cutlass.Int64 if req64 else cutlass.Int32, 8 if req64 else 4),
-            _ptr(out, cutlass.BFloat16),
-            _ptr(part, cutlass.Float32),
-            _ptr(lse, cutlass.Float32),
-            _ptr(gate_t, cutlass.BFloat16),
-            cutlass.Int32(rows),
-            cutlass.Int32(gate_stride),
-            cutlass.Int32(n_whole),
-            cutlass.Int32(tail_row0),
-            cutlass.Int32(n_ctas),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
-        )
-        _COMPILED[key] = fn
+    compile_args = (
+        # read with scalar loads: a row slice of the selection needs no copy
+        from_dlpack(selected_tokens, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+        _ptr(q, cutlass.BFloat16),
+        _ptr(k_cache, cutlass.Uint8),
+        _ptr(v_cache, cutlass.Uint8),
+        _ptr(k_scale_cache, cutlass.Uint8),
+        _ptr(v_scale_cache, cutlass.Uint8),
+        _ptr(kv_scale_quant_orig, cutlass.Float32, 4),
+        _ptr(block_table, cutlass.Int32, 4),
+        _ptr(request_indices, cutlass.Int64 if req64 else cutlass.Int32, 8 if req64 else 4),
+        _ptr(out, cutlass.BFloat16),
+        _ptr(part, cutlass.Float32),
+        _ptr(lse, cutlass.Float32),
+        _ptr(gate_t, cutlass.BFloat16),
+        cutlass.Int32(rows),
+        cutlass.Int32(gate_stride),
+        cutlass.Int32(n_whole),
+        cutlass.Int32(tail_row0),
+        cutlass.Int32(n_ctas),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    merge_args = (
+        from_dlpack(gate_t, assumed_align=16).mark_layout_dynamic(leading_dim=gate_t.dim() - 1),
+        _ptr(part, cutlass.Float32),
+        _ptr(lse, cutlass.Float32, 4),
+        _ptr(out, cutlass.BFloat16, 8),
+        cutlass.Int32(merged),
+        cutlass.Int32(gate_stride),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    kern_kw = dict(
+        rpr=rpr,
+        group=group,
+        kv_heads=num_kv_heads,
+        width=width,
+        tpb=tpb,
+        scale=float(softmax_scale),
+        num_pages=num_pages,
+        bt_width=block_table.shape[1],
+        num_requests=block_table.shape[0],
+        k_strides=tuple(k_cache.stride()[:3]),
+        ks_strides=tuple(k_scale_cache.stride()[:2]),
+        q_strides=tuple(q.stride()[:2]),
+        req64=req64,
+        gated=gated,
+        pdl=use_pdl,
+    )
+    # A launch plan depends on the call's row count: an eager step (a mixed step's
+    # generation rows) meeting a new one would compile mid-serving, for seconds. The first
+    # call of a geometry compiles every plan its row counts can reach instead.
+    if splits_given is None and key[:5] + key[7:] not in _PLANNED:
+        _PLANNED.add(key[:5] + key[7:])
+        # A group is one request's rows: at most a block-table row's worth of them.
+        max_groups = block_table.shape[0]
+        for plan_splits_, plan_tail in reachable_plans(
+            max_groups, num_kv_heads, width, _num_sms(q.device.index or 0)
+        ):
+            if (
+                _layout(
+                    rpr, group, width, block_table.shape[1], tpb, 1 if plan_tail else plan_splits_
+                )
+                is None
+            ):
+                continue
+            _compile_verify(key[:5] + (plan_splits_, plan_tail) + key[7:], kern_kw, compile_args)
+            if plan_tail or plan_splits_ > 1:
+                _compile_merge(num_q_heads, plan_splits_, gated, use_pdl, merge_args)
+    fn = _compile_verify(key, kern_kw, compile_args)
     fn(
         selected_tokens,
         q.data_ptr(),
@@ -1783,23 +1844,7 @@ def nvfp4_sparse_gqa_verify_grouped(
     )
     if merged <= 0:
         return out
-    mkey = ("rowmerge", num_q_heads, n_splits, gated, use_pdl, MERGE_PARTS)
-    mfn = _COMPILED.get(mkey)
-    if mfn is None:
-        mfn = cute.compile(
-            _RowMergeKernel(
-                heads=num_q_heads, splits=n_splits, gated=gated, pdl=use_pdl, parts=MERGE_PARTS
-            ),
-            from_dlpack(gate_t, assumed_align=16).mark_layout_dynamic(leading_dim=gate_t.dim() - 1),
-            _ptr(part, cutlass.Float32),
-            _ptr(lse, cutlass.Float32, 4),
-            _ptr(out, cutlass.BFloat16, 8),
-            cutlass.Int32(merged),
-            cutlass.Int32(gate_stride),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
-        )
-        _COMPILED[mkey] = mfn
+    mfn = _compile_merge(num_q_heads, n_splits, gated, use_pdl, merge_args)
     mfn(
         gate_t[tail_row0:],
         part.data_ptr(),
