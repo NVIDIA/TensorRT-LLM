@@ -3316,7 +3316,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "on the same paged cache and supports SM90 only. AUTO (the default) "
         "resolves to TRTLLM where it can run and every drafter layer is "
         "windowed, and to VANILLA otherwise, including on a disaggregated worker "
-        "without TRTLLM_DISAGG_SHARED_DRAFT_KV=1 and under modeling_v2.")
+        "without TRTLLM_DISAGG_SHARED_DRAFT_KV=1.")
 
     skip_ctx_buffer_budget_check: bool = Field(
         default=False,
@@ -7066,15 +7066,14 @@ class TorchLlmArgs(BaseLlmArgs):
                           and self.cache_transceiver_config.backend is not None)
                 shared_draft_kv = os.environ.get(
                     "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1"
-                # An unshared disaggregated worker refuses a windowed TRTLLM draft pool; modeling_v2 drafts on VANILLA.
+                # An unshared disaggregated worker refuses a windowed TRTLLM draft pool.
                 if (self.speculative_config.attention_backend == "AUTO"
-                        and ((disagg and not shared_draft_kv)
-                             or self.modeling_v2 != "off")):
+                        and disagg and not shared_draft_kv):
                     self.speculative_config.attention_backend = "VANILLA"
                     logger.info(
                         "DFlash attention_backend AUTO resolved to VANILLA "
                         "(disaggregated worker without "
-                        "TRTLLM_DISAGG_SHARED_DRAFT_KV=1, or modeling_v2).")
+                        "TRTLLM_DISAGG_SHARED_DRAFT_KV=1).")
                 # A draft KV shared with the target (TRTLLM_DISAGG_SHARED_DRAFT_KV=1) is transferred.
                 if disagg and not (self.speculative_config.attention_backend in
                                    ("TRTLLM", "AUTO") and shared_draft_kv):
