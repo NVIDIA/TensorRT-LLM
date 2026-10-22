@@ -134,6 +134,7 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import StepInputStager
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
@@ -1249,6 +1250,8 @@ def _spec_recompute_claim_limit(
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
+    # A step-input stager while it records this manager's writes, else None.
+    step_input_stager: Optional["StepInputStager"] = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -6754,6 +6757,16 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        if self.step_input_stager is not None:
+            # Staged write; see the window banner in DecoderRunner._forward_decoder.
+            self.step_input_stager.block_offsets(
+                self.host_kv_cache_block_offsets,
+                dst_tensor,
+                copy_idx.tolist(),
+                self._index_scale_ints,
+                self.kv_offset.tolist(),
+            )
+            return
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
