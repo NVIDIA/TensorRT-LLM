@@ -283,6 +283,7 @@ def create_moe(
     communication_method: Optional[str] = None,
     unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
     allow_backend_degradation: bool = True,
+    accepts_global_routed_output: bool = False,
 ) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -314,6 +315,8 @@ def create_moe(
             serve this layer raises with the rejection trail instead of falling
             back. For callers that must know they got the backend they asked
             for, e.g. because they are measuring it.
+        accepts_global_routed_output: See ``ConfigurableMoE.__init__``. Other
+            layers have no ``FUSED_COMM`` backend, so they ignore it.
 
     Returns:
         A complete MoE layer: a ``MoE`` (``ConfigurableMoE`` around an
@@ -384,6 +387,7 @@ def create_moe(
             activation=activation,
             communication_method=communication_method,
             unfinalized_combine_fn=unfinalized_combine_fn,
+            accepts_global_routed_output=accepts_global_routed_output,
         )
 
     # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE

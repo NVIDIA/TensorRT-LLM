@@ -32,6 +32,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -52,7 +53,7 @@ struct Block;
 struct ReuseScope
 {
     std::optional<LoraTaskIdType> loraId;
-    std::optional<std::uint64_t> salt;
+    std::optional<std::string> salt;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
@@ -68,7 +69,7 @@ struct ReuseScope
 // collision-resistant and >= 256-bit. The radix tree is a globally shared,
 // cross-request/cross-tenant cache index, prefix matching is decided purely by
 // digest equality with NO re-verification of the underlying tokens, and the
-// hashed input (tokens, the user-supplied cache_salt in ReuseScope, multimodal
+// hashed input (tokens, the salt string in ReuseScope, multimodal
 // content bytes) is attacker-influenceable. A hash collision therefore silently
 // reuses another request's KV blocks (cross-request corruption / data leak),
 // and tenant isolation via cache_salt relies entirely on this hash's collision
@@ -244,6 +245,8 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Previous node in the chain (RootBlock or Block). Null after detaching from the tree.
     // Raw non-owning pointer: while attached, the prev node's `next` map owns us via shared_ptr.
     NodeBase* prev{nullptr};
+    //! Non-owning scope access while attached; cleared together with prev on detachment.
+    RootBlock* root{nullptr};
 
     TypedVec<LifeCycleId, CommittedPage*> storage;
 

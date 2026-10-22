@@ -193,8 +193,9 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    # The number of heads per kv head.
-    num_heads_per_kv: Optional[int] = 1
+    # Upper bound on query heads per KV head over the target model's layers
+    # (unsharded); sizes the spec-dec tree mask.
+    max_num_heads_per_kv: Optional[int] = 1
 
     multi_item_part_lens: Optional[list[list[int]]] = None
     """Additional token layout information for multi-item scoring.
@@ -968,6 +969,10 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
     sage_attn_smooth_k: bool = False
+    # Per-tensor FP8 recipe of the PrimTS FMHA library. Quantize Q/K and/or V to
+    # E4M3 with one scale each, folded into the softmax and output scales.
+    qk_fp8_per_tensor: bool = False
+    v_fp8_per_tensor: bool = False
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False

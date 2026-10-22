@@ -161,6 +161,7 @@ add_th_common_family(
   parallelDecodeKVCacheUpdateOp.cpp
   specDecOp.cpp
   fusedSamplingOp.cpp
+  chainSpeculativeSamplingOp.cpp
   dynamicTreeOp.cpp
   loraOp.cpp
   inplaceSliceCopyOp.cpp

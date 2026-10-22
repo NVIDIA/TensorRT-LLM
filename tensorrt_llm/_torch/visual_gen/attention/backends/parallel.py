@@ -1300,6 +1300,7 @@ class RingAttention(AttentionBackend):
 
         kv_bufs[0, 0].copy_(k)
         kv_bufs[0, 1].copy_(v)
+        output_dtype = q.dtype
         for step in range(self.world_size):
             cur, nxt = step % 2, 1 - step % 2
             if step < self.world_size - 1:
@@ -1311,6 +1312,7 @@ class RingAttention(AttentionBackend):
                 attention_mask=PredefinedAttentionMask.FULL,
                 **inner_kw,
             )
+            output_dtype = block_out.dtype
             # Inner backend returns LSE as [B, H, S]; merge uses [B, S, H] with out [B, S, H, D].
             block_lse = block_lse_bh.transpose(1, 2).contiguous()
             if step == 0:
@@ -1320,8 +1322,8 @@ class RingAttention(AttentionBackend):
                 self._update_out_and_lse(out, lse, block_out, block_lse)
             if step < self.world_size - 1:
                 self._ring_wait()
-        if out.dtype != q.dtype:
-            return out.to(dtype=q.dtype)
+        if out.dtype != output_dtype:
+            return out.to(dtype=output_dtype)
         return out
 
     @property
