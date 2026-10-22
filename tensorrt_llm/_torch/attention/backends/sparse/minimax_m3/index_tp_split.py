@@ -115,7 +115,7 @@ class IndexTpSplit:
             raise ValueError(
                 "MiniMax-M3 index_tp_split needs TP 2 or 4 with CUDA peer access and no attention DP."
             )
-        self.mapping, self.rank, self.world = mapping, mapping.tp_rank, mapping.tp_size
+        self.rank, self.world = mapping.tp_rank, mapping.tp_size
         heads = num_heads // self.world
         self.heads = slice(self.rank * heads, (self.rank + 1) * heads)
         n = len(layer_ids)
@@ -154,8 +154,6 @@ class IndexTpSplit:
 
         Returns the view of max_score's storage that holds the scores, blocks
         innermost. Nothing may run between the two kernels: PDL overlaps them.
-        Every TP rank must make the same calls with the same seq_lens, since
-        the reduce waits until all ranks have pushed.
         """
         recv = self.recv[self.sets[layer_idx]]
         torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(

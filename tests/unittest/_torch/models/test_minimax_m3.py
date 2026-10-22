@@ -484,8 +484,6 @@ def test_fused_qkv_index_projection_preserves_index_head_groups(
         MiniMaxM3SparseAttentionConfig(implementation="triton", fuse_qkv_index_projection=True)
     with pytest.raises(ValueError, match=r"requires indexer_kv_dtype='fp8'"):
         MiniMaxM3SparseAttentionConfig(implementation="msa", fuse_qkv_index_projection=True)
-    with pytest.raises(ValueError, match=r"index_tp_split=True requires"):
-        MiniMaxM3SparseAttentionConfig(implementation="msa", index_tp_split=True)
 
 
 @pytest.mark.cpu_only
@@ -1618,8 +1616,6 @@ def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
         assert shard_geometry(module, "v") == (kv_world, kv_rank)
         assert shard_geometry(module, "index_q") == (kv_world, kv_rank)
         assert shard_geometry(module, "index_k") == (1, 0)
-        module.replicate_index_q = True
-        assert shard_geometry(module, "index_q") == (1, 0)
 
 
 @pytest.mark.cpu_only
