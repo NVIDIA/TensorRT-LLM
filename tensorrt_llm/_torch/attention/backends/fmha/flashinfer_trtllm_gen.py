@@ -39,6 +39,7 @@ Example:
 """
 
 import math
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -232,6 +233,52 @@ def _get_multi_ctas_kv_counter_size(
         * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
     )
     return aligned_num_counters * torch.int32.itemsize
+
+
+@lru_cache(maxsize=1)
+def _decode_seqs_per_launch() -> int:
+    """``TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH``: at most this many sequences per decode FMHA launch.
+
+    Off (0) by default. The trtllm-gen generation kernel splits each sequence's KV over
+    ``SMs / (CTAs of one split)`` CTAs, so at large batches every sequence gets one CTA and
+    the launch lasts as long as one CTA streaming the longest sequence. Launching the batch
+    in groups of at most N sequences gives each group's sequences proportionally more KV splits.
+    """
+    value = os.environ.get("TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH", "0").strip()
+    try:
+        return max(0, int(value))
+    except ValueError:
+        raise ValueError(
+            f"TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH must be an integer, got {value!r}"
+        ) from None
+
+
+def _decode_launch_groups(
+    batch_size: int,
+    q_len_per_req: Optional[int],
+    num_query_rows: int,
+    num_output_rows: int,
+    window_left: int,
+) -> Optional[List[Tuple[int, int]]]:
+    """Near-equal ``[first, last)`` sequence ranges for grouped decode launches, or None.
+
+    Only unwindowed attention is grouped (a sliding window bounds every sequence's KV). Grouping
+    needs a fixed number of query rows per sequence that covers the query and output tensors
+    exactly; otherwise (or when off, or the batch fits in one group) it returns None.
+    """
+    limit = _decode_seqs_per_launch()
+    if (
+        limit < 2
+        or window_left >= 0
+        or batch_size <= limit
+        or not q_len_per_req
+        or num_query_rows != batch_size * q_len_per_req
+        or num_output_rows != num_query_rows
+    ):
+        return None
+    num_groups = -(-batch_size // limit)
+    bounds = [batch_size * g // num_groups for g in range(num_groups + 1)]
+    return list(zip(bounds[:-1], bounds[1:]))
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -1164,17 +1211,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
+        decode_kwargs = dict(
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
             max_seq_len=max_kv_len,
             bmm1_scale=gen_bmm1_scale,
             bmm2_scale=gen_bmm2_scale,
             window_left=window_left,
-            out=params.output,
             sinks=fwd.attention_sinks,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
@@ -1191,6 +1234,29 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             ),
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
+        groups = _decode_launch_groups(
+            batch_beam, q_len_per_req, q_processed.size(0), params.output.size(0), window_left
+        )
+        if groups is None:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                out=params.output,
+                **decode_kwargs,
+            )
+            return
+        # Sequences [first, last) of each group own token rows
+        # [first * q_len_per_req, last * q_len_per_req) of the query and the output.
+        for first, last in groups:
+            rows = slice(first * q_len_per_req, last * q_len_per_req)
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed[rows],
+                block_tables=block_tables[first:last],
+                seq_lens=params.sequence_lengths[first:last],
+                out=params.output[rows],
+                **decode_kwargs,
+            )
 
     def run_mla_generation(
         self,
