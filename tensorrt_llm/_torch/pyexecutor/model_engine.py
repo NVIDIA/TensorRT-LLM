@@ -403,8 +403,8 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        # Router Replay (R3) capturer owned by this engine (None when disabled or
-        # for draft engines). Registered in the model extra attrs so the MoE
+        # Router Replay (R3) capturer owned by this engine (None when disabled).
+        # Registered in the model extra attrs so the MoE
         # routing hook reaches this engine's capturer during its forward, the
         # same way ``moe_layers`` is looked up -- no process-wide state.
         self.route_capture = RouteCapture.create(
