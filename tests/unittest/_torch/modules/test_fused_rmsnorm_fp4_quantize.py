@@ -463,4 +463,7 @@ def test_rmsnorm_ws_kernel_gate(m, n, residual, contiguous, expect_ws):
         # A column slice of a wider buffer: unit-stride last dim, larger pitch.
         hs = torch.empty((m, n + 32), dtype=torch.bfloat16, device="meta")[:, :n]
         assert not hs.is_contiguous()
+    # The ws kernel needs more shared memory than SM 12.x provides.
+    if getSMVersion() >= 120:
+        expect_ws = False
     assert norm._ws_kernel_eligible(hs, res) is expect_ws

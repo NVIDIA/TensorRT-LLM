@@ -210,7 +210,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params)
         norm_out += block_offset;
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
 
@@ -306,7 +306,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params)
             reinterpret_cast<uint32_t*>(params.quant_out)[access_id] = quant_val;
         }
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -393,12 +393,12 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::
 {
     // The NVFP4 epilogue (cvt_warp_fp16_to_fp4) is compiled only for
     // __CUDA_ARCH__ >= 1000 and emits zeros otherwise, so this kernel is correct
-    // only on SM 10.x (Blackwell). Fail fast on unsupported archs rather than
+    // only on SM 10.x and later. Fail fast on unsupported archs rather than
     // silently producing wrong FP4 (the Python dispatch in rms_norm.py already
     // routes those to the unfused path).
     int const sm = tensorrt_llm::common::getSMVersion();
-    TLLM_CHECK_WITH_INFO(sm >= 100 && sm < 120,
-        "residualRmsNormFp4Quant requires SM 10.x (Blackwell); got SM %d. The fused NVFP4 epilogue is unsupported on "
+    TLLM_CHECK_WITH_INFO(sm >= 100,
+        "residualRmsNormFp4Quant requires SM 10.x or later; got SM %d. The fused NVFP4 epilogue is unsupported on "
         "this arch.",
         sm);
     TLLM_CHECK_WITH_INFO(params.quant_out != nullptr && params.scale_out != nullptr,
