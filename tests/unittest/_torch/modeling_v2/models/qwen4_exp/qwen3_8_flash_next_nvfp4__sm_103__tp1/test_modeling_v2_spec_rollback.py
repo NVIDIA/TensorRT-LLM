@@ -273,16 +273,27 @@ def _slots(num):
     return list(range(3, 3 + 2 * num, 2))
 
 
+def _rollback(b, batched):
+    """The handler; `batched` binds the index planes, so `begin` gathers them all in one launch
+    and the commit restores them in one (`qsa_rollback_gather` / `qsa_rollback_restore`)."""
+    rollback = SpeculativeRollback()
+    if batched:
+        rollback.set_index_planes(b.index)
+    return rollback
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["per_layer", "batched"])
 @pytest.mark.parametrize("case", ["decode", "mixed"])
-def test_commit_matches_the_accepted_prefix(case):
+def test_commit_matches_the_accepted_prefix(case, batched):
     ctx_lens, gen_starts, p, gen_accepted = CASES[case]
     b = _Batch(11, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
     b.set_accepted(gen_accepted)
-    _verify_step(b, SpeculativeRollback())
+    _verify_step(b, _rollback(b, batched))
     _assert_state(b, _reference(b), case)
 
 
-def test_commit_over_the_strided_planes_of_a_shared_page():
+@pytest.mark.parametrize("batched", [False, True], ids=["per_layer", "batched"])
+def test_commit_over_the_strided_planes_of_a_shared_page(batched):
     """The handler stages and restores the index and position planes by advanced indexing, so
     planes that are strided views of one buffer (an NVFP4 KV cache's side planes) roll back
     like contiguous ones, and the bytes of the other layers' pages in the same buffer stay as
@@ -293,7 +304,7 @@ def test_commit_over_the_strided_planes_of_a_shared_page():
         13, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)), shared_page=True
     )
     b.set_accepted(gen_accepted)
-    _verify_step(b, SpeculativeRollback())
+    _verify_step(b, _rollback(b, batched))
     _assert_state(b, _reference(b), case)
 
 
@@ -328,11 +339,12 @@ def test_discard_drops_a_stale_staging():
     _assert_state(b, (b.ngram0, b.conv0, b.index0, b.position0), "discarded")
 
 
-def test_commit_is_sync_free():
+@pytest.mark.parametrize("batched", [False, True], ids=["per_layer", "batched"])
+def test_commit_is_sync_free(batched):
     ctx_lens, gen_starts, p, gen_accepted = CASES["mixed"]
     b = _Batch(16, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
     b.set_accepted(gen_accepted)
-    rollback = SpeculativeRollback()
+    rollback = _rollback(b, batched)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -396,13 +408,14 @@ _REPLAYS = {
 }
 
 
+@pytest.mark.parametrize("batched", [False, True], ids=["per_layer", "batched"])
 @pytest.mark.parametrize("case", sorted(_REPLAYS))
-def test_capture_and_replay_follow_the_accepted_counts(case):
+def test_capture_and_replay_follow_the_accepted_counts(case, batched):
     """The whole staged step and commit captured once, replayed with the
     accepted counts and the pre-step state rewritten in place."""
     ctx_lens, gen_starts, p, _ = CASES[case]
     b = _Batch(18, ctx_lens, gen_starts, p, _slots(len(gen_starts)))
-    rollback = SpeculativeRollback()
+    rollback = _rollback(b, batched)
     b.set_accepted((p,) * len(gen_starts))
 
     side = torch.cuda.Stream()

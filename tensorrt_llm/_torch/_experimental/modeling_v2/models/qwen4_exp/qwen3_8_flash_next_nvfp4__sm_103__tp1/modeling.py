@@ -159,6 +159,8 @@ from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_deco
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
+from .ops.attention.qsa_rollback_planes import plane_table as _plane_table
+from .ops.attention.qsa_rollback_planes import qsa_rollback_gather, qsa_rollback_restore
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
 from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
 from .ops.attention.qsa_topk_expand_decode import supports as _topk_expand_supports
@@ -1884,6 +1886,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         bound = _Bound(
             cm, pool_idx, index_cache, position_cache, kv, conv, ssm, (ple_conv, ple_ngram)
         )
+        if self.spec_rollback is not None:
+            self.spec_rollback.set_index_planes([index_cache[i] for i in self.attn_layers])
         if self.mtp_enabled:
             bound = bound._replace(**self._bind_step_buffers(cm, g, mm, conv0, ssm0))
         self._bound = bound
@@ -6604,6 +6608,15 @@ class SpeculativeRollback:
 
     def __init__(self) -> None:
         self._pending: dict | None = None
+        # (base addresses, page strides, plane count) of every attention layer's index-K
+        # plane, once the cache manager is bound: `begin` then gathers all of them at once and
+        # the commit restores them in one launch (`ops/attention/qsa_rollback_planes`).
+        self._planes: tuple | None = None
+
+    def set_index_planes(self, planes: list) -> None:
+        """Bind the attention layers' index-K planes (static for the manager's lifetime)."""
+        ptrs, strides = _plane_table(planes)
+        self._planes = (ptrs, strides, len(planes))
 
     # ------------------------------------------------------------- staging ---
 
@@ -6650,7 +6663,16 @@ class SpeculativeRollback:
             within=positions % tokens_per_block,
             index=[],
             position=None,
+            index_all=None,
         )
+        if self._planes is not None:
+            # Every plane's slots before the trunk writes any of them: what each layer's
+            # `stage_index` would capture before its own store, in one launch.
+            ptrs, strides, count = self._planes
+            pending = self._pending
+            pending["index_all"] = qsa_rollback_gather(
+                ptrs, strides, pending["pages"], pending["within"], count
+            )
 
     def stage_ple_pools(self, ngram_pool: torch.Tensor, conv_pool: torch.Tensor) -> None:
         """Before the PLE block's first write: both pools, and the generation slots'
@@ -6680,6 +6702,9 @@ class SpeculativeRollback:
         pages, within = pending["pages"], pending["within"]
         if pending["position"] is None:
             pending["position"] = (position_cache, position_cache[pages, within])
+        if pending["index_all"] is not None:
+            pending["index"].append(None)
+            return
         pending["index"].append((index_cache, index_cache[pages, within]))
 
     # -------------------------------------------------------------- commit ---
@@ -6722,8 +6747,14 @@ class SpeculativeRollback:
             torch.arange(p, device=accepted.device).unsqueeze(0) >= accepted.unsqueeze(1), [-1]
         )
         pages, within = pending["pages"], pending["within"]
-        for cache, old in pending["index"]:
-            cache[pages, within] = torch.where(rejected[:, None, None], old, cache[pages, within])
+        if pending["index_all"] is not None:
+            ptrs, strides, _ = self._planes
+            qsa_rollback_restore(ptrs, strides, pages, within, rejected, pending["index_all"])
+        else:
+            for cache, old in pending["index"]:
+                cache[pages, within] = torch.where(
+                    rejected[:, None, None], old, cache[pages, within]
+                )
         cache, old = pending["position"]
         cache[pages, within] = torch.where(rejected[:, None], old, cache[pages, within])
 
