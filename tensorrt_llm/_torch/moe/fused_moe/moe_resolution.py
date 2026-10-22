@@ -637,20 +637,22 @@ def resolve_moe_impl(
             f"(requested {requested}). Each candidate's reason: "
             f"{report.describe_rejections()}"
         )
+    elif report.degraded:
+        cause = report.degraded_from
+        others = ", ".join(
+            f"{rejection.legacy_backend}={rejection.reason.value}"
+            for rejection in report.requested_rejections
+            if rejection is not cause
+        )
+        logger.warning(
+            f"MoE backend {requested} cannot serve this layer{location} "
+            f"({'no candidate was considered' if cause is None else cause.describe()}); "
+            f"running {winner_cls.__name__} instead."
+            + (f" Also turned down: {others}." if others else "")
+        )
     else:
-        if report.degraded:
-            cause = report.degraded_from
-            others = ", ".join(
-                f"{rejection.legacy_backend}={rejection.reason.value}"
-                for rejection in report.requested_rejections
-                if rejection is not cause
-            )
-            logger.warning(
-                f"MoE backend {requested} cannot serve this layer{location} "
-                f"({'no candidate was considered' if cause is None else cause.describe()}); "
-                f"running {winner_cls.__name__} instead."
-                + (f" Also turned down: {others}." if others else "")
-            )
+        # Only the undegraded path reaches here, so ``describe()`` is built at
+        # most once per resolution: the warnings above carry their own text.
         logger.debug(report.describe())
 
     return report
