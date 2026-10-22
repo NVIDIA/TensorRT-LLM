@@ -3721,6 +3721,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The GDN mixer implements the in-forward snapshot split.
+            mamba_manager_extra_kwargs["supports_inforward_snapshot"] = True
         if getattr(sparse_attention_config, "algorithm", None) == "qsa":
             # Resolve the side-cache shape from the same checkpoint geometry
             # used to construct the QSA index projection.

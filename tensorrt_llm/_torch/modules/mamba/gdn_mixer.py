@@ -60,26 +60,18 @@ from .fuse_elementwise_ops import (
 )
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
-from .mamba2_metadata import Mamba2Metadata
+from .mamba2_metadata import InforwardSnapshotSplit, Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
 
-# Qwen3.5 GDN target-verify fast path (q35_env.fast_paths_enabled(); values tuned for Qwen3.5-397B on SM 10.3).
-# A decode-only MTP target-verify step with the cached replay and at most _Q35_FUSE_MAX_BATCH requests runs the chain
-# between in_proj and out_proj as
-# - the low-M in_proj with the conv1d update in its epilogue, then the CUDA core kernel (q35_gdn_core.py: replay +
-#   in-layer checkpoint commit + gated RMSNorm + FP8, one CTA per (request, value head)), when the in_proj takes the
-#   low-M kernel; otherwise
-# - the conv1d update kernel, then one launch of replay + gated RMSNorm (+ FP8): the Triton kernel (q35_gdn_fused.py)
-#   for up to 64 (request, value head) pairs and fewer than _Q35_CORE_MIN_BATCH requests, else the CUDA core kernel.
+# Qwen3.5 GDN target-verify fast path (tuned for Qwen3.5-397B on SM 10.3): a decode-only cached-replay MTP verify
+# step of at most _Q35_FUSE_MAX_BATCH requests runs low-M in_proj (+ conv1d epilogue) -> q35_gdn_core, or conv1d ->
+# one fused replay + gated RMSNorm launch (Triton below _Q35_CORE_MIN_BATCH requests, else q35_gdn_core).
 _Q35_FUSE_MAX_BATCH = 64
-# From this many requests the separate-conv path also takes the CUDA core kernel: at TP8 the in_proj leaves the low-M
-# kernel from 5 requests on, where the Triton fused kernel is slower than the CUDA core kernel.
+# At TP8 the in_proj leaves the low-M kernel from 5 requests on, where the CUDA core kernel beats the Triton one.
 _Q35_CORE_MIN_BATCH = 5
 # The CUDA core kernel releases its PDL dependents at entry.
 _Q35_CORE_TRIGGER = 2
-# Launch options of the Triton fused kernel: 4 warps, SSM state fetched before the PDL wait, both history buffers
-# fetched by slot (no dependent round trip), dependents released at entry, forward substitution on row-vector tuples.
 _Q35_FUSE_OPTS = dict(num_warps=4, prefetch_state=True, spec_hist=True, trigger=2, solve=2)
 
 # GDN prefill CUDA graph (TRTLLM_Q35_GDN_PREFILL_GRAPH): context-only batches of up to this many (padded) tokens.
@@ -122,6 +114,90 @@ def chunk_gated_delta_rule(
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
+def _inforward_split_prefill_core(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    split: InforwardSnapshotSplit,
+    stage_ssm: torch.Tensor,
+    output: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Chunked GDN prefill of a context-only batch with in-forward Mamba snapshots.
+
+    Each planned sequence is split into [.., P) and its tail. One chunked prefill over all sequences
+    (initial states gathered, final states returned) gives every sequence's final state, written to the
+    live slots: the state at P for the planned requests. The tails are then recomputed from the state at
+    P, as a separate context iteration of the tail would; their outputs replace the first pass's and their
+    final states (the state at the prompt end) go to the staging rows, from which the cache manager
+    restores the live slots after committing the snapshot at P.
+
+    Args:
+        query, key, value, g, beta: Post-convolution GDN inputs, ``[1, num_tokens, heads, dim]``.
+        ssm_states: The layer's SSM state pool, ``[slots, H, V, K]``.
+        split: This step's split (``Mamba2Metadata.inforward_split``).
+        stage_ssm: The layer's SSM staging rows, ``[rows, H, V, K]``.
+        output: Optional preallocated output.
+    """
+    initial = ssm_states.index_select(0, split.gather)
+    core_out, final = chunk_gated_delta_rule(
+        q=query,
+        k=key,
+        v=value,
+        g=g,
+        beta=beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=split.cu,
+        head_first=False,
+        use_qk_l2norm_in_kernel=False,
+        output=output,
+    )
+    final = final.to(ssm_states.dtype)
+    ssm_states.index_copy_(0, split.live, final.index_select(0, split.main_rows))
+    tail = split.tail_tok
+    tail_out, tail_final = chunk_gated_delta_rule(
+        q=query.index_select(1, tail),
+        k=key.index_select(1, tail),
+        v=value.index_select(1, tail),
+        g=g.index_select(1, tail),
+        beta=beta.index_select(1, tail),
+        initial_state=final.index_select(0, split.split_rows),
+        output_final_state=True,
+        cu_seqlens=split.cu_tail,
+        head_first=False,
+        use_qk_l2norm_in_kernel=False,
+    )
+    stage_ssm.index_copy_(0, split.stage_rows, tail_final.to(stage_ssm.dtype))
+    core_out[0].index_copy_(0, tail, tail_out[0].to(core_out.dtype))
+    return core_out
+
+
+def _inforward_split_conv_states(
+    conv_states: torch.Tensor,
+    window: torch.Tensor,
+    split: InforwardSnapshotSplit,
+    stage_conv: torch.Tensor,
+) -> None:
+    """Swap the convolution states of the split requests after the prefill convolution.
+
+    The convolution ran over whole chunks, so the live slots hold the window that ends at the prompt end:
+    stage it and put the window that ends at P (``window``, the raw ``[k * (d_conv - 1), conv_dim]``
+    inputs before P, oldest first) into the live slots.
+    """
+    stage_conv.index_copy_(0, split.stage_rows, conv_states.index_select(0, split.tail_slots))
+    conv_states.index_copy_(
+        0,
+        split.tail_slots,
+        window.view(split.k, conv_states.shape[-1], -1)
+        .transpose(1, 2)
+        .contiguous()
+        .to(conv_states.dtype),
+    )
+
+
 def _extract_gdn_extra_attrs(layer_idx: str):
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Model extra attrs is not set"
@@ -149,36 +225,21 @@ def _q35_direct_call(fn, *args, **kwargs):
 def _q35_read_graph_switches() -> None:
     """The TRTLLM_Q35_* prefill switches of this module; q35_env.activate() re-reads them."""
     global _q35_op_call, _Q35_GDN_PREFILL_GRAPH, _Q35_GDN_GRAPH_LEAN, _Q35_GDN_GRAPH_DIRECT
-    # TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook
-    # off. The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers,
-    # Triton launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
+    # Run this piecewise-excluded custom op with dynamo's eval-frame hook off, so the Python frames it creates
+    # inside the torch.compile'd region skip dynamo's frame callback.
     _q35_op_call = (
         torch._dynamo.disable(_q35_direct_call, recursive=True)
         if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1"
         else _q35_direct_call
     )
-    # TRTLLM_Q35_GDN_PREFILL_GRAPH=1: under the piecewise torch.compile path the GDN core (state reset, conv1d,
-    # post-conv, FlashInfer chunked prefill) runs eagerly between the captured pieces, and its ~8 Python-launched
-    # kernels cost ~1 ms of host time per layer. For context-only batches of up to _Q35_GDN_PREFILL_GRAPH_MAX_TOKENS
-    # (padded) tokens the core is captured as one CUDA graph per (layer, padded token count, number of context
-    # requests) and replayed:
-    # - Token inputs and the output go through static buffers shared by all layers (copied in / out around each
-    #   replay): the piece outputs that feed the op do not keep fixed addresses on every rank.
-    # - The graph bakes in the addresses of the Mamba metadata buffers (has_initial_states, state_indices,
-    #   query_start_loc(_long)) and of the layer's state pools; a replay requires them unchanged, otherwise the key
-    #   is re-warmed and re-captured (e.g. a graph captured during the engine warmup on dummy-request buffers).
-    # The graph runs on the padded token count: cu_seqlens / query_start_loc bound the work to the real tokens, as on
-    # the eager path. The first _Q35_GDN_PREFILL_GRAPH_WARMUP calls of each key run eagerly (Triton / FlashInfer
-    # specializations, workspaces), the next one captures. Mixed and generation batches stay eager.
+    # Capture the eager GDN core of context-only batches (~1 ms host time per layer) as per-shape CUDA graphs; see
+    # _q35_gdn_prefill_graphed.
     _Q35_GDN_PREFILL_GRAPH = os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH", "0") == "1"
-    # TRTLLM_Q35_GDN_GRAPH_LEAN=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): the per-call key check reads the layer's state
-    # pool addresses from the hybrid manager's per-layer state lists instead of building a mamba_layer_cache()
-    # dataclass (two tensor selects and a frozen dataclass per GDN layer and iteration).
+    # The graph key check reads the state pool addresses from the hybrid manager's per-layer lists instead of
+    # building a mamba_layer_cache() dataclass.
     _Q35_GDN_GRAPH_LEAN = os.environ.get("TRTLLM_Q35_GDN_GRAPH_LEAN", "0") == "1"
-    # TRTLLM_Q35_GDN_GRAPH_DIRECT=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): a key whose token inputs and output have the
-    # same addresses and strides in its warm-up call and in its capture call is captured on those tensors and
-    # replayed without the four copies through the static buffers while they keep them; a call on other addresses
-    # uses the static-buffer graph of the key (captured on first need).
+    # A key whose token I/O kept its addresses and strides from the warm-up to the capture call is captured on
+    # those tensors and replayed without the static-buffer copies while they stay the same.
     _Q35_GDN_GRAPH_DIRECT = os.environ.get("TRTLLM_Q35_GDN_GRAPH_DIRECT", "0") == "1"
 
 
@@ -221,10 +282,8 @@ def _q35_gdn_capture(body, args) -> torch.cuda.CUDAGraph:
     if _q35_gdn_prefill_graph_pool is None:
         _q35_gdn_prefill_graph_pool = torch.cuda.graph_pool_handle()
     graph = torch.cuda.CUDAGraph()
-    # torch.cuda.graph() runs torch.cuda.synchronize(), gc.collect() and torch.cuda.empty_cache() on entry, and
-    # these captures happen while serving. gc.collect() is slow (the piecewise runner patches it out the same
-    # way), and empty_cache() hands cached blocks back to the driver under the KV transceiver's (NIXL / UCX)
-    # memory registrations: a disagg CTX segfaulted in nixlUcxWorker::arm right after its first lazy captures.
+    # These captures happen while serving: skip torch.cuda.graph()'s gc.collect() (slow) and empty_cache(), which
+    # would free blocks under the KV transceiver's NIXL / UCX memory registrations (segfault in nixlUcxWorker::arm).
     with (
         patch.object(gc, "collect", lambda *args, **kwargs: 0),
         patch.object(torch.cuda, "empty_cache", lambda: None),
@@ -261,7 +320,12 @@ def _q35_gdn_static_view(role: str, t: torch.Tensor, token_dim: int) -> Optional
 def _q35_gdn_prefill_graphed(
     gdn_layer, mixed_qkv, a, b, layer_idx, output, attn_metadata, spec_metadata
 ) -> bool:
-    """Run a context-only GDN core through its per-shape CUDA graph; False: not applicable, run it eagerly."""
+    """Run a context-only GDN core through its per-shape CUDA graph; False: not applicable, run it eagerly.
+
+    One graph per (layer, padded token count, context requests, split signature); token I/O goes through static
+    buffers shared by all layers. The graph bakes in the Mamba metadata and state pool addresses: when they change
+    the key is re-warmed and re-captured. The first _Q35_GDN_PREFILL_GRAPH_WARMUP calls of a key run eagerly.
+    """
     num_ctx = attn_metadata.num_contexts
     num_tokens = mixed_qkv.shape[0]
     if (
@@ -290,7 +354,11 @@ def _q35_gdn_prefill_graphed(
         conv_ptr,
         ssm_ptr,
     )
-    key = (layer_idx, num_tokens, num_ctx)
+    # An in-forward snapshot split runs more kernels, sized by (requests split, tail tokens).
+    split_sig = getattr(mamba_metadata, "inforward_split_sig", (0, 0))
+    if getattr(mamba_metadata, "inforward_split", None) is not None:
+        meta += (mamba_metadata._inforward_split_buf.data_ptr(),)
+    key = (layer_idx, num_tokens, num_ctx, split_sig)
     entry = _q35_gdn_prefill_graphs.get(key)
     if entry is not None and entry[2] != meta:
         entry = None
@@ -666,13 +734,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """(in_proj_qkvz, in_proj_ba) outputs from one low-M launch, or None when it does not apply.
 
-        The FP8 (W8A8) ``in_proj_qkvz`` rows and the BF16 ``in_proj_ba`` rows run as two segments of one kernel
-        (``lowm_linear.lowm_gemm``) instead of a cuBLAS FP8 GEMM (plus its activation-quantize kernel) on the main
-        stream and a BF16 GEMM on the aux stream. The FP8 segment takes ``h_fp8`` (E4M3 from the preceding all-reduce)
-        when given, else quantizes the BF16 ``hidden_states`` in registers with ``in_proj_qkvz.input_scale`` (the
-        values of the quantize kernel); the BF16 segment takes ``hidden_states``. With ``conv``, the epilogue also
-        runs the target-verify conv1d update of the q|k|v channels (convolved rows, intermediate windows and conv
-        state written by the GEMM).
+        The FP8 ``in_proj_qkvz`` and BF16 ``in_proj_ba`` rows run as two segments of one ``lowm_gemm`` launch. The
+        FP8 segment takes ``h_fp8`` when given, else quantizes ``hidden_states`` in registers with
+        ``in_proj_qkvz.input_scale``. With ``conv``, the epilogue also runs the target-verify conv1d update of the
+        q|k|v channels.
         """
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
         act, mode = ("fp8", "mixed8") if h_fp8 is not None else ("quant", "mixed")
@@ -720,10 +785,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         h_fp8: the same activations already quantized to E4M3 with in_proj_qkvz's static input scale (the preceding
         all-reduce emits it under the Qwen3.5 fast paths); in_proj_ba keeps BF16.
-        q35_fast_paths: try the fused low-M in_proj first (eager / CUDA-graph runs only, not under torch.compile), and
-        when in_proj_ba runs on the aux stream leave its join to the caller (_q35_join_ba before the first consumer
-        of a / b), so that the separate target-verify conv1d update, which reads q|k|v only, does not wait for the
-        BF16 ba GEMM.
+        q35_fast_paths: try the fused low-M in_proj first (not under torch.compile); an aux-stream in_proj_ba is
+        joined by the caller (_q35_join_ba before the first reader of a / b), so the conv1d update does not wait for it.
         """
         fused = (
             self._lowm_in_proj(hidden_states, h_fp8)
@@ -1409,8 +1472,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         state_indices_d = kwargs["state_indices_d"]
         num_prefill = kwargs["num_prefill"]
         num_decodes = kwargs["num_decodes"]
+        inforward_split = kwargs.get("inforward_split")
 
         conv_states_to_use = conv_states
+        if inforward_split is not None:
+            if num_decode_tokens > 0 or is_target_verify:
+                raise RuntimeError("In-forward Mamba snapshots need a context-only batch")
+            # The convolution state at P: the d_conv - 1 raw inputs before P.
+            inforward_window = mixed_qkv.index_select(0, inforward_split.conv_win)
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         if num_decode_tokens > 0:
@@ -1523,6 +1592,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
+            if inforward_split is not None:
+                _inforward_split_conv_states(
+                    conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
+                )
             query, key, value, g, beta = fused_gdn_post_conv(
                 mixed_qkv_t,
                 None,
@@ -1660,6 +1733,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if attn_out_prefill is None:
                 return attn_out_decode
             return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
+
+        if inforward_split is not None:
+            return _inforward_split_prefill_core(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                ssm_states,
+                inforward_split,
+                kwargs["inforward_stage"][0],
+                output,
+            )
 
         core_attn_out, _ = chunk_gated_delta_rule(
             q=query,
@@ -1847,6 +1933,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "use_cached_replay_all_layer_commit": use_cached_replay_all_layer_commit,
             "q35_fast_paths": fast_paths_enabled(),
         }
+        inforward_split = (
+            getattr(mamba_metadata, "inforward_split", None) if num_prefills > 0 else None
+        )
+        if inforward_split is not None:
+            kwargs["inforward_split"] = inforward_split
+            kwargs["inforward_stage"] = (
+                attn_metadata.kv_cache_manager.inforward_snapshot_stage_views(self.layer_idx)
+            )
         if num_prefills > 0:
             attn_out = self.forward_extend(
                 conv_states,

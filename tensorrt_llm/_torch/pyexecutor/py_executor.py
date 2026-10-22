@@ -201,22 +201,15 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 # content waits for decoding iteration stream_interval.
 DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME = "TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP"
 
-# With "1", the overlap loop of a speculative-decoding executor runs with
-# ``execution_stream``, the stream every forward runs on, as its current stream.
-# The sampler's work and the next step's input preparation then follow each
-# forward in stream order instead of across two cross-stream waits per step (the
-# current stream waits for the forward after it, the forward for the current
-# stream before the next). The order of the work does not change: everything
-# the loop issues on its current stream already runs between two consecutive
-# forwards.
+# With "1", the overlap loop of a speculative-decoding executor makes
+# ``execution_stream`` its current stream, so the two cross-stream waits per
+# forward drop out; the work order is unchanged.
 OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME = (
     "TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM")
 
-# TRTLLM_Q35_CACHED_STREAM_EVENTS=1: _forward_step orders the execution stream
-# after the current stream and back with two CUDA events created once and
-# re-recorded every step, instead of Stream.wait_stream (which creates, and
-# later destroys, a new event per call). A stream wait captures the event's
-# record at the time of the wait, so re-recording later is harmless.
+# With "1", _forward_step orders the streams with two events re-recorded every
+# step instead of Stream.wait_stream (a new event per call). A wait captures the
+# record current at the time of the wait, so re-recording later is safe.
 CACHED_STREAM_EVENTS_ENV_VAR_NAME = "TRTLLM_Q35_CACHED_STREAM_EVENTS"
 
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
@@ -437,6 +430,9 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+    # The KV cache manager takes Mamba snapshots inside the forward, so a KV
+    # send must wait for the requests' state restores (_send_kv_async).
+    _wait_mamba_restore_events = False
 
     def __init__(
         self,
@@ -711,6 +707,10 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        inforward_snapshot_rows = getattr(self.kv_cache_manager,
+                                          "inforward_snapshot_rows", 0)
+        self._wait_mamba_restore_events = (isinstance(
+            inforward_snapshot_rows, int) and inforward_snapshot_rows > 0)
         self.enable_joint_kv_cache_reuse = (
             self._is_kv_manager_v2
             and self.kv_cache_manager.enable_joint_kv_cache_reuse)
@@ -8077,10 +8077,9 @@ class PyExecutor:
                                     ] * self.model_engine.max_total_draft_tokens
             elif (self.model_engine.enable_spec_decode and len(ctx_draft_tokens)
                   < self.model_engine.max_total_draft_tokens):
-                # CTX drafted fewer tokens than this GEN verifies (e.g. a CTX
-                # with MTP max_draft_len 1 to keep its context iterations
-                # cheap): pad to the GEN's draft width. Like the dummies
-                # above, the padding is rejected on verify.
+                # A CTX with a smaller max_draft_len than this GEN: pad to the
+                # GEN's draft width; like the dummies above, the padding is
+                # rejected on verify.
                 ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
                     self.model_engine.max_total_draft_tokens -
                     len(ctx_draft_tokens))
@@ -8258,6 +8257,15 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+        if self._wait_mamba_restore_events:
+            # In-forward Mamba snapshots copy the prompt-end state back after
+            # the sampler event; the KV sender reads the cache on its own
+            # stream, so that copy has to finish first.
+            for req in scheduled_requests:
+                restore_event = req.py_mamba_restore_event
+                if restore_event is not None:
+                    req.py_mamba_restore_event = None
+                    restore_event.synchronize()
         # Order matters: reaping before the connector registers its transfer
         # can release a request the connector still needs.
         self.disagg.send_completed_context(scheduled_requests)
@@ -9265,11 +9273,9 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
-            # A generation-only request under the overlap scheduler skipped its
-            # iteration-1 response above (the CTX returned the first token), so
-            # with stream_interval N its first streamed content would wait for
-            # decoding iteration N; TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1 streams
-            # its first GEN step as well.
+            # A generation-only request skipped its iteration-1 response (the
+            # CTX returned the first token); without this its first streamed
+            # content waits for decoding iteration stream_interval.
             first_gen_emit = (
                 emit_first_gen_step and request.is_generation_only_request
                 and not getattr(request, "py_gen_first_emitted", False))
