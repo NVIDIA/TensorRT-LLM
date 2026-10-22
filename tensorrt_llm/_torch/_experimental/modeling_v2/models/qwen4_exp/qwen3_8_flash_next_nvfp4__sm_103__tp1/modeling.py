@@ -107,6 +107,7 @@ forward, which cannot express a host readback.
 
 import math
 import os
+import re
 from typing import NamedTuple
 
 import torch
@@ -172,6 +173,7 @@ from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.embedding.ngram_hash import ngram_hash
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
+from .ops.gemm.fp8_per_tensor_mm import fp8_per_tensor_mm, fp8_per_tensor_weight
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
@@ -575,6 +577,33 @@ def _mtp_draft_head_mode() -> str:
     mode = os.environ.get(_MTP_DRAFT_HEAD_ENV, "fp8").lower()
     assert mode in ("bf16", "fp8"), f"{_MTP_DRAFT_HEAD_ENV}={mode!r}: expected bf16 or fp8"
     return mode
+
+
+#: Set to 1 to run the GDN input / output and attention input / output projections in FP8
+#: (`fp8_per_tensor_mm`: e4m3 weights with a per-tensor scale, the activation quantized per
+#: call with a dynamic per-tensor scale) wherever a call reaches `_DENSE_FP8_MIN_ROWS` rows. A
+#: lossy mode beside the checkpoint's bf16 projections (gsm8k-gated); off by default.
+_DENSE_FP8_ENV = "TRTLLM_MODELING_V2_DENSE_FP8"
+
+#: Rows from which a projection takes the FP8 entry, per projection kind: the input
+#: projections at every row count the bf16 GEMV / fused paths do not serve, the K=6144 output
+#: projections only where the GEMM saving outgrows the activation quantization's two launches
+#: (GB300 micro-bench: cuBLASLt bf16 8-10 us vs FP8 6-7 us + ~4 us below ~512 rows).
+_DENSE_FP8_MIN_ROWS = {"in": 1, "out": 512}  # capacity: fixed: dispatch thresholds
+
+
+def _dense_fp8_enabled() -> bool:
+    mode = os.environ.get(_DENSE_FP8_ENV, "0")
+    assert mode in ("0", "1"), f"{_DENSE_FP8_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
+
+
+def _dense_mm(x: torch.Tensor, weight_t: torch.Tensor, fp8, gemm, kind: str) -> torch.Tensor:
+    """A dense projection on the FP8 entry when its weight has an FP8 copy (`fp8` = `(codes_t,
+    scale)`) and the call has enough rows for `kind`, else on the step's bf16 entry `gemm`."""
+    if fp8 is not None and x.shape[0] >= _DENSE_FP8_MIN_ROWS[kind]:
+        return fp8_per_tensor_mm(x, *fp8)
+    return gemm(x, weight_t)
 
 
 #: Decode batches up to this many rows run each trunk hyper-connection site as
@@ -1669,6 +1698,14 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._fuse_hc_first_projections()
         if self.mtp_enabled:
             self._mtp_fused = _mtp_fused_views(self)
+        # FP8 copies of the trunk's dense projections (`_DENSE_FP8_ENV`), beside the bf16
+        # weights the 1-row GEMV / fused paths and the draft layer keep reading.
+        self._dense8 = {}
+        if _dense_fp8_enabled():
+            for name in w:
+                if re.fullmatch(r"l\d+_(attn_in_w|o_w|in_proj_w|out_w)", name):
+                    codes, scale = fp8_per_tensor_weight(w[name])
+                    self._dense8[name] = (codes.t(), scale)
 
         # The CPU-only load checks build the targets over host weights; they launch nothing.
         self._side_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -2156,6 +2193,12 @@ class _LayerWeights(NamedTuple):
     # `[gate | up | gate logit | pad]` (`weights._cat_rows`): `sh_gu` and `sh_gate` are its
     # column blocks.
     sh_gug: torch.Tensor
+    # FP8 copies `(codes_t, scale)` of the dense projections (`_DENSE_FP8_ENV`); None when off
+    # and on the other layer kind.
+    attn_in8: tuple | None = None
+    o8: tuple | None = None
+    in_proj8: tuple | None = None
+    out8: tuple | None = None
 
 
 def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
@@ -2253,6 +2296,10 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
                 sh_dn=w[f"l{i}_sh_dn"].t(),
                 sh_gate=w[f"l{i}_sh_gu"][2 * core.shared_inter : 2 * core.shared_inter + 1].t(),
                 sh_gug=w[f"l{i}_sh_gu"].t(),
+                attn_in8=getattr(core, "_dense8", {}).get(f"l{i}_attn_in_w"),
+                o8=getattr(core, "_dense8", {}).get(f"l{i}_o_w"),
+                in_proj8=getattr(core, "_dense8", {}).get(f"l{i}_in_proj_w"),
+                out8=getattr(core, "_dense8", {}).get(f"l{i}_out_w"),
             )
         )
     return layers
@@ -3032,7 +3079,7 @@ class PrefillTarget:
         core = self.core
         num_tokens = x.shape[0]
 
-        proj = cublas_mm(x, L.attn_in)
+        proj = _dense_mm(x, L.attn_in, L.attn_in8, cublas_mm, "in")
         gate = torch.split(proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1)[1]
         # The index query lands in the q slots of the scratch; its k and v slots
         # are layout only and nothing reads them.
@@ -3077,7 +3124,7 @@ class PrefillTarget:
                 self._kv_probe = None
         eager_on_graph(proj, proj_qkv, index_scratch, attn_out, i, inner=self._attention_core)
         fused_sigmoid_mul_inplace(attn_out, gate)
-        return cublas_mm(attn_out, L.o)
+        return _dense_mm(attn_out, L.o, L.o8, cublas_mm, "out")
 
     def _attention_core(self, proj, proj_qkv, index_scratch, attn_out, i) -> None:
         """Break: the index plane's store and compression, the dense/sparse decision and the
@@ -3387,7 +3434,7 @@ class PrefillTarget:
         gated-norm epilogue run over all `T` rows here, the recurrence in the `_gdn_core`
         break, which leaves its output in `core_out` `[1, T, num_v_heads, head_v_dim]`."""
         core = self.core
-        proj = cublas_mm(x, L.in_proj)
+        proj = _dense_mm(x, L.in_proj, L.in_proj8, cublas_mm, "in")
         z = torch.split(proj, core.in_proj_split, 1)[1]
         eager_on_graph(proj, core_out, i, inner=self._gdn_core)
         return self._gdn_epilogue(core_out, z, L, x.shape[0])
@@ -3613,7 +3660,8 @@ class PrefillTarget:
             fp8_scale=None,
             gate_activation="sigmoid",
         )
-        return cublas_mm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
+        o = torch.reshape(o, [num_tokens, core.value_dim])
+        return _dense_mm(o, L.out, L.out8, cublas_mm, "out")
 
     def _ple_block(self, hc, hc_out, normed_out) -> None:
         """Break: the n-gram side path on one decoder layer, over the step's `n` rows,
@@ -4884,7 +4932,7 @@ class DecodeTarget:
         ) = qsa
         num_tokens = x.shape[0]
 
-        proj = gemm(x, L.attn_in)
+        proj = _dense_mm(x, L.attn_in, L.attn_in8, gemm, "in")
         main = torch.cuda.current_stream()
         side = core._side_stream
         qkv_view, gate, index_view = torch.split(
@@ -5068,7 +5116,7 @@ class DecodeTarget:
             )
         if not gated:
             fused_sigmoid_mul_inplace(out, gate)
-        return gemm(out, L.o)
+        return _dense_mm(out, L.o, L.o8, gemm, "out")
 
     def _gdn_verify(
         self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay
@@ -5167,7 +5215,7 @@ class DecodeTarget:
                 True,
             )
         else:
-            proj = gemm(x, L.in_proj)
+            proj = _dense_mm(x, L.in_proj, L.in_proj8, gemm, "in")
         mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
 
         if (
@@ -5190,7 +5238,7 @@ class DecodeTarget:
                 core.num_k_heads,
                 core.head_k_dim,
             )
-            return gemm(o, L.out)
+            return _dense_mm(o, L.out, L.out8, gemm, "out")
         if is_verify:
             out = self._gdn_verify(
                 mixed_qkv,
@@ -5233,7 +5281,7 @@ class DecodeTarget:
             core.num_k_heads,
             core.head_k_dim,
         )
-        return gemm(o, L.out)
+        return _dense_mm(o, L.out, L.out8, gemm, "out")
 
     def _gdn_epilogue(self, out, z, L, num_tokens, gemm=cublas_mm) -> torch.Tensor:
         """Gated RMS norm (sigmoid gate, plain non-gemma weight) and output projection
@@ -5247,7 +5295,8 @@ class DecodeTarget:
             fp8_scale=None,
             gate_activation="sigmoid",
         )
-        return gemm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
+        o = torch.reshape(o, [num_tokens, core.value_dim])
+        return _dense_mm(o, L.out, L.out8, gemm, "out")
 
     def _ple_block(self, hc, input_ids, ple_state, next_norm, stage, gemm=cublas_mm) -> tuple:
         """The n-gram side path on one decoder layer, added into the stream and
