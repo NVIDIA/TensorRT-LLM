@@ -8186,6 +8186,15 @@ class PyExecutor:
                 # and the draft model will produce real tokens for next step.
                 ctx_draft_tokens = [0
                                     ] * self.model_engine.max_total_draft_tokens
+            elif (self.model_engine.enable_spec_decode and len(ctx_draft_tokens)
+                  < self.model_engine.max_total_draft_tokens):
+                # CTX drafted fewer tokens than this GEN verifies (e.g. a CTX
+                # with MTP max_draft_len 1 to keep its context iterations
+                # cheap): pad to the GEN's draft width. Like the dummies
+                # above, the padding is rejected on verify.
+                ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
+                    self.model_engine.max_total_draft_tokens -
+                    len(ctx_draft_tokens))
             req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
