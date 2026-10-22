@@ -64,7 +64,8 @@ from ..moe.fused_moe.moe_comm_timeout_guard import (moe_comm_serving_timeouts,
                                                     set_moe_comm_warmup)
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
-from ..nccl_window_tensor_scope import (discard_nccl_window_tensor_outputs,
+from ..nccl_window_tensor_scope import (disabled_nccl_window_tensor_scope,
+                                        discard_nccl_window_tensor_outputs,
                                         install_eager_nccl_window_tensor_scopes,
                                         nccl_window_tensor_scope)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
@@ -6582,17 +6583,15 @@ class PyTorchModelEngine(ModelEngine):
             if self._torch_compile_prefill_only else contextlib.nullcontext())
         # This boundary stays outside torch.compile, so one lease scope covers
         # eager, compiled, and CUDA-graph model execution.
-        window_scope = (nccl_window_tensor_scope(kwargs) if getattr(
-            self, "_nccl_window_tensor_scopes_enabled", True) else None)
-        with reclaim_scope, compile_scope, (window_scope
-                                            or contextlib.nullcontext()):
+        window_scope = (nccl_window_tensor_scope(kwargs)
+                        if self._nccl_window_tensor_scopes_enabled else
+                        disabled_nccl_window_tensor_scope())
+        with reclaim_scope, compile_scope, window_scope:
             if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
                 outputs = trace_func(self.model.forward)(**kwargs)
             else:
                 outputs = self.model.forward(**kwargs)
-            if window_scope is not None:
-                outputs = window_scope.escape(outputs)
-            return outputs
+            return window_scope.escape(outputs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,

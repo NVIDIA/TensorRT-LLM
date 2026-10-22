@@ -288,6 +288,7 @@ def test_prefill_compile_scopes_whole_model_forward(
         _torch_compile_backend=None,
         _torch_compile_prefill_only=prefill_only,
         _eager_workspace_reclaimer=None,
+        _nccl_window_tensor_scopes_enabled=False,
         is_warmup=False,
     )
     monkeypatch.setattr(model_engine_module, "get_model_extra_attrs", lambda: {})
@@ -346,6 +347,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _nccl_window_tensor_scopes_enabled=False,
         _warmup_timer=_WarmupTimer(rank=0),
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),

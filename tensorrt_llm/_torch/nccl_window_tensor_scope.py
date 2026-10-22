@@ -163,6 +163,32 @@ def nccl_window_tensor_scope(inputs: Any) -> _NCCLWindowTensorScope:
     return _NCCLWindowTensorScope(inputs)
 
 
+class _DisabledNCCLWindowTensorScope:
+    """No-op scope for forwards that cannot create NCCL window tensors."""
+
+    def __enter__(self) -> "_DisabledNCCLWindowTensorScope":
+        return self
+
+    def escape(self, outputs: Any) -> Any:
+        return outputs
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        return None
+
+
+_DISABLED_NCCL_WINDOW_TENSOR_SCOPE = _DisabledNCCLWindowTensorScope()
+
+
+def disabled_nccl_window_tensor_scope() -> _DisabledNCCLWindowTensorScope:
+    """Return the shared no-op scope; it issues no lease operations."""
+    return _DISABLED_NCCL_WINDOW_TENSOR_SCOPE
+
+
 @contextmanager
 def discard_nccl_window_tensor_outputs(inputs: Any) -> Iterator[None]:
     """Release window tensors produced while preserving borrowed inputs."""

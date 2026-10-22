@@ -169,6 +169,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = object.__new__(PyTorchModelEngine)
         self.engine._eager_workspace_reclaimer = None
+        self.engine._nccl_window_tensor_scopes_enabled = False
         self.engine.is_spec_decode = False
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None

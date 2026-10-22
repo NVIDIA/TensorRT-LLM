@@ -629,6 +629,18 @@ def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
     assert events[1][3] is False
 
 
+def test_disabled_window_tensor_scope_issues_no_lease_ops(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise AssertionError("a disabled scope must not issue lease operations")
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", fail)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", fail)
+
+    outputs = object()
+    with nccl_window_tensor_scope.disabled_nccl_window_tensor_scope() as scope:
+        assert scope.escape(outputs) is outputs
+
+
 @pytest.mark.parametrize("scopes_enabled", [True, False])
 def test_model_forward_window_scope_follows_engine_gate(monkeypatch, scopes_enabled):
     from types import SimpleNamespace
