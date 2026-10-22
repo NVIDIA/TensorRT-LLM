@@ -152,6 +152,11 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        # cleanup() also runs on an engine whose construction failed part-way.
+        self._cleanup_done = False
+        self.model_loader: Optional[ModelLoader] = None
+        self._runner: Optional[ModelRunner] = None
+        self._torch_compile_backend: Optional[Backend] = None
         configured_encoder_max_num_tokens = self._init_from_args(
             model_path=model_path,
             llm_args=llm_args,
@@ -187,10 +192,6 @@ class PyTorchModelEngine(ModelEngine):
         Returns the encoder token budget before any multimodal increase."""
         _configure_deep_gemm_pdl()
 
-        self._metrics: dict[str, float] = defaultdict(float)
-        self._cleanup_done = False
-        self._model_caller: Optional[ModelCaller] = None
-        self._runner: Optional[ModelRunner] = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -289,7 +290,6 @@ class PyTorchModelEngine(ModelEngine):
                 partial_model_loading=self.llm_args.is_partial_model_loading,
             )
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
-        self.model_loader: Optional[ModelLoader] = None
         if model is None:
             lora_config: Optional[LoraConfig] = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
@@ -408,7 +408,6 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._torch_compile_backend = None
         self._init_model_capacity()
 
     def _size_cuda_graphs(self) -> None:
@@ -578,6 +577,7 @@ class PyTorchModelEngine(ModelEngine):
             self.max_draft_len = 0
             self.max_total_draft_tokens = 0
 
+        self._metrics: dict[str, float] = defaultdict(float)
         self.iter_states = {}
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._lora_owner: Optional[DecoderLoraOwner] = None
