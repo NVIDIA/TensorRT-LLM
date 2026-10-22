@@ -147,6 +147,64 @@ TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "unpool": ((2, "direct:128,2"), (MAX_ROWS, CUBLAS)),
 }
 
+#: The tep4 table on sm107 (212 SMs), the tep4 shapes chosen the same way: the direct
+#: kernel at 1-3 rows for QKV, 1-2 for the attention output projection, 1-6 for the
+#: pooler slice and 1-5 for the unpooler slice; then split-K 2 for QKV, flashinfer's
+#: split-K ``(64, 8, 1, 11)`` for the attention output projection (faster than cuBLAS
+#: here) and split-K 4 for the slices.
+SM107_TP4_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": (
+        (1, "direct:256,2"),
+        (2, "direct:64,4"),
+        (3, "direct:32,2"),
+        (MAX_ROWS, "splitk:64,8,2,12"),
+    ),
+    "o_proj": ((2, "direct:128,4"), (MAX_ROWS, "splitk:64,8,1,11")),
+    "pool": ((1, "direct:256,2"), (6, "direct:128,2"), (MAX_ROWS, "splitk:64,8,4,11")),
+    "unpool": ((3, "direct:128,2"), (5, "direct:64,2"), (MAX_ROWS, "splitk:64,8,4,10")),
+}
+
+#: The tep4 pooler and unpooler on the whole replicated weights on sm107: direct at 1-3
+#: and 1-2 rows, then split-K 2 for the pooler and flashinfer's split-K ``(64, 8, 1, 12)``
+#: for the unpooler.
+SM107_TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "pool": (
+        (1, "direct:256,2"),
+        (2, "direct:64,4"),
+        (3, "direct:32,2"),
+        (MAX_ROWS, "splitk:64,8,2,11"),
+    ),
+    "unpool": ((2, "direct:128,2"), (MAX_ROWS, "splitk:64,8,1,12")),
+}
+
+#: ``wide_dense_gemms``: the sm107 tep4 kernels of the 9..32-row calls of a decode step of 2..4
+#: requests, as ``(last row count, kernel)`` steps from 9 rows. Each is flashinfer's split-K with
+#: the ``split_k`` of the site's 8-row cell in ``SM107_TP4_KERNELS``, so it sums the same K slices
+#: in the same order and every row of a wide call gets the bits that row gets in a one-request
+#: step (``install`` checks this). Among those tactics, the fastest in 62-layer chains of cold
+#: weights; each beats cuBLAS on its site up to 32 rows, except the attention output projection
+#: at 9..16 rows, where cuBLAS is measured slightly faster.
+SM107_TP4_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((16, "splitk:64,16,2,11"), (WIDE_MAX_ROWS, "splitk:64,32,2,9")),
+    "o_proj": ((16, "splitk:64,16,1,10"), (WIDE_MAX_ROWS, "splitk:64,32,1,9")),
+    "pool": ((16, "splitk:64,8,4,11"), (WIDE_MAX_ROWS, "splitk:64,16,4,10")),
+    "unpool": ((16, "splitk:64,16,4,9"), (WIDE_MAX_ROWS, "splitk:64,32,4,8")),
+}
+
+
+def wide_kernels() -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each ``wide_dense_gemms`` site for rows 9..32 (index ``rows - 9``)."""
+    out = {}
+    for site, steps in SM107_TP4_WIDE_KERNELS.items():
+        kernels, first = [], MAX_ROWS + 1
+        for last, kernel in steps:
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        assert len(kernels) == WIDE_MAX_ROWS - MAX_ROWS, steps
+        out[site] = tuple(kernels)
+    return out
+
+
 #: The measured table of each ``(compute capability, TP size)``, with the pooler and
 #: unpooler on the rank's slices (``kernel_steps`` swaps in the replicated tep4 cells).
 KERNELS_BY_SM_TP: Mapping[
@@ -155,6 +213,15 @@ KERNELS_BY_SM_TP: Mapping[
     ((10, 3), 8): DEFAULT_KERNELS,
     ((10, 3), 4): TP4_KERNELS,
     ((10, 7), 8): SM107_KERNELS,
+    ((10, 7), 4): SM107_TP4_KERNELS,
+}
+
+#: The pooler and unpooler cells of each tep4 table on the whole replicated weights.
+TP4_REPLICATED_PROJECTION_KERNELS_BY_SM: Mapping[
+    Tuple[int, int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {
+    (10, 3): TP4_REPLICATED_PROJECTION_KERNELS,
+    (10, 7): SM107_TP4_REPLICATED_PROJECTION_KERNELS,
 }
 
 
@@ -185,8 +252,8 @@ def kernel_steps(
             f"[musespark_open] dense_gemms: no kernel table for SM {key[0]} at TP {key[1]} "
             f"(supported: {sorted(KERNELS_BY_SM_TP)})"
         )
-    if key == ((10, 3), 4) and not sharded:
-        return {**table, **TP4_REPLICATED_PROJECTION_KERNELS}
+    if key[1] == 4 and not sharded:
+        return {**table, **TP4_REPLICATED_PROJECTION_KERNELS_BY_SM[key[0]]}
     return table
 
 
@@ -377,8 +444,12 @@ class DenseGemmPlan:
         prefetch: bool,
         enable_pdl: bool,
         capability: Optional[Tuple[int, int]] = None,
+        wide: Optional[Mapping[str, Tuple[str, ...]]] = None,
     ) -> None:
         self.kernels = dict(kernels)
+        #: ``wide_dense_gemms``: the kernel of a site's 9..32-row calls (``wide[site][rows - 9]``);
+        #: a site it does not name keeps the built-in dispatch at those rows.
+        self.wide = dict(wide or {})
         #: The 9..32-row table (``set_wide_kernels``) and whether the current forward arms it.
         self.wide_kernels: Dict[str, Tuple[str, ...]] = {}
         self.wide_armed = False
@@ -405,14 +476,25 @@ class DenseGemmPlan:
         self.side_stream_is_capture_stream: Optional[bool] = None
 
     def kernel_for(self, role: str, rows: int) -> Optional[str]:
-        """The kernel of a ``rows``-row call at site ``role``, or None where the plan has none:
-        ``kernels`` at 1..8 rows; ``wide_kernels`` at 9..32 rows while ``wide_armed``."""
+        """The kernel of a ``rows``-row call at site ``role``, or None where the plan has none
+        (the built-in dispatch): ``kernels`` at 1..8 rows; at 9..32 rows the construction's
+        ``wide`` table (``wide_dense_gemms``) for the sites it names, else ``wide_kernels``
+        while ``wide_armed`` (``wide_projection_gathers``)."""
         if 1 <= rows <= MAX_ROWS:
             return self.kernels[role][rows - 1]
-        if self.wide_armed and WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+        if not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+            return None
+        wide = self.wide.get(role)
+        if wide is not None:
+            return wide[rows - WIDE_MIN_ROWS]
+        if self.wide_armed:
             wide = self.wide_kernels.get(role)
             return None if wide is None else wide[rows - WIDE_MIN_ROWS]
         return None
+
+    def kernel(self, role: str, rows: int) -> Optional[str]:
+        """``kernel_for``: the kernel of a ``role`` call of ``rows`` rows, or ``None``."""
+        return self.kernel_for(role, rows)
 
     def set_wide_kernels(self, kernels: Mapping[str, Tuple[str, ...]]) -> None:
         """Give sites a kernel per row count 9..32 (``kernels[site][rows - WIDE_MIN_ROWS]``).
@@ -704,7 +786,7 @@ class DenseGemmDispatcher:
                 f"to publish {tuple(publish.shape)} but got {rows} rows x {int(weight.shape[0])}"
             )
         plan = self.site.plan
-        kernel = plan.kernels[self.site.role][rows - 1]
+        kernel = plan.kernel_for(self.site.role, rows)
         if self.fits(input_tensor, weight, bias) and parse_kernel(kernel)[0] in policy.direct:
             dense_gemm(input_tensor.view(-1, k), weight, kernel, plan.enable_pdl, out=publish)
             if (
@@ -809,12 +891,14 @@ def install(
     model: torch.nn.Module,
     prefetch: bool,
     kernels: Optional[Mapping[str, Tuple[str, ...]]] = None,
+    wide: bool = False,
 ) -> DenseGemmPlan:
     """Route every layer's four projections through ``dense_gemm``; return the shared plan.
 
     ``kernels`` is the kernel of each site per row count; when None, the table of the
     device's compute capability (``device_capability``, read once here), the model's TP
-    size and its projection layout (``default_kernels``). Every module is checked
+    size and its projection layout (``default_kernels``). ``wide`` (``wide_dense_gemms``,
+    sm107 tep4 with the sharded projections) adds ``wide_kernels`` for the 9..32-row calls. Every module is checked
     before any is re-classed, so a refusal
     leaves the model as it was. Only the weights' shapes are read, so this runs
     on a model whose weights are still on the meta device.
@@ -844,7 +928,27 @@ def install(
             "(MUSESPARK_OPEN_SHARDED_PROJECTIONS=1); without them the pooler GEMM reads the "
             "whole replicated weight"
         )
-    plan = DenseGemmPlan(kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability)
+    wide_table = {}
+    if wide:
+        if tuple(capability) != (10, 7) or tp_size != 4 or not sharded:
+            raise ValueError(
+                "[musespark_open] wide_dense_gemms is measured for sm107 at TP4 with the sharded "
+                f"pooler and unpooler; got SM {tuple(capability)} at TP{tp_size}, "
+                f"{'sharded' if sharded else 'replicated'} projections"
+            )
+        wide_table = wide_kernels()
+        for role, wide_cells in wide_table.items():
+            family, fields = parse_kernel(kernels[role][MAX_ROWS - 1])
+            for kernel in wide_cells:
+                wide_family, wide_fields = parse_kernel(kernel)
+                if family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]:
+                    raise ValueError(
+                        f"[musespark_open] wide_dense_gemms: {role} kernel {kernel} does not sum "
+                        f"the K slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
+                    )
+    plan = DenseGemmPlan(
+        kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability, wide=wide_table
+    )
 
     layers = list(model.layers)
     planned = []
@@ -877,6 +981,12 @@ def install(
                     raise ValueError(
                         f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
                     )
+            for rows, kernel in enumerate(wide_table.get(role, ()), start=MAX_ROWS + 1):
+                error = kernel_error(kernel, rows, *shape)
+                if error is not None:
+                    raise ValueError(
+                        f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
+                    )
             planned.append((index, role, modules[role], shape, weights))
 
     next_of = {"qkv": "o_proj", "o_proj": "pool"}
@@ -898,4 +1008,13 @@ def install(
         f"{MAX_ROWS} rows by {describe(kernels)}; "
         f"L2 prefetch of the next weight {'on' if prefetch else 'off'}"
     )
+    if wide_table:
+        steps = "; ".join(
+            f"{site}=" + ", ".join(f"{k}@..{last}" for last, k in SM107_TP4_WIDE_KERNELS[site])
+            for site in SM107_TP4_WIDE_KERNELS
+        )
+        logger.info(
+            f"[musespark_open] wide_dense_gemms: calls of {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows by "
+            f"{steps}; each row gets the bits of its {MAX_ROWS}-row kernel"
+        )
     return plan

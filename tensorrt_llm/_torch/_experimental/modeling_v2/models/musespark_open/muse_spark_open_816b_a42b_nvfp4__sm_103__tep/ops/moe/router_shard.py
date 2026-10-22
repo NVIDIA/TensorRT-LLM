@@ -491,3 +491,181 @@ class RouterShardPublish(OpWrapper):
 
 
 router_shard_publish = RouterShardPublish()
+
+
+#: ``router_shard_wide`` (``wide_prologue``): the rows a call may carry, and the fewest. The
+#: built-in router takes its tensor-core launch from 16 rows up to 128; the wide prologue
+#: serves TP4 decode steps of two to four requests (16..32 rows at K=7).
+WIDE_MIN_ROWS = 16
+WIDE_MAX_ROWS = 32
+#: The built-in tensor-core launch's tiles: 16 tokens x 32 experts per program, the
+#: 8192-wide dot split into 16 programs of 512, 4 warps (``_router_tensorcore_kernel``).
+WIDE_TOKENS_PER_TILE = 16
+WIDE_EXPERTS_PER_TILE = 32
+WIDE_SPLITS = 16
+
+
+#: ``router_shard_wide`` launches the built-in ``_router_tensorcore_kernel``'s statements over
+#: the rank's ``L`` experts: the same tile, loads and ``tl.dot`` (TF32x3) per program, so
+#: each program's partial is the built-in program's for the same 32 experts; only the
+#: weight rows it is given and the partials' row stride (``L`` instead of 256) differ.
+@triton.jit
+def _router_shard_wide_kernel(
+    hidden_states,
+    weight,
+    partials,
+    TOKENS: tl.constexpr,
+    EXPERTS: tl.constexpr,
+):
+    tokens = tl.program_id(0) * 16 + tl.arange(0, 16)
+    experts = tl.program_id(1) * 32 + tl.arange(0, 32)
+    split = tl.program_id(2)
+    acc = tl.zeros((16, 32), tl.float32)
+    for block in range(4):
+        hidden = split * 512 + block * 128 + tl.arange(0, 128)
+        x = tl.load(
+            hidden_states + tokens[:, None] * 8192 + hidden[None, :],
+            tokens[:, None] < TOKENS,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(weight + experts[None, :] * 8192 + hidden[:, None])
+        acc = tl.dot(x, w, acc, input_precision="tf32x3")
+    tl.store(
+        partials + split * TOKENS * EXPERTS + tokens[:, None] * EXPERTS + experts[None, :],
+        acc,
+        tokens[:, None] < TOKENS,
+    )
+
+
+#: The built-in ``_router_tensorcore_reduce_kernel``'s statements: the 16 partials of an
+#: element summed by one ``tl.sum`` over a ``[16, 128]`` tile at 4 warps, then scaled.
+@triton.jit
+def _router_shard_wide_reduce_kernel(partials, output, scale, SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * 128 + tl.arange(0, 128)
+    splits = tl.arange(0, 16)
+    values = tl.load(
+        partials + splits[:, None] * SIZE + offsets[None, :],
+        offsets[None, :] < SIZE,
+        other=0.0,
+    )
+    tl.store(output + offsets, tl.sum(values, axis=0) * scale, offsets < SIZE)
+
+
+class RouterShardWide(OpWrapper):
+    """The rank's ``L`` router logit columns of a 16..32-row step, the built-in tensor-core bits.
+
+    At 16..128 rows the built-in ``MuseSparkOpenMoE.router_logits`` runs
+    ``_router_tensorcore_kernel`` (TF32x3, ``(cdiv(M, 16), 8, 16)`` programs of 16
+    tokens x 32 experts x 512 hidden) and a reduce of its 16 partials, reading the
+    whole 8 MiB weight on every rank. This entry launches the same two kernels'
+    statements over this rank's ``L`` experts only (``(cdiv(M, 16), L / 32, 16)``
+    programs on ``weight[L r : L r + L]``): every program is the built-in program of
+    those 32 experts, and every logit's 16 partials are summed by the same reduction,
+    so each logit is the built-in one bit for bit, from a quarter of the weight at EP4.
+
+    A plain launch (no programmatic dependent launch) into the caller's ``out``,
+    for a side stream forked from the producer of ``hidden_states`` (``router_fork``).
+
+    Args:
+        hidden_states: ``[M, 8192]`` BF16, contiguous, ``16 <= M <= 32``.
+        weight: the full router weight ``[256, 8192]`` FP32, contiguous.
+        rank: the expert-parallel rank ``r``; columns ``[L r, L r + L)`` are computed.
+        scale: the metap multiplier, a Python float (applied in FP32 after the sum).
+        out: ``[M, L]`` FP32, contiguous, on the input's device; overwritten.
+        ranks: the expert-parallel group size (4 or 8); ``L = local_experts(ranks)``.
+
+    Returns:
+        ``out``.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    note = """
+    The claim the test proves is equality with the built-in router's columns
+    ``L r .. L r + L - 1`` at every row count 16..32, for every rank, at EP4 and EP8,
+    eagerly and through a CUDA-graph replay on a forked side stream; the cells
+    additionally gate the op against the float64 reference.
+    """
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> torch.Tensor:
+        tokens = hidden_states.shape[0]
+        local = local_experts(ranks)
+        first = rank * local
+        partials = torch.empty(
+            (WIDE_SPLITS, tokens, local), device=hidden_states.device, dtype=torch.float32
+        )
+        _router_shard_wide_kernel[
+            (triton.cdiv(tokens, WIDE_TOKENS_PER_TILE), local // WIDE_EXPERTS_PER_TILE, WIDE_SPLITS)
+        ](
+            hidden_states,
+            weight[first : first + local],
+            partials,
+            TOKENS=tokens,
+            EXPERTS=local,
+            num_warps=4,
+        )
+        _router_shard_wide_reduce_kernel[(triton.cdiv(tokens * local, 128),)](
+            partials,
+            out,
+            scale,
+            SIZE=tokens * local,
+            num_warps=4,
+        )
+        return out
+
+    def reference(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> torch.Tensor:
+        """``RouterShard.reference``: the float64 product, the multiplier on the FP32 sum.
+
+        ``out`` does not change the values."""
+        del out
+        return router_shard.reference(hidden_states, weight, rank, scale, 16, ranks=ranks)
+
+    def is_valid(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> None:
+        """Dense row-major operands; 16..32 rows (the built-in's tensor-core launch range)."""
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
+            raise ValueError(f"hidden_states must be 2-D BF16, got {hidden_states.dtype}")
+        if not hidden_states.is_contiguous() or hidden_states.shape[1] != HIDDEN:
+            raise ValueError(f"hidden_states must be contiguous [M, {HIDDEN}]")
+        rows = hidden_states.shape[0]
+        if not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+            raise ValueError(f"{WIDE_MIN_ROWS}..{WIDE_MAX_ROWS} rows, got {rows}")
+        if weight.dtype != torch.float32 or tuple(weight.shape) != (EXPERTS, HIDDEN):
+            raise ValueError(f"weight must be FP32 [{EXPERTS}, {HIDDEN}]")
+        if not weight.is_contiguous():
+            raise ValueError("weight must be contiguous")
+        if ranks not in RANK_COUNTS:
+            raise ValueError(f"ranks must be one of {RANK_COUNTS}, got {ranks}")
+        if not 0 <= rank < ranks:
+            raise ValueError(f"rank must be in [0, {ranks}), got {rank}")
+        local = local_experts(ranks)
+        if out.dtype != torch.float32 or tuple(out.shape) != (rows, local):
+            raise ValueError(f"out must be FP32 [{rows}, {local}]")
+        if not out.is_contiguous() or out.device != hidden_states.device:
+            raise ValueError("out must be contiguous, on the input's device")
+
+
+router_shard_wide = RouterShardWide()

@@ -15,11 +15,12 @@ behind the built-in ``MUSESPARK_OPEN_BF16X3_ROUTER`` option) and sums its split-
 partials with the multiplier folded in. The GEMM computes ``W X^T`` on tcgen05: the
 256 experts are the MMA's M dimension (two tiles of 128), the call's rows its N
 dimension (one tile of the next power of two of up to 128 rows, then 128-row
-tiles), so the weight is streamed once per 128 rows. A call of ``t`` row tiles runs
-``splits(rows) = CTAS // (2 * t)`` K splits -- 76, 38, 25, 19 -- so that its
-``2 * t * splits`` CTAs fill the GPU's SMs in one wave; each CTA owns every
-``splits``-th K tile of 64. It splits each FP32 weight it loads into three BF16
-terms, ``w = w0 + w1 + w2`` -- exact for every FP32 value of normal magnitude --
+tiles), so the weight is streamed once per 128 rows. A call of ``t`` row tiles on a
+device of ``S`` SMs runs ``splits(rows) = S // (2 * t)`` K splits -- 76, 38, 25, 19
+on GB300's 152 SMs, 106, 53, 35, 26 on R200's 212 -- so that its ``2 * t * splits``
+CTAs fill the GPU's SMs in one wave; each CTA owns every ``splits``-th K tile of 64.
+It splits each FP32 weight it loads into three BF16 terms, ``w = w0 + w1 + w2`` --
+exact for every FP32 value of normal magnitude --
 and a BF16 row times a BF16 term is exact in FP32, so the only rounding is the FP32
 accumulation on the tensor cores (``w0`` products into one accumulator, ``w1`` and
 ``w2`` into a second, added at the end of the CTA). It stores its ``[rows, 128]``
@@ -30,7 +31,8 @@ Values. Not the built-in kernels' bits: a budgeted entry. A logit's arithmetic
 depends on its row, the weight and the call's number of 128-row tiles only, so a
 row's logits do not depend on the call's other rows, and a call is deterministic.
 Its error against the exact product is the FP32 accumulation's alone, and grows
-with the K tiles each split accumulates (2 at 76 splits, 7 at 19); the built-in
+with the K tiles each split accumulates (2 at 76 splits, 7 at 19); a logit's bits
+also depend on the device's SM count, which sets the split count; the built-in
 TF32x3 kernel also rounds every weight to 22 bits, the TF32 ``Linear`` to 11.
 
 Programmatic dependent launch: the GEMM waits (``griddepcontrol.wait``) before its
@@ -39,6 +41,9 @@ before reading the partials and releases its dependents.
 """
 
 from __future__ import annotations
+
+import functools
+from typing import Optional
 
 import torch
 import triton
@@ -53,8 +58,8 @@ HIDDEN = 8192
 #: last accepted token and 7 drafts, the router shard's) up to 64 requests.
 MIN_ROWS = 9
 MAX_ROWS = 512
-#: The GEMM's CTAs per call: one per SM of a GB300 (152), so one wave.
-CTAS = 152
+#: GB300's SM count (sm_103).
+GB300_SMS = 152
 #: The GEMM's expert tiles (M) and row tiles (N) of 128.
 EXPERT_TILES = EXPERTS // 128
 ROW_TILE = 128
@@ -67,9 +72,22 @@ def row_tile(rows: int) -> int:
     return min(max(triton.next_power_of_2(rows), 8), ROW_TILE)
 
 
-def splits(rows: int) -> int:
-    """The K splits of a call of ``rows`` rows: 76, 38, 25, 19 for 1, 2, 3, 4 row tiles."""
-    return CTAS // (EXPERT_TILES * triton.cdiv(rows, ROW_TILE))
+@functools.lru_cache(maxsize=None)
+def _sms_of(device: int) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def device_sms() -> int:
+    """The SM count of the current CUDA device: the GEMM's CTAs per call (one wave)."""
+    return _sms_of(torch.cuda.current_device())
+
+
+def splits(rows: int, sms: Optional[int] = None) -> int:
+    """The K splits of a call of ``rows`` rows on a device of ``sms`` SMs (default: the
+    current device's): one CTA per SM over the call's ``2 * t`` output tiles -- 76, 38,
+    25, 19 for 1, 2, 3, 4 row tiles on 152 SMs, 106, 53, 35, 26 on 212."""
+    sms = device_sms() if sms is None else sms
+    return sms // (EXPERT_TILES * triton.cdiv(rows, ROW_TILE))
 
 
 def _gemm(tile: int):
@@ -114,7 +132,7 @@ class RouterGemm(OpWrapper):
         ``[M, 256]`` FP32 logits, newly allocated.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Budgeted, not bitwise: the test gates every cell against the float64 product
@@ -129,7 +147,7 @@ class RouterGemm(OpWrapper):
         self, hidden_states: torch.Tensor, weight: torch.Tensor, scale: float
     ) -> torch.Tensor:
         rows = hidden_states.shape[0]
-        split_count = splits(rows)
+        split_count = splits(rows, _sms_of(hidden_states.device.index))
         partials = torch.empty(
             (split_count, rows, EXPERTS), device=hidden_states.device, dtype=torch.float32
         )

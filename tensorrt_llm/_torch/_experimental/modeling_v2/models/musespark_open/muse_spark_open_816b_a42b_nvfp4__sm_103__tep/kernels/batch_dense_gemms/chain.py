@@ -82,14 +82,14 @@ The prep issues the prefetch after its own wait and still releases its dependent
 (the FMHA) only at its end; the prefetch reads only the immutable weight, writes
 nothing (its keep-alive store is never taken) and waits on nothing.
 
-LL safety: armed only on decode forwards of 33..512 rows at sm103 TEP4; the 8-row
-paths and the 9..32-row band never see it.
+LL safety: armed only on decode forwards of 33..512 rows at TEP4 (sm103 and sm107); the
+8-row paths and the 9..32-row band never see it.
 """
 
 from __future__ import annotations
 
 import contextlib
-from typing import Callable, Dict, FrozenSet, Iterator, Optional, Sequence
+from typing import Callable, Dict, FrozenSet, Iterator, Optional, Sequence, Tuple
 
 import torch
 
@@ -124,9 +124,18 @@ PREP_PREFETCH_MIN_ROWS = 33
 PREP_PREFETCH_MAX_ROWS = 64
 #: Decode-step row counts at which the QKV projection runs flashinfer's TGV GEMM: those of
 #: the captured decode graphs where cuBLAS's pick does not split K (same bits) and is slower
-#: than the TGV tactic below. At 176 and 208 rows cuBLAS picks a faster kernel and keeps
-#: the call; at 40, 48 and 80 rows it splits K.
+#: than the TGV tactic below, measured per device against that device's cuBLAS picks. On
+#: GB300 (sm_103) at 176 and 208 rows cuBLAS picks a faster kernel and keeps the call; at
+#: 40, 48 and 80 rows it splits K.
 QKV_TGV_ROWS = frozenset({144, 160, 192, 224, 240, 256})
+#: The same table on R200 (sm_107): empty. There cuBLAS's QKV pick does not split K from 136
+#: rows (every TGV tactic gives its bits), but it is faster than every TGV tactic at every
+#: captured row count of 40..512; below 136 rows
+#: no TGV tactic gives its bits. So at sm_107 the path keeps the built-in QKV GEMM and serves
+#: only the PDL norm-gates.
+QKV_TGV_ROWS_SM107 = frozenset()
+#: The table per device compute capability; any other device keeps the built-in QKV GEMM.
+QKV_TGV_ROWS_BY_CAPABILITY = {(10, 3): QKV_TGV_ROWS, (10, 7): QKV_TGV_ROWS_SM107}
 #: The TGV tactic of the table, as flashinfer's ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` lists it:
 #: (CTA M, CTA N, A/B stages, 2-CTA MMA) = a 64 x 128 tile, 7 stages, 2-CTA.
 QKV_TGV_CONFIG = (64, 128, 7, True)
@@ -370,20 +379,27 @@ def check(model: torch.nn.Module, plan) -> None:
             )
 
 
-def install(model: torch.nn.Module, plan) -> BatchDenseGemms:
+def install(
+    model: torch.nn.Module, plan, capability: Optional[Tuple[int, int]] = None
+) -> BatchDenseGemms:
     """Hand every attention the switch; return it.
 
-    Every layer is checked before anything changes (``check``). The QKV table stays empty when
-    flashinfer's TGV tactic table does not hold ``QKV_TGV_CONFIG``.
+    Every layer is checked before anything changes (``check``). The QKV table is the one of
+    the device's ``capability`` (``QKV_TGV_ROWS_BY_CAPABILITY``; default: the current
+    device's); it stays empty on another device or when flashinfer's TGV tactic table does not
+    hold ``QKV_TGV_CONFIG``.
     """
     check(model, plan)
+    if capability is None and torch.cuda.is_available():
+        capability = tuple(torch.cuda.get_device_capability())
+    rows = QKV_TGV_ROWS_BY_CAPABILITY.get(capability, frozenset())
     tactic = tgv_tactic()
     if tactic is None and run_tgv_cute_ext is not None:
         logger.warning(
             f"[musespark_open] batch_dense_gemms: flashinfer's TGV tactic table holds no "
             f"{QKV_TGV_CONFIG}; the QKV projections keep the built-in GEMM"
         )
-    switch = BatchDenseGemms(plan, QKV_TGV_ROWS, tactic)
+    switch = BatchDenseGemms(plan, rows, tactic)
     for layer in model.layers:
         layer.self_attn._batch_dense_gemms = switch
     prefetching = sum(
