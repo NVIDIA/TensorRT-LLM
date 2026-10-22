@@ -1176,6 +1176,8 @@ class TestLogsprobsInBatchedSampling:
         *,
         seq_slots: list[int],
         draft_lens: list[int],
+        max_new_tokens: int | None = None,
+        is_streaming: bool = False,
     ) -> ScheduledRequests:
         """Build a batch of test requests consumable by sample_async."""
         with torch.inference_mode(True):
@@ -1188,11 +1190,11 @@ class TestLogsprobsInBatchedSampling:
             scheduled_requests.generation_requests = [
                 LlmRequest(
                     request_id=seq_slot,
-                    max_new_tokens=draft_len,
+                    max_new_tokens=draft_len if max_new_tokens is None else max_new_tokens,
                     input_tokens=[],  # not used by tested code
                     sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                     seq_slot=seq_slot,
-                    is_streaming=False,  # not relevant for tested code
+                    is_streaming=is_streaming,
                     draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
                         torch.testing.make_tensor(
                             (draft_len,),
@@ -1511,6 +1513,29 @@ class TestLogsprobsInBatchedSampling:
             model_outputs=model_outputs,
             sampler=sampler,
         )
+
+        requests = mock_requests.all_requests()
+        if len(requests) == 1 and requests[0].py_beam_width > 1 and requests[0].py_return_log_probs:
+            # Keep the request active so logprobs come from the step store rather
+            # than beam-history finalization, which supplies its own token IDs.
+            request = requests[0]
+            active_requests = self._build_mock_requests(
+                sampling_params_list,
+                seq_slots=[request.py_seq_slot],
+                draft_lens=[0],
+                max_new_tokens=2,
+                is_streaming=True,
+            )
+            sampler.store.log_probs_store.sampled_log_prob_indices[request.py_seq_slot].fill_(-1)
+            sampler.setup_sampler_step(active_requests)
+            active_state = sampler.sample_async(
+                active_requests, model_outputs, num_context_logits_prefix_sum=[0]
+            )
+            sampler.update_requests(active_state)
+            assert active_requests.all_requests()[0].state == LlmRequestState.GENERATION_IN_PROGRESS
+            self._validate_logprobs(
+                mock_requests=active_requests, model_outputs=model_outputs, sampler=sampler
+            )
 
 
 def test_selected_raw_logprobs():
