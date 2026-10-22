@@ -482,6 +482,41 @@ def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("shared_draft", [False, True])
+def test_p128_target_fails_fast_only_with_a_shared_draft_layer(monkeypatch, shared_draft):
+    """On SM107 a BF16 target's dense layers keep SDPA, so a missing FlashInfer route only
+    fails setup when a shared draft layer needs it."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
+        lambda: 107,
+    )
+    monkeypatch.setattr(
+        FlashInferTrtllmGenFmha, "is_environment_available", classmethod(lambda cls: True)
+    )
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-flashinfer_trtllm_gen")
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "_prepare_page_table_tensor",
+        lambda self, capacity: setattr(self, "_use_per_layer_page_tables", True),
+    )
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = DataType.HALF
+    manager.is_draft = False
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = 128
+    manager._dense_native_layer_ids = (0, 1, 2)
+    manager._shared_draft_layer_ids = [60] if shared_draft else []
+    manager.layer_offsets = {0: 0, 1: 1, 2: 2, **({60: 3} if shared_draft else {})}
+
+    if shared_draft:
+        with pytest.raises(RuntimeError, match="TLLM_FMHA_LIBS excludes it"):
+            manager._prepare_page_table_tensor(8)
+    else:
+        manager._prepare_page_table_tensor(8)
+        assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("via_accessor", [False, True])
 def test_draft_kv_cache_view_rejects_multiple_local_layers(via_accessor: bool) -> None:
     """The single-pool view must reject a second layer before publishing wrong pointers."""

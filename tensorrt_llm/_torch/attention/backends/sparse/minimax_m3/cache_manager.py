@@ -592,7 +592,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # here rather than in the global allowlist. On SM107 this opt-in is the
         # only route for these layers: FallbackFmha has no P128 paged-context kernels.
         if self.tokens_per_block == 128:
-            _require_trtllm_gen_extra_page_route(128)
+            # On SM107 the dense layers keep SDPA (see the model's native dense attention
+            # setup), so only the shared draft layers need the route there.
+            if any(i in self.layer_offsets for i in self._shared_draft_layer_ids):
+                _require_trtllm_gen_extra_page_route(128)
             self.trtllm_gen_extra_tokens_per_block = frozenset({128})
         if self._use_per_layer_page_tables:
             # Per-layer page tables already give every layer its own pool.
