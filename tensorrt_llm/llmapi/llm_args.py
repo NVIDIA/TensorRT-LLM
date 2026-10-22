@@ -1724,6 +1724,35 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
             layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")))
 
 
+class GlmKpoolSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Use checkpoint-owned GLM-5.3-Flash k-pool indexer geometry with the PyTorch sparse-MLA backend.
+
+    The indexer top-k, pool size and key width come from the checkpoint.
+    """
+    algorithm: Literal["glm_kpool"] = "glm_kpool"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import \
+            GlmKpoolSparseParams
+        from tensorrt_llm._torch.pyexecutor.config_utils import \
+            unwrap_glm5_next_text_config
+
+        pretrained_config = kwargs.get("pretrained_config")
+        if pretrained_config is None:
+            return GlmKpoolSparseParams()
+        config = unwrap_glm5_next_text_config(pretrained_config)
+        return GlmKpoolSparseParams(
+            index_topk=int(config.index_topk),
+            index_kpool=int(config.index_kpool),
+            index_always_select_tail=bool(
+                config.index_kpool_always_select_tail),
+            index_head_dim=int(config.index_head_dim),
+        )
+
+
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = Field(default="skip_softmax")
@@ -4421,6 +4450,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
         CSA2SparseAttentionConfig,
+        GlmKpoolSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
     ],

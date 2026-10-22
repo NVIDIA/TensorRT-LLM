@@ -753,6 +753,31 @@ def test_cache_manager_routing_guards(route, monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_glm_kpool_sparse_config_lowers_the_checkpoint_geometry():
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
+        GlmKpoolSparseAttention,
+        GlmKpoolSparseParams,
+    )
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+    from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
+    from tensorrt_llm.llmapi.llm_args import GlmKpoolSparseAttentionConfig
+
+    pretrained = _config()
+    text = unwrap_glm5_next_text_config(pretrained)
+    sparse = GlmKpoolSparseAttentionConfig()
+    params = sparse.to_sparse_params(pretrained_config=pretrained)
+    assert params == GlmKpoolSparseParams(
+        index_topk=text.index_topk,
+        index_kpool=text.index_kpool,
+        index_always_select_tail=text.index_kpool_always_select_tail,
+        index_head_dim=text.index_head_dim,
+    )
+    assert sparse.to_sparse_params(pretrained_config=text) == params
+    assert sparse.supports_backend("pytorch") and not sparse.supports_backend("tensorrt")
+    assert get_attention_backend("TRTLLM", sparse_params=params) is GlmKpoolSparseAttention
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8_kv_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
 @pytest.mark.parametrize(
     "verify_kernel", [None, True, False], ids=["no-mtp", "fused-mtp", "sequential-mtp"]

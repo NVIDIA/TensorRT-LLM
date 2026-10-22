@@ -1380,6 +1380,7 @@
         "csa2",
         "dsa",
         "deepseek_v4",
+        "glm_kpool",
         "minimax_m3",
         "qsa",
         "rocket",

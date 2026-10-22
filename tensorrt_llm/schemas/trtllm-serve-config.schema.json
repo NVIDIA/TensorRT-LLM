@@ -2619,6 +2619,20 @@
       "title": "EncodeExtraInputSpec",
       "type": "object"
     },
+    "GlmKpoolSparseAttentionConfig": {
+      "additionalProperties": false,
+      "description": "Use checkpoint-owned GLM-5.3-Flash k-pool indexer geometry with the PyTorch sparse-MLA backend.\n\nThe indexer top-k, pool size and key width come from the checkpoint.",
+      "properties": {
+        "algorithm": {
+          "const": "glm_kpool",
+          "default": "glm_kpool",
+          "title": "Algorithm",
+          "type": "string"
+        }
+      },
+      "title": "GlmKpoolSparseAttentionConfig",
+      "type": "object"
+    },
     "GmsConfig": {
       "additionalProperties": false,
       "description": "Prototype configuration for GPU Memory Service (GMS) weight sharing.\n\nComposes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:\nGMS controls *where* weights live (a node-shared GPU memory pool\nso multiple TRT-LLM instances zero-copy share the same bytes),\nwhile ``checkpoint_format`` controls *how* they get there (HF disk,\nMX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==\nLoadFormat.GMS``; setting any non-default field here without that\nload_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.\n\nTwo roles are decided at connect time by the GMS daemon, not by\nconfig:\n\n- **RW (writer)**: the first instance loads weights into the pool\n  via the normal checkpoint-loader pipeline, then commits them.\n- **RO (reader)**: subsequent instances zero-copy materialize the\n  already-committed layout \u2014 no disk I/O, no per-instance copies.\n\nSee :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`\nfor the integration adapter and the ``LoadFormat.GMS`` branch in\n``ModelLoader.load`` for orchestration.",
@@ -7526,6 +7540,7 @@
               "csa2": "#/$defs/CSA2SparseAttentionConfig",
               "deepseek_v4": "#/$defs/DeepSeekV4SparseAttentionConfig",
               "dsa": "#/$defs/DeepSeekSparseAttentionConfig",
+              "glm_kpool": "#/$defs/GlmKpoolSparseAttentionConfig",
               "minimax_m3": "#/$defs/MiniMaxM3SparseAttentionConfig",
               "qsa": "#/$defs/QSASparseAttentionConfig",
               "rocket": "#/$defs/RocketSparseAttentionConfig",
@@ -7548,6 +7563,9 @@
             },
             {
               "$ref": "#/$defs/CSA2SparseAttentionConfig"
+            },
+            {
+              "$ref": "#/$defs/GlmKpoolSparseAttentionConfig"
             },
             {
               "$ref": "#/$defs/SkipSoftmaxAttentionConfig"

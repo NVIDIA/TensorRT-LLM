@@ -2908,6 +2908,7 @@
                   "csa2": "#/$defs/CSA2SparseAttentionConfig",
                   "deepseek_v4": "#/$defs/DeepSeekV4SparseAttentionConfig",
                   "dsa": "#/$defs/DeepSeekSparseAttentionConfig",
+                  "glm_kpool": "#/$defs/GlmKpoolSparseAttentionConfig",
                   "minimax_m3": "#/$defs/MiniMaxM3SparseAttentionConfig",
                   "qsa": "#/$defs/QSASparseAttentionConfig",
                   "rocket": "#/$defs/RocketSparseAttentionConfig",
@@ -2930,6 +2931,9 @@
                 },
                 {
                   "$ref": "#/$defs/CSA2SparseAttentionConfig"
+                },
+                {
+                  "$ref": "#/$defs/GlmKpoolSparseAttentionConfig"
                 },
                 {
                   "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
@@ -4167,6 +4171,20 @@
         "dtype"
       ],
       "title": "EncodeExtraInputSpec",
+      "type": "object"
+    },
+    "GlmKpoolSparseAttentionConfig": {
+      "additionalProperties": false,
+      "description": "Use checkpoint-owned GLM-5.3-Flash k-pool indexer geometry with the PyTorch sparse-MLA backend.\n\nThe indexer top-k, pool size and key width come from the checkpoint.",
+      "properties": {
+        "algorithm": {
+          "const": "glm_kpool",
+          "default": "glm_kpool",
+          "title": "Algorithm",
+          "type": "string"
+        }
+      },
+      "title": "GlmKpoolSparseAttentionConfig",
       "type": "object"
     },
     "GmsConfig": {
@@ -9246,6 +9264,7 @@
               "csa2": "#/$defs/CSA2SparseAttentionConfig",
               "deepseek_v4": "#/$defs/DeepSeekV4SparseAttentionConfig",
               "dsa": "#/$defs/DeepSeekSparseAttentionConfig",
+              "glm_kpool": "#/$defs/GlmKpoolSparseAttentionConfig",
               "minimax_m3": "#/$defs/MiniMaxM3SparseAttentionConfig",
               "qsa": "#/$defs/QSASparseAttentionConfig",
               "rocket": "#/$defs/RocketSparseAttentionConfig",
@@ -9268,6 +9287,9 @@
             },
             {
               "$ref": "#/$defs/CSA2SparseAttentionConfig"
+            },
+            {
+              "$ref": "#/$defs/GlmKpoolSparseAttentionConfig"
             },
             {
               "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
