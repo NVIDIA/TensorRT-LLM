@@ -550,9 +550,9 @@ def kda_mtp_replay_num_spec(num_spec: int) -> Optional[int]:
 # Fused CUDA MTP verify kernel (trtllm::kimi_k3_kda_mtp_verify).
 # ---------------------------------------------------------------------------
 
-# (heads per rank, num_spec) the kernel takes: attention-DP ranks (96 heads) with 3 or 5 drafts, TP8 ranks (12 heads)
-# with 3 drafts. TP8 with 5 drafts stays on the CuTe DSL kernels (no measurable gain).
-_CUDA_VERIFY_ROUTES = frozenset({(96, 3), (96, 5), (12, 3)})
+# (heads per rank, num_spec) the kernel takes: attention-DP ranks (96 heads) with 3 or 5 drafts. TP8 ranks (12 heads)
+# stay on the CuTe DSL kernels, which are as fast there when launched with PDL.
+_CUDA_VERIFY_ROUTES = frozenset({(96, 3), (96, 5)})
 # The Kimi K3 constants the kernel bakes in.
 _CUDA_LOWER_BOUND = -5.0
 _CUDA_SCALE = 128**-0.5
