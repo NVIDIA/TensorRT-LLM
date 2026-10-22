@@ -366,7 +366,7 @@ def _write_sites():
     groups = [
         ("runner", DecoderRunner._prepare_tp_inputs, "copy", 7),
         ("trtllm", TrtllmAttentionMetadata.prepare, "copy", 2),
-        ("trtllm", TrtllmAttentionMetadata.prepare, "block_offsets", 1),
+        ("trtllm", TrtllmAttentionMetadata.prepare, "block_offsets", 2),
         ("dflash", DFlashSpecMetadata.prepare, "copy", 2),
         ("interface", SpecMetadata._populate_request_rng_state, "copy", 1),
     ]

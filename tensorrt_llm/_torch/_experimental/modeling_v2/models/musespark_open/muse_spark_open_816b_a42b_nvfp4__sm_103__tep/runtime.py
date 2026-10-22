@@ -524,10 +524,6 @@ class StepInputStaging:
                 or type(attn_metadata).prepare is not TrtllmAttentionMetadata.prepare,
                 "attention metadata type",
             ),
-            (
-                getattr(attn_metadata, "draft_kv_cache_manager", None) is not None,
-                "draft KV cache manager",
-            ),
             (runner.guided_decoder is not None, "guided decoding"),
             (cfg.use_mrope, "mrope"),
             (cfg.enable_attention_dp, "attention DP"),

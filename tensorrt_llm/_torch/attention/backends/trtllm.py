@@ -1115,14 +1115,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
-                # Use the wrapper method which works for both V1 and V2
-                self.draft_kv_cache_manager.copy_batch_block_offsets(
-                    self.draft_kv_cache_block_offsets,
-                    self.request_ids,
-                    self.beam_width,
-                    self.num_contexts,
-                    self.num_seqs,
-                    max_blocks=max_blocks)
+                if stager is None or not stager.block_offsets(
+                        self.draft_kv_cache_manager,
+                        self.draft_kv_cache_block_offsets, self.request_ids,
+                        self.beam_width, self.num_contexts, self.num_seqs):
+                    # Use the wrapper method which works for both V1 and V2
+                    self.draft_kv_cache_manager.copy_batch_block_offsets(
+                        self.draft_kv_cache_block_offsets,
+                        self.request_ids,
+                        self.beam_width,
+                        self.num_contexts,
+                        self.num_seqs,
+                        max_blocks=max_blocks)
 
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
