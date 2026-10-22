@@ -936,8 +936,10 @@ class PyExecutor:
         torch.cuda.current_stream().wait_stream(self.execution_stream)
         if self._executor_events is not None:
             # The model's actions after warmup and graph capture, on every rank
-            # (some are collective, so every rank reaches this point).
-            self._executor_events.after_warmup()
+            # (some are collective, so every rank reaches this point, and a
+            # rank-local failure arms the rank-crash watchdog).
+            with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                self._executor_events.after_warmup()
         self.encoder_launch_executor = (ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="encoder-launch")
                                         if self.is_encoder_decoder else None)
