@@ -13,9 +13,6 @@
 # behind a fixed address is the difference between a restart being invisible
 # and a restart ending the session. Use --no-gateway when a single short-lived
 # server is all you need.
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 set -uo pipefail
 
 usage() {
@@ -126,67 +123,16 @@ if [[ "${MODE}" == "agg" ]]; then
     start_server server "${PORT}" || exit 1
     SERVER_URL="http://${HOSTNAME_FQDN}:${PORT}"
 else
-    WORKER_CONFIG=""
-    FILTERED_SERVE_ARGS=()
-    for ((i=0; i<${#EXTRA_SERVE_ARGS[@]}; i++)); do
-        case "${EXTRA_SERVE_ARGS[i]}" in
-            --config|--extra_llm_api_options)
-                (( i + 1 < ${#EXTRA_SERVE_ARGS[@]} )) || { echo "Missing worker config path" >&2; exit 1; }
-                i=$((i + 1))
-                WORKER_CONFIG="${EXTRA_SERVE_ARGS[i]}" ;;
-            --config=*|--extra_llm_api_options=*)
-                WORKER_CONFIG="${EXTRA_SERVE_ARGS[i]#*=}" ;;
-            *) FILTERED_SERVE_ARGS+=("${EXTRA_SERVE_ARGS[i]}") ;;
-        esac
-    done
-    EXTRA_SERVE_ARGS=("${FILTERED_SERVE_ARGS[@]}")
-    INTERNAL_REQUEST_AUTH_KEY=$(python3 - "${WORKER_CONFIG}" "${RUN_DIR}/worker.yaml" <<'PYCONFIG'
-import os
-import secrets
-import sys
-import yaml
-
-config = {}
-if sys.argv[1]:
-    with open(sys.argv[1]) as stream:
-        config = yaml.safe_load(stream) or {}
-key = config.get("internal_request_auth_key")
-if key is None:
-    key = secrets.token_hex(32)
-if not isinstance(key, str) or not key:
-    raise ValueError("internal_request_auth_key must be a non-empty string")
-config["internal_request_auth_key"] = key
-fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-with os.fdopen(fd, "w") as stream:
-    os.fchmod(stream.fileno(), 0o600)
-    stream.truncate(0)
-    yaml.safe_dump(config, stream)
-# Emit a YAML scalar so quotes and backslashes in an explicit secret are preserved.
-import json
-print(json.dumps(key))
-PYCONFIG
-    ) || exit 1
-    # Restrict an existing proxy config before the heredoc writes its secret.
-    python3 - "${RUN_DIR}/disagg.yaml" <<'PYCONFIG' || exit 1
-import os
-import sys
-fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-try:
-    os.fchmod(fd, 0o600)
-finally:
-    os.close(fd)
-PYCONFIG
     # Both workers hold a full copy of the weights, so a single-GPU box cannot
     # run this mode; CUDA_VISIBLE_DEVICES splits them across two devices.
-    CUDA_VISIBLE_DEVICES="${CTX_GPU:-0}" start_server ctx "${CTX_PORT}" --config "${RUN_DIR}/worker.yaml" || exit 1
-    CUDA_VISIBLE_DEVICES="${GEN_GPU:-1}" start_server gen "${GEN_PORT}" --config "${RUN_DIR}/worker.yaml" || exit 1
+    CUDA_VISIBLE_DEVICES="${CTX_GPU:-0}" start_server ctx "${CTX_PORT}" || exit 1
+    CUDA_VISIBLE_DEVICES="${GEN_GPU:-1}" start_server gen "${GEN_PORT}" || exit 1
 
     cat > "${RUN_DIR}/disagg.yaml" <<EOF
 hostname: 0.0.0.0
 port: ${PORT}
 model: ${MODEL}
 backend: "pytorch"
-internal_request_auth_key: ${INTERNAL_REQUEST_AUTH_KEY}
 context_servers:
   num_instances: 1
   urls: ["127.0.0.1:${CTX_PORT}"]

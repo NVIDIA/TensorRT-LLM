@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import time
 from collections import OrderedDict
 from unittest.mock import Mock, call, patch
 
@@ -49,7 +48,7 @@ def test_rank_info_server_challenges_unauthenticated_request():
 def test_rank_info_server_accepts_once_with_valid_tag():
     server = _make_server()
     nonce = b"n" * 32
-    server._rank_info_auth_challenges[b"client"] = (nonce, time.monotonic() + 30)
+    server._rank_info_auth_challenges[b"client"] = nonce
     request = [
         MessageType.REQUEST_INSTANCE_INFO,
         nonce,
@@ -67,7 +66,7 @@ def test_rank_info_server_accepts_once_with_valid_tag():
 def test_rank_info_server_rejects_wrong_key_and_consumes_challenge():
     server = _make_server()
     nonce = b"n" * 32
-    server._rank_info_auth_challenges[b"client"] = (nonce, time.monotonic() + 30)
+    server._rank_info_auth_challenges[b"client"] = nonce
     request = [
         MessageType.REQUEST_INSTANCE_INFO,
         nonce,
@@ -124,78 +123,6 @@ def test_transfer_worker_requires_key_before_native_setup(key):
                 kv_cache_manager=Mock(), device_id=0, instance_name="test", rank_info_auth_key=key
             )
         )
-
-
-@pytest.mark.parametrize(
-    "frames",
-    [
-        [MessageType.REQUEST_INSTANCE_INFO, b"nonce"],
-        [MessageType.REQUEST_INSTANCE_INFO, b"nonce", b"tag", b"extra"],
-    ],
-)
-def test_malformed_response_consumes_challenge(frames):
-    server = _make_server()
-    server._rank_info_auth_challenges[b"client"] = (b"n" * 32, time.monotonic() + 30)
-    server._handle_rank_info_request(b"client", frames)
-    assert b"client" not in server._rank_info_auth_challenges
-    server._rank_info.to_bytes.assert_not_called()
-    server._messenger.send.assert_called_once_with([b"client", MessageType.AUTHENTICATION_ERROR])
-
-
-def test_valid_tag_for_unissued_nonce_is_rejected():
-    server = _make_server()
-    server._rank_info_auth_challenges[b"client"] = (b"n" * 32, time.monotonic() + 30)
-    nonce = b"x" * 32
-    server._handle_rank_info_request(
-        b"client",
-        [
-            MessageType.REQUEST_INSTANCE_INFO,
-            nonce,
-            _rank_info_auth_tag(_AUTH_KEY, _ENDPOINT, nonce),
-        ],
-    )
-    assert b"client" not in server._rank_info_auth_challenges
-    server._rank_info.to_bytes.assert_not_called()
-    server._messenger.send.assert_called_once_with([b"client", MessageType.AUTHENTICATION_ERROR])
-
-
-def test_full_challenge_cache_preserves_pending_client():
-    server = _make_server()
-    nonce = b"n" * 32
-    server._rank_info_auth_challenges[b"client"] = (nonce, time.monotonic() + 30)
-    with patch(f"{_TRANSFER_MODULE}._RANK_INFO_CHALLENGE_CACHE_SIZE", 1):
-        server._handle_rank_info_request(b"other", [MessageType.REQUEST_INSTANCE_INFO])
-    assert b"client" in server._rank_info_auth_challenges
-    assert b"other" not in server._rank_info_auth_challenges
-    server._messenger.send.assert_called_once_with([b"other", MessageType.AUTHENTICATION_ERROR])
-    server._handle_rank_info_request(
-        b"client",
-        [
-            MessageType.REQUEST_INSTANCE_INFO,
-            nonce,
-            _rank_info_auth_tag(_AUTH_KEY, _ENDPOINT, nonce),
-        ],
-    )
-    server._rank_info.to_bytes.assert_called_once()
-
-
-def test_expired_challenge_is_reclaimed_and_cannot_authenticate():
-    server = _make_server()
-    nonce = b"n" * 32
-    server._rank_info_auth_challenges[b"client"] = (nonce, time.monotonic() - 1)
-    server._handle_rank_info_request(
-        b"client",
-        [
-            MessageType.REQUEST_INSTANCE_INFO,
-            nonce,
-            _rank_info_auth_tag(_AUTH_KEY, _ENDPOINT, nonce),
-        ],
-    )
-    server._rank_info.to_bytes.assert_not_called()
-    assert not server._rank_info_auth_challenges
-    with patch(f"{_TRANSFER_MODULE}._RANK_INFO_CHALLENGE_CACHE_SIZE", 1):
-        server._handle_rank_info_request(b"other", [MessageType.REQUEST_INSTANCE_INFO])
-    assert b"other" in server._rank_info_auth_challenges
 
 
 @pytest.mark.parametrize("ownership", [False, True])

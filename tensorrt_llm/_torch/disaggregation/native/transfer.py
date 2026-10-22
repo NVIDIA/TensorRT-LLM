@@ -102,7 +102,6 @@ _RANK_INFO_AUTH_CONTEXT = b"trtllm-rank-info-request-v1\0"
 _RANK_INFO_NONCE_BYTES = 32
 _RANK_INFO_AUTH_TAG_BYTES = 32
 _RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
-_RANK_INFO_CHALLENGE_TTL_S = 30.0
 
 
 def _require_rank_info_auth_key(key: Optional[bytes]) -> bytes:
@@ -2925,7 +2924,7 @@ class Receiver(ReceiverBase):
                 if message == [MessageType.AUTHENTICATION_ERROR]:
                     raise RankInfoAuthenticationError(
                         "RankInfo authentication failed: configure the same internal_request_auth_key "
-                        "on all context, generation, and proxy servers; retry if the challenge expired"
+                        "on all context, generation, and proxy servers"
                     )
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
@@ -3762,7 +3761,7 @@ class RankInfoServer:
     ):
         self._rank_info = rank_info
         self._rank_info_auth_key = _require_rank_info_auth_key(rank_info_auth_key)
-        self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
+        self._rank_info_auth_challenges: OrderedDict[bytes, bytes] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
@@ -3801,32 +3800,21 @@ class RankInfoServer:
         self._messenger.start_listener(handle_message)
 
     def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
-        now = time.monotonic()
-        while self._rank_info_auth_challenges:
-            _, expires = next(iter(self._rank_info_auth_challenges.values()))
-            if expires > now:
-                break
-            self._rank_info_auth_challenges.popitem(last=False)
         if len(message) == 1:
-            if (
-                send_id not in self._rank_info_auth_challenges
-                and len(self._rank_info_auth_challenges) >= _RANK_INFO_CHALLENGE_CACHE_SIZE
-            ):
-                self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
-                return
             challenge = secrets.token_bytes(_RANK_INFO_NONCE_BYTES)
-            self._rank_info_auth_challenges[send_id] = (challenge, now + _RANK_INFO_CHALLENGE_TTL_S)
+            self._rank_info_auth_challenges[send_id] = challenge
             self._rank_info_auth_challenges.move_to_end(send_id)
+            if len(self._rank_info_auth_challenges) > _RANK_INFO_CHALLENGE_CACHE_SIZE:
+                self._rank_info_auth_challenges.popitem(last=False)
             self._messenger.send([send_id, MessageType.AUTHENTICATION_CHALLENGE, challenge])
             return
 
-        pending = self._rank_info_auth_challenges.pop(send_id, None)
         if len(message) != 3:
             self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
             return
 
         nonce, provided_tag = message[1:]
-        expected_nonce = pending[0] if pending is not None else None
+        expected_nonce = self._rank_info_auth_challenges.pop(send_id, None)
         authenticated = (
             len(nonce) == _RANK_INFO_NONCE_BYTES
             and len(provided_tag) == _RANK_INFO_AUTH_TAG_BYTES
