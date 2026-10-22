@@ -277,6 +277,58 @@ def apply_fused_layernorm_adaln_quant(
     return out
 
 
+# residual_norm_quant modes.
+RESIDUAL_ONLY = 0
+LAYER_NORM = 1
+ADA_LAYER_NORM = 2
+
+
+def residual_norm_quant(
+    x: torch.Tensor,
+    mode: int,
+    rows_per_batch: int,
+    *,
+    y: Optional[torch.Tensor] = None,
+    y_bias: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    inv_out_scale: Optional[torch.Tensor] = None,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Gated residual and LayerNorm / AdaLN + static FP8 quant of [..., hidden] rows in one pass.
+
+    RESIDUAL_ONLY: returns (x + gate * (y + y_bias), None).
+    LAYER_NORM: affine weight / bias [hidden]; ADA_LAYER_NORM: weight (scale) / bias (shift) of
+    shape [batch, hidden]. Returns (updated x or None without y, e4m3 normalized rows).
+    """
+    shape = x.shape
+    hidden = shape[-1]
+
+    def rows(t):
+        return None if t is None else t.reshape(-1, hidden).contiguous()
+
+    def fp32(t):
+        return None if t is None else t.to(torch.float32).reshape(-1, hidden).contiguous()
+
+    x_out, normed = torch.ops.trtllm.fused_residual_norm_quant(
+        rows(x),
+        rows(y),
+        y_bias,
+        fp32(gate),
+        mode,
+        fp32(weight),
+        fp32(bias),
+        rows_per_batch,
+        eps,
+        None if inv_out_scale is None else inv_out_scale.reshape(1).to(torch.float32),
+    )
+    return (
+        x_out.view(shape) if y is not None else None,
+        normed.view(shape) if mode != RESIDUAL_ONLY else None,
+    )
+
+
 def apply_fused_layernorm_affine_quant(
     x: torch.Tensor,
     ln_weight: torch.Tensor,

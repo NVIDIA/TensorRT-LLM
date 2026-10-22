@@ -214,6 +214,12 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8"),
             },
         }
+        # trtllm-gen dense FP8 context attention serves the per-tensor FP8 recipe on Rubin.
+        DENSE_FP8_RECIPES = {
+            107: {
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -256,10 +262,12 @@ class AttentionConfig(StrictBaseModel):
                 recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
                 family = "VC-Attention"
             else:
-                recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(
-                    sm_version, set()
+                recipes = (
+                    SAGE_RECIPES.get(sm_version, set())
+                    | PRIMSTS_RECIPES.get(sm_version, set())
+                    | DENSE_FP8_RECIPES.get(sm_version, set())
                 )
-                family = "SAGE and PrimTS"
+                family = "SAGE, PrimTS and dense FP8"
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
