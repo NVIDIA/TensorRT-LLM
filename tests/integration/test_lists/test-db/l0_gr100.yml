@@ -26,3 +26,7 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec
   - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py
+  - unittest/_torch/visual_gen/test_attention_trtllm_dense_fp8.py
+  - unittest/_torch/visual_gen/test_wan_block_fp8_fusion.py
+  - unittest/_torch/visual_gen/kernels/parallel/test_fused_residual_norm_quant.py
+  - unittest/_torch/kernels/parallel/test_cublas_scaled_mm_epilogue.py

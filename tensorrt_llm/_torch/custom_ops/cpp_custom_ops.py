@@ -337,6 +337,8 @@ def _register_fake():
         out_dtype,
         output_buffer_kind: int = 0,
         group: Optional[List[int]] = None,
+        epilogue: int = 0,
+        d_scale: Optional[torch.Tensor] = None,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -1837,6 +1839,24 @@ def _register_fake():
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fused_residual_norm_quant")
+    def _(
+        x: torch.Tensor,
+        y: Optional[torch.Tensor],
+        y_bias: Optional[torch.Tensor],
+        gate: Optional[torch.Tensor],
+        mode: int,
+        weight: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        rows_per_batch: int,
+        eps: float,
+        inv_out_scale: Optional[torch.Tensor],
+    ):
+        x_out = torch.empty_like(x) if y is not None else x.new_empty(0)
+        normed = (x.new_empty(x.shape, dtype=torch.float8_e4m3fn)
+                  if mode != 0 else x.new_empty(0, dtype=torch.float8_e4m3fn))
+        return x_out, normed
 
     @torch.library.register_fake("trtllm::fmha_dense_fp8")
     def _(

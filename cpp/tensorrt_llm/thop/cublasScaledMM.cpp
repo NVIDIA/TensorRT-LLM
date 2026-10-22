@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (out) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,10 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
 #include <cublasLt.h>
+#include <map>
+#include <mutex>
 #include <torch/extension.h>
+#include <tuple>
 #include <unordered_map>
 
 using torch::Tensor;
@@ -261,10 +264,143 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     cublasWrapper->destroyDescriptors();
 }
 
+// cuBLASLt epilogues of cublas_scaled_mm beyond the default bias add.
+enum class ScaledMmEpilogue : int64_t
+{
+    kDefault = 0, // bias added when given
+    kGelu = 1,    // tanh GELU after the optional bias
+};
+
+struct EpilogueAlgoKey
+{
+    int device;
+    int64_t m, n, k, lda, ldb, ldd;
+    int epilogue;
+    int outType;
+    int biasType;
+
+    bool operator<(EpilogueAlgoKey const& o) const
+    {
+        return std::tie(device, m, n, k, lda, ldb, ldd, epilogue, outType, biasType)
+            < std::tie(o.device, o.m, o.n, o.k, o.lda, o.ldb, o.ldd, o.epilogue, o.outType, o.biasType);
+    }
+};
+
+// FP8 x FP8 GEMM through cuBLASLt with a GELU / bias epilogue and an optional e4m3 output scaled by
+// d_scale. The algorithm is the cuBLASLt heuristic's first choice, cached per problem.
+void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, Tensor const& scale_a,
+    Tensor const& scale_b, std::optional<at::Tensor> const& bias, ScaledMmEpilogue epilogue,
+    std::optional<at::Tensor> const& d_scale)
+{
+    int64_t const m = a.size(0);
+    int64_t const n = b.size(1);
+    int64_t const k = a.size(1);
+    bool const outFp8 = out.scalar_type() == torch::kFloat8_e4m3fn;
+    TORCH_CHECK(outFp8 || out.scalar_type() == torch::kBFloat16, "cublas_scaled_mm epilogues output bf16 or e4m3");
+    TORCH_CHECK(outFp8 == d_scale.has_value(), "e4m3 output needs d_scale, and d_scale needs e4m3 output");
+    TORCH_CHECK(scale_a.numel() == 1 && scale_b.numel() == 1, "cublas_scaled_mm epilogues need per-tensor scales");
+
+    thread_local std::shared_ptr<cublasLtHandle_t> ltHandle;
+    if (ltHandle == nullptr)
+    {
+        ltHandle = getCublasLtHandle();
+    }
+    auto const handle = *ltHandle;
+    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+    auto const& workspace = getWorkspaceTensor(a.device(), stream.stream());
+    size_t const workspaceBytes = CUBLAS_WORKSPACE_SIZE;
+
+    cublasLtMatmulDesc_t op;
+    check_cuda_error(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    // Row-major out = a @ b is column-major out^T = b^T (A, transposed) x a^T (B).
+    cublasOperation_t const transA = CUBLAS_OP_T;
+    cublasOperation_t const transB = CUBLAS_OP_N;
+    check_cuda_error(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+    check_cuda_error(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+    void const* scaleAPtr = scale_b.data_ptr();
+    void const* scaleBPtr = scale_a.data_ptr();
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleAPtr, sizeof(scaleAPtr)));
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleBPtr, sizeof(scaleBPtr)));
+    int8_t const fastAccum = 1;
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccum, sizeof(fastAccum)));
+    if (outFp8)
+    {
+        void const* dScalePtr = d_scale->data_ptr();
+        check_cuda_error(
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &dScalePtr, sizeof(dScalePtr)));
+    }
+    bool const gelu = epilogue == ScaledMmEpilogue::kGelu;
+    cublasLtEpilogue_t const epi = bias.has_value() ? (gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS)
+                                                    : (gelu ? CUBLASLT_EPILOGUE_GELU : CUBLASLT_EPILOGUE_DEFAULT);
+    check_cuda_error(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+    cudaDataType_t biasType = CUDA_R_16BF;
+    if (bias.has_value())
+    {
+        TORCH_CHECK(bias->numel() == n && bias->is_contiguous(), "bias must be contiguous [n]");
+        biasType = convert_torch_dtype(bias->scalar_type());
+        void const* biasPtr = bias->data_ptr();
+        check_cuda_error(
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &biasPtr, sizeof(biasPtr)));
+        check_cuda_error(
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType)));
+    }
+
+    int64_t const lda = b.stride(1);
+    int64_t const ldb = a.stride(0);
+    int64_t const ldd = out.stride(0);
+    cudaDataType_t const outType = convert_torch_dtype(out.scalar_type());
+    cublasLtMatrixLayout_t layoutA, layoutB, layoutC, layoutD;
+    check_cuda_error(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_8F_E4M3, k, n, lda));
+    check_cuda_error(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_8F_E4M3, k, m, ldb));
+    // An e4m3 D still takes a bf16 C descriptor; C is unused with beta = 0.
+    check_cuda_error(cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, n, m, ldd));
+    check_cuda_error(cublasLtMatrixLayoutCreate(&layoutD, outType, n, m, ldd));
+
+    static std::mutex algoMutex;
+    static std::map<EpilogueAlgoKey, cublasLtMatmulAlgo_t> algos;
+    cublasLtMatmulAlgo_t algo;
+    {
+        std::lock_guard<std::mutex> lock(algoMutex);
+        EpilogueAlgoKey const key{a.get_device(), m, n, k, lda, ldb, ldd, static_cast<int>(epi),
+            static_cast<int>(outType), static_cast<int>(biasType)};
+        auto it = algos.find(key);
+        if (it == algos.end())
+        {
+            cublasLtMatmulPreference_t pref;
+            check_cuda_error(cublasLtMatmulPreferenceCreate(&pref));
+            check_cuda_error(cublasLtMatmulPreferenceSetAttribute(
+                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceBytes, sizeof(workspaceBytes)));
+            cublasLtMatmulHeuristicResult_t result{};
+            int found = 0;
+            check_cuda_error(cublasLtMatmulAlgoGetHeuristic(
+                handle, op, layoutA, layoutB, layoutC, layoutD, pref, 1, &result, &found));
+            check_cuda_error(cublasLtMatmulPreferenceDestroy(pref));
+            TORCH_CHECK(found > 0, "cublas_scaled_mm: no cuBLASLt algorithm for m=", m, " n=", n, " k=", k,
+                " epilogue=", static_cast<int>(epi));
+            it = algos.emplace(key, result.algo).first;
+        }
+        algo = it->second;
+    }
+    float const alpha = 1.f;
+    float const beta = 0.f;
+    void* cPtr = outFp8 ? nullptr : out.data_ptr();
+    check_cuda_error(cublasLtMatmul(handle, op, &alpha, b.data_ptr(), layoutA, a.data_ptr(), layoutB, &beta, cPtr,
+        layoutC, out.data_ptr(), layoutD, &algo, workspace.data_ptr(), workspaceBytes, stream));
+    check_cuda_error(cublasLtMatrixLayoutDestroy(layoutA));
+    check_cuda_error(cublasLtMatrixLayoutDestroy(layoutB));
+    check_cuda_error(cublasLtMatrixLayoutDestroy(layoutC));
+    check_cuda_error(cublasLtMatrixLayoutDestroy(layoutD));
+    check_cuda_error(cublasLtMatmulDescDestroy(op));
+}
+
 } // namespace
 
 Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, Tensor& out)
+    std::optional<at::Tensor> const& bias, Tensor& out, int64_t epilogue = 0,
+    std::optional<at::Tensor> const& d_scale = std::nullopt)
 {
     // Check device
     CHECK_TH_CUDA(mat_a);
@@ -288,13 +424,31 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
     TORCH_CHECK(mat_a.dtype() == torch::kFloat8_e4m3fn);
     TORCH_CHECK(mat_b.dtype() == torch::kFloat8_e4m3fn);
 
+    TORCH_CHECK(epilogue == static_cast<int64_t>(ScaledMmEpilogue::kDefault)
+            || epilogue == static_cast<int64_t>(ScaledMmEpilogue::kGelu),
+        "cublas_scaled_mm: epilogue must be 0 (default) or 1 (GELU)");
+    if (epilogue != static_cast<int64_t>(ScaledMmEpilogue::kDefault) || d_scale.has_value())
+    {
+        if (d_scale.has_value())
+        {
+            CHECK_TH_CUDA(d_scale.value());
+            TORCH_CHECK(d_scale->scalar_type() == torch::kFloat32 && d_scale->numel() == 1,
+                "cublas_scaled_mm: d_scale must be float32 [1]");
+        }
+        cublaslt_fp8_epilogue_gemm(
+            out, mat_a, mat_b, scale_a, scale_b, bias, static_cast<ScaledMmEpilogue>(epilogue), d_scale);
+        return out;
+    }
     cublas_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, bias, true);
     return out;
 }
 
+// epilogue: 0 adds the optional bias; 1 applies tanh GELU after the optional bias.
+// d_scale: float32 [1] multiplier applied before an e4m3 output (1 / output dequant scale).
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
-    c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    c10::optional<torch::List<int64_t>> group = c10::nullopt, int64_t epilogue = 0,
+    std::optional<at::Tensor> const& d_scale = std::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
@@ -304,7 +458,7 @@ Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& 
     auto [out, _] = torch_ext::allocate_output(
         output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
-    return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
+    return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out, epilogue, d_scale);
 }
 
 Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias, Tensor& out)
@@ -347,8 +501,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
-        " -> (Tensor out)");
+        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None, int epilogue=0,"
+        " Tensor? d_scale=None) -> (Tensor out)");
     m.def(
         "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
         " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");

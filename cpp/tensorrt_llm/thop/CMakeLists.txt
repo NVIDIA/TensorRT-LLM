@@ -163,7 +163,8 @@ add_th_common_family(
   rotateRowsOp.cpp
   scatterKvSlotsOp.cpp
   denseFp8FmhaOp.cpp
-  fusedDiTQKNormRopeFp8Op.cpp)
+  fusedDiTQKNormRopeFp8Op.cpp
+  fusedResidualNormQuantOp.cpp)
 # denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
 # target carries the compile definitions those headers need to match the
 # library's struct layouts.
