@@ -14,14 +14,12 @@
 # limitations under the License.
 """Qwen3.5 decode fast paths and the role profiles of the remaining TRTLLM_Q35_* switches.
 
-The Qwen3.5 kernels and launch policies (fused all-reduces, CuTe DSL attention / MoE-front / GDN kernels,
-low-M GEMMs, steady-state decode preparation) are tuned for the Qwen3.5-397B shapes on SM 10.3 (GB300).
-activate() turns them on when the model being loaded is Qwen3.5 on SM 10.3; fast_paths_enabled() is the
-predicate the call sites read.
+The Qwen3.5 kernels and launch policies are tuned for the Qwen3.5-397B shapes on SM 10.3 (GB300). activate()
+turns them on when the model being loaded is Qwen3.5 on SM 10.3; fast_paths_enabled() is the predicate the call
+sites read.
 
-A few switches stay environment variables because the right value depends on the worker's role (context vs.
-generation, with or without attention DP). They default to off. TRTLLM_Q35_PROFILE selects a set of values for
-them that activate() applies to a Qwen3.5 model on SM 10.3:
+Switches whose right value depends on the worker's role stay environment variables, default off.
+TRTLLM_Q35_PROFILE selects a set of values for them that activate() applies to a Qwen3.5 model on SM 10.3:
 
 * unset, empty or ``off``: nothing is applied.
 * ``gen`` (generation / decode workers): the _GEN table, with or without attention DP.
@@ -65,9 +63,7 @@ _GEN = {
 }
 # Context (prefill) workers without attention DP.
 _CTX = {
-    "TRTLLM_Q35_BRANCH_SNAPSHOT": "1",
     "TRTLLM_Q35_CTX_ATTN_PLAN": "1",
-    "TRTLLM_Q35_CTX_LEAN_TOKENS": "1",
     "TRTLLM_Q35_CUSTOM_OP_EAGER": "1",
     "TRTLLM_Q35_GDN_GRAPH_DIRECT": "1",
     "TRTLLM_Q35_GDN_GRAPH_LEAN": "1",
