@@ -32,6 +32,10 @@ per column given one slot per request; CUDA-graph padding entries share one dumm
 slot and write it in no defined order, as ``index_put`` with duplicate indices
 does.
 
+The context may live in pages (``page_table``), addressed as the single-request op
+addresses them: a paged call differs from a dense one only in which row a column
+is read from or appended to, so on the same values the two are bitwise equal.
+
 Numerics follow the single-request op: fp32 scores, base-2 online softmax, the
 probabilities rounded to the operand dtype for the P.V product with the row sum
 taken from the fp32 values, each split normalized and merged in fp32 by
@@ -57,6 +61,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWr
 from .dflash_window_attention import (
     MAX_SPLITS,
     WINDOW,
+    _context_rows,
+    _page_arguments,
     _window_attention_merge_kernel,
     attention_reference,
     unsupported_reason,
@@ -77,6 +83,7 @@ def _window_attention_wide_split_kernel(
     v_new_ptr,
     seqlens_ptr,
     batch_idx_ptr,
+    page_table_ptr,
     out_ptr,
     o_part_ptr,
     lse_part_ptr,
@@ -92,6 +99,8 @@ def _window_attention_wide_split_kernel(
     stride_vs,
     stride_vn,
     stride_vh,
+    stride_pt,
+    page_rows,
     stride_knt,
     stride_knh,
     stride_vnt,
@@ -112,6 +121,7 @@ def _window_attention_wide_split_kernel(
     APPEND: tl.constexpr,
     DIRECT: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    PAGE: tl.constexpr,
 ):
     split = tl.program_id(0)
     bh = tl.program_id(1)
@@ -130,8 +140,15 @@ def _window_attention_wide_split_kernel(
         return
     slot = tl.load(batch_idx_ptr + b).to(tl.int64)
     dims = tl.arange(0, D)
-    k_base = k_ptr + slot * stride_ks + kvh * stride_kh
-    v_base = v_ptr + slot * stride_vs + kvh * stride_vh
+    if PAGE:
+        # A pool of pages: ``slot`` is the request's page-table row (``_context_rows``).
+        table = page_table_ptr + slot * stride_pt
+        k_base = k_ptr + kvh * stride_kh
+        v_base = v_ptr + kvh * stride_vh
+    else:
+        table = page_table_ptr
+        k_base = k_ptr + slot * stride_ks + kvh * stride_kh
+        v_base = v_ptr + slot * stride_vs + kvh * stride_vh
     block_start = seqlen - M
     new_row0 = b.to(tl.int64) * M
     jj = tl.arange(0, TAIL)
@@ -141,7 +158,7 @@ def _window_attention_wide_split_kernel(
             # The append: the block's K/V into the arena at [L - M, L). No program of
             # this grid reads those columns (the tail tile reads k_new / v_new).
             new_rows = new_row0 + jj
-            cols = (block_start + jj).to(tl.int64)
+            kv_rows = _context_rows(table, block_start + jj, jj_ok, page_rows, PAGE)
             k_blk = tl.load(
                 k_new_ptr + new_rows[:, None] * stride_knt + kvh * stride_knh + dims[None, :],
                 mask=jj_ok[:, None],
@@ -150,8 +167,12 @@ def _window_attention_wide_split_kernel(
                 v_new_ptr + new_rows[:, None] * stride_vnt + kvh * stride_vnh + dims[None, :],
                 mask=jj_ok[:, None],
             )
-            tl.store(k_base + cols[:, None] * stride_kn + dims[None, :], k_blk, mask=jj_ok[:, None])
-            tl.store(v_base + cols[:, None] * stride_vn + dims[None, :], v_blk, mask=jj_ok[:, None])
+            tl.store(
+                k_base + kv_rows[:, None] * stride_kn + dims[None, :], k_blk, mask=jj_ok[:, None]
+            )
+            tl.store(
+                v_base + kv_rows[:, None] * stride_vn + dims[None, :], v_blk, mask=jj_ok[:, None]
+            )
 
     # Packed tile row r = g * M + i: query head kvh * GROUP + g, block row i at key
     # position seqlen - M + i (bottom-right aligned).
@@ -180,12 +201,12 @@ def _window_attention_wide_split_kernel(
     for c0 in tl.range(start, arena_end, BLOCK_N, num_stages=STAGES):
         cols = c0 + tl.arange(0, BLOCK_N)
         ok = cols < arena_end
-        cols64 = cols.to(tl.int64)
+        kv_rows = _context_rows(table, cols, ok, page_rows, PAGE)
         k = tl.load(
-            k_base + cols64[:, None] * stride_kn + dims[None, :], mask=ok[:, None], other=0.0
+            k_base + kv_rows[:, None] * stride_kn + dims[None, :], mask=ok[:, None], other=0.0
         )
         v = tl.load(
-            v_base + cols64[:, None] * stride_vn + dims[None, :], mask=ok[:, None], other=0.0
+            v_base + kv_rows[:, None] * stride_vn + dims[None, :], mask=ok[:, None], other=0.0
         )
         s = tl.dot(q, tl.trans(k))
         keep = ok[None, :] & (cols[None, :] >= first_key[:, None])
@@ -217,14 +238,14 @@ def _window_attention_wide_split_kernel(
                 other=0.0,
             )
         else:
-            cols64 = cols.to(tl.int64)
+            kv_rows = _context_rows(table, cols, jj_ok, page_rows, PAGE)
             k = tl.load(
-                k_base + cols64[:, None] * stride_kn + dims[None, :],
+                k_base + kv_rows[:, None] * stride_kn + dims[None, :],
                 mask=jj_ok[:, None],
                 other=0.0,
             )
             v = tl.load(
-                v_base + cols64[:, None] * stride_vn + dims[None, :],
+                v_base + kv_rows[:, None] * stride_vn + dims[None, :],
                 mask=jj_ok[:, None],
                 other=0.0,
             )
@@ -316,6 +337,7 @@ def wide_window_attention_launch(
     enable_pdl: bool,
     k_new: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
     *,
     block_n: int,
     split_keys: int,
@@ -324,6 +346,9 @@ def wide_window_attention_launch(
     merge_warps: int,
 ) -> torch.Tensor:
     """Launch the split and merge kernels with an explicit geometry.
+
+    ``page_table``: the caches are pools of ``k_cache.shape[1]``-token pages and
+    ``cache_batch_idx`` names table rows (``dflash_window_attention``'s module docstring).
 
     Raises:
         ValueError: if ``split_keys`` is not a whole number of tiles or the
@@ -350,6 +375,7 @@ def wide_window_attention_launch(
     append = k_new is not None
     if not append:
         k_new = v_new = k_cache  # unused
+    page_table, page, page_rows, stride_pt = _page_arguments(k_cache, page_table, cache_batch_idx)
     direct = num_splits == 1
     if direct:
         o_part = lse_part = out  # unused
@@ -368,6 +394,7 @@ def wide_window_attention_launch(
         v_new,
         cache_seqlens,
         cache_batch_idx,
+        page_table,
         out,
         o_part,
         lse_part,
@@ -383,6 +410,8 @@ def wide_window_attention_launch(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        stride_pt,
+        page_rows,
         k_new.stride(0),
         k_new.stride(1),
         v_new.stride(0),
@@ -403,6 +432,7 @@ def wide_window_attention_launch(
         APPEND=append,
         DIRECT=direct,
         LAUNCH_WITH_PDL=enable_pdl,
+        PAGE=page,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
     )
@@ -449,9 +479,9 @@ class DflashWindowAttentionWide(OpWrapper):
     """Non-causal sliding-window attention of several DFlash blocks over their slots' pooled K/V.
 
     ``__call__(q, k_cache, v_cache, cache_seqlens, cache_batch_idx, window_size,
-    softmax_scale=None, enable_pdl=False, k_new=None, v_new=None)``: the arguments
-    and the result of ``dflash_window_attention`` (see there), without its
-    single-request merge entry trigger. The split geometry follows the request
+    softmax_scale=None, enable_pdl=False, k_new=None, v_new=None, page_table=None)``:
+    the arguments and the result of ``dflash_window_attention`` (see there), without
+    its single-request merge entry trigger. The split geometry follows the request
     count (``wide_launch_config``).
 
     Fusion boundary: the output projection (after) stays outside; so does the
@@ -481,9 +511,18 @@ class DflashWindowAttentionWide(OpWrapper):
         enable_pdl: bool = False,
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
     ) -> None:
         reason = wide_unsupported_reason(
-            q, k_cache, v_cache, cache_seqlens, cache_batch_idx, window_size, k_new, v_new
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens,
+            cache_batch_idx,
+            window_size,
+            k_new,
+            v_new,
+            page_table,
         )
         if reason is not None:
             raise ValueError(f"dflash_window_attention_wide: {reason}")
@@ -500,6 +539,7 @@ class DflashWindowAttentionWide(OpWrapper):
         enable_pdl: bool = False,
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         config = wide_launch_config(q.shape[0], window_size[0] + q.shape[1])
         return wide_window_attention_launch(
@@ -513,6 +553,7 @@ class DflashWindowAttentionWide(OpWrapper):
             enable_pdl,
             k_new,
             v_new,
+            page_table,
             **config,
         )
 
@@ -528,6 +569,7 @@ class DflashWindowAttentionWide(OpWrapper):
         enable_pdl: bool = False,
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dense masked softmax attention in fp32, one rounding at the end.
 
@@ -544,6 +586,7 @@ class DflashWindowAttentionWide(OpWrapper):
             torch.float32,
             k_new,
             v_new,
+            page_table,
         ).to(q.dtype)
 
 
@@ -563,10 +606,11 @@ def wide_unsupported_reason(
     window_size: tuple[int, int],
     k_new: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
 ) -> str | None:
     """Why the kernels would answer these inputs wrongly, or None if they take them."""
     reason = unsupported_reason(
-        q, k_cache, v_cache, cache_seqlens, cache_batch_idx, window_size, k_new, v_new
+        q, k_cache, v_cache, cache_seqlens, cache_batch_idx, window_size, k_new, v_new, page_table
     )
     if reason is not None:
         return reason

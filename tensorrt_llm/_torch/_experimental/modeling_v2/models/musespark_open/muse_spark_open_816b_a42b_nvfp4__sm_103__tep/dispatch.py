@@ -948,11 +948,11 @@ FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
 WINDOWED_CONTEXT_ARENA_PATHS: Tuple[str, ...] = ("drafter_window_compact",)
 #: The fast paths that address the drafter's context K/V as the dense arena
 #: ``[slots, L, capacity, Hkv, D]`` of a DFlash worker that does not page it, by
-#: slot and column: the drafter block decode's window attention with its fused
-#: append, and the context-K/V fork's side chain and commit. Over a paged context
-#: (``paged_drafter_context``) the plan leaves them out with every fast path built
-#: on them; every other fast path is independent of where the context lives.
-DENSE_ARENA_PATHS: Tuple[str, ...] = ("drafter_block_decode", "context_kv_fork")
+#: slot and column: the context-K/V fork's side chain and commit. Over a paged
+#: context (``paged_drafter_context``) the plan leaves them out with every fast
+#: path built on them; every other fast path is independent of where the context
+#: lives (the drafter block decode reads it through the worker's page table).
+DENSE_ARENA_PATHS: Tuple[str, ...] = ("context_kv_fork",)
 
 
 def dependents(names: Iterable[str]) -> FrozenSet[str]:
