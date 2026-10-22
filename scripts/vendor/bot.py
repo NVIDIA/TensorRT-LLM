@@ -35,6 +35,7 @@ _LOG = logging.getLogger("vendor-bot")
 _STATE_FILE = "state.sqlite"
 _STOP = threading.Event()
 _HEARTBEAT_SECONDS = 30
+_FEEDBACK_KEY = re.compile(r"<!-- vendor-bot-feedback:v1 ([0-9a-f]{64}) -->")
 
 
 def _now() -> str:
@@ -51,6 +52,20 @@ def _summary(error: object) -> str:
     text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[REDACTED]", text)
     text = re.sub(r"(?i)(authorization\s*[:=]\s*).+", r"\1[REDACTED]", text)
     return text[:500]
+
+
+def _upstream_feedback(proof: dict, vendor_name: str) -> str:
+    return (
+        "Upstream-main source ancestry is valid: pinned commit "
+        f"`{proof['promoted']}` contains canonical "
+        f"dev tip `{proof['checked_canonical_tip']}` and is reachable from "
+        f"the configured upstream branch at `{proof['upstream_observed_main']}`. "
+        f"No vendor-promotion metadata or upstream PR list is required for "
+        f"{field(vendor_name)} in this mode. Promotion will fast-forward dev to "
+        "the exact reviewed pin, not the moving upstream tip, and restore the canonical "
+        "lock URL/branch. This is **not** a code-review approval. Normal review and CI "
+        "still apply; promotion requires the source PR to merge and ancestry to remain valid."
+    )
 
 
 class Store:
@@ -452,27 +467,32 @@ class Monitor:
         attribution: dict[str, dict] | None = None,
         upstream_proof: dict | None = None,
         no_promotion: bool = False,
+        source: manage.Vendor | None = None,
     ) -> None:
         number = pr["number"]
         state = "blocked" if problem else "ignored" if no_promotion else "metadata_valid"
         message = (
-            f"@{pr['user']['login']} — vendor promotion needs {problem.owner} action:\n\n{problem}"
+            f"Vendor promotion needs {problem.owner} action:\n\n{problem}"
             "\n\nThe bot will recheck automatically on a later poll."
             if problem
             else "Vendor promotion metadata and source attribution are valid. "
             "This is **not** a code-review approval. Promotion still requires the source PR to merge."
         )
+        notification_message = message
+        if problem is not None and problem.notification_text is not None:
+            notification_message = (
+                f"Vendor promotion needs {problem.owner} action:\n\n{problem.notification_text}"
+                "\n\nThe bot will recheck automatically on a later poll."
+            )
         if upstream_proof is not None and problem is None:
-            message = (
-                "Upstream-main source ancestry is valid: pinned commit "
-                f"`{upstream_proof['promoted']}` contains canonical "
-                f"dev tip `{upstream_proof['checked_canonical_tip']}` and is reachable from "
-                f"the configured upstream branch at `{upstream_proof['upstream_observed_main']}`. "
-                f"No vendor-promotion metadata or upstream PR list is required for "
-                f"{field(self.gh.vendor_name)} in this mode. Promotion will fast-forward dev to "
-                "the exact reviewed pin, not the moving upstream tip, and restore the canonical "
-                "lock URL/branch. This is **not** a code-review approval. Normal review and CI "
-                "still apply; promotion requires the source PR to merge and ancestry to remain valid."
+            message = _upstream_feedback(upstream_proof, self.gh.vendor_name)
+            notification_message = _upstream_feedback(
+                upstream_proof
+                | {
+                    "checked_canonical_tip": "LATEST_DEV_TIP",
+                    "upstream_observed_main": "UPSTREAM_TIP",
+                },
+                self.gh.vendor_name,
             )
         if no_promotion:
             message = (
@@ -481,11 +501,13 @@ class Monitor:
                 "no longer applies; no upstream-PR metadata is required by this monitor. "
                 "This is **not** a code-review approval. Normal review and CI still apply."
             )
+            notification_message = message
         if attribution:
             details = metadata.similarity_feedback(attribution, self.gh.upstream_repo)
             if details:
                 message += "\n\n" + details
-        body = f"{self.marker}\n{message}"
+                notification_message += "\n\n" + details
+        head = promote._sha(pr["head"]["sha"])
         dismissal_notice = (
             "\n\nAn authorized reviewer must dismiss the automated metadata "
             "review; this account lacks dismissal permission."
@@ -517,8 +539,7 @@ class Monitor:
             for item in comments
             if item["user"]["login"] == self.actor and item.get("body", "").startswith(self.marker)
         ]
-        if len(existing) > 1:
-            raise ValueError("Multiple bot feedback comments; inspect before continuing.")
+        latest = max(existing, key=lambda item: int(item["id"]), default=None)
         reviews = (
             [
                 item
@@ -528,69 +549,24 @@ class Monitor:
             if current["state"] == "open" and current["user"]["login"] != self.actor
             else []
         )
-        automated = [
+        marked_reviews = [
             item
             for item in reviews
-            if item.get("body", "").startswith(self.marker) and item["state"] == "CHANGES_REQUESTED"
+            if item.get("body", "").startswith(self.marker)
+            and item["state"] in ("CHANGES_REQUESTED", "DISMISSED")
         ]
+        automated = [item for item in marked_reviews if item["state"] == "CHANGES_REQUESTED"]
         manual = [
             item
             for item in reviews
             if not item.get("body", "").startswith(self.marker)
             and item["state"] in ("APPROVED", "CHANGES_REQUESTED")
         ]
-        if no_promotion and not existing and not automated:
+        if no_promotion and latest is None and not marked_reviews:
             self._transition(number, "ignored", "not a promotable update for this canonical vendor")
             return
-        if existing:
-            if existing[0]["body"] != body and not (
-                not problem and existing[0]["body"] == body + dismissal_notice
-            ):
-                self.gh.api(
-                    f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                    method="PATCH",
-                    payload={"body": body},
-                )
-                _LOG.info("PR #%s: updated metadata feedback comment", number)
-        else:
-            existing = [
-                self.gh.api(
-                    f"{self.prefix}/issues/{number}/comments", method="POST", payload={"body": body}
-                )
-            ]
-            _LOG.info("PR #%s: posted metadata feedback comment", number)
-        if current["state"] != "open" or current["user"]["login"] == self.actor:
-            self._transition(
-                number,
-                state,
-                str(problem) if problem else "feedback reconciled; not a code-review approval",
-            )
-            return
-        if problem and problem.owner == "author":
-            review_body = (
-                f"{self.marker}\n{problem.problem}\n\nSee the vendor-bot comment for "
-                "the specific fix and the latest validation result."
-            )
-            for review in automated:
-                if review["body"] != review_body:
-                    self.gh.api(
-                        f"{self.prefix}/pulls/{number}/reviews/{review['id']}",
-                        method="PUT",
-                        payload={"body": review_body},
-                    )
-                    _LOG.info("PR #%s: updated metadata review %s", number, review["id"])
-            if not automated and not manual:
-                self.gh.api(
-                    f"{self.prefix}/pulls/{number}/reviews",
-                    method="POST",
-                    payload={
-                        "event": "REQUEST_CHANGES",
-                        "commit_id": pr["head"]["sha"],
-                        "body": review_body,
-                    },
-                )
-                _LOG.info("PR #%s: requested metadata changes", number)
-        elif not problem:
+        dismissal_blocked = False
+        if not problem:
             for review in automated:
                 # Never replace a metadata objection with APPROVE or dismiss a
                 # human review. GitHub may require an authorized human dismissal.
@@ -613,26 +589,87 @@ class Monitor:
                         number,
                         review["id"],
                     )
-                    self._transition(
-                        number, "blocked", "Authorized human must dismiss metadata review"
-                    )
-                    if existing and existing[0]["body"] != body + dismissal_notice:
-                        self.gh.api(
-                            f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                            method="PATCH",
-                            payload={"body": body + dismissal_notice},
-                        )
-                    return
-            if existing and existing[0]["body"] == body + dismissal_notice:
-                self.gh.api(
-                    f"{self.prefix}/issues/comments/{existing[0]['id']}",
-                    method="PATCH",
-                    payload={"body": body},
+                    dismissal_blocked = True
+        if dismissal_blocked:
+            message += dismissal_notice
+            notification_message += dismissal_notice
+        fingerprint = metadata.fingerprint(
+            {
+                "vendor": self.gh.vendor_name,
+                "base_branch": self.gh.base_branch,
+                "source": {"url": source.url, "branch": source.branch, "commit": source.commit}
+                if source is not None
+                else None,
+                "state": state,
+                "message": notification_message,
+            }
+        )
+        # Only the newest bot-owned result counts: A -> B -> A must notify again.
+        # The fingerprint is durable on GitHub even if the POST response or SQLite is lost.
+        lines = latest["body"].splitlines() if latest else []
+        recorded = _FEEDBACK_KEY.fullmatch(lines[1]) if len(lines) > 1 else None
+        if recorded is None or recorded[1] != fingerprint:
+            body = (
+                f"{self.marker}\n<!-- vendor-bot-feedback:v1 {fingerprint} -->\n"
+                f"### Vendor validation: {field(self.gh.vendor_name)}\n\n"
+                f"@{pr['user']['login']} — {message}\n\n"
+                f"Checked PR revision: [`{head[:12]}`]"
+                f"(https://github.com/{self.gh.consumer_repo}/pull/{number}/commits/{head}). "
+                "This is a snapshot; newer results are posted as new comments."
+            )
+            if source is not None:
+                body += (
+                    f"\n\nChecked source: {field(source.url)} / {field(source.branch)}, "
+                    f"pin `{source.commit}`."
                 )
+            if latest is not None:
+                body += (
+                    f"\n\nSupersedes [previous vendor validation]"
+                    f"(https://github.com/{self.gh.consumer_repo}/pull/{number}"
+                    f"#issuecomment-{latest['id']})."
+                )
+            latest = self.gh.api(
+                f"{self.prefix}/issues/{number}/comments", method="POST", payload={"body": body}
+            )
+            _LOG.info("PR #%s: posted metadata feedback comment %s", number, latest["id"])
+        feedback_url = (
+            f"https://github.com/{self.gh.consumer_repo}/pull/{number}#issuecomment-{latest['id']}"
+        )
+        review_body = (
+            f"{self.marker}\nVendor validation result: "
+            f"{'needs ' + problem.owner + ' action' if problem else 'no source-validation objection'}."
+            f"\n\n[Latest vendor validation and step-by-step fix]({feedback_url})."
+        )
+        for review in marked_reviews:
+            if review["body"] != review_body:
+                self.gh.api(
+                    f"{self.prefix}/pulls/{number}/reviews/{review['id']}",
+                    method="PUT",
+                    payload={"body": review_body},
+                )
+                _LOG.info("PR #%s: updated metadata review %s", number, review["id"])
+        if (
+            problem
+            and problem.owner == "author"
+            and not automated
+            and not manual
+            and current["state"] == "open"
+            and current["user"]["login"] != self.actor
+        ):
+            self.gh.api(
+                f"{self.prefix}/pulls/{number}/reviews",
+                method="POST",
+                payload={"event": "REQUEST_CHANGES", "commit_id": head, "body": review_body},
+            )
+            _LOG.info("PR #%s: requested metadata changes", number)
         self._transition(
             number,
-            state,
-            str(problem) if problem else "feedback reconciled; not a code-review approval",
+            "blocked" if dismissal_blocked else state,
+            "Authorized human must dismiss metadata review"
+            if dismissal_blocked
+            else str(problem)
+            if problem
+            else "feedback reconciled; not a code-review approval",
         )
 
     def _inputs(self, pr: dict) -> tuple[manage.Vendor, manage.Vendor] | None:
@@ -844,10 +881,12 @@ class Monitor:
             # to advance the shared canonical branch. Do not report stale inputs as valid.
             upstream_proof = promote._check_source(self.gh, previous, reviewed)
         except Diagnostic as error:
-            self._feedback(pr, error)
+            self._feedback(pr, error, source=reviewed)
             return
         self.progress.operation("reconciling_feedback", number)
-        self._feedback(pr, None, attribution=evidence, upstream_proof=upstream_proof)
+        self._feedback(
+            pr, None, attribution=evidence, upstream_proof=upstream_proof, source=reviewed
+        )
         if not pr.get("merged"):
             return
         # Re-read mutable description/head before any promotion. Immutable lock

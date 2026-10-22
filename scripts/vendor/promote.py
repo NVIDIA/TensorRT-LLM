@@ -270,34 +270,65 @@ def _check_source(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) 
         _check_source_repo(gh, repo)
         _check_canonical_tip(gh, previous, reviewed)
         return None
-    if not _is_upstream_main(gh, reviewed):
-        raise Diagnostic(
-            f"An upstream source must use the configured branch {field(gh.upstream_branch)}.",
-            "Pin a commit reachable from that branch which contains the latest canonical "
-            "dev tip, or use a temporary branch in a personal fork based on that dev tip. "
-            "Update the lock and regenerate the vendored snapshot.",
-        )
     _check_selection(previous, reviewed)
-    tip = _check_canonical_tip(gh, previous, reviewed)
-    if (
+    tip = _canonical_tip(gh, previous, reviewed)
+    contains_tip = (
+        gh.compare(_repo_name(previous.url), tip, reviewed.commit)["merge_base_commit"]["sha"]
+        == tip
+    )
+    contains_previous = (
         gh.compare(repo, previous.commit, reviewed.commit)["merge_base_commit"]["sha"]
-        != previous.commit
-    ):
-        raise Diagnostic(
-            "The upstream pin does not contain the previous canonical revision.",
-            "Choose an upstream pin containing the canonical history, or use the explicit "
-            "maintainer refresh workflow to reconcile divergent histories.",
-        )
+        == previous.commit
+    )
     upstream = _sha(gh.get(f"repos/{repo}/git/ref/heads/{gh.upstream_branch}")["object"]["sha"])
-    if gh.compare(repo, reviewed.commit, upstream)["merge_base_commit"]["sha"] != reviewed.commit:
-        raise Diagnostic(
-            f"The pinned source commit {field(reviewed.commit)} is not reachable from "
-            f"{field(repo)} / {field(gh.upstream_branch)} at `{upstream}`.",
-            "Pin a commit on the configured upstream branch that also contains the latest "
-            "canonical dev tip. If the changes are not upstream yet, publish them on a "
-            "temporary fork branch and provide vendor-promotion metadata instead. "
-            "Regenerate the lock and vendored snapshot for the chosen SHA.",
-        )
+    reachable = (
+        gh.compare(repo, reviewed.commit, upstream)["merge_base_commit"]["sha"] == reviewed.commit
+    )
+    branch_matches = _is_upstream_main(gh, reviewed)
+    if not (branch_matches and contains_tip and contains_previous and reachable):
+
+        def describe(dev_tip: str, upstream_tip: str) -> Diagnostic:
+            checks = [
+                f"- {'PASS' if branch_matches else 'FAIL'} — configured branch: "
+                f"expected {field(gh.upstream_branch)}, selected {field(reviewed.branch)}.",
+                f"- {'PASS' if contains_tip and contains_previous else 'FAIL'} — "
+                f"the pin {'contains' if contains_tip and contains_previous else 'does not contain'} "
+                f"the latest canonical branch tip and its history: {field(previous.branch)} "
+                f"at `{dev_tip}`. [Compare pin → dev](https://github.com/{_repo_name(previous.url)}"
+                f"/compare/{reviewed.commit}...{dev_tip}).",
+                f"- {'PASS' if reachable else 'FAIL'} — the pin "
+                f"{'is reachable' if reachable else 'is not reachable'} from "
+                f"{field(repo)} / {field(gh.upstream_branch)} at `{upstream_tip}`. "
+                f"[Compare pin → upstream](https://github.com/{repo}"
+                f"/compare/{reviewed.commit}...{upstream_tip}).",
+            ]
+            return Diagnostic(
+                "The upstream source cannot be promoted with the current lock.\n\n"
+                f"Selected source: {field(repo)} / {field(reviewed.branch)}, "
+                f"pin `{reviewed.commit}`.\n\n" + "\n".join(checks),
+                "Choose one of these paths:\n\n"
+                f"1. **Temporary fork branch:** Fetch {field(previous.url)} / "
+                f"{field(previous.branch)}, create or rebase your temporary branch onto its "
+                f"latest tip (observed `{dev_tip}`), and apply the intended changes. Test and push "
+                "that branch to your fork. Update the consumer lock URL, branch, and commit; "
+                "use `scripts/vendor/manage.py` to regenerate and verify the vendored snapshot, "
+                "then commit and push the consumer changes. Add the paired upstream PRs in the "
+                "PR description's vendor-promotion block (use `unpaired_reason` only when "
+                "there genuinely is no upstream PR).\n"
+                f"2. **Upstream branch:** Use {field(repo)} / {field(gh.upstream_branch)} "
+                "only with a pin that passes all three checks above, then regenerate and "
+                "verify the snapshot. This mode does not require an upstream PR list.\n\n"
+                "Changing only the branch field or PR metadata cannot fix failed ancestry "
+                "checks. Equivalent patches under different SHAs do not establish Git ancestry. "
+                "If preserving the dev history is not possible, ask a maintainer for an explicit "
+                "refresh rather than replacing the dev branch history. See the "
+                f"[vendor update guide](https://github.com/{gh.consumer_repo}/blob/"
+                f"{gh.base_branch}/3rdparty/vendor-sources.md).",
+            )
+
+        problem = describe(tip, upstream)
+        problem.notification_text = str(describe("LATEST_DEV_TIP", "UPSTREAM_TIP"))
+        raise problem
     return {
         "promoted": reviewed.commit,
         "upstream_base": previous.commit,
@@ -306,8 +337,8 @@ def _check_source(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) 
     }
 
 
-def _check_canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> str:
-    """Require the immutable source pin to contain the live canonical branch tip."""
+def _canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> str:
+    """Read the live dev tip without accepting a rewritten canonical history."""
     repo = _repo_name(previous.url)
     tip = _sha(gh.get(f"repos/{repo}/git/ref/heads/{previous.branch}")["object"]["sha"])
     if tip in (previous.commit, reviewed.commit):
@@ -317,27 +348,43 @@ def _check_canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.V
             "Canonical branch no longer contains the consumer lock's revision; "
             "a maintainer must inspect the branch history before promotion."
         )
+    return tip
+
+
+def _check_canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> str:
+    """Require the immutable source pin to contain the live canonical branch tip."""
+    repo = _repo_name(previous.url)
+    tip = _canonical_tip(gh, previous, reviewed)
+    if tip in (previous.commit, reviewed.commit):
+        return tip
     if gh.compare(repo, tip, reviewed.commit)["merge_base_commit"]["sha"] != tip:
-        if _is_upstream_main(gh, reviewed):
-            raise Diagnostic(
-                f"The pinned upstream commit {field(reviewed.commit)} does not contain "
-                f"the latest canonical branch tip {field(tip)}.",
-                "Select a newer upstream commit containing that exact dev tip, or use a "
-                "temporary fork branch based on the latest dev tip with vendor-promotion "
-                "metadata. If upstream and dev have diverged, a maintainer must use the "
-                "explicit refresh workflow. Update the lock and vendored snapshot; "
-                "equivalent patches under different SHAs do not establish Git ancestry.",
+
+        def describe(dev_tip: str) -> Diagnostic:
+            if _is_upstream_main(gh, reviewed):
+                return Diagnostic(
+                    f"The pinned upstream commit {field(reviewed.commit)} does not contain "
+                    f"the latest canonical branch tip {field(dev_tip)}.",
+                    "Select a newer upstream commit containing that exact dev tip, or use a "
+                    "temporary fork branch based on the latest dev tip with vendor-promotion "
+                    "metadata. If upstream and dev have diverged, a maintainer must use the "
+                    "explicit refresh workflow. Update the lock and vendored snapshot; "
+                    "equivalent patches under different SHAs do not establish Git ancestry.",
+                )
+            return Diagnostic(
+                f"The pinned temporary source commit {field(reviewed.commit)} does not contain "
+                f"the latest canonical branch tip {field(dev_tip)}.",
+                f"Fetch {field(previous.url)} / {field(previous.branch)} and rebase the temporary "
+                f"source branch {field(reviewed.branch)} onto its latest tip (observed "
+                f"`{dev_tip}`). Push it, then use "
+                "`scripts/vendor/manage.py` to update the consumer lock and vendored snapshot "
+                "to the rebased SHA. The consumer lock's old pin alone is not a sufficient "
+                "base; updating only the PR metadata or temporary branch without its lock pin "
+                "will not fix this.",
             )
-        raise Diagnostic(
-            f"The pinned temporary source commit {field(reviewed.commit)} does not contain "
-            f"the latest canonical branch tip {field(tip)}.",
-            f"Fetch {field(previous.url)} / {field(previous.branch)} and rebase the temporary "
-            f"source branch {field(reviewed.branch)} onto `{tip}`. Push it, then use "
-            "`scripts/vendor/manage.py` to update the consumer lock and vendored snapshot "
-            "to the rebased SHA. The consumer lock's old pin alone is not a sufficient "
-            "base; updating only the PR metadata or temporary branch without its lock pin "
-            "will not fix this.",
-        )
+
+        problem = describe(tip)
+        problem.notification_text = str(describe("LATEST_DEV_TIP"))
+        raise problem
     return tip
 
 
