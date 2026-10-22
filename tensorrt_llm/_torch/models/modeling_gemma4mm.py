@@ -985,7 +985,13 @@ def _normalize_vision_patches(
 
 
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
-    """Shared multimodal encoder flow for Gemma4 conditional generation models."""
+    """Shared multimodal encoder flow for Gemma4 conditional generation models.
+
+    Gemma4 declares its item-major ``pixel_values`` and ``audio_features``
+    layouts, including their per-item position, length, and mask fields, through
+    ``get_multimodal_item_partitions``, so the mixin's
+    ``build_multimodal_encoder_input`` slices them without a Gemma4 override.
+    """
 
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
@@ -1324,7 +1330,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
         Generation-only batches need no multimodal token-type ids for context masking.
         """
-        del position_ids, forward_kwargs
         mm_token_type_ids = None
         if (
             attn_metadata.num_contexts > 0
