@@ -1543,6 +1543,105 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
 
 
+def test_v2_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(monkeypatch):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 2
+    mgr._use_replay_state_update = True
+    mgr._dummy_request_mask = torch.tensor([False, True])
+    mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
+    mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
+    mgr.replay_step_width = 4
+    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
+    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
+    mgr._stacked_conv_states = torch.empty(2, 0)
+    mgr.intermediate_conv_states = torch.empty(0)
+    mgr._commit_gdn_cached_replay_history_layers = MagicMock()
+
+    promote_calls = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
+        lambda *args, **kwargs: promote_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
+        lambda *args, **kwargs: pytest.fail(
+            "V2 replay bookkeeping must be folded into the conv promotion launch"
+        ),
+    )
+
+    mgr.update_mamba_states(
+        SimpleNamespace(num_seqs=2, num_contexts=0),
+        torch.tensor([3, 2], dtype=torch.int32),
+        state_indices=torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+    mgr._commit_gdn_cached_replay_history_layers.assert_called_once()
+    assert len(promote_calls) == 1
+    args, kwargs = promote_calls[0]
+    assert args[0] is mgr._stacked_conv_states
+    assert kwargs["position_source_is_token_count"] is True
+    assert kwargs["replay_pnat"] is mgr.prev_num_accepted_tokens
+    assert kwargs["replay_cache_buf_idx"] is mgr.cache_buf_idx
+    assert kwargs["dummy_request_mask"].tolist() == [False, True]
+    assert kwargs["replay_step_width"] == 4
+    assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
+
+
+@skip_no_cuda
+def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
+    """The one-launch promotion leaves the conv states and replay bookkeeping of the
+    per-step reference (_advance_replay_state, then per-layer promotion)."""
+    num_layers, batch_size = 3, 4
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=batch_size,
+        num_mamba_layers=num_layers,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        conv_state_layout="q_k_v",
+    )
+    try:
+        assert mgr._stacked_conv_states is not None
+        torch.manual_seed(0)
+        mgr.intermediate_conv_states.normal_()
+        for state in mgr.all_conv_states:
+            state.normal_()
+        slots = torch.tensor([1, 3, 0, 2], dtype=torch.int32, device="cuda")
+        mgr.prev_num_accepted_tokens.copy_(
+            torch.randint(0, mgr.replay_history_size, mgr.prev_num_accepted_tokens.shape)
+        )
+        mgr.cache_buf_idx.copy_(torch.randint(0, 2, mgr.cache_buf_idx.shape))
+        mgr._dummy_request_mask[:batch_size] = torch.tensor([False, False, True, False])
+        num_accepted = torch.tensor([1, 4, 2, 3], dtype=torch.int32, device="cuda")
+
+        ref_conv = [state.clone() for state in mgr.all_conv_states]
+        ref_meta = ReplayStateUpdateMetadata(
+            mgr.prev_num_accepted_tokens.clone(),
+            mgr.cache_buf_idx.clone(),
+            mgr.replay_step_width,
+            mgr.replay_history_size,
+        )
+        _advance_replay_state(
+            ref_meta, slots, num_accepted, mgr._dummy_request_mask[:batch_size].clone()
+        )
+        for layer, dst in enumerate(ref_conv):
+            for g in range(batch_size):
+                dst[slots[g]] = mgr.intermediate_conv_states[layer, g, num_accepted[g] - 1]
+
+        mgr._commit_gdn_cached_replay_history_layers = MagicMock()
+        mgr.update_mamba_states(
+            SimpleNamespace(num_seqs=batch_size, num_contexts=0),
+            num_accepted,
+            state_indices=slots,
+        )
+        torch.cuda.synchronize()
+        for state, ref in zip(mgr.all_conv_states, ref_conv):
+            assert torch.equal(state, ref)
+        assert torch.equal(mgr.prev_num_accepted_tokens, ref_meta.prev_num_accepted_tokens)
+        assert torch.equal(mgr.cache_buf_idx, ref_meta.cache_buf_idx)
+    finally:
+        mgr.shutdown()
+
+
 @skip_no_cuda
 def test_attention_dp_dummy_has_reserved_slot_with_batch_size_one():
     mgr = _make_mgr(max_batch_size=1, max_draft_len=0, enable_attention_dp=True)

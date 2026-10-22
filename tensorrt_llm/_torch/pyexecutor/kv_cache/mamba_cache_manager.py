@@ -5006,13 +5006,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        num_accepted_draft_tokens = (
-            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
-                torch.int32)
         if state_indices is None:
             state_indices = self.get_state_indices()
         state_indices_d = state_indices[num_contexts:num_contexts +
                                         num_gens].to(torch.int32)
+        if (self._use_replay_state_update and accepted_leaf_positions is None
+                and self._stacked_conv_states is not None):
+            self._promote_conv_states_and_advance_replay(
+                attn_metadata, num_accepted_tokens, state_indices_d)
+            return
+        num_accepted_draft_tokens = (
+            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
+                torch.int32)
         if self.use_kda_replay_update:
             assert self._dummy_request_mask is not None
             is_dummy_request = self._dummy_request_mask[
@@ -5052,6 +5057,38 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._promote_state(self.all_conv_states, self._stacked_conv_states,
                             self.intermediate_conv_states, src_state_indices,
                             accepted_positions, state_indices_d)
+
+    def _promote_conv_states_and_advance_replay(
+            self, attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices_d: torch.Tensor) -> None:
+        """Replay-path update after a linear speculative step, in one launch.
+
+        The cached replay keeps no intermediate SSM states, so only the
+        accepted convolution windows of all layers are promoted; the same
+        launch advances PNAT and the active history buffer (the arithmetic of
+        ``_advance_replay_state``).
+        """
+        num_contexts = attn_metadata.num_contexts
+        num_gens = attn_metadata.num_seqs - num_contexts
+        self._commit_gdn_cached_replay_history_layers(attn_metadata, num_gens)
+        assert self._dummy_request_mask is not None
+        accepted_tokens = num_accepted_tokens[num_contexts:num_contexts +
+                                              num_gens]
+        _promote_mamba_state_triton(
+            self._stacked_conv_states,
+            self.intermediate_conv_states,
+            self.intermediate_state_indices[:num_gens],
+            accepted_tokens,
+            state_indices_d,
+            num_accepted_tokens=accepted_tokens,
+            position_source_is_token_count=True,
+            replay_pnat=self.prev_num_accepted_tokens,
+            replay_cache_buf_idx=self.cache_buf_idx,
+            dummy_request_mask=self.
+            _dummy_request_mask[num_contexts:num_contexts + num_gens],
+            replay_step_width=self.replay_step_width,
+            replay_history_size=self.replay_history_size)
 
     @staticmethod
     def _promote_state(per_layer: List[torch.Tensor],
