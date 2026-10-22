@@ -3013,3 +3013,81 @@ def test_receiver_rejects_peer_on_another_protocol_version_at_registration(
     with pytest.raises(transfer_mod.PeerIncompatibleError, match="protocol version mismatch"):
         receiver._get_sender_info(params)
     assert len(messengers) == 1
+
+
+def _decode_path_session(
+    monkeypatch: pytest.MonkeyPatch, rid: int
+) -> tuple[_ReceiverProbe, RxSession, KVRecvTask, Mock]:
+    """One published writer (rank 0) with a bounce region, reached through the wire decoder."""
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    session = _make_rx_session(receiver, rid=rid)
+    chunk = _sole_piece([np.array([0], dtype=np.int64)])
+    session.receive(chunk)
+    task = session._kv_tasks[0]
+    task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(
+        chunk, _paged_receive_table(), {0: (0x1000, 0x100)}
+    )
+    task._kv_result_report_tokens = {0: _KV_RESULT_REPORT_TOKEN}
+    receiver._get_session = lambda unique_rid: session if unique_rid == rid else None
+    scatter = Mock()
+    monkeypatch.setattr(bounce_mod, "scatter_write_result", scatter)
+    return receiver, session, task, scatter
+
+
+def _wire_result(rid: int, *, token: bytes, dst_ptr: int) -> list[bytes]:
+    tail = bounce_mod.encode_result_tail(
+        SimpleNamespace(
+            dst_ptrs=np.array([dst_ptr], dtype=np.int64),
+            sizes=np.array([8], dtype=np.int64),
+            bounce_dst_base=0x1000,
+        )
+    )
+    return transfer_mod._make_kv_result_msg(
+        0,
+        rid,
+        0,
+        True,
+        AgentResult.SUCCESS,
+        kv_result_report_token=token,
+        transfer_size=8,
+        tail=tail,
+    )
+
+
+@pytest.mark.cpu_only
+def test_decoded_result_with_wrong_token_records_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Through the wire decoder, a SUCCESS carrying another token cannot complete the writer."""
+    receiver, session, task, scatter = _decode_path_session(monkeypatch, rid=201)
+    message = _wire_result(201, token=b"wrong-token-0000", dst_ptr=0x2000)
+
+    with pytest.raises(ValueError, match="report token"):
+        Receiver._process_kv_agent_result(receiver, b"", message)
+
+    assert task._writer_reports == {}
+    assert task.status != transfer_mod.TaskStatus.TRANSFERRED
+    assert session.kv_cache_size_bytes == 0
+    assert receiver._bounce.failed_writers == []
+    scatter.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_decoded_result_with_out_of_bounds_tail_cannot_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through the wire decoder, a valid token with out-of-bounds descriptors never scatters.
+
+    The verified writer is recorded as FAILED instead, so nothing lands in the KV cache and
+    the request does not wait for the transfer timeout.
+    """
+    receiver, session, task, scatter = _decode_path_session(monkeypatch, rid=202)
+    message = _wire_result(202, token=_KV_RESULT_REPORT_TOKEN, dst_ptr=0x2100)
+
+    Receiver._process_kv_agent_result(receiver, b"", message)
+
+    assert task._writer_reports == {0: False}
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert session.kv_cache_size_bytes == 0
+    assert receiver._bounce.failed_writers == [((202, 0), 0)]
+    scatter.assert_not_called()
