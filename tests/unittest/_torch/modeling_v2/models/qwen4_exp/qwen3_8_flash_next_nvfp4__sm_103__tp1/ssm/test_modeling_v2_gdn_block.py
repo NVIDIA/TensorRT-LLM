@@ -111,6 +111,11 @@ def _layer(seed: int) -> types.SimpleNamespace:
         a_log=torch.empty(HV, device=DEV).uniform_(-5.5, 3.5, generator=g),
         dt_bias=torch.empty(HV, device=DEV).uniform_(-8.9, 19.2, generator=g),
         gnorm=(1.0 + 0.1 * torch.randn(VD // HV, generator=g, device=DEV)).to(BF16),
+        # No FP8 copies: the projections stay on the bf16 entries (dense FP8 mode off).
+        in_proj8=None,
+        out8=None,
+        in_proj_g=None,
+        out_g=None,
     )
 
 
