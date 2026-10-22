@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <limits>
 #include <optional>
 #include <type_traits>
 #include <variant>
@@ -34,6 +35,142 @@
 namespace su = tensorrt_llm::executor::serialize_utils;
 namespace texec = tensorrt_llm::executor;
 using VecTokens = texec::VecTokens;
+
+template <typename T>
+void checkContainerDeserialization(T const& original)
+{
+    std::ostringstream os;
+    su::serialize(original, os);
+    auto const bytes = os.str();
+    std::vector<char> buffer(bytes.begin(), bytes.end());
+    su::VectorWrapBuf<char> streamBuf(buffer);
+    std::istream is(&streamBuf);
+    EXPECT_EQ(su::deserialize<T>(is), original);
+    for (size_t length = 0; length < bytes.size(); ++length)
+    {
+        std::istringstream truncated(bytes.substr(0, length));
+        EXPECT_THROW(su::deserialize<T>(truncated), tensorrt_llm::common::TllmException) << length;
+    }
+    for (auto const count : {size_t{1} << 32, std::numeric_limits<size_t>::max()})
+    {
+        std::ostringstream malformed;
+        su::serialize(count, malformed);
+        std::istringstream input(malformed.str());
+        EXPECT_THROW(su::deserialize<T>(input), tensorrt_llm::common::TllmException);
+    }
+}
+
+TEST(SerializeUtilsTest, RejectMalformedContainerLengths)
+{
+    checkContainerDeserialization(std::string{"payload"});
+    checkContainerDeserialization(std::vector<int>{1, 2, 3});
+    checkContainerDeserialization(std::list<int>{1, 2, 3});
+    checkContainerDeserialization(std::vector<std::optional<std::string>>{std::nullopt, "value"});
+    checkContainerDeserialization(std::string{});
+    checkContainerDeserialization(std::vector<int>{});
+    checkContainerDeserialization(std::list<int>{});
+}
+
+TEST(SerializeUtilsTest, RejectTruncatedDiscriminators)
+{
+    std::istringstream optionalInput;
+    EXPECT_THROW(su::deserialize<std::optional<int>>(optionalInput), tensorrt_llm::common::TllmException);
+    std::istringstream variantInput;
+    EXPECT_THROW(su::deserialize<std::variant<int>>(variantInput), tensorrt_llm::common::TllmException);
+}
+
+TEST(SerializeUtilsTest, ZeroSizeArrayRoundtrip)
+{
+    using EmptyArray = std::array<int, 0>;
+    using EmptyPair = std::pair<EmptyArray, EmptyArray>;
+    std::istringstream empty;
+    EXPECT_EQ(su::deserialize<EmptyArray>(empty), EmptyArray{});
+    std::vector<EmptyArray> const original(3);
+    std::ostringstream malformed;
+    su::serialize(su::kMaxZeroWidthContainerElements + 1, malformed);
+    std::istringstream malformedInput(malformed.str());
+    EXPECT_THROW(su::deserialize<std::vector<EmptyPair>>(malformedInput), tensorrt_llm::common::TllmException);
+
+    std::ostringstream os;
+    su::serialize(original, os);
+    std::istringstream is(os.str());
+    EXPECT_EQ(su::deserialize<std::vector<EmptyArray>>(is), original);
+}
+
+TEST(SerializeUtilsTest, RejectMalformedAgentDescLengths)
+{
+    using texec::kv_cache::AgentDesc;
+    constexpr size_t kMiB = 1024 * 1024;
+
+    auto const largeBackend = std::string(2 * kMiB, 'x');
+    auto const largeDesc = AgentDesc::deserialize(AgentDesc{largeBackend}.serialize());
+    EXPECT_EQ(largeDesc.getBackendAgentDesc(), largeBackend);
+
+    EXPECT_THROW(AgentDesc::deserialize(std::string(64 * kMiB + 1, '\0')), tensorrt_llm::common::TllmException);
+
+    for (auto const count : {size_t{1} << 32, std::numeric_limits<size_t>::max()})
+    {
+        std::ostringstream os;
+        su::serialize(std::string{}, os);
+        su::serialize(count, os);
+        EXPECT_THROW(AgentDesc::deserialize(os.str()), tensorrt_llm::common::TllmException);
+    }
+    AgentDesc const original{"backend", {{0, 1024, 256}}, "handshake"};
+    auto const bytes = original.serialize();
+    auto const restored = AgentDesc::deserialize(bytes);
+    EXPECT_EQ(restored.getBackendAgentDesc(), original.getBackendAgentDesc());
+    EXPECT_EQ(restored.getBounceHandshake(), original.getBounceHandshake());
+    ASSERT_EQ(restored.getVramRegions().size(), 1);
+    auto const legacySize = bytes.size() - su::serializedSize(original.getBounceHandshake());
+    for (size_t length = 0; length < bytes.size(); ++length)
+    {
+        if (length == legacySize)
+        {
+            EXPECT_TRUE(AgentDesc::deserialize(bytes.substr(0, length)).getBounceHandshake().empty());
+        }
+        else
+        {
+            EXPECT_THROW(AgentDesc::deserialize(bytes.substr(0, length)), tensorrt_llm::common::TllmException)
+                << length;
+        }
+    }
+    auto const empty = AgentDesc::deserialize(AgentDesc{""}.serialize());
+    EXPECT_TRUE(empty.getBackendAgentDesc().empty());
+    EXPECT_TRUE(empty.getVramRegions().empty());
+    EXPECT_TRUE(empty.getBounceHandshake().empty());
+}
+
+TEST(SerializeUtilsTest, RejectMalformedRequestAndBufferInfo)
+{
+    namespace kv = texec::kv_cache;
+    kv::RequestAndBufferInfo const original{"agent", "address", tensorrt_llm::batch_manager::RequestInfo{},
+        {kv::MemoryDesc{nullptr, 1024, 0}}, "metadata", 0, {0, 2}};
+    std::ostringstream os;
+    kv::RequestAndBufferInfo::serialize(original, os);
+    auto const bytes = os.str();
+    for (size_t length = 0; length < bytes.size(); ++length)
+    {
+        std::istringstream truncated(bytes.substr(0, length));
+        EXPECT_THROW(kv::RequestAndBufferInfo::deserialize(truncated), tensorrt_llm::common::TllmException) << length;
+    }
+    for (auto const count : {size_t{1} << 32, std::numeric_limits<size_t>::max()})
+    {
+        std::ostringstream prefix;
+        su::serialize(original.mAgentName, prefix);
+        su::serialize(original.mAddress, prefix);
+        tensorrt_llm::batch_manager::RequestInfo::serialize(original.mRequestInfo, prefix);
+        su::serialize(count, prefix);
+        std::istringstream descriptors(prefix.str());
+        EXPECT_THROW(kv::RequestAndBufferInfo::deserialize(descriptors), tensorrt_llm::common::TllmException);
+
+        auto const kindsOffset = bytes.size() - original.mBufferKinds.size() - sizeof(size_t);
+        std::ostringstream kinds;
+        kinds.write(bytes.data(), kindsOffset);
+        su::serialize(count, kinds);
+        std::istringstream kindsInput(kinds.str());
+        EXPECT_THROW(kv::RequestAndBufferInfo::deserialize(kindsInput), tensorrt_llm::common::TllmException);
+    }
+}
 
 void compareRequestPerfMetrics(texec::RequestPerfMetrics const& lh, texec::RequestPerfMetrics const& rh)
 {

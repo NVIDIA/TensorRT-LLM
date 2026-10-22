@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +34,18 @@
 
 namespace tensorrt_llm::executor::serialize_utils
 {
+
+inline constexpr size_t kMaxZeroWidthContainerElements = 1ULL << 20;
+
+template <typename T>
+inline constexpr bool isZeroWidthSerialized = false;
+
+template <typename T, size_t N>
+inline constexpr bool isZeroWidthSerialized<std::array<T, N>> = N == 0 || isZeroWidthSerialized<T>;
+
+template <typename First, typename Second>
+inline constexpr bool isZeroWidthSerialized<std::pair<First, Second>>
+    = isZeroWidthSerialized<First> && isZeroWidthSerialized<Second>;
 
 template <typename CharT, typename TraitsT = std::char_traits<CharT>>
 class VectorWrapBuf : public std::basic_streambuf<CharT, TraitsT>
@@ -394,6 +406,7 @@ T deserialize(std::istream& is)
     {
         T data;
         is.read(reinterpret_cast<char*>(&data), sizeof(data));
+        TLLM_CHECK_WITH_INFO(is, "Truncated serialized value");
         return data;
     }
     // Enum class
@@ -402,6 +415,7 @@ T deserialize(std::istream& is)
         using UnderlyingType = std::underlying_type_t<T>;
         UnderlyingType value;
         is.read(reinterpret_cast<char*>(&value), sizeof(value));
+        TLLM_CHECK_WITH_INFO(is, "Truncated serialized enum");
         return static_cast<T>(value);
     }
     // deserialize from serialization class
@@ -622,6 +636,7 @@ T deserialize(std::istream& is)
     {
         bool hasValue = false;
         is.read(reinterpret_cast<char*>(&hasValue), sizeof(hasValue));
+        TLLM_CHECK_WITH_INFO(is, "Truncated serialized optional");
 
         if (hasValue)
         {
@@ -637,11 +652,19 @@ T deserialize(std::istream& is)
     {
         size_t size = 0;
         is.read(reinterpret_cast<char*>(&size), sizeof(size));
+        TLLM_CHECK_WITH_INFO(is, "Truncated serialized container size");
 
         T container;
+        TLLM_CHECK_WITH_INFO(size <= container.max_size(), "Invalid serialized container size");
+        if constexpr (isZeroWidthSerialized<typename ValueType<T>::type>)
+        {
+            TLLM_CHECK_WITH_INFO(
+                size <= kMaxZeroWidthContainerElements, "Invalid zero-width serialized container size");
+        }
         for (size_t i = 0; i < size; ++i)
         {
             auto element = deserialize<typename ValueType<T>::type>(is);
+            TLLM_CHECK_WITH_INFO(is, "Truncated serialized container element");
             container.push_back(std::move(element));
         }
         return container;
@@ -669,6 +692,7 @@ T deserialize(std::istream& is)
         // Get the index of the active type
         std::size_t index = 0;
         is.read(reinterpret_cast<char*>(&index), sizeof(index));
+        TLLM_CHECK_WITH_INFO(is, "Truncated serialized variant index");
 
         return deserializeVariantByIndex<T>(is, index, std::make_index_sequence<std::variant_size_v<T>>{});
     }
