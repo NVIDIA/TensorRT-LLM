@@ -1167,6 +1167,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         registered by the quantization method's ``create_weights``; the
         value defaults to 1.0 until the checkpoint loader sets it.
 
+        A checkpoint that carries a per-channel pre-quant scale (NVFP4_AWQ /
+        NVFP4_ARC) gets it applied before quantization: the quantization
+        method loads it into ``self.fc31_act_scale`` (``[1, hidden]``), and
+        ``fc31_input_scale`` was calibrated on the scaled activation. The
+        kernel itself only ever sees the quantized input.
+
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
         ``FusedCommMoEScheduler`` can call ``quantize_input`` uniformly
@@ -1187,6 +1193,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            x_bf16 = (x_bf16 * fc31_act_scale).to(torch.bfloat16)
         x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
             x_bf16,
             self.fc31_input_scale,

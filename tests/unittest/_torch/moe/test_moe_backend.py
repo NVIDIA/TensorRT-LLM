@@ -2592,6 +2592,57 @@ def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(
         )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
+    monkeypatch: pytest.MonkeyPatch, has_pre_quant_scale: bool
+) -> None:
+    """An NVFP4_AWQ / NVFP4_ARC pre-quant scale reaches the activation quantizer.
+
+    ``canonical_quant`` folds both recipes into ``nvfp4``, so ``can_implement``
+    admits them, and ``load_quant_scales`` loads their per-channel pre-quant
+    scale into ``fc31_act_scale``. The fused kernel consumes only the quantized
+    activation, which leaves ``quantize_input`` as the one place to apply it.
+
+    ``__new__`` without ``__init__``: the real constructor wants a GPU and a
+    symmetric-memory provider, and ``quantize_input`` reads two parameters.
+    """
+    hidden_size = 64
+    backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
+    torch.nn.Module.__init__(backend)
+    backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    # Weight creation registers the slot as None, and only a checkpoint that
+    # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
+    backend.register_parameter("fc31_act_scale", None)
+    if has_pre_quant_scale:
+        backend.register_parameter(
+            "fc31_act_scale",
+            torch.nn.Parameter(
+                torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0),
+                requires_grad=False,
+            ),
+        )
+    quantizer_calls = []
+
+    def fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        quantizer_calls.append((x.clone(), global_scale))
+        num_rows, num_cols = x.shape
+        return (
+            torch.zeros(num_rows, num_cols // 2, dtype=torch.uint8),
+            torch.zeros(num_rows * num_cols // sf_vec_size, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fake_fp4_quantize, raising=False)
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    backend.quantize_input(x)
+
+    [(quantized, global_scale)] = quantizer_calls
+    expected = x * backend.fc31_act_scale if has_pre_quant_scale else x
+    torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
+    assert global_scale is backend.fc31_input_scale
+
+
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2815,6 +2866,119 @@ def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
         # This clamp-heavy input is intentionally wider than the generic
         # MegaMoE sweep and needs one percentage point of NVFP4 headroom.
         check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
+
+
+@pytest.mark.gpu
+def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
+    """MegaMoE and CUTLASS agree on an NVFP4_AWQ layer, and both match the reference.
+
+    The checkpoint carries the per-channel ``w1`` / ``w3`` ``pre_quant_scale``
+    an AWQ calibration writes, and its input scale is calibrated on
+    ``x * pre_quant_scale``, which is what the reference runs FC1 on. The last
+    check is the control: MegaMoE against the reference on the unscaled input
+    must fail, or this test could not tell a dropped scale apart.
+    """
+    dtype = torch.bfloat16
+    num_experts = 8
+    top_k = 2
+    hidden_size = 512
+    intermediate_size = 512
+    seq_len = 16
+
+    verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping(rank=mpi_rank())
+    _ensure_single_proc_dist_for_megamoe(MoeBackendType.MEGAMOE_CUTEDSL, mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        # One vector for every expert, as AWQ writes it, with per-channel
+        # factors in [1/e, e]: dropping it moves FC1's input far past tolerance.
+        pre_quant_scale = torch.empty(hidden_size, device="cuda").uniform_(-1, 1).exp().to(dtype)
+        x_smoothed = x * pre_quant_scale
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x_smoothed, MoeBackendType.MEGAMOE_CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        ref_cls = quant_kwargs.pop("ref_cls")
+        weights = quantize_util.create_weights(**quant_kwargs)
+        for expert_id in range(num_experts):
+            weights[f"{expert_id}.w1.pre_quant_scale"] = pre_quant_scale
+            weights[f"{expert_id}.w3.pre_quant_scale"] = pre_quant_scale
+        token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+
+        outputs = {}
+        for backend_type in (MoeBackendType.CUTLASS, MoeBackendType.MEGAMOE_CUTEDSL):
+            backend = create_test_backend(
+                backend_type=backend_type,
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ),
+                mapping=mapping,
+            )
+            backend.load_weights([weights])
+            backend.post_load_weights()
+            backend.cuda()
+            assert backend.fc31_act_scale is not None
+            with torch.inference_mode():
+                x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+                outputs[backend_type] = run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe(x_smoothed, router_logits)
+            unscaled_ref_output = ref_fused_moe(x, router_logits)
+
+    cutlass_output = outputs[MoeBackendType.CUTLASS]
+    megamoe_output = outputs[MoeBackendType.MEGAMOE_CUTEDSL]
+    ref_fused_moe.check_accuracy(cutlass_output, ref_output)
+    ref_fused_moe.check_accuracy(megamoe_output, ref_output)
+    ref_fused_moe.check_accuracy(megamoe_output, cutlass_output)
+    with pytest.raises(Exception, match="Mismatch percentage"):
+        ref_fused_moe.check_accuracy(megamoe_output, unscaled_ref_output)
 
 
 @pytest.fixture(scope="module")
