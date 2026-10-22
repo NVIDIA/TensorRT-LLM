@@ -677,9 +677,7 @@ private:
         if (mSM != kSM_107)
         {
             FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
-            int32_t ctaDim = 512;
-            std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
-            return {options, optionsFromArgs, ctaDim};
+            return autoTuner.selectKernel();
         }
 
         if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
