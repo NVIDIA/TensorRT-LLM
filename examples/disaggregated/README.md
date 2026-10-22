@@ -19,6 +19,7 @@ These two files are the minimum that runs, and are used by the sections below:
 
 ```yaml
 # ctx_config.yaml
+internal_request_auth_key: <shared-secret>
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
@@ -26,11 +27,15 @@ cache_transceiver_config:
 
 ```yaml
 # gen_config.yaml
+internal_request_auth_key: <shared-secret>
 cache_transceiver_config:
   backend: NIXL
 ```
 
-These examples omit `max_tokens_in_buffer` and leave the runtime at `auto`.
+Replace `<shared-secret>` with the same cryptographically random value in every
+worker and proxy configuration. Use at least 128 bits of entropy; a freshly
+generated 32-byte secret is recommended. These examples omit
+`max_tokens_in_buffer` and leave the runtime at `auto`.
 On the standard PyTorch model-loading path, `backend: DEFAULT` with runtime
 `auto` normally selects NIXL/Python when no legacy backend selector or
 incompatible configuration intervenes. Keep `DEFAULT`/`auto` when the test
@@ -117,6 +122,7 @@ To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with
 **Context server configuration:**
 ```yaml
 # context_config_nixl.yml
+internal_request_auth_key: <shared-secret>
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
@@ -125,6 +131,7 @@ cache_transceiver_config:
 **Generation server configuration:**
 ```yaml
 # gen_config_nixl.yml
+internal_request_auth_key: <shared-secret>
 cache_transceiver_config:
   backend: NIXL
 ```
@@ -265,11 +272,12 @@ generation_servers:
 ```
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
-Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
-server config and in each context/generation worker config. The proxy signs internal
-generation requests with this key, and generation workers reject request-supplied
-disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
-the internal handoff does not carry a valid signature.
+Set `internal_request_auth_key` to the same cryptographically random secret in the
+disaggregated server config and in each context/generation worker config. Use at
+least 128 bits of entropy; a freshly generated 32-byte secret is recommended. The
+proxy signs internal generation requests with this key, and generation workers
+reject request-supplied disaggregated metadata such as `ctx_info_endpoint` or
+`encoded_opaque_state` when the internal handoff does not carry a valid signature.
 
 
 #### Sending requests to the disaggregated server

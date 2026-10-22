@@ -60,6 +60,23 @@ def test_rank_info_server_accepts_once_with_valid_tag():
     server._messenger.send.assert_called_once_with([b"client", MessageType.AUTHENTICATION_ERROR])
 
 
+def test_rank_info_server_rejects_wrong_key_and_consumes_challenge():
+    server = _make_server()
+    nonce = b"n" * 32
+    server._rank_info_auth_challenges[b"client"] = nonce
+    request = [
+        MessageType.REQUEST_INSTANCE_INFO,
+        nonce,
+        _rank_info_auth_tag(b"wrong-key" * 4, _ENDPOINT, nonce),
+    ]
+
+    server._handle_rank_info_request(b"client", request)
+
+    server._messenger.send.assert_called_once_with([b"client", MessageType.AUTHENTICATION_ERROR])
+    assert b"client" not in server._rank_info_auth_challenges
+    server._rank_info.to_bytes.assert_not_called()
+
+
 def test_receiver_authenticates_rank_info_request():
     receiver = Receiver.__new__(Receiver)
     receiver._rank_info_auth_key = _AUTH_KEY
