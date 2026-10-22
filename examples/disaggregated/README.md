@@ -260,6 +260,8 @@ The supplied SLURM benchmark, simple-example, and local Ray/MPI launch scripts
 generate a fresh shared authentication key for each deployment and provision it
 in private worker/proxy configuration files; users do not need to supply a key.
 The service-discovery script already generates a shared key when none is supplied.
+The [local OpenEngine launcher](../../tensorrt_llm/grpc/openengine/README.md#disaggregated-serving)
+also provisions a fresh shared key for its context/generation gRPC pair.
 The shared `disaggregated_mpi_worker` job uses the launcher's key when present;
 otherwise rank 0 generates a native RankInfo key and broadcasts it before the
 job splits into context and generation groups. The generated MPI key is internal

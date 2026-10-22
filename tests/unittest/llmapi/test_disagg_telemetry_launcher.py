@@ -495,3 +495,30 @@ def test_rank_info_key_is_shared_with_mpi_ranks_and_spawned_client(monkeypatch):
     assert serve._resolve_rank_info_auth_key(config, True, comm) == key
     comm.bcast.assert_not_called()
     assert env_name not in os.environ
+
+
+@pytest.mark.parametrize("protocol", ["openengine", "smg"])
+def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol):
+    config = tmp_path / "worker.yaml"
+    config.write_text(
+        "internal_request_auth_key: deployment-key\ncache_transceiver_config:\n  backend: NIXL\n"
+    )
+    launch = mock.Mock()
+    module = SimpleNamespace(launch_server=launch, launch_smg_server=launch)
+    monkeypatch.setitem(sys.modules, f"tensorrt_llm.grpc.{protocol}.server", module)
+    monkeypatch.setattr(serve, "get_is_diffusion_only_model", lambda _: False)
+    monkeypatch.setattr(serve, "device_count", lambda: 1)
+    monkeypatch.setattr(serve, "find_spec", lambda _: object())
+
+    serve.main(
+        args=["dummy/model", "--config", str(config), "--grpc", "--grpc-protocol", protocol],
+        standalone_mode=False,
+    )
+
+    launch.assert_called_once()
+    llm_args = launch.call_args.args[2]
+    transceiver = llm_args["cache_transceiver_config"]
+    assert transceiver.backend == "NIXL"
+    assert transceiver._rank_info_auth_key == b"deployment-key"
+    assert "_rank_info_auth_key" not in transceiver.model_dump()
+    assert "internal_request_auth_key" not in llm_args
