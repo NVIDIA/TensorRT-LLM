@@ -148,11 +148,17 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
 #if ENABLE_MULTI_DEVICE
 
 // Need static connection initialization for accurate KV cache size estimation.
+// Disable graph register to avoid hangs, as getComm() does: NCCL reads the parameter once per
+// process, so a pipeline-only model, which never calls getComm(), would otherwise fix it to the
+// default for every later model in the same process.
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
         _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
+        _putenv_s("NCCL_GRAPH_REGISTER", "0");
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    setenv("NCCL_GRAPH_REGISTER", "0", 0);
     if (getenv("NCCL_NVLS_ENABLE") == nullptr && !ipcNvlsFabricUsable())
     {
         setenv("NCCL_NVLS_ENABLE", "0", 0);
