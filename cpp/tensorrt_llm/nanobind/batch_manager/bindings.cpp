@@ -26,6 +26,7 @@
 
 #include <ATen/ATen.h>
 #include <algorithm>
+#include <cstring>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/chrono.h>
@@ -361,7 +362,7 @@ void initBindings(nb::module_& m)
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                tb::LlmRequest::SizeType32 max_new_tokens, nb::handle input_tokens_handle,
                 executor::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<at::Tensor> prompt_embedding_table,
                 std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
@@ -400,16 +401,32 @@ void initBindings(nb::module_& m)
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
+                // A 1-D contiguous int32 CPU ndarray is memcpy'd (no O(ISL) PyLong casts under the GIL);
+                // anything else takes the sequence cast.
+                auto input_tokens = [&]() -> std::vector<tb::LlmRequest::TokenIdType>
+                {
+                    nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> arr;
+                    if (nb::try_cast(input_tokens_handle, arr, /*convert=*/false))
+                    {
+                        std::vector<tb::LlmRequest::TokenIdType> out(arr.shape(0));
+                        if (arr.shape(0) > 0)
+                        {
+                            std::memcpy(out.data(), arr.data(), arr.shape(0) * sizeof(int32_t));
+                        }
+                        return out;
+                    }
+                    return nb::cast<std::vector<tb::LlmRequest::TokenIdType>>(input_tokens_handle);
+                }();
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
-                    multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
-                    kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
-                    draft_tokens, exclude_input_from_output, encoder_input_tokens, return_encoder_output, priority,
-                    encoder_input_features_tensor_ptr, encoder_output_length, llm_request_type, input_token_extra_ids,
-                    return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
-                    multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
-                    std::move(cache_salt)};
+                new (self) tb::LlmRequest{request_id, max_new_tokens, std::move(input_tokens), sampling_config,
+                    is_streaming, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
+                    multimodal_positions, multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr,
+                    lora_config_tensor_ptr, kv_cache_retention_config, return_log_probs, return_context_logits,
+                    return_generation_logits, draft_tokens, exclude_input_from_output, encoder_input_tokens,
+                    return_encoder_output, priority, encoder_input_features_tensor_ptr, encoder_output_length,
+                    llm_request_type, input_token_extra_ids, return_perf_metrics, context_phase_params, arrival_time,
+                    std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths, std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("prompt_embedding_table") = std::nullopt,
