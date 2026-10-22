@@ -68,7 +68,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 107, 89, 120),
+    getSMVersion() not in (100, 107, 89, 120, 121),
     reason="The test is for Blackwell and Ada only. Current SM is %d." %
     getSMVersion(),
 )
@@ -163,7 +163,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (90, 89, 120),
+    getSMVersion() not in (90, 89, 120, 121),
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),
 )
