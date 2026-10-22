@@ -495,7 +495,8 @@ def test_per_layer_dynamic_manager_shares_the_base_lifecycle_only():
     assert not isinstance(manager, MoeLoadBalancer)
     assert manager.is_dynamic_routing()
     assert repr(manager) == (
-        "PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, num_slots=24, auxiliary_sms=8)"
+        "PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, num_slots=24, auxiliary_sms=8, "
+        "planner=halo_q)"
     )
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     assert layer.produces_replica_plan

@@ -218,7 +218,14 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             return
 
         backend_ref = weakref.ref(backend)
-        from .mega_moe.rebalance_slot_scheduler import build_rebalance_slot_scheduler_group
+        if self.manager.planner == "halo_r":
+            from .mega_moe.halo_r_slot_scheduler import (
+                build_halo_r_slot_scheduler_group as build_scheduler_group,
+            )
+        else:
+            from .mega_moe.rebalance_slot_scheduler import (
+                build_rebalance_slot_scheduler_group as build_scheduler_group,
+            )
 
         if bool(getattr(backend, "tactic_autotune", False)):
             # Synthetic profiling may visit every helper row before a real
@@ -232,7 +239,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
         # ``layer_idx`` is the backend's model layer index: shared-slot pools
         # compare producers across ranks by it.
-        scheduler_group = build_rebalance_slot_scheduler_group(
+        scheduler_group = build_scheduler_group(
             arena=arena,
             manager=self.manager,
             mapping=backend.mapping,
@@ -257,13 +264,13 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         *,
         overlap_fn: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
-        """Submit HALO-Q/TMA and return its physical routes without a host wait.
+        """Submit the replica planner and copy; return physical routes without a host wait.
 
         ``overlap_fn`` runs after the copy stream is submitted but before the
         physical routes are lent to the caller, so independent main-stream work
         such as shared experts overlaps planning and the helper-weight copy.
         """
-        del offset_by_ep_rank  # HALO-Q consumes global logical expert IDs.
+        del offset_by_ep_rank  # The planners consume global logical expert IDs.
         if overlap_fn is not None and not callable(overlap_fn):
             raise TypeError("overlap_fn must be callable")
         if self._scheduler_group is None or self._arena is None:
@@ -296,7 +303,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                 if type(notes) is not list:
                     notes = []
                     error.__notes__ = notes
-                notes.append("overlap_fn failed after HALO-Q/TMA enqueue; " + cleanup_note)
+                notes.append("overlap_fn failed after the rebalance enqueue; " + cleanup_note)
                 raise
             physical, generation = self._scheduler_group.plan_finish(part, defer_wait=True)
         generation = int(generation)
@@ -394,6 +401,11 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
         # Resident helper experts need helper rows that only their layer writes.
         self.helper_residency = helper_slot_mode == "per_layer_resident"
+        self.planner = str(getattr(config, "planner", "halo_q"))
+        if self.planner not in ("halo_q", "halo_r"):
+            raise ValueError(f"unknown per-layer dynamic EPLB planner {self.planner!r}")
+        if self.planner == "halo_r" and self.helper_residency:
+            raise ValueError("planner 'halo_r' requires helper_slot_mode 'shared_banks'")
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None
@@ -423,7 +435,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         return (
             f"PerLayerDynamicMoeLoadBalancer(ep_rank={self.ep_rank}, "
             f"ep_size={self.ep_size}, num_slots={self.num_slots}, "
-            f"auxiliary_sms={self.auxiliary_sms})"
+            f"auxiliary_sms={self.auxiliary_sms}, planner={self.planner})"
         )
 
     def is_static_routing(self) -> bool:
