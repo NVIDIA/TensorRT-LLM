@@ -161,7 +161,8 @@ acceptance gate, so it must be defensible:
   `internal-perf-nsight-system-analysis` products),
   `server_nsys_metrics.nsys-rep` (Run A2a utilization
   pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
-  `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`, `serve.log`,
+  `microbench_<hotspot>.py`, `ncu_<hotspot>.ncu-rep[z]` plus per-hotspot
+  details / raw CSV summaries, `serve.log`,
   and any benchmark result JSON you produce
   while replaying the load.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.
@@ -191,7 +192,8 @@ context — do not touch them.
    `analysis/` directory, decompose the nsys timeline with the
    **`internal-perf-nsight-system-analysis` skill** (Run A step 5 below — load it
    unprompted; it re-reads the trace you just captured and costs no
-   extra server launch), then run the ncu deep dive (Run B below) on
+   extra server launch), then run the standalone ncu microbenchmark deep
+   dive (Run B below) on
    the top nsys kernels — **loading the `perf-nsight-compute-analysis`
    skill** as its capture + interpretation methodology — into the same
    directory, and tear every server down.
