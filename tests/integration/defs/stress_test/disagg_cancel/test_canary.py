@@ -134,7 +134,7 @@ _CANARY_YAML = textwrap.dedent(
     generation_servers: {{}}
     stress_config:
       duration_min: 1
-      kv_cache_manager: v1
+      kv_cache_manager: v2
       transceiver: python
       canary:
         prompts_file: {prompts_file}

@@ -29,7 +29,6 @@ def _make_creator(
     costs_available: bool = False,
     is_v2: bool = True,
     separate_draft: bool = True,
-    two_model: bool = False,
     user_max_tokens=None,
     slope: int = 100,
 ) -> KvCacheCreator:
@@ -37,7 +36,6 @@ def _make_creator(
     c._kv_cache_config = KvCacheConfig(max_gpu_total_bytes=GB, max_tokens=user_max_tokens)
     c._is_kv_cache_manager_v2 = is_v2
     c._max_batch_size = 8
-    c._draft_model_engine = object() if two_model else None
     c._should_create_separate_draft_kv_cache = lambda: separate_draft
     c._get_kv_size_per_token = lambda *args, **kwargs: CacheCost(slope=slope)
     costs = (CacheCost(slope=80), CacheCost(slope=20)) if costs_available else None
@@ -84,10 +82,9 @@ def test_user_max_tokens_is_left_alone():
     "kwargs",
     [
         {"separate_draft": False},
-        {"two_model": True},
         {"is_v2": False},
     ],
-    ids=["target_only", "two_model", "v1"],
+    ids=["target_only", "v1"],
 )
 def test_backstop_is_scoped_to_one_model_v2_drafts(kwargs):
     _, draft = _split(_make_creator(**kwargs))

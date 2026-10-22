@@ -258,6 +258,32 @@ def test_offer_is_backed_by_real_pages(manager, connector):
     assert len(set(page_indices)) == len(page_indices)
 
 
+def test_a_served_cache_is_allocated_off_the_execution_stream(connector):
+    """The fence waits for the allocation, not for the execution stream."""
+    torch.cuda.init()
+    execution_stream = torch.cuda.Stream()
+    manager = make_manager(connector, execution_stream=execution_stream)
+    try:
+        request = make_request()
+        assert schedule(manager, request)
+        kv_cache = manager.kv_cache_map[request.py_request_id]
+        assert kv_cache.cuda_stream == manager._allocation_stream.cuda_stream
+
+        batch = run(manager, request)
+        manager.report_batch_to_connector(batch)
+        assert kv_cache.cuda_stream == execution_stream.cuda_stream
+
+        with torch.cuda.stream(execution_stream):
+            torch.cuda._sleep(1 << 31)
+            forward_done = torch.cuda.Event()
+            forward_done.record(execution_stream)
+        manager.wait_allocation_fences([request.py_request_id])
+        assert not forward_done.query(), "the fence waited for the execution stream"
+        execution_stream.synchronize()
+    finally:
+        manager.shutdown()
+
+
 def test_the_unchunked_path_allocates_nothing_for_the_prefix(manager, connector):
     """``resize_context`` already covered the whole prompt, so honouring the
     offer only moves the request's start."""

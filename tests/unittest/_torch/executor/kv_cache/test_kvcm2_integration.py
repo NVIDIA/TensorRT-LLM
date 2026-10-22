@@ -1325,6 +1325,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     manager.is_estimating_kv_cache = False
     manager._has_cp_helix = False
     manager.kv_cache_map = {} if fresh_cache else {request.py_request_id: kv_cache}
+    manager._on_allocation_stream = set()
     manager._stream = SimpleNamespace(cuda_stream=Mock())
     manager._context_reuse_tokens = Mock(return_value=[10, 11, 12])
     manager._create_kv_cache = Mock(return_value=kv_cache)
@@ -1956,6 +1957,7 @@ class _ContextRequest:
     context_current_position: int = 0
     py_served_prefix_end: int = 0
     py_num_connector_matched_tokens: int = 0
+    py_connector_allocation_reported: bool = False
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None
@@ -2921,8 +2923,12 @@ def _make_admission_manager(
     manager.is_estimating_kv_cache = is_estimating_kv_cache
     manager._spec_recompute_tail = 0
     manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
+    manager._allocation_stream = None
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager._resume_and_restore = lambda _req_id, _kv_cache: True
     kv_cache = SimpleNamespace(
+        is_active=False,
         num_committed_tokens=7,
         enable_swa_scratch_reuse=True,
         drop_cached_token_attribution=Mock(),
