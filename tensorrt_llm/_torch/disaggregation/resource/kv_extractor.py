@@ -464,6 +464,8 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     - Consistent: the same internal layer produces the same ID regardless of
       PP configuration, so that peer matching in peer.py works correctly.
 
+    For managers that declare ``get_disagg_global_layer_ids``: returns the
+    manager's declaration, which must satisfy the same two guarantees.
     For standard V2 managers: maps local IDs to global model layer IDs via
     pp_layers (which happen to also be collision-free).
     For managers with virtual layers: encodes
@@ -471,6 +473,16 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     _layer_attn_to_layer_id inverse mapping.
     """
     local_layer_ids = manager.impl.layer_grouping[lg_idx]
+
+    get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
+    if get_global_layer_ids is not None:
+        global_layer_ids = [int(layer_id) for layer_id in get_global_layer_ids(lg_idx)]
+        if len(global_layer_ids) != len(local_layer_ids):
+            raise ValueError(
+                f"Layer group {lg_idx}: {len(global_layer_ids)} declared global layer ids "
+                f"for {len(local_layer_ids)} layers"
+            )
+        return global_layer_ids
 
     if not hasattr(manager, "_layer_attn_to_layer_id"):
         # Standard: local_layer_id is index into pp_layers
