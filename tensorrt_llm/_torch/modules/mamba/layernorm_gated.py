@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
+
 from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
 
@@ -141,6 +143,16 @@ _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
 
 
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switch; q35_env.activate() re-reads it."""
+    global _Q35_PDL_EARLY_TRIGGER
+    # Release PDL dependents (out_proj) at kernel entry so they prefetch their
+    # weights; they read Y only after their own griddepcontrol.wait.
+    _Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER",
+                                            "0") == "1"
+
+
 @functools.lru_cache(maxsize=None)
 def _pdl_device_policy(device_index: int) -> tuple[bool, int]:
     """Whether PDL is allowed on this device, and its SM count."""
@@ -180,6 +192,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr = False,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -194,6 +207,15 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if EARLY_TRIGGER:
+        # Dependents read Y only after their own griddepcontrol.wait.
+        tl.extra.cuda.gdc_launch_dependents()
+    # The weight is a parameter (not produced in-step), so it is fetched before
+    # the PDL wait; X (the producer's output) and Z (an earlier in-step kernel's
+    # output) are read only after it.
+    w = tl.load(W + cols).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
@@ -202,9 +224,6 @@ def _rms_norm_gated_fwd_multirow_kernel(
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
-    w = tl.load(W + cols).to(tl.float32)
-    if WEIGHT_IS_DELTA:
-        w += 1.0
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
@@ -223,7 +242,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
-    if LAUNCH_WITH_PDL:
+    if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -306,6 +325,7 @@ def rms_norm_gated_token_major(
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=_MULTIROW_NUM_WARPS,
+            EARLY_TRIGGER=_Q35_PDL_EARLY_TRIGGER,
             launch_pdl=launch_with_pdl,
         )
     return out
