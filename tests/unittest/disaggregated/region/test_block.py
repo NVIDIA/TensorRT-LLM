@@ -25,10 +25,10 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
     plan_transfers,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import AttentionInfo, RankInfo
@@ -103,7 +103,7 @@ def test_spec_region_and_spec_region_pair():
 
 
 def _kv_table(layer_offsets, bytes_per_layer, kv_heads):
-    """One attention space whose global layer ``i`` sits at ``layer_offsets[i]`` (K then V)."""
+    """One attention layer group whose global layer ``i`` sits at ``layer_offsets[i]`` (K then V)."""
     half = bytes_per_layer // 2
     buffers = (BufferDecl(half, ATTENTION_TP, (("head", kv_heads),), "head"),)
     regions = []
@@ -116,10 +116,10 @@ def _kv_table(layer_offsets, bytes_per_layer, kv_heads):
     slot = max(o for o in layer_offsets if o is not None) + bytes_per_layer
     return PageTable(
         pools=[Pool(0, slot_bytes=slot, num_slots=4)],
-        spaces=[
-            UnitSpace(
+        layer_groups=[
+            LayerGroup(
                 spec="attention",
-                unit=CacheKind.PAGED,
+                kind=CacheKind.PAGED,
                 regions=regions,
                 params={"tokens_per_block": 4, "window": None},
             )

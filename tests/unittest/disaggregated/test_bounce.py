@@ -47,11 +47,11 @@ from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
-    bounce_unit_bytes_per_space,
+    bounce_unit_bytes_per_layer_group,
     plan_transfers,
     receiver_extra_bytes,
 )
@@ -251,10 +251,10 @@ def test_fanin_bounce_safe_gate() -> None:
         region = Region(pool=0, layer=0, role="index_key", offset=0, buffers=(decl,))
         return PageTable(
             pools=[Pool(base_address=0x1000, slot_bytes=64, num_slots=4)],
-            spaces=[
-                UnitSpace(
+            layer_groups=[
+                LayerGroup(
                     spec="attention",
-                    unit=CacheKind.PAGED,
+                    kind=CacheKind.PAGED,
                     regions=[region],
                     params={"tokens_per_block": 16, "window": None},
                 )
@@ -424,10 +424,10 @@ class TestFanInReserve:
                 Pool(base_address=0x200000, slot_bytes=100, num_slots=8),
                 Pool(base_address=0x300000, slot_bytes=25, num_slots=8),
             ],
-            spaces=[
-                UnitSpace(
+            layer_groups=[
+                LayerGroup(
                     spec="attention",
-                    unit=CacheKind.PAGED,
+                    kind=CacheKind.PAGED,
                     # Two regions share pool 1: its slot counts once.
                     regions=[
                         region(0, "all", 0, 100),
@@ -439,7 +439,7 @@ class TestFanInReserve:
             ],
         )
 
-        assert bounce_unit_bytes_per_space(page_table) == [125]
+        assert bounce_unit_bytes_per_layer_group(page_table) == [125]
         assert btr.block_bytes_per_group(page_table) == [125]
 
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
@@ -525,7 +525,7 @@ class TestFanInReserve:
 
     def test_reserve_does_not_wait_for_recv_space(self, monkeypatch):
         # The receiver reserves on the executor thread, so a full recv region must fall back to
-        # the per-fragment path at once instead of waiting for space to free up.
+        # the per-fragment path at once instead of waiting for layer group to free up.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         timeouts = []
 
@@ -729,7 +729,7 @@ class TestFanInReserve:
 # trailing-empty-group handling, and recurrent-state (extra_bytes) sizing
 # --------------------------------------------------------------------------- #
 
-# Kimi K3 geometry: 24 MLA layers in one attention unit space; 69 KDA layers
+# Kimi K3 geometry: 24 MLA layers in one attention layer group; 69 KDA layers
 # whose per-layer recurrent state is a bf16 short-conv slot + fp32 delta slot,
 # replicated per rank.
 _K3_MLA_BLOCK_BYTES = 32 * 576 * 2 * 24  # tpb x (kv_lora_rank+rope) x bf16 x 24 layers = 884,736
@@ -744,13 +744,13 @@ _K3_KDA_PAYLOAD_BYTES = (
 def _k3_page_table() -> PageTable:
     """A K3-shaped page table as the mamba spec describes it.
 
-    One unit space per life cycle, attention first and the recurrent-state space LAST, as the
-    space index follows the life-cycle id.
+    One layer group per life cycle, attention first and the recurrent-state layer group LAST, as the
+    layer group index follows the life-cycle id.
     """
     mla_layer_bytes = _K3_MLA_BLOCK_BYTES // 24
-    attn = UnitSpace(
+    attn = LayerGroup(
         spec="mamba",
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         regions=[
             Region(
                 pool=0,
@@ -794,10 +794,10 @@ def _k3_page_table() -> PageTable:
             )
         )
     regions.sort(key=lambda r: (r.pool, r.offset))
-    mamba = UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)
+    mamba = LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=regions)
     return PageTable(
         pools=[Pool(0x100000, _K3_MLA_BLOCK_BYTES, 128), conv_pool, ssm_pool],
-        spaces=[attn, mamba],
+        layer_groups=[attn, mamba],
     )
 
 
@@ -810,12 +810,12 @@ def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
 
 
 def _receiver_units(page_table, dst_slot):
-    """A receive request's per-space units: one attention block, and the state slot if any."""
+    """A receive request's per-layer group units: one attention block, and the state slot if any."""
     return [
         np.array([dst_slot] if dst_slot is not None else [], dtype=np.int64)
-        if space.unit == CacheKind.STATE
+        if layer_group.kind == CacheKind.STATE
         else np.array([0], dtype=np.int64)
-        for space in page_table.spaces
+        for layer_group in page_table.layer_groups
     ]
 
 
@@ -834,7 +834,7 @@ def _state_paired(sender_ri, peer_ri, global_heads=8):
         )
         return PageTable(
             pools=[Pool(0x100, heads * 4, 4)],
-            spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=[region])],
+            layer_groups=[LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=[region])],
         )
 
     return bool(plan_transfers(sender_ri, peer_ri, table(sender_ri), table(peer_ri)))
@@ -843,14 +843,14 @@ def _state_paired(sender_ri, peer_ri, global_heads=8):
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestHybridK3Bounce:
     def test_block_bytes_per_group_keeps_mamba_placeholder(self):
-        # The state space must stay in the list as a placeholder (None), aligned with the
-        # space indices a recv request uses, instead of truncating the list.
-        assert bounce_unit_bytes_per_space(_k3_page_table()) == [_K3_MLA_BLOCK_BYTES, None]
+        # The state layer group must stay in the list as a placeholder (None), aligned with the
+        # layer group indices a recv request uses, instead of truncating the list.
+        assert bounce_unit_bytes_per_layer_group(_k3_page_table()) == [_K3_MLA_BLOCK_BYTES, None]
         assert btr.block_bytes_per_group(_k3_page_table()) == [_K3_MLA_BLOCK_BYTES, None]
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
         # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
-        # the recurrent-state space (transceiver._create_chunk), which used to trip the
+        # the recurrent-state layer group (transceiver._create_chunk), which used to trip the
         # unknown-slot-size guard and silently push every K3 request onto the per-fragment
         # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
         t = _make_transport(
@@ -902,7 +902,7 @@ class TestHybridK3Bounce:
     def test_receiver_payload_bytes_zero_without_slot_or_group(self):
         pt = _k3_page_table()
         assert receiver_extra_bytes(pt, pt, _receiver_units(pt, None)) == 0
-        pure_attn = PageTable(pools=pt.pools, spaces=[pt.spaces[0]])
+        pure_attn = PageTable(pools=pt.pools, layer_groups=[pt.layer_groups[0]])
         assert receiver_extra_bytes(pure_attn, pure_attn, _receiver_units(pure_attn, 3)) == 0
 
     def test_receiver_payload_unsizable_without_sender_table(self):

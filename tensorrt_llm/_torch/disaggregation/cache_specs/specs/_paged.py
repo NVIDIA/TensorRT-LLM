@@ -29,7 +29,7 @@ import numpy as np
 from tensorrt_llm import logger
 
 from ..correspondence import log_incompatible
-from ..page_table import BufferDecl, PageTable, UnitSpace
+from ..page_table import BufferDecl, LayerGroup, PageTable
 from ..spec import ChunkContext, LocalUnitsContext, PairContext, RegistrationRegion
 from ..topology import ATTENTION_TP
 
@@ -103,7 +103,7 @@ def local_units(ctx: LocalUnitsContext) -> np.ndarray:
     """
     tpb = ctx.reuse_adapter.tokens_per_block
     prompt_blocks = (ctx.transfer_len + tpb - 1) // tpb
-    ordinals = ctx.reuse_adapter.get_block_ordinals(ctx.request, ctx.space_index)
+    ordinals = ctx.reuse_adapter.get_block_ordinals(ctx.request, ctx.group_index)
     window = np.full(prompt_blocks, -1, dtype=np.int64)
     n = min(int(ordinals.size), prompt_blocks)
     window[:n] = ordinals[:n]
@@ -111,10 +111,10 @@ def local_units(ctx: LocalUnitsContext) -> np.ndarray:
     return window
 
 
-def chunk_units(space: UnitSpace, units: np.ndarray, ctx: ChunkContext) -> np.ndarray:
-    window = space.params.get("window")
+def chunk_units(layer_group: LayerGroup, units: np.ndarray, ctx: ChunkContext) -> np.ndarray:
+    window = layer_group.params.get("window")
     if window is not None and window < ctx.prompt_len:
-        # SWA blocks can leave the active window between chunks: defer the space and send its
+        # SWA blocks can leave the active window between chunks: defer the layer group and send its
         # complete final active window at once.
         return units if ctx.is_last else np.full_like(units, -1)
     # Positional: keep the chunk's ordinals, blank everything else.
@@ -133,7 +133,7 @@ def pair_units(
         # partition_context_for_helix), so its table is the strided subset of ours; block reuse is
         # rejected under helix.
         src_units = src_units[ctx.peer_ri.cp_rank :: ctx.peer_ri.cp_size]
-    tokens_per_block = ctx.space.params["tokens_per_block"]
+    tokens_per_block = ctx.layer_group.params["tokens_per_block"]
     dst_start_block = (
         ctx.dst_start_token // tokens_per_block if ctx.dst_start_token is not None else 0
     )
@@ -149,10 +149,10 @@ def transfer_bytes(region_bytes: int, units: np.ndarray) -> int:
 # ---------------------------------------------------------------------------
 
 
-def registration_regions(page_table: PageTable, space_index: int) -> List[RegistrationRegion]:
+def registration_regions(page_table: PageTable, group_index: int) -> List[RegistrationRegion]:
     # Each pool is an independent allocation spanning all of its slots.
     regions = []
-    for pool_idx in page_table.spaces[space_index].pools:
+    for pool_idx in page_table.layer_groups[group_index].pools:
         pool = page_table.pools[pool_idx]
         regions.append(
             RegistrationRegion(pool.base_address, pool.num_slots * pool.slot_stride_bytes)
@@ -160,11 +160,11 @@ def registration_regions(page_table: PageTable, space_index: int) -> List[Regist
     return regions
 
 
-def bounce_unit_bytes(page_table: PageTable, space_index: int) -> int:
+def bounce_unit_bytes(page_table: PageTable, group_index: int) -> int:
     # Several regions of one physical pool contribute that pool once.
     return sum(
         int(page_table.pools[pool_idx].slot_bytes)
-        for pool_idx in page_table.spaces[space_index].pools
+        for pool_idx in page_table.layer_groups[group_index].pools
     )
 
 
@@ -180,8 +180,8 @@ def _uses_exact_tpb_regions(ri) -> bool:
         return False
     return any(
         region.replicated or any("token" in buf.axis_names for buf in region.buffers)
-        for space in ri.page_table.spaces
-        for region in space.regions
+        for layer_group in ri.page_table.layer_groups
+        for region in layer_group.regions
     )
 
 
@@ -271,7 +271,7 @@ def warn_token_major_fragments(self_ri, peer_ri, groups) -> None:
         1
         for group in groups
         for ri in group.regions
-        for buf in page_table.spaces[group.self_space].regions[ri].buffers
+        for buf in page_table.layer_groups[group.self_layer_group].regions[ri].buffers
         if "token" in buf.axis_names
     )
     if per_token:

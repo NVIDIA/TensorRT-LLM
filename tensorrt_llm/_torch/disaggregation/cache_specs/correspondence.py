@@ -20,7 +20,7 @@
 3. The intersection becomes byte runs -- one per row of the axes outside the split axis.
 4. Ranks holding identical bytes elect one sender (:func:`~.topology.elects_sender`).
 
-Regions of the same ``(space, pool)`` pair and election are merged into one
+Regions of the same ``(layer_group, pool)`` pair and election are merged into one
 :class:`TransferGroup`, so per request the transfer extracts unit addresses once per group, not
 once per region. Groups are cached per peer; per request only unit base addresses are added.
 """
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 RegionRef = Tuple[int, int]
-"""``(space index, region index)`` within one page table."""
+"""``(layer_group index, region index)`` within one page table."""
 
 Run = Tuple[int, int, int]
 """``(src offset, dst offset, length)`` in bytes, relative to a unit's slot base."""
@@ -63,17 +63,17 @@ Run = Tuple[int, int, int]
 
 
 def _region_index(page_table: PageTable) -> Dict[Tuple[str, int, str], RegionRef]:
-    """``{(spec, layer, role): (space, region)}``; a spec holds each (layer, role) once."""
+    """``{(spec, layer, role): (layer_group, region)}``; a spec holds each (layer, role) once."""
     index: Dict[Tuple[str, int, str], RegionRef] = {}
-    for si, space in enumerate(page_table.spaces):
-        for ri, region in enumerate(space.regions):
-            key = (space.spec, region.layer, region.role)
+    for gi, layer_group in enumerate(page_table.layer_groups):
+        for ri, region in enumerate(layer_group.regions):
+            key = (layer_group.spec, region.layer, region.role)
             if key in index:
                 raise ValueError(
-                    f"{space.spec} region (layer={region.layer}, role={region.role!r}) appears in "
-                    f"spaces {index[key][0]} and {si}; a spec holds each (layer, role) once"
+                    f"{layer_group.spec} region (layer={region.layer}, role={region.role!r}) appears in "
+                    f"layer groups {index[key][0]} and {gi}; a spec holds each (layer, role) once"
                 )
-            index[key] = (si, ri)
+            index[key] = (gi, ri)
     return index
 
 
@@ -81,11 +81,11 @@ def check_page_table(page_table: PageTable) -> None:
     """Structural checks of a freshly built table: known specs, unique regions, valid pools."""
     specs_in(page_table)
     _region_index(page_table)
-    for space in page_table.spaces:
-        for region in space.regions:
+    for layer_group in page_table.layer_groups:
+        for region in layer_group.regions:
             if not 0 <= region.pool < len(page_table.pools):
                 raise ValueError(
-                    f"{space.spec} region {region.key} names missing pool {region.pool}"
+                    f"{layer_group.spec} region {region.key} names missing pool {region.pool}"
                 )
 
 
@@ -103,18 +103,18 @@ def match_regions(
     specs_in(peer_page_table)
     peer_index = _region_index(peer_page_table)
     mapping: Dict[RegionRef, RegionRef] = {}
-    for si, space in enumerate(self_page_table.spaces):
-        for ri, region in enumerate(space.regions):
-            ref = peer_index.get((space.spec, region.layer, region.role))
+    for gi, layer_group in enumerate(self_page_table.layer_groups):
+        for ri, region in enumerate(layer_group.regions):
+            ref = peer_index.get((layer_group.spec, region.layer, region.role))
             if ref is None:
                 continue
-            peer_space = peer_page_table.spaces[ref[0]]
-            if peer_space.unit != space.unit:
+            peer_layer_group = peer_page_table.layer_groups[ref[0]]
+            if peer_layer_group.kind != layer_group.kind:
                 raise ValueError(
-                    f"{space.spec} region {region.key} is a {space.unit.name} unit locally but "
-                    f"{peer_space.unit.name} on the peer"
+                    f"{layer_group.spec} region {region.key} is a {layer_group.kind.name} unit locally but "
+                    f"{peer_layer_group.kind.name} on the peer"
                 )
-            mapping[(si, ri)] = ref
+            mapping[(gi, ri)] = ref
     return mapping
 
 
@@ -122,9 +122,14 @@ def matched_pairs(
     self_page_table: PageTable, peer_page_table: PageTable, mapping: Dict[RegionRef, RegionRef]
 ) -> List[MatchedPair]:
     pairs = []
-    for (si, ri), (psi, pri) in mapping.items():
-        space, peer_space = self_page_table.spaces[si], peer_page_table.spaces[psi]
-        pairs.append((space, space.regions[ri], peer_space, peer_space.regions[pri]))
+    for (gi, ri), (pgi, pri) in mapping.items():
+        layer_group, peer_layer_group = (
+            self_page_table.layer_groups[gi],
+            peer_page_table.layer_groups[pgi],
+        )
+        pairs.append(
+            (layer_group, layer_group.regions[ri], peer_layer_group, peer_layer_group.regions[pri])
+        )
     return pairs
 
 
@@ -236,7 +241,7 @@ def _election(src: Region, dst: Region, self_ri: "RankInfo", peer_ri: "RankInfo"
 
 
 # ---------------------------------------------------------------------------
-# Transfer groups: runs merged per (space, pool) pair and election
+# Transfer groups: runs merged per (layer group, pool) pair and election
 # ---------------------------------------------------------------------------
 
 
@@ -299,10 +304,10 @@ class RunPlan(RegionMapperBase):
 
 @dataclass
 class TransferGroup:
-    """Matched regions of one local/peer ``(space, pool)`` pair that share a sender election."""
+    """Matched regions of one local/peer ``(layer_group, pool)`` pair that share a sender election."""
 
-    self_space: int
-    peer_space: int
+    self_layer_group: int
+    peer_layer_group: int
     self_pool: int
     peer_pool: int
     domain: str
@@ -310,7 +315,7 @@ class TransferGroup:
     """How many local ranks hold these bytes; one of them is elected to send."""
     plan: RunPlan
     regions: Tuple[int, ...]
-    """Local region indices (within ``self_space``) the group moves."""
+    """Local region indices (within ``self_layer_group``) the group moves."""
 
 
 def plan_transfers(
@@ -323,27 +328,30 @@ def plan_transfers(
     """Every transfer group from this rank to one peer rank, skipping ``excluded`` regions."""
     mapping = match_regions(self_page_table, peer_page_table)
     buckets: Dict[tuple, List[Tuple[int, int, List[Run]]]] = defaultdict(list)
-    for (si, ri), (psi, pri) in mapping.items():
-        if (si, ri) in excluded:
+    for (gi, ri), (pgi, pri) in mapping.items():
+        if (gi, ri) in excluded:
             continue
-        space, peer_space = self_page_table.spaces[si], peer_page_table.spaces[psi]
-        src, dst = space.regions[ri], peer_space.regions[pri]
-        context = f"{space.spec} region (layer={src.layer}, role={src.role!r})"
+        layer_group, peer_layer_group = (
+            self_page_table.layer_groups[gi],
+            peer_page_table.layer_groups[pgi],
+        )
+        src, dst = layer_group.regions[ri], peer_layer_group.regions[pri]
+        context = f"{layer_group.spec} region (layer={src.layer}, role={src.role!r})"
         runs = region_runs(src, dst, self_ri, peer_ri, context)
         if not runs:
             continue
         domain, factor = _election(src, dst, self_ri, peer_ri)
-        buckets[(si, psi, src.pool, dst.pool, domain, factor)].append((src.offset, ri, runs))
+        buckets[(gi, pgi, src.pool, dst.pool, domain, factor)].append((src.offset, ri, runs))
 
     groups = []
     for key in sorted(buckets):
-        si, psi, pool, peer_pool, domain, factor = key
+        gi, pgi, pool, peer_pool, domain, factor = key
         # Local physical order, so regions contiguous on both sides merge into one run.
         items = sorted(buckets[key])
         groups.append(
             TransferGroup(
-                self_space=si,
-                peer_space=psi,
+                self_layer_group=gi,
+                peer_layer_group=pgi,
                 self_pool=pool,
                 peer_pool=peer_pool,
                 domain=domain,
@@ -379,10 +387,10 @@ def _hosted_and_replicated(
 ) -> Tuple[Set[int], Set[RegionKey]]:
     hosted: Set[int] = set()
     replicated: Set[RegionKey] = set()
-    for space in page_table.spaces:
-        if space.spec != spec_name:
+    for layer_group in page_table.layer_groups:
+        if layer_group.spec != spec_name:
             continue
-        for region in space.regions:
+        for region in layer_group.regions:
             hosted.add(region.layer)
             if region.replicated:
                 replicated.add(region.key)
@@ -412,8 +420,8 @@ def validate_peer_compatible(
         )
     mapping = match_regions(self_page_table, peer_page_table)
     pairs = matched_pairs(self_page_table, peer_page_table, mapping)
-    for space, region, _, peer_region in pairs:
-        context = f"{space.spec} region (layer={region.layer}, role={region.role!r})"
+    for layer_group, region, _, peer_region in pairs:
+        context = f"{layer_group.spec} region (layer={region.layer}, role={region.role!r})"
         if len(region.buffers) != len(peer_region.buffers):
             raise ValueError(
                 f"{context}: buffer count differs (local={len(region.buffers)}, "
@@ -449,5 +457,9 @@ def notify_peer_registered(
         spec.on_peer_registered(
             self_ri,
             peer_ri,
-            [g for g in groups if self_page_table.spaces[g.self_space].spec == spec.name],
+            [
+                g
+                for g in groups
+                if self_page_table.layer_groups[g.self_layer_group].spec == spec.name
+            ],
         )

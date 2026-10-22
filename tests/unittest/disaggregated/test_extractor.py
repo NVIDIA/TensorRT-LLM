@@ -25,10 +25,10 @@ from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
     build_page_table,
     memory_registration_descs,
     spec_named,
@@ -61,9 +61,9 @@ def _nhd(nbytes, heads, tokens_per_block):
     )
 
 
-def _layout(space):
-    """``[(pool, layer, role, offset, buffers)]`` of a space's regions, in order."""
-    return [(r.pool, r.layer, r.role, r.offset, r.buffers) for r in space.regions]
+def _layout(layer_group):
+    """``[(pool, layer, role, offset, buffers)]`` of a layer group's regions, in order."""
+    return [(r.pool, r.layer, r.role, r.offset, r.buffers) for r in layer_group.regions]
 
 
 @pytest.mark.cpu_only
@@ -119,18 +119,20 @@ def test_build_page_table():
     try:
         page_table = build_page_table(manager)
 
-        # One space per life cycle, indexed by life-cycle id.
-        assert len(page_table.spaces) == len(manager.impl.layer_grouping)
-        layers = sorted(layer for space in page_table.spaces for layer in space.layers)
+        # One layer group per life cycle, indexed by life-cycle id.
+        assert len(page_table.layer_groups) == len(manager.impl.layer_grouping)
+        layers = sorted(
+            layer for layer_group in page_table.layer_groups for layer in layer_group.layers
+        )
         assert layers == sorted(int(layer) for layer in manager.pp_layers)
 
         buffer_bytes = num_kv_heads * tokens_per_block * head_dim * 2
-        for space in page_table.spaces:
-            assert space.spec == "attention"
-            assert space.unit == CacheKind.PAGED
-            assert space.params["tokens_per_block"] == tokens_per_block
+        for layer_group in page_table.layer_groups:
+            assert layer_group.spec == "attention"
+            assert layer_group.kind == CacheKind.PAGED
+            assert layer_group.params["tokens_per_block"] == tokens_per_block
             roles = {}
-            for region in space.regions:
+            for region in layer_group.regions:
                 roles.setdefault(region.layer, set()).add(region.role)
                 # K/V are head-major, sharded by KV head over attention TP.
                 assert region.buffers == _hnd(buffer_bytes, num_kv_heads)
@@ -138,8 +140,8 @@ def test_build_page_table():
                 assert 0 <= region.offset and region.offset + region.nbytes <= pool.slot_bytes
             assert all(r == {"key", "value"} for r in roles.values())
             # Regions are in physical order.
-            assert [(r.pool, r.offset) for r in space.regions] == sorted(
-                (r.pool, r.offset) for r in space.regions
+            assert [(r.pool, r.offset) for r in layer_group.regions] == sorted(
+                (r.pool, r.offset) for r in layer_group.regions
             )
 
         for pool in page_table.pools:
@@ -148,7 +150,7 @@ def test_build_page_table():
 
         # The extractor addresses a unit's slot in the pool its regions live in.
         extractor = KVRegionExtractorV1(manager)
-        region = page_table.spaces[0].regions[0]
+        region = page_table.layer_groups[0].regions[0]
         pool = page_table.pools[region.pool]
         region_ids = np.array([0, 1], dtype=np.int64)
         memory = extractor.extract(region_ids, region.pool).memory
@@ -182,23 +184,23 @@ def test_page_table_meta_serialization():
     ]
     page_table = PageTable(
         pools=[kv_pool],
-        spaces=[
-            UnitSpace(
+        layer_groups=[
+            LayerGroup(
                 spec="attention",
-                unit=CacheKind.PAGED,
+                kind=CacheKind.PAGED,
                 regions=regions,
                 params={"tokens_per_block": 16, "window": 512},
             )
         ],
     )
     restored = PageTable.from_dict(page_table.to_dict())
-    space = restored.spaces[0]
-    assert space.spec == "attention"
-    assert space.unit == CacheKind.PAGED
-    assert space.params["window"] == 512
-    assert space.params["tokens_per_block"] == 16
-    assert space.layers == [0, 1]
-    assert space.regions == regions
+    layer_group = restored.layer_groups[0]
+    assert layer_group.spec == "attention"
+    assert layer_group.kind == CacheKind.PAGED
+    assert layer_group.params["window"] == 512
+    assert layer_group.params["tokens_per_block"] == 16
+    assert layer_group.layers == [0, 1]
+    assert layer_group.regions == regions
     assert restored.pools[0].to_dict() == kv_pool.to_dict()
 
 
@@ -281,19 +283,19 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
         (0x1000, 512, 4),
         (0x1000, 128, 4),
     ]
-    (space,) = page_table.spaces
-    assert space.spec == "minimax_m3"
-    assert space.params == {"tokens_per_block": 16, "window": None}
+    (layer_group,) = page_table.layer_groups
+    assert layer_group.spec == "minimax_m3"
+    assert layer_group.params == {"tokens_per_block": 16, "window": None}
     nhd = _nhd(128, 1, 16)
     replicated = (BufferDecl(128, ATTENTION_TP),)
-    assert _layout(space) == [
+    assert _layout(layer_group) == [
         (0, 0, "key", 0, nhd),
         (0, 0, "value", 128, nhd),
         (0, 1, "key", 256, nhd),
         (0, 1, "value", 384, nhd),
         (1, 1, "index_key", 0, replicated),
     ]
-    assert [r.replicated for r in space.regions] == [False] * 4 + [True]
+    assert [r.replicated for r in layer_group.regions] == [False] * 4 + [True]
 
 
 def test_v2_builder_splits_mixed_kind_pool_into_per_role_regions():
@@ -317,11 +319,11 @@ def test_v2_builder_splits_mixed_kind_pool_into_per_role_regions():
 
     page_table = spec_named("minimax_m3").describe(manager)
     assert len(page_table.pools) == 1
-    (space,) = page_table.spaces
+    (layer_group,) = page_table.layer_groups
     nhd = _nhd(128, 1, 16)
     replicated = (BufferDecl(128, ATTENTION_TP),)
     # All regions address the same physical pool; the INDEX_KEY interleaves after layer 0.
-    assert _layout(space) == [
+    assert _layout(layer_group) == [
         (0, 0, "key", 0, nhd),
         (0, 0, "value", 128, nhd),
         (0, 0, "index_key", 256, replicated),
@@ -340,12 +342,12 @@ def test_v2_builder_defaults_to_head_major_kv():
     # A manager no spec claims by class is plain attention: head-major K/V written by the TRTLLM
     # attention kernels.
     page_table = build_page_table_from_manager(_make_fake_v2_manager(attrs))
-    assert page_table.spaces[0].spec == "attention"
-    assert [r.buffers for r in page_table.spaces[0].regions] == [_hnd(128, 1)] * 4
+    assert page_table.layer_groups[0].spec == "attention"
+    assert [r.buffers for r in page_table.layer_groups[0].regions] == [_hnd(128, 1)] * 4
 
 
 @pytest.mark.cpu_only
-def test_state_space_serialization():
+def test_state_layer_group_serialization():
     conv_sections = (512, 256, 256)
     ssm_bytes, ssm_bytes_per_head = 256, 128
     conv = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in conv_sections)
@@ -359,15 +361,15 @@ def test_state_space_serialization():
                 0, layer, str(MambaRole.SSM_STATE), base + sum(conv_sections), ssm, local_layer=lid
             )
         )
-    space = UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)
+    layer_group = LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=regions)
 
-    d = space.to_dict()
-    assert d["unit"] == int(CacheKind.STATE)
+    d = layer_group.to_dict()
+    assert d["kind"] == int(CacheKind.STATE)
     assert d["layouts"] == [[b.to_dict() for b in conv], [b.to_dict() for b in ssm]]
 
-    restored = UnitSpace.from_dict(d)
+    restored = LayerGroup.from_dict(d)
     assert restored.spec == "mamba"
-    assert restored.unit == CacheKind.STATE
+    assert restored.kind == CacheKind.STATE
     assert restored.params == {}
     assert restored.regions == regions
     conv_region, ssm_region = restored.regions[:2]
@@ -476,13 +478,13 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
         (0x20000, 32, 4),
         (0x30000, 128, 8),
     ]
-    assert len(page_table.spaces) == 2
-    recurrent, attention = page_table.spaces
-    # Space index == life-cycle id; both spaces belong to the mamba spec.
-    assert (recurrent.spec, recurrent.unit) == ("mamba", CacheKind.STATE)
-    assert (attention.spec, attention.unit) == ("mamba", CacheKind.PAGED)
+    assert len(page_table.layer_groups) == 2
+    recurrent, attention = page_table.layer_groups
+    # Layer group index == life-cycle id; both layer groups belong to the mamba spec.
+    assert (recurrent.spec, recurrent.kind) == ("mamba", CacheKind.STATE)
+    assert (attention.spec, attention.kind) == ("mamba", CacheKind.PAGED)
     assert recurrent.params == {}
-    # The recurrent space keeps V2 layer numbering.
+    # The recurrent layer group keeps V2 layer numbering.
     assert [(r.local_layer, r.layer) for r in recurrent.regions] == [
         (0, 0),
         (0, 0),
@@ -552,7 +554,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     ]
     page_table = PageTable(
         pools=[physical_pool],
-        spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)],
+        layer_groups=[LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=regions)],
     )
 
     # V2 interleaved: one shared pool registered once
@@ -574,7 +576,7 @@ def test_region_offsets_past_four_gib_survive_rank_info_roundtrip() -> None:
     ]
     page_table = PageTable(
         pools=[Pool(base_address=(1 << 40) + 1000, slot_bytes=slot_bytes, num_slots=2)],
-        spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)],
+        layer_groups=[LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=regions)],
     )
     ri = RankInfo(
         instance_name="ctx",
@@ -590,18 +592,20 @@ def test_region_offsets_past_four_gib_survive_rank_info_roundtrip() -> None:
         page_table=page_table,
     )
     restored = RankInfo.from_bytes(ri.to_bytes()).page_table
-    assert [r.offset for r in restored.spaces[0].regions] == [lid * (1 << 31) for lid in range(4)]
+    assert [r.offset for r in restored.layer_groups[0].regions] == [
+        lid * (1 << 31) for lid in range(4)
+    ]
     assert restored.pools[0].to_dict() == page_table.pools[0].to_dict()
 
 
 @pytest.mark.cpu_only
 def test_mixed_page_table_serialization():
-    # Paged attention space (life cycle 0): layer 0.
+    # Paged attention layer group (life cycle 0): layer 0.
     attn_regions = [
         Region(0, 0, "key", 0, _hnd(256, 4), local_layer=0),
         Region(0, 0, "value", 256, _hnd(256, 4), local_layer=0),
     ]
-    # Recurrent state space (life cycle 1): layers 1 and 2.
+    # Recurrent state layer group (life cycle 1): layers 1 and 2.
     conv = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in (256, 128, 128))
     ssm = (BufferDecl(2048, STATE_TP, (("head", 32),), "head"),)
     state_regions = [
@@ -614,28 +618,28 @@ def test_mixed_page_table_serialization():
     ]
     page_table = PageTable(
         pools=[Pool(1000, 512, 10), Pool(2000, 1024, 10), Pool(3000, 2048, 10)],
-        spaces=[
-            UnitSpace(
+        layer_groups=[
+            LayerGroup(
                 spec="mamba",
-                unit=CacheKind.PAGED,
+                kind=CacheKind.PAGED,
                 regions=attn_regions,
                 params={"tokens_per_block": 16, "window": None},
             ),
-            UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=state_regions),
+            LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=state_regions),
         ],
     )
 
     restored = PageTable.from_dict(page_table.to_dict())
 
-    assert len(restored.spaces) == 2
-    paged, state = restored.spaces
-    assert (paged.unit, state.unit) == (CacheKind.PAGED, CacheKind.STATE)
+    assert len(restored.layer_groups) == 2
+    paged, state = restored.layer_groups
+    assert (paged.kind, state.kind) == (CacheKind.PAGED, CacheKind.STATE)
     assert paged.layers == [0]
     assert state.layers == [1, 2]
     assert state.pools == [1, 2]
     assert [(r.local_layer, r.layer) for r in state.regions[::2]] == [(0, 1), (1, 2)]
     assert state.regions == state_regions
 
-    # Which space holds each layer comes straight from the regions.
-    layer_to_space = {r.layer: si for si, s in enumerate(restored.spaces) for r in s.regions}
-    assert layer_to_space == {0: 0, 1: 1, 2: 1}
+    # Which layer group holds each layer comes straight from the regions.
+    layer_to_group = {r.layer: gi for gi, s in enumerate(restored.layer_groups) for r in s.regions}
+    assert layer_to_group == {0: 0, 1: 1, 2: 1}

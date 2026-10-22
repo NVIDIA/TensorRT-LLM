@@ -24,7 +24,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
 class CacheReuseAdapter(ABC):
-    """Prefix-reuse API of a cache manager, per unit space of its page table."""
+    """Prefix-reuse API of a cache manager, per layer group of its page table."""
 
     @property
     @abstractmethod
@@ -38,20 +38,20 @@ class CacheReuseAdapter(ABC):
     def _global_cached_token_count(self, req: LlmRequest) -> int:
         """Block-aligned cached prefix length reported by the cache manager."""
 
-    def get_cached_token_count_per_space(
+    def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
-        num_spaces: int,
+        num_layer_groups: int,
     ) -> List[int]:
-        """Per-space cached prefix in tokens (block-aligned).
+        """Per-layer-group cached prefix in tokens (block-aligned).
 
         Returns the reuse-hit prefix only; SWA stale-region handling lives at
         the transfer call site (it is a transport concern, not a cache one).
         """
         if not self.enable_block_reuse:
-            return [0] * num_spaces
+            return [0] * num_layer_groups
         scalar = max(0, self._global_cached_token_count(req))
-        return [scalar] * num_spaces
+        return [scalar] * num_layer_groups
 
     @abstractmethod
     def get_block_ids(
@@ -59,7 +59,7 @@ class CacheReuseAdapter(ABC):
         req: LlmRequest,
         group_idx: int,
     ) -> np.ndarray:
-        """Per-space block identifiers for *req* (dtype ``int64``).
+        """Per-layer-group block identifiers for *req* (dtype ``int64``).
 
         Returned values are **primary memory-pool slot indices**, not raw block IDs:
         ``KVRegionExtractorV1.extract`` and downstream transfer code do
@@ -116,10 +116,10 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         tpb = self.tokens_per_block
         return (kv_cache.num_committed_tokens // tpb) * tpb
 
-    def get_cached_token_count_per_space(
+    def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
-        num_spaces: int,
+        num_layer_groups: int,
     ) -> List[int]:
         """Skip only groups actually restored by admission and normal resume.
 
@@ -129,12 +129,12 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         """
         scalar = self._global_cached_token_count(req)
         if scalar == 0:
-            return [0] * num_spaces
+            return [0] * num_layer_groups
         statuses = self._mgr.kv_cache_map[req.py_request_id].reuse_status
         tpb = self.tokens_per_block
         return [
             min(scalar, statuses[group].endpoint // tpb * tpb) if statuses[group].complete else 0
-            for group in range(num_spaces)
+            for group in range(num_layer_groups)
         ]
 
     def get_block_ids(self, req, group_idx):

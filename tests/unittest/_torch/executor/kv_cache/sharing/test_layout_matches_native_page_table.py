@@ -15,7 +15,7 @@
 """``derive_layout`` against the page table native builds from the same live manager, for three
 model shapes with small caches and no checkpoint: each transferred buffer's layer, pool, offset,
 size and mapper, and each layer group's kind, window, heads, pools and roles against the unit
-space of its life cycle; and each buffer's offset and size against the runtime's address and page
+layer group of its life cycle; and each buffer's offset and size against the runtime's address and page
 size of its layer and role."""
 
 from __future__ import annotations
@@ -60,16 +60,16 @@ SHAPES = {
 
 
 def native_groups(page_table):
-    """What native's page table says per unit space (one per layer group, indexed alike): each
+    """What native's page table says per layer group (one per layer group, indexed alike): each
     region as ``(layer, pool base, offset, size, declarations)``. Pools are named by base address;
     order-free parts are sorted."""
     out = []
-    for space in page_table.spaces:
+    for layer_group in page_table.layer_groups:
         pools = [
             (int(p.base_address), int(p.slot_bytes), int(p.num_slots))
-            for p in (page_table.pools[i] for i in space.pools)
+            for p in (page_table.pools[i] for i in layer_group.pools)
         ]
-        state = space.unit == CacheKind.STATE
+        state = layer_group.kind == CacheKind.STATE
         rows = [
             (
                 region.layer,
@@ -78,13 +78,13 @@ def native_groups(page_table):
                 region.nbytes,
                 region.buffers,
             )
-            for region in space.regions
+            for region in layer_group.regions
         ]
         out.append(
             {
                 "kind": "state" if state else "attention",
-                "window": None if state else space.params["window"],
-                "layers": space.layers,
+                "window": None if state else layer_group.params["window"],
+                "layers": layer_group.layers,
                 "pools": pools,
                 "rows": sorted(rows, key=lambda row: row[:4]),
             }
@@ -95,7 +95,7 @@ def native_groups(page_table):
 def layout_groups(geometry):
     """The same per layer group from ``derive_layout``'s result, without local-only buffers (native
     skips ignored roles); transferred buffers no group claims are listed last. A group's pools are
-    those of its device pool group its transferred buffers sit in, as native's unit space lists only
+    those of its device pool group its transferred buffers sit in, as native's layer group lists only
     the pools its regions use."""
     layout = geometry.layout
     out, claimed = [], set()
@@ -178,7 +178,7 @@ def test_layout_matches_the_page_table_native_builds(real_manager, hybrid_manage
         derived = layout_groups(geometry)
 
         layout = geometry.layout
-        paged = [s for s in page_table.spaces if s.unit == CacheKind.PAGED]
+        paged = [s for s in page_table.layer_groups if s.kind == CacheKind.PAGED]
         assert paged
         assert all(s.params["tokens_per_block"] == layout.tokens_per_block for s in paged)
         assert len(derived) == len(native), derived[len(native) :]
@@ -201,8 +201,8 @@ def test_layout_matches_the_page_table_native_builds(real_manager, hybrid_manage
         # role, so a layer's K and V trading places shows only here.
         internal = {
             region.layer: region.local_layer
-            for space in page_table.spaces
-            for region in space.regions
+            for layer_group in page_table.layer_groups
+            for region in layer_group.regions
         }
         base = {(p.group, p.index): p.base for ps in geometry.device_pools.values() for p in ps}
         for b in layout.buffers:

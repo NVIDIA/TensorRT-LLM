@@ -19,10 +19,10 @@ Locks the behavior of disagg region matching across the representative scenarios
 
   * single KV pool, full layer overlap (basic MHA)
   * MLA (kv_factor=1, KEY-only regions)
-  * KV + block-scale pools coexisting in one space
-  * KV + REPLICATED indexer pools coexisting in one space
+  * KV + block-scale pools coexisting in one layer group
+  * KV + REPLICATED indexer pools coexisting in one layer group
   * PP partial layer overlap (regions match by global layer id)
-  * peer splitting the same layers over two spaces, or over two pools of one space
+  * peer splitting the same layers over two layer groups, or over two pools of one layer group
 
 Regions match by ``(spec, layer, role)``; matched regions must declare the same layout.
 """
@@ -34,10 +34,10 @@ from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
     match_regions,
     validate_peer_compatible,
 )
@@ -91,26 +91,26 @@ def _indexer(pool, layers, role="indexer_k"):
     return _regions(pool, [(g, role) for g in layers], _replicated())
 
 
-def _space(regions):
-    return UnitSpace(
+def _layer_group(regions):
+    return LayerGroup(
         spec="attention",
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         regions=regions,
         params={"tokens_per_block": 16, "window": None},
     )
 
 
-def _page_table(spaces, pool_specs=None):
+def _page_table(layer_groups, pool_specs=None):
     """A PageTable over ``pool_specs`` = ``[(slot_bytes, num_slots, base_addr), ...]``.
 
     Defaults to one 1024-byte/64-slot pool per pool index the regions name.
     """
     if pool_specs is None:
-        num_pools = 1 + max(r.pool for s in spaces for r in s.regions)
+        num_pools = 1 + max(r.pool for s in layer_groups for r in s.regions)
         pool_specs = [(1024, 64, 0x1000 * (p + 1)) for p in range(num_pools)]
     return PageTable(
         pools=[Pool(base_address=base, slot_bytes=sb, num_slots=ns) for sb, ns, base in pool_specs],
-        spaces=spaces,
+        layer_groups=layer_groups,
     )
 
 
@@ -158,12 +158,15 @@ def _registrar(self_pt, **kwargs):
     return PeerRegistrar(self_ri, KVRegionExtractorV1(self_pt))
 
 
-def _identity(num_regions, space=0):
-    return {(space, i): (space, i) for i in range(num_regions)}
+def _identity(num_regions, layer_group=0):
+    return {(layer_group, i): (layer_group, i) for i in range(num_regions)}
 
 
 def _group_shape(groups):
-    return [(g.self_space, g.peer_space, g.self_pool, g.peer_pool, g.regions) for g in groups]
+    return [
+        (g.self_layer_group, g.peer_layer_group, g.self_pool, g.peer_pool, g.regions)
+        for g in groups
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +175,9 @@ def _group_shape(groups):
 
 
 def test_kv_only_full_overlap():
-    """Single space, single KV pool on each side. Identity mapping."""
-    self_pt = _page_table([_space(_kv(0, [10, 11]))])
-    peer_pt = _page_table([_space(_kv(0, [10, 11]))])
+    """Single layer group, single KV pool on each side. Identity mapping."""
+    self_pt = _page_table([_layer_group(_kv(0, [10, 11]))])
+    peer_pt = _page_table([_layer_group(_kv(0, [10, 11]))])
 
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
@@ -188,8 +191,8 @@ def test_kv_only_full_overlap():
 
 def test_mla_kv_only_full_overlap():
     """MLA: KEY-only regions, kv_factor=1."""
-    self_pt = _page_table([_space(_key_only(0, [0, 1]))])
-    peer_pt = _page_table([_space(_key_only(0, [0, 1]))])
+    self_pt = _page_table([_layer_group(_key_only(0, [0, 1]))])
+    peer_pt = _page_table([_layer_group(_key_only(0, [0, 1]))])
 
     reg = _registrar(self_pt, is_mla=True, kv_heads=1)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt, is_mla=True, kv_heads=1)
@@ -198,17 +201,17 @@ def test_mla_kv_only_full_overlap():
     assert _group_shape(reg.transfer_groups(peer_ri)) == [(0, 0, 0, 0, (0, 1))]
 
 
-def test_kv_and_block_scale_in_same_space():
-    """KV pool (idx=0) + block-scale pool (idx=1) match by role within the space."""
+def test_kv_and_block_scale_in_same_layer_group():
+    """KV pool (idx=0) + block-scale pool (idx=1) match by role within the layer group."""
 
-    def _space_with_scales():
+    def _layer_group_with_scales():
         scales = _regions(
             1, [(g, r) for g in (100, 101) for r in ("key_block_scale", "value_block_scale")]
         )
-        return _space(_kv(0, [100, 101]) + scales)
+        return _layer_group(_kv(0, [100, 101]) + scales)
 
-    self_pt = _page_table([_space_with_scales()], [(1024, 64, 0x1000), (512, 64, 0x2000)])
-    peer_pt = _page_table([_space_with_scales()], [(1024, 64, 0x3000), (512, 64, 0x4000)])
+    self_pt = _page_table([_layer_group_with_scales()], [(1024, 64, 0x1000), (512, 64, 0x2000)])
+    peer_pt = _page_table([_layer_group_with_scales()], [(1024, 64, 0x3000), (512, 64, 0x4000)])
 
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
@@ -220,13 +223,15 @@ def test_kv_and_block_scale_in_same_space():
     ]
 
 
-def test_kv_and_indexer_in_same_space():
+def test_kv_and_indexer_in_same_layer_group():
     """KV pool + replicated indexer pool match independently by role."""
     self_pt = _page_table(
-        [_space(_kv(0, [0, 1]) + _indexer(1, [0, 1]))], [(1024, 64, 0x1000), (512, 64, 0x2000)]
+        [_layer_group(_kv(0, [0, 1]) + _indexer(1, [0, 1]))],
+        [(1024, 64, 0x1000), (512, 64, 0x2000)],
     )
     peer_pt = _page_table(
-        [_space(_kv(0, [0, 1]) + _indexer(1, [0, 1]))], [(1024, 64, 0x3000), (512, 64, 0x4000)]
+        [_layer_group(_kv(0, [0, 1]) + _indexer(1, [0, 1]))],
+        [(1024, 64, 0x3000), (512, 64, 0x4000)],
     )
 
     reg = _registrar(self_pt)
@@ -247,7 +252,7 @@ def test_minimax_split_kv_and_replicated_index_pools_match():
 
     def _pt(base):
         return _page_table(
-            [_space(_kv(0, [0, 1], _nhd()) + _indexer(1, [0, 1], role="index_key"))],
+            [_layer_group(_kv(0, [0, 1], _nhd()) + _indexer(1, [0, 1], role="index_key"))],
             [(512, 64, base), (256, 64, base + 0x1000)],
         )
 
@@ -257,8 +262,11 @@ def test_minimax_split_kv_and_replicated_index_pools_match():
 
     mapping = match_regions(self_pt, peer_pt)
     assert mapping == _identity(6)
-    for (si, ri), (psi, pri) in mapping.items():
-        assert self_pt.spaces[si].regions[ri].buffers == peer_pt.spaces[psi].regions[pri].buffers
+    for (gi, ri), (pgi, pri) in mapping.items():
+        assert (
+            self_pt.layer_groups[gi].regions[ri].buffers
+            == peer_pt.layer_groups[pgi].regions[pri].buffers
+        )
     assert _group_shape(reg.transfer_groups(peer_ri)) == [
         (0, 0, 0, 0, (0, 1, 2, 3)),
         (0, 0, 1, 1, (4, 5)),
@@ -271,8 +279,8 @@ def test_mismatched_region_layouts_raise():
     Same region but a different declaration on the two sides is a version or
     configuration inconsistency.
     """
-    self_pt = _page_table([_space(_regions(0, [(0, "index_key")], _replicated()))])
-    peer_pt = _page_table([_space(_regions(0, [(0, "index_key")], _nhd()))])
+    self_pt = _page_table([_layer_group(_regions(0, [(0, "index_key")], _replicated()))])
+    peer_pt = _page_table([_layer_group(_regions(0, [(0, "index_key")], _nhd()))])
 
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
@@ -285,8 +293,8 @@ def test_mismatched_region_layouts_raise():
 
 def test_pp_partial_layer_overlap():
     """Self covers global layers {10,11}, peer covers {11,12}. Only layer 11 matches."""
-    self_pt = _page_table([_space(_kv(0, [10, 11]))])
-    peer_pt = _page_table([_space(_kv(0, [11, 12]))])
+    self_pt = _page_table([_layer_group(_kv(0, [10, 11]))])
+    peer_pt = _page_table([_layer_group(_kv(0, [11, 12]))])
 
     reg = _registrar(self_pt, layer_num_per_pp=[1, 1])
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt, layer_num_per_pp=[1, 1])
@@ -298,14 +306,14 @@ def test_pp_partial_layer_overlap():
     assert groups[0].plan.runs == [(2 * BUF, 0, 2 * BUF)]
 
 
-def test_regions_spanning_multiple_peer_spaces_form_one_group_per_space():
-    """A local space whose layers the peer holds in two spaces maps into both.
+def test_regions_spanning_multiple_peer_layer_groups_form_one_transfer_group_each():
+    """A local layer group whose layers the peer holds in two layer groups maps into both.
 
-    Each peer space indexes its own per-request units, so the regions split into one
-    transfer group per peer space instead of being merged.
+    Each peer layer group indexes its own per-request units, so the regions split into one
+    transfer group per peer layer group instead of being merged.
     """
-    self_pt = _page_table([_space(_kv(0, [10, 11]))])
-    peer_pt = _page_table([_space(_kv(0, [10])), _space(_kv(0, [11]))])
+    self_pt = _page_table([_layer_group(_kv(0, [10, 11]))])
+    peer_pt = _page_table([_layer_group(_kv(0, [10])), _layer_group(_kv(0, [11]))])
 
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
@@ -325,8 +333,8 @@ def test_regions_spanning_multiple_peer_spaces_form_one_group_per_space():
 def test_buffer_count_mismatch_raises():
     """Matched regions must declare the same number of buffers on both sides."""
     sections = (BufferDecl(64, ATTENTION_TP), BufferDecl(64, ATTENTION_TP))
-    self_pt = _page_table([_space(_regions(0, [(0, "key")], _replicated()))])
-    peer_pt = _page_table([_space(_regions(0, [(0, "key")], sections))])
+    self_pt = _page_table([_layer_group(_regions(0, [(0, "key")], _replicated()))])
+    peer_pt = _page_table([_layer_group(_regions(0, [(0, "key")], sections))])
 
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
@@ -340,30 +348,30 @@ def test_buffer_count_mismatch_raises():
 def test_duplicate_region_across_spaces_raises():
     """A spec holds each (layer, role) once.
 
-    The same global layer id in two spaces of one spec would silently corrupt matching.
+    The same global layer id in two layer groups of one spec would silently corrupt matching.
     """
-    dup_pt = _page_table([_space(_kv(0, [10])), _space(_kv(0, [10]))])
-    ok_pt = _page_table([_space(_kv(0, [10]))])
+    dup_pt = _page_table([_layer_group(_kv(0, [10])), _layer_group(_kv(0, [10]))])
+    ok_pt = _page_table([_layer_group(_kv(0, [10]))])
 
     # A peer table is checked when matching against it; a local one when it is built.
-    with pytest.raises(ValueError, match="appears in spaces 0 and 1"):
+    with pytest.raises(ValueError, match="appears in layer groups 0 and 1"):
         match_regions(ok_pt, dup_pt)
-    with pytest.raises(ValueError, match="appears in spaces 0 and 1"):
+    with pytest.raises(ValueError, match="appears in layer groups 0 and 1"):
         check_page_table(dup_pt)
 
 
-def test_two_pools_distinct_roles_in_same_space():
-    """Regions of distinct roles in two pools of one space match by role, not by pool.
+def test_two_pools_distinct_roles_in_same_layer_group():
+    """Regions of distinct roles in two pools of one layer group match by role, not by pool.
 
     The peer stores the two roles in the opposite pool order; each local region still finds
     the peer region with the same (layer, role).
     """
     self_pt = _page_table(
-        [_space(_kv(0, [10, 11]) + _indexer(1, [10, 11]))],
+        [_layer_group(_kv(0, [10, 11]) + _indexer(1, [10, 11]))],
         [(1024, 64, 0x1000), (512, 64, 0x2000)],
     )
     peer_pt = _page_table(
-        [_space(_indexer(0, [10, 11]) + _kv(1, [10, 11]))],
+        [_layer_group(_indexer(0, [10, 11]) + _kv(1, [10, 11]))],
         [(512, 64, 0x3000), (1024, 64, 0x4000)],
     )
 
@@ -389,10 +397,10 @@ def test_same_role_regions_matched_by_layer():
 
     A peer region whose layer self does not hold is never matched even if the role matches.
     """
-    self_pt = _page_table([_space(_kv(0, [10, 11]))])
+    self_pt = _page_table([_layer_group(_kv(0, [10, 11]))])
     # Peer pool 0 holds only layer 12; pool 1 holds layers 10 and 11.
     peer_pt = _page_table(
-        [_space(_kv(0, [12]) + _kv(1, [10, 11]))], [(1024, 64, 0x3000), (1024, 64, 0x4000)]
+        [_layer_group(_kv(0, [12]) + _kv(1, [10, 11]))], [(1024, 64, 0x3000), (1024, 64, 0x4000)]
     )
 
     reg = _registrar(self_pt)
@@ -417,10 +425,10 @@ def test_same_role_regions_matched_by_layer():
 def test_mixed_layouts_are_rejected(self_buffers, peer_buffers):
     """Region layouts must be the same on both peers."""
     self_pt = _page_table(
-        [_space(_regions(0, [(10, "indexer_k"), (11, "indexer_k")], self_buffers))]
+        [_layer_group(_regions(0, [(10, "indexer_k"), (11, "indexer_k")], self_buffers))]
     )
     peer_pt = _page_table(
-        [_space(_regions(0, [(10, "indexer_k"), (11, "indexer_k")], peer_buffers))]
+        [_layer_group(_regions(0, [(10, "indexer_k"), (11, "indexer_k")], peer_buffers))]
     )
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
@@ -433,8 +441,8 @@ def test_mixed_layouts_are_rejected(self_buffers, peer_buffers):
 
 def test_region_offsets_drive_extracted_pointers():
     """Matched regions' runs are relative to a unit's slot base from ``extract``."""
-    self_pt = _page_table([_space(_kv(0, [10, 11]))], [(1024, 64, 0x1000)])
-    peer_pt = _page_table([_space(_kv(0, [11]))], [(512, 64, 0x9000)])
+    self_pt = _page_table([_layer_group(_kv(0, [10, 11]))], [(1024, 64, 0x1000)])
+    peer_pt = _page_table([_layer_group(_kv(0, [11]))], [(512, 64, 0x9000)])
 
     reg = _registrar(self_pt)
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)

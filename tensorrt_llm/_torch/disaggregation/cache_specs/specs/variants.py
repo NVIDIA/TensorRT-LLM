@@ -33,7 +33,7 @@ from ._base import StandardSpec
 class AttentionSpec(StandardSpec):
     """Paged attention: MHA / GQA / MLA, full or sliding window, in a standard ``KVCacheManagerV2``.
 
-    Every life cycle is one paged space. K/V are sharded by KV head and stored head-major, the
+    Every life cycle is one paged layer group. K/V are sharded by KV head and stored head-major, the
     layout the TRTLLM attention kernels write; index-key caches are replicated and move whole from
     one elected sender. MLA is the one-head, key-only case of the same layout.
     """
@@ -128,7 +128,7 @@ class Csa2Spec(AttentionSpec):
         "tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager.CSA2CacheManager",
     )
 
-    def role_buffers(self, manager, unit, role, nbytes, *, heads, tokens_per_block, context):
+    def role_buffers(self, manager, kind, role, nbytes, *, heads, tokens_per_block, context):
         return (_paged.replicated(nbytes),)
 
     def global_layer_ids(self, manager, cycle):
@@ -144,7 +144,7 @@ class Csa2Spec(AttentionSpec):
     def sends_first_tokens(self, request) -> bool:
         return getattr(request, "py_csa2_remote_tail_mode", None) != "source"
 
-    def excluded_regions(self, manager, page_table, space_index, request) -> FrozenSet[int]:
+    def excluded_regions(self, manager, page_table, group_index, request) -> FrozenSet[int]:
         split_layer = getattr(request, "py_csa2_remote_tail_split", None)
         if split_layer is None:
             return frozenset()
@@ -153,7 +153,7 @@ class Csa2Spec(AttentionSpec):
             for (layer_id, role), identity in manager._physical_roles.items()
         }
         excluded = set()
-        for index, region in enumerate(page_table.spaces[space_index].regions):
+        for index, region in enumerate(page_table.layer_groups[group_index].regions):
             identity = identities.get((region.local_layer, region.role))
             if identity is None:
                 continue
@@ -168,7 +168,7 @@ class Csa2Spec(AttentionSpec):
 class MambaSpec(StandardSpec):
     """Hybrid recurrent models (Mamba2, GDN, KDA): attention life cycles plus recurrent state.
 
-    Attention life cycles are paged as in ``attention``. Recurrent life cycles are state spaces: a
+    Attention life cycles are paged as in ``attention``. Recurrent life cycles are state layer groups: a
     request owns one slot holding every recurrent layer's state, moved once after the last chunk:
 
     * convolution state is sectioned (``[x | B | C]`` for Mamba2, ``[Q | K | V]`` for GDN), each
@@ -185,7 +185,7 @@ class MambaSpec(StandardSpec):
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.MambaHybridCacheManagerV2",
     )
 
-    def life_cycle_unit(self, manager, cycle) -> CacheKind:
+    def life_cycle_kind(self, manager, cycle) -> CacheKind:
         # Recurrent and attention layers never share a life cycle: their buffer configs differ,
         # so V2 groups them apart.
         recurrent = [manager._is_local_mamba_layer(int(lid)) for lid in cycle.internal_layer_ids]

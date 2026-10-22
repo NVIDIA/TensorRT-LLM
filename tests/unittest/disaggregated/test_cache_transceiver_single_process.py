@@ -725,7 +725,7 @@ def _get_layer_to_window_size(
 ) -> Dict[int, Optional[int]]:
     """Build a mapping from global layer_id to its sliding window size.
 
-    Read from the window of each paged unit space of the page table. Aggregates
+    Read from the window of each paged layer group of the page table. Aggregates
     from all PP ranks since each rank only handles a subset of layers.
     """
     layer_to_window: Dict[int, Optional[int]] = {}
@@ -734,11 +734,11 @@ def _get_layer_to_window_size(
     for pp_rank in range(pp):
         manager = managers[pp_rank * tp]
         page_table = KVRegionExtractorV1(manager).page_table
-        for space in page_table.spaces:
-            if space.unit != CacheKind.PAGED:
+        for layer_group in page_table.layer_groups:
+            if layer_group.kind != CacheKind.PAGED:
                 continue
-            for layer_id in space.layers:
-                layer_to_window[layer_id] = space.params.get("window")
+            for layer_id in layer_group.layers:
+                layer_to_window[layer_id] = layer_group.params.get("window")
 
     return layer_to_window
 

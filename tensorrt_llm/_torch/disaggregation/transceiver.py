@@ -485,36 +485,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         a cache spec moves less, see ``cache_specs.transfer_length``), which drops the speculative
         tail and the ctx first-token block (num_extra_kv_tokens slots are not transferred; both
         sides use the same length, so the ranges stay consistent). On the receiver the
-        already-cached prefix is masked so the sender skips it. Each space's cache spec lists its
-        own units (a recurrent-state space carries one slot, or nothing when this rank has none).
+        already-cached prefix is masked so the sender skips it. Each layer group's cache spec lists its
+        own units (a recurrent-state layer group carries one slot, or nothing when this rank has none).
         """
         adapter = self._reuse_adapter
         page_table = self._page_table
         assert page_table is not None
-        spaces = page_table.spaces
+        layer_groups = page_table.layer_groups
         transfer_len = transfer_length(page_table, req)
-        cached_per_space = (
-            adapter.get_cached_token_count_per_space(req, len(spaces))
+        cached_per_layer_group = (
+            adapter.get_cached_token_count_per_layer_group(req, len(layer_groups))
             if req.is_generation_only_request
-            else [0] * len(spaces)
+            else [0] * len(layer_groups)
         )
         groups = [
-            spec_for(space).local_units(
+            spec_for(layer_group).local_units(
                 LocalUnitsContext(
                     request=req,
-                    space_index=idx,
-                    space=space,
+                    group_index=idx,
+                    layer_group=layer_group,
                     cache_manager=self._kv_cache_manager,
                     reuse_adapter=adapter,
                     transfer_len=transfer_len,
-                    cached_tokens=cached_per_space[idx],
+                    cached_tokens=cached_per_layer_group[idx],
                 )
             )
-            for idx, space in enumerate(spaces)
+            for idx, layer_group in enumerate(layer_groups)
         ]
         return Chunk(
             block_ids_per_layer_groups=groups,
-            kind_per_layer_group=[space.unit for space in spaces],
+            kind_per_layer_group=[layer_group.kind for layer_group in layer_groups],
             token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
             excluded_regions=excluded_regions(self._kv_cache_manager, page_table, req),
@@ -529,7 +529,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         ``cache_specs.chunk_transfer_bytes``.
 
         Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same spaces from their physical pools, while this sums the
+        computes per-block bytes for the same layer groups from their physical pools, while this sums the
         regions that move; keep the two accountings in mind together when changing either.
         """
         return chunk_transfer_bytes(
@@ -940,8 +940,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             is_last=is_last_chunk,
             prompt_len=req.prompt_len,
         )
-        for space, block_ids in zip(self._page_table.spaces, all_block_ids):
-            chunk_block_ids.append(spec_for(space).chunk_units(space, block_ids, chunk_ctx))
+        for layer_group, block_ids in zip(self._page_table.layer_groups, all_block_ids):
+            chunk_block_ids.append(
+                spec_for(layer_group).chunk_units(layer_group, block_ids, chunk_ctx)
+            )
         if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_block_ids):
             return None
         # The block window is rounded up; the span this piece delivers is not. Every reader below

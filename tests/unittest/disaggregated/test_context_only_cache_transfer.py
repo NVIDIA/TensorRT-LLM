@@ -175,9 +175,9 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         ]
         region_mapping = match_regions(source_info.page_table, target_info.page_table)
         matched_global_ids = set()
-        for (src_space, src_region), (dst_space, dst_region) in region_mapping.items():
-            source_region = source_info.page_table.spaces[src_space].regions[src_region]
-            target_region = target_info.page_table.spaces[dst_space].regions[dst_region]
+        for (src_layer_group, src_region), (dst_layer_group, dst_region) in region_mapping.items():
+            source_region = source_info.page_table.layer_groups[src_layer_group].regions[src_region]
+            target_region = target_info.page_table.layer_groups[dst_layer_group].regions[dst_region]
             assert source_region.replicated
             assert target_region.replicated
             assert source_region.key == target_region.key

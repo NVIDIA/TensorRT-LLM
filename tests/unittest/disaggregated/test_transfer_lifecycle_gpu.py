@@ -378,10 +378,10 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
     result = []
     seen = set()
     roles = set()
-    for space_index, blocks in enumerate(chunk.block_ids_per_layer_groups):
-        space = extractor.page_table.spaces[space_index]
-        assert len(space.regions) > 0
-        for region in space.regions:
+    for group_index, blocks in enumerate(chunk.block_ids_per_layer_groups):
+        layer_group = extractor.page_table.layer_groups[group_index]
+        assert len(layer_group.regions) > 0
+        for region in layer_group.regions:
             memory = extractor.extract(blocks, region.pool).memory
             assert len(memory.ptrs) > 0
             roles.add(region.role)

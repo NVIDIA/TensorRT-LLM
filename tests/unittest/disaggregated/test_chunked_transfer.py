@@ -27,7 +27,7 @@ import pytest
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.cache_specs import PageTable, UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import LayerGroup, PageTable
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -135,15 +135,15 @@ def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
 
 
 def _attention_page_table(tokens_per_block: int, *windows) -> PageTable:
-    """A page table of paged attention spaces, one per window (``None``: full attention).
+    """A page table of paged attention layer groups, one per window (``None``: full attention).
 
-    Selection reads only a space's spec, unit and params, so the spaces carry no regions.
+    Selection reads only a layer group's spec, unit and params, so the layer groups carry no regions.
     """
     return PageTable(
-        spaces=[
-            UnitSpace(
+        layer_groups=[
+            LayerGroup(
                 spec="attention",
-                unit=CacheKind.PAGED,
+                kind=CacheKind.PAGED,
                 params={"tokens_per_block": tokens_per_block, "window": window},
             )
             for window in windows
@@ -152,10 +152,10 @@ def _attention_page_table(tokens_per_block: int, *windows) -> PageTable:
 
 
 def _make_projection_sender() -> Sender:
-    """Create a Sender wired to a stub registrar with two full-attention unit spaces.
+    """Create a Sender wired to a stub registrar with two full-attention layer groups.
 
     Full attention is spelled as a window the prompt never outgrows, so pairing must not
-    depend on whether a space carries a window.
+    depend on whether a layer group carries a window.
     """
     peer_ri = SimpleNamespace(
         dp_rank=0,
@@ -186,8 +186,14 @@ def _make_projection_sender() -> Sender:
         SimpleNamespace(src=src_region, dst=dst_region)
     ]
     groups = [
-        SimpleNamespace(self_space=space, peer_space=space, self_pool=0, peer_pool=0, plan=plan)
-        for space in range(2)
+        SimpleNamespace(
+            self_layer_group=layer_group,
+            peer_layer_group=layer_group,
+            self_pool=0,
+            peer_pool=0,
+            plan=plan,
+        )
+        for layer_group in range(2)
     ]
 
     registrar = MagicMock()
@@ -205,7 +211,7 @@ def _make_projection_sender() -> Sender:
 
 
 def _make_projection_task(slice_id: int = 1) -> KVSendTask:
-    # Chunk [4, 8) of an 8-block prompt. Space 1 is a short (windowed) space
+    # Chunk [4, 8) of an 8-block prompt. Layer group 1 is a short (windowed) layer group
     # that only holds ordinals 5..7.
     return KVSendTask(
         Chunk(
@@ -238,7 +244,7 @@ def _make_projection_req_info(slice_id=None) -> RecvReqInfo:
 
 
 def test_build_kv_write_meta_pairs_holes_by_ordinal():
-    """Each space pairs only the ordinals both tables hold; -1 entries are skipped."""
+    """Each layer group pairs only the ordinals both tables hold; -1 entries are skipped."""
     sender = _make_projection_sender()
 
     write_meta = sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
@@ -260,7 +266,9 @@ def test_build_kv_write_meta_pairs_holes_by_ordinal():
 def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     """The final SWA transfer is not projected down to the final context chunk."""
     sender = _make_projection_sender()
-    sender._registrar.self_extractor.page_table.spaces[0].params["window"] = 6 * _PROJECTION_TPB
+    sender._registrar.self_extractor.page_table.layer_groups[0].params["window"] = (
+        6 * _PROJECTION_TPB
+    )
     task = KVSendTask(
         Chunk(
             block_ids_per_layer_groups=[
@@ -558,13 +566,13 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     transceiver._page_table = PageTable(
-        spaces=[
-            UnitSpace(
+        layer_groups=[
+            LayerGroup(
                 spec="mamba",
-                unit=CacheKind.PAGED,
+                kind=CacheKind.PAGED,
                 params={"tokens_per_block": 32, "window": None},
             ),
-            UnitSpace(spec="mamba", unit=CacheKind.STATE),
+            LayerGroup(spec="mamba", kind=CacheKind.STATE),
         ]
     )
     cache_transceiver_config = CacheTransceiverConfig(
@@ -1045,7 +1053,7 @@ def _build_prefill_chunk_tokens_for(
     ``sliding_window_size`` defaults to a full-attention layer spelled as a
     window the prompt never outgrows (a max_attention_window cap); ``None`` is
     the other spelling of full attention. Passing a window shorter than the
-    prompt makes the space genuinely windowed.
+    prompt makes the layer group genuinely windowed.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -1182,9 +1190,9 @@ def test_window_covering_the_whole_prompt_streams_like_full_attention(window_tok
     """A window the prompt never outgrows evicts nothing, so its chunks stream.
 
     A full-attention layer may carry no window or a window capped at
-    max_attention_window, so a space is only genuinely windowed when its window
+    max_attention_window, so a layer group is only genuinely windowed when its window
     cuts the prompt short. Deferring on a non-None window alone would hold every
-    capped space back to the last chunk and silently disable pipelining. All
+    capped layer group back to the last chunk and silently disable pipelining. All
     three spellings must behave identically.
     """
     chunk = _build_prefill_chunk_tokens_for(

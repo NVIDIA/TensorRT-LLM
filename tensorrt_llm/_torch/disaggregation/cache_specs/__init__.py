@@ -14,11 +14,11 @@
 # limitations under the License.
 """Cache specs for the native P/D transfer: what each cache is, and how its bytes map.
 
-A rank's cache is a :class:`PageTable` of unit spaces and regions, each region carrying its own
+A rank's cache is a :class:`PageTable` of layer groups and regions, each region carrying its own
 layout declaration (:class:`BufferDecl`). One class per cache variant (``specs/variants.py``)
 claims the manager classes it understands and describes them (:class:`CacheSpec`); one algorithm
 (``correspondence``) maps any two sides' regions onto each other. The rest of the transfer only
-asks the spec of a unit space. See ``CACHE_SPECS_DEVELOPER_GUIDE.md`` for adding a spec.
+asks the spec of a layer group. See ``CACHE_SPECS_DEVELOPER_GUIDE.md`` for adding a spec.
 """
 
 from . import specs  # noqa: F401  (registers the built-in specs)
@@ -34,9 +34,9 @@ from .correspondence import (
     plan_transfers,
     validate_peer_compatible,
 )
-from .page_table import BufferDecl, PageTable, Pool, Region, UnitSpace
+from .page_table import BufferDecl, LayerGroup, PageTable, Pool, Region
 from .queries import (
-    bounce_unit_bytes_per_space,
+    bounce_unit_bytes_per_layer_group,
     chunk_transfer_bytes,
     excluded_regions,
     has_replicated_regions,
@@ -77,9 +77,9 @@ __all__ = [
     "STATE_TP",
     "ShardGrid",
     "TransferGroup",
-    "UnitSpace",
+    "LayerGroup",
     "attention_grid",
-    "bounce_unit_bytes_per_space",
+    "bounce_unit_bytes_per_layer_group",
     "build_page_table",
     "check_peer_compatible",
     "chunk_transfer_bytes",

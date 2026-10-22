@@ -41,11 +41,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     PairContext,
     Pool,
     Region,
-    UnitSpace,
     plan_transfers,
     spec_for,
 )
@@ -416,10 +416,10 @@ def _make_block_chunk(num_blocks: int, excluded_regions=frozenset()) -> Chunk:
     )
 
 
-def _attention_space(regions) -> UnitSpace:
-    return UnitSpace(
+def _attention_layer_group(regions) -> LayerGroup:
+    return LayerGroup(
         spec="attention",
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         regions=sorted(regions, key=lambda r: (r.pool, r.offset)),
         params={"tokens_per_block": _TOKENS_PER_BLOCK, "window": None},
     )
@@ -450,7 +450,7 @@ def _coalesced_page_table() -> PageTable:
         regions.append(Region(pool=0, layer=layer, role="value", offset=(off + 1) * u, buffers=nhd))
     regions.append(Region(pool=0, layer=1, role="index_key", offset=4 * u, buffers=replicated))
     pool = Pool(base_address=0x10000, slot_bytes=9 * u, num_slots=8)
-    return PageTable(pools=[pool], spaces=[_attention_space(regions)])
+    return PageTable(pools=[pool], layer_groups=[_attention_layer_group(regions)])
 
 
 def _ignored_role_page_table() -> PageTable:
@@ -467,7 +467,7 @@ def _ignored_role_page_table() -> PageTable:
         Region(pool=0, layer=1, role="key", offset=2 * u, buffers=hnd),
     ]
     pool = Pool(base_address=0x20000, slot_bytes=4 * u, num_slots=8)
-    return PageTable(pools=[pool], spaces=[_attention_space(regions)])
+    return PageTable(pools=[pool], layer_groups=[_attention_layer_group(regions)])
 
 
 def _expected_write_bytes(page_table: PageTable, chunk: Chunk) -> int:
@@ -497,12 +497,14 @@ def _summed_sender_bytes(page_table: PageTable, chunk: Chunk) -> int:
     for group in plan_transfers(
         rank_info, rank_info, page_table, page_table, chunk.excluded_regions
     ):
-        space = page_table.spaces[group.self_space]
-        units = chunk.block_ids_per_layer_groups[group.self_space]
-        src_units, dst_units = spec_for(space).pair_units(
+        layer_group = page_table.layer_groups[group.self_layer_group]
+        units = chunk.block_ids_per_layer_groups[group.self_layer_group]
+        src_units, dst_units = spec_for(layer_group).pair_units(
             units,
-            chunk.block_ids_per_layer_groups[group.peer_space],
-            PairContext(self_ri=rank_info, peer_ri=rank_info, space=space, dst_start_token=None),
+            chunk.block_ids_per_layer_groups[group.peer_layer_group],
+            PairContext(
+                self_ri=rank_info, peer_ri=rank_info, layer_group=layer_group, dst_start_token=None
+            ),
         )
         if src_units.size == 0:
             continue

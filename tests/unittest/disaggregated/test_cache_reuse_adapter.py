@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_specs import UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import LayerGroup
 from tensorrt_llm._torch.disaggregation.cache_specs.specs._paged import pair_ordinals
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -37,11 +37,11 @@ def _arr(values):
     return np.array(values, dtype=np.int64)
 
 
-def _space(window=None, tokens_per_block=8, spec="attention"):
-    """A paged attention unit space (no regions: _create_chunk only reads its spec and params)."""
-    return UnitSpace(
+def _layer_group(window=None, tokens_per_block=8, spec="attention"):
+    """A paged attention layer group (no regions: _create_chunk only reads its spec and params)."""
+    return LayerGroup(
         spec=spec,
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         params={"tokens_per_block": tokens_per_block, "window": window},
     )
 
@@ -130,15 +130,15 @@ def _build_transceiver_for_kv_slice(
     """Stub a KvCacheTransceiverV2 so _create_chunk runs without dist setup.
 
     Wires only the attributes the method touches:
-      - reuse adapter: tokens_per_block, per-space cached count, ordinals
-      - page table:    unit spaces (``spec`` selects the cache spec's request-wide rules)
+      - reuse adapter: tokens_per_block, per-layer group cached count, ordinals
+      - page table:    layer groups (``spec`` selects the cache spec's request-wide rules)
 
     `block_ids` is beam-0's stale-stripped chain (valid window followed by any
     speculative / ctx first-token over-hang). The adapter's positional table is
     modeled by prepending the manager-reported SWA holes, as V2 reports them via
     valid_only=False.
     """
-    space = _space(sliding_window_size, tokens_per_block, spec)
+    layer_group = _layer_group(sliding_window_size, tokens_per_block, spec)
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
@@ -161,11 +161,12 @@ def _build_transceiver_for_kv_slice(
 
     reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_space=lambda req, num_spaces: [cached_tokens] * num_spaces,
+        get_cached_token_count_per_layer_group=lambda req, num_layer_groups: [cached_tokens]
+        * num_layer_groups,
         get_block_ids=lambda req, idx: block_ids,
         get_block_ordinals=get_block_ordinals,
     )
-    page_table = SimpleNamespace(spaces=[space])
+    page_table = SimpleNamespace(layer_groups=[layer_group])
     cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
 
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -189,12 +190,12 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     transceiver, req = _build_transceiver_for_kv_slice(
         0, 257, tokens_per_block=128, is_generation_only=True
     )
-    # Native lifecycle IDs (space indices), not physical pool IDs, index reuse_status.
-    # Two distinct window spaces can share a physical pool without sharing reuse.
-    spaces = [
-        _space(tokens_per_block=128),
-        _space(window=128, tokens_per_block=128),
-        _space(window=128, tokens_per_block=128),
+    # Native lifecycle IDs (layer group indices), not physical pool IDs, index reuse_status.
+    # Two distinct window layer groups can share a physical pool without sharing reuse.
+    layer_groups = [
+        _layer_group(tokens_per_block=128),
+        _layer_group(window=128, tokens_per_block=128),
+        _layer_group(window=128, tokens_per_block=128),
     ]
     pages = [[10, 11, 12], [-1, 21, 22], [-1, 31, 32]]
     cache = SimpleNamespace(
@@ -211,8 +212,8 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     )
     adapter = _CacheReuseAdapterV2(manager)
     transceiver._reuse_adapter = adapter
-    transceiver._page_table.spaces = spaces
-    assert adapter.get_cached_token_count_per_space(req, len(spaces)) == [
+    transceiver._page_table.layer_groups = layer_groups
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [
         256,
         256 if encoder_hit else 0,
         0,
@@ -226,14 +227,14 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     # A later commit must not make newly allocated, unreceived pages look like
     # an admission-time prefix hit.
     cache.num_committed_tokens = 384
-    assert adapter.get_cached_token_count_per_space(req, len(spaces))[0] == 256
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups))[0] == 256
     cache.reuse_status[1].complete = False  # manager declined an available OPTIONAL group
-    assert adapter.get_cached_token_count_per_space(req, len(spaces)) == [256, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [256, 0, 0]
     manager.enable_block_reuse = False
-    assert adapter.get_cached_token_count_per_space(req, len(spaces)) == [0, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [0, 0, 0]
     manager.enable_block_reuse = True
     manager.kv_cache_map.clear()
-    assert adapter.get_cached_token_count_per_space(req, len(spaces)) == [0, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [0, 0, 0]
 
 
 class TestCreateKvSliceBlockSpan:
@@ -509,7 +510,7 @@ class TestKvSliceProperty:
 
 
 # ---------------------------------------------------------------------------
-# CacheReuseAdapter.get_cached_token_count_per_space: raw reuse-hit scalar.
+# CacheReuseAdapter.get_cached_token_count_per_layer_group: raw reuse-hit scalar.
 # ---------------------------------------------------------------------------
 
 
@@ -586,32 +587,32 @@ class TestAdapterBlockOrdinals:
             create_cache_reuse_adapter(mgr)
 
 
-class TestAdapterPerSpace:
-    """Per-space cached prefix: adapter reports only the reuse-hit scalar."""
+class TestAdapterPerLayerGroup:
+    """Per-layer-group cached prefix: adapter reports only the reuse-hit scalar."""
 
     TPB = 8
 
     def test_reuse_disabled(self):
         ad = _StubAdapter(scalar=128, tpb=self.TPB, enabled=False)
-        out = ad.get_cached_token_count_per_space(_FakeReq(256), 2)
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [0, 0]
 
     def test_zero_scalar(self):
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_space(_FakeReq(256), 2)
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [0, 0]
 
     def test_passthrough(self):
         ad = _StubAdapter(scalar=64, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_space(_FakeReq(256), 2)
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [64, 64]
 
-    def test_one_entry_per_space(self):
-        # The adapter returns the raw scalar for every space; masking it into the
+    def test_one_entry_per_layer_group(self):
+        # The adapter returns the raw scalar for every layer group; masking it into the
         # positional table (where it may fall inside SWA holes anyway) is
         # _create_chunk's job.
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_space(_FakeReq(32), 3)
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), 3)
         assert out == [8, 8, 8]
 
 

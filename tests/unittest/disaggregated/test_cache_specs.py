@@ -32,10 +32,10 @@ from tensorrt_llm._torch.disaggregation import cache_specs as cs
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs.page_table import (
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
 )
 from tensorrt_llm._torch.disaggregation.cache_specs.registry import register, unregister
 from tensorrt_llm._torch.disaggregation.cache_specs.spec import ChunkContext, PairContext
@@ -103,9 +103,11 @@ def _byte_ids(region: Region, ri, global_units: GlobalUnits) -> Dict[Address, By
     return ids
 
 
-def _space_byte_ids(page_table: PageTable, space: int, ri, global_units) -> Dict[Address, ByteId]:
+def _layer_group_byte_ids(
+    page_table: PageTable, layer_group: int, ri, global_units
+) -> Dict[Address, ByteId]:
     ids: Dict[Address, ByteId] = {}
-    for region in page_table.spaces[space].regions:
+    for region in page_table.layer_groups[layer_group].regions:
         ids.update(_byte_ids(region, ri, global_units))
     return ids
 
@@ -134,30 +136,36 @@ def check_resharding(
             src_ri = by_rank[flat]
             src_pt = src_ri.page_table
             src_layers = {
-                (space.spec, region.key) for space in src_pt.spaces for region in space.regions
+                (layer_group.spec, region.key)
+                for layer_group in src_pt.layer_groups
+                for region in layer_group.regions
             }
             for group in cs.plan_transfers(src_ri, dst_ri, src_pt, dst_pt):
                 if not cs.owns_transfer(group, src_ri, dst_ri):
                     continue
-                src_ids = _space_byte_ids(src_pt, group.self_space, src_ri, global_units)
-                dst_ids = _space_byte_ids(dst_pt, group.peer_space, dst_ri, global_units)
+                src_ids = _layer_group_byte_ids(
+                    src_pt, group.self_layer_group, src_ri, global_units
+                )
+                dst_ids = _layer_group_byte_ids(
+                    dst_pt, group.peer_layer_group, dst_ri, global_units
+                )
                 for s, d, n in group.plan.runs:
                     for b in range(n):
                         src_id = src_ids[(group.self_pool, s + b)]
                         dst_id = dst_ids[(group.peer_pool, d + b)]
                         if src_id != dst_id:
                             raise AssertionError(
-                                f"rank {flat} -> {dst_ri.instance_rank} space {group.peer_space}: "
+                                f"rank {flat} -> {dst_ri.instance_rank} layer group {group.peer_layer_group}: "
                                 f"byte {d + b} of pool {group.peer_pool} gets {src_id}, expected "
                                 f"{dst_id}"
                             )
-                        writes[(group.peer_space, (group.peer_pool, d + b))] += 1
-            for space_index, space in enumerate(dst_pt.spaces):
-                for region in space.regions:
-                    if (space.spec, region.key) not in src_layers:
+                        writes[(group.peer_layer_group, (group.peer_pool, d + b))] += 1
+            for group_index, layer_group in enumerate(dst_pt.layer_groups):
+                for region in layer_group.regions:
+                    if (layer_group.spec, region.key) not in src_layers:
                         continue
                     for address, byte_id in _byte_ids(region, dst_ri, global_units).items():
-                        expected[(space_index, address)] = byte_id
+                        expected[(group_index, address)] = byte_id
         missing = [k for k in expected if writes[k] == 0]
         repeated = [k for k, count in writes.items() if count > 1]
         if missing or repeated:
@@ -226,7 +234,7 @@ def _stage_layers(model: Model, par: Par, pp_rank: int) -> List[int]:
     return list(range(start, start + sizes[pp_rank]))
 
 
-def _attention_space(model, layers, kv, pools, base) -> UnitSpace:
+def _attention_layer_group(model, layers, kv, pools, base) -> LayerGroup:
     buf = int(model.tokens_per_block * kv * model.head_dim * model.element_bytes)
     axes = (("token", model.tokens_per_block), ("head", kv)) if model.nhd else (("head", kv),)
     kv_decl = (BufferDecl(buf, A, axes, "head"),)
@@ -252,10 +260,10 @@ def _attention_space(model, layers, kv, pools, base) -> UnitSpace:
             for i, gid in enumerate(layers):
                 regions.append(Region(1, gid, "index_key", i * model.index_key, idx, i))
     params = {"tokens_per_block": model.tokens_per_block, "window": None}
-    return UnitSpace("attention", CacheKind.PAGED, regions, params)
+    return LayerGroup("attention", CacheKind.PAGED, regions, params)
 
 
-def _state_space(model, layers, grid_size, pools, base) -> UnitSpace:
+def _state_layer_group(model, layers, grid_size, pools, base) -> LayerGroup:
     sections = [s // grid_size for s in model.conv_sections]
     heads = model.ssm_heads // grid_size
     roles = [
@@ -287,7 +295,7 @@ def _state_space(model, layers, grid_size, pools, base) -> UnitSpace:
             pools.append(Pool(base + 0x100000 * k, slot_bytes=size * n, num_slots=16))
             for i, gid in enumerate(layers):
                 regions.append(Region(first_pool + k, gid, role, i * size, decls, 100 + i))
-    return UnitSpace("attention", CacheKind.STATE, regions, {})
+    return LayerGroup("attention", CacheKind.STATE, regions, {})
 
 
 def make_rank(model: Model, par: Par, *, name="ctx", pp_rank=0, tp_rank=0, cp_rank=0) -> RankInfo:
@@ -321,15 +329,17 @@ def make_rank(model: Model, par: Par, *, name="ctx", pp_rank=0, tp_rank=0, cp_ra
         ),
     )
     base = 0x10_0000_0000 if name == "ctx" else 0x20_0000_0000
-    pools, spaces = [], []
+    pools, layer_groups = [], []
     if attn:
-        spaces.append(_attention_space(model, attn, kv, pools, base))
+        layer_groups.append(_attention_layer_group(model, attn, kv, pools, base))
     if state:
-        spaces.append(_state_space(model, state, cs.state_grid(ri).size, pools, base + 0x4000000))
+        layer_groups.append(
+            _state_layer_group(model, state, cs.state_grid(ri).size, pools, base + 0x4000000)
+        )
     # A hybrid manager is described by the mamba spec, attention life cycles included.
-    for space in spaces:
-        space.spec = "mamba" if "M" in model.pattern else "attention"
-    ri.page_table = PageTable(pools=pools, spaces=spaces)
+    for layer_group in layer_groups:
+        layer_group.spec = "mamba" if "M" in model.pattern else "attention"
+    ri.page_table = PageTable(pools=pools, layer_groups=layer_groups)
     return ri
 
 
@@ -347,7 +357,7 @@ def test_page_table_round_trips_and_dedups_layouts_on_the_wire():
         check_page_table_round_trip(make_rank(model, Par(tp=2)).page_table)
     table = make_rank(Model(pattern="AAAAAAAA"), Par()).page_table
     # Eight layers x K/V share one declaration.
-    assert len(table.to_dict()["spaces"][0]["layouts"]) == 1
+    assert len(table.to_dict()["layer_groups"][0]["layouts"]) == 1
 
 
 def test_region_and_buffer_declarations():
@@ -364,7 +374,7 @@ def test_region_and_buffer_declarations():
 
 
 # ---------------------------------------------------------------------------
-# Registry: specs claim managers by class, spaces name their spec
+# Registry: specs claim managers by class, layer groups name their spec
 # ---------------------------------------------------------------------------
 
 
@@ -379,8 +389,8 @@ def test_builtin_variants_are_registered_specs():
         "mamba",
         "qsa",
     } <= names
-    space = UnitSpace("csa2", CacheKind.PAGED)
-    assert cs.spec_for(space) is cs.spec_named("csa2")
+    layer_group = LayerGroup("csa2", CacheKind.PAGED)
+    assert cs.spec_for(layer_group) is cs.spec_named("csa2")
 
 
 class _BaseManager:
@@ -432,7 +442,7 @@ def test_two_specs_cannot_claim_one_manager_class(claiming_specs):
 def test_unknown_spec_fails_loudly():
     table = make_rank(Model(), Par()).page_table
     alien = PageTable.from_dict(table.to_dict())
-    alien.spaces[0].spec = "alien"
+    alien.layer_groups[0].spec = "alien"
     for call in (
         lambda: cs.match_regions(table, alien),
         lambda: cs.specs_in(alien),
@@ -517,21 +527,21 @@ def test_v2_life_cycles_become_spaces_of_regions():
         ],
     )
     table = cs.build_page_table(manager)
-    assert [s.spec for s in table.spaces] == ["attention", "attention"]
-    assert [s.unit for s in table.spaces] == [CacheKind.PAGED, CacheKind.PAGED]
-    assert table.spaces[0].params == {"tokens_per_block": 4, "window": None}
-    assert table.spaces[1].params == {"tokens_per_block": 4, "window": 64}
-    assert [(r.pool, r.layer, r.role, r.offset) for r in table.spaces[0].regions] == [
+    assert [s.spec for s in table.layer_groups] == ["attention", "attention"]
+    assert [s.kind for s in table.layer_groups] == [CacheKind.PAGED, CacheKind.PAGED]
+    assert table.layer_groups[0].params == {"tokens_per_block": 4, "window": None}
+    assert table.layer_groups[1].params == {"tokens_per_block": 4, "window": 64}
+    assert [(r.pool, r.layer, r.role, r.offset) for r in table.layer_groups[0].regions] == [
         (0, 10, key, 0),
         (0, 10, value, 64),
         (0, 10, index, 128),
         (0, 12, key, 192),
     ]
     # The padding buffer keeps its slot offset but has no region.
-    assert [(r.role, r.offset) for r in table.spaces[1].regions] == [(key, 0), (value, 128)]
+    assert [(r.role, r.offset) for r in table.layer_groups[1].regions] == [(key, 0), (value, 128)]
     kv_decl = BufferDecl(64, A, (("head", 2),), "head")
-    assert table.spaces[0].regions[0].buffers == (kv_decl,)
-    assert table.spaces[0].regions[2].buffers == (BufferDecl(64, A),)
+    assert table.layer_groups[0].regions[0].buffers == (kv_decl,)
+    assert table.layer_groups[0].regions[2].buffers == (BufferDecl(64, A),)
     assert table.pools == [Pool(0x1000, 4096, 32)]
 
 
@@ -591,9 +601,9 @@ def test_mamba_describes_attention_and_state_life_cycles():
     manager.ssm_state_dtype = SimpleNamespace(itemsize=4)
     manager._request_id_to_state_index = {7: 3}
     table = cs.spec_named("mamba").describe(manager)
-    attention, state = table.spaces
-    assert (attention.spec, attention.unit) == ("mamba", CacheKind.PAGED)
-    assert (state.spec, state.unit, state.params) == ("mamba", CacheKind.STATE, {})
+    attention, state = table.layer_groups
+    assert (attention.spec, attention.kind) == ("mamba", CacheKind.PAGED)
+    assert (state.spec, state.kind, state.params) == ("mamba", CacheKind.STATE, {})
     conv_region = state.regions[0]
     assert (conv_region.pool, conv_region.role) == (1, conv)
     assert [b.nbytes for b in conv_region.buffers] == [16, 8, 8]
@@ -655,7 +665,7 @@ def _virtual_manager():
 @pytest.mark.parametrize("spec", ["deepseek_v4", "csa2"])
 def test_virtual_layers_get_pp_independent_global_ids(spec):
     table = cs.spec_named(spec).describe(_virtual_manager())
-    swa, compressed = table.spaces
+    swa, compressed = table.layer_groups
     # model_layer * num_attention_types + attention_type
     assert [r.layer for r in swa.regions] == [8, 10]
     assert [r.layer for r in compressed.regions] == [9, 11]
@@ -759,7 +769,7 @@ def test_helix_replicated_state_reaches_every_receiver():
             for src in ctx
             for group in cs.plan_transfers(src, dst, src.page_table, dst.page_table)
             if any(
-                src.page_table.spaces[group.self_space].regions[r].role == "ple"
+                src.page_table.layer_groups[group.self_layer_group].regions[r].role == "ple"
                 for r in group.regions
             )
             and cs.owns_transfer(group, src, dst)
@@ -776,15 +786,15 @@ def test_regions_match_by_spec_layer_and_role():
     ctx = make_rank(Model(pattern="AMAM", index_key=8), Par(pp=2), pp_rank=1)
     gen = make_rank(Model(pattern="AMAM", index_key=8), Par(), name="gen")
     mapping = cs.match_regions(ctx.page_table, gen.page_table)
-    for (si, ri), (psi, pri) in mapping.items():
-        mine = ctx.page_table.spaces[si].regions[ri]
-        theirs = gen.page_table.spaces[psi].regions[pri]
+    for (gi, ri), (pgi, pri) in mapping.items():
+        mine = ctx.page_table.layer_groups[gi].regions[ri]
+        theirs = gen.page_table.layer_groups[pgi].regions[pri]
         assert mine.key == theirs.key
     # Every region of the PP stage (layers 2, 3) has a counterpart; the peer's layers 0, 1 do not.
-    assert len(mapping) == sum(len(s.regions) for s in ctx.page_table.spaces)
+    assert len(mapping) == sum(len(s.regions) for s in ctx.page_table.layer_groups)
 
     dup = PageTable.from_dict(gen.page_table.to_dict())
-    dup.spaces[0].regions.append(dup.spaces[0].regions[0])
+    dup.layer_groups[0].regions.append(dup.layer_groups[0].regions[0])
     with pytest.raises(ValueError, match="holds each \\(layer, role\\) once"):
         cs.match_regions(ctx.page_table, dup)
 
@@ -818,8 +828,8 @@ def test_peer_layout_mismatches_are_rejected():
         cs.validate_peer_compatible(hnd, with_index, hnd.page_table, with_index.page_table)
 
     other_spec = make_rank(Model(), Par(), name="gen")
-    for space in other_spec.page_table.spaces:
-        space.spec = "minimax_m3"
+    for layer_group in other_spec.page_table.layer_groups:
+        layer_group.spec = "minimax_m3"
     with pytest.raises(ValueError, match="cache specs differ"):
         cs.validate_peer_compatible(hnd, other_spec, hnd.page_table, other_spec.page_table)
 
@@ -829,15 +839,15 @@ def test_peer_layout_mismatches_are_rejected():
 # ---------------------------------------------------------------------------
 
 
-def _pair_ctx(self_ri, peer_ri, space, dst_start_token=None):
+def _pair_ctx(self_ri, peer_ri, layer_group, dst_start_token=None):
     return PairContext(
-        self_ri=self_ri, peer_ri=peer_ri, space=space, dst_start_token=dst_start_token
+        self_ri=self_ri, peer_ri=peer_ri, layer_group=layer_group, dst_start_token=dst_start_token
     )
 
 
 def test_paged_units_pair_by_ordinal_and_state_by_slot():
     ri = make_rank(Model(pattern="AMAM"), Par())
-    paged, state = ri.page_table.spaces
+    paged, state = ri.page_table.layer_groups
     spec = cs.spec_for(paged)
     src, dst = spec.pair_units(
         np.array([10, 11, -1, 13]), np.array([-1, 21, 22, 23]), _pair_ctx(ri, ri, paged)
@@ -856,9 +866,9 @@ def test_paged_units_pair_by_ordinal_and_state_by_slot():
 def test_helix_receiver_takes_its_strided_blocks():
     ctx = make_rank(Model(), Par(tp=1))
     gen = make_rank(Model(), Par(tp=1, cp=2), name="gen", cp_rank=1)
-    space = ctx.page_table.spaces[0]
-    src, dst = cs.spec_for(space).pair_units(
-        np.array([10, 11, 12, 13]), np.array([21, 23]), _pair_ctx(ctx, gen, space)
+    layer_group = ctx.page_table.layer_groups[0]
+    src, dst = cs.spec_for(layer_group).pair_units(
+        np.array([10, 11, 12, 13]), np.array([21, 23]), _pair_ctx(ctx, gen, layer_group)
     )
     assert src.tolist() == [11, 13] and dst.tolist() == [21, 23]
 
@@ -866,12 +876,14 @@ def test_helix_receiver_takes_its_strided_blocks():
 def test_chunk_units_defer_windows_and_whole_request_spaces():
     spec = cs.spec_named("attention")
     units = np.arange(6)
-    full = UnitSpace("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": None})
-    swa = UnitSpace("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": 8})
-    state = UnitSpace("attention", CacheKind.STATE)
+    full = LayerGroup("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": None})
+    swa = LayerGroup("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": 8})
+    state = LayerGroup("attention", CacheKind.STATE)
 
-    def chunk(space, values, is_last):
-        return spec.chunk_units(space, values, ChunkContext(2, 4, is_last, prompt_len=24)).tolist()
+    def chunk(layer_group, values, is_last):
+        return spec.chunk_units(
+            layer_group, values, ChunkContext(2, 4, is_last, prompt_len=24)
+        ).tolist()
 
     assert chunk(full, units, False) == [-1, -1, 2, 3, -1, -1]
     assert chunk(swa, units, False) == [-1] * 6
@@ -884,16 +896,16 @@ def test_chunk_units_defer_windows_and_whole_request_spaces():
 
 def test_chunk_bytes_count_regions_not_slots():
     table = make_rank(Model(pattern="AMAM", kv_heads=4, ple=12), Par()).page_table
-    attn_bytes = sum(r.nbytes for r in table.spaces[0].regions)
-    state_bytes = sum(r.nbytes for r in table.spaces[1].regions)
+    attn_bytes = sum(r.nbytes for r in table.layer_groups[0].regions)
+    state_bytes = sum(r.nbytes for r in table.layer_groups[1].regions)
     units = [np.array([3, -1, 4]), np.array([9])]
     assert cs.chunk_transfer_bytes(table, units) == 2 * attn_bytes + state_bytes
-    ple_regions = {(1, i) for i, r in enumerate(table.spaces[1].regions) if r.role == "ple"}
+    ple_regions = {(1, i) for i, r in enumerate(table.layer_groups[1].regions) if r.role == "ple"}
     assert cs.chunk_transfer_bytes(table, units, ple_regions) == (
         2 * attn_bytes + state_bytes - 2 * 12
     )
     assert cs.receiver_extra_bytes(table, table, units) == state_bytes
-    assert cs.bounce_unit_bytes_per_space(table) == [table.pools[0].slot_bytes, None]
+    assert cs.bounce_unit_bytes_per_layer_group(table) == [table.pools[0].slot_bytes, None]
     assert cs.resume_after_receive(table, SimpleNamespace(prompt_len=37)) == 37
 
 
@@ -927,7 +939,7 @@ def test_sender_write_meta_covers_paged_blocks_and_state_slot():
     task = KVSendTask(
         Chunk(
             block_ids_per_layer_groups=[np.array([10, -1, 12]), np.array([3])],
-            kind_per_layer_group=[s.unit for s in ctx.page_table.spaces],
+            kind_per_layer_group=[s.kind for s in ctx.page_table.layer_groups],
             token_range=TokenRange(0, 12),
             is_last=True,
         ),
@@ -950,7 +962,7 @@ def test_sender_write_meta_covers_paged_blocks_and_state_slot():
             continue
         src_pool = ctx.page_table.pools[group.self_pool]
         dst_pool = gen.page_table.pools[group.peer_pool]
-        pairs = [(10, 20), (12, 22)] if group.self_space == 0 else [(3, 5)]
+        pairs = [(10, 20), (12, 22)] if group.self_layer_group == 0 else [(3, 5)]
         for s_unit, d_unit in pairs:
             for s, d, n in group.plan.runs:
                 expected.append(
@@ -966,7 +978,7 @@ def test_sender_write_meta_covers_paged_blocks_and_state_slot():
     # TP rank 0 of 2 is the elected sender of the replicated side state, and it sends the state
     # once, into the receiver's slot 5.
     ple_pool = gen.page_table.pools[
-        next(r.pool for r in gen.page_table.spaces[1].regions if r.role == "ple")
+        next(r.pool for r in gen.page_table.layer_groups[1].regions if r.role == "ple")
     ]
     slot5 = ple_pool.base_address + 5 * ple_pool.slot_stride_bytes
     assert sum(n for _, d, n in got if slot5 <= d < slot5 + ple_pool.slot_bytes) == 2 * 12
@@ -1016,7 +1028,7 @@ def _linear_rank(model: LinearModel, par: Par, name: str, tp_rank: int) -> RankI
             Pool(base, slot_bytes=conv_bytes * n, num_slots=8),
             Pool(base + 0x100000, slot_bytes=state_bytes * n, num_slots=8),
         ],
-        spaces=[UnitSpace("linear_state", CacheKind.STATE, regions)],
+        layer_groups=[LayerGroup("linear_state", CacheKind.STATE, regions)],
     )
     return RankInfo(
         instance_name=name,

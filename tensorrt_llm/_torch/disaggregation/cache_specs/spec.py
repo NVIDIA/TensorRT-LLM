@@ -17,7 +17,7 @@
 A spec is a plugin. It claims the cache-manager classes it understands and answers three sorts of
 questions:
 
-* **Description**: what memory a manager holds (:meth:`CacheSpec.describe`), as unit spaces of
+* **Description**: what memory a manager holds (:meth:`CacheSpec.describe`), as layer groups of
   regions with their layout declarations. How two sides' bytes correspond follows from those
   declarations alone (``correspondence``); a spec never writes a mapper.
 * **Selection**: which units of a request move (:meth:`CacheSpec.local_units`,
@@ -25,7 +25,7 @@ questions:
   of the spec (how much history moves, what is excluded, where a received request resumes).
 * **Checks and memory**: peer compatibility beyond the declarations, and what to register.
 
-Everything outside ``cache_specs`` asks the spec of a unit space instead of testing its spec.
+Everything outside ``cache_specs`` asks the spec of a layer group instead of testing its spec.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 
-from .page_table import BufferDecl, PageTable, Region, UnitSpace
+from .page_table import BufferDecl, LayerGroup, PageTable, Region
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -49,14 +49,14 @@ class LocalUnitsContext:
     """What :meth:`CacheSpec.local_units` may consult to list a request's units on this rank."""
 
     request: Any
-    space_index: int
-    space: UnitSpace
+    group_index: int
+    layer_group: LayerGroup
     cache_manager: Any
     reuse_adapter: Any
     transfer_len: int
     """Prompt tokens the request moves (see :meth:`CacheSpec.transfer_length`)."""
     cached_tokens: int
-    """Block-aligned prefix the receiver already holds for this space (0 on the sender)."""
+    """Block-aligned prefix the receiver already holds for this layer group (0 on the sender)."""
 
 
 @dataclass(frozen=True)
@@ -75,8 +75,8 @@ class PairContext:
 
     self_ri: "RankInfo"
     peer_ri: "RankInfo"
-    space: UnitSpace
-    """The sender's space being paired."""
+    layer_group: LayerGroup
+    """The sender's layer group being paired."""
     dst_start_token: Optional[int]
 
 
@@ -93,8 +93,8 @@ class RegistrationRegion:
     within_known: bool = False
 
 
-MatchedPair = Tuple[UnitSpace, Region, UnitSpace, Region]
-"""``(local space, local region, peer space, peer region)`` of one matched region."""
+MatchedPair = Tuple[LayerGroup, Region, LayerGroup, Region]
+"""``(local layer_group, local region, peer layer_group, peer region)`` of one matched region."""
 
 
 class CacheSpec(ABC):
@@ -107,7 +107,7 @@ class CacheSpec(ABC):
     """
 
     name: ClassVar[str]
-    """Recorded as ``UnitSpace.spec`` on every space the spec describes; peers match on it."""
+    """Recorded as ``LayerGroup.spec`` on every layer group the spec describes; peers match on it."""
 
     managers: ClassVar[Tuple[str, ...]] = ()
     """Dotted paths of the cache-manager classes this spec describes. A manager is claimed by the
@@ -117,12 +117,12 @@ class CacheSpec(ABC):
 
     @abstractmethod
     def describe(self, manager) -> PageTable:
-        """Every region of the manager's memory, as unit spaces of this or other specs."""
+        """Every region of the manager's memory, as layer groups of this or other specs."""
 
     def role_buffers(
         self,
         manager,
-        unit: CacheKind,
+        kind: CacheKind,
         role: str,
         nbytes: int,
         *,
@@ -130,7 +130,7 @@ class CacheSpec(ABC):
         tokens_per_block: int,
         context: str,
     ) -> Tuple[BufferDecl, ...]:
-        """How one ``(layer, role)`` buffer of ``nbytes`` in a ``unit`` space is laid out and split
+        """How one ``(layer, role)`` buffer of ``nbytes`` in a ``kind`` layer group is laid out and split
         across ranks (``heads``: the rank's KV heads)."""
         raise NotImplementedError(f"{self.name} does not describe per-role layouts")
 
@@ -156,19 +156,21 @@ class CacheSpec(ABC):
         return True
 
     def excluded_regions(
-        self, manager, page_table: PageTable, space_index: int, request
+        self, manager, page_table: PageTable, group_index: int, request
     ) -> FrozenSet[int]:
-        """Indices of regions of one space this request does not move."""
+        """Indices of regions of one layer group this request does not move."""
         return frozenset()
 
     # ---- selection: which units of a request move ----
 
     @abstractmethod
     def local_units(self, ctx: LocalUnitsContext) -> np.ndarray:
-        """This rank's unit ids (pool slots) for one request in one space; ``-1`` = none."""
+        """This rank's unit ids (pool slots) for one request in one layer group; ``-1`` = none."""
 
     @abstractmethod
-    def chunk_units(self, space: UnitSpace, units: np.ndarray, ctx: ChunkContext) -> np.ndarray:
+    def chunk_units(
+        self, layer_group: LayerGroup, units: np.ndarray, ctx: ChunkContext
+    ) -> np.ndarray:
         """The part of :meth:`local_units` one prompt chunk sends; ``-1`` blanks the rest."""
 
     @abstractmethod
@@ -178,12 +180,12 @@ class CacheSpec(ABC):
         """Equal-length sender / receiver unit ids that move; both empty when nothing does."""
 
     @abstractmethod
-    def transfer_bytes(self, space: UnitSpace, region_bytes: int, units: np.ndarray) -> int:
-        """Bytes ``region_bytes`` per unit of a space move for ``units``."""
+    def transfer_bytes(self, layer_group: LayerGroup, region_bytes: int, units: np.ndarray) -> int:
+        """Bytes ``region_bytes`` per unit of a layer group move for ``units``."""
 
     @abstractmethod
-    def sends_incrementally(self, space: UnitSpace) -> bool:
-        """Whether the space's units can move in token chunks while the prompt is still running."""
+    def sends_incrementally(self, layer_group: LayerGroup) -> bool:
+        """Whether the layer group's units can move in token chunks while the prompt is still running."""
 
     # ---- compatibility ----
 
@@ -204,11 +206,11 @@ class CacheSpec(ABC):
 
     @abstractmethod
     def registration_regions(
-        self, page_table: PageTable, space_index: int
+        self, page_table: PageTable, group_index: int
     ) -> List[RegistrationRegion]:
-        """Device allocations backing one space, to register with the transfer agent."""
+        """Device allocations backing one layer group, to register with the transfer agent."""
 
-    def bounce_unit_bytes(self, page_table: PageTable, space_index: int) -> Optional[int]:
+    def bounce_unit_bytes(self, page_table: PageTable, group_index: int) -> Optional[int]:
         """Bytes per unit the bounce buffer reserves per ordinal, or None when it sizes by
         :meth:`receiver_extra_bytes` instead."""
         return None
@@ -217,10 +219,10 @@ class CacheSpec(ABC):
         self,
         sender_page_table: PageTable,
         receiver_page_table: PageTable,
-        space_index: int,
+        group_index: int,
         dst_units: np.ndarray,
     ) -> int:
-        """Bytes landing in this space's units that the per-ordinal bounce sizing does not cover."""
+        """Bytes landing in this layer group's units that the per-ordinal bounce sizing does not cover."""
         return 0
 
     def __repr__(self) -> str:

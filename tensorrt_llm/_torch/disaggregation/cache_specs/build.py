@@ -33,14 +33,14 @@ def build_page_table(manager) -> PageTable:
 
 
 def role_layout(
-    manager, unit: CacheKind, role: str, nbytes: int, *, heads: int, tokens_per_block: int
+    manager, kind: CacheKind, role: str, nbytes: int, *, heads: int, tokens_per_block: int
 ) -> Tuple[BufferDecl, ...]:
     """How the spec describing ``manager`` lays out one ``(layer, role)`` buffer, for readers of the
     cache layout other than the transfer (named reuse)."""
     spec = claim(manager)
     return spec.role_buffers(
         manager,
-        unit,
+        kind,
         role,
         nbytes,
         heads=heads,

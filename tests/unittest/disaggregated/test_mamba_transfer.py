@@ -37,10 +37,10 @@ from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
     STATE_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
     plan_transfers,
     receiver_extra_bytes,
     validate_peer_compatible,
@@ -345,7 +345,7 @@ def _state_page_table(
     side_bytes=None,
     layers=(1, 2),
 ) -> PageTable:
-    """One mamba state space: conv / SSM state for ``layers``, side state on the last layer.
+    """One mamba state layer group: conv / SSM state for ``layers``, side state on the last layer.
 
     Each role sits in its own pool whose slot holds the role of every layer back to back, the way
     ``KVCacheManagerV2`` coalesces equal-size buffers of one life cycle.
@@ -392,7 +392,7 @@ def _state_page_table(
     regions.sort(key=lambda r: (r.pool, r.offset))
     return PageTable(
         pools=pools,
-        spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)],
+        layer_groups=[LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=regions)],
     )
 
 

@@ -56,7 +56,7 @@ else:
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.cache_specs import PageTable, UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import LayerGroup, PageTable
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -245,11 +245,11 @@ def test_session_status_enum():
 # ---------------------------------------------------------------------------
 
 
-def _paged_space(tokens_per_block: int, window: Optional[int] = None) -> UnitSpace:
-    """A paged attention space as ``cache_specs`` describes a KVCacheManagerV2 life cycle."""
-    return UnitSpace(
+def _paged_layer_group(tokens_per_block: int, window: Optional[int] = None) -> LayerGroup:
+    """A paged attention layer group as ``cache_specs`` describes a KVCacheManagerV2 life cycle."""
+    return LayerGroup(
         spec="attention",
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         params={"tokens_per_block": tokens_per_block, "window": window},
     )
 
@@ -285,7 +285,9 @@ def _send_prefill_chunks(
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
-    transceiver._page_table.spaces = [_paged_space(tokens_per_block) for _ in all_block_ids]
+    transceiver._page_table.layer_groups = [
+        _paged_layer_group(tokens_per_block) for _ in all_block_ids
+    ]
     transceiver._send_reqs = {}
 
     prompt_len = total_blocks * tokens_per_block
@@ -347,7 +349,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
-    transceiver._page_table.spaces = [_paged_space(tokens_per_block)]
+    transceiver._page_table.layer_groups = [_paged_layer_group(tokens_per_block)]
     transceiver._send_reqs = {}
     # A full-attention group keeps the whole prompt resident from block 0, so
     # _describe_local describes every block regardless of prefill progress.
@@ -406,12 +408,12 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_space=lambda req, num_spaces: [0] * num_spaces,
+        get_cached_token_count_per_layer_group=lambda req, num_layer_groups: [0] * num_layer_groups,
         get_block_ids=_unexpected_get_block_ids,
         get_block_ordinals=lambda req, idx: source_block_ids,
     )
     transceiver._page_table = PageTable(
-        spaces=[_paged_space(tokens_per_block, window=window_blocks * tokens_per_block)]
+        layer_groups=[_paged_layer_group(tokens_per_block, window=window_blocks * tokens_per_block)]
     )
     transceiver._kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
@@ -800,7 +802,7 @@ def get_block_ids_per_layer_groups(
     tokens_per_block: int,
     prompt_len: int,
 ) -> List[np.ndarray]:
-    """Positional block table per unit space (life cycle), straight from the cache manager.
+    """Positional block table per layer group (life cycle), straight from the cache manager.
 
     Entry i is the pool slot for block ordinal i or -1 (SWA-evicted / unbound),
     fitted to ceil(prompt_len / tpb) entries -- the same shape
@@ -810,8 +812,8 @@ def get_block_ids_per_layer_groups(
     prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
     tables: List[np.ndarray] = []
 
-    # The space index is the V2 life-cycle id.
-    for group_id in range(len(page_table.spaces)):
+    # The layer group index is the V2 life-cycle id.
+    for group_id in range(len(page_table.layer_groups)):
         ordinals = list(
             kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
                 group_id, valid_only=False
@@ -1530,10 +1532,10 @@ def test_session_cancel_after_send():
         # avoid depending on KVCacheManager's sequence-management API (which
         # changed shape across versions).
         page_table = ctx_transfer_worker._rank_info.page_table
-        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.spaces]
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
-            kind_per_layer_group=[space.unit for space in page_table.spaces],
+            kind_per_layer_group=[layer_group.kind for layer_group in page_table.layer_groups],
             token_range=TokenRange(start=0, end=ctx_request.prompt_len),
             is_last=True,
         )
@@ -1775,10 +1777,10 @@ def test_session_has_transferring_tasks_false():
 
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
         page_table = ctx_transfer_worker._rank_info.page_table
-        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.spaces]
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
-            kind_per_layer_group=[space.unit for space in page_table.spaces],
+            kind_per_layer_group=[layer_group.kind for layer_group in page_table.layer_groups],
             token_range=TokenRange(start=0, end=ctx_request.prompt_len),
             is_last=True,
         )
@@ -1862,8 +1864,8 @@ def test_incompatible_peer_fails_only_affected_requests(
     # empty per-layer-group block lists suffice (no KV sequence needed).
     page_table = gen_tw._rank_info.page_table
     empty_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.spaces],
-        kind_per_layer_group=[space.unit for space in page_table.spaces],
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        kind_per_layer_group=[layer_group.kind for layer_group in page_table.layer_groups],
         token_range=TokenRange(start=0, end=0),
         is_last=True,
     )

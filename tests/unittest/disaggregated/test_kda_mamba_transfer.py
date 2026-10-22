@@ -67,8 +67,8 @@ import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
+    LayerGroup,
     PageTable,
-    UnitSpace,
     receiver_extra_bytes,
     validate_peer_compatible,
 )
@@ -198,14 +198,20 @@ def _create_kda_managers(
     return managers
 
 
-def _get_state_space(page_table) -> UnitSpace:
-    spaces = [space for space in page_table.spaces if space.unit == CacheKind.STATE]
-    assert len(spaces) == 1, f"expected exactly one recurrent-state space, got {len(spaces)}"
-    return spaces[0]
+def _get_state_layer_group(page_table) -> LayerGroup:
+    layer_groups = [
+        layer_group
+        for layer_group in page_table.layer_groups
+        if layer_group.kind == CacheKind.STATE
+    ]
+    assert len(layer_groups) == 1, (
+        f"expected exactly one recurrent-state layer group, got {len(layer_groups)}"
+    )
+    return layer_groups[0]
 
 
-def _role_regions(space: UnitSpace, role: str):
-    return [region for region in space.regions if region.role == role]
+def _role_regions(layer_group: LayerGroup, role: str):
+    return [region for region in layer_group.regions if region.role == role]
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +223,8 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
     mgr = _create_kda_managers(1, enable_attention_dp=enable_attention_dp)[0]
     try:
         pt = build_page_table_from_manager(mgr)
-        space = _get_state_space(pt)
-        assert space.spec == "mamba"
+        layer_group = _get_state_layer_group(pt)
+        assert layer_group.spec == "mamba"
 
         first_kda_layer = next(iter(_mamba_layer_ids(mgr)))
         conv = mgr.get_conv_states(first_kda_layer)
@@ -234,8 +240,8 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert tuple(ssm.shape[1:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
 
         # Both roles present on every KDA layer with correct byte sizes.
-        conv_regions = _role_regions(space, _CONV_ROLE)
-        ssm_regions = _role_regions(space, _SSM_ROLE)
+        conv_regions = _role_regions(layer_group, _CONV_ROLE)
+        ssm_regions = _role_regions(layer_group, _SSM_ROLE)
         kda_layers = [i for i, m in enumerate(_KDA_MASK) if m]
         assert sorted(r.layer for r in conv_regions) == kda_layers
         assert sorted(r.layer for r in ssm_regions) == kda_layers
@@ -253,7 +259,7 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
 
         # Matched-parallelism payload: receiver_extra_bytes must equal
         # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
-        slot_one = [np.array([1], dtype=np.int64) for _ in pt.spaces]
+        slot_one = [np.array([1], dtype=np.int64) for _ in pt.layer_groups]
         payload = receiver_extra_bytes(pt, pt, slot_one)
         assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
@@ -277,12 +283,12 @@ def test_kda_hetero_tp_sharded_accepted():
         gen_pt = build_page_table_from_manager(gen_mgr)
 
         # Production per-rank slots are the global sizes divided by tp.
-        ctx_space = _get_state_space(ctx_pt)
-        gen_space = _get_state_space(gen_pt)
-        ctx_conv_bpl = _role_regions(ctx_space, _CONV_ROLE)[0].nbytes
-        ctx_ssm_bpl = _role_regions(ctx_space, _SSM_ROLE)[0].nbytes
-        gen_conv_bpl = _role_regions(gen_space, _CONV_ROLE)[0].nbytes
-        gen_ssm_bpl = _role_regions(gen_space, _SSM_ROLE)[0].nbytes
+        ctx_layer_group = _get_state_layer_group(ctx_pt)
+        gen_layer_group = _get_state_layer_group(gen_pt)
+        ctx_conv_bpl = _role_regions(ctx_layer_group, _CONV_ROLE)[0].nbytes
+        ctx_ssm_bpl = _role_regions(ctx_layer_group, _SSM_ROLE)[0].nbytes
+        gen_conv_bpl = _role_regions(gen_layer_group, _CONV_ROLE)[0].nbytes
+        gen_ssm_bpl = _role_regions(gen_layer_group, _SSM_ROLE)[0].nbytes
         assert ctx_conv_bpl == CONV_SLOT_BYTES // 2
         assert ctx_ssm_bpl == SSM_SLOT_BYTES // 2
         assert gen_conv_bpl == CONV_SLOT_BYTES // 4
@@ -439,7 +445,7 @@ def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
     validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
 
     # One side holds a recurrent-layer-free stage of the hybrid model
-    # (no recurrent-state space at all): nothing to validate.
+    # (no recurrent-state layer group at all): nothing to validate.
     empty_pt = PageTable()
     validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, empty_pt)
     validate_peer_compatible(ctx_ri, gen_ri, empty_pt, gen_pt)

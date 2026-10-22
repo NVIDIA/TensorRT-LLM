@@ -24,10 +24,10 @@ from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
     plan_transfers,
     spec_for,
     spec_named,
@@ -71,10 +71,10 @@ def make_page_table(
     tokens_per_block=16,
     attn_layout="hnd",
 ):
-    """Create a hybrid page table: one paged attention space plus one recurrent-state space.
+    """Create a hybrid page table: one paged attention layer group plus one recurrent-state layer group.
 
-    The attention space holds a K and a V region per layer, sized so the layers fill the
-    pool slot. ``mamba_tp`` is the TP degree the synthetic recurrent-state space is sharded
+    The attention layer group holds a K and a V region per layer, sized so the layers fill the
+    pool slot. ``mamba_tp`` is the TP degree the synthetic recurrent-state layer group is sharded
     for: per-rank sizes are the ``mamba_tp`` shard of a fixed global state, so page tables
     built for different TP degrees stay peer-compatible under the mamba spec's global
     (TP-aggregated) size check. Pass the rank's effective mamba TP (``make_rankinfo``
@@ -99,9 +99,9 @@ def make_page_table(
                     local_layer=i,
                 )
             )
-    attn = UnitSpace(
+    attn = LayerGroup(
         spec="mamba",
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         regions=attn_regions,
         params={"tokens_per_block": tokens_per_block, "window": None},
     )
@@ -136,7 +136,7 @@ def make_page_table(
                 local_layer=lid,
             )
         )
-    state = UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=state_regions)
+    state = LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=state_regions)
 
     return PageTable(
         pools=[
@@ -144,7 +144,7 @@ def make_page_table(
             Pool(base_address=0xA000, slot_bytes=2 * conv_slot_bytes, num_slots=128),
             Pool(base_address=0xB000, slot_bytes=2 * ssm_slot_bytes, num_slots=128),
         ],
-        spaces=[attn, state],
+        layer_groups=[attn, state],
     )
 
 
@@ -416,20 +416,24 @@ def _fragments(region_pairs):
     )
 
 
-def _group(groups, space=_ATTN_SPACE, pool=None):
-    """The single transfer group of a local space (and pool, when given)."""
-    found = [g for g in groups if g.self_space == space and (pool is None or g.self_pool == pool)]
+def _group(groups, layer_group=_ATTN_SPACE, pool=None):
+    """The single transfer group of a local layer group (and pool, when given)."""
+    found = [
+        g
+        for g in groups
+        if g.self_layer_group == layer_group and (pool is None or g.self_pool == pool)
+    ]
     assert len(found) == 1, found
     return found[0]
 
 
 def _attention_plan(reg, peer_ri):
-    """The run plan of the attention space's group to ``peer_ri``."""
+    """The run plan of the attention layer group's group to ``peer_ri``."""
     return _group(reg.transfer_groups(peer_ri)).plan
 
 
-def _single_space_table(layer_offsets, bytes_per_layer, heads, tokens_per_block, buffers, layout):
-    """One attention space, one pool: global layer ``i`` at ``layer_offsets[i]`` of the slot.
+def _single_group_table(layer_offsets, bytes_per_layer, heads, tokens_per_block, buffers, layout):
+    """One attention layer group, one pool: global layer ``i`` at ``layer_offsets[i]`` of the slot.
 
     Layer ``i`` holds ``buffers`` equal regions (roles key, value) back to back; ``None``
     offsets skip a global id, so two tables can overlap on any subset of layers.
@@ -456,10 +460,10 @@ def _single_space_table(layer_offsets, bytes_per_layer, heads, tokens_per_block,
     slot = max(o for o in layer_offsets if o is not None) + bytes_per_layer
     return PageTable(
         pools=[Pool(base_address=0, slot_bytes=slot, num_slots=4)],
-        spaces=[
-            UnitSpace(
+        layer_groups=[
+            LayerGroup(
                 spec="attention",
-                unit=CacheKind.PAGED,
+                kind=CacheKind.PAGED,
                 regions=regions,
                 params={"tokens_per_block": tokens_per_block, "window": None},
             )
@@ -470,12 +474,12 @@ def _single_space_table(layer_offsets, bytes_per_layer, heads, tokens_per_block,
 def _plan(
     self_ri, peer_ri, self_offsets, peer_offsets, self_bpl, peer_bpl, buffers=2, layout="hnd"
 ):
-    """The run plan between two single-space tables built by ``_single_space_table``.
+    """The run plan between two single-layer-group tables built by ``_single_group_table``.
 
     Each side declares its own rank's KV heads and tokens per block.
     """
     tables = [
-        _single_space_table(
+        _single_group_table(
             offsets,
             bpl,
             ri.attention.kv_heads_per_rank,
@@ -900,8 +904,8 @@ def test_nhd_head_mismatch_uses_scale_pool_geometry():
 
 
 def test_replicated_region_ignores_kv_head_mismatch():
-    self_pt = _single_space_table([0], 1024, 1, 16, buffers=2, layout="replicated")
-    peer_pt = _single_space_table([0], 1024, 8, 16, buffers=2, layout="replicated")
+    self_pt = _single_group_table([0], 1024, 1, 16, buffers=2, layout="replicated")
+    peer_pt = _single_group_table([0], 1024, 8, 16, buffers=2, layout="replicated")
 
     self_rankinfo = make_rankinfo(instance_name="local", kv_heads_per_rank=1, page_table=self_pt)
     reg = _make_peer_registrar(self_rankinfo)
@@ -925,7 +929,7 @@ def test_replicated_region_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     Mirrors the C++ MLACacheFormatter::needSendCache pairing so the
     replicated traffic spreads across local ranks for multi-DP generation.
     """
-    page_table = _single_space_table([0], 1024, 2, 16, buffers=2, layout="replicated")
+    page_table = _single_group_table([0], 1024, 2, 16, buffers=2, layout="replicated")
 
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -1204,7 +1208,7 @@ def test_peer_registrar_nhd_head_match_moves_whole_region():
     """NHD + equal heads takes the merged-run fast path, not per-token slicing.
 
     With a dedicated (non-interleaved) K/V pool the run merge collapses the
-    whole space's regions into a single fragment per block — the fragment-count
+    whole layer group's regions into a single fragment per block — the fragment-count
     budget for separate layouts.
     """
     self_pt = make_page_table(attn_layout="nhd")
@@ -1277,18 +1281,18 @@ def test_hnd_head_mismatch_inconsistent_slot_geometry_raises():
 
 
 # ---------------------------------------------------------------------------
-# Spec dispatch: a unit space's spec name selects its spec; each region's buffer
+# Spec dispatch: a layer group's spec name selects its spec; each region's buffer
 # declarations (replicated included) decide how its bytes map and who sends them.
 # ---------------------------------------------------------------------------
 
 
 def _add_replicated_side_regions(page_table, *, bytes_per_layer=8):
-    """Graft a replicated recurrent side role (e.g. PLE) onto the state space, in its own pool."""
+    """Graft a replicated recurrent side role (e.g. PLE) onto the state layer group, in its own pool."""
     page_table.pools.append(
         Pool(base_address=0xC000, slot_bytes=2 * bytes_per_layer, num_slots=128)
     )
     pool = len(page_table.pools) - 1
-    page_table.spaces[_STATE_SPACE].regions.extend(
+    page_table.layer_groups[_STATE_SPACE].regions.extend(
         Region(
             pool=pool,
             layer=gid,
@@ -1304,10 +1308,15 @@ def _add_replicated_side_regions(page_table, *, bytes_per_layer=8):
 
 def test_spec_dispatch_keys_on_spec_name_only():
     page_table = make_page_table()
-    assert [space.unit for space in page_table.spaces] == [CacheKind.PAGED, CacheKind.STATE]
-    assert all(isinstance(spec_for(space), MambaSpec) for space in page_table.spaces)
-    attention_only = _single_space_table([0], 64, 2, 16, buffers=2, layout="hnd")
-    assert isinstance(spec_for(attention_only.spaces[0]), AttentionSpec)
+    assert [layer_group.kind for layer_group in page_table.layer_groups] == [
+        CacheKind.PAGED,
+        CacheKind.STATE,
+    ]
+    assert all(
+        isinstance(spec_for(layer_group), MambaSpec) for layer_group in page_table.layer_groups
+    )
+    attention_only = _single_group_table([0], 64, 2, 16, buffers=2, layout="hnd")
+    assert isinstance(spec_for(attention_only.layer_groups[0]), AttentionSpec)
     assert isinstance(spec_named("attention"), AttentionSpec)
     assert isinstance(spec_named("mamba"), MambaSpec)
     with pytest.raises(ValueError, match="unknown cache spec 'linear_state'"):
@@ -1317,7 +1326,7 @@ def test_spec_dispatch_keys_on_spec_name_only():
 def test_mamba_replicated_side_region_elects_one_sender():
     """Replicated side state elects one sender per fan-in group.
 
-    Sharded conv state in the same space is sent by every mamba TP rank.
+    Sharded conv state in the same layer group is sent by every mamba TP rank.
     """
     peer_pt = make_page_table(mamba_tp=1)
     _add_replicated_side_regions(peer_pt)
@@ -1377,13 +1386,13 @@ def test_replicated_validation_covers_state_spaces():
 
 
 def test_attention_replicated_validation_rejects_missing_index_key_region():
-    self_pt = _single_space_table([0], 64, 2, 16, buffers=2, layout="hnd")
-    self_pt.spaces[0].regions.append(
+    self_pt = _single_group_table([0], 64, 2, 16, buffers=2, layout="hnd")
+    self_pt.layer_groups[0].regions.append(
         Region(
             pool=0, layer=0, role="index_key", offset=64, buffers=(BufferDecl(16, ATTENTION_TP),)
         )
     )
-    peer_pt = _single_space_table([0], 64, 2, 16, buffers=2, layout="hnd")
+    peer_pt = _single_group_table([0], 64, 2, 16, buffers=2, layout="hnd")
     ri = make_rankinfo(instance_name="local", page_table=self_pt)
     with pytest.raises(
         ValueError, match=r"attention: replicated roles differ on overlapping layers.*index_key"

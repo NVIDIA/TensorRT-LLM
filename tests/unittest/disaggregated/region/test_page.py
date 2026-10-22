@@ -20,10 +20,10 @@ from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
+    LayerGroup,
     PageTable,
     Pool,
     Region,
-    UnitSpace,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -41,10 +41,10 @@ def _kv_regions(layer, offset, local_layer=0, pool=0, nbytes=128):
     ]
 
 
-def _attention_space(regions, window=None, tokens_per_block=64):
-    return UnitSpace(
+def _attention_layer_group(regions, window=None, tokens_per_block=64):
+    return LayerGroup(
         spec="attention",
-        unit=CacheKind.PAGED,
+        kind=CacheKind.PAGED,
         regions=regions,
         params={"tokens_per_block": tokens_per_block, "window": window},
     )
@@ -85,9 +85,9 @@ def test_physical_pool_rejects_strides_smaller_than_slot():
 
 def test_region_roundtrip():
     """Each (layer, role) buffer is one region; its pool, offset and ids survive the wire."""
-    space = _attention_space(_kv_regions(layer=5, offset=0, local_layer=0))
-    restored = UnitSpace.from_dict(space.to_dict())
-    assert restored.regions == space.regions
+    layer_group = _attention_layer_group(_kv_regions(layer=5, offset=0, local_layer=0))
+    restored = LayerGroup.from_dict(layer_group.to_dict())
+    assert restored.regions == layer_group.regions
     key, value = restored.regions
     assert (key.pool, key.layer, key.role, key.offset, key.local_layer) == (0, 5, "key", 0, 0)
     assert (value.pool, value.layer, value.role, value.offset) == (0, 5, "value", 128)
@@ -107,32 +107,32 @@ def test_region_roundtrip():
 )
 def test_region_layout_roundtrip(buffers):
     """Replicated / token-major / head-major declarations survive serialization."""
-    space = _attention_space([Region(2, 0, "index_key", 64, buffers)])
-    restored = UnitSpace.from_dict(space.to_dict()).regions[0]
+    layer_group = _attention_layer_group([Region(2, 0, "index_key", 64, buffers)])
+    restored = LayerGroup.from_dict(layer_group.to_dict()).regions[0]
     assert restored.buffers == buffers
     assert restored.role == "index_key"
     assert restored.replicated == all(b.split_axis is None for b in buffers)
 
 
-def test_unit_space_roundtrip():
-    space = _attention_space(
+def test_layer_group_roundtrip():
+    layer_group = _attention_layer_group(
         _kv_regions(layer=5, offset=0, local_layer=0) + _kv_regions(6, 256, local_layer=1),
         window=512,
     )
-    restored = UnitSpace.from_dict(space.to_dict())
+    restored = LayerGroup.from_dict(layer_group.to_dict())
     assert restored.spec == "attention"
-    assert restored.unit == CacheKind.PAGED
+    assert restored.kind == CacheKind.PAGED
     assert restored.params == {"tokens_per_block": 64, "window": 512}
     assert restored.layers == [5, 6]
     assert restored.pools == [0]
     assert len(restored.regions) == 4
 
 
-def test_unit_space_sends_each_distinct_layout_once():
+def test_layer_group_sends_each_distinct_layout_once():
     regions = _kv_regions(layer=0, offset=0) + [
         Region(0, 0, "index_key", 256, (BufferDecl(64, ATTENTION_TP),))
     ]
-    d = _attention_space(regions).to_dict()
+    d = _attention_layer_group(regions).to_dict()
     # K and V share one declaration; the replicated index key has its own.
     assert len(d["layouts"]) == 2
     assert [row[4] for row in d["regions"]] == [0, 0, 1]
@@ -141,15 +141,15 @@ def test_unit_space_sends_each_distinct_layout_once():
 def test_kv_cache_page_table_roundtrip():
     page_table = PageTable(
         pools=[Pool(base_address=0x10000, slot_bytes=256, num_slots=4)],
-        spaces=[_attention_space(_kv_regions(layer=5, offset=0))],
+        layer_groups=[_attention_layer_group(_kv_regions(layer=5, offset=0))],
     )
     d = page_table.to_dict()
     restored = PageTable.from_dict(d)
-    assert len(restored.spaces) == 1
+    assert len(restored.layer_groups) == 1
     assert len(restored.pools) == 1
     assert restored.pools[0].base_address == 0x10000
-    assert restored.spaces[0].params["tokens_per_block"] == 64
-    assert restored.pool_of(restored.spaces[0].regions[0]) is restored.pools[0]
+    assert restored.layer_groups[0].params["tokens_per_block"] == 64
+    assert restored.pool_of(restored.layer_groups[0].regions[0]) is restored.pools[0]
 
 
 # ---------------------------------------------------------------------------

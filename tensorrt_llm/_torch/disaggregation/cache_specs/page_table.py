@@ -17,7 +17,7 @@
 The page table has four parts, none of them specific to a cache spec:
 
 * :class:`Pool` -- where memory is: a base address and how a slot is addressed.
-* :class:`UnitSpace` -- memory that one per-request list of unit ids indexes (a life cycle's blocks,
+* :class:`LayerGroup` -- memory that one per-request list of unit ids indexes (a life cycle's blocks,
   a request's state slot). ``spec`` names the plugin that owns its selection rules; ``params`` is
   free-form data only that plugin reads.
 * :class:`Region` -- one piece of memory inside a unit's slot: what it is (global layer id + role,
@@ -207,17 +207,17 @@ class Region:
 
 
 @dataclass
-class UnitSpace:
+class LayerGroup:
     """Memory one per-request list of unit ids indexes.
 
-    ``unit`` says how the ids are read: PAGED ids are blocks by ordinal (entry ``i`` covers tokens
+    ``kind`` says how the ids are read: PAGED ids are blocks by ordinal (entry ``i`` covers tokens
     ``[i * tokens_per_block, ...)``), STATE ids are one slot per request. ``spec`` names the plugin
     whose rules select a request's units; ``params`` holds what those rules need (window size,
     tokens per block, ...) and must be msgpack-able.
     """
 
     spec: str
-    unit: CacheKind
+    kind: CacheKind
     regions: List[Region] = field(default_factory=list)
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -239,7 +239,7 @@ class UnitSpace:
             )
         return {
             "spec": self.spec,
-            "unit": int(self.unit),
+            "kind": int(self.kind),
             "params": dict(self.params),
             # Most layers share a layout, so declarations are sent once per distinct layout.
             "layouts": [[b.to_dict() for b in buffers] for buffers in layouts],
@@ -247,13 +247,13 @@ class UnitSpace:
         }
 
     @staticmethod
-    def from_dict(data: dict) -> "UnitSpace":
+    def from_dict(data: dict) -> "LayerGroup":
         layouts = [
             tuple(BufferDecl.from_dict(b) for b in buffers) for buffers in data.get("layouts", [])
         ]
-        return UnitSpace(
+        return LayerGroup(
             spec=str(data["spec"]),
-            unit=CacheKind(int(data["unit"])),
+            kind=CacheKind(int(data["kind"])),
             params=dict(data.get("params") or {}),
             regions=[
                 Region(
@@ -271,14 +271,14 @@ class UnitSpace:
 
 @dataclass
 class PageTable:
-    """Everything a rank's cache holds: pools, and unit spaces of regions inside them.
+    """Everything a rank's cache holds: pools, and layer groups of regions inside them.
 
-    For a ``KVCacheManagerV2`` the space index is the life-cycle id, so per-request unit lists line
+    For a ``KVCacheManagerV2`` the layer group index is the life-cycle id, so per-request unit lists line
     up with the manager's own groups.
     """
 
     pools: List[Pool] = field(default_factory=list)
-    spaces: List[UnitSpace] = field(default_factory=list)
+    layer_groups: List[LayerGroup] = field(default_factory=list)
 
     def pool_of(self, region: Region) -> Pool:
         return self.pools[region.pool]
@@ -286,12 +286,12 @@ class PageTable:
     def to_dict(self) -> dict:
         return {
             "pools": [p.to_dict() for p in self.pools],
-            "spaces": [s.to_dict() for s in self.spaces],
+            "layer_groups": [s.to_dict() for s in self.layer_groups],
         }
 
     @staticmethod
     def from_dict(data: dict) -> "PageTable":
         return PageTable(
             pools=[Pool.from_dict(p) for p in data.get("pools", [])],
-            spaces=[UnitSpace.from_dict(s) for s in data.get("spaces", [])],
+            layer_groups=[LayerGroup.from_dict(s) for s in data.get("layer_groups", [])],
         )

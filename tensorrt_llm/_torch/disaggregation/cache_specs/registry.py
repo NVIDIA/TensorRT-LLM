@@ -14,8 +14,8 @@
 # limitations under the License.
 """The registered cache specs, and the only place a spec is identified.
 
-A manager is claimed by the spec that names the class nearest to it in its MRO; a unit space names
-its spec (``UnitSpace.spec``), which maps to the registered spec here. A name no spec registers is
+A manager is claimed by the spec that names the class nearest to it in its MRO; a layer group names
+its spec (``LayerGroup.spec``), which maps to the registered spec here. A name no spec registers is
 an error wherever it is met -- validating a peer, matching regions, building a transfer -- never a
 skip.
 """
@@ -25,7 +25,7 @@ from __future__ import annotations
 import sys
 from typing import Dict, List, Optional, Type, TypeVar
 
-from .page_table import PageTable, UnitSpace
+from .page_table import LayerGroup, PageTable
 from .spec import CacheSpec
 
 _SPECS: Dict[str, CacheSpec] = {}
@@ -70,9 +70,9 @@ def spec_named(name: str) -> CacheSpec:
         ) from None
 
 
-def spec_for(space: UnitSpace) -> CacheSpec:
-    """The spec of one unit space."""
-    return spec_named(space.spec)
+def spec_for(layer_group: LayerGroup) -> CacheSpec:
+    """The spec of one layer group."""
+    return spec_named(layer_group.spec)
 
 
 def _resolve(path: str) -> Optional[type]:
@@ -102,12 +102,12 @@ def claim(manager) -> CacheSpec:
 
 
 def specs_in(page_table: Optional[PageTable]) -> List[CacheSpec]:
-    """The distinct specs of a page table's spaces, in first-use order; unknown specs raise."""
+    """The distinct specs of a page table's layer groups, in first-use order; unknown specs raise."""
     if page_table is None:
         return []
     out: List[CacheSpec] = []
-    for space in page_table.spaces:
-        spec = spec_for(space)
+    for layer_group in page_table.layer_groups:
+        spec = spec_for(layer_group)
         if spec not in out:
             out.append(spec)
     return out

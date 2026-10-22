@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_specs import PageTable, UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import LayerGroup, PageTable
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -1122,7 +1122,7 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
     chunk = transceiver._create_chunk(request)
 
-    # No mamba unit space -> no STATE entries in block_ids
+    # No mamba layer group -> no STATE entries in block_ids
     assert all(ids.size == 0 for ids in chunk.block_ids_per_layer_groups)
 
 
@@ -1146,12 +1146,12 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
-    # Provide a mamba state space so _create_chunk places the slot ID
-    mamba_space = UnitSpace(spec="mamba", unit=CacheKind.STATE)
+    # Provide a mamba state layer group so _create_chunk places the slot ID
+    mamba_layer_group = LayerGroup(spec="mamba", kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = PageTable(spaces=[mamba_space])
+    transceiver._page_table = PageTable(layer_groups=[mamba_layer_group])
     request = SimpleNamespace(
         is_generation_only_request=False,
         prompt_len=0,
@@ -1160,7 +1160,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 
     chunk = transceiver._create_chunk(request)
 
-    # Slot index 7 should be in the STATE space's block_ids
+    # Slot index 7 should be in the STATE layer group's block_ids
     assert chunk.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
@@ -3596,11 +3596,14 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
     try:
         page_table = build_page_table_from_manager(mgr)
 
-        # One unit space per life cycle, indexed by life-cycle id.
-        assert len(page_table.spaces) == len(mgr.impl.layer_grouping)
-        assert [space.spec for space in page_table.spaces[:2]] == ["mamba", "mamba"]
-        assert page_table.spaces[0].unit == CacheKind.STATE
-        assert page_table.spaces[1].unit == CacheKind.PAGED
+        # One layer group per life cycle, indexed by life-cycle id.
+        assert len(page_table.layer_groups) == len(mgr.impl.layer_grouping)
+        assert [layer_group.spec for layer_group in page_table.layer_groups[:2]] == [
+            "mamba",
+            "mamba",
+        ]
+        assert page_table.layer_groups[0].kind == CacheKind.STATE
+        assert page_table.layer_groups[1].kind == CacheKind.PAGED
 
         requests = mgr.add_dummy_requests([123], token_nums=[64], is_gen=False)
         assert len(requests) == 1
@@ -3620,12 +3623,12 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
     )
     try:
         page_table = build_page_table_from_manager(mgr)
-        mamba_space = page_table.spaces[0]
+        mamba_layer_group = page_table.layer_groups[0]
 
-        assert mamba_space.unit == CacheKind.STATE
+        assert mamba_layer_group.kind == CacheKind.STATE
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        conv_region = next(r for r in mamba_space.regions if r.role == MambaRole.CONV_STATE)
+        conv_region = next(r for r in mamba_layer_group.regions if r.role == MambaRole.CONV_STATE)
         # A sectioned conv state is one BufferDecl per section, each sharded along its bytes.
         assert all(b.split_axis == "byte" for b in conv_region.buffers)
         assert [b.nbytes for b in conv_region.buffers] == [

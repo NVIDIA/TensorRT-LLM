@@ -623,14 +623,14 @@ def decode_result_tail(message):
 
 
 def block_bytes_per_group(page_table: PageTable) -> list[int | None]:
-    """Return transferred bytes per cache block for each layer group (page-table unit space).
+    """Return transferred bytes per cache block for each page-table layer group.
 
-    Each space's cache spec answers: a paged space counts every distinct physical pool its regions
-    live in once; a space sized per request instead (recurrent state, see
+    Each layer group's cache spec answers: a paged group counts every distinct physical pool its
+    regions live in once; a group sized per request instead (recurrent state, see
     ``receiver_extra_bytes``) keeps a ``None`` placeholder so the result stays aligned with
     receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.cache_specs import bounce_unit_bytes_per_space
+    from tensorrt_llm._torch.disaggregation.cache_specs import bounce_unit_bytes_per_layer_group
 
     assert page_table is not None
-    return bounce_unit_bytes_per_space(page_table)
+    return bounce_unit_bytes_per_layer_group(page_table)

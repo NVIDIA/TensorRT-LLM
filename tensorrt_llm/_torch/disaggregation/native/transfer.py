@@ -1723,7 +1723,7 @@ class Sender(SenderBase):
 
         # Aggregate fragments from every transfer group using numpy concatenation.
         # Send ownership is per group: ranks holding identical bytes elect one
-        # sender, ranks holding a unique shard always send. Each space's cache
+        # sender, ranks holding a unique shard always send. Each layer group's cache
         # spec pairs the two sides' units (blocks by ordinal, a recurrent state
         # slot once); every unit is addressed by its slot base.
         page_table = extractor.page_table
@@ -1731,21 +1731,21 @@ class Sender(SenderBase):
         for group in self._registrar.transfer_groups(peer_ri, task._chunk.excluded_regions):
             if not self._registrar.owns(group, peer_ri):
                 continue
-            spaces = (group.self_space, group.peer_space)
-            units = paired_units.get(spaces)
+            layer_groups = (group.self_layer_group, group.peer_layer_group)
+            units = paired_units.get(layer_groups)
             if units is None:
-                space = page_table.spaces[group.self_space]
-                units = spec_for(space).pair_units(
-                    src_block_ids_per_groups[group.self_space],
-                    dst_block_ids_per_groups[group.peer_space],
+                layer_group = page_table.layer_groups[group.self_layer_group]
+                units = spec_for(layer_group).pair_units(
+                    src_block_ids_per_groups[group.self_layer_group],
+                    dst_block_ids_per_groups[group.peer_layer_group],
                     PairContext(
                         self_ri=self_ri,
                         peer_ri=peer_ri,
-                        space=space,
+                        layer_group=layer_group,
                         dst_start_token=req_info.dst_start_token,
                     ),
                 )
-                paired_units[spaces] = units
+                paired_units[layer_groups] = units
             src_units, dst_units = units
             if src_units.size == 0:
                 continue

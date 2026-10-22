@@ -1927,9 +1927,9 @@ class TestDeepseekV4CacheManager:
         try:
             page_table = build_page_table_from_manager(cache_manager)
             saw_region = False
-            for space in page_table.spaces:
-                assert space.spec == "deepseek_v4"
-                for region in space.regions:
+            for layer_group in page_table.layer_groups:
+                assert layer_group.spec == "deepseek_v4"
+                for region in layer_group.regions:
                     saw_region = True
                     # All DSv4 roles are laid out head-major (INDEXED): one
                     # buffer sharded along its KV heads.

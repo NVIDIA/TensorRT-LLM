@@ -10,7 +10,7 @@ transceiver.
 
 | File | Holds |
 |------|-------|
-| `page_table.py` | `PageTable` / `Pool` / `UnitSpace` / `Region` / `BufferDecl`: a rank's memory, with no spec-specific fields |
+| `page_table.py` | `PageTable` / `Pool` / `LayerGroup` / `Region` / `BufferDecl`: a rank's memory, with no spec-specific fields |
 | `spec.py` | `CacheSpec`: what a spec answers (description, selection, request-wide rules, checks, memory) |
 | `registry.py` | spec name -> spec; `claim(manager)`: the spec naming the class nearest in the manager's MRO |
 | `build.py` | `build_page_table(manager)`: the claiming spec describes the manager |
@@ -28,9 +28,9 @@ transceiver.
 ```
 PageTable
 ├─ pools:  [Pool]        base address, slot bytes, slot / layer strides
-└─ spaces: [UnitSpace]   one per V2 life cycle (index == life-cycle id)
-     ├─ spec:    "csa2"           the spec owning the space's rules (peers must agree)
-     ├─ unit:    PAGED | STATE    blocks by ordinal, or one slot per request
+└─ layer_groups: [LayerGroup]  one per V2 life cycle (index == life-cycle id)
+     ├─ spec:    "csa2"           the spec owning the layer group's rules (peers must agree)
+     ├─ kind:    PAGED | STATE    blocks by ordinal, or one slot per request
      ├─ params:  {...}            read only by the spec (window, tokens_per_block, ...)
      └─ regions: [Region]         one per (layer, role) buffer
           ├─ layer, role          global layer id + role: what it is, matched with the peer
@@ -38,7 +38,7 @@ PageTable
           └─ buffers: [BufferDecl] how its bytes are laid out and split across ranks
 ```
 
-The shape is fixed: a new cache adds spaces, regions, roles, axis names and params, never fields.
+The shape is fixed: a new cache adds layer groups, regions, roles, axis names and params, never fields.
 On the wire, regions are rows and declarations are sent once per distinct layout.
 
 ### Declaring a layout: `BufferDecl`
@@ -75,9 +75,9 @@ Axis names are free strings; the algorithm only reads their extents and which on
 2. **Connect** (once per peer). `validate_peer_compatible` checks both sides run the same specs,
    matched regions declare the same layout, replicated roles are not one-sided, and then each
    spec's own `validate_peer`. `plan_transfers` matches regions by `(spec, layer, role)`, turns each
-   pair into slot-relative byte runs, and merges them per `(space, pool)` pair and sender election
+   pair into slot-relative byte runs, and merges them per `(layer_group, pool)` pair and sender election
    into `TransferGroup`s, cached per peer.
-3. **Per request.** `local_units` lists the request's unit ids per space, `chunk_units` narrows
+3. **Per request.** `local_units` lists the request's unit ids per layer group, `chunk_units` narrows
    them to a prompt chunk, `excluded_regions` names regions the request does not move; on the
    sender `pair_units` pairs the two sides' units, and each owned group's runs are added to the
    units' slot base addresses.
@@ -101,7 +101,7 @@ How each role is laid out is the spec's knowledge, not the manager's: `StandardS
 answers per `(layer, role)` buffer from `replicated_roles`, `kv_layout` and `state_buffers`, which a
 spec overrides with what it reads from its manager (section sizes, head geometry, the backend's
 storage layout). Managers only name storage-only roles (`get_disagg_ignored_roles`).
-`role_layout(manager, unit, role, nbytes, ...)` answers the same question for other readers of the
+`role_layout(manager, kind, role, nbytes, ...)` answers the same question for other readers of the
 cache layout (named reuse).
 
 ## Adding a spec
@@ -113,7 +113,7 @@ cache layout (named reuse).
 3. Override only what differs, for example:
    * `role_buffers` (or `replicated_roles` / `kv_layout` / `state_buffers`) -- how each role is
      laid out and split across ranks;
-   * `describe` / `describe_life_cycle` / `life_cycle_unit` / `global_layer_ids` /
+   * `describe` / `describe_life_cycle` / `life_cycle_kind` / `global_layer_ids` /
      `window_size` -- what memory exists;
    * `local_units` / `chunk_units` / `pair_units` / `state_slot` -- which units move;
    * `transfer_length` / `excluded_regions` / `sends_first_tokens` / `resume_after_receive` --

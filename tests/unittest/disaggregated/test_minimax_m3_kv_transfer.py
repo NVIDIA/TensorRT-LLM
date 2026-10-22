@@ -227,9 +227,9 @@ def _create_manager(
     )
 
 
-def _regions_by_role(space, role) -> dict:
-    """``{global layer: region}`` of one role in a unit space."""
-    return {region.layer: region for region in space.regions if region.role == str(role)}
+def _regions_by_role(layer_group, role) -> dict:
+    """``{global layer: region}`` of one role in a layer group."""
+    return {region.layer: region for region in layer_group.regions if region.role == str(role)}
 
 
 def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
@@ -243,11 +243,11 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     regions.
     """
 
-    def check_declarations(space):
-        keys = _regions_by_role(space, Role.KEY)
-        values = _regions_by_role(space, Role.VALUE)
-        index_keys = _regions_by_role(space, Role.INDEX_KEY)
-        assert {(r.layer, r.role) for r in space.regions} == (
+    def check_declarations(layer_group):
+        keys = _regions_by_role(layer_group, Role.KEY)
+        values = _regions_by_role(layer_group, Role.VALUE)
+        index_keys = _regions_by_role(layer_group, Role.INDEX_KEY)
+        assert {(r.layer, r.role) for r in layer_group.regions} == (
             {(layer, str(Role.KEY)) for layer in range(NUM_LAYERS)}
             | {(layer, str(Role.VALUE)) for layer in range(NUM_LAYERS)}
             | {(1, str(Role.INDEX_KEY))}
@@ -266,11 +266,11 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
         Mapping(world_size=2, rank=0, tp_size=2, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
     try:
-        space = build_page_table_from_manager(manager).spaces[0]
-        assert space.spec == "minimax_m3"
-        keys, values, index_keys = check_declarations(space)
+        layer_group = build_page_table_from_manager(manager).layer_groups[0]
+        assert layer_group.spec == "minimax_m3"
+        keys, values, index_keys = check_declarations(layer_group)
         # Coalesced: every region addresses the same physical pool.
-        assert len({region.pool for region in space.regions}) == 1
+        assert len({region.pool for region in layer_group.regions}) == 1
         unit = keys[0].nbytes  # one K or V buffer per block
         # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
         # index-K makes the K/V layer stride non-uniform.
@@ -296,8 +296,8 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
         Mapping(world_size=1, rank=0, tp_size=1, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
     try:
-        space = build_page_table_from_manager(manager).spaces[0]
-        keys, values, index_keys = check_declarations(space)
+        layer_group = build_page_table_from_manager(manager).layer_groups[0]
+        keys, values, index_keys = check_declarations(layer_group)
         kv_pools = {region.pool for region in list(keys.values()) + list(values.values())}
         assert len(kv_pools) == 1
         assert index_keys[1].pool not in kv_pools
@@ -357,12 +357,12 @@ def _get_nvfp4_scale_view(
     page_table = KVRegionExtractorV1(manager).page_table
     local_layer_id = manager.layer_offsets[layer_idx]
     scale_roles = frozenset({"key_block_scale", "value_block_scale"})
-    for space in page_table.spaces:
+    for layer_group in page_table.layer_groups:
         # Scale buffers land in their own pool (smaller size class), next to each other in the
         # layer's slot, so one byte range of that pool covers both of the layer's scale roles.
         matching_regions = [
             region
-            for region in space.regions
+            for region in layer_group.regions
             if region.role in scale_roles and region.local_layer == local_layer_id
         ]
         if not matching_regions:

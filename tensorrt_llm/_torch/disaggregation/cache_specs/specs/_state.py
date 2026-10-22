@@ -85,11 +85,11 @@ def transfer_bytes(region_bytes: int, units: np.ndarray) -> int:
     return region_bytes if bool((units >= 0).any()) else 0
 
 
-def registration_regions(page_table: PageTable, space_index: int) -> List[RegistrationRegion]:
+def registration_regions(page_table: PageTable, group_index: int) -> List[RegistrationRegion]:
     # Roles may share one allocation (interleaved, equal sizes) or be separate. Lowest base first,
     # so a covering region registers before roles that fall inside it.
     pools = sorted(
-        (page_table.pools[p] for p in page_table.spaces[space_index].pools),
+        (page_table.pools[p] for p in page_table.layer_groups[group_index].pools),
         key=lambda p: p.base_address,
     )
     return [
@@ -100,14 +100,14 @@ def registration_regions(page_table: PageTable, space_index: int) -> List[Regist
 def _keys(page_table: PageTable, spec_name: str) -> Set[RegionKey]:
     return {
         region.key
-        for space in page_table.spaces
-        if space.spec == spec_name and space.unit == CacheKind.STATE
-        for region in space.regions
+        for layer_group in page_table.layer_groups
+        if layer_group.spec == spec_name and layer_group.kind == CacheKind.STATE
+        for region in layer_group.regions
     }
 
 
 def receiver_extra_bytes(
-    sender_page_table: PageTable, receiver_page_table: PageTable, space_index: int, dst_units
+    sender_page_table: PageTable, receiver_page_table: PageTable, group_index: int, dst_units
 ) -> int:
     """Bytes landing in the receiver's slot: its own region bytes over regions the sender holds.
 
@@ -116,9 +116,9 @@ def receiver_extra_bytes(
     """
     if dst_units.size == 0:
         return 0
-    space = receiver_page_table.spaces[space_index]
-    sender_keys = _keys(sender_page_table, space.spec)
-    return sum(region.nbytes for region in space.regions if region.key in sender_keys)
+    layer_group = receiver_page_table.layer_groups[group_index]
+    sender_keys = _keys(sender_page_table, layer_group.spec)
+    return sum(region.nbytes for region in layer_group.regions if region.key in sender_keys)
 
 
 def validate_peer(spec_name: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]) -> None:
@@ -130,8 +130,8 @@ def validate_peer(spec_name: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]
     replicated full-size state while sharding over a grid > 1 violates it under heterogeneous TP --
     exactly where resharding would read past the slot -- and is rejected here.
     """
-    for space, region, _, peer_region in pairs:
-        if space.unit != CacheKind.STATE:
+    for layer_group, region, _, peer_region in pairs:
+        if layer_group.kind != CacheKind.STATE:
             continue
         role = f"role {region.role!r} (layer {region.layer})"
         for i, (a, b) in enumerate(zip(region.buffers, peer_region.buffers)):

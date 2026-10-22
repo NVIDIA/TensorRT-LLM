@@ -14,12 +14,12 @@
 # limitations under the License.
 """The base of every built-in spec: a ``KVCacheManagerV2`` described life cycle by life cycle.
 
-Each life cycle becomes one unit space (its index is the life-cycle id), paged or state as
-:meth:`StandardSpec.life_cycle_unit` decides, and each ``(layer, role)`` buffer in it one region
+Each life cycle becomes one layer group (its index is the life-cycle id), paged or state as
+:meth:`StandardSpec.life_cycle_kind` decides, and each ``(layer, role)`` buffer in it one region
 whose layout :meth:`StandardSpec.role_buffers` declares. The defaults describe standard paged
 attention: K/V sharded by KV head, head-major, and the index-key role replicated. Roles the manager
 declares storage-only (``get_disagg_ignored_roles``) get no region. Selection and memory rules follow
-the space's unit (``_paged`` / ``_state``). A variant subclasses this and overrides what its cache
+the layer group's kind (``_paged`` / ``_state``). A variant subclasses this and overrides what its cache
 does differently; it is not registered itself.
 """
 
@@ -31,7 +31,7 @@ import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 
-from ..page_table import BufferDecl, PageTable, Region, UnitSpace
+from ..page_table import BufferDecl, LayerGroup, PageTable, Region
 from ..spec import (
     CacheSpec,
     ChunkContext,
@@ -56,13 +56,13 @@ class StandardSpec(CacheSpec):
             )
         ignored = _v2.ignored_roles(manager)
         pools, cycles = _v2.life_cycles(manager)
-        spaces = [self.describe_life_cycle(manager, cycle, ignored) for cycle in cycles]
-        return PageTable(pools=pools, spaces=spaces)
+        layer_groups = [self.describe_life_cycle(manager, cycle, ignored) for cycle in cycles]
+        return PageTable(pools=pools, layer_groups=layer_groups)
 
     def describe_life_cycle(
         self, manager, cycle: LifeCycle, ignored: FrozenSet[str] = frozenset()
-    ) -> UnitSpace:
-        unit = self.life_cycle_unit(manager, cycle)
+    ) -> LayerGroup:
+        kind = self.life_cycle_kind(manager, cycle)
         tokens_per_block = int(manager.impl.init_config.tokens_per_block)
         heads = _paged.kv_heads_per_rank(manager)
         global_ids = dict(zip(cycle.internal_layer_ids, self.global_layer_ids(manager, cycle)))
@@ -78,7 +78,7 @@ class StandardSpec(CacheSpec):
                 )
             buffers = self.role_buffers(
                 manager,
-                unit,
+                kind,
                 buf.role,
                 buf.size,
                 heads=heads,
@@ -96,16 +96,16 @@ class StandardSpec(CacheSpec):
                 )
             )
         regions.sort(key=lambda r: (r.pool, r.offset))
-        if unit == CacheKind.PAGED:
+        if kind == CacheKind.PAGED:
             params = _paged.params(tokens_per_block, self.window_size(manager, cycle))
         else:
             params = {}
-        return UnitSpace(spec=self.name, unit=unit, regions=regions, params=params)
+        return LayerGroup(spec=self.name, kind=kind, regions=regions, params=params)
 
     def role_buffers(
         self,
         manager,
-        unit: CacheKind,
+        kind: CacheKind,
         role: str,
         nbytes: int,
         *,
@@ -120,10 +120,10 @@ class StandardSpec(CacheSpec):
         laid out by :meth:`state_buffers`.
         """
         if role in self.replicated_roles(manager):
-            if unit == CacheKind.PAGED:
+            if kind == CacheKind.PAGED:
                 return (_paged.replicated(nbytes),)
             return _state.whole(nbytes)
-        if unit == CacheKind.PAGED:
+        if kind == CacheKind.PAGED:
             return (_paged.kv(nbytes, heads, tokens_per_block, self.kv_layout(manager), context),)
         return self.state_buffers(manager, role, nbytes, context)
 
@@ -142,7 +142,7 @@ class StandardSpec(CacheSpec):
         """The layout of a state role not in :meth:`replicated_roles`; held whole by default."""
         return _state.whole(nbytes)
 
-    def life_cycle_unit(self, manager, cycle: LifeCycle) -> CacheKind:
+    def life_cycle_kind(self, manager, cycle: LifeCycle) -> CacheKind:
         """Whether a life cycle's ids are blocks (PAGED) or one slot per request (STATE)."""
         return CacheKind.PAGED
 
@@ -161,34 +161,36 @@ class StandardSpec(CacheSpec):
         return _ownership.requires_physical_ownership(manager, mapping, transceiver_config)
 
     def state_slot(self, manager, request) -> Optional[int]:
-        """The request's slot in a state space, or None when this rank holds no state."""
+        """The request's slot in a state layer group, or None when this rank holds no state."""
         raise NotImplementedError(f"{self.name} describes no state units")
 
     # ---- selection ----
 
     def local_units(self, ctx: LocalUnitsContext) -> np.ndarray:
-        if ctx.space.unit == CacheKind.PAGED:
+        if ctx.layer_group.kind == CacheKind.PAGED:
             return _paged.local_units(ctx)
         return _state.units(self.state_slot(ctx.cache_manager, ctx.request))
 
-    def chunk_units(self, space: UnitSpace, units: np.ndarray, ctx: ChunkContext) -> np.ndarray:
-        if space.unit == CacheKind.PAGED:
-            return _paged.chunk_units(space, units, ctx)
+    def chunk_units(
+        self, layer_group: LayerGroup, units: np.ndarray, ctx: ChunkContext
+    ) -> np.ndarray:
+        if layer_group.kind == CacheKind.PAGED:
+            return _paged.chunk_units(layer_group, units, ctx)
         # Whole-request units ride the last chunk.
         return units if ctx.is_last else np.full_like(units, -1)
 
     def pair_units(self, src_units, dst_units, ctx: PairContext):
-        if ctx.space.unit == CacheKind.PAGED:
+        if ctx.layer_group.kind == CacheKind.PAGED:
             return _paged.pair_units(src_units, dst_units, ctx)
         return _state.pair_units(src_units, dst_units, ctx)
 
-    def transfer_bytes(self, space: UnitSpace, region_bytes: int, units: np.ndarray) -> int:
-        if space.unit == CacheKind.PAGED:
+    def transfer_bytes(self, layer_group: LayerGroup, region_bytes: int, units: np.ndarray) -> int:
+        if layer_group.kind == CacheKind.PAGED:
             return _paged.transfer_bytes(region_bytes, units)
         return _state.transfer_bytes(region_bytes, units)
 
-    def sends_incrementally(self, space: UnitSpace) -> bool:
-        return space.unit == CacheKind.PAGED
+    def sends_incrementally(self, layer_group: LayerGroup) -> bool:
+        return layer_group.kind == CacheKind.PAGED
 
     # ---- compatibility ----
 
@@ -204,20 +206,20 @@ class StandardSpec(CacheSpec):
     # ---- memory ----
 
     def registration_regions(
-        self, page_table: PageTable, space_index: int
+        self, page_table: PageTable, group_index: int
     ) -> List[RegistrationRegion]:
-        if page_table.spaces[space_index].unit == CacheKind.PAGED:
-            return _paged.registration_regions(page_table, space_index)
-        return _state.registration_regions(page_table, space_index)
+        if page_table.layer_groups[group_index].kind == CacheKind.PAGED:
+            return _paged.registration_regions(page_table, group_index)
+        return _state.registration_regions(page_table, group_index)
 
-    def bounce_unit_bytes(self, page_table: PageTable, space_index: int) -> Optional[int]:
-        if page_table.spaces[space_index].unit == CacheKind.PAGED:
-            return _paged.bounce_unit_bytes(page_table, space_index)
+    def bounce_unit_bytes(self, page_table: PageTable, group_index: int) -> Optional[int]:
+        if page_table.layer_groups[group_index].kind == CacheKind.PAGED:
+            return _paged.bounce_unit_bytes(page_table, group_index)
         return None
 
-    def receiver_extra_bytes(self, sender_page_table, receiver_page_table, space_index, dst_units):
-        if receiver_page_table.spaces[space_index].unit == CacheKind.PAGED:
+    def receiver_extra_bytes(self, sender_page_table, receiver_page_table, group_index, dst_units):
+        if receiver_page_table.layer_groups[group_index].kind == CacheKind.PAGED:
             return 0
         return _state.receiver_extra_bytes(
-            sender_page_table, receiver_page_table, space_index, dst_units
+            sender_page_table, receiver_page_table, group_index, dst_units
         )
