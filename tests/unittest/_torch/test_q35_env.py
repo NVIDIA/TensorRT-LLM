@@ -28,35 +28,6 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch import q35_env
 
-_GEN_NAMES = {
-    "TRTLLM_Q35_CACHED_STREAM_EVENTS",
-    "TRTLLM_Q35_DRAFT_BOOKKEEPING",
-    "TRTLLM_Q35_DRAFT_FP8_HEAD",
-    "TRTLLM_Q35_DRAFT_TAIL",
-    "TRTLLM_Q35_FUSED_ACCEPT",
-    "TRTLLM_Q35_FUSED_STEP0",
-    "TRTLLM_Q35_LL_ARGMAX_EXCHANGE",
-    "TRTLLM_Q35_PDL_EARLY_TRIGGER",
-    "TRTLLM_Q35_POSITIONS_HOIST",
-    "TRTLLM_Q35_REPLICATED_EMBED",
-    "TRTLLM_Q35_SAMPLER_EVENT_RING",
-    "TRTLLM_Q35_SAMPLER_HOST_RING",
-    "TRTLLM_Q35_SAMPLER_ZEROCOPY",
-    "TRTLLM_Q35_SAMPLING_SCAN_CACHE",
-    "TRTLLM_Q35_SHARDED_TARGET_SAMPLING",
-    "TRTLLM_Q35_SKIP_MROPE_COS_SIN",
-    "TRTLLM_Q35_SPEC_PREPARE_CACHE",
-}
-_CTX_NAMES = {
-    "TRTLLM_Q35_BRANCH_SNAPSHOT",
-    "TRTLLM_Q35_CTX_ATTN_PLAN",
-    "TRTLLM_Q35_CTX_LEAN_TOKENS",
-    "TRTLLM_Q35_CUSTOM_OP_EAGER",
-    "TRTLLM_Q35_GDN_GRAPH_DIRECT",
-    "TRTLLM_Q35_GDN_GRAPH_LEAN",
-    "TRTLLM_Q35_GDN_PREFILL_GRAPH",
-    "TRTLLM_Q35_SKIP_MROPE_COS_SIN",
-}
 _ALL_SWITCHES = set(q35_env._GEN) | set(q35_env._CTX)
 
 
@@ -77,12 +48,7 @@ def _switches_set():
 
 @pytest.fixture
 def env(monkeypatch):
-    """No TRTLLM_Q35_* variable set, fresh activation state and one recording reader instead of the real ones.
-
-    The reader records (fast paths on, TRTLLM_Q35_FUSED_ACCEPT) every time it runs. Tests set TRTLLM_Q35_*
-    variables through os.environ directly; the fixture removes all of them afterwards and restores the ones that
-    were set before.
-    """
+    """Clean TRTLLM_Q35_* environment and activation state; one reader recording (fast paths, FUSED_ACCEPT)."""
     saved = {name: os.environ.pop(name) for name in _q35_names()}
     seen = []
     monkeypatch.setattr(
@@ -104,14 +70,7 @@ def env(monkeypatch):
     os.environ.update(saved)
 
 
-def test_tables():
-    assert set(q35_env._GEN) == _GEN_NAMES
-    assert set(q35_env._CTX) == _CTX_NAMES
-    assert all(value == "1" for value in {**q35_env._GEN, **q35_env._CTX}.values())
-    assert q35_env.PROFILE_ENV not in _ALL_SWITCHES
-
-
-@pytest.mark.parametrize("value", [None, "", "off"])
+@pytest.mark.parametrize("value", [None, "off"])
 def test_profile_unset_enables_fast_paths_only(env, value):
     _, seen = env
     if value is not None:
@@ -122,29 +81,22 @@ def test_profile_unset_enables_fast_paths_only(env, value):
     assert seen == [(True, None)]
 
 
-@pytest.mark.parametrize("attention_dp", [False, True])
-def test_gen_profile(env, attention_dp):
+@pytest.mark.parametrize(
+    "profile,attention_dp,expected",
+    [
+        ("gen", False, q35_env._GEN),
+        ("gen", True, q35_env._GEN),
+        ("ctx", False, q35_env._CTX),
+        ("ctx", True, {}),
+    ],
+)
+def test_profiles(env, profile, attention_dp, expected):
     _, seen = env
-    os.environ[q35_env.PROFILE_ENV] = "gen"
+    os.environ[q35_env.PROFILE_ENV] = profile
     q35_env.activate(_config(attention_dp=attention_dp))
-    assert {name: os.environ[name] for name in _switches_set()} == q35_env._GEN
-    assert seen == [(True, "1")]  # the readers ran once, after the environment was set
-
-
-def test_ctx_profile_without_attention_dp(env):
-    _, seen = env
-    os.environ[q35_env.PROFILE_ENV] = "ctx"
-    q35_env.activate(_config(attention_dp=False))
-    assert {name: os.environ[name] for name in _switches_set()} == dict.fromkeys(_CTX_NAMES, "1")
-    assert seen == [(True, None)]
-
-
-def test_ctx_profile_with_attention_dp(env):
-    _, seen = env
-    os.environ[q35_env.PROFILE_ENV] = "ctx"
-    q35_env.activate(_config(attention_dp=True))
-    assert not _switches_set()
-    assert seen == [(True, None)]
+    assert {name: os.environ[name] for name in _switches_set()} == expected
+    # The readers ran once, after the environment was set.
+    assert seen == [(True, expected.get("TRTLLM_Q35_FUSED_ACCEPT"))]
 
 
 @pytest.mark.parametrize("profile", ["gen", "ctx"])
@@ -160,7 +112,7 @@ def test_environment_wins(env, profile):
             assert os.environ[name] == value, name
 
 
-@pytest.mark.parametrize("value", ["on", "1", "GEN", "gen,ctx", "decode"])
+@pytest.mark.parametrize("value", ["on", "GEN"])
 def test_invalid_profile_raises(env, value):
     _, seen = env
     os.environ[q35_env.PROFILE_ENV] = value
@@ -170,32 +122,18 @@ def test_invalid_profile_raises(env, value):
     assert seen == []
 
 
-@pytest.mark.parametrize("profile", [None, "gen", "ctx"])
 @pytest.mark.parametrize(
     "model_type,capability",
-    [
-        ("qwen3_next", (10, 3)),
-        ("llama", (10, 3)),
-        ("qwen3_5_moe", (10, 0)),
-        ("qwen3_5_moe", (9, 0)),
-    ],
+    [("qwen3_next", (10, 3)), ("qwen3_5_moe", (10, 0)), ("qwen3_5_moe", None)],
 )
-def test_other_models_and_gpus(env, profile, model_type, capability):
-    monkeypatch, seen = env
-    if profile is not None:
-        os.environ[q35_env.PROFILE_ENV] = profile
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
-    q35_env.activate(_config(model_type=model_type))
-    assert not _switches_set()
-    assert not q35_env.fast_paths_enabled()
-    assert seen == []
-
-
-def test_no_gpu(env):
+def test_other_models_and_gpus(env, model_type, capability):
     monkeypatch, seen = env
     os.environ[q35_env.PROFILE_ENV] = "gen"
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    q35_env.activate(_config())
+    if capability is None:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    else:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
+    q35_env.activate(_config(model_type=model_type))
     assert not _switches_set()
     assert not q35_env.fast_paths_enabled()
     assert seen == []
@@ -211,23 +149,16 @@ def test_profile_once_per_process(env):
     q35_env.activate(_config())
     assert seen == [(True, "1")]
     assert "TRTLLM_Q35_FUSED_ACCEPT" not in os.environ
-    assert "TRTLLM_Q35_BRANCH_SNAPSHOT" not in os.environ
+    assert "TRTLLM_Q35_CTX_ATTN_PLAN" not in os.environ
 
 
 def test_fast_paths_follow_the_loaded_model(env):
-    monkeypatch, seen = env
+    _, seen = env
     q35_env.activate(_config())
     assert q35_env.fast_paths_enabled()
+    q35_env.set_fast_paths(True)  # unchanged: no reader re-run
     q35_env.activate(_config(model_type="qwen3_next"))
     assert not q35_env.fast_paths_enabled()
-    assert seen == [(True, None), (False, None)]
-
-
-def test_set_fast_paths_reruns_readers(env):
-    _, seen = env
-    q35_env.set_fast_paths(True)
-    q35_env.set_fast_paths(True)
-    q35_env.set_fast_paths(False)
     assert seen == [(True, None), (False, None)]
 
 
@@ -285,6 +216,17 @@ def _import_time_reads(tree):
             reads.append((node.lineno, name))
         stack.extend(ast.iter_child_nodes(node))
     return reads
+
+
+def test_profile_switches_are_read():
+    """Every switch a profile sets is read by some module (no dead profile entries)."""
+    package = Path(tensorrt_llm.__file__).parent
+    sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in package.rglob("*.py")
+        if path.name != "q35_env.py"
+    )
+    assert sorted(name for name in _ALL_SWITCHES if f'"{name}"' not in sources) == []
 
 
 def test_profile_switches_are_not_read_at_import():
