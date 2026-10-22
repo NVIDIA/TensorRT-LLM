@@ -270,6 +270,23 @@ def tmem_ld_32x32b_x8(taddr: Int32, *, loc=None, ip=None):
     return [Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(8)]
 
 
+@dsl_user_op
+def tmem_ld_32x32b_xn(taddr: Int32, n: int, *, loc=None, ip=None):
+    """tcgen05.ld 32x32b.x``n`` (``n`` 16 or 32): this thread's TMEM lane, ``n`` columns."""
+    assert n in (16, 32), n
+    outs = ", ".join(f"${i}" for i in range(n))
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * n),
+        [Int32(taddr).ir_value(loc=loc, ip=ip)],
+        f"tcgen05.ld.sync.aligned.32x32b.x{n}.b32 {{{outs}}}, [${n}];\n"
+        "tcgen05.wait::ld.sync.aligned;",
+        ",".join(["=f"] * n) + ",r",
+        loc=loc,
+        ip=ip,
+    )
+    return [Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(n)]
+
+
 # ---------------------------------------------------------------------------
 # Global memory
 # ---------------------------------------------------------------------------

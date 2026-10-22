@@ -26,7 +26,9 @@ are not launches of their own. The experts and the finalize are reached
 unchanged: their routing calls read the routing method's memo and the replicated
 experts' placement, which this module fills for the logits tensor the fused op returns.
 On a layer that ``three_window_placement`` gave three ring windows the placement is the
-three-window one (``PLACE_BALANCE3``) and is recorded with its 96-expert window.
+three-window one (``PLACE_BALANCE3``) and is recorded with its 96-expert window; on a
+layer ``half_window_experts`` gave the half window (TP4) it is ``PLACE_HALF``, recorded
+with its 96-expert window likewise.
 
 Values. The logits, the selected ids, the routing weights, the placement and
 the quantized expert input are the built-in path's bit for bit (the ops' tests
@@ -109,6 +111,8 @@ def _placement(moe, world: Optional[int] = None):
         return _route.PLACE_NONE, local, None
     if state.balance and getattr(state, "windows", 2) == 3:
         return _route.PLACE_BALANCE3, local, state
+    if getattr(state, "half", False):
+        return _route.PLACE_HALF, local, state
     if state.balance:
         return _route.PLACE_BALANCE, local, state
     if state.static_from < local:
@@ -127,8 +131,15 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
     #: ``pool_direct.DirectPoolSite`` (its producers publish into the routed kernel's
     #: transport); None otherwise.
     _pool_direct_armed = None
+    #: ``wide_prologue``: the TP4 wide inbox (``WIDE_MAX_ROWS`` rows) of the 16..32-row
+    #: prologue, or None (those steps keep the built-in prepare).
+    _wide_inbox: Optional[ProjectionInbox] = None
 
     def prepare_moe_inputs(self, hidden_states: torch.Tensor):
+        if self._wide_inbox is not None:
+            wide = self._wide_prepare(hidden_states)
+            if wide is not None:
+                return wide
         warps = self._prologue_router_warps(hidden_states)
         if warps is None:
             self._pool_direct_refuse_declined(hidden_states)
@@ -210,6 +221,83 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
         self._prologue_record_routing(out, place, state, world)
         return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
 
+    def _wide_prepare(self, hidden_states: torch.Tensor):
+        """``wide_prologue``: the prologue of a 16..32-row decode step, or None (nothing launched).
+
+        Where the built-in decode would run its tensor-core router and the fused routing on
+        a pool-deferring call of 16..32 rows: this rank's router columns
+        (``router_shard_wide``, the built-in tensor-core bits) on the router fork's side
+        stream, the pool slice GEMM on the current one, and ``pool_gather_route`` on the
+        wide inbox -- the pool gather + quantization, the logit exchange and the routing
+        (no placement: above 8 rows the experts are the built-in ones and read only the
+        routing memo). The pool slice is this rank's columns of the built-in replicated
+        pool projection, by a GEMM of its own shape.
+        """
+        rows = hidden_states.shape[0] if hidden_states.dim() == 2 else 0
+        if not _shard.WIDE_MIN_ROWS <= rows <= _shard.WIDE_MAX_ROWS:
+            return None
+        if self._prologue_router_conditions(hidden_states, _shard.WIDE_MAX_ROWS) is None:
+            return None
+        inbox = self._wide_inbox
+        world = inbox.world
+        columns = _route.local_columns(world)
+        probe = hidden_states.view(-1)[: rows * columns].view(rows, columns)
+        args = self._pool_quant_args(probe, max_rows=inbox.max_rows)
+        if args is None:
+            return None
+        gain, global_scale = args
+        routing = self.experts.routing_method
+        side = self._router_stream
+        local = _shard.local_experts(world)
+        with self.nvtx("router"):
+            main = torch.cuda.current_stream()
+            logits_local = torch.empty(
+                (rows, local), device=hidden_states.device, dtype=torch.float32
+            )
+            if side is None:
+                _shard.router_shard_wide(
+                    hidden_states,
+                    self.router.weight,
+                    inbox.rank,
+                    self.metap_multiplier,
+                    logits_local,
+                    ranks=world,
+                )
+            else:
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    _shard.router_shard_wide(
+                        hidden_states,
+                        self.router.weight,
+                        inbox.rank,
+                        self.metap_multiplier,
+                        logits_local,
+                        ranks=world,
+                    )
+        with self.nvtx("pool"):
+            projected = self._replicated_projection(
+                self.pooler, hidden_states, self._pool_gather_workspace
+            )
+            if side is not None:
+                main.wait_stream(side)
+            bias = routing.e_score_correction_bias
+            _require_aligned(pooled=projected, gain=gain, bias=bias, logits=logits_local)
+            out = _route.pool_gather_route(
+                projected,
+                logits_local,
+                inbox,
+                gain,
+                global_scale,
+                self.pre_expert_norm.variance_epsilon,
+                bias,
+                routing.renorm_eps,
+                _route.PLACE_NONE,
+                enable_pdl=self._prologue_enable_pdl,
+                return_gathered=False,
+            )
+        self._prologue_record_routing(out, _route.PLACE_NONE, None, world)
+        return out.logits, Fp4QuantizedTensor(out.fp4, out.scale, is_sf_swizzled=False)
+
     def _prologue_record_routing(self, out, place: int, state, world: int = 8) -> None:
         """What the experts and the finalize read, keyed on the logits object: the
         routing memo, and the replicated experts' placement."""
@@ -220,6 +308,8 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
             state.placement = (out.logits, version, out.local_ids, out.weights_bf16, out.stats)
             if place == _route.PLACE_BALANCE3:
                 state.placement += (3 * _route.local_experts(world),)
+            elif place == _route.PLACE_HALF:
+                state.placement += (_route.HALF_SPAN,)
             state.last_stats = out.stats
 
     def _pool_direct_refuse_declined(self, hidden_states: torch.Tensor) -> None:
@@ -243,6 +333,17 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
         kernel and route with the fused routing kernel, on a pool-deferring
         call of at most 8 BF16 rows. Reads nothing that differs between ranks.
         """
+        if self._prologue_router_conditions(hidden_states, MAX_ROWS) is None:
+            return None
+        overlaps = getattr(self, "_prepare_stream", None) is not None
+        return _shard.builtin_warps(hidden_states.shape[0], overlaps)
+
+    def _prologue_router_conditions(self, hidden_states: torch.Tensor, max_rows: int):
+        """True when a pool-deferring call of 1..``max_rows`` BF16 rows meets every built-in
+        condition of the router launch and the fused routing kernel; else None.
+
+        Reads nothing that differs between ranks.
+        """
         if not getattr(self, "_defer_pool", False) or self._prologue_inbox is None:
             return None
         routing = getattr(self.experts, "routing_method", None)
@@ -264,7 +365,7 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
             or hidden_states.dtype != torch.bfloat16
             or not hidden_states.is_contiguous()
             or hidden_states.shape[1] != _shard.HIDDEN
-            or not 1 <= hidden_states.shape[0] <= MAX_ROWS
+            or not 1 <= hidden_states.shape[0] <= max_rows
             or weight.device != hidden_states.device
         ):
             return None
@@ -277,8 +378,7 @@ class MuseSparkOpenTepPrologueMoE(MuseSparkOpenTepGatherMoE):
             or not bias.is_contiguous()
         ):
             return None
-        overlaps = getattr(self, "_prepare_stream", None) is not None
-        return _shard.builtin_warps(hidden_states.shape[0], overlaps)
+        return True
 
 
 def agreed_build(mapping) -> bool:
