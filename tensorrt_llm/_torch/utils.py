@@ -241,6 +241,22 @@ class Fp4QuantizedTensor:
 
 
 @dataclass
+class Fp8PerTokenQuantizedTensor:
+    """FP8 E4M3 activation with an FP32 scale per token.
+
+    ``unquantized_hidden_states`` optionally keeps the BF16/FP16 source for
+    non-FP8 consumers of the same input.
+    """
+    fp8_tensor: torch.Tensor
+    per_token_scale: torch.Tensor  # [num_tokens, 1], fp32
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+
+@dataclass
 class MxFp8QuantizedTensor:
     """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
 
