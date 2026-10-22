@@ -19,6 +19,11 @@ offset is the row's own max and causality is the selection's. Splits take interl
 the union. Rows of a group that belong to different requests (a partial or misaligned group)
 are served in separate passes; rows of an invalid request give zeros.
 
+Launch (`plan_launch`): within one wave every (group, KV head) unit takes the same number of
+splits; past one wave the units of the full waves take one CTA each (bf16 output, the gate
+fused) and the units of the last, partial wave -- whole groups -- take two to four CTAs each,
+whose rows alone go through the merge.
+
 Roles (11 warps):
 
 * warps 5-6 `cp.async` each tile's raw NVFP4 K / V rows (eight threads a 128-byte row), K scales
@@ -33,8 +38,10 @@ Roles (11 warps):
   memory (f16) after the first resolve; per tile load S, take the max over the row's own
   entries, move the row's reference max only when it grew past `RESCALE_TH` (log2), rescaling
   O in tensor memory then, and write P = 2^(s - max) as f16 (0 off the row's selection);
-  finally normalize O (times the V global scale), optionally gate it, and store it (or an fp32
-  partial and its log2-sum-exp for the merge).
+  finally normalize O (times the V global scale) and store it as bf16 (or an fp32 partial and
+  its log2-sum-exp for the merge). With the output gate the four warps read the CTA's gate
+  rows (coalesced) before the last P V completes, the live warps stage bf16(O / l) in the free
+  K slots, and all four apply the gate and store coalesced rows.
 
 Tensor memory: O in columns 0-255, S/P buffers at 256 and 320, Q at 384. Shared memory: two f16
 K and two f16 V slots (32 KB each), three raw slots, the union tables (up to ~225 KB): one CTA
@@ -87,9 +94,7 @@ from .qsa_paged_sparse_gqa_nvfp4_decode import (
     _lds4,
     _MergeKernel,
     _ptr,
-    _round_bf16,
     _scale2s,
-    _sigmoid,
     _stg1,
     _sts1,
     _sts4,
@@ -140,6 +145,8 @@ CHUNK_COLS = 32
 Q_LD = 528
 #: Most splits of one (group, KV head) union.
 MAX_PLAN_SPLITS = 32
+#: Most splits of a last-wave unit (tail mode).
+MAX_TAIL_SPLITS = 4
 #: Fewer request groups than this take the per-row kernel (GB300: it is as fast or faster
 #: below 32 rows at four rows a request, the grouped kernel from 32 rows up).
 MIN_GROUPS = 8
@@ -148,7 +155,8 @@ MIN_GROUPS = 8
 class _Layout(NamedTuple):
     """The shared-memory plan of one compile: bitmap words (`ngw` groups of four), the union's
     group capacity, local tiles a CTA may own in one pass, union-scratch offsets in raw slot 0
-    and the table size in int32 words."""
+    and the table size in int32 words.
+    """
 
     ngw: int
     nw: int
@@ -163,7 +171,8 @@ def _layout(rpr: int, group: int, width: int, bt_width: int, tpb: int, splits: i
     """The kernel's shared-memory plan for `rpr` rows a group over a `width`-column expanded
     selection and a `bt_width`-page block table, or None where it does not fit: the union
     scratch (each row's token bitmap, the union's group list and the request's block-table
-    row) shares raw slot 0, the staged q rows raw slots 1-2."""
+    row) shares raw slot 0, the staged q rows raw slots 1-2.
+    """
     if tpb % 4 or tpb & (tpb - 1) or rpr < 1 or rpr * group > BM:
         return None
     ngw = -(-(bt_width * tpb) // 128)
@@ -183,6 +192,11 @@ def _layout(rpr: int, group: int, width: int, bt_width: int, tpb: int, splits: i
     return _Layout(ngw, nw, ug_max, tmax, u_ug, u_bt, tab_words) if fits else None
 
 
+def _sigmoid_fast(x):
+    """1 / (1 + 2^(-x log2 e)) on ex2.approx and rcp.approx (relative error ~1e-6)."""
+    return cute.arch.rcp_approx(1.0 + cute.math.exp2(-x * LOG2E, fastmath=True))
+
+
 def _phase(g, n):
     """Parity of use `g` of a ring of `n` slots."""
     return (g // n) % 2
@@ -198,6 +212,7 @@ class _VerifyKernel:
         width,
         tpb,
         splits,
+        tail,
         scale,
         num_pages,
         bt_width,
@@ -209,11 +224,13 @@ class _VerifyKernel:
         gated,
         pdl,
     ):
-        lay = _layout(rpr, group, width, bt_width, tpb, splits)
+        lay = _layout(rpr, group, width, bt_width, tpb, 1 if tail else splits)
         assert lay is not None, "no shared-memory plan for this geometry (see `_layout`)"
         self.T = rpr
         self.group, self.kvh, self.width, self.tpb = group, kv_heads, width, tpb
         self.splits = splits
+        #: tail mode: CTAs below `n_whole` serve whole units, the rest `splits`-way splits
+        self.tail = tail
         self.scale_log2 = scale * LOG2E
         self.num_pages, self.bt_width, self.num_requests = num_pages, bt_width, num_requests
         self.ks, self.kss, self.qs = k_strides, ks_strides, q_strides
@@ -257,10 +274,14 @@ class _VerifyKernel:
         bt_ptr: cute.Pointer,
         req_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
+        part_ptr: cute.Pointer,
         lse_ptr: cute.Pointer,
         gate_ptr: cute.Pointer,
         rows: cutlass.Int32,
         gate_stride: cutlass.Int32,
+        n_whole: cutlass.Int32,
+        tail_row0: cutlass.Int32,
+        n_ctas: cutlass.Int32,
         stream,
     ):
         def qk():
@@ -319,7 +340,6 @@ class _VerifyKernel:
         )
         req = cute.make_tensor(req_ptr, cute.make_layout((rows,), stride=(1,)))
         gs = cute.make_tensor(gs_ptr, cute.make_layout((3,), stride=(1,)))
-        n_groups = (rows + self.T - 1) // self.T
         self.kernel(
             qk_mma,
             qk_mma_acc,
@@ -338,12 +358,15 @@ class _VerifyKernel:
             bt,
             req,
             out_ptr.toint(),
+            part_ptr.toint(),
             lse_ptr.toint(),
             gate_ptr.toint(),
             rows,
             gate_stride,
+            n_whole,
+            tail_row0,
         ).launch(
-            grid=[n_groups * self.kvh * self.splits, 1, 1],
+            grid=[n_ctas, 1, 1],
             block=[THREADS, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
@@ -468,12 +491,12 @@ class _VerifyKernel:
         return cutlass.min(n_ug, self.ug_max)
 
     @cute.jit
-    def _resolve(self, lead, kvh, split, n_loc, n_ug, tidx, s_bm, s_ug, s_tab, s_bt):
+    def _resolve(self, lead, kvh, split, nsplit, n_loc, n_ug, tidx, s_bm, s_ug, s_tab, s_bt):
         """Every local tile's groups (entry of the group's first token, (token, row) selection
-        bytes), then each (tile, verify row)'s 64-bit selection word."""
+        bytes), then each (tile, verify row)'s 64-bit selection word.
+        """
         rpr: cutlass.Constexpr = self.T
         nw: cutlass.Constexpr = self.nw
-        splits: cutlass.Constexpr = self.splits
         tmax: cutlass.Constexpr = self.tmax
         n_rs: cutlass.Constexpr = -(-(tmax * GPT) // THREADS)
         s_roff = s_tab + self.t_roff * 4
@@ -487,7 +510,7 @@ class _VerifyKernel:
         for i in cutlass.range_constexpr(n_rs):
             slot = tidx + i * THREADS
             kl = slot // GPT
-            ugi = (split + kl * splits) * GPT + slot % GPT
+            ugi = (split + kl * nsplit) * GPT + slot % GPT
             gid = _lds1(s_ug + cutlass.min(ugi, self.ug_max - 1) * 4)
             gid = cutlass.min(cutlass.max(gid, 0), 8 * nw - 1)
             gids.append(gid)
@@ -495,7 +518,7 @@ class _VerifyKernel:
         for i in cutlass.range_constexpr(n_rs):
             slot = tidx + i * THREADS
             kl = slot // GPT
-            ugi = (split + kl * splits) * GPT + slot % GPT
+            ugi = (split + kl * nsplit) * GPT + slot % GPT
             gid = gids[i]
             page = pages[i]
             wsel = gid >> 3
@@ -537,7 +560,22 @@ class _VerifyKernel:
 
     @cute.jit
     def _pass_tiles(
-        self, act, lead, kvh, r0, rows, sel_base, split, tidx, warp, lane, s_raw, s_scan, s_tab, mBT
+        self,
+        act,
+        lead,
+        kvh,
+        r0,
+        rows,
+        sel_base,
+        split,
+        nsplit,
+        tidx,
+        warp,
+        lane,
+        s_raw,
+        s_scan,
+        s_tab,
+        mBT,
     ):
         """Union + resolve of one pass; returns the CTA's local tile count."""
         s_bm = s_raw + self.u_bm
@@ -550,11 +588,11 @@ class _VerifyKernel:
         n_loc = cutlass.Int32(
             cutlass.select_(
                 split < n_tiles,
-                (n_tiles - split + self.splits - 1) // self.splits,
+                (n_tiles - split + nsplit - 1) // nsplit,
                 cutlass.Int32(0),
             )
         )
-        self._resolve(lead, kvh, split, n_loc, n_ug, tidx, s_bm, s_ug, s_tab, s_bt)
+        self._resolve(lead, kvh, split, nsplit, n_loc, n_ug, tidx, s_bm, s_ug, s_tab, s_bt)
         return n_loc
 
     @cute.kernel
@@ -577,10 +615,13 @@ class _VerifyKernel:
         mBT: cute.Tensor,
         mReq: cute.Tensor,
         out_base: cutlass.Int64,
+        part_base: cutlass.Int64,
         lse_base: cutlass.Int64,
         gate_base: cutlass.Int64,
         rows: cutlass.Int32,
         gate_stride: cutlass.Int32,
+        n_whole: cutlass.Int32,
+        tail_row0: cutlass.Int32,
     ):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -593,9 +634,21 @@ class _VerifyKernel:
         group: cutlass.Constexpr = self.group
         kvh_n: cutlass.Constexpr = self.kvh
         splits: cutlass.Constexpr = self.splits
-        gi = bidx // (kvh_n * splits)
-        kvh = (bidx // splits) % kvh_n
-        split = bidx % splits
+        if const_expr(self.tail):
+            # units (group, KV head) below n_whole: one CTA each; the rest: `splits` CTAs each
+            is_whole = bidx < n_whole
+            t_cta = bidx - n_whole
+            unit = cutlass.Int32(cutlass.select_(is_whole, bidx, n_whole + t_cta // splits))
+            split = cutlass.Int32(cutlass.select_(is_whole, cutlass.Int32(0), t_cta % splits))
+            nsplit = cutlass.Int32(
+                cutlass.select_(is_whole, cutlass.Int32(1), cutlass.Int32(splits))
+            )
+        else:
+            unit = bidx // splits
+            split = bidx % splits
+            nsplit = cutlass.Int32(splits)
+        gi = unit // kvh_n
+        kvh = unit % kvh_n
         r0 = gi * rpr
 
         smem = SmemAllocator()
@@ -754,6 +807,7 @@ class _VerifyKernel:
                     rows,
                     sel_base,
                     split,
+                    nsplit,
                     tidx,
                     warp,
                     lane,
@@ -852,14 +906,19 @@ class _VerifyKernel:
                 rows,
                 kvh,
                 split,
+                nsplit,
+                tail_row0,
                 mGs,
                 scale_log2,
                 out_base,
+                part_base,
                 lse_base,
                 gate_base,
                 gate_stride,
                 tview,
                 o_final,
+                tidx,
+                s_k16,
             )
         # every role done with tensor memory (the softmax warps read O last)
         cute.arch.sync_threads()
@@ -886,7 +945,8 @@ class _VerifyKernel:
         """Raw tile copies: K and V rows eight threads a row (16-byte chunk lt % 8 of rows
         lt // 8 + 8 i: whole 128-byte lines a warp instruction); the K-scale row lt and chunk
         lt % 4 of the V-scale group lt // 4 (both at the group's scale offset + lt % 4). Raw slots
-        1-2 hold the q rows until Q is in tensor memory."""
+        1-2 hold the q rows until Q is in tensor memory.
+        """
         s_roff = s_tab + self.t_roff * 4
         s_soff = s_tab + self.t_soff * 4
         s_gmask = s_tab + self.t_gmask * 4
@@ -944,7 +1004,8 @@ class _VerifyKernel:
     ):
         """Thread `dt` < 64 dequantizes K row `dt` of each tile, the others V row `dt - 64`: the raw
         row and its scales into registers (the raw slot is then free), then into the f16 SW128
-        slot once the MMA has released it."""
+        slot once the MMA has released it.
+        """
         is_v = dt >= BN
         n = dt % BN
         for kl in cutlass.range(n_loc):
@@ -979,7 +1040,8 @@ class _VerifyKernel:
     @cute.jit
     def _decode_row(self, w, sw, dst, n, is_v: cutlass.Constexpr):
         """Raw row words `w` (8 x 4) and scale words `sw` -> f16 SW128 row `n` at `dst`: 16-byte
-        chunk ci of the row's 64-dim block ci // 8 at 8192 (ci // 8) + 128 n + 16 ((ci % 8) ^ (n % 8))."""
+        chunk ci of the row's 64-dim block ci // 8 at 8192 (ci // 8) + 128 n + 16 ((ci % 8) ^ (n % 8)).
+        """
         sel_v = (n % 4) * 0x11
         for c in cutlass.range_constexpr(8):
             # blocks 2c, 2c + 1. K: bytes 2c, 2c + 1 of the token's 16 (word c // 2);
@@ -1027,7 +1089,8 @@ class _VerifyKernel:
     ):
         """QK(g), then QK(j) / PV(j - 1) pairs, then the last PV: S/P buffer j % 2 at TMEM column
         TMEM_S0 + 64 (j % 2); QK(j) overwrites it only after PV(j - 2) was issued (tcgen05 MMAs of
-        one thread execute in order)."""
+        one thread execute in order).
+        """
         tQ = cute.make_tensor(tmem_ptr + TMEM_Q, q_layout.outer)
         tSrQ = qk_thr.make_fragment_A(tQ)[None, None, None, 0]
         tSrQ = cute.make_tensor(cute.recast_ptr(tmem_ptr + TMEM_Q, dtype=F16), tSrQ.layout)
@@ -1128,7 +1191,8 @@ class _VerifyKernel:
         o_full,
     ):
         """Per tile: S from tensor memory, the max over the row's own entries, the reference max
-        moved (and O rescaled) only past RESCALE_TH, P = 2^(s - max) as f16 over the S."""
+        moved (and O rescaled) only past RESCALE_TH, P = 2^(s - max) as f16 over the S.
+        """
         load_s, tLtS0, tLcS, store_p, tPtP0, tPcP, load_o, store_o, tLtO, tLcO, tStO = tview
         rpr: cutlass.Constexpr = self.T
         s_bits = s_tab + self.t_bits * 4
@@ -1227,82 +1291,127 @@ class _VerifyKernel:
         rows,
         kvh,
         split,
+        nsplit,
+        tail_row0,
         mGs,
         scale_log2,
         out_base,
+        part_base,
         lse_base,
         gate_base,
         gate_stride,
         tview,
         o_final,
+        st,
+        s_stage,
     ):
-        """O / l (times the V global scale), gated or as an fp32 partial and its log2-sum-exp."""
+        """O / l (times the V global scale): a whole unit's rows as bf16, a split's as an fp32
+        partial and its log2-sum-exp for the merge (rows from `tail_row0` on).
+
+        Gated whole units: the four softmax warps read the gate (coalesced, 16 bytes a chunk of
+        eight values) before the last P V completes; the live warps stage bf16(O / l) in the
+        free K slots; then all four apply the gate and store coalesced rows."""
         load_s, tLtS0, tLcS, store_p, tPtP0, tPcP, load_o, store_o, tLtO, tLcO, tStO = tview
         group: cutlass.Constexpr = self.group
         heads: cutlass.Constexpr = self.heads
         splits: cutlass.Constexpr = self.splits
+        tailm: cutlass.Constexpr = self.tail
+        has_whole: cutlass.Constexpr = tailm or splits == 1
+        has_split: cutlass.Constexpr = tailm or splits > 1
+        gated_whole: cutlass.Constexpr = has_whole and self.gated
+        rows_m: cutlass.Constexpr = self.rows_m
+        cpr: cutlass.Constexpr = HEAD_DIM // 8  # 16-byte chunks a row
+        n_gc: cutlass.Constexpr = -(-(rows_m * cpr) // (32 * SOFT_WARPS))
+        n_chunks: cutlass.Constexpr = HEAD_DIM // CHUNK_COLS
         neg_inf = -Float32.inf
-        cute.arch.mbarrier_wait(o_final, 0)
-        tcgen05_fence_after()
         row = r0 + m // group
         h = m % group
+        head = kvh * group + h
+        prow = cutlass.Int64(row - tail_row0)
+        prows = cutlass.Int64(rows - tail_row0)
+        whole = nsplit == 1
+        gregs = []
+        if const_expr(gated_whole):
+            for j in cutlass.range_constexpr(n_gc):
+                k = st + 32 * SOFT_WARPS * j
+                gm = cutlass.min(k // cpr, rows_m - 1)
+                grow = cutlass.min(r0 + gm // group, rows - 1)
+                ghead = kvh * group + gm % group
+                gregs.append(
+                    _ldg4(
+                        gate_base
+                        + (cutlass.Int64(grow) * gate_stride + ghead * HEAD_DIM + (k % cpr) * 8) * 2
+                    )
+                )
+        cute.arch.mbarrier_wait(o_final, 0)
+        tcgen05_fence_after()
         if warp < self.live_warps:
             gv = mGs[2]
             inv = Float32(0.0)
             if row_sum > Float32(0.0):
                 inv = gv / row_sum
-            head = kvh * group + h
-            for c in cutlass.range_constexpr(HEAD_DIM // CHUNK_COLS):
+            for c in cutlass.range_constexpr(n_chunks):
                 rO = cute.make_rmem_tensor(tLcO.shape, Float32)
                 cute.copy(load_o, cute.make_tensor(tLtO.iterator + c * CHUNK_COLS, tLtO.layout), rO)
-                if live:
-                    for v8 in cutlass.range_constexpr(CHUNK_COLS // 8):
-                        vals = [rO[8 * v8 + i] * inv for i in range(8)]
-                        d0 = c * CHUNK_COLS + 8 * v8
-                        if const_expr(splits == 1):
-                            if const_expr(self.gated):
-                                gaddr = (
-                                    gate_base
-                                    + (cutlass.Int64(row) * gate_stride + head * HEAD_DIM + d0) * 2
-                                )
-                                g4 = _ldg4(gaddr)
-                                for e in cutlass.range_constexpr(4):
-                                    vals[2 * e] = _round_bf16(vals[2 * e]) * _sigmoid(
-                                        _bf2_lo(g4[e])
-                                    )
-                                    vals[2 * e + 1] = _round_bf16(vals[2 * e + 1]) * _sigmoid(
-                                        _bf2_hi(g4[e])
-                                    )
-                            oaddr = (
-                                out_base + ((cutlass.Int64(row) * heads + head) * HEAD_DIM + d0) * 2
-                            )
-                            stg4(
-                                oaddr,
-                                _bf2_pack(vals[0], vals[1]),
-                                _bf2_pack(vals[2], vals[3]),
-                                _bf2_pack(vals[4], vals[5]),
-                                _bf2_pack(vals[6], vals[7]),
-                            )
-                        else:
-                            paddr = (
-                                out_base
-                                + (
-                                    ((cutlass.Int64(split) * rows + row) * heads + head) * HEAD_DIM
-                                    + d0
-                                )
-                                * 4
-                            )
+                for v8 in cutlass.range_constexpr(CHUNK_COLS // 8):
+                    vals = [rO[8 * v8 + i] * inv for i in range(8)]
+                    d0 = c * CHUNK_COLS + 8 * v8
+                    oaddr = out_base + ((cutlass.Int64(row) * heads + head) * HEAD_DIM + d0) * 2
+                    paddr = (
+                        part_base
+                        + (((cutlass.Int64(split) * prows + prow) * heads + head) * HEAD_DIM + d0)
+                        * 4
+                    )
+                    packed = [_bf2_pack(vals[2 * e], vals[2 * e + 1]) for e in range(4)]
+                    saddr = s_stage + cutlass.min(m, rows_m - 1) * Q_LD + d0 * 2
+                    if const_expr(has_whole):
+                        if whole:
+                            if const_expr(gated_whole):
+                                if m < rows_m:
+                                    _sts4(saddr, packed[0], packed[1], packed[2], packed[3])
+                            else:
+                                if live:
+                                    stg4(oaddr, packed[0], packed[1], packed[2], packed[3])
+                    if const_expr(has_split):
+                        if live & (nsplit > 1):
                             stg4f(paddr, vals[0], vals[1], vals[2], vals[3])
                             stg4f(paddr + 16, vals[4], vals[5], vals[6], vals[7])
-            if const_expr(splits > 1):
-                if live:
+            if const_expr(has_split):
+                if live & (nsplit > 1):
                     lse = neg_inf
                     if row_sum > Float32(0.0):
                         lse = row_max * scale_log2 + cute.math.log2(row_sum)
                     _stg1(
-                        lse_base + ((cutlass.Int64(split) * rows + row) * heads + head) * 4,
+                        lse_base + ((cutlass.Int64(split) * prows + prow) * heads + head) * 4,
                         _f32_bits(lse),
                     )
+        if const_expr(gated_whole):
+            if whole:
+                cute.arch.barrier(barrier_id=1, number_of_threads=32 * SOFT_WARPS)
+                for j in cutlass.range_constexpr(n_gc):
+                    k = st + 32 * SOFT_WARPS * j
+                    gm = cutlass.min(k // cpr, rows_m - 1)
+                    grow = r0 + gm // group
+                    ghead = kvh * group + gm % group
+                    a4 = _lds4(s_stage + gm * Q_LD + (k % cpr) * 16)
+                    g4 = gregs[j]
+                    res = [
+                        _bf2_pack(
+                            _bf2_lo(a4[e]) * _sigmoid_fast(_bf2_lo(g4[e])),
+                            _bf2_hi(a4[e]) * _sigmoid_fast(_bf2_hi(g4[e])),
+                        )
+                        for e in range(4)
+                    ]
+                    if (k < rows_m * cpr) & (grow < rows):
+                        stg4(
+                            out_base
+                            + ((cutlass.Int64(grow) * heads + ghead) * HEAD_DIM + (k % cpr) * 8)
+                            * 2,
+                            res[0],
+                            res[1],
+                            res[2],
+                            res[3],
+                        )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1319,16 +1428,34 @@ def _num_sms(device_index: int) -> int:
 
 def plan_splits(n_groups: int, kv_heads: int, width: int, num_sms: int) -> int:
     """Splits so the grid fills the GPU once (one CTA an SM): measured on GB300, a second
-    partial wave costs more than the extra splits save."""
+    partial wave costs more than the extra splits save.
+    """
     est_tiles = -(-int(width * 1.25) // BN)
     return max(1, min(MAX_PLAN_SPLITS, est_tiles, num_sms // (n_groups * kv_heads)))
+
+
+def plan_launch(n_groups: int, kv_heads: int, width: int, num_sms: int):
+    """(splits, n_whole) of a launch: n_whole None = every unit (group, KV head) takes `splits`
+    CTAs (one wave: `plan_splits`); else units below n_whole take one CTA and the units of the
+    last, partial wave (whole groups) `splits` CTAs each, merged afterwards."""
+    units = n_groups * kv_heads
+    if units <= num_sms:
+        return plan_splits(n_groups, kv_heads, width, num_sms), None
+    waves = -(-units // num_sms)
+    tail = units - (waves - 1) * num_sms
+    tail = -(-tail // kv_heads) * kv_heads
+    tail_splits = min(MAX_TAIL_SPLITS, num_sms // tail)
+    if tail_splits < 2:
+        return 1, None
+    return tail_splits, units - tail
 
 
 def _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request):
     """(splits, layout) of the grouped kernel for this call, or None where the per-row kernel
     takes it: fewer than `MIN_GROUPS` groups, one row a request, not SM103, or no shared-memory
     plan (more than six rows a request, or a block table wider than the union scratch holds:
-    612 pages of 32 tokens at four rows a request)."""
+    612 pages of 32 tokens at four rows a request).
+    """
     rows, num_q_heads, head_dim = q.shape
     rpr = int(rows_per_request)
     if rpr < 2 or -(-rows // rpr) < MIN_GROUPS or head_dim != HEAD_DIM:
@@ -1346,7 +1473,8 @@ def _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_r
 
 def takes_grouped(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request):
     """Whether `nvfp4_sparse_gqa_verify` runs this call on the grouped kernel (else on the
-    per-row kernel). A host-side decision on shapes only: a per-capture constant."""
+    per-row kernel). A host-side decision on shapes only: a per-capture constant.
+    """
     plan = _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request)
     return plan is not None
 
@@ -1369,7 +1497,8 @@ def nvfp4_sparse_gqa_verify_grouped(
     splits: Optional[int] = None,
 ) -> torch.Tensor:
     """The grouped kernel (and the merge with more than one split), whatever the row count;
-    `splits` overrides the plan. `nvfp4_sparse_gqa_verify` is the routed entry."""
+    `splits` overrides the plan. `nvfp4_sparse_gqa_verify` is the routed entry.
+    """
     rows, num_q_heads, head_dim = q.shape
     num_pages, num_kv_heads, tpb, packed = k_cache.shape
     rpr = int(rows_per_request)
@@ -1390,12 +1519,15 @@ def nvfp4_sparse_gqa_verify_grouped(
     if rows == 0:
         return out
     n_groups = -(-rows // rpr)
+    units = n_groups * num_kv_heads
+    n_whole = None
     if splits is None:
-        splits = plan_splits(n_groups, num_kv_heads, width, _num_sms(q.device.index or 0))
+        splits, n_whole = plan_launch(n_groups, num_kv_heads, width, _num_sms(q.device.index or 0))
     n_splits = max(1, min(MAX_SPLITS, int(splits)))
-    assert _layout(rpr, group, width, block_table.shape[1], tpb, n_splits) is not None, (
-        "no shared-memory plan for this geometry: route through nvfp4_sparse_gqa_verify"
-    )
+    tail = n_whole is not None
+    assert (
+        _layout(rpr, group, width, block_table.shape[1], tpb, 1 if tail else n_splits) is not None
+    ), "no shared-memory plan for this geometry: route through nvfp4_sparse_gqa_verify"
     use_pdl = bool(pdl and get_env_enable_pdl())
     gated = output_gate is not None
     if gated:
@@ -1403,6 +1535,14 @@ def nvfp4_sparse_gqa_verify_grouped(
         assert output_gate.dtype == torch.bfloat16
         assert (output_gate.stride(0) * 2) % 16 == 0 and output_gate.data_ptr() % 16 == 0
     req64 = request_indices.dtype == torch.int64
+    if tail:
+        tail_row0 = (n_whole // num_kv_heads) * rpr
+        n_ctas = n_whole + (units - n_whole) * n_splits
+    elif n_splits > 1:
+        n_whole, tail_row0, n_ctas = 0, 0, units * n_splits
+    else:
+        n_whole, tail_row0, n_ctas = units, rows, units
+    merged = rows - tail_row0
     key = (
         rpr,
         group,
@@ -1410,6 +1550,7 @@ def nvfp4_sparse_gqa_verify_grouped(
         width,
         tpb,
         n_splits,
+        tail,
         float(softmax_scale),
         num_pages,
         tuple(block_table.shape),
@@ -1417,17 +1558,16 @@ def nvfp4_sparse_gqa_verify_grouped(
         tuple(k_scale_cache.stride()[:2]),
         tuple(q.stride()[:2]),
         req64,
-        gated and n_splits == 1,
+        gated,
         use_pdl,
     )
-    if n_splits > 1:
+    if merged > 0:
         part = torch.empty(
-            (n_splits, rows, num_q_heads, head_dim), dtype=torch.float32, device=q.device
+            (n_splits, merged, num_q_heads, head_dim), dtype=torch.float32, device=q.device
         )
-        lse = torch.empty((n_splits, rows, num_q_heads), dtype=torch.float32, device=q.device)
-        o_t, l_t = part, lse
+        lse = torch.empty((n_splits, merged, num_q_heads), dtype=torch.float32, device=q.device)
     else:
-        o_t, l_t = out, out
+        part, lse = out, out
     gate_t = output_gate if gated else q
     gate_stride = output_gate.stride(0) if gated else 0
     fn = _COMPILED.get(key)
@@ -1439,6 +1579,7 @@ def nvfp4_sparse_gqa_verify_grouped(
             width=width,
             tpb=tpb,
             splits=n_splits,
+            tail=tail,
             scale=float(softmax_scale),
             num_pages=num_pages,
             bt_width=block_table.shape[1],
@@ -1447,7 +1588,7 @@ def nvfp4_sparse_gqa_verify_grouped(
             ks_strides=tuple(k_scale_cache.stride()[:2]),
             q_strides=tuple(q.stride()[:2]),
             req64=req64,
-            gated=gated and n_splits == 1,
+            gated=gated,
             pdl=use_pdl,
         )
         fn = cute.compile(
@@ -1462,11 +1603,15 @@ def nvfp4_sparse_gqa_verify_grouped(
             _ptr(kv_scale_quant_orig, cutlass.Float32, 4),
             _ptr(block_table, cutlass.Int32, 4),
             _ptr(request_indices, cutlass.Int64 if req64 else cutlass.Int32, 8 if req64 else 4),
-            _ptr(o_t, cutlass.Float32),
-            _ptr(l_t, cutlass.Float32),
+            _ptr(out, cutlass.BFloat16),
+            _ptr(part, cutlass.Float32),
+            _ptr(lse, cutlass.Float32),
             _ptr(gate_t, cutlass.BFloat16),
             cutlass.Int32(rows),
             cutlass.Int32(gate_stride),
+            cutlass.Int32(n_whole),
+            cutlass.Int32(tail_row0),
+            cutlass.Int32(n_ctas),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--opt-level 2 --enable-tvm-ffi",
         )
@@ -1481,13 +1626,17 @@ def nvfp4_sparse_gqa_verify_grouped(
         kv_scale_quant_orig.data_ptr(),
         block_table.data_ptr(),
         request_indices.data_ptr(),
-        o_t.data_ptr(),
-        l_t.data_ptr(),
+        out.data_ptr(),
+        part.data_ptr(),
+        lse.data_ptr(),
         gate_t.data_ptr(),
         rows,
         gate_stride,
+        n_whole,
+        tail_row0,
+        n_ctas,
     )
-    if n_splits == 1:
+    if merged <= 0:
         return out
     mkey = ("merge", num_q_heads, n_splits, gated, use_pdl)
     mfn = _COMPILED.get(mkey)
@@ -1504,7 +1653,14 @@ def nvfp4_sparse_gqa_verify_grouped(
             options="--opt-level 2 --enable-tvm-ffi",
         )
         _COMPILED[mkey] = mfn
-    mfn(gate_t, part.data_ptr(), lse.data_ptr(), out.data_ptr(), rows, gate_stride)
+    mfn(
+        gate_t[tail_row0:],
+        part.data_ptr(),
+        lse.data_ptr(),
+        out[tail_row0:].data_ptr(),
+        merged,
+        gate_stride,
+    )
     return out
 
 
@@ -1527,7 +1683,8 @@ def nvfp4_sparse_gqa_verify(
     """`nvfp4_sparse_gqa_decode` for rows that come `rows_per_request` consecutive rows a
     request: the grouped kernel where `takes_grouped`, the per-row kernel otherwise. Returns
     `[rows, Hq, D]` bf16 (contiguous); with `output_gate` (`[rows, Hq * D]` bf16, unit column
-    stride) `bf16(attn) * sigmoid(gate)` rounded to bf16."""
+    stride) `bf16(attn) * sigmoid(gate)` rounded to bf16.
+    """
     plan = _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request)
     if plan is None:
         return nvfp4_sparse_gqa_decode(
@@ -1560,7 +1717,7 @@ def nvfp4_sparse_gqa_verify(
         rows_per_request,
         output_gate=output_gate,
         pdl=pdl,
-        splits=plan[0],
+        splits=None,
     )
 
 
@@ -1570,7 +1727,8 @@ def _verify(segments, overlap=0.05, **overrides) -> dict:
     heads of 256, 32 tokens a page, 2051 selected tokens). `overlap` is the spread of a
     request's rows' block scores around the request's (each row then takes its top 512 blocks
     in ascending order, as `qsa_topk_expand_decode` writes them); None selects every row
-    independently at random, as the decode op's cells do."""
+    independently at random, as the decode op's cells do.
+    """
     return dict(segments=segments, rows_per_request=4, overlap=overlap, **overrides)
 
 
@@ -1601,8 +1759,8 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
             spec=_verify(tuple((3000 + 211 * i, 4) for i in range(8)), overlap=None),
         ),
         Cell(
-            why="MTP3 verify at 1024 rows (256 requests x 4): one split, gate fused into the "
-            "kernel's store",
+            why="MTP3 verify at 1024 rows (256 requests x 4): one CTA a unit with the gate fused "
+            "into its store, the last wave's units split two ways and merged",
             spec=_verify(tuple((2100 + (37 * i) % 1900, 4) for i in range(256)), gated=True),
         ),
         Cell(
@@ -1642,22 +1800,27 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
     Routing (`takes_grouped`, host-side, on shapes only): the grouped kernel from
     `MIN_GROUPS` (8) groups of T >= 2 rows up, on SM103, where its shared-memory plan fits
     (T <= 6; a block table of at most 612 pages of 32 tokens at T = 4, 892 at T = 3, 1364 at
-    T = 2); the per-row kernel otherwise. Splits fill the GPU once (one CTA an SM), each split
-    followed by the decode op's merge.
+    T = 2); the per-row kernel otherwise. Launch (`plan_launch`): within one wave of
+    (group, KV head) units every unit takes the same splits, filling the GPU once (one CTA an
+    SM), followed by the decode op's merge; past one wave the units of the full waves take one
+    CTA each (bf16 output, the gate fused) and the units of the partial last wave two to four,
+    only their rows merged.
 
-    GB300, one layer, cold L2, T = 4, a request's rows sharing ~80% of their blocks (union
-    1.2x a row's selection): 32 rows 18.7 us, 128 rows 36.4, 512 rows 91.7, 1024 rows 181 --
-    against 22.8 / 65.9 / 230 / 448 us for the per-row kernel; at union 1.4x 19.2 / 39.5 /
-    104 / 203 us. Rows that select independently (union 2.7x) gain less: 23.8 / 59.9 / 176 /
-    346 us against 23.1 / 67.3 / 232 / 452. Below 32 rows the call is the per-row kernel's.
+    GB300, one layer, cold L2, T = 4, the decode step's call (output gate on) on MTP3 verify
+    selections dumped from a served run (a request's rows' union 1.4-1.7x a row's selection,
+    about 8.4K tokens of context, the server's pool geometry): 64 rows 31.2 us, 128 rows 50.4,
+    256 rows 75.3, 512 rows 137, 1024 rows 232 -- against 39.5 / 69.5 / 135 / 237 / 461 us for
+    the per-row kernel. Below 32 rows the call is the per-row kernel's.
 
     Numerics: dequantized K/V values are exact in f16; scores on f16 MMAs with fp32
     accumulation; P rounded to f16 (as the per-row kernel); a row's softmax offset moves only
     when its max grew by more than 2^8, the sum stays fp32 unrounded; the second-level scales
-    act on the scores and the normalized output. Within the decode op's band (4 ulp element,
+    act on the scores and the normalized output; the output gate's sigmoid on `ex2.approx` and
+    `rcp.approx` (relative error ~1e-6) where the kernel applies it, as the merge's elsewhere.
+    Within the decode op's band (4 ulp element,
     2 ulp RMS) of the float64 reference and of the per-row kernel; not bitwise the per-row
     kernel (tiles hold the group's union). Deterministic; graph-capturable (row count is a
-    runtime value; one compile per (T, split) variant).
+    runtime value; one compile per (T, splits, launch mode) variant).
 
     Preconditions: as `qsa_paged_sparse_gqa_nvfp4_decode` (bf16 q with head_dim 256 and
     16-byte aligned rows; K and V planes, and their scale planes, share strides; power-of-two
@@ -1718,7 +1881,8 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
         output_gate=None,
     ) -> torch.Tensor:
         """`qsa_paged_sparse_gqa_nvfp4_decode`'s reference (`rows_per_request` only groups the
-        work, it does not change the result)."""
+        work, it does not change the result).
+        """
         return qsa_paged_sparse_gqa_nvfp4_decode.reference(
             q,
             k_cache,

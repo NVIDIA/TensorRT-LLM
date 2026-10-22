@@ -3,9 +3,9 @@
 """GPU test: `qsa_paged_sparse_gqa_nvfp4_verify` against the reference of
 `qsa_paged_sparse_gqa_nvfp4_decode` and against the per-row kernel, inside the NVFP4 op's band
 (4 ulp of each (row, head)'s max, 2 ulp relative RMS), over its cells; plus the routing to the
-per-row kernel, forced splits and other rows a request, invalid request rows, an unaligned
-row slice of the selection, the selections `is_valid` refuses, determinism and graph replay
-against eager."""
+per-row kernel, forced splits and other rows a request, the launch plan (a partial last wave's
+units split and merged), invalid request rows, an unaligned row slice of the selection, the
+selections `is_valid` refuses, determinism and graph replay against eager."""
 
 import math
 import zlib
@@ -211,6 +211,41 @@ def test_other_rows_a_request_and_forced_splits(rows_per_request, splits) -> Non
         **args, rows_per_request=rows_per_request, splits=splits
     )
     el, rms, ok = within_ulp(out, op.reference(**args, rows_per_request=rows_per_request))
+    assert ok, f"vs reference: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+
+
+def test_launch_plan_splits_only_a_partial_last_wave() -> None:
+    plan = _verify_module.plan_launch
+    # within one wave every unit (group, KV head) takes the same splits
+    assert plan(32, 2, WIDTH, 152) == (2, None)
+    # 512 units on 152 SMs: three full waves of one CTA a unit, the last 56 units split in two
+    assert plan(256, 2, WIDTH, 152) == (2, 456)
+    # a last wave too full to split (104 units): one CTA a unit
+    assert plan(128, 2, WIDTH, 152) == (1, None)
+
+
+@pytest.mark.parametrize("gated", [False, True], ids=["plain", "gated"])
+def test_split_last_wave_matches_one_cta_a_unit(gated) -> None:
+    """The units of the full waves are bitwise the one-CTA-a-unit launch; the split and
+    merged last wave stays inside the band of it and of the reference."""
+    args = build(tuple((2100 + (37 * i) % 1900, 4) for i in range(256)), seed=2718)
+    rows = args["q"].shape[0]
+    if gated:
+        g = torch.Generator(device=DEV).manual_seed(2719)
+        args["output_gate"] = torch.randn(rows, 24 * 256, generator=g, device=DEV).to(
+            torch.bfloat16
+        )
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    splits, n_whole = _verify_module.plan_launch(rows // 4, 2, WIDTH, sms)
+    if n_whole is None:
+        pytest.skip(f"{sms} SMs: no partial last wave at {rows} rows")
+    out = op(**args, rows_per_request=4)
+    one = _verify_module.nvfp4_sparse_gqa_verify_grouped(**args, rows_per_request=4, splits=1)
+    head = (n_whole // 2) * 4
+    assert torch.equal(out[:head], one[:head])
+    el, rms, ok = within_ulp(out, one)
+    assert ok, f"vs one CTA a unit: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+    el, rms, ok = within_ulp(out, op.reference(**args, rows_per_request=4))
     assert ok, f"vs reference: {el:.2f} ulp element, {rms:.2f} ulp RMS"
 
 
