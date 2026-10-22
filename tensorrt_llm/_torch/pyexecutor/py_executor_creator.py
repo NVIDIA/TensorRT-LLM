@@ -54,6 +54,7 @@ from .dwdp import DwdpManager, get_global_dwdp_manager
 from .engine.runners.decoder.runner import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
+from .kv_cache import host_tier_memory
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -1153,6 +1154,11 @@ def _create_py_executor(
             log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+
+        if host_tier_memory.drop_page_cache_enabled():
+            host_tier_memory.drop_page_cache(
+                (checkpoint_dir, getattr(spec_config, "speculative_model", None)
+                 if spec_config is not None else None))
 
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE

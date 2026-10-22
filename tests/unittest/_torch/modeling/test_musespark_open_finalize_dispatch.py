@@ -128,6 +128,84 @@ def test_chunked_finalize_dispatch(
         assert result is finalized
 
 
+@pytest.mark.parametrize(
+    "tokens,max_tokens,expect,sparse",
+    [
+        (129, 512, "chunked", None),
+        (512, 512, "chunked", None),
+        (513, 512, "unfused", True),
+        (129, 128, "unfused", False),
+        (159, 128, "unfused", False),
+        (160, 128, "unfused", True),
+    ],
+)
+def test_sparse_finalize_reaches_only_unfused_batches_of_160_tokens_or_more(
+    monkeypatch, tokens: int, max_tokens: int, expect: str, sparse
+) -> None:
+    """MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE never takes a batch the fused finalize serves.
+
+    With MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED (``max_tokens`` 512) the
+    sparse kernel only sees batches above 512 tokens; without it, unfused
+    batches of 129..159 tokens keep the tile kernel.
+    """
+    from tensorrt_llm._torch.models import modeling_musespark_open as builtin
+
+    combine_calls = []
+
+    def spy_combine(*args, **kwargs):
+        combine_calls.append(kwargs["sparse_slots"])
+        return torch.full((kwargs["num_tokens"], kwargs["hidden_size"]), 3.0)
+
+    monkeypatch.setattr(builtin, "post_expert_norm_combine", spy_combine)
+    hidden = torch.ones(tokens, 4, dtype=torch.bfloat16)
+    indices = torch.zeros(tokens, 8, dtype=torch.int32)
+    weights = torch.full((tokens, 8), 1 / 8)
+    routed = torch.full_like(hidden, 2)
+    finalized = torch.full_like(hidden, 3)
+    routing = SimpleNamespace(
+        apply=Mock(return_value=(indices, weights)), clear_routing_memo=Mock()
+    )
+    experts = Mock(return_value=(routed, weights, indices))
+    experts.routing_method = routing
+    experts.comm = None
+    workspace = SimpleNamespace(
+        finalize=Mock(return_value=finalized), finalize_chunked=Mock(return_value=finalized)
+    )
+    module = SimpleNamespace(
+        experts=experts,
+        prepare_moe_inputs=Mock(return_value=(weights, hidden)),
+        nvtx=lambda _: nullcontext(),
+        _finalize_ar_workspace=workspace,
+        _finalize_ar_max_tokens=max_tokens,
+        _large_finalize_sparse=True,
+        _large_finalize_4warps=False,
+        expert_hidden_size=4,
+        top_k=8,
+        post_expert_norm_weight=torch.zeros(4),
+        post_expert_norm_eps=1e-8,
+        all_reduce=Mock(side_effect=lambda value: value),
+        unpooler=Mock(side_effect=lambda value: value),
+        _unpool_gather_workspace=None,
+        mapping=SimpleNamespace(enable_attention_dp=False, has_tp=lambda: True, moe_tp_size=1),
+    )
+    module.finalize = MethodType(MuseSparkOpenMoE.finalize, module)
+    module._replicated_projection = MethodType(MuseSparkOpenMoE._replicated_projection, module)
+    MuseSparkOpenMoE.forward(module, hidden, None)
+    assert workspace.finalize_chunked.call_count == int(expect == "chunked")
+    assert combine_calls == ([] if sparse is None else [sparse])
+
+
+@pytest.mark.parametrize("value,enabled", [(None, False), ("0", False), ("1", True), ("on", True)])
+def test_large_finalize_sparse_switch_values(monkeypatch, value, enabled) -> None:
+    from tensorrt_llm._torch.models import modeling_musespark_open as builtin
+
+    if value is None:
+        monkeypatch.delenv("MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE", raising=False)
+    else:
+        monkeypatch.setenv("MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE", value)
+    assert builtin._large_finalize_sparse_enabled() is enabled
+
+
 @pytest.mark.parametrize("value,max_tokens", [(None, 128), ("0", 128), ("1", 512), ("on", 512)])
 def test_chunked_finalize_switch_values(monkeypatch, value, max_tokens) -> None:
     from tensorrt_llm._torch.models import modeling_musespark_open as builtin

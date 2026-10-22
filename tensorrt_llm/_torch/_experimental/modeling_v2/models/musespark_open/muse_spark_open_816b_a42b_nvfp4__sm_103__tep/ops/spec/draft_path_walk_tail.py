@@ -30,7 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .draft_path_walk import DraftPathWalk
 
@@ -102,32 +102,6 @@ class DraftPathWalkTail(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS = (
-        Cell(
-            "this target's draft head: one request, K = 7, top 16, with the rewind",
-            dict(requests=1, positions=7, scores="random", rewind=True),
-        ),
-        Cell(
-            "two requests walk and rewind independently; rewinds below zero clamp",
-            dict(requests=2, positions=7, scores="random", rewind=True, clamp=True),
-        ),
-        Cell(
-            "tied scores: the walk picks the lowest position, the token the lowest id",
-            dict(requests=1, positions=7, scores="ties", rewind=True),
-        ),
-        Cell(
-            "NaN and infinite scores follow torch's argmax",
-            dict(requests=1, positions=7, scores="special", rewind=True),
-        ),
-        Cell(
-            "no KV lengths to rewind (a backend without kv_lens_cuda)",
-            dict(requests=2, positions=3, scores="random", rewind=False),
-        ),
-        Cell(
-            "permuted batch indices and a strided accepted-token view",
-            dict(requests=3, positions=7, scores="random", rewind=True, permuted=True),
-        ),
-    )
 
     note = """
     Metadata consumed: ``spec_metadata.batch_indices_cuda`` and the attention

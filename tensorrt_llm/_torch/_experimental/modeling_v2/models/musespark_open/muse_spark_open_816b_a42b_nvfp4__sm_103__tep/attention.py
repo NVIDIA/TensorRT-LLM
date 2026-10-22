@@ -30,10 +30,42 @@ from .ops.attention.paged_decode_attention import paged_decode_attention, window
 from .ops.attention.preattn_prep import HEAD_DIM as _PREP_HEAD_DIM
 from .ops.attention.preattn_prep import PreattnPrep, is_rope_table
 
-#: Rows a decode step may carry for ``preattn_prep`` to run: 64 requests of a
-#: last accepted token and 7 drafts each. Rows are independent in the op (one
-#: position per row), so a step of several sequences runs it as one of one.
-_PREATTN_PREP_MAX_ROWS = 512
+#: Rows a decode step may carry for ``preattn_prep`` to run: 128 requests of a
+#: last accepted token and 7 drafts each (a generation worker of ``max_batch_size``
+#: 128). Rows are independent in the op (one position per row), so a step of
+#: several sequences runs it as one of one.
+_PREATTN_PREP_MAX_ROWS = 1024
+
+#: Rows a context step (prefill chunks, with any generation rows beside them) may
+#: carry for ``context_prep`` to run the same op: the largest step its bit-identity
+#: sample covers (``ops/attention/preattn_prep.py``, 32768 rows). The op has no row
+#: limit of its own; every step a ``max_num_tokens`` of 8192 admits is below this.
+_CONTEXT_PREP_MAX_ROWS = 32768
+
+
+def zero_padded_rows(output: Optional[torch.Tensor], attn_metadata: AttentionMetadata) -> bool:
+    """Zero the rows of a context step's attention output past the step's real rows.
+
+    A step with context rows that replays a breakable prefill CUDA graph is padded to the
+    graph's bucket (``attn_metadata.padded_num_tokens``). The captured segment in front of
+    the attention op allocates its output for every row of the bucket, and the attention
+    kernels write the step's ``attn_metadata.num_tokens`` real rows only, so the other rows
+    hold whatever the graph's memory pool last held there. Those rows go on through the
+    output projection, the router and the experts; their results are discarded and no op
+    mixes rows, so no real row's value depends on them, but which experts they load does,
+    and that changes with any change of the captured body's allocations. Zeroed, they are
+    the same rows on every replay of every build.
+
+    Returns whether rows were zeroed: never on a decode step, an unpadded step or an
+    output with no row past the real ones.
+    """
+    if output is None or getattr(attn_metadata, "padded_num_tokens", None) is None:
+        return False
+    real = attn_metadata.num_tokens
+    if attn_metadata.num_contexts == 0 or output.shape[0] <= real:
+        return False
+    output[real:].zero_()
+    return True
 
 
 def _builtin_prep_kernel_mismatch() -> Optional[str]:
@@ -65,20 +97,33 @@ def _builtin_prep_kernel_mismatch() -> Optional[str]:
 
 
 class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
-    """The built-in attention, whose pre-attention prep a decode step can swap for one op.
+    """The built-in attention, whose pre-attention prep a step can swap for one op.
 
     Never constructed directly: ``adopt`` re-classes a built-in
     ``MuseSparkOpenAttention`` in place, adding methods and one plain attribute.
     A call carrying ``preattn_prep`` -- only ``DecodeTarget`` passes it -- runs
     the prep as that op when the projection fits it (at most
-    ``_PREATTN_PREP_MAX_ROWS`` rows); every
-    other call, every prefill step among them, runs the built-in
-    ``preprocess_qkv``. Both produce the same bits. The op is launched with
-    programmatic dependent launch under the switch the built-in flashinfer
-    kernels follow (``TRTLLM_ENABLE_PDL``, on by default).
+    ``_PREATTN_PREP_MAX_ROWS`` rows). A call carrying ``context_prep`` -- only
+    ``PrefillTarget`` passes it, under the ``context_prep`` fast path -- runs the
+    same op on a context step's projection: every row of the step, context and
+    generation rows alike (at most ``_CONTEXT_PREP_MAX_ROWS``). Every other call
+    runs the built-in ``preprocess_qkv``. Both produce the same bits. The op is
+    launched with programmatic dependent launch under the switch the built-in
+    flashinfer kernels follow (``TRTLLM_ENABLE_PDL``, on by default).
+
+    With ``_zero_padded_rows`` set (``context_prep``), the attention op also zeroes
+    the rows of its output that a replayed prefill CUDA graph pads the step with and
+    no attention kernel writes (``zero_padded_rows``).
     """
 
     _preattn_prep: Optional[PreattnPrep]
+    #: The op a ``PrefillTarget`` layer call hands on, for that call only.
+    _context_prep: Optional[PreattnPrep] = None
+    #: Set on the instance by ``layers.adopt_model`` under ``context_prep``: the attention
+    #: op zeroes the padded rows of a replayed prefill graph's output (``zero_padded_rows``).
+    #: An instance attribute, not a call keyword: a replay runs the attention op from its
+    #: captured arguments without running ``forward``.
+    _zero_padded_rows: bool = False
 
     @classmethod
     def adopt(cls, attention: MuseSparkOpenAttention) -> "MuseSparkOpenTepAttention":
@@ -160,17 +205,25 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
         attn_metadata: AttentionMetadata,
         *args,
         preattn_prep: Optional[PreattnPrep] = None,
+        context_prep: Optional[PreattnPrep] = None,
         **kwargs,
     ) -> torch.Tensor:
         self._preattn_prep = preattn_prep
+        self._context_prep = context_prep
         try:
             return super().forward(position_ids, hidden_states, attn_metadata, *args, **kwargs)
         finally:
             self._preattn_prep = None
+            self._context_prep = None
 
     def preprocess_qkv(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]):
         op = self._preattn_prep
-        if op is None or not self._fits_preattn_prep(qkv, position_ids):
+        if op is not None:
+            fits = self._fits_preattn_prep(qkv, position_ids)
+        else:
+            op = self._context_prep
+            fits = op is not None and self._fits_context_prep(qkv, position_ids)
+        if not fits:
             return super().preprocess_qkv(qkv, position_ids)
         rope = not self.skip_rope
         qkv_out, gate = op(
@@ -204,6 +257,37 @@ class MuseSparkOpenTepAttention(MuseSparkOpenAttention):
                 f"(layer {self.layer_idx}, {qkv.dtype} {tuple(qkv.shape)}); "
                 "running the built-in prep",
                 key="musespark_open.preattn_prep.decline",
+            )
+        return fits
+
+    def _attn_impl(self, q, k, v, attn_metadata, *args, **kwargs):
+        result = super()._attn_impl(q, k, v, attn_metadata, *args, **kwargs)
+        if self._zero_padded_rows:
+            # Positionally, ``output`` is the sixth argument after the metadata.
+            output = kwargs.get("output", args[5] if len(args) > 5 else None)
+            zero_padded_rows(output, attn_metadata)
+        return result
+
+    def _fits_context_prep(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]) -> bool:
+        """Whether a context step's projection fits the op: ``_fits_preattn_prep``'s
+        conditions with ``_CONTEXT_PREP_MAX_ROWS`` for the row bound."""
+        rows = qkv.shape[0]
+        if rows < 1 or rows > _CONTEXT_PREP_MAX_ROWS or torch.compiler.is_compiling():
+            return False
+        fits = (
+            qkv.dim() == 2
+            and qkv.is_cuda
+            and qkv.dtype == torch.bfloat16
+            and qkv.stride(-1) == 1
+            and qkv.shape[1] == 2 * (self.q_size + self.kv_size)
+            and (self.skip_rope or (position_ids is not None and position_ids.numel() == rows))
+        )
+        if not fits:
+            logger.warning_once(
+                "[musespark_open] context_prep: a context projection did not fit preattn_prep "
+                f"(layer {self.layer_idx}, {qkv.dtype} {tuple(qkv.shape)}); "
+                "running the built-in prep",
+                key="musespark_open.context_prep.decline",
             )
         return fits
 
@@ -509,8 +593,10 @@ class MuseSparkOpenTepPrepDecodeAttention(
     ``MuseSparkOpenAttention`` in place. ``MuseSparkOpenTepAttention``
     overrides ``preprocess_qkv`` (and takes ``preattn_prep``),
     ``MuseSparkOpenTepDecodeAttention`` overrides ``_attn_impl`` (and takes
-    ``decode_attention``); no method is overridden by both, and each
-    ``forward`` takes its own keyword and hands the rest on. A decode step
+    ``decode_attention``); each ``forward`` takes its own keyword and hands the
+    rest on. ``MuseSparkOpenTepAttention._attn_impl`` runs the decode class's
+    ``_attn_impl`` first and only then zeroes a padded context step's rows, which
+    no decode step has. A decode step
     therefore runs ``preattn_prep`` and hands its fused QKV -- the bits the
     built-in prep would have produced -- to ``paged_decode_attention`` on a
     sliding-window layer, or to the built-in attention on a full-attention
@@ -574,6 +660,7 @@ TRTLLM_GEN_DECODE_PATHS = (
     "full_attention_prep_append",
     "full_attention_split_kv",
     "full_attention_prep_fold",
+    "multi_request_split_kv",
 )
 
 

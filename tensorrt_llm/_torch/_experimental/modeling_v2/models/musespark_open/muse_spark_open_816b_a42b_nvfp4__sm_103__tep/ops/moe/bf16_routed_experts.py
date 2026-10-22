@@ -38,7 +38,7 @@ from typing import List
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Model geometry of the BF16 expert layers (after the pool projection).
 HIDDEN = 4096
@@ -67,34 +67,6 @@ class Bf16RoutedExperts(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="one decode row, one local expert: the smallest routing table",
-            spec=dict(rows=1, active=1),
-        ),
-        Cell(
-            why="DFlash with 1 draft token, 3 local experts",
-            spec=dict(rows=2, active=3),
-        ),
-        Cell(
-            why="the K = 7 verify width at the layer-61 critical-rank mode (4 experts)",
-            spec=dict(rows=8, active=4),
-        ),
-        Cell(
-            why="the K = 7 verify width at the layer-0 critical-rank mode (6 experts, "
-            "2.5 FC1 waves)",
-            spec=dict(rows=8, active=6),
-        ),
-        Cell(
-            why="the K = 7 verify width with no local expert: the routing table is empty",
-            spec=dict(rows=8, active=0),
-        ),
-        Cell(
-            why="the stacked path's row limit: 16 rows, 9 local experts",
-            spec=dict(rows=16, active=9),
-        ),
-    )
 
     note = """
     Not bitwise for FP32 ``topk_weights``: FlashInfer accepts them, but its

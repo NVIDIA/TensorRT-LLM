@@ -32,6 +32,21 @@ built-in model's:
 Either way every value is the built-in path's, bit for bit. Prefill steps
 never pass the flags and run the built-in path unchanged.
 
+``wide_projection_gathers`` (``kernels/wide_projection_gathers``) widens the
+same three classes to decode steps of 9..32 rows while ``DecodeTarget`` arms it
+(``_wide``): there the projections return the rank's slice too, and the fused
+ops run on the path's wide inboxes (``_wide_pool_inbox``, ``_wide_gather_inbox``,
+32 rows per slot); the 8-row inboxes above serve only calls of at most 8 rows.
+At those rows the built-in multiplies the whole replicated weights, so the
+slice GEMM is a different kernel from the built-in's (FP32 summation order);
+the gathers and their consumers are the built-in kernels' bits on the gathered
+rows, as at 1..8.
+
+``projection_publish`` (``kernels/projection_publish``) takes the same deferred
+projections on decode steps of 33..512 rows while ``DecodeTarget`` arms it
+(``_published``): the slice GEMM writes into a multicast transport slot and the
+pre-expert quantization and the post-FFN join consume the published slot.
+
 Every rank must take the same path at every call: the fused ops and the
 built-in gathers are collectives over different memory, so a rank that took
 the other one would leave its peers waiting forever. The per-call choice
@@ -71,7 +86,14 @@ from tensorrt_llm.mapping import Mapping
 
 from ...ops.comm import pool_gather_fp4quant as _pool
 from ...ops.comm import unpool_gather_boundary as _unpool
-from ...ops.comm.projection_inbox import MAX_ROWS, ProjectionInbox
+from ...ops.comm.projection_inbox import MAX_ROWS, WIDE_ROWS, ProjectionInbox
+
+
+def fused_rows(owner) -> int:
+    """The most rows a call of ``owner`` (a re-classed MoE or post-FFN join) may fuse: 32 while
+    ``wide_projection_gathers`` is armed for the forward (``owner._wide``), else 8."""
+    wide = getattr(owner, "_wide", None)
+    return WIDE_ROWS if wide is not None and wide.is_armed else MAX_ROWS
 
 
 def _require_aligned(**tensors: torch.Tensor) -> None:
@@ -95,18 +117,33 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
     _defer_unpool: bool
     _defer_pool: bool
     _pool_inbox: Optional[ProjectionInbox]
+    #: ``wide_projection_gathers``: its arming (``WideProjections``) and the pool site's
+    #: 32-row inbox; None without the path.
+    _wide = None
+    _wide_pool_inbox: Optional[ProjectionInbox] = None
+    #: ``projection_publish``: its arming (``PublishedProjections``) and this layer's buffer of
+    #: each site's transport (None: the site does not publish); None without the path.
+    _published = None
+    _published_pool_buffer: Optional[int] = None
+    _published_unpool_buffer: Optional[int] = None
 
     def _replicated_projection(self, module, hidden_states, workspace):
         defer = (self._defer_unpool and module is self.unpooler) or (
             self._defer_pool and module is self.pooler
         )
+        published = self._published
+        if defer and published is not None and published.is_armed:
+            # 33..512 rows: the slice GEMM publishes into the site's transport.
+            slot = published.project(self, module, hidden_states)
+            if slot is not None:
+                return slot
         if (
             not defer
             or workspace is None
             or torch.compiler.is_compiling()
             or hidden_states.dtype != torch.bfloat16
             or hidden_states.ndim != 2
-            or not 0 < hidden_states.shape[0] <= MAX_ROWS
+            or not 0 < hidden_states.shape[0] <= fused_rows(self)
             or not hidden_states.is_contiguous()
         ):
             return super()._replicated_projection(module, hidden_states, workspace)
@@ -122,6 +159,11 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
         return projected
 
     def prepare_expert_input(self, pooled: torch.Tensor):
+        published = self._published
+        if published is not None and published.is_armed:
+            quantized = published.consume_pool(self, pooled)
+            if quantized is not None:
+                return quantized
         if (
             pooled.dim() == 2
             # The built-in workspace's TP size is the one the slices are cut for.
@@ -132,18 +174,23 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             if args is not None:
                 gain, global_scale = args
                 _require_aligned(pooled=pooled, gain=gain)
-                # The gathered row is written although nothing reads it: the op
-                # with that store runs better beside the 8-row decode router (the
+                narrow = pooled.shape[0] <= MAX_ROWS
+                # At 1..8 rows the gathered row is written although nothing reads it:
+                # the op with that store runs better beside the 8-row decode router (the
                 # pool site's real neighbour) than the op without it.
                 fp4, scale, _ = _pool.pool_gather_rmsnorm_fp4quant(
                     pooled,
-                    self._pool_inbox,
+                    self._pool_inbox if narrow else self._wide_pool_inbox,
                     gain,
                     global_scale,
                     self.pre_expert_norm.variance_epsilon,
-                    return_gathered=True,
+                    return_gathered=narrow,
                 )
+                if not narrow:
+                    self._wide.report("pool", pooled.shape[0], True)
                 return Fp4QuantizedTensor(fp4, scale, is_sf_swizzled=False)
+            if pooled.shape[0] > MAX_ROWS and self._wide is not None:
+                self._wide.report("pool", pooled.shape[0], False)
             # Gather as the built-in would have, then prepare as it would have.
             pooled = self._pool_gather_workspace.gather(pooled)
         return super().prepare_expert_input(pooled)
@@ -163,8 +210,9 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
 
         backend = getattr(self.experts, "backend", self.experts)
         rows = pooled.shape[0]
+        inbox = self._pool_inbox if rows <= MAX_ROWS else self._wide_pool_inbox
         if (
-            self._pool_inbox is None
+            inbox is None
             or not getattr(self, "_pre_expert_quant_fused", True)
             or not pooled.is_cuda
             or pooled.dtype != torch.bfloat16
@@ -174,7 +222,7 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             or not isinstance(getattr(backend, "op_backend", None), TRTLLMOpBackend)
             or not getattr(backend, "has_nvfp4", False)
             or getattr(backend, "fc31_act_scale", None) is not None
-            or not 1 <= rows <= MAX_ROWS
+            or not 1 <= rows <= fused_rows(self)
             or rows > getattr(self.experts, "moe_max_num_tokens", rows)
             or not rmsnorm_fp4_quant_available()
         ):
@@ -208,6 +256,13 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
 
     _gather_inbox: Optional[ProjectionInbox]
     _gather: Optional[object]
+    #: ``wide_projection_gathers``: its arming and the unpool site's 32-row inbox; None
+    #: without the path.
+    _wide = None
+    _wide_gather_inbox: Optional[ProjectionInbox] = None
+    #: ``projection_publish``: its arming and this layer's buffer of the unpool transport.
+    _published = None
+    _published_unpool_buffer: Optional[int] = None
     _boundary_trigger: str = "exit"
     _capture_fold: Optional[torch.Tensor] = None
     _capture_stored: bool = False
@@ -220,6 +275,11 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
         next_norm: RMSNorm,
         gain: Optional[torch.Tensor] = None,
     ):
+        published = self._published
+        if published is not None and published.is_armed:
+            joined = published.consume_unpool(self, residual, branch, eps, next_norm, gain)
+            if joined is not None:
+                return joined
         if (
             branch.dim() == 2
             # The built-in workspace's TP size is the one the slices are cut for.
@@ -227,7 +287,10 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
             and residual.shape[-1] == _unpool.HIDDEN
         ):
             alpha, beta = self.coefficients()
-            if self._fits_fused(residual, branch, next_norm, gain, alpha, beta):
+            fused = self._fits_fused(residual, branch, next_norm, gain, alpha, beta)
+            if branch.shape[0] > MAX_ROWS and self._wide is not None:
+                self._wide.report("unpool", branch.shape[0], fused)
+            if fused:
                 _require_aligned(
                     residual=residual,
                     branch=branch,
@@ -235,6 +298,9 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
                     alpha=alpha,
                     beta=beta,
                     weight=next_norm.weight,
+                )
+                inbox = (
+                    self._gather_inbox if residual.shape[0] <= MAX_ROWS else self._wide_gather_inbox
                 )
                 capture = self._capture_fold
                 if capture is not None and not _unpool.capture_fits(
@@ -248,7 +314,7 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
                 if capture is None:
                     return _unpool.unpool_gather_boundary(
                         branch,
-                        self._gather_inbox,
+                        inbox,
                         residual,
                         gain,
                         alpha,
@@ -261,7 +327,7 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
                     )
                 result = _unpool.unpool_gather_boundary(
                     branch,
-                    self._gather_inbox,
+                    inbox,
                     residual,
                     gain,
                     alpha,
@@ -294,11 +360,12 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
 
         hidden = _unpool.HIDDEN
         rows = residual.shape[0] if residual.dim() == 2 else 0
+        inbox = self._gather_inbox if rows <= MAX_ROWS else self._wide_gather_inbox
         if not (
-            self._gather_inbox is not None
+            inbox is not None
             and self._fused_enabled
             and not torch.compiler.is_compiling()
-            and 1 <= rows <= MAX_ROWS
+            and 1 <= rows <= min(fused_rows(self), _unpool.max_rows(inbox))
             and branch.shape[0] == rows
             and residual.is_cuda
             and residual.dtype == torch.float32

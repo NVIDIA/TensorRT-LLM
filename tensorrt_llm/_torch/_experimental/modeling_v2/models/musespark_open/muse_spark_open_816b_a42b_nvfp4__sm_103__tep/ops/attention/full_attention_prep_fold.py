@@ -67,7 +67,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from . import full_attention_split_kv as _v4
 
@@ -166,52 +166,6 @@ class FullAttnSplitKvFold(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows, ctx (= seq_lens[0], the step's rows included); optional splits (default: the
-    # device's SM count), pdl, permuted, q_scale (default the checkpoint's), scale (KV scale).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"{rows} rows, {ctx} keys: {why}", spec=dict(rows=rows, ctx=ctx))
-        for rows, ctx, why in (
-            (8, 100000, "K=7 verify at a 100k-token context (past % 32 = 24)"),
-            (8, 455031, "K=7 verify at a 455k-token context, the step straddles two pages"),
-            (8, 8192, "a short context; the step's 8 rows end its last page (past % 32 = 24)"),
-            (8, 8200, "past % 32 = 0: the step opens a new page"),
-            (8, 8217, "past % 32 = 17: the step straddles two pages"),
-            (8, 8225, "past % 32 = 25: 7 rows on one page, 1 on the next"),
-            (8, 8231, "past % 32 = 31: 1 row on one page, 7 on the next"),
-            (8, 1048581, "near the 1M sequence limit"),
-            (3, 100003, "a partial row group (K=2 verify) across a page boundary"),
-            (1, 100000, "one row (plain decode)"),
-            (8, 40, "one split: every other split is key-less"),
-            (8, 8, "the first step: every key is new"),
-            (1, 1, "the first token: one key"),
-        )
-    ) + (
-        Cell(
-            why="8 rows, 455031 keys, PDL launch (the served build)",
-            spec=dict(rows=8, ctx=455031, pdl=True),
-        ),
-        Cell(
-            why="8 rows, 100000 keys, the permuted (low-latency) projection layout",
-            spec=dict(rows=8, ctx=100000, permuted=True),
-        ),
-        Cell(
-            why="8 rows, 100000 keys, a query pre-scale of 1 (one BF16 rounding of Q)",
-            spec=dict(rows=8, ctx=100000, q_scale=1.0),
-        ),
-        Cell(
-            why="8 rows, 100000 keys, a KV scale other than 1",
-            spec=dict(rows=8, ctx=100000, scale=0.5),
-        ),
-        Cell(
-            why="8 rows, 131 keys: the first CTA's last tile pads past the step's first page",
-            spec=dict(rows=8, ctx=131),
-        ),
-        Cell(
-            why="8 rows, 40003 keys, 96 splits (fewer CTAs than SMs)",
-            spec=dict(rows=8, ctx=40003, splits=96),
-        ),
-    )
 
     note = """
     Metadata consumed: seq_lens[0] (device; read by the kernel, never on the host), the

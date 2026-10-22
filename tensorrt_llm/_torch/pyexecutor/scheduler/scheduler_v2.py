@@ -147,12 +147,213 @@ class BudgetTracker:
         self._seen_peft_task_ids.add(lora_task_id)
 
 
+def _read_non_negative_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}") from err
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
+    return value
+
+
+class PrefillDecodeInterval:
+    """Cadence that keeps context work off most decode steps.
+
+    Context chunks ride generation steps: every context token added to a step
+    lengthens it for every request decoding in it. Under steady arrivals, and
+    while a long uncached prompt is being chunked, that puts a context chunk
+    into back-to-back steps and stretches the step time of every decoding
+    request for as long as the burst lasts.
+
+    With ``interval`` N, once a pass admits context work the next N passes that
+    schedule generation requests admit none, so at most one context-carrying
+    step runs per N + 1 steps while requests decode. A pass that admits context
+    gets the whole remaining token budget, so arrivals that waited are merged
+    into that one step. When nothing decodes, context work is admitted at once:
+    there is no decoding request to protect, and holding it back would only
+    idle the device.
+
+    Executor filters that run after this scheduler (batch waiting, multimodal
+    encoder budgets, the context attended-KV cap) can withhold the context
+    requests a pass returned. The next pass detects that none of them ran and
+    withdraws the admission (see ``withdraw_if_not_run``), so such a filter
+    delays context work by its own rules only, not by an extra interval.
+
+    The state is a pure function of the sequence of scheduling decisions and
+    of the request states the executor leaves behind, so ranks that schedule
+    the same requests stay in lockstep.
+    """
+
+    def __init__(self, interval: int):
+        if interval <= 0:
+            raise ValueError(f"interval must be positive, got {interval}")
+        self.interval = interval
+        self._remaining = 0
+        # Context position of each request the last admitting pass returned,
+        # kept until the next pass has checked that they ran.
+        self._last_admitted: dict[int, int] = {}
+
+    @property
+    def remaining(self) -> int:
+        """Generation passes left before context work may be admitted again."""
+        return self._remaining
+
+    def defers_context(self, has_generation: bool) -> bool:
+        """Whether this pass must leave pending context work waiting."""
+        return has_generation and self._remaining > 0
+
+    def record_pass(self, scheduled_ctx: RequestList, has_generation: bool) -> None:
+        """Advance the cadence by one scheduling pass that returned *scheduled_ctx*."""
+        if scheduled_ctx:
+            self._remaining = self.interval
+            self._last_admitted = {
+                req.py_request_id: req.context_current_position for req in scheduled_ctx
+            }
+        elif has_generation and self._remaining > 0:
+            self._remaining -= 1
+
+    def withdraw_if_not_run(
+        self, active_requests: RequestList, context_init_state_value: int
+    ) -> bool:
+        """Undo the last admission if the executor ran none of its context requests.
+
+        Called once per pass, before the pass decides on context work. A context
+        request that ran has advanced its context position or left the context
+        state by then; one that the executor withheld is still a context request
+        at, or (after its admission was released) before, the position it was
+        admitted at. Only when every request of the last admission is found in
+        that state did no context step run, and the cadence is re-opened.
+        Returns whether it was.
+        """
+        last_admitted, self._last_admitted = self._last_admitted, {}
+        if not last_admitted:
+            return False
+        withheld = 0
+        for req in active_requests:
+            admitted_position = last_admitted.get(req.py_request_id)
+            if admitted_position is None:
+                continue
+            if (
+                req.state_value != context_init_state_value
+                or req.context_current_position > admitted_position
+            ):
+                return False
+            withheld += 1
+        if withheld != len(last_admitted):
+            return False
+        self._remaining = 0
+        return True
+
+
+class ShortestPrefillFirstOrder:
+    """Order pending context requests by the prefill work they still need.
+
+    A request's work is the part of its prompt that is not cached yet: the
+    remaining context of a request that has started prefilling, or, for one
+    that has not, its prompt length minus the reusable prefix the KV cache
+    manager reports. Cheap follow-up turns then reach their first token ahead
+    of a long cold prompt that arrived earlier, and the long prompt takes what
+    is left of the chunk budget.
+
+    Aging bounds the reordering: a request that has gone ``max_wait_passes``
+    scheduling passes without being given any context tokens moves ahead of
+    every request that has not, and aged requests keep arrival order among
+    themselves. A long prompt that keeps receiving what is left of the budget
+    therefore never ages, while one that shorter requests keep crowding out
+    does. Ties keep arrival order. The clock runs for every active request in
+    the context state, including passes in which the batch fills up before the
+    scheduler reaches it.
+
+    The reordering may try a request that has not started prefilling ahead of
+    one that has. The scheduler therefore never lets the former preempt the
+    latter for KV pages: arrival order would have scheduled, and protected,
+    the started request first.
+
+    The prefix probe is a radix walk over the prompt, so it runs at most once
+    per request and only when there is something to reorder.
+    """
+
+    def __init__(self, max_wait_passes: int):
+        self.max_wait_passes = max_wait_passes
+        self._pass = 0
+        self._waiting_since: dict[int, int] = {}
+        self._uncached_estimate: dict[int, int] = {}
+
+    def _uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
+        if not req.is_first_context_chunk:
+            return req.context_remaining_length
+        request_id = req.py_request_id
+        estimate = self._uncached_estimate.get(request_id)
+        if estimate is None:
+            reusable = kv_cache_manager.probe_context_reuse(req)
+            if reusable is None:
+                estimate = req.context_remaining_length
+            else:
+                estimate = max(req.prompt_len - reusable, 1)
+            self._uncached_estimate[request_id] = estimate
+        return estimate
+
+    def order(
+        self,
+        pending_ctx: RequestList,
+        active_requests: RequestList,
+        context_init_state_value: int,
+        kv_cache_manager,
+        reorder: bool,
+    ) -> RequestList:
+        """Account one scheduling pass and return *pending_ctx* in admission order.
+
+        *pending_ctx* holds the requests this pass may try; *active_requests*
+        all active requests, whose context requests keep their waiting clocks
+        even when the pass does not reach them. Requests in other states
+        (encoder init) keep their relative order ahead of the context requests.
+        With ``reorder`` False the list is returned as is and only the waiting
+        bookkeeping advances, which is all a pass that admits no context work
+        needs.
+        """
+        self._pass += 1
+        waiting_ids = {
+            r.py_request_id for r in active_requests if r.state_value == context_init_state_value
+        }
+        for request_id in [rid for rid in self._waiting_since if rid not in waiting_ids]:
+            del self._waiting_since[request_id]
+            self._uncached_estimate.pop(request_id, None)
+        for request_id in waiting_ids:
+            self._waiting_since.setdefault(request_id, self._pass)
+        context_reqs = [r for r in pending_ctx if r.state_value == context_init_state_value]
+        if not reorder or len(context_reqs) < 2:
+            return pending_ctx
+
+        def admission_key(item):
+            arrival, req = item
+            waited = self._pass - self._waiting_since[req.py_request_id]
+            if waited >= self.max_wait_passes:
+                return (0, 0, arrival)
+            return (1, self._uncached_tokens(req, kv_cache_manager), arrival)
+
+        ordered = [req for _, req in sorted(enumerate(context_reqs), key=admission_key)]
+        others = [r for r in pending_ctx if r.state_value != context_init_state_value]
+        return others + ordered
+
+    def record_admitted(self, scheduled_ctx: RequestList) -> None:
+        """Restart the waiting clock of every request given context tokens this pass."""
+        for req in scheduled_ctx:
+            self._waiting_since[req.py_request_id] = self._pass
+
+
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
 
     Merges capacity checking (KV cache allocation via resize()) and token budget
     assignment into one unified loop.
     """
+
+    # Scheduling passes between two summaries of the prefill-decode interval.
+    _CONTEXT_ADMISSION_LOG_PASSES = 4096
 
     def __init__(
         self,
@@ -267,6 +468,30 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._skip_blocked_pending_ctx = (
             os.environ.get("TLLM_SCHEDULER_DISABLE_BLOCKED_CTX_SKIP", "0") != "1"
         )
+
+        # Opt-in (default off) context admission policies for decode-heavy
+        # aggregated serving; see PrefillDecodeInterval and
+        # ShortestPrefillFirstOrder. With both unset, scheduling is unchanged.
+        interval = _read_non_negative_int_env("TRTLLM_SCHED_PREFILL_DECODE_INTERVAL", 0)
+        self._prefill_decode_interval = PrefillDecodeInterval(interval) if interval > 0 else None
+        self._shortest_prefill_first = None
+        if os.environ.get("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "0") == "1":
+            self._shortest_prefill_first = ShortestPrefillFirstOrder(
+                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128)
+            )
+        self._context_admission_stats: Counter = Counter()
+        if self._prefill_decode_interval is not None or self._shortest_prefill_first is not None:
+            logger.info(
+                "KVCacheV2Scheduler context admission: "
+                f"prefill_decode_interval={interval}, "
+                "shortest_prefill_first="
+                f"{self._shortest_prefill_first is not None}"
+                + (
+                    f" (max_wait_passes={self._shortest_prefill_first.max_wait_passes})"
+                    if self._shortest_prefill_first is not None
+                    else ""
+                )
+            )
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -482,6 +707,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
+            if self._shortest_prefill_first is not None and req.is_first_context_chunk:
+                protected.update(self._started_context_ids(requests_list))
             return self._try_preempt_for_pages(
                 requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
             )
@@ -489,6 +716,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
         #
+        # The opt-in admission policies may hold context requests back this
+        # pass or change the order in which they are tried.
+        has_generation = bool(scheduled_gen)
+        ctx_candidates, deferred_by_interval = self._admissible_pending_ctx(
+            pending_ctx, requests_list, has_generation
+        )
+
         # Prefix-aware skip: when several first-chunk context requests would
         # contribute the same not-yet-cached block, admitting them together
         # makes every one of them recompute that prefix. Admit one, defer the
@@ -497,7 +731,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # context requests running this iteration, or None when the skip cannot
         # fire at all and every probe below can be avoided.
         contributed_blocks = self._collect_contributed_blocks(
-            requests_list, pending_ctx, inflight_request_ids
+            requests_list, ctx_candidates, inflight_request_ids
         )
         # A deferral behind an in-flight contributor leaves nothing on any of
         # the scheduled lists, so the deadlock detector below would read the
@@ -505,7 +739,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
-        for req in pending_ctx:
+        for req in ctx_candidates:
             if budget.requests_full:
                 break
             # A radix probe cannot affect admission once the chunk token budget
@@ -586,6 +820,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        if self._prefill_decode_interval is not None:
+            self._record_context_admission(scheduled_ctx, has_generation, deferred_by_interval)
+        if self._shortest_prefill_first is not None:
+            self._shortest_prefill_first.record_admitted(scheduled_ctx)
+
         self._detect_deadlock(
             active_requests,
             inflight_request_ids,
@@ -611,6 +850,66 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    # ---- Opt-in context admission policies ----
+
+    def _admissible_pending_ctx(
+        self, pending_ctx: RequestList, active_requests: RequestList, has_generation: bool
+    ) -> tuple[RequestList, bool]:
+        """Pending requests phase 2 may try this pass, in the order to try them.
+
+        Returns the candidates and whether the prefill-decode interval held
+        context requests back. Without the opt-ins this is *pending_ctx*
+        unchanged.
+        """
+        interval = self._prefill_decode_interval
+        if interval is not None and interval.withdraw_if_not_run(
+            active_requests, self._context_init_state_value
+        ):
+            self._context_admission_stats["withdrawn"] += 1
+        defer = interval is not None and interval.defers_context(has_generation)
+        candidates = pending_ctx
+        if self._shortest_prefill_first is not None:
+            candidates = self._shortest_prefill_first.order(
+                pending_ctx,
+                active_requests,
+                self._context_init_state_value,
+                self.kv_cache_manager,
+                reorder=not defer,
+            )
+        if not defer:
+            return candidates, False
+        held = [r for r in candidates if r.state_value == self._context_init_state_value]
+        if not held:
+            return candidates, False
+        return [r for r in candidates if r.state_value != self._context_init_state_value], True
+
+    def _record_context_admission(
+        self, scheduled_ctx: RequestList, has_generation: bool, deferred: bool
+    ) -> None:
+        self._prefill_decode_interval.record_pass(scheduled_ctx, has_generation)
+        stats = self._context_admission_stats
+        stats["passes"] += 1
+        stats["deferred"] += int(deferred)
+        stats["context"] += int(bool(scheduled_ctx))
+        if stats["passes"] >= self._CONTEXT_ADMISSION_LOG_PASSES:
+            logger.info(
+                f"[V2Scheduler] prefill-decode interval "
+                f"{self._prefill_decode_interval.interval}: over {stats['passes']} passes, "
+                f"{stats['context']} admitted context work, "
+                f"{stats['deferred']} held pending context back, "
+                f"{stats['withdrawn']} admissions withdrawn because the executor did not "
+                "run them"
+            )
+            stats.clear()
+
+    def _started_context_ids(self, requests: RequestList) -> set[int]:
+        """Ids of the context requests in *requests* that have started prefilling."""
+        return {
+            r.py_request_id
+            for r in requests
+            if r.state_value == self._context_init_state_value and not r.is_first_context_chunk
+        }
 
     # ---- Prefix-aware skip ----
 

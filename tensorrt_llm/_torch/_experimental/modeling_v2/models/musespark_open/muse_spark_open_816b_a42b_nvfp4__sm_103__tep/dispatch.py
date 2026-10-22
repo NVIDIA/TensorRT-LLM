@@ -103,6 +103,22 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
         ("full_attention_split_kv",),
     ),
+    FastPath(
+        "multi_request_split_kv",
+        "decode FMHA of steps with two or more requests as balanced page-split partials",
+        "construct",
+    ),
+    FastPath(
+        "multi_request_prep_append",
+        "every layer's K/V append folded into the decode prep of steps with two or more requests",
+        "construct",
+        ("preattn_prep",),
+    ),
+    FastPath(
+        "decode_kv_splits",
+        "multi-request decode FMHA over an over-subscribed KV split, 72..512 rows",
+        "construct",
+    ),
     # Dense projections and prefetch.
     FastPath("dense_gemms", "dense projections on one named kernel per shape", "construct"),
     FastPath(
@@ -117,6 +133,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
         ("dense_gemms", "boundary_early_release"),
     ),
+    FastPath(
+        "batch_dense_gemms",
+        "33..512-row decode steps: QKV on the TGV GEMM at 144..256 rows, o_proj weight L2 "
+        "prefetch and PDL attention norm-gate in their row bands",
+        "construct",
+        ("dense_gemms", "boundary_early_release"),
+    ),
     # Hops and boundaries.
     FastPath(
         "post_attention_hop",
@@ -128,6 +151,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "attention output projection writing into the hop's transport",
         "construct",
         ("post_attention_hop", "dense_gemms"),
+    ),
+    FastPath(
+        "wide_post_attention_hop",
+        "the post-attention hop on 9..1024-row decode steps (several requests)",
+        "construct",
+        ("post_attention_hop",),
     ),
     FastPath(
         "projection_gathers",
@@ -152,6 +181,19 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
         ("projection_gathers",),
     ),
+    FastPath(
+        "wide_projection_gathers",
+        "sharded pool/unpool with fused gathers and the next QKV on split-K, 9..32-row decode steps",
+        "construct",
+        ("projection_gathers", "dense_gemms"),
+    ),
+    FastPath(
+        "projection_publish",
+        "sharded pool/unpool GEMMs publishing into multicast transports their consumers poll, "
+        "33..512-row decode steps",
+        "construct",
+        ("projection_gathers",),
+    ),
     # MoE.
     FastPath(
         "moe_prologue",
@@ -170,6 +212,34 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "expert finalize all-reduce on the fused hop's transport",
         "construct",
     ),
+    FastPath(
+        "router_gemm",
+        "router logits of 9..512-row calls as a BF16x3 split-K tensor-core GEMM",
+        "construct",
+    ),
+    FastPath(
+        "wide_moe_allreduce",
+        "MoE output all-reduce of 129..1024-row decode steps on the MNNVL two-shot",
+        "construct",
+    ),
+    FastPath(
+        "finalize_two_shot",
+        "expert finalize and all-reduce of 64..512-row decode steps in one two-shot kernel",
+        "construct",
+        ("finalize_transport",),
+    ),
+    # Context steps.
+    FastPath(
+        "context_sequence_parallel",
+        "large context steps' norms, residual joins, router and pool/unpool on a row shard",
+        "construct",
+    ),
+    FastPath(
+        "context_prep",
+        "context steps' pre-attention prep in one launch per layer, padded graph rows zeroed",
+        "construct",
+        ("preattn_prep",),
+    ),
     FastPath("replicated_experts", "ring-buddy expert replication, balanced", "load"),
     # persistent_experts and bf16_routed_experts run over the ring-buddy stack with
     # replicated_experts, else over the rank's own expert block (the owner-only window).
@@ -181,6 +251,11 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("replicated_experts", "persistent_experts", "moe_prologue"),
     ),
     FastPath("bf16_routed_experts", "BF16 experts given unpacked routing", "load"),
+    FastPath(
+        "hot_replicas",
+        "hot NVFP4 expert copies placed per step on 33..512-row decode steps",
+        "load",
+    ),
     FastPath(
         "early_expert_ids",
         "persistent expert kernel starting from early-published ids",
@@ -195,11 +270,28 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "drafter block decode over the window's keys with the K/V append fused",
         "draft",
     ),
+    FastPath(
+        "wide_drafter_window_attention",
+        "drafter window attention of 33..1024-row block decodes on a multi-request split geometry",
+        "draft",
+        ("drafter_block_decode",),
+    ),
     FastPath("draft_head", "drafter LM head on vocabulary shards", "draft"),
+    FastPath(
+        "wide_draft_topk",
+        "draft-head key exchange of draft steps of 33 or more rows: each rank's own top-k",
+        "draft",
+        ("draft_head",),
+    ),
     FastPath("drafter_fc_shard", "drafter fc projection column-sharded", "draft"),
     FastPath("fused_accept", "acceptance and forced acceptance in one launch", "draft"),
     FastPath("drafter_fixed_gemms", "drafter GEMMs on fixed low-M tactics", "draft"),
     FastPath("context_kv_fork", "drafter context-K/V store on a side stream", "draft"),
+    FastPath(
+        "drafter_window_compact",
+        "windowed drafter arena compaction in place, one read and write per window",
+        "draft",
+    ),
     FastPath(
         "verify_fold",
         "step bookkeeping folded into the acceptance kernel",
@@ -231,6 +323,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ),
     ),
     FastPath("split_sampler", "target head verify sampler split over two kernels", "draft"),
+    FastPath(
+        "wide_split_sampler",
+        "the split verify sampler on 129..1024-row decode steps (the shipped 512-thread block)",
+        "draft",
+        ("split_sampler",),
+    ),
     FastPath(
         "lm_head_inbox",
         "LM-head GEMM into a multicast inbox the sampler gathers",
@@ -706,7 +804,7 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
         "the fused finalize all-reduce workspace (MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1 at "
         "TP8; built in on one tray at TP4)",
         _fabric_finalize,
-        ("finalize_transport",),
+        ("finalize_transport", "finalize_two_shot"),
     ),
     Precondition(
         "the sharded pool/unpool projections (MUSESPARK_OPEN_SHARDED_PROJECTIONS=1)",
@@ -755,6 +853,11 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
         ("post_attention_hop",),
     ),
     Precondition(
+        "the CuTe DSL for the wide post-attention hop",
+        _cute_dsl_kernels(("ops.allreduce.post_attn_hop_wide", "HAS_CUTE_DSL")),
+        ("wide_post_attention_hop",),
+    ),
+    Precondition(
         "the CuTe DSL for the drafter hops",
         _cute_dsl_kernels(("ops.allreduce.drafter_hop", "HAS_CUTE_DSL")),
         ("drafter_hops",),
@@ -763,6 +866,11 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
         "the CuTe DSL and the built-in finalize module for the finalize transport",
         _cute_dsl_kernels(("ops.moe.finalize_allreduce_transport", "HAS_CUTE_DSL")),
         ("finalize_transport",),
+    ),
+    Precondition(
+        "the CuTe DSL and the built-in finalize module for the two-shot finalize",
+        _cute_dsl_kernels(("ops.moe.finalize_two_shot", "HAS_CUTE_DSL")),
+        ("finalize_two_shot",),
     ),
     Precondition(
         "the CuTe DSL, the built-in cluster boundary and flashinfer's RMSNormFP4QuantKernel "
@@ -822,15 +930,21 @@ def missing_preconditions(
     return [p.requirement for p in required if not p.holds(text_model, model_config)]
 
 
-#: The fast paths that address the drafter's context-K/V arena by absolute token
-#: column: the context-K/V fork's side chain and commit, and the verify fold's
-#: written-out context store. None of them is composed over a windowed arena.
+#: The fast paths that write the drafter's context-K/V arena by token column: the
+#: context-K/V fork's side chain and commit, and the verify fold's written-out
+#: context store. Over a windowed arena they address each slot's window from its
+#: base (``_ctx_base``) and end with the built-in's window compaction, and are
+#: composed only together with this target's compaction (``WINDOWED_CONTEXT_ARENA_PATHS``,
+#: which they were validated with); without it a windowed arena leaves them out.
 #: (The drafter block decode reads only the physical length the built-in prepare
 #: hands it, so it composes over either arena.)
 FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
     "context_kv_fork",
     "verify_fold",
 )
+#: The fast paths that act only on a windowed drafter context arena: the per-step window
+#: compaction. None of them is composed over a full-length arena, which never compacts.
+WINDOWED_CONTEXT_ARENA_PATHS: Tuple[str, ...] = ("drafter_window_compact",)
 
 
 def dependents(names: Iterable[str]) -> FrozenSet[str]:
@@ -863,8 +977,10 @@ def compose(
     Call after the built-in constructor and before anything is installed. A
     deployment without a composition (``composition``, structural) gets
     ``NO_PATHS`` under ``auto`` and raises under ``require``. Otherwise the plan
-    is the composition's fast paths, less those written for a full-length drafter
-    context arena when the worker's arena is windowed (structural as well), and
+    is the composition's fast paths, less those written for a windowed arena when
+    the worker's arena is not windowed, and, over a windowed arena, less the
+    arena-writing paths (``FULL_CONTEXT_ARENA_PATHS``) unless the composition also
+    serves the window compaction (structural as well), and
     the preconditions of those paths are checked once, agreed over the TP group
     (collective; every rank returns the same plan or raises the same error).
 
@@ -885,7 +1001,10 @@ def compose(
     windowed = windowed_context_arena(spec_worker)
     paths = frozenset(served.served)
     if windowed:
-        paths = paths - dependents(FULL_CONTEXT_ARENA_PATHS)
+        if not paths & frozenset(WINDOWED_CONTEXT_ARENA_PATHS):
+            paths = paths - dependents(FULL_CONTEXT_ARENA_PATHS)
+    else:
+        paths = paths - dependents(WINDOWED_CONTEXT_ARENA_PATHS)
     local = missing_preconditions(text_model, model_config, preconditions(paths, served))
     agreed = agreed_union(mapping, local + ([_WINDOWED_ARENA] if windowed else []))
     missing = [item for item in agreed if not item.startswith(_WINDOWED_ARENA)]

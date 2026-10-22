@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Columns per program: 8 bf16 values (16 bytes) per thread at 4 warps.
 BLOCK = 1024
@@ -68,49 +68,6 @@ class ReplicatedEmbeddingGather(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            "the target's decode step: 8 int32 token ids",
-            spec=dict(shape=(8,), dtype="int32", ids="valid", table="normal"),
-        ),
-        Cell(
-            "the DFlash bonus and mask rows: 2 int64 ids, as the built-in drafter prep embeds them",
-            spec=dict(shape=(2,), dtype="int64", ids="valid", table="normal"),
-        ),
-        Cell(
-            "the DFlash noise block: [1, 8] int64 ids, the bonus token then 7 mask ids",
-            spec=dict(shape=(1, 8), dtype="int64", ids="noise", table="normal"),
-        ),
-        Cell(
-            "signed zeros: every -0.0 of the table comes out +0.0, as the all-reduce sanitizes it",
-            spec=dict(shape=(8,), dtype="int32", ids="valid", table="signed_zeros"),
-        ),
-        Cell(
-            "ids no shard owns (-1, vocab, larger) give +0.0 rows, as every rank masks them",
-            spec=dict(shape=(6,), dtype="int64", ids="invalid", table="normal"),
-        ),
-        Cell(
-            "shard edges: the first and last row of every rank's shard",
-            spec=dict(shape=(16,), dtype="int64", ids="edges", table="normal"),
-        ),
-        Cell(
-            "64 int32 ids: the decode step of 8 requests",
-            spec=dict(shape=(64,), dtype="int32", ids="valid", table="normal"),
-        ),
-        Cell(
-            "512 int32 ids: the decode step of 64 requests, with signed zeros",
-            spec=dict(shape=(512,), dtype="int32", ids="valid", table="signed_zeros"),
-        ),
-        Cell(
-            "576 int64 ids: the largest call the target serves from the table",
-            spec=dict(shape=(576,), dtype="int64", ids="valid", table="normal"),
-        ),
-        Cell(
-            "[64, 8] int64 ids: 64 requests' blocks, ids no shard owns among them",
-            spec=dict(shape=(64, 8), dtype="int64", ids="mixed", table="signed_zeros"),
-        ),
-    )
 
     note = """
     Metadata consumed: none. Grid (ids, ceil(hidden / 1024)), 4 warps, one

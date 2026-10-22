@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 
 @triton.jit
@@ -72,22 +72,6 @@ class DraftPathWalk(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS = (
-        Cell(
-            "this target's draft head: one request, K = 7, top 16",
-            dict(requests=1, positions=7, scores="random"),
-        ),
-        Cell("one drafted position", dict(requests=1, positions=1, scores="random")),
-        Cell("two requests walk independently", dict(requests=2, positions=7, scores="random")),
-        Cell(
-            "tied scores: the walk picks the lowest position, the token the lowest id",
-            dict(requests=1, positions=7, scores="ties"),
-        ),
-        Cell(
-            "NaN and infinite scores follow torch's argmax",
-            dict(requests=1, positions=7, scores="special"),
-        ),
-    )
 
     def __call__(
         self,

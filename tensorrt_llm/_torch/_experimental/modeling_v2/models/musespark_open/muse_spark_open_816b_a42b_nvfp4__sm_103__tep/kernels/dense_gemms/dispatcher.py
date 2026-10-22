@@ -16,9 +16,17 @@ yields a ``DenseGemmDispatcher`` and keeps whatever the engine assigns to it as
 that dispatcher's fallback. A call that fits -- BF16, no bias, at most 8 rows,
 the site's shape -- runs ``dense_gemm`` with the kernel this fast path names for
 the site and row count, the same on every rank; any other call goes to the built-in dispatcher
-unchanged. Nothing else in the layer changes, so the other fast paths
+unchanged. A fast path may also give the plan a table for 9..32 rows
+(``DenseGemmPlan.set_wide_kernels``, ``wide_projection_gathers``): while it arms
+the plan (``wide_armed``, one decode forward), a call of those rows at a site the
+table names runs that table's kernel. Nothing else in the layer changes, so the other fast paths
 that re-class the attention, the decoder layer or the MoE compose with this one:
 their GEMM calls still land in these dispatchers.
+
+Above 32 rows the built-in ``Linear`` never asks a low-M dispatcher, so a fast path
+that acts on larger decode steps arms the plan instead (``DenseGemmPlan.batch``, set
+for one decode forward by ``batch_dense_gemms``): while it is set, a re-classed
+projection's ``apply_linear`` hands the call to it with the built-in GEMM as a callable.
 
 With ``dense_gemm_prefetch`` a projection that ran also forks a side stream that asks the L2 to
 fetch the next projection's weight (QKV -> the same layer's attention output ->
@@ -68,11 +76,15 @@ from ...ops.gemm.dense_gemm import (
     DIRECT,
     MAX_ROWS,
     SPLITK,
+    WIDE_MAX_ROWS,
     dense_gemm,
     kernel_error,
     l2_prefetch,
     parse_kernel,
 )
+
+#: The first row count of a plan's wide table (``DenseGemmPlan.set_wide_kernels``).
+WIDE_MIN_ROWS = MAX_ROWS + 1
 
 #: The four projections of a layer, in the order a step runs them.
 SITES = ("qkv", "o_proj", "pool", "unpool")
@@ -351,6 +363,8 @@ class DenseGemmPlan:
     prefetch stream.
 
     ``kernels[site][rows - 1]`` is the kernel of a call of ``rows`` rows.
+    ``wide_kernels[site][rows - WIDE_MIN_ROWS]`` is the kernel of a call of 9..32 rows
+    while ``wide_armed`` (only for the sites the wide table names; none by default).
     ``pending`` is True between a prefetch fork and the join that follows it: the
     next projection's dispatcher, or the target's at the end of its forward.
     ``dropped`` counts the forks a join dropped because they were made in another
@@ -365,6 +379,13 @@ class DenseGemmPlan:
         capability: Optional[Tuple[int, int]] = None,
     ) -> None:
         self.kernels = dict(kernels)
+        #: The 9..32-row table (``set_wide_kernels``) and whether the current forward arms it.
+        self.wide_kernels: Dict[str, Tuple[str, ...]] = {}
+        self.wide_armed = False
+        #: The fast path armed for the current decode forward above 32 rows (``batch_dense_gemms``'s
+        #: ``BatchDenseGemms``), whose ``projection`` every re-classed projection's
+        #: ``apply_linear`` calls; ``None`` otherwise.
+        self.batch = None
         self.prefetch = prefetch
         self.enable_pdl = enable_pdl
         #: The compute capability of the device the plan serves (``install`` reads it once);
@@ -382,6 +403,33 @@ class DenseGemmPlan:
         #: the capture may take the same one: the fork and join are then in-order work on
         #: one stream, the same result with the prefetch on the critical path.
         self.side_stream_is_capture_stream: Optional[bool] = None
+
+    def kernel_for(self, role: str, rows: int) -> Optional[str]:
+        """The kernel of a ``rows``-row call at site ``role``, or None where the plan has none:
+        ``kernels`` at 1..8 rows; ``wide_kernels`` at 9..32 rows while ``wide_armed``."""
+        if 1 <= rows <= MAX_ROWS:
+            return self.kernels[role][rows - 1]
+        if self.wide_armed and WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+            wide = self.wide_kernels.get(role)
+            return None if wide is None else wide[rows - WIDE_MIN_ROWS]
+        return None
+
+    def set_wide_kernels(self, kernels: Mapping[str, Tuple[str, ...]]) -> None:
+        """Give sites a kernel per row count 9..32 (``kernels[site][rows - WIDE_MIN_ROWS]``).
+
+        Raises:
+            ValueError: for an unknown site or a table that does not cover 9..32 rows.
+        """
+        rows = WIDE_MAX_ROWS - WIDE_MIN_ROWS + 1
+        for role, table in kernels.items():
+            if role not in SITES or len(table) != rows:
+                raise ValueError(
+                    f"[musespark_open] dense_gemms: a wide table names {rows} kernels per site of "
+                    f"{SITES}, got {role!r} with {len(table)}"
+                )
+            for kernel in table:
+                parse_kernel(kernel)
+        self.wide_kernels = {role: tuple(table) for role, table in kernels.items()}
 
     def fork_prefetch(self, weight: torch.Tensor) -> None:
         """Ask the L2 for ``weight`` on the side stream, after the current stream's work so far."""
@@ -552,7 +600,8 @@ class DenseGemmDispatcher:
         )
 
     def fits(self, input_tensor: torch.Tensor, weight: torch.Tensor, bias) -> bool:
-        """Whether ``dense_gemm`` serves this call: BF16, no bias, at most 8 rows, the site's shape."""
+        """Whether ``dense_gemm`` serves this call: BF16, no bias, the site's shape, a row count
+        the plan has a kernel for (``DenseGemmPlan.kernel_for``)."""
         if bias is not None or torch.is_grad_enabled() or torch.compiler.is_compiling():
             return False
         if not (
@@ -570,7 +619,7 @@ class DenseGemmDispatcher:
         rows = input_tensor.numel() // int(weight.shape[1])
         # The split-K kernel's TMA needs 32-byte aligned operands.
         return (
-            1 <= rows <= MAX_ROWS
+            self.site.plan.kernel_for(self.site.role, rows) is not None
             and input_tensor.data_ptr() % 32 == 0
             and weight.data_ptr() % 32 == 0
         )
@@ -605,7 +654,7 @@ class DenseGemmDispatcher:
         k = int(weight.shape[1])
         x = input_tensor.view(-1, k)
         rows = int(x.shape[0])
-        kernel = plan.kernels[self.site.role][rows - 1]
+        kernel = plan.kernel_for(self.site.role, rows)
         out = dense_gemm(x, weight, kernel, plan.enable_pdl)
         if (
             plan.prefetch
@@ -698,6 +747,21 @@ class MuseSparkOpenTepDenseLinear(Linear):
     @_low_m_gemm_dispatcher.setter
     def _low_m_gemm_dispatcher(self, builtin) -> None:
         self.__dict__["_low_m_dispatcher"].builtin = builtin
+
+    def apply_linear(self, input, bias, lora_params=None, layer_idx=None):
+        """The built-in ``apply_linear``; while a fast path arms the plan (``DenseGemmPlan.batch``)
+        the call goes through that path's ``projection`` with the built-in call as a callable
+        and this module (when the call carries no bias)."""
+        dispatcher = self.__dict__["_low_m_dispatcher"]
+        batch = dispatcher.site.plan.batch
+        if batch is None or (getattr(self, "lora", None) is not None and bool(lora_params)):
+            return Linear.apply_linear(self, input, bias, lora_params, layer_idx)
+        return batch.projection(
+            dispatcher.site,
+            input,
+            lambda: Linear.apply_linear(self, input, bias, lora_params, layer_idx),
+            self if bias is None else None,
+        )
 
     @classmethod
     def check(cls, linear: torch.nn.Module, site: str) -> None:

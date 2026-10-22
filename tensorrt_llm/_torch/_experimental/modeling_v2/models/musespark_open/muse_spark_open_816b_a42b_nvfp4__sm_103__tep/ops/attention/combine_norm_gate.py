@@ -32,7 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .full_attention_split_kv import MIN_PAGES, PAGE
 
@@ -216,45 +216,6 @@ class CombineNormGate(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows x 16 heads, 152 splits (one per SM), the gate as the prep "
-            "writes it",
-            spec=dict(rows=8, splits=152, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="152 splits of which 88 are key-less (-inf), as at 8k keys",
-            spec=dict(rows=8, splits=152, empty=88, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="one split holds keys (a 40-key context)",
-            spec=dict(rows=8, splits=152, empty=151, gate_ndim=2, trigger="after_wait"),
-        ),
-        Cell(
-            why="the gate as a [rows, H, 64] view",
-            spec=dict(rows=8, splits=152, gate_ndim=3, trigger="after_wait"),
-        ),
-        Cell(why="plain decode: one row", spec=dict(rows=1, splits=152, gate_ndim=2)),
-        Cell(why="304 splits (two per SM)", spec=dict(rows=8, splits=304, gate_ndim=2)),
-        Cell(why="19 splits (a small grid)", spec=dict(rows=3, splits=19, gate_ndim=2)),
-        Cell(
-            why="the implicit trigger at exit",
-            spec=dict(rows=8, splits=152, gate_ndim=2, trigger="exit"),
-        ),
-        Cell(
-            why="seq_lens of an 8k context: 64 keyed splits read, 88 key-less ones skipped",
-            spec=dict(rows=8, splits=152, gate_ndim=2, trigger="after_wait", ctx=8192),
-        ),
-        Cell(
-            why="seq_lens of a 40-key context: one keyed split read",
-            spec=dict(rows=8, splits=152, gate_ndim=2, trigger="after_wait", ctx=40),
-        ),
-        Cell(
-            why="seq_lens of a 100k context: every split keyed",
-            spec=dict(rows=8, splits=152, gate_ndim=2, trigger="after_wait", ctx=100000),
-        ),
-    )
 
     note = """
     The norm-gate half is norm_gate's kernel statement for statement on the BF16-rounded merge,

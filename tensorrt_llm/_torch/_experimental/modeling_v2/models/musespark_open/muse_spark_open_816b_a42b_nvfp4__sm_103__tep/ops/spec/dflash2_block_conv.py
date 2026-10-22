@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: The drafter's convolution geometry: hidden 8192, two taps, 16 channels per
 #: coefficient group, a block of K + 1 rows (K <= 7) per request.
@@ -171,67 +171,6 @@ class Dflash2BlockConv(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows (or requests x block), hidden, taps, group_size, dtype;
-    # delta = "prepare" | "finish" (a side of the drafter's [T, 2, taps,
-    # groups] projection, strided) | "contiguous".
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"drafter decode, block {k + 1} (K = {k}), {side} side",
-            spec=dict(requests=1, block=k + 1, delta=side, **_CKPT),
-        )
-        for k in (3, 5, 7)
-        for side in ("prepare", "finish")
-    ) + (
-        Cell(
-            why="block 1: one row, no shifted tap reaches a row",
-            spec=dict(requests=1, block=1, delta="prepare", **_CKPT),
-        ),
-        Cell(
-            why="block 8 of the published drafter config: K + 1 = 8 at K = 7",
-            spec=dict(requests=1, block=8, delta="contiguous", **_CKPT),
-        ),
-        Cell(
-            why="3 requests x block 8: the previous request's last row is masked",
-            spec=dict(requests=3, block=8, delta="finish", **_CKPT),
-        ),
-        Cell(
-            why="4 requests x block 4: block_size divisible by the row count",
-            spec=dict(requests=4, block=4, delta="prepare", **_CKPT),
-        ),
-        Cell(
-            why="one tap: the product alone",
-            spec=dict(requests=2, block=6, delta="prepare", hidden=512, taps=1, group_size=16),
-        ),
-        Cell(
-            why="three taps: two shifted terms, two mask positions",
-            spec=dict(requests=2, block=5, delta="finish", hidden=512, taps=3, group_size=16),
-        ),
-        Cell(
-            why="hidden 1000, group 8: a masked tail in the last column block",
-            spec=dict(requests=2, block=8, delta="contiguous", hidden=1000, taps=2, group_size=8),
-        ),
-        Cell(
-            why="fp16 operands",
-            spec=dict(requests=1, block=8, delta="prepare", **{**_CKPT, "dtype": torch.float16}),
-        ),
-        Cell(
-            why="fp32 operands: no intermediate rounding",
-            spec=dict(requests=1, block=8, delta="finish", **{**_CKPT, "dtype": torch.float32}),
-        ),
-        Cell(
-            why="0 rows: an empty result, no launch",
-            spec=dict(requests=0, block=8, delta="prepare", **_CKPT),
-        ),
-        Cell(
-            why="pdl_conv: the K = 7 prepare call launched with PDL and an entry trigger",
-            spec=dict(requests=1, block=8, delta="prepare", entry_trigger=True, **_CKPT),
-        ),
-        Cell(
-            why="pdl_conv: entry trigger, 3 requests x block 8 (the previous request's row masked)",
-            spec=dict(requests=3, block=8, delta="finish", entry_trigger=True, **_CKPT),
-        ),
-    )
 
     note = """
     Metadata consumed: none. One Triton kernel, JIT-compiled on first use per

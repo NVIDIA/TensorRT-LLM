@@ -83,7 +83,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .pool_gather_fp4quant import _AVAILABLE as _POOL_AVAILABLE
 from .pool_gather_fp4quant import _VECTOR_SPAN_WORDS, _VECTORS, BLOCK, HIDDEN, local_columns
@@ -1560,44 +1560,6 @@ class PoolGatherRoute(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, balanced ring-buddy placement (the verify shape)",
-            spec=dict(rows=8, place=PLACE_BALANCE),
-        ),
-        Cell(why="8 rows, routing only (no placement)", spec=dict(rows=8, place=PLACE_NONE)),
-        Cell(
-            why="decode without drafts: 1 row, the CTA's second row idle",
-            spec=dict(rows=1, place=PLACE_BALANCE),
-        ),
-        Cell(
-            why="an odd row count (3 rows): the second CTA carries one row",
-            spec=dict(rows=3, place=PLACE_BALANCE),
-        ),
-        Cell(why="8 rows, owner-only placement", spec=dict(rows=8, place=PLACE_OWNER)),
-        Cell(why="8 rows, static placement", spec=dict(rows=8, place=PLACE_STATIC)),
-        Cell(
-            why="8 rows, balanced placement over three ring windows (the 96-expert stack)",
-            spec=dict(rows=8, place=PLACE_BALANCE3),
-        ),
-        Cell(
-            why="1 row over three ring windows: at most 8 experts, the carry rarely moves",
-            spec=dict(rows=1, place=PLACE_BALANCE3),
-        ),
-        Cell(
-            why="tep4 K=7 verify: 8 rows, 64 experts per rank, owner-only placement (one tray)",
-            spec=dict(rows=8, place=PLACE_OWNER, world=4),
-        ),
-        Cell(
-            why="tep4: 8 rows, routing only (no placement)",
-            spec=dict(rows=8, place=PLACE_NONE, world=4),
-        ),
-        Cell(
-            why="tep4: 8 rows, the balanced flow over four 64-expert blocks",
-            spec=dict(rows=8, place=PLACE_BALANCE, world=4),
-        ),
-    )
 
     note = """
     Certified against the built-in chain bit for bit: the full router's logits,

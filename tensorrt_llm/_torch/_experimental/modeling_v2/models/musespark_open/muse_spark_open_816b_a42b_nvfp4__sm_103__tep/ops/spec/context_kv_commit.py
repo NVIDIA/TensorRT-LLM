@@ -20,6 +20,14 @@ arena ends up holding the built-in's bytes. Columns are computed from each
 slot's length before any length is written, as the built-in's ``col_idx`` is
 taken before its update: a CTA barrier separates every thread's reads of the
 lengths from the first length write.
+
+Over the windowed drafter context arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA=1``)
+a slot's physical column 0 holds its logical token ``ctx_base[slot]``, and the
+built-in stores row ``r`` at column ``min(ctx_len[slot] - ctx_base[slot] + r,
+capacity - 1)``. Given ``ctx_base`` and that last column, the entry zeroes those
+columns instead; the lengths are updated as before (the built-in's window
+compaction and its read of ``ctx_len - ctx_base`` follow the call, on the caller's
+side). Without ``ctx_base`` the arithmetic is the dense arena's, unchanged.
 """
 
 from __future__ import annotations
@@ -28,7 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 #: Generation requests one call takes; the single program loops over them.
 MAX_REQUESTS = 64
@@ -42,9 +50,9 @@ TILE_ELEMENTS = 8192
 def _columns(
     arena_ptr,
     slot,
-    ctx,
+    origin,
     accepted,
-    max_ctx,
+    last_col,
     slot_stride,
     layer_stride,
     col_stride,
@@ -55,11 +63,14 @@ def _columns(
     BLOCK: tl.constexpr,
     PAIRS: tl.constexpr,
 ):
-    """Pointers to the (row, layer) columns ``START .. START + PAIRS - 1`` of a slot, and which are zeroed."""
+    """Pointers to the (row, layer) columns ``START .. START + PAIRS - 1`` of a slot, and which are zeroed.
+
+    Row ``r`` sits at column ``min(origin + r, last_col)``.
+    """
     pair = START + tl.arange(0, PAIRS)
     row = pair // LAYERS
     layer = (pair % LAYERS).to(tl.int64)
-    col = tl.minimum(ctx + row, max_ctx - 1)
+    col = tl.minimum(origin + row, last_col)
     base = slot * slot_stride + layer * layer_stride + col * col_stride
     offsets = tl.arange(0, BLOCK)
     zeroed = (pair < ROWS * LAYERS) & (row >= accepted)
@@ -77,6 +88,7 @@ def _context_kv_commit_kernel(
     k_ptr,
     v_ptr,
     ctx_len_ptr,
+    base_ptr,
     slots_ptr,
     accepted_ptr,
     new_len_ptr,
@@ -84,6 +96,7 @@ def _context_kv_commit_kernel(
     num_gens,
     num_slots,
     max_ctx,
+    last_col,
     k_slot_stride,
     k_layer_stride,
     k_col_stride,
@@ -96,6 +109,7 @@ def _context_kv_commit_kernel(
     BLOCK: tl.constexpr,
     PAIRS: tl.constexpr,
     HAS_V: tl.constexpr,
+    HAS_BASE: tl.constexpr,
 ):
     # Every request's new length is computed from the lengths as they were
     # before this call (the built-in gathers ``ctx_len[slots]`` once, adds, and
@@ -103,17 +117,21 @@ def _context_kv_commit_kernel(
     for g in range(num_gens):
         slot = tl.load(slots_ptr + g).to(tl.int64)
         ctx = tl.load(ctx_len_ptr + slot)
+        # The physical column of the slot's next context token.
+        origin = ctx
+        if HAS_BASE:
+            origin = ctx - tl.load(base_ptr + slot)
         accepted = tl.load(accepted_ptr + g).to(tl.int64)
         # A tile of K columns and its V columns are loaded before either is
         # stored, so their loads are in flight together.
         for start in tl.static_range(0, ROWS * LAYERS, PAIRS):
             k_cols, zeroed = _columns(
-                k_ptr, slot, ctx, accepted, max_ctx, k_slot_stride, k_layer_stride, k_col_stride,
-                start, ROWS, LAYERS, WIDTH, BLOCK, PAIRS,
+                k_ptr, slot, origin, accepted, last_col, k_slot_stride, k_layer_stride,
+                k_col_stride, start, ROWS, LAYERS, WIDTH, BLOCK, PAIRS,
             )  # fmt: skip
             if HAS_V:
                 v_cols, _ = _columns(
-                    v_ptr, slot, ctx, accepted, max_ctx, v_slot_stride, v_layer_stride,
+                    v_ptr, slot, origin, accepted, last_col, v_slot_stride, v_layer_stride,
                     v_col_stride, start, ROWS, LAYERS, WIDTH, BLOCK, PAIRS,
                 )  # fmt: skip
                 k = tl.load(k_cols, mask=zeroed, other=0.0)
@@ -163,75 +181,14 @@ class ContextKvCommit(OpWrapper):
       before any write, scattered in request order), then every slot's length
       is clamped to ``max_ctx``;
     * ``num_ctx_out[g] = ctx_len[slots[g]]`` (the new lengths).
+
+    ``ctx_base`` (int64 ``[slots]``, the windowed arena's logical index of each
+    slot's column 0) moves the rows to columns ``min(ctx_len[slot] -
+    ctx_base[slot] + r, last_column)``; ``last_column`` defaults to ``max_ctx -
+    1`` and must be a column of the arenas. ``ctx_base`` is read, never written.
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the target's decode step: one request, K + 1 = 8 rows, 5 layers, 1 kv head x 128",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, accepted=(4,)),
-        ),
-        Cell(
-            why="every row accepted: nothing is zeroed, the length still advances",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, accepted=(8,)),
-        ),
-        Cell(
-            why="only the bonus row accepted: seven rows zeroed",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, accepted=(1,)),
-        ),
-        Cell(
-            why="a context at the arena's end: columns clamp to max_ctx - 1, the length to max_ctx",
-            spec=dict(
-                gens=1,
-                rows=8,
-                layers=5,
-                kv_heads=1,
-                head_dim=128,
-                slots=2,
-                accepted=(3,),
-                at_end=True,
-            ),
-        ),
-        Cell(
-            why="several requests in distinct slots, int64 counts",
-            spec=dict(
-                gens=3,
-                rows=4,
-                layers=2,
-                kv_heads=2,
-                head_dim=64,
-                slots=5,
-                accepted=(1, 4, 2),
-                int64=True,
-            ),
-        ),
-        Cell(
-            why="4 kv heads x 128: three tiles per request, the last one partly past the columns",
-            spec=dict(
-                gens=2,
-                rows=8,
-                layers=5,
-                kv_heads=4,
-                head_dim=128,
-                slots=3,
-                accepted=(2, 6),
-            ),
-        ),
-        Cell(
-            why="no V arena (single-latent drafter cache)",
-            spec=dict(
-                gens=1,
-                rows=8,
-                layers=5,
-                kv_heads=1,
-                head_dim=128,
-                slots=2,
-                accepted=(5,),
-                no_v=True,
-            ),
-        ),
-    )
 
     note = """
     Metadata consumed: none. One Triton program (grid 1, 4 warps) that loops
@@ -290,10 +247,13 @@ class ContextKvCommit(OpWrapper):
         num_ctx_out: torch.Tensor,
         rows: int,
         max_ctx: int,
+        ctx_base=None,
+        last_column=None,
     ) -> None:
         num_gens = slots.numel()
         if num_gens == 0:
             return
+        last = max_ctx - 1 if last_column is None else last_column
         layers, width = k_arena.shape[1], k_arena.shape[3] * k_arena.shape[4]
         new_len = torch.empty(num_gens, dtype=torch.int64, device=ctx_len.device)
         has_v = v_arena is not None
@@ -302,6 +262,7 @@ class ContextKvCommit(OpWrapper):
             k_arena,
             values,
             ctx_len,
+            ctx_len if ctx_base is None else ctx_base,
             slots,
             num_accepted,
             new_len,
@@ -309,6 +270,7 @@ class ContextKvCommit(OpWrapper):
             num_gens,
             ctx_len.numel(),
             max_ctx,
+            last,
             k_arena.stride(0),
             k_arena.stride(1),
             k_arena.stride(2),
@@ -321,6 +283,7 @@ class ContextKvCommit(OpWrapper):
             BLOCK=triton.next_power_of_2(width),
             PAIRS=tile_pairs(rows, layers, width),
             HAS_V=has_v,
+            HAS_BASE=ctx_base is not None,
             num_warps=4,
         )
 
@@ -334,6 +297,8 @@ class ContextKvCommit(OpWrapper):
         num_ctx_out: torch.Tensor,
         rows: int,
         max_ctx: int,
+        ctx_base=None,
+        last_column=None,
     ) -> None:
         """The built-in torch ops, in place: mask the stored rows in row order, then update the lengths.
 
@@ -344,7 +309,9 @@ class ContextKvCommit(OpWrapper):
         ``index_put`` of the masked rows.
         """
         offsets = torch.arange(rows, dtype=torch.long, device=ctx_len.device)
-        col = (ctx_len[slots].unsqueeze(1) + offsets.unsqueeze(0)).clamp(max=max_ctx - 1)
+        origin = ctx_len[slots] if ctx_base is None else ctx_len[slots] - ctx_base[slots]
+        last = max_ctx - 1 if last_column is None else last_column
+        col = (origin.unsqueeze(1) + offsets.unsqueeze(0)).clamp(max=last)
         mask = offsets.unsqueeze(0) < num_accepted.long().unsqueeze(1)
         for arena in (k_arena, v_arena):
             if arena is None:
@@ -367,7 +334,10 @@ class ContextKvCommit(OpWrapper):
         num_ctx_out: torch.Tensor,
         rows: int,
         max_ctx: int,
+        ctx_base=None,
+        last_column=None,
     ) -> None:
+        last = max_ctx - 1 if last_column is None else last_column
         for name, arena in (("k_arena", k_arena), ("v_arena", v_arena)):
             if arena is None and name == "v_arena":
                 continue
@@ -377,8 +347,8 @@ class ContextKvCommit(OpWrapper):
             assert arena.stride(4) == 1 and arena.stride(3) == arena.shape[4], (
                 f"{name}'s (kv_heads, head_dim) elements of a column must be contiguous"
             )
-            assert arena.shape[2] >= max_ctx, (
-                f"{name} has {arena.shape[2]} columns, fewer than max_ctx {max_ctx}"
+            assert 0 <= last < arena.shape[2], (
+                f"{name} has {arena.shape[2]} columns; the last column {last} is not one of them"
             )
         if v_arena is not None:
             assert v_arena.shape[:2] == k_arena.shape[:2], (
@@ -386,6 +356,12 @@ class ContextKvCommit(OpWrapper):
             )
         assert ctx_len.dtype == torch.int64 and ctx_len.dim() == 1, "ctx_len must be int64 [slots]"
         assert ctx_len.shape[0] == k_arena.shape[0], "ctx_len must have one length per arena slot"
+        if ctx_base is not None:
+            assert (
+                ctx_base.dtype == torch.int64
+                and ctx_base.shape == ctx_len.shape
+                and ctx_base.is_contiguous()
+            ), "ctx_base must be int64 [slots], one base per arena slot"
         assert slots.dtype == torch.int64 and slots.dim() == 1, "slots must be int64 [gens]"
         assert num_accepted.dim() == 1 and num_accepted.numel() == slots.numel(), (
             "num_accepted must hold one count per request"

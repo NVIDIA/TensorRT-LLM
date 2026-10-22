@@ -37,7 +37,6 @@ import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
-    Cell,
     OpWrapper,
     true_fp32_matmul,
 )
@@ -277,43 +276,6 @@ class PagedDecodeAttention(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows, ctx (= seq_lens[0], the step's rows included), window, page,
-    # q_fp8, splits (None = window_splits(window)).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"{rows} rows, sliding window 2048, {ctx} keys: {why}",
-            spec=dict(rows=rows, ctx=ctx, window=2048, page=32),
-        )
-        for rows, ctx, why in (
-            (8, 100000, "K=7 verify at a 100k-token context, the primary cell"),
-            (8, 131072, "K=7 verify at a 128k-token context"),
-            (8, 2100, "window just below the context: the first page is partly outside"),
-            (8, 2055, "window start exactly at a block boundary"),
-            (8, 1000, "context shorter than the window: plain causal"),
-            (8, 40, "a short context inside one 32-key block"),
-            (3, 100000, "a partial row group (K=2 verify)"),
-            (1, 100000, "one row (plain decode)"),
-            (1, 1, "the first token: no cached key at all"),
-        )
-    ) + (
-        Cell(
-            why="8 rows, Q quantized as the built-in path does (q_fp8)",
-            spec=dict(rows=8, ctx=100000, window=2048, page=32, q_fp8=True),
-        ),
-        Cell(
-            why="8 rows, 64-token pages",
-            spec=dict(rows=8, ctx=100000, window=2048, page=64),
-        ),
-        Cell(
-            why="8 rows, full causal attention over 4096 keys in 64 splits",
-            spec=dict(rows=8, ctx=4096, window=0, page=32, splits=64),
-        ),
-        Cell(
-            why="8 rows, more splits than blocks (empty splits)",
-            spec=dict(rows=8, ctx=300, window=2048, page=32, splits=66),
-        ),
-    )
 
     note = """
     Metadata consumed: seq_lens[0] (device; read by the kernels, never on the

@@ -41,13 +41,17 @@ _EXIT_LOG = {"registered": False}
 
 
 def _eligible(moe) -> bool:
-    """Whether this layer runs the prologue's routed kernel followed by the persistent expert kernel."""
+    """Whether this layer runs the prologue's routed kernel followed by the persistent expert kernel.
+
+    A class built on the prologue MoE qualifies: the one the target makes is
+    ``router_gemm``'s, which changes the router logits of 9..512-row calls only.
+    """
     from ...ops.moe import persistent_experts as _persistent
     from ..moe_prologue.prologue import MuseSparkOpenTepPrologueMoE
     from ..replicated_experts import ring_buddy as _ring_buddy
 
     state = getattr(moe, "_replicated_experts", None)
-    if type(moe) is not MuseSparkOpenTepPrologueMoE or state is None or state.kind != "nvfp4":
+    if not isinstance(moe, MuseSparkOpenTepPrologueMoE) or state is None or state.kind != "nvfp4":
         return False
     if not getattr(moe, "_prologue_enable_pdl", False):
         return False

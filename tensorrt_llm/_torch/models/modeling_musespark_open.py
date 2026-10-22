@@ -53,6 +53,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
 - ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
   expert finalize kernels.
+- ``MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE`` (default off): finalize batches of 160
+  tokens or more by visiting only each token's local expert slots.
 - ``MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP`` (default off): overlap the router with the
   pool projection for batches of 129..512 tokens too.
 - ``MUSESPARK_OPEN_LARGE_NORM_GATE`` (default off): fuse H64 attention norm/gate with
@@ -358,6 +360,95 @@ def _fused_post_expert_norm_combine(
     return out
 
 
+@triton.jit
+def _post_expert_norm_combine_sparse_kernel(
+    out_ptr,  # [num_tokens, HIDDEN] fp32
+    gemm2_ptr,  # [num_permuted, >= HIDDEN], any float dtype
+    index_ptr,  # [num_tokens * TOP_K] integer, -1 for a non-local slot
+    weights_ptr,  # [num_tokens * TOP_K] any float dtype
+    norm_weight_ptr,  # [HIDDEN] any float dtype
+    gemm2_row_stride,
+    gemm2_num_rows,
+    eps,
+    TOP_K: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """One program per token that visits only the slots local to this rank.
+
+    The same function as ``_post_expert_norm_combine_kernel``: gather,
+    weight-first RMSNorm, weight and sum, and a slot that is invalid or past the
+    end of ``gemm2`` is never read. The difference is the working set. That
+    kernel holds the whole ``[TOP_K, HIDDEN]`` tile for every slot, local or
+    not; this one branches on each slot's scalar index and keeps one
+    ``[HIDDEN]`` row plus the accumulator, so a token with two local experts out
+    of eight (the expectation at EP4) loads and normalizes two rows. Large
+    batches are bandwidth-bound on exactly those rows.
+
+    ROUNDING-DIFFERENT from the tile kernel: the slots are summed in slot order
+    rather than in the tile reduction's order, and each variance is reduced over
+    a 1-D row rather than one row of a 2-D tile.
+    """
+    token = tl.program_id(0)
+    hoff = tl.arange(0, BLOCK_H)
+    in_row = hoff < HIDDEN
+    gain = tl.load(norm_weight_ptr + hoff, mask=in_row, other=0.0).to(tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for slot in tl.static_range(TOP_K):
+        index = tl.load(index_ptr + token * TOP_K + slot)
+        if (index >= 0) & (index < gemm2_num_rows):
+            row = tl.load(
+                gemm2_ptr + index.to(tl.int64) * gemm2_row_stride + hoff,
+                mask=in_row,
+                other=0.0,
+            ).to(tl.float32)
+            scaled = row * gain
+            variance = tl.sum(scaled * scaled, axis=0) / HIDDEN
+            normed = scaled * tl.rsqrt(variance + eps)
+            weight = tl.load(weights_ptr + token * TOP_K + slot).to(tl.float32)
+            acc += normed * weight
+    tl.store(out_ptr + token * HIDDEN + hoff, acc, mask=in_row)
+
+
+_SPARSE_FINALIZE_NUM_WARPS = 4
+
+#: The smallest batch that ``MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE`` finalizes
+#: with the sparse-slot kernel. The tile kernel runs one program per token, so
+#: up to one program per SM (152 on GB300) it finishes in a single wave and is
+#: the faster kernel; past that it needs a second wave, and the sparse kernel's
+#: smaller working set makes it the faster one on EP4 inputs.
+_SPARSE_FINALIZE_MIN_TOKENS = 160
+
+
+def _sparse_post_expert_norm_combine(
+    gemm2_output: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    routing_weights: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    *,
+    num_tokens: int,
+    top_k: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    out = torch.empty((num_tokens, hidden_size), dtype=torch.float32, device=gemm2_output.device)
+    _post_expert_norm_combine_sparse_kernel[(num_tokens,)](
+        out,
+        gemm2_output,
+        expanded_idx_to_permuted_idx.reshape(-1),
+        routing_weights.reshape(-1),
+        norm_weight,
+        gemm2_output.stride(0),
+        gemm2_output.shape[0],
+        eps,
+        TOP_K=top_k,
+        HIDDEN=hidden_size,
+        BLOCK_H=triton.next_power_of_2(hidden_size),
+        num_warps=_SPARSE_FINALIZE_NUM_WARPS,
+    )
+    return out
+
+
 def post_expert_norm_combine(
     gemm2_output: torch.Tensor,
     expanded_idx_to_permuted_idx: torch.Tensor,
@@ -369,6 +460,7 @@ def post_expert_norm_combine(
     top_k: int,
     hidden_size: int,
     num_warps: int = _FINALIZE_NUM_WARPS,
+    sparse_slots: bool = False,
 ) -> torch.Tensor:
     """Weight-first RMSNorm each selected expert output, then combine, in FP32.
 
@@ -383,6 +475,11 @@ def post_expert_norm_combine(
     difference is ~1e-6 relative on an FP32 value that is cast to BF16 two
     statements later, i.e. two orders of magnitude below the grain of the dtype
     it lands in.
+
+    ``sparse_slots`` selects ``_post_expert_norm_combine_sparse_kernel``, which
+    reads only the local slots of each token instead of the whole top-k tile.
+    ``num_warps`` sets the tile kernel's width only; the sparse kernel always
+    runs ``_SPARSE_FINALIZE_NUM_WARPS`` warps.
     """
     # ``num_tokens == 0`` happens on the zero-token DP pad and would launch an
     # empty grid; a row-major ``gemm2_output`` is what the kernel's single row
@@ -397,6 +494,17 @@ def post_expert_norm_combine(
             "post-expert-norm combine",
             gemm2_output_on_cuda=on_cuda,
             gemm2_output_row_major=row_major,
+        )
+    if on_cuda and num_tokens > 0 and row_major and sparse_slots:
+        return _sparse_post_expert_norm_combine(
+            gemm2_output,
+            expanded_idx_to_permuted_idx,
+            routing_weights,
+            norm_weight,
+            eps,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            hidden_size=hidden_size,
         )
     if on_cuda and num_tokens > 0 and row_major:
         return _fused_post_expert_norm_combine(
@@ -689,6 +797,25 @@ def _fused_finalize_ar_chunked_enabled() -> bool:
     capture.
     """
     return os.environ.get("MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _large_finalize_sparse_enabled() -> bool:
+    """Whether the unfused finalize of a large batch takes the sparse-slot kernel.
+
+    Off unless MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE names a truthy value. It
+    acts on ``MuseSparkOpenMoE.finalize`` calls of at least
+    ``_SPARSE_FINALIZE_MIN_TOKENS`` tokens. Batches that the fused finalize +
+    all-reduce takes (up to 128 tokens, or up to
+    ``_FINALIZE_AR_CHUNKED_MAX_TOKENS`` with
+    MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED) never reach that finalize.
+    Resolved at module construction, before warmup and any graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_LARGE_FINALIZE_SPARSE", "0").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -1808,6 +1935,7 @@ class MuseSparkOpenMoE(nn.Module):
         self.metap_multiplier = config.metap_multiplier
         self.mapping = model_config.mapping
         self._large_finalize_4warps = os.getenv("MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS", "0") == "1"
+        self._large_finalize_sparse = _large_finalize_sparse_enabled()
         self._finalize_ar_max_tokens = (
             _FINALIZE_AR_CHUNKED_MAX_TOKENS if _fused_finalize_ar_chunked_enabled() else 128
         )
@@ -2218,6 +2346,10 @@ class MuseSparkOpenMoE(nn.Module):
                 and self.expert_hidden_size == 4096
                 and self.top_k == 8
                 else _FINALIZE_NUM_WARPS
+            ),
+            sparse_slots=(
+                getattr(self, "_large_finalize_sparse", False)
+                and num_tokens >= _SPARSE_FINALIZE_MIN_TOKENS
             ),
         )
 

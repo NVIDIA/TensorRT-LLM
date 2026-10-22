@@ -47,9 +47,9 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
-from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLDS, ProjectionInbox
+from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WIDE_ROWS, WORLDS, ProjectionInbox
 
 #: Width of the pooled (expert) activation.
 HIDDEN = 4096
@@ -140,7 +140,9 @@ if _AVAILABLE:
     class _PoolGatherRmsnormFp4QuantKernel(_FlashinferKernel):
         """flashinfer's RMSNorm + FP4 quantization, reading its row from the pool inbox."""
 
-        def __init__(self, peer_rank: int, world: int, stale_poll: bool = False):
+        def __init__(
+            self, peer_rank: int, world: int, stale_poll: bool = False, capacity: int = MAX_ROWS
+        ):
             major, minor = torch.cuda.get_device_capability()
             super().__init__(
                 dtype=cutlass.BFloat16,
@@ -169,8 +171,12 @@ if _AVAILABLE:
                     f"{self.rows_per_block} rows per CTA, {self.num_vec_blocks} vectors of "
                     f"{self.vec_size}"
                 )
+            if capacity not in (MAX_ROWS, WIDE_ROWS):
+                raise ValueError(f"an inbox holds {MAX_ROWS} or {WIDE_ROWS} rows, not {capacity}")
             self.peer_rank = peer_rank
             self.world = world
+            # Rows per inbox slot: the inbox's ``max_rows``.
+            self.capacity = capacity
             self.row_words = local_columns(world) // 2
             # Vector v of a thread lies in rank owner(v)'s slice, at word
             # offset(v) + 4 * lane of its row: at TP8 one vector per rank, at TP4 two.
@@ -321,7 +327,7 @@ if _AVAILABLE:
                         received[4 * v + 2] = l2
                         received[4 * v + 3] = l3
                         sent = (
-                            (Int64(slot) * world + self.peer_rank) * MAX_ROWS + row64
+                            (Int64(slot) * world + self.peer_rank) * self.capacity + row64
                         ) * row_words + (word + self.offset(v))
                         for b in cutlass.range_constexpr(world):
                             if cutlass.const_expr(b != self.peer_rank):
@@ -337,7 +343,7 @@ if _AVAILABLE:
                     for v in cutlass.range_constexpr(_VECTORS):
                         if cutlass.const_expr(self.owner(v) != self.peer_rank):
                             box = (
-                                (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                (Int64(slot) * world + self.owner(v)) * self.capacity + row64
                             ) * row_words + (word + self.offset(v))
                             p0, t0, p1, t1, p2, t2, p3, t3 = poll_words(own + box * 8)
                             received[4 * v] = p0
@@ -355,7 +361,7 @@ if _AVAILABLE:
                         for v in cutlass.range_constexpr(_VECTORS):
                             if cutlass.const_expr(self.owner(v) != self.peer_rank):
                                 box = (
-                                    (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                    (Int64(slot) * world + self.owner(v)) * self.capacity + row64
                                 ) * row_words + (word + self.offset(v))
                                 p0, t0, p1, t1, p2, t2, p3, t3 = poll_words_if(
                                     own + box * 8,
@@ -385,7 +391,7 @@ if _AVAILABLE:
                         for v in cutlass.range_constexpr(_VECTORS):
                             if cutlass.const_expr(self.owner(v) != self.peer_rank):
                                 box = (
-                                    (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                    (Int64(slot) * world + self.owner(v)) * self.capacity + row64
                                 ) * row_words + (word + self.offset(v))
                                 p0, t0, p1, t1, p2, t2, p3, t3 = poll_words(own + box * 8)
                                 received[4 * v] = p0
@@ -397,7 +403,7 @@ if _AVAILABLE:
                 for v in cutlass.range_constexpr(_VECTORS):
                     if cutlass.const_expr(self.owner(v) != self.peer_rank):
                         box = (
-                            (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                            (Int64(slot) * world + self.owner(v)) * self.capacity + row64
                         ) * row_words + (word + self.offset(v))
                         clear_words(own + box * 8)
                     w0 = received[4 * v]
@@ -490,8 +496,9 @@ if _AVAILABLE:
         store_gathered: bool,
         stale_poll: bool = False,
         world: int = 8,
+        capacity: int = MAX_ROWS,
     ):
-        kernel = _PoolGatherRmsnormFp4QuantKernel(peer_rank, world, stale_poll)
+        kernel = _PoolGatherRmsnormFp4QuantKernel(peer_rank, world, stale_poll, capacity)
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
         with torch.cuda.device(device_index):
@@ -548,16 +555,10 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
 
     A collective over the TP group (TP4 or TP8, ``inbox.world``): every rank
     calls it with the same row count, in the same order relative to its other
-    calls on ``inbox``.
+    calls on ``inbox``. Rows 1 to ``inbox.max_rows`` (8, or 32 on a wide inbox at TP4).
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="DFlash2 K=7 verify: 8 rows (four CTAs of two rows)", spec=dict(rows=8)),
-        Cell(why="decode without drafts: 1 row, the second row of the CTA idle", spec=dict(rows=1)),
-        Cell(why="an odd row count between the two (3 rows)", spec=dict(rows=3)),
-    )
 
     note = """
     Certified against the built-in gather followed by flashinfer's
@@ -565,8 +566,9 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
     and without the gathered row's store; CUDA-graph replays with changing
     inputs, row-count changes, tag wrap, a delayed rank; and in the
     integration's test, a two-stream 62-layer chain with back-to-back replays),
-    and against `reference` within a band. Rows 1..8 only: the built-in sharded
-    projections stop at 8.
+    and against `reference` within a band. Rows 1..8 on an 8-row inbox; rows
+    9..32 on a wide inbox at TP4 (the built-in shards only 1..8; there it is
+    certified against the built-in gather workspace + flashinfer's kernel).
     """
 
     def __call__(
@@ -593,6 +595,7 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
             bool(return_gathered),
             bool(stale_poll),
             inbox.world,
+            inbox.max_rows,
         )(
             gathered,
             gain,
@@ -667,11 +670,13 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
         stale_poll: bool = False,
     ) -> None:
         """Raw vector accesses at fixed strides: a strided or misaligned input is
-        read as if packed; a row count outside 1..8 addresses outside the inbox."""
+        read as if packed; a row count above the inbox's ``max_rows`` addresses
+        outside it."""
         rows = local.shape[0] if local.dim() == 2 else -1
         columns = local_columns(inbox.world)
-        if not 1 <= rows <= MAX_ROWS or tuple(local.shape) != (rows, columns):
-            raise ValueError(f"local must be [1..{MAX_ROWS}, {columns}], got {tuple(local.shape)}")
+        top = inbox.max_rows
+        if not 1 <= rows <= top or tuple(local.shape) != (rows, columns):
+            raise ValueError(f"local must be [1..{top}, {columns}], got {tuple(local.shape)}")
         for tensor, shape, dtype in (
             (local, (rows, columns), torch.bfloat16),
             (gain, (HIDDEN,), torch.bfloat16),

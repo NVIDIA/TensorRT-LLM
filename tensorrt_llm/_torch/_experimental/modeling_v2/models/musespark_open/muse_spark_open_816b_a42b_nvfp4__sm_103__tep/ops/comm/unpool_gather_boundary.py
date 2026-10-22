@@ -13,12 +13,14 @@ next layer's pre-QKV Gemma RMSNorm.
 This entry is that boundary kernel with the gather folded into its load. The
 boundary already splits each row over a cluster of ``C`` CTAs, CTA ``c``
 owning columns ``[c * 8192/C, (c+1) * 8192/C)`` -- for every row count this
-entry takes (1..8, so ``C`` is 16 or 8) that range lies inside one rank's
-1024-column (TP8) or 2048-column (TP4) slice. So each thread publishes its 16
-bytes of this rank's slice
+entry takes (1..8, so ``C`` is 16 or 8; and at TP4 9..32, ``C`` = 4) that range
+lies inside one rank's 1024-column (TP8) or 2048-column (TP4) slice. So each
+thread publishes its 16 bytes of this rank's slice
 to one peer and polls exactly the 16 bytes of one peer's slice it is about to
 normalize; no CTA waits on more than one peer, nothing waits for the whole
-gather, and the gathered branch never touches global memory.
+gather, and the gathered branch never touches global memory. Rows 9..32 need a
+wide inbox (``ProjectionInbox(..., max_rows=WIDE_ROWS)``): the inbox's rows per
+slot are compiled into the kernel's addressing.
 
 Bit-identical to the built-in gather + boundary: the CTA/thread layout, the
 per-thread arithmetic and the cluster reduction are the boundary kernel's own
@@ -53,9 +55,9 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
-from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLDS, ProjectionInbox
+from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WIDE_ROWS, WORLDS, ProjectionInbox
 
 #: Width of the residual stream the boundary normalizes.
 HIDDEN = 8192
@@ -115,6 +117,7 @@ if _AVAILABLE:
             peer_rank: int,
             trigger: int = 0,
             world: int = 8,
+            capacity: int = MAX_ROWS,
         ):
             cluster, threads = boundary_geometry(m)
             super().__init__(m, cluster, threads, gain, post_eps, pre_eps, norm_fp32)
@@ -122,9 +125,13 @@ if _AVAILABLE:
             # kernel's inbox addressing is written for.
             if world not in WORLDS or self.iters != 1 or (self.threads * 8) > local_columns(world):
                 raise ValueError(f"rows={m} gives a boundary geometry this gather cannot feed")
+            if capacity not in (MAX_ROWS, WIDE_ROWS) or not 1 <= m <= capacity:
+                raise ValueError(f"rows={m} do not fit an inbox of {capacity} rows per slot")
             self.peer_rank = peer_rank
             self.trigger = trigger
             self.world = world
+            # Rows per inbox slot: the inbox's ``max_rows``.
+            self.capacity = capacity
             # 32-bit payload words of one row of one rank's slice, and the threads
             # that cover it at four words each.
             self.row_words = local_columns(world) // 2
@@ -258,7 +265,7 @@ if _AVAILABLE:
             )
             if peer != self.peer_rank:
                 sent = (
-                    (Int64(slot) * self.world + self.peer_rank) * MAX_ROWS + Int64(row)
+                    (Int64(slot) * self.world + self.peer_rank) * self.capacity + Int64(row)
                 ) * self.row_words + Int64(word)
                 publish_words(inbox.toint() + Int64(peer) * stride + sent * 8, w0, w1, w2, w3, tag)
 
@@ -273,7 +280,7 @@ if _AVAILABLE:
                     inbox.toint()
                     + Int64(self.peer_rank) * stride
                     + (
-                        ((Int64(slot) * self.world + Int64(peer)) * MAX_ROWS + Int64(row))
+                        ((Int64(slot) * self.world + Int64(peer)) * self.capacity + Int64(row))
                         * self.row_words
                         + Int64(word)
                     )
@@ -471,9 +478,12 @@ if _AVAILABLE:
         *,
         capture: bool = False,
         world: int = 8,
+        capacity: int = MAX_ROWS,
     ):
         kind = _UnpoolGatherBoundaryCaptureKernel if capture else _UnpoolGatherBoundaryKernel
-        kernel = kind(rows, has_gain, post_eps, pre_eps, norm_fp32, peer_rank, trigger, world)
+        kernel = kind(
+            rows, has_gain, post_eps, pre_eps, norm_fp32, peer_rank, trigger, world, capacity
+        )
         pointers = [
             make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
             for dtype in _POINTER_TYPES
@@ -536,66 +546,18 @@ class UnpoolGatherBoundary(OpWrapper):
 
     A collective over the TP group (TP4 or TP8, ``inbox.world``): every rank
     calls it with the same row count, in the same order relative to its other
-    calls on ``inbox``. Launched with programmatic dependent launch.
+    calls on ``inbox``. Launched with programmatic dependent launch. Rows 1..8 on
+    any inbox; rows 9..32 at TP4 on a wide inbox (``inbox.max_rows`` 32).
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, the post-FFN norm's gain, BF16-first pre-QKV norm",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="decode without drafts: 1 row, cluster of 16 CTAs, two CTAs per peer slice",
-            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="a short draft (3 rows) between the two cluster shapes",
-            spec=dict(rows=3, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="the FP32-residual pre-QKV norm ordering switch",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True),
-        ),
-        Cell(
-            why="a weightless first norm (the boundary's other arm)",
-            spec=dict(rows=8, with_gain=False, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="dependents launched right after the wait",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="after_wait"),
-        ),
-        Cell(
-            why="early release: dependents launched at entry, the next QKV streams its weight meanwhile",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry"),
-        ),
-        Cell(
-            why="capture with early release: the capture from a boundary that releases the next QKV at entry",
-            spec=dict(
-                rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry", capture=True
-            ),
-        ),
-        Cell(
-            why="capture: K=7 verify that also stores the layer's DFlash capture",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, capture=True),
-        ),
-        Cell(
-            why="capture: the capture at 1 row (cluster of 16 CTAs)",
-            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False, capture=True),
-        ),
-        Cell(
-            why="capture: the capture with the FP32-residual pre-QKV norm (no BF16 residual in-kernel)",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True, capture=True),
-        ),
-    )
 
     note = """
     Certified against the built-in gather + cluster boundary bit for bit (the
     test compares raw bits through CUDA-graph replays with changing inputs,
     shape changes, tag wrap and a delayed rank), and against `reference` within
-    a band. Rows 1..8 only: the built-in sharded projections stop at 8, and at
-    more rows the boundary's CTAs would straddle two peers' slices.
+    a band. Rows 1..8; and 9..32 at TP4 only, on a wide inbox: at TP8 the
+    boundary's 4-CTA clusters of those rows would straddle two peers' slices.
     """
 
     def __call__(
@@ -643,6 +605,7 @@ class UnpoolGatherBoundary(OpWrapper):
                 inbox.rank,
                 TRIGGERS[trigger],
                 world=inbox.world,
+                capacity=inbox.max_rows,
             )
             compiled(*operands, stream)
         else:
@@ -657,6 +620,7 @@ class UnpoolGatherBoundary(OpWrapper):
                 TRIGGERS[trigger],
                 capture=True,
                 world=inbox.world,
+                capacity=inbox.max_rows,
             )
             compiled(*operands, capture.data_ptr(), capture.stride(0), stream)
         return updated, normalized
@@ -710,15 +674,17 @@ class UnpoolGatherBoundary(OpWrapper):
         """Every input is read through raw 16-byte vector accesses at fixed strides.
 
         A strided, misaligned or mistyped tensor is read as if it were packed,
-        with no error; a row count outside 1..8 addresses outside the inbox.
+        with no error; a row count above the inbox's ``max_rows`` addresses outside
+        it, and one of 9..32 at TP8 has CTAs that straddle two peers' slices.
         ``capture`` is written the same way: 16-byte stores at its row stride, so
         it must be BF16 ``[M, 8192]`` with unit column stride, a row stride that
         keeps every row 16-byte aligned, and a 16-byte aligned start.
         """
         rows = local.shape[0] if local.dim() == 2 else -1
         columns = local_columns(inbox.world)
-        if not 1 <= rows <= MAX_ROWS:
-            raise ValueError(f"local must be [1..{MAX_ROWS}, {columns}], got {tuple(local.shape)}")
+        top = max_rows(inbox)
+        if not 1 <= rows <= top:
+            raise ValueError(f"local must be [1..{top}, {columns}], got {tuple(local.shape)}")
         expected = (
             (local, (rows, columns), torch.bfloat16),
             (residual, (rows, HIDDEN), torch.float32),
@@ -751,6 +717,13 @@ class UnpoolGatherBoundary(OpWrapper):
 
 
 unpool_gather_boundary = UnpoolGatherBoundary()
+
+
+def max_rows(inbox: ProjectionInbox) -> int:
+    """The most rows a call on ``inbox`` may carry: its ``max_rows`` where the boundary's CTAs
+    of every such row count stay inside one peer's slice (TP4), else ``MAX_ROWS``."""
+    capacity = getattr(inbox, "max_rows", MAX_ROWS)
+    return capacity if inbox.world == 4 else min(capacity, MAX_ROWS)
 
 
 def capture_fits(capture: torch.Tensor, rows: int, device: torch.device) -> bool:

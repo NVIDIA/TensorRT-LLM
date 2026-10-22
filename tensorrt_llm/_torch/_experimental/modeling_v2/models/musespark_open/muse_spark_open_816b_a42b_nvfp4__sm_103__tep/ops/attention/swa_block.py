@@ -48,7 +48,7 @@ try:
 except ImportError:  # the pre-3.2 layout
     from triton.language.extra.cuda import libdevice
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .paged_decode_attention import (
     BLOCK_N,
@@ -478,81 +478,6 @@ class SwaBlockAttention(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # spec: rows, ctx, window, page, q_fp8, fused_prep, gate (None / "2d" / "3d"),
-    # permuted, rope.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"{rows} rows, {ctx} keys, prep and norm-gate fused: {why}",
-            spec=dict(
-                rows=rows, ctx=ctx, window=2048, page=32, q_fp8=True, fused_prep=True, gate="3d"
-            ),
-        )
-        for rows, ctx, why in (
-            (8, 100000, "K=7 verify at a 100k-token context, the primary cell"),
-            (8, 449000, "K=7 verify at a long context"),
-            (8, 2055, "window start exactly at a block boundary"),
-            (8, 2056, "the window's last block just full"),
-            (8, 2040, "context just below the window"),
-            (8, 2048, "context equal to the window"),
-            (8, 1000, "context shorter than the window: plain causal"),
-            (8, 40, "a short context inside two 32-key blocks"),
-            (8, 8, "no cached key: the step's rows only"),
-            (5, 100003, "a partial row group across a page boundary"),
-            (1, 100000, "one row (plain decode)"),
-            (1, 1, "the first token"),
-        )
-    ) + (
-        Cell(
-            why="8 rows, prep fused, gate left to the norm-gate kernel",
-            spec=dict(
-                rows=8, ctx=100000, window=2048, page=32, q_fp8=True, fused_prep=True, gate=None
-            ),
-        ),
-        Cell(
-            why="8 rows, pre-wait loads only: prep output in, no gate",
-            spec=dict(
-                rows=8, ctx=100000, window=2048, page=32, q_fp8=True, fused_prep=False, gate=None
-            ),
-        ),
-        Cell(
-            why="8 rows, prep output in, norm-gate fused with a contiguous gate",
-            spec=dict(
-                rows=8, ctx=100000, window=2048, page=32, q_fp8=True, fused_prep=False, gate="2d"
-            ),
-        ),
-        Cell(
-            why="8 rows, Q kept BF16 (no q_fp8)",
-            spec=dict(
-                rows=8, ctx=100000, window=2048, page=32, q_fp8=False, fused_prep=True, gate="3d"
-            ),
-        ),
-        Cell(
-            why="8 rows, the low-latency [q|k|v|gate] weight layout",
-            spec=dict(
-                rows=8,
-                ctx=100000,
-                window=2048,
-                page=32,
-                q_fp8=True,
-                fused_prep=True,
-                gate="3d",
-                permuted=True,
-            ),
-        ),
-        Cell(
-            why="8 rows, 64-token pages",
-            spec=dict(
-                rows=8, ctx=100000, window=2048, page=64, q_fp8=True, fused_prep=True, gate="3d"
-            ),
-        ),
-        Cell(
-            why="8 rows, a 512-key window",
-            spec=dict(
-                rows=8, ctx=5000, window=512, page=32, q_fp8=True, fused_prep=True, gate="3d"
-            ),
-        ),
-    )
 
     note = """
     Metadata consumed: seq_lens[0], the sequence's K and V page ids, the

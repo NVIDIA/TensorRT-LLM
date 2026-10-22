@@ -110,7 +110,6 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
-    Cell,
     OpWrapper,
     true_fp32_matmul,
 )
@@ -361,44 +360,6 @@ class FullAttnSplitKv(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # The tep4 cells (kv_heads=4) are certified by the tep4 op test.
-
-    # spec: rows, ctx (= seq_lens[0], the step's rows included); optional splits (default: the
-    # device's SM count), pdl, prefetch (default False).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"{rows} rows, {ctx} keys: {why}", spec=dict(rows=rows, ctx=ctx))
-        for rows, ctx, why in (
-            (8, 100000, "K=7 verify at a 100k-token context"),
-            (8, 455031, "K=7 verify at a 455k-token context, last page partly written"),
-            (8, 100003, "the step's tokens straddle a page boundary"),
-            (8, 1048581, "near the 1M sequence limit, straddling the last page boundary"),
-            (3, 100003, "a partial row group (K=2 verify) across a page boundary"),
-            (1, 100000, "one row (plain decode)"),
-            (8, 19457, "one page more than 4 pages per split on every SM"),
-            (8, 8192, "a short context: 64 splits of one tile, 88 key-less splits"),
-            (8, 1027, "a short context: splits of 4 to 5 pages"),
-            (8, 161, "two splits"),
-            (8, 40, "one split: every other split is key-less"),
-            (8, 8, "the first step: every key is new"),
-            (1, 1, "the first token: one key"),
-        )
-    ) + (
-        Cell(
-            why="8 rows, 100000 keys, PDL launch with the non-default pre-wait page prefetch",
-            spec=dict(rows=8, ctx=100000, pdl=True, prefetch=True),
-        ),
-        Cell(
-            why="8 rows, 455031 keys, PDL launch (the op's build)",
-            spec=dict(rows=8, ctx=455031, pdl=True),
-        ),
-        Cell(
-            why="8 rows, 100000 keys, two CTAs' worth of splits per SM (304)",
-            spec=dict(rows=8, ctx=100000, splits=304),
-        ),
-        Cell(
-            why="8 rows, 100000 keys, a small grid (long splits)",
-            spec=dict(rows=8, ctx=100000, splits=19),
-        ),
-    )
 
     note = """
     Metadata consumed: seq_lens[0] (device; read by the kernel, never on the host), the

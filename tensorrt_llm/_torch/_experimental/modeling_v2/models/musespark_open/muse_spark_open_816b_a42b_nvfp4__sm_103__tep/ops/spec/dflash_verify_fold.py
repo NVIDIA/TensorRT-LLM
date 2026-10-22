@@ -35,18 +35,19 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
 from .dflash_accept import (
     COUNTER_STRIDE,
-    FORCE_FIXED,
     FORCE_FRACTIONAL,
-    FORCE_NONE,
-    MAX_REQUESTS,
+    LOOP_REQUESTS,
     SLOT_STRIDE,
     dflash_accept,
 )
 
+#: The requests one launch takes: its single program loops over them, as
+#: ``dflash_accept``'s per-request loop does up to ``LOOP_REQUESTS``.
+MAX_REQUESTS = LOOP_REQUESTS
 #: Elements of ``_seq_lens_cuda`` copied per loop iteration.
 SEQ_BLOCK = 128
 
@@ -198,37 +199,6 @@ class DflashVerifyFold(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            "the target's decode step: one request, K = 7, block 8, forced 3.05 (fractional)",
-            spec=dict(gens=1, k=7, block=8, force=FORCE_FRACTIONAL, rate=3.05),
-        ),
-        Cell(
-            "natural acceptance (no override): the count is the leading-match count",
-            spec=dict(gens=1, k=7, block=8, force=FORCE_NONE, rate=0.0),
-        ),
-        Cell(
-            "integer override: every request gets base_total",
-            spec=dict(gens=3, k=5, block=6, force=FORCE_FIXED, rate=2.0),
-        ),
-        Cell(
-            "several requests on distinct slots, fractional override",
-            spec=dict(gens=4, k=3, block=4, force=FORCE_FRACTIONAL, rate=1.6),
-        ),
-        Cell(
-            "context lengths at the ceiling: the query positions clamp to max_ctx",
-            spec=dict(gens=2, k=7, block=8, force=FORCE_NONE, rate=0.0, near_ceiling=True),
-        ),
-        Cell(
-            "int64 target tokens (the greedy argmax path), no kv_lens / seq_lens buffers",
-            spec=dict(gens=2, k=7, block=8, force=FORCE_NONE, rate=0.0, int64=True, bare=True),
-        ),
-        Cell(
-            "K = 1, a block wider than K + 1",
-            spec=dict(gens=2, k=1, block=4, force=FORCE_NONE, rate=0.0),
-        ),
-    )
 
     note = """
     Metadata consumed: the worker's ``_batch_to_slot`` / ``_ctx_len`` (read),

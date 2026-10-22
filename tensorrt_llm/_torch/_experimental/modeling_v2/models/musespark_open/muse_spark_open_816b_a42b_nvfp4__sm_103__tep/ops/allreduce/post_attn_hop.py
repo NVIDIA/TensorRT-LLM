@@ -106,7 +106,7 @@ from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1875,30 +1875,6 @@ class PostAttnConsumerHop(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="no speculation: one row, the 16-CTA cluster split", spec=dict(rows=1)),
-        Cell(why="two rows: the smallest 8-CTA split", spec=dict(rows=2)),
-        Cell(why="K = 3 verify width", spec=dict(rows=4)),
-        Cell(why="K = 5 verify width", spec=dict(rows=6)),
-        Cell(why="K = 7 verify width, the one row count the target serves", spec=dict(rows=8)),
-        Cell(
-            why="the second buffer: odd layers publish into parity 1",
-            spec=dict(rows=8, parity=1),
-        ),
-        Cell(
-            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
-            spec=dict(rows=8, norm_fp32=True),
-        ),
-        Cell(
-            why="exact zeros and negative zeros published unchanged (0x80000000 is now a payload)",
-            spec=dict(rows=8, zeros=True),
-        ),
-        Cell(
-            why="cancelling partials: the FP32 rank-order sum differs from other orders",
-            spec=dict(rows=8, cancel=True),
-        ),
-    )
-
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of
     the row count the target serves directly (8 at K = 7), from the target's
@@ -2015,28 +1991,6 @@ class PostAttnHop(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-
-    # The decode step of this target at K = 7 carries 8 rows; K = 3 / 5 carry 4 / 6;
-    # one row is the no-speculation step and the only shape on the 16-CTA split.
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="no speculation: one row, the 16-CTA cluster split", spec=dict(rows=1)),
-        Cell(why="two rows: the smallest 8-CTA split", spec=dict(rows=2)),
-        Cell(why="K = 3 verify width", spec=dict(rows=4)),
-        Cell(why="K = 5 verify width", spec=dict(rows=6)),
-        Cell(why="K = 7 verify width, the measured configuration", spec=dict(rows=8)),
-        Cell(
-            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
-            spec=dict(rows=8, norm_fp32=True),
-        ),
-        Cell(
-            why="exact zeros and negative zeros in every rank's partial",
-            spec=dict(rows=8, zeros=True),
-        ),
-        Cell(
-            why="cancelling partials: the FP32 rank-order sum differs from other orders",
-            spec=dict(rows=8, cancel=True),
-        ),
-    )
 
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step
