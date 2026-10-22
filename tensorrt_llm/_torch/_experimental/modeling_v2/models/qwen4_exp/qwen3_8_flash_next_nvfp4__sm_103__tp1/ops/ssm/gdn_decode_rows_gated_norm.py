@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """One Gated-DeltaNet decode step per row and the gated RMS norm on its output, streamed
-over the fp32 state pool: the decode step at batch sizes past the cluster kernel's.
+over the fp32 or bf16 state pool: the decode step at batch sizes past the cluster kernel's
+over an fp32 pool, and at every batch size over a bf16 pool.
 
 Tier 6 (CuTe DSL written for this target; the recurrence is the gated delta rule of
 FlashInfer's `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here). At a
-decode batch the step is the pool's traffic -- each (row, v-head) state, 64 KB fp32, read
-and written once -- so a CTA owns one whole state and streams it: warp w the value rows
-[w * RPW, (w + 1) * RPW), lane l the key columns [4l, 4l + 4) of each, so a warp's
-access is one contiguous 512-byte state row. The state is loaded before
+decode batch the step is the pool's traffic -- each (row, v-head) state, 64 KB fp32 or
+32 KB bf16, read and written once -- so a CTA owns one whole state and streams it: warp w
+the value rows [w * RPW, (w + 1) * RPW), lane l the key columns [4l, 4l + 4) of each, so
+a warp's access is one contiguous state row. A bf16 state is widened to fp32 on the load
+and rounded back (nearest even) on the store. The state is loaded before
 `griddepcontrol.wait` (nothing in the step writes it ahead of this kernel). The two dot
 products a value row takes over K are reduced across the warp by a transposed
 reduction (RPW rows in RPW - 1 + log2(32 / RPW) shuffles, not 5 RPW), which leaves row
@@ -35,7 +37,7 @@ from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 from .gdn_decode_gated_norm_pdl import _recurrence_reference
 from .gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl as _one_launch
 
-#: Key columns a lane (a 16-byte vector of a state row).
+#: Key columns a lane (one 16-byte fp32 or 8-byte bf16 vector of a state row).
 _PL = 4
 #: Warps a CTA; a warp owns `V // _WARPS` value rows of the head's state.
 _WARPS = 8
@@ -94,6 +96,40 @@ def _st_state(addr, pred, a, b, c, d, *, loc=None, ip=None):
         [cutlass.Int64(addr), cutlass.Int32(pred)] + [cutlass.Float32(v) for v in (a, b, c, d)],
         "{ .reg .pred p; setp.ne.b32 p, $2, 0; @p st.global.cs.v4.f32 [$1], {$3, $4, $5, $6}; "
         "mov.u32 $0, 0; }",
+        "=r,l,r,f,f,f,f",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _ld_state_bf16(addr, pred, *, loc=None, ip=None):
+    """Four bf16 of a state row (streaming) as fp32, or zeros where `pred` is 0."""
+    r = _asm_n(
+        4,
+        T.f32(),
+        [cutlass.Int64(addr), cutlass.Int32(pred)],
+        "{ .reg .pred p; .reg .b32 w0, w1; setp.ne.b32 p, $5, 0; mov.b32 w0, 0; "
+        "mov.b32 w1, 0; @p ld.global.cs.v2.b32 {w0, w1}, [$4]; shl.b32 $0, w0, 16; "
+        "and.b32 $1, w0, 0xFFFF0000; shl.b32 $2, w1, 16; and.b32 $3, w1, 0xFFFF0000; }",
+        "=f,=f,=f,=f,l,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+    return [cutlass.Float32(v) for v in r]
+
+
+@dsl_user_op
+def _st_state_bf16(addr, pred, a, b, c, d, *, loc=None, ip=None):
+    """Four fp32 rounded to bf16 into a state row (streaming) where `pred` is not 0."""
+    _asm(
+        T.i32(),
+        [cutlass.Int64(addr), cutlass.Int32(pred)] + [cutlass.Float32(v) for v in (a, b, c, d)],
+        "{ .reg .pred p; .reg .b32 r0, r1; setp.ne.b32 p, $2, 0; "
+        "cvt.rn.bf16x2.f32 r0, $4, $3; cvt.rn.bf16x2.f32 r1, $6, $5; "
+        "@p st.global.cs.v2.b32 [$1], {r0, r1}; mov.u32 $0, 0; }",
         "=r,l,r,f,f,f,f",
         loc,
         ip,
@@ -189,10 +225,15 @@ class _GdnRowsKernel:
     """CTA (v-head, row): the row's whole state of that head. `norm`: the gated RMS norm on
     the head's output; else the recurrence's output, rounded to bf16, is stored as is."""
 
-    def __init__(self, k_heads, v_heads, kdim, vdim, pdl, norm=True):
+    def __init__(self, k_heads, v_heads, kdim, vdim, pdl, norm=True, state_bf16=False):
         assert kdim == 32 * _PL and vdim % _WARPS == 0
         self.h, self.hv, self.k, self.v, self.pdl = k_heads, v_heads, kdim, vdim, pdl
         self.norm = norm
+        # The pool's element size and the lane's 4-column load and store of a state row.
+        self.sb = 2 if state_bf16 else 4
+        self.ld_state, self.st_state = (
+            (_ld_state_bf16, _st_state_bf16) if state_bf16 else (_ld_state, _st_state)
+        )
         self.rpw = vdim // _WARPS
         assert self.rpw in (4, 8, 16, 32)
         # Lanes that hold one row's reduced sums.
@@ -290,9 +331,11 @@ class _GdnRowsKernel:
                 cutlass.Int64(cutlass.max(slot, cutlass.Int32(0))) * s_slot
                 + cutlass.Int64(hv * s_head + v0 * s_row + lane * _PL)
             )
-            * 4
+            * self.sb
         )
-        h = [_ld_state(base + cutlass.Int64(j * s_row * 4), live) for j in range(self.rpw)]
+        h = [
+            self.ld_state(base + cutlass.Int64(j * s_row * self.sb), live) for j in range(self.rpw)
+        ]
         a_log = mALog[hv]
         dtb = mDt[hv]
         w_l = cutlass.Float32(0.0)
@@ -349,7 +392,7 @@ class _GdnRowsKernel:
                 h[j][e] = u * kn[e] + decay * h[j][e]
                 acc = h[j][e] * qn[e] + acc
             part.append(acc)
-            _st_state(base + cutlass.Int64(j * s_row * 4), live, *h[j])
+            self.st_state(base + cutlass.Int64(j * s_row * self.sb), live, *h[j])
         o = _rows_reduce(part, lane)
 
         # 4. The gated RMS norm over the head's V outputs, each rounded to bf16 first (the
@@ -387,7 +430,8 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
     if rows == 0:
         return out
     pdl = bool(pdl and get_env_enable_pdl())
-    key = (k_heads, v_heads, kdim, vdim, pdl, norm)
+    state_bf16 = pool.dtype == torch.bfloat16
+    key = (k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16)
     ptrs = (
         proj,
         pool.data_ptr(),
@@ -402,7 +446,12 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
         gm = cute.AddressSpace.gmem
         cargs = (
             from_dlpack(proj, assumed_align=8).mark_layout_dynamic(leading_dim=1),
-            make_ptr(cutlass.Float32, ptrs[1], gm, assumed_align=16),
+            make_ptr(
+                cutlass.BFloat16 if state_bf16 else cutlass.Float32,
+                ptrs[1],
+                gm,
+                assumed_align=8 if state_bf16 else 16,
+            ),
             make_ptr(cutlass.Int32, ptrs[2], gm, assumed_align=4),
             make_ptr(cutlass.Float32, ptrs[3], gm, assumed_align=4),
             make_ptr(cutlass.Float32, ptrs[4], gm, assumed_align=4),
@@ -410,7 +459,7 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
             make_ptr(cutlass.BFloat16, ptrs[6], gm, assumed_align=2),
         )
         fn = cute.compile(
-            _GdnRowsKernel(k_heads, v_heads, kdim, vdim, pdl, norm),
+            _GdnRowsKernel(k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16),
             *cargs,
             cutlass.Int32(1),
             cutlass.Int32(1),
@@ -437,8 +486,8 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
 
 
 class GdnDecodeRowsGatedNorm(OpWrapper):
-    """A single-token Gated-DeltaNet step per row over the fp32 slot pool, then the
-    sigmoid-gated RMS norm of its output per v-head. With `proj` the decode input
+    """A single-token Gated-DeltaNet step per row over the fp32 or bf16 slot pool, then
+    the sigmoid-gated RMS norm of its output per v-head. With `proj` the decode input
     projection's output row `[q (H*K) | k (H*K) | v (HV*V) | z (HV*V) | a (HV) | b (HV)]`
     (after the conv step: q, k, v are the conv's SiLU outputs)::
 
@@ -466,14 +515,23 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
             why="2 rows, coalesced pool (slot stride 36 layers, slot 100), row 1 a pad slot (-1)",
             spec=dict(rows=2, pool="coalesced", pad=True),
         ),
+        Cell(why="bf16 pool (mamba_ssm_cache_dtype), 128 rows", spec=dict(rows=128, state="bf16")),
+        Cell(why="bf16 pool, 1 row (con 1)", spec=dict(rows=1, state="bf16")),
+        Cell(
+            why="bf16 pool, 33 rows, one pad slot (-1)", spec=dict(rows=33, pad=True, state="bf16")
+        ),
+        Cell(
+            why="bf16 pool, 2 rows, coalesced: slot stride 36 layers, slot 100",
+            spec=dict(rows=2, pool="coalesced", state="bf16"),
+        ),
     )
 
     note = """
     Metadata consumed: `slots` (the cache manager's state indices for the step).
 
     Preconditions: bf16 `proj` `[rows, 2*H*K + 2*HV*V + 2*HV]` with unit column stride
-    and 8-byte aligned rows; the pool fp32 `[slots, HV, V, K]` with K innermost (any
-    outer strides, multiples of 4) and 16-byte aligned; `K == 128`, `V % 8 == 0` with
+    and 8-byte aligned rows; the pool fp32 or bf16 `[slots, HV, V, K]` with K innermost
+    (any outer strides, multiples of 4) and aligned to 4 elements; `K == 128`, `V % 8 == 0` with
     `V / 8` in {4, 8, 16, 32}; `A_log`, `dt_bias` fp32 `[HV]`; `norm_weight` bf16
     `[V]`; int32 `slots` `[rows]`. **The pool rows and `slots` must not be written by
     any kernel of the same step queued ahead of this one**: both are read before
@@ -490,14 +548,17 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
 
     Numerics: fp32 inside; each dot product over K is a lane's 4-term FMA chain and then
     the transposed reduction's tree; `o` rounded to bf16 before the norm, the output
-    rounded once. Inside torch's default band for bf16 / fp32 of the composition's
-    float64 reference, not bitwise FlashInfer's kernel.
+    rounded once. A bf16 pool's state is rounded once per step, at the store, and `o`
+    comes from the state before that rounding. Inside torch's default band for bf16 and
+    the pool's dtype of the composition's float64 reference, not bitwise FlashInfer's
+    kernel. Batch-invariant: a row's output and state do not depend on the other rows.
 
     Certified: 128 and 3 rows (the fewest a decode step sends here once the conv-fused
     path stops) over a contiguous 461-slot pool, and 2 rows over the cache manager's
     coalesced pool (slot stride 36 layers' states, slot 100 ~2.8G elements past the
-    base) with the second row a pad slot (-1). Under graph replay the op reads the
-    projection after `griddepcontrol.wait` (16 rows). Not certified: `pdl=False`.
+    base) with the second row a pad slot (-1); the same over a bf16 pool. Under graph
+    replay the op reads the projection after `griddepcontrol.wait` (16 rows). Not
+    certified: `pdl=False`.
     """
 
     def __call__(
@@ -529,7 +590,7 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
         pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`(out, pool_after)`: `gdn_decode_gated_norm_pdl`'s reference, the same contract --
-        the fp64 recurrence (o rounded to bf16, the pool to fp32), then the gated norm
+        the fp64 recurrence (o rounded to bf16, the pool to its dtype), then the gated norm
         entry's fp32 reference."""
         return _one_launch.reference(
             proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, pdl
@@ -553,12 +614,10 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
         assert proj.dtype == torch.bfloat16 and proj.stride(1) == 1, "bf16 proj, unit column stride"
         assert proj.shape[1] == 2 * k_heads * kdim + 2 * v_heads * vdim + 2 * v_heads, "proj width"
         assert proj.data_ptr() % 8 == 0 and proj.stride(0) % 4 == 0, "8-byte aligned proj rows"
-        assert pool.dtype == torch.float32 and pool.stride(3) == 1 and kd == kdim, (
-            "fp32 pool [S, HV, V, K]"
-        )
-        assert pool.data_ptr() % 16 == 0 and all(s % 4 == 0 for s in pool.stride()[:3]), (
-            "16-byte aligned pool rows"
-        )
+        assert pool.dtype in (torch.float32, torch.bfloat16), "fp32 or bf16 pool"
+        assert pool.stride(3) == 1 and kd == kdim, "pool [S, HV, V, K]"
+        assert pool.data_ptr() % (_PL * pool.element_size()) == 0, "pool aligned to 4 elements"
+        assert all(s % _PL == 0 for s in pool.stride()[:3]), "pool strides multiples of 4"
         assert kdim == 32 * _PL, f"K == {32 * _PL}"
         assert vdim % _WARPS == 0 and vdim // _WARPS in (4, 8, 16, 32), "V / 8 in {4, 8, 16, 32}"
         assert v_heads % k_heads == 0, "HV a multiple of H"
@@ -594,6 +653,14 @@ class GdnDecodeRows(OpWrapper):
         Cell(
             why="2 rows, the cache manager's coalesced pool: slot stride 36 layers",
             spec=dict(rows=2, pool="coalesced", out="row_range"),
+        ),
+        Cell(
+            why="bf16 pool: 121 generation rows into a row range of the step output",
+            spec=dict(rows=121, out="row_range", state="bf16"),
+        ),
+        Cell(
+            why="bf16 pool: 3 rows, one pad slot (-1)",
+            spec=dict(rows=3, pad=True, out="row_range", state="bf16"),
         ),
     )
 
@@ -634,7 +701,7 @@ class GdnDecodeRows(OpWrapper):
         out: torch.Tensor,
         pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(o, pool_after)`: the fp64 recurrence, o rounded to bf16 (the pool to fp32)."""
+        """`(o, pool_after)`: the fp64 recurrence, o rounded to bf16 (the pool to its dtype)."""
         rows = proj.shape[0]
         v_heads, vdim = pool.shape[1], pool.shape[2]
         q, k, v, _, a, b = torch.split(

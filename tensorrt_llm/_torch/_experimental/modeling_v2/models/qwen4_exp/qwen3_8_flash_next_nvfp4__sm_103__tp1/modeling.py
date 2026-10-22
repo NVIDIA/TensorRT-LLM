@@ -80,8 +80,8 @@ speculative decoding. The QSA index and position planes keep their own types und
 is also what ``auto`` resolves to for this checkpoint (`_SSM_STATE_DTYPES`): a lossy
 substitution, since the state is rounded to bf16 once per decode token, once per prefill call and
 at every cached-replay checkpoint commit. The conv, PLE and replay-history buffers keep their own
-types under both. A bf16 pool makes the decode step call its recurrence without ``cu_seqlens``;
-see ``DecodeTarget._gdn_block``.
+types under both. Over a bf16 pool a decode step takes one recurrence kernel at every batch size,
+so a row's tokens do not depend on its batch; see ``DecodeTarget._gdn_block``.
 
 **Breakable prefill CUDA graph.** With ``prefill_cuda_graph_backend: breakable`` the engine
 captures the core's ``forward`` (the body, not the shell) for a step with context rows at each of
@@ -148,6 +148,7 @@ from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
+from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
 from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
@@ -217,7 +218,6 @@ from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
 from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gated_delta_rule_update
-from .ops.ssm.fused_sigmoid_gating_delta_rule_update import fused_sigmoid_gating_delta_rule_update
 from .ops.ssm.gdn_decode_gated_norm_pdl import MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS
 from .ops.ssm.gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl
 from .ops.ssm.gdn_decode_rows_gated_norm import gdn_decode_rows, gdn_decode_rows_gated_norm
@@ -258,6 +258,10 @@ _MAMBA_FIELDS = (
 # A context launch at or above this many rows takes `qsa_sparse_gqa_rowtile`;
 # measured on GB300 it loses at 543 rows and wins from 4096 rows up.
 _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer size
+# Over an NVFP4 pool, a step with more context rows than this reads its context requests'
+# pages dequantized into a bf16 scratch through `qsa_sparse_gqa_rowtile`. GB300, a layer:
+# 16384 context rows 1.36 ms there against 77-948 ms for the NVFP4 per-row kernel.
+_NVFP4_ROWTILE_MIN_ROWS = 256  # capacity: fixed: a dispatch threshold, not a buffer size
 
 #: Context-step MoE launches of at least this many rows run on the CuTe DSL MoE
 #: (`fp4_moe_renorm_cute_dsl`, from the second expert copy `weights.py` keeps in
@@ -476,9 +480,8 @@ _CUTEDSL_MAX_DRAFT_LEN = 3
 # process.
 _PAD_SLOT_ID = -1
 
-# Gated-DeltaNet gating form: the only pair `fused_sigmoid_gating_delta_rule_update`
-# is certified at; matches `gdn_prefill_conv_post`'s default so prefill and decode
-# compute the same `g`.
+# Gated-DeltaNet gating form: the pair the decode kernels compute with and
+# `gdn_prefill_conv_post`'s default, so prefill and decode compute the same `g`.
 _SOFTPLUS_BETA = 1.0
 _SOFTPLUS_THRESHOLD = 20.0
 
@@ -2513,6 +2516,86 @@ def _cute_dsl_routed(core, L, logits, xq, xsf, routed_out) -> torch.Tensor:
     )
 
 
+def _nvfp4_context_plan(core, md, req_idx, block_table, tpb: int) -> tuple:
+    """The pages a step's context requests read, for the bf16 row-tile pass over an NVFP4
+    pool: request `r` lists its first `ceil(kv_len / tpb)` table pages at scratch pages
+    `offsets[r]` on. Returns `(slots, counts, offsets, table, k_scratch, v_scratch)`, the
+    operands `qsa_nvfp4_pages_to_bf16` fills per layer: `table` (all -1 here) gets the
+    requests' slot rows, the scratch pools `[listed, Hkv, tpb, D]` bf16 the pages."""
+    num_contexts = md.num_contexts
+    device = block_table.device
+    # The host's and the device's KV lengths are the same per-step values: the host's
+    # size the scratch, the device's place the pages.
+    listed = int(((md.kv_lens_runtime[:num_contexts] + (tpb - 1)) // tpb).sum())
+    lens = md.seq_lens_cuda[:num_contexts].long()
+    slots = req_idx[torch.cumsum(lens, 0) - lens]
+    counts = torch.div(
+        md.kv_lens_cuda_runtime[:num_contexts].long() + (tpb - 1), tpb, rounding_mode="floor"
+    )
+    offsets = torch.cumsum(counts, 0) - counts
+    table = torch.full_like(block_table, -1)
+    shape = (listed, core.heads_kv, tpb, core.head_dim)
+    k_scratch = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    v_scratch = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    return slots, counts, offsets, table, k_scratch, v_scratch
+
+
+def _sparse_gqa_nvfp4_context(
+    core, kv, plan, q, block_table, selected, req_idx, logical, tpb: int, num_ctx: int, out
+) -> torch.Tensor:
+    """Sparse GQA of a step with context rows over an NVFP4 pool, into `out` `[rows,
+    q_width]`. With a plan (`_nvfp4_context_plan`) the first `num_ctx` rows, the context
+    rows, take the row-tile pass over the plan's scratch, filled here from this layer's
+    pool; the other rows, and every row without a plan, go split-K over the pool itself
+    (with the prefill pair the entry would take its per-row prefill kernel)."""
+    rows = q.shape[0]
+    head = 0
+    if plan is not None:
+        slots, counts, offsets, table, k_scratch, v_scratch = plan
+        qsa_nvfp4_pages_to_bf16(
+            kv.k,
+            kv.v,
+            kv.k_scale,
+            kv.v_scale,
+            core.kv_scale_quant_orig,
+            block_table,
+            slots,
+            counts,
+            offsets,
+            table,
+            k_scratch,
+            v_scratch,
+        )
+        context = qsa_sparse_gqa_rowtile(
+            q=q[:num_ctx],
+            k_cache=k_scratch,
+            v_cache=v_scratch,
+            block_table=table,
+            selected_tokens=selected[:num_ctx],
+            request_indices=req_idx[:num_ctx],
+            tokens_per_block=tpb,
+            softmax_scale=core.softmax_scale,
+            query_positions=logical[:num_ctx],
+            compress_ratio=core.compress_ratio,
+        )
+        out[:num_ctx].copy_(torch.reshape(context, [num_ctx, core.q_width]))
+        head = num_ctx
+    if head < rows:
+        rest = _sparse_gqa(
+            core,
+            kv,
+            q=q[head:],
+            block_table=block_table,
+            selected_tokens=selected[head:],
+            request_indices=req_idx[head:],
+            tokens_per_block=tpb,
+            query_positions=None,
+            compress_ratio=None,
+        )
+        out[head:rows].copy_(torch.reshape(rest, [rows - head, core.q_width]))
+    return out
+
+
 def _live_score_columns(core, md, batch: int) -> int:
     """A host-side bound on every row's selection window in a step with context rows: the
     longest sequence's compressed length, with the verify width as slack for the draft
@@ -2628,8 +2711,9 @@ class _PrefillStep(NamedTuple):
     `n` ids. `attn` is thop_attention's per-step arguments; `gdn`, `ple` and `qsa` are the
     recurrent, PLE and QSA bookkeeping tuples their breaks unpack, each cut to the batch's
     rows; `stage` says the speculative rollback stages this verify step; `vision` is the
-    shell's `(rows, mm_token_indices)` or None. A new one replaces it every step, so no
-    break reads a previous step's."""
+    shell's `(rows, mm_token_indices)` or None; `nvfp4_context` is `_nvfp4_context_plan`'s
+    scratch for the context rows over an NVFP4 pool, or None. A new one replaces it every
+    step, so no break reads a previous step's."""
 
     num_tokens: int
     physical_tokens: int
@@ -2640,6 +2724,7 @@ class _PrefillStep(NamedTuple):
     qsa: tuple
     stage: bool
     vision: tuple | None
+    nvfp4_context: tuple | None = None
 
 
 class PrefillTarget:
@@ -3044,11 +3129,25 @@ class PrefillTarget:
                             token_topk=core.token_topk,
                         )
                     )
-            # A context launch of thousands of rows over a bf16 pool takes the row-tile
-            # pass: consecutive rows of one request share their K/V tiles; rows of groups
-            # that span requests, the generation rows of a mixed step among them, are served
-            # row by row. Below the threshold the per-row kernel is faster.
-            if num_tokens >= _ROWTILE_MIN_ROWS and kv.k.dtype == q_dst.dtype:
+            if kv.k_scale is not None:
+                _sparse_gqa_nvfp4_context(
+                    core,
+                    kv,
+                    step.nvfp4_context,
+                    q_dst,
+                    block_table,
+                    selected,
+                    req_idx,
+                    logical,
+                    tokens_per_block,
+                    num_ctx,
+                    attn_out[:num_tokens],
+                )
+            elif num_tokens >= _ROWTILE_MIN_ROWS and kv.k.dtype == q_dst.dtype:
+                # A context launch of thousands of rows over a bf16 pool takes the row-tile
+                # pass: consecutive rows of one request share their K/V tiles; rows of
+                # groups that span requests, the generation rows of a mixed step among them,
+                # are served row by row. Below the threshold the per-row kernel is faster.
                 out = qsa_sparse_gqa_rowtile(
                     q=q_dst,
                     k_cache=kv.k,
@@ -3061,6 +3160,7 @@ class PrefillTarget:
                     query_positions=logical,
                     compress_ratio=core.compress_ratio,
                 )
+                attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
             else:
                 out = _sparse_gqa(
                     core,
@@ -3075,7 +3175,7 @@ class PrefillTarget:
                     query_positions=logical,
                     compress_ratio=core.compress_ratio,
                 )
-            attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
+                attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
         else:
             # The dense op reads its packed QKV flat: one compact copy.
             qkv = proj_qkv[:num_tokens]
@@ -3200,10 +3300,10 @@ class PrefillTarget:
         `[1, T, num_v_heads, head_v_dim]` in place and zeroes rows `[n:]`. Every branch
         is on a host int of the step, never a tensor value.
 
-        Over an fp32 recurrent pool outside a verify step the context rows take one fused
+        Outside a verify step, over either pool dtype, the context rows take one fused
         conv + post-conv pass (`_gdn_prefill_prep`) and FlashInfer's chunked recurrence, and
-        a mixed step's one-token generation rows FlashInfer's single-token decode kernel;
-        otherwise `_gdn_core_generic`."""
+        a mixed step's one-token generation rows the decode step's recurrence
+        (`gdn_decode_rows`); a verify step takes `_gdn_core_verify`."""
         core = self.core
         L = self._layers[i]
         step = self._step
@@ -3226,10 +3326,10 @@ class PrefillTarget:
             replay,
         ) = step.gdn
         num_tokens = step.num_tokens
-        ssm_states = core._bound.ssm[i]
-        if is_verify or ssm_states.dtype != torch.float32:
-            self._gdn_core_generic(proj, out, i)
+        if is_verify:
+            self._gdn_core_verify(proj, out, i)
             return
+        ssm_states = core._bound.ssm[i]
         mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
         conv_states = core._bound.conv[i]
 
@@ -3309,10 +3409,11 @@ class PrefillTarget:
             )
         out[:, num_tokens:].zero_()
 
-    def _gdn_core_generic(self, proj, out, i) -> None:
-        """`_gdn_core` on a verify step or over a bf16 recurrent pool: the conv, the
-        post-conv gating and the chunked delta rule over the step's `n` rows, or under
-        speculation the verify path for the generation rows. The q|k|v columns are read in
+    def _gdn_core_verify(self, proj, out, i) -> None:
+        """`_gdn_core` on a verify step: the context rows' conv, post-conv gating and
+        chunked delta rule, and the verify path for the generation rows. A context row
+        advances its slot as on the base path; a generation row is a draft chain of unknown
+        accepted length, so it goes to the rollback buffers. The q|k|v columns are read in
         place, as the column view of the projection every consumer here is certified on;
         the a and b columns are copied out first, as the verify path reads them contiguous.
         The chunked delta rule writes its rows of `out` directly."""
@@ -3347,117 +3448,38 @@ class PrefillTarget:
         # A context sequence carrying nothing starts from a zeroed slot; only the
         # context prefix is a candidate (a generation row's state must survive).
         reset_recurrent_state_rows(ssm_states, si_p, hi_p, conv_states)
-        if num_decode_tokens > 0:
-            mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
-            # Prefill conv wants channel-major, decode token-major.
-            mq_p_t = extract_transpose_prefill_slice(mq_p, num_prefill_tokens, 0, core.conv_dim)
-            causal_conv1d_fwd(
-                x=mq_p_t,
-                weight=L.conv_w,
-                bias=None,
-                conv_states=conv_states,
-                query_start_loc=qsl_p,
-                cache_indices=si_p,
-                has_initial_state=hi_p,
-                silu_activation=True,
-                pad_slot_id=_PAD_SLOT_ID,
-                out=None,
-            )
-            if is_verify:
-                # A context row advances its slot as on the base path; a generation
-                # row is a draft chain of unknown accepted length, so it goes to the
-                # rollback buffers.
-                a_p, a_d = torch.split(a, [num_prefill_tokens, num_decode_tokens], 0)
-                b_p, b_d = torch.split(b, [num_prefill_tokens, num_decode_tokens], 0)
-                q, k, v, g, beta = fused_gdn_post_conv(
-                    prefill=mq_p_t,
-                    decode=None,
-                    a=a_p,
-                    b=b_p,
-                    A_log=L.a_log,
-                    dt_bias=L.dt_bias,
-                    num_k_heads=core.num_k_heads,
-                    head_k_dim=core.head_k_dim,
-                    num_v_heads=core.num_v_heads,
-                    head_v_dim=core.head_v_dim,
-                    l2_norm_eps=_L2_NORM_EPS,
-                    softplus_threshold=_SOFTPLUS_THRESHOLD,
-                )
-                # q and k are already L2-normalized by the post-conv call.
-                chunk_gated_delta_rule(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    scale=None,
-                    initial_state=ssm_states,
-                    initial_state_indices=si_p,
-                    inplace_indexed_state_update=True,
-                    output_final_state=False,
-                    cu_seqlens=qsl_long_p,
-                    use_qk_l2norm_in_kernel=False,
-                    output=out[:, :num_prefill_tokens],
-                )
-                out_d = self._gdn_verify(
-                    mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
-                )
-                out[:, num_prefill_tokens:num_tokens].copy_(out_d)
-                out[:, num_tokens:].zero_()
-                return
-            causal_conv1d_update(
-                x=mq_d,
-                conv_state=conv_states,
-                weight=L.conv_w,
-                bias=None,
-                silu_activation=True,
-                cache_seqlens=None,
-                conv_state_indices=si_d,
-                pad_slot_id=_PAD_SLOT_ID,
-            )
-            q, k, v, g, beta = fused_gdn_post_conv(
-                prefill=mq_p_t,
-                decode=mq_d,
-                a=a,
-                b=b,
-                A_log=L.a_log,
-                dt_bias=L.dt_bias,
-                num_k_heads=core.num_k_heads,
-                head_k_dim=core.head_k_dim,
-                num_v_heads=core.num_v_heads,
-                head_v_dim=core.head_v_dim,
-                l2_norm_eps=_L2_NORM_EPS,
-                softplus_threshold=_SOFTPLUS_THRESHOLD,
-            )
-        else:
-            mq_t = extract_transpose_prefill_slice(mixed_qkv, num_tokens, 0, core.conv_dim)
-            causal_conv1d_fwd(
-                x=mq_t,
-                weight=L.conv_w,
-                bias=None,
-                conv_states=conv_states,
-                query_start_loc=qsl_all,
-                cache_indices=si_all,
-                has_initial_state=hi_all,
-                silu_activation=True,
-                pad_slot_id=_PAD_SLOT_ID,
-                out=None,
-            )
-            q, k, v, g, beta = fused_gdn_post_conv(
-                prefill=mq_t,
-                decode=None,
-                a=a,
-                b=b,
-                A_log=L.a_log,
-                dt_bias=L.dt_bias,
-                num_k_heads=core.num_k_heads,
-                head_k_dim=core.head_k_dim,
-                num_v_heads=core.num_v_heads,
-                head_v_dim=core.head_v_dim,
-                l2_norm_eps=_L2_NORM_EPS,
-                softplus_threshold=_SOFTPLUS_THRESHOLD,
-            )
-        # q and k are already L2-normalized; the recurrence must not repeat it.
+        mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
+        a_p, a_d = torch.split(a, [num_prefill_tokens, num_decode_tokens], 0)
+        b_p, b_d = torch.split(b, [num_prefill_tokens, num_decode_tokens], 0)
+        # Prefill conv wants channel-major.
+        mq_p_t = extract_transpose_prefill_slice(mq_p, num_prefill_tokens, 0, core.conv_dim)
+        causal_conv1d_fwd(
+            x=mq_p_t,
+            weight=L.conv_w,
+            bias=None,
+            conv_states=conv_states,
+            query_start_loc=qsl_p,
+            cache_indices=si_p,
+            has_initial_state=hi_p,
+            silu_activation=True,
+            pad_slot_id=_PAD_SLOT_ID,
+            out=None,
+        )
+        q, k, v, g, beta = fused_gdn_post_conv(
+            prefill=mq_p_t,
+            decode=None,
+            a=a_p,
+            b=b_p,
+            A_log=L.a_log,
+            dt_bias=L.dt_bias,
+            num_k_heads=core.num_k_heads,
+            head_k_dim=core.head_k_dim,
+            num_v_heads=core.num_v_heads,
+            head_v_dim=core.head_v_dim,
+            l2_norm_eps=_L2_NORM_EPS,
+            softplus_threshold=_SOFTPLUS_THRESHOLD,
+        )
+        # q and k are already L2-normalized by the post-conv call.
         chunk_gated_delta_rule(
             q,
             k,
@@ -3466,13 +3488,17 @@ class PrefillTarget:
             beta,
             scale=None,
             initial_state=ssm_states,
-            initial_state_indices=si_all,
+            initial_state_indices=si_p,
             inplace_indexed_state_update=True,
             output_final_state=False,
-            cu_seqlens=qsl_long,
+            cu_seqlens=qsl_long_p,
             use_qk_l2norm_in_kernel=False,
-            output=out[:, :num_tokens],
+            output=out[:, :num_prefill_tokens],
         )
+        out_d = self._gdn_verify(
+            mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
+        )
+        out[:, num_prefill_tokens:num_tokens].copy_(out_d)
         out[:, num_tokens:].zero_()
 
     def _gdn_prefill_prep(self, mq, a, b, L, i, qsl, si, hi):
@@ -3836,6 +3862,16 @@ class PrefillTarget:
                 tokens_per_block=md.tokens_per_block,
             )
 
+        nvfp4_context = None
+        if (
+            sparse
+            and core.quant_mode == QM_NVFP4_KV_CACHE
+            and num_prefill_tokens > _NVFP4_ROWTILE_MIN_ROWS
+        ):
+            nvfp4_context = _nvfp4_context_plan(
+                core, md, qsa[0], md.qsa_block_table, md.tokens_per_block
+            )
+
         self._step = _PrefillStep(
             num_tokens=num_tokens,
             physical_tokens=physical_tokens,
@@ -3846,6 +3882,7 @@ class PrefillTarget:
             qsa=qsa,
             stage=stage,
             vision=vision,
+            nvfp4_context=nvfp4_context,
         )
 
     def forward(
@@ -4310,20 +4347,39 @@ class PrefillTarget:
                 compress_ratio=core.compress_ratio,
                 token_topk=core.token_topk,
             )
-            attn_out = torch.reshape(
-                _sparse_gqa(
+            if kv.k_scale is not None:
+                num_ctx = md.num_ctx_tokens
+                plan = None
+                if num_ctx > _NVFP4_ROWTILE_MIN_ROWS:
+                    plan = _nvfp4_context_plan(core, md, req_idx, block_table, tokens_per_block)
+                _sparse_gqa_nvfp4_context(
                     core,
                     kv,
-                    q=q_dst,
-                    block_table=block_table,
-                    selected_tokens=selected,
-                    request_indices=req_idx,
-                    tokens_per_block=tokens_per_block,
-                    query_positions=logical,
-                    compress_ratio=core.compress_ratio,
-                ),
-                [rows, core.q_width],
-            )
+                    plan,
+                    q_dst,
+                    block_table,
+                    selected,
+                    req_idx,
+                    logical,
+                    tokens_per_block,
+                    num_ctx,
+                    attn_out,
+                )
+            else:
+                attn_out = torch.reshape(
+                    _sparse_gqa(
+                        core,
+                        kv,
+                        q=q_dst,
+                        block_table=block_table,
+                        selected_tokens=selected,
+                        request_indices=req_idx,
+                        tokens_per_block=tokens_per_block,
+                        query_positions=logical,
+                        compress_ratio=core.compress_ratio,
+                    ),
+                    [rows, core.q_width],
+                )
         else:
             attn_out = thop_attention(
                 q=qkv,
@@ -4979,14 +5035,14 @@ class DecodeTarget:
         rows runs the conv step as that GEMM's epilogue (`gdn_in_proj_conv1d_pdl`), and
         over an fp32 recurrent pool at up to `_GDN_DECODE_FUSED_MAX_ROWS` rows the
         recurrence and the gated norm as one launch (`gdn_decode_gated_norm_pdl`); past
-        them, after the conv step, as one streaming launch (`gdn_decode_rows_gated_norm`).
-        Over a bf16 pool the recurrence is `fused_sigmoid_gating_delta_rule_update`'s rows
-        form, which is batch-invariant."""
+        them, and at every batch size over a bf16 pool, after the conv step, as one
+        streaming launch (`gdn_decode_rows_gated_norm`). That kernel computes each (row,
+        v-head) on its own, so over a bf16 pool a row's output and state do not depend on
+        its batch."""
         core = self.core
         si_all, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
         num_tokens = x.shape[0]
         ssm_states = core._bound.ssm[i]
-        fp32_state = ssm_states.dtype == torch.float32
 
         conv_fused = fused_conv and not is_verify and num_tokens <= _GDN_CONV_FUSED_MAX_ROWS
         if conv_fused:
@@ -5004,7 +5060,11 @@ class DecodeTarget:
             proj = gemm(x, L.in_proj)
         mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
 
-        if fp32_state and conv_fused and num_tokens <= _GDN_DECODE_FUSED_MAX_ROWS:
+        if (
+            ssm_states.dtype == torch.float32
+            and conv_fused
+            and num_tokens <= _GDN_DECODE_FUSED_MAX_ROWS
+        ):
             # The recurrence and the gated norm as one launch that reads this layer's
             # pool rows before its PDL wait: in a captured single-token step nothing
             # ahead of it writes them, and the slot indices are filled before the
@@ -5047,51 +5107,23 @@ class DecodeTarget:
                 conv_state_indices=si_all,
                 pad_slot_id=_PAD_SLOT_ID,
             )
-        if fp32_state:
-            # The recurrence and the gated norm as one launch over `proj`, whose q/k/v
-            # columns the conv step rewrote in place; it computes both gates and the
-            # q/k L2 norm itself, at the softplus pair (1, 20) and epsilon 1e-6 this
-            # target's constants name, and reads this layer's pool rows before its PDL
-            # wait (nothing in a single-token step writes them ahead of it).
-            o = gdn_decode_rows_gated_norm(
-                proj,
-                ssm_states,
-                si_all,
-                L.a_log,
-                L.dt_bias,
-                L.gnorm,
-                core.eps,
-                core.num_k_heads,
-                core.head_k_dim,
-            )
-            return gemm(o, L.out)
-        else:
-            # The rows form, `cu_seqlens` None: it finds row n's tokens at
-            # `n * q.stride(1)`, so q/k/v are split from a contiguous `[T, 10240]` copy
-            # reshaped to `[T, 1, 80, 128]` (K and V heads are both 128 wide), where the
-            # size-1 token axis carries the row stride; a/b are contiguous `[T, 48]`.
-            qkv_rows = torch.reshape(mixed_qkv.contiguous(), [num_tokens, 1, -1, core.head_k_dim])
-            q, k, v = torch.split(
-                qkv_rows, [core.num_k_heads, core.num_k_heads, core.num_v_heads], 2
-            )
-            out = fused_sigmoid_gating_delta_rule_update(
-                A_log=L.a_log,
-                a=torch.reshape(a.contiguous(), [num_tokens, 1, core.num_v_heads]),
-                dt_bias=L.dt_bias,
-                softplus_beta=_SOFTPLUS_BETA,
-                softplus_threshold=_SOFTPLUS_THRESHOLD,
-                q=q,
-                k=k,
-                v=v,
-                b=torch.reshape(b.contiguous(), [num_tokens, 1, core.num_v_heads]),
-                initial_state_source=ssm_states,
-                initial_state_indices=si_all,
-                scale=None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=None,
-                output=None,
-            )
-        return self._gdn_epilogue(out, z, L, num_tokens, gemm)
+        # The recurrence and the gated norm as one launch over `proj`, whose q/k/v
+        # columns the conv step rewrote in place; it computes both gates and the q/k L2
+        # norm itself, at the softplus pair (1, 20) and epsilon 1e-6 this target's
+        # constants name, and reads this layer's pool rows before its PDL wait (nothing
+        # in a single-token step writes them ahead of it).
+        o = gdn_decode_rows_gated_norm(
+            proj,
+            ssm_states,
+            si_all,
+            L.a_log,
+            L.dt_bias,
+            L.gnorm,
+            core.eps,
+            core.num_k_heads,
+            core.head_k_dim,
+        )
+        return gemm(o, L.out)
 
     def _gdn_epilogue(self, out, z, L, num_tokens, gemm=cublas_mm) -> torch.Tensor:
         """Gated RMS norm (sigmoid gate, plain non-gemma weight) and output projection

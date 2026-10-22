@@ -7,9 +7,11 @@ Wraps the in-tree module callable
 (tier-2 sourcing), the adapter in front of the installed FlashInfer's
 ``flashinfer.chunk_gated_delta_rule`` (CuTe-DSL tcgen05 kernel on sm_100/103).
 One call is: ``g -> exp(g)``, a Triton gather of the indexed pool slots into a
-packed fp32 ``[N, HV, V, K]`` buffer, the FlashInfer kernel, and a Triton
-scatter of the final states back into the same slots. Call-compatible with the
-vendored Triton ``chunk_gated_delta_rule`` (``modules/fla/chunk``).
+packed ``[N, HV, V, K]`` buffer in the pool's dtype (the sm_100/103 kernel keeps
+the state in fp32 inside and reads and writes it in that dtype), the FlashInfer
+kernel, and a Triton scatter of the final states back into the same slots.
+Call-compatible with the vendored Triton ``chunk_gated_delta_rule``
+(``modules/fla/chunk``).
 
 FlashInfer API: ``flashinfer.chunk_gated_delta_rule`` (``flashinfer.gdn_prefill``),
 reached through the adapter above.
@@ -73,8 +75,8 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: geometry (H, HV, K, V); seqlens; `slots`-row pool with `indices`
-    # (or _engine_slots); output (None | "buffer"). Every cell is
-    # qwen3.8-flash-next-nvfp4's geometry, in place over an fp32 pool.
+    # (or _engine_slots); pool_dtype (fp32); output (None | "buffer"). Every cell is
+    # qwen3.8-flash-next-nvfp4's geometry, in place.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"qwen3.8 prefill into output=, 461-slot pool, seqlens {list(s)}",
@@ -97,6 +99,16 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                 indices=_engine_slots(4),
             ),
         ),
+        Cell(
+            why="bf16 pool (mamba_ssm_cache_dtype), 461 slots, seqlens [200, 37, 91]",
+            spec=dict(
+                geometry=QWEN38_GEOMETRY,
+                seqlens=(200, 37, 91),
+                slots=ENGINE_SLOTS,
+                indices=_engine_slots(3),
+                pool_dtype=torch.bfloat16,
+            ),
+        ),
     )
 
     note = """
@@ -116,10 +128,12 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
 
     Certified at the 461-slot fp32 pool: three ragged context rows and one
     8192-token row, each into an `output=` buffer, and an 8-token context
-    chunk with three one-token rows.
+    chunk with three one-token rows; and at the 461-slot bf16 pool: three
+    ragged context rows.
 
-    Memory per call: a packed fp32 copy of the named slots in and out (2 x
-    3 MiB per sequence), `exp(g)`, and the output. q/k/v/beta are not copied
+    Memory per call: a packed copy of the named slots in and out in the pool's
+    dtype (2 x 3 MiB per sequence fp32, half that bf16), `exp(g)`, and the
+    output. q/k/v/beta are not copied
     when already contiguous / fp32.
 
     JIT and streams: the first call per process compiles the CuTe-DSL
@@ -130,8 +144,9 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     Numerics (measured vs an fp64 recurrence, 1 x 8192 tokens, qwen3.8
     geometry): o rel-L2 4.06e-3, max abs 1.26e-3; state rel-L2 3.31e-3 --
     the Triton op's are
-    4.00e-3 / 1.13e-3 / 3.26e-3. Not bitwise to it. No cold-call defect:
-    nothing in the call is autotuned.
+    4.00e-3 / 1.13e-3 / 3.26e-3. Not bitwise to it. A bf16 pool rounds each
+    sequence's state to bf16 once per call, on the scatter. No cold-call
+    defect: nothing in the call is autotuned.
 
     Loud, from the callable: `head_first=True`, `q.shape[0] != 1`, H_q != H_k,
     fp32 q, non-fp32 `g`, `cu_seqlens` or `initial_state` None, in-place
@@ -140,7 +155,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     Not checked: indices distinct and in `[0, S)`; q/k unit-norm (by the
     caller or the flag).
 
-    Not certified: `state_workspace=`, bf16/fp16 pool, `scale` other than the
+    Not certified: `state_workspace=`, an fp16 pool, `scale` other than the
     default, fp16 operands, K or V other than 128, other head ratios, and what the
     target never passes: `inplace_indexed_state_update=False` (final states
     returned) and `use_qk_l2norm_in_kernel`.

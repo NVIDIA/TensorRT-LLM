@@ -63,7 +63,7 @@ def _build(spec, seed):
     pool = (
         torch.randn(spec["slots"], num_v_heads, head_v_dim, head_k_dim, generator=gen, device=DEV)
         * 0.1
-    )
+    ).to(spec.get("pool_dtype", torch.float32))
     cu = torch.tensor([0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=torch.long, device=DEV)
     indices = torch.tensor(spec["indices"], dtype=torch.int32, device=DEV)
     output = None
