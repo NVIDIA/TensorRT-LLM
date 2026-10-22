@@ -603,7 +603,7 @@ def _dispatch_kwargs(case):
     return kwargs
 
 
-def test_eligibility_policy():
+def test_eligibility_policy(monkeypatch):
     kk = _dispatch_module()
 
     def reason(heads, num_spec, mxfp8=True, **changes):
@@ -612,9 +612,13 @@ def test_eligibility_policy():
 
     assert reason(96, 3) is None
     assert reason(96, 5) is None
+    # TP8 ranks (12 heads) stay on the CuTe DSL kernels, whose PDL variant is as fast there.
+    assert reason(12, 3) == "12 heads with num_spec 3"
+    assert reason(12, 5) == "12 heads with num_spec 5"
+    # beta and the beta cache are read through 8-head tensor-map boxes: unpadded rows stay on the CuTe DSL kernels. The
+    # 12-head layouts are the ones that can be unpadded (96 heads are a multiple of 8): check them with the route open.
+    monkeypatch.setattr(kk, "_KF_VERIFY_ROUTES", kk._KF_VERIFY_ROUTES | {(12, 3)})
     assert reason(12, 3) is None
-    assert reason(12, 5) is not None  # TP8 with 5 drafts stays on the CuTe DSL kernels
-    # beta and the beta cache are read through 8-head tensor-map boxes: unpadded rows stay on the CuTe DSL kernels.
     heads12 = _case(12, 3, 4, seed=1)
     rows = heads12["x_q"].shape[1]
     assert reason(12, 3, beta=heads12["beta"].reshape(1, rows, 12).clone()) == "beta alignment"
@@ -648,7 +652,7 @@ def test_eligibility_policy():
     assert reason(96, 3, ssm_state_indices=strided) == "layout"
 
 
-@pytest.mark.parametrize("heads,num_spec", [(96, 3), (12, 5)])
+@pytest.mark.parametrize("heads,num_spec", [(96, 3), (12, 3), (12, 5)])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_dispatch_routes_only_when_enabled(enabled, heads, num_spec, monkeypatch):
     kk = _dispatch_module()
@@ -809,7 +813,7 @@ def _engine_setup(heads, num_spec, batch, seed, num_layers=3, max_batch=None):
     return runtime, manager, slots, hidden
 
 
-@pytest.mark.parametrize("heads,num_spec,batch", [(96, 3, 5), (96, 5, 3), (12, 3, 7)])
+@pytest.mark.parametrize("heads,num_spec,batch", [(96, 3, 5), (96, 5, 3)])
 @torch.no_grad()
 def test_engine_layout_takes_the_kf_route(heads, num_spec, batch, monkeypatch):
     from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer

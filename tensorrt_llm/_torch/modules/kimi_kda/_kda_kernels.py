@@ -552,9 +552,10 @@ def kda_mtp_replay_num_spec(num_spec: int) -> Optional[int]:
 
 # Default off. Startup snapshot per dispatch instance, strict 0/1 parsing.
 _KF_VERIFY_ENV = "TRTLLM_K3_KDA_VERIFY_KF"
-# (heads per rank, num_spec) the kernel takes: attention-DP ranks (96 heads) with 3 or 5 drafts, TP8 ranks (12 heads)
-# with 3 drafts. TP8 with 5 drafts stays on the CuTe DSL kernels (no measurable gain).
-_KF_VERIFY_ROUTES = frozenset({(96, 3), (96, 5), (12, 3)})
+# (heads per rank, num_spec) the kernel takes: attention-DP ranks (96 heads) with 3 or 5 drafts. TP8 ranks (12 heads)
+# stay on the CuTe DSL kernels, which launched with PDL are as fast there: on Rubin, 24 requests with 3 drafts take
+# 7.5 us per call with CuTe + PDL against 8.4 us with this kernel (6.5 against 7.2 us at 16 requests).
+_KF_VERIFY_ROUTES = frozenset({(96, 3), (96, 5)})
 # The Kimi K3 constants the kernel bakes in.
 _KF_LOWER_BOUND = -5.0
 _KF_SCALE = 128**-0.5
