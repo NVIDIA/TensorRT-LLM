@@ -6,6 +6,7 @@ from itertools import accumulate
 
 import pytest
 import torch
+from kda_module_test_utils import clone_pool, make_batch
 
 from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.fused_prefill_conv import (
     fused_prefill_conv,
@@ -13,7 +14,6 @@ from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.fused_prefill_c
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import fused_kda_post_conv
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
-from tests.unittest._torch.modules.kimi_kda.kda_module_test_utils import clone_pool, make_batch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()

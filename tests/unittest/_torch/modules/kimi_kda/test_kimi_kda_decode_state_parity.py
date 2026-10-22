@@ -15,8 +15,9 @@ import torch
 
 pytest.importorskip("fla")
 
+from kda_module_test_utils import compare  # noqa: E402
+
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kda_module_test_utils import compare  # noqa: E402
 
 HIDDEN_SIZE = 512
 NUM_HEADS = 4

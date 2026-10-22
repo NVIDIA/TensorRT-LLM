@@ -110,11 +110,7 @@ def test_module_with_prepared_schedule_matches_device_generation(heads: int) -> 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("FlashInfer KDA requires SM100/SM103/SM107")
     pytest.importorskip("fla")
-    from tests.unittest._torch.modules.kimi_kda.kda_module_test_utils import (
-        clone_pool,
-        make_attention,
-        make_batch,
-    )
+    from kda_module_test_utils import clone_pool, make_attention, make_batch
 
     module = make_attention(heads, hidden_size=768, bf16_weights=True)
     lengths = [17, 65]

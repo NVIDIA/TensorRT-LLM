@@ -9,11 +9,7 @@ import torch
 
 pytest.importorskip("fla")
 
-from tests.unittest._torch.modules.kimi_kda.kda_module_test_utils import (
-    compare,
-    make_attention,
-    make_batch,
-)
+from kda_module_test_utils import compare, make_attention, make_batch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
