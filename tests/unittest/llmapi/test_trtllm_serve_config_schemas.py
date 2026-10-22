@@ -643,6 +643,28 @@ def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> 
     assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check
 
 
+@pytest.mark.parametrize(("indent", "sort_keys"), [(None, True), (2, False)])
+def test_version_metadata_sync_preserves_current_file_formatting(
+    tmp_path: Path, indent: int | None, sort_keys: bool
+) -> None:
+    """Current metadata must pass checks and updates without reformatting JSON."""
+    version = generator._source_version()
+    for filename, command in generator._SCHEMA_COMMANDS.items():
+        schema = {
+            "type": "object",
+            "title": f"TensorRT-LLM {version} {command}",
+            "$id": f"{generator._DOCS_URL}/{version}/_static/schemas/{filename}",
+        }
+        (tmp_path / filename).write_text(
+            json.dumps(schema, indent=indent, sort_keys=sort_keys) + "\n", encoding="utf-8"
+        )
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    for check in (True, False):
+        generator.sync_schema_version_metadata(tmp_path, check=check)
+        assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
 @pytest.mark.parametrize("change", ["missing", "malformed"])
 def test_version_metadata_sync_validates_all_files_before_writing(
     tmp_path: Path, change: str

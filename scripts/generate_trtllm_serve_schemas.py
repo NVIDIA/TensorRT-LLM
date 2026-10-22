@@ -297,12 +297,11 @@ def sync_schema_version_metadata(output_dir: Path, *, check: bool = False) -> li
         if not path.is_file():
             missing.append(filename)
             continue
-        original = path.read_text(encoding="utf-8")
-        schema = json.loads(original)
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        original_metadata = (schema.get("$id"), schema.get("title"))
         _set_schema_version_metadata(schema, filename, command, version)
-        content = json.dumps(schema, indent=2, sort_keys=True) + "\n"
-        if original != content:
-            updates[path] = content
+        if original_metadata != (schema["$id"], schema["title"]):
+            updates[path] = json.dumps(schema, indent=2, sort_keys=True) + "\n"
     if missing:
         raise ValueError(
             f"Cannot sync version metadata for missing schemas: {', '.join(missing)}. "
