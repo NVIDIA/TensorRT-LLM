@@ -534,6 +534,7 @@ def _make_admission_executor(model, requests):
     real ones, over a model engine holding `model`; everything else they touch is a stub."""
     executor = types.SimpleNamespace(
         model_engine=types.SimpleNamespace(model=model),
+        _is_kv_manager_v2=False,
         kv_cache_manager=None,
         kv_cache_transceiver=None,
         max_beam_width=1,
