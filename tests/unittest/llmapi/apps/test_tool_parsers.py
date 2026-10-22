@@ -47,6 +47,7 @@ from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.serve.tool_parser.utils import find_common_prefix
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
@@ -6218,3 +6219,20 @@ def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
 
     assert [(c.name, c.tool_index)
             for c in calls] == [("functions.get_weather", -1)]
+
+
+@pytest.mark.parametrize("s1,s2,expected", [
+    ("", "", ""),
+    ("", "abc", ""),
+    ("abc", "", ""),
+    ("abc", "abc", "abc"),
+    ("abc", "abcdef", "abc"),
+    ("abcdef", "abc", "abc"),
+    ("abcx", "abcy", "abc"),
+    ("xabc", "yabc", ""),
+    ('{"a": "\u00e9\u4e2d', '{"a": "\u00e9\u4e2d\U0001F600"}',
+     '{"a": "\u00e9\u4e2d'),
+    ("a" * 1000 + "b", "a" * 1000 + "c", "a" * 1000),
+])
+def test_find_common_prefix(s1, s2, expected):
+    assert find_common_prefix(s1, s2) == expected
