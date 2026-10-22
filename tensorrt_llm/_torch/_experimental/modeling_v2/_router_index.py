@@ -23,9 +23,11 @@ Two levels, on purpose:
   where any configuration lands.
 
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
-are deliberately not routing inputs. They do not change which code runs, so a
+are deliberately not routing inputs. They do not change which target runs, so a
 target claims a configuration regardless of them; ``require`` promises that the
-target ran, not that a particular knob setting was measured.
+target ran, not that a particular knob setting was measured. The resolver records
+``max_batch_size`` for the target it returns (``resolved_max_batch_size``), which a
+target may read to size or leave out a fast path inside itself.
 
 Routing modules are imported lazily: resolving a GptOss config never imports
 the DeepSeek tree, and a target's modeling code is imported only on the
@@ -121,6 +123,20 @@ def resolved_mode(target: type) -> ModelingV2Mode:
     return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
 
 
+# The engine's ``max_batch_size`` each target class was last resolved under.
+_RESOLVED_MAX_BATCH_SIZES: Dict[type, int] = {}
+
+
+def resolved_max_batch_size(target: type) -> Optional[int]:
+    """The ``max_batch_size`` ``modeling_v2_resolve`` saw for ``target``; None for a class built without it.
+
+    Not a routing input (it never decides which target runs). A target may read
+    it at construction to leave out a fast path whose memory cost only pays off
+    at a few concurrent requests.
+    """
+    return _RESOLVED_MAX_BATCH_SIZES.get(target)
+
+
 def routing_module(arch: str):
     """Import and return the routing module for ``arch``, or None."""
     name = MODELING_V2_ROUTERS.get(arch)
@@ -175,4 +191,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         return None
     if target is not None:
         _RESOLVED_MODES[target] = mode
+        max_batch_size = getattr(llm_args, "max_batch_size", None)
+        if max_batch_size is None:
+            _RESOLVED_MAX_BATCH_SIZES.pop(target, None)
+        else:
+            _RESOLVED_MAX_BATCH_SIZES[target] = int(max_batch_size)
     return target
