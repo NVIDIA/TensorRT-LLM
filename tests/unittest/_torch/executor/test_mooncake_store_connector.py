@@ -26,6 +26,7 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -44,9 +45,20 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheLayout,
     KvCacheRegion,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import gpudirect as gpudirect_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import PageAddressing
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
+    PageAddressing,
+    allocation_spans,
+    split_at_cuts,
+)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
+    RangeFacts,
+    allocation_range,
+    describe_range,
+    format_diagnosis,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
@@ -74,6 +86,11 @@ class FakeStore:
     def __init__(self):
         self.objects = set()
         self.registered = []
+        self.unregistered = []
+        #: Registrations, unregistrations and the close, in call order.
+        self.events = []
+        #: Index of the `register_buffer` call to fail, counting from 0.
+        self.fail_register_at = None
         self.put_calls = []
         self.get_calls = []
         self.exist_calls = []
@@ -84,7 +101,16 @@ class FakeStore:
         self.workers = []
 
     def register_buffer(self, address, size):
+        if self.fail_register_at == len(self.registered):
+            self.events.append(("register_failed", address))
+            return -600
         self.registered.append((address, size))
+        self.events.append(("register", address))
+        return 0
+
+    def unregister_buffer(self, address):
+        self.unregistered.append(address)
+        self.events.append(("unregister", address))
         return 0
 
     def batch_is_exist(self, keys):
@@ -105,6 +131,7 @@ class FakeStore:
 
     def close(self):
         self.closed = True
+        self.events.append(("close",))
 
 
 def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8):
@@ -135,6 +162,101 @@ def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8):
             )
         )
     return KvCacheLayout(tokens_per_block=TOKENS_PER_BLOCK, groups=tuple(groups))
+
+
+#: Small enough that a single page crosses it, so the splitting is visible in a
+#: layout built from plain integers. A real V2 pool maps 2 to 32 MiB at a time.
+CHUNK_BYTES = 256
+#: Not a multiple of the chunk size: `cuMemAddressReserve` with the default
+#: alignment may return any base, and the chunks tile from there.
+POOL_BASE = 0x1000 + CHUNK_BYTES // 4
+REGION_SIZE = 300
+REGION_SLOTS = 4
+POOL_BYTES = REGION_SIZE * REGION_SLOTS
+#: The whole reservation, which `VirtMem` sizes to a multiple of the chunk.
+RESERVATION_BYTES = -(-POOL_BYTES // CHUNK_BYTES) * CHUNK_BYTES
+
+
+def make_pool_layout(*, base=POOL_BASE):
+    """One region wide enough to straddle a chunk, packed slot to slot."""
+    return KvCacheLayout(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        groups=(
+            KvCacheLayerGroupLayout(
+                layer_group_id=0,
+                layer_ids=(0,),
+                window_size=None,
+                regions=(
+                    KvCacheRegion(
+                        base=base,
+                        size=REGION_SIZE,
+                        stride=REGION_SIZE,
+                        num_slots=REGION_SLOTS,
+                        buffers=(KvCacheBufferRef(layer_id=0, role="key"),),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def chunked_lookup(*reservations, chunk_bytes=CHUNK_BYTES):
+    """Answer like `cuMemGetAddressRange` for reservations mapped chunk by chunk.
+
+    Args:
+        reservations: `(base, size)` of each reservation, sized in chunks.
+        chunk_bytes: Size of every `cuMemCreate` allocation mapped into them.
+    """
+
+    def lookup(address):
+        for base, size in reservations:
+            if base <= address < base + size:
+                index = (address - base) // chunk_bytes
+                return base + index * chunk_bytes, chunk_bytes
+        return None
+
+    return lookup
+
+
+def chunk_pieces(start, end, *, chunk_base=POOL_BASE, chunk_bytes=CHUNK_BYTES):
+    """`[start, end)` cut wherever a chunk counted from `chunk_base` begins."""
+    pieces = []
+    cursor = start
+    while cursor < end:
+        chunk_end = chunk_base + ((cursor - chunk_base) // chunk_bytes + 1) * chunk_bytes
+        stop = min(chunk_end, end)
+        pieces.append((cursor, stop))
+        cursor = stop
+    return pieces
+
+
+@pytest.fixture(autouse=True)
+def no_driver_allocations(monkeypatch):
+    """None of these fake addresses is a CUDA allocation, so skip the driver.
+
+    Keeps the cuts the same whether or not the host running the tests has a
+    usable CUDA driver. Tests that need a pool backed by allocations install
+    one with `mapped_pool`.
+    """
+    monkeypatch.setattr(worker_module, "allocation_range", lambda _address: None)
+
+
+@pytest.fixture(autouse=True)
+def no_mooncake_client_started(monkeypatch):
+    """Start each test as a process whose first Mooncake client is still to come."""
+    monkeypatch.setattr(gpudirect_module, "_peermem_at_first_client", gpudirect_module._NOT_STARTED)
+
+
+@pytest.fixture
+def mapped_pool(monkeypatch):
+    """Back the fake pool with chunked allocations, as the driver would report them."""
+
+    def install(*reservations):
+        lookup = chunked_lookup(*(reservations or ((POOL_BASE, RESERVATION_BYTES),)))
+        monkeypatch.setattr(worker_module, "allocation_range", lookup)
+        return lookup
+
+    return install
 
 
 @pytest.fixture
@@ -277,6 +399,135 @@ def test_page_addressing_rejects_out_of_range_page():
         addressing.buffers(0, -1)
 
 
+def test_page_addressing_registration_covers_every_slot_once():
+    layout = make_layout(num_groups=2, regions_per_group=2, num_slots=4)
+    ranges = PageAddressing(layout).registration_ranges()
+
+    # Regions were laid out back to back, so the whole span merges into one.
+    all_regions = [region for group in layout.groups for region in group.regions]
+    lowest = min(region.base for region in all_regions)
+    highest = max(
+        region.base + region.stride * (region.num_slots - 1) + region.size for region in all_regions
+    )
+    assert ranges == [(lowest, highest)]
+
+
+def test_allocation_spans_cuts_at_every_allocation_boundary():
+    lookup = chunked_lookup((POOL_BASE, RESERVATION_BYTES))
+    spans = allocation_spans(POOL_BASE, POOL_BASE + POOL_BYTES, lookup)
+
+    assert spans == chunk_pieces(POOL_BASE, POOL_BASE + POOL_BYTES)
+    assert len(spans) == RESERVATION_BYTES // CHUNK_BYTES
+    for start, end in spans:
+        base, size = lookup(start)
+        assert end <= base + size, "a piece runs into the next allocation"
+
+
+def test_allocation_spans_starts_and_ends_mid_allocation():
+    lookup = chunked_lookup((POOL_BASE, RESERVATION_BYTES))
+    start, end = POOL_BASE + 10, POOL_BASE + CHUNK_BYTES + 20
+    assert allocation_spans(start, end, lookup) == [
+        (start, POOL_BASE + CHUNK_BYTES),
+        (POOL_BASE + CHUNK_BYTES, end),
+    ]
+
+
+def test_allocation_spans_gives_up_on_an_address_it_cannot_resolve():
+    """An unsplittable range must not be mistaken for one that needs no cut."""
+    lookup = chunked_lookup((POOL_BASE, CHUNK_BYTES))
+    assert allocation_spans(POOL_BASE, POOL_BASE + 2 * CHUNK_BYTES, lookup) is None
+
+
+def test_allocation_spans_rejects_an_answer_that_misses_the_address():
+    """An answer for some other address is rejected rather than trusted."""
+    assert allocation_spans(POOL_BASE, POOL_BASE + 64, lambda _address: (0, 1)) is None
+
+
+@pytest.mark.parametrize(
+    "start,size,cuts,expected",
+    [
+        (100, 50, [], [(100, 50)]),
+        (100, 50, [100, 150], [(100, 50)]),  # cuts at the ends cut nothing
+        (100, 50, [120], [(100, 20), (120, 30)]),
+        (100, 50, [50, 110, 130, 200], [(100, 10), (110, 20), (130, 20)]),
+        (100, 0, [100], [(100, 0)]),
+    ],
+    ids=["no_cuts", "cuts_at_the_ends", "one_cut", "several_cuts", "empty"],
+)
+def test_split_at_cuts_preserves_the_bytes_and_their_order(start, size, cuts, expected):
+    pieces = split_at_cuts(start, size, cuts)
+    assert pieces == expected
+    assert sum(piece_size for _, piece_size in pieces) == size
+
+
+def test_page_addressing_splits_a_page_that_crosses_an_allocation():
+    lookup = chunked_lookup((POOL_BASE, RESERVATION_BYTES))
+    addressing = PageAddressing(make_pool_layout(), allocation_lookup=lookup)
+
+    addresses, sizes = addressing.buffers(0, 0)
+    assert list(zip(addresses, sizes)) == [
+        (POOL_BASE, CHUNK_BYTES),
+        (POOL_BASE + CHUNK_BYTES, REGION_SIZE - CHUNK_BYTES),
+    ]
+    # One region still contributes its whole payload, just in several buffers.
+    assert sum(sizes) == addressing.bytes_per_page(0)
+
+
+def test_page_addressing_registers_one_range_per_allocation():
+    lookup = chunked_lookup((POOL_BASE, RESERVATION_BYTES))
+    ranges = PageAddressing(make_pool_layout(), allocation_lookup=lookup).registration_ranges()
+
+    # The same bytes as the unsplit span, handed over one allocation at a time.
+    assert ranges == chunk_pieces(POOL_BASE, POOL_BASE + POOL_BYTES)
+
+
+def test_page_addressing_separates_pools_whose_reservations_touch():
+    """Merging adjacent pools into one span must not merge their registrations."""
+    second_base = POOL_BASE + POOL_BYTES
+    first = make_pool_layout().groups[0]
+    second = make_pool_layout(base=second_base).groups[0]
+    layout = KvCacheLayout(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        groups=(
+            first,
+            KvCacheLayerGroupLayout(
+                layer_group_id=1,
+                layer_ids=(1,),
+                window_size=None,
+                regions=second.regions,
+            ),
+        ),
+    )
+    # Two reservations, each filled exactly by its pool, so the second starts
+    # where the first ends and the spans merge.
+    chunk_bytes = POOL_BYTES // 3
+    lookup = chunked_lookup(
+        (POOL_BASE, POOL_BYTES), (second_base, POOL_BYTES), chunk_bytes=chunk_bytes
+    )
+
+    ranges = PageAddressing(layout, allocation_lookup=lookup).registration_ranges()
+    assert ranges == [
+        (POOL_BASE + index * chunk_bytes, POOL_BASE + (index + 1) * chunk_bytes)
+        for index in range(6)
+    ]
+    assert second_base in [start for start, _ in ranges]
+
+
+def test_page_addressing_leaves_everything_whole_without_a_lookup():
+    """Host staging never registers the pools, so it never asks the driver."""
+    addressing = PageAddressing(make_pool_layout())
+    assert addressing.buffers(0, 0) == ([POOL_BASE], [REGION_SIZE])
+    assert addressing.registration_ranges() == [(POOL_BASE, POOL_BASE + POOL_BYTES)]
+    assert not addressing.unresolved_ranges
+
+
+def test_page_addressing_reports_the_ranges_it_could_not_resolve():
+    addressing = PageAddressing(make_pool_layout(), allocation_lookup=lambda _address: None)
+    span = (POOL_BASE, POOL_BASE + POOL_BYTES)
+    assert addressing.registration_ranges() == [span]
+    assert addressing.unresolved_ranges == (span,)
+
+
 def test_page_addressing_rejects_mixed_slot_counts():
     region_a = KvCacheRegion(base=0, size=8, stride=8, num_slots=4, buffers=())
     region_b = KvCacheRegion(base=64, size=8, stride=8, num_slots=8, buffers=())
@@ -295,7 +546,355 @@ def test_page_addressing_rejects_mixed_slot_counts():
         PageAddressing(layout)
 
 
-# ---- worker ----
+# ---- GPUDirect diagnosis ----
+
+_ALLOCATION = 0x7F0000000000
+_ALLOCATION_BYTES = 32 << 20
+
+
+@pytest.fixture
+def stub_driver_facts(monkeypatch):
+    """Report chosen facts instead of asking a driver that may not be present."""
+
+    def install(*facts):
+        by_address = {fact.address: fact for fact in facts}
+        monkeypatch.setattr(
+            gpudirect_module, "describe_range", lambda address, _length: by_address[address]
+        )
+        return [(fact.address, fact.address + fact.length) for fact in facts]
+
+    return install
+
+
+def _facts(*, offset=0, length=64, gdr_capable=True):
+    return RangeFacts(
+        address=_ALLOCATION + offset,
+        length=length,
+        allocation_start=_ALLOCATION,
+        allocation_size=_ALLOCATION_BYTES,
+        gdr_capable=gdr_capable,
+    )
+
+
+def test_range_facts_detects_a_range_that_runs_past_its_allocation():
+    assert _facts(length=_ALLOCATION_BYTES).fits_one_allocation is True
+    assert (
+        _facts(offset=_ALLOCATION_BYTES // 2, length=_ALLOCATION_BYTES).fits_one_allocation is False
+    )
+
+
+def test_range_facts_will_not_judge_without_the_allocation():
+    facts = RangeFacts(address=_ALLOCATION, length=64)
+    assert facts.fits_one_allocation is None
+
+
+def test_allocation_range_answers_nothing_for_an_address_the_driver_disowns():
+    """Callers get the documented fallback rather than an exception."""
+    assert allocation_range(_ALLOCATION) is None
+
+
+def test_describe_range_reports_a_failure_instead_of_raising():
+    facts = describe_range(_ALLOCATION, 1 << 20)
+    assert isinstance(facts, RangeFacts)
+    assert facts.address == _ALLOCATION
+    assert facts.describe()
+
+
+def test_format_diagnosis_blames_the_missing_peermem_module(monkeypatch, stub_driver_facts):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: False)
+    monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
+    ranges = stub_driver_facts(_facts())
+
+    report = format_diagnosis(ranges, rank=0)
+    assert "ibv_reg_mr" in report
+    assert "nvidia_peermem is not loaded" in report
+    assert "WITH_NVIDIA_PEERMEM=0" in report
+
+
+@pytest.mark.parametrize("peermem_env", [None, "0"], ids=["peermem_path", "dmabuf_path"])
+def test_format_diagnosis_blames_a_range_that_crosses_allocations(
+    monkeypatch, stub_driver_facts, peermem_env
+):
+    """Both paths refuse it, and under peermem it looks like a missing module."""
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: True)
+    if peermem_env is None:
+        monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
+    else:
+        monkeypatch.setenv("WITH_NVIDIA_PEERMEM", peermem_env)
+    ranges = stub_driver_facts(_facts(offset=_ALLOCATION_BYTES // 2, length=_ALLOCATION_BYTES))
+
+    report = format_diagnosis(ranges, rank=3)
+    assert "rank 3" in report
+    assert "1 range(s) run past the cuMemCreate allocation" in report
+    assert "EFAULT" in report and "EINVAL" in report
+
+
+def test_format_diagnosis_sends_memory_without_gdr_to_dmabuf(monkeypatch, stub_driver_facts):
+    """peermem cannot register it at any size, while dma-buf can."""
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: True)
+    monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
+    ranges = stub_driver_facts(_facts(gdr_capable=False))
+
+    report = format_diagnosis(ranges, rank=0)
+    assert "without gpuDirectRDMACapable" in report
+    assert "WITH_NVIDIA_PEERMEM=0 selects dma-buf" in report
+
+
+def test_format_diagnosis_does_not_blame_gdr_on_the_dmabuf_path(monkeypatch, stub_driver_facts):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: False)
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "0")
+    ranges = stub_driver_facts(_facts(gdr_capable=False))
+
+    report = format_diagnosis(ranges, rank=0)
+    assert "gpuDirectRDMACapable" not in report
+    assert "Nothing here explains a registration failure" in report
+
+
+def test_format_diagnosis_admits_when_it_explains_nothing(monkeypatch, stub_driver_facts):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: True)
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "1")
+    ranges = stub_driver_facts(_facts())
+
+    report = format_diagnosis(ranges, rank=0)
+    assert "Nothing here explains a registration failure" in report
+
+
+@pytest.mark.parametrize(
+    "module_line, expected",
+    [
+        ("nvidia_peermem 16384 0 - Live 0x0000000000000000", True),
+        ("nv_peer_mem 16384 0 - Live 0x0000000000000000", True),
+        ("nvidia 1234 1 - Live 0x0000000000000000", False),
+    ],
+    ids=["nvidia_peermem", "nv_peer_mem", "neither"],
+)
+def test_peermem_loaded_recognizes_both_modules(tmp_path, monkeypatch, module_line, expected):
+    modules = tmp_path / "modules"
+    modules.write_text(module_line + "\n")
+    real_open = open
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda path, *args, **kwargs: real_open(
+            modules if path == "/proc/modules" else path, *args, **kwargs
+        ),
+    )
+    assert gpudirect_module.peermem_loaded() is expected
+
+
+@pytest.fixture
+def registration_host(monkeypatch):
+    """A host whose peer-memory module and dma-buf support the test chooses."""
+    monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
+
+    def install(*, peermem, dmabuf):
+        monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: peermem)
+        monkeypatch.setattr(gpudirect_module, "dmabuf_supported_everywhere", lambda: dmabuf)
+
+    return install
+
+
+def _select(protocol="rdma", *, registers_device_memory=True):
+    return gpudirect_module.select_registration_path(
+        protocol, registers_device_memory=registers_device_memory
+    )
+
+
+@pytest.mark.parametrize("registers_device_memory", [True, False], ids=["kv_pools", "capacity"])
+def test_select_registration_path_picks_dmabuf_without_peermem(
+    registration_host, registers_device_memory
+):
+    """Any role selects, since the first client fixes the path for the process."""
+    registration_host(peermem=False, dmabuf=True)
+    assert _select(registers_device_memory=registers_device_memory) is True
+    assert os.environ["WITH_NVIDIA_PEERMEM"] == "0"
+    assert gpudirect_module.dmabuf_selected()
+
+
+def test_select_registration_path_leaves_tcp_alone(registration_host):
+    registration_host(peermem=False, dmabuf=True)
+    assert _select("tcp") is False
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "peermem, dmabuf",
+    [(True, True), (None, True), (False, False), (False, None)],
+    ids=["peermem_loaded", "modules_unreadable", "no_dmabuf", "dmabuf_unknown"],
+)
+def test_select_registration_path_leaves_an_uncertain_host_alone(
+    registration_host, peermem, dmabuf
+):
+    registration_host(peermem=peermem, dmabuf=dmabuf)
+    assert _select() is False
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
+
+
+@pytest.mark.parametrize("value", ["1", "0"])
+def test_select_registration_path_never_overrides_the_deployment(
+    registration_host, monkeypatch, value
+):
+    registration_host(peermem=False, dmabuf=True)
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", value)
+    assert _select() is False
+    assert os.environ["WITH_NVIDIA_PEERMEM"] == value
+
+
+def test_select_registration_path_never_writes_after_the_first_client(registration_host):
+    """Mooncake would ignore the write, so the warning would claim a path it never takes."""
+    registration_host(peermem=False, dmabuf=True)
+    assert _select("tcp") is False
+    assert _select(registers_device_memory=False) is False
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
+    assert not gpudirect_module.dmabuf_selected()
+
+
+def test_select_registration_path_refuses_a_late_client_that_needs_dmabuf(registration_host):
+    registration_host(peermem=False, dmabuf=True)
+    _select("tcp")
+    with pytest.raises(RuntimeError, match="export WITH_NVIDIA_PEERMEM=0 before the first"):
+        _select()
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
+
+
+def test_select_registration_path_refuses_a_value_changed_after_the_first_client(
+    registration_host, monkeypatch
+):
+    registration_host(peermem=True, dmabuf=True)
+    _select()
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "0")
+    with pytest.raises(RuntimeError, match="reads it only then"):
+        _select()
+    # Clients that register no GPU memory are unaffected by the path.
+    assert _select(registers_device_memory=False) is False
+    assert _select("tcp") is False
+
+
+def test_select_registration_path_accepts_a_late_client_on_the_same_path(registration_host):
+    registration_host(peermem=False, dmabuf=True)
+    assert _select(registers_device_memory=False) is True
+    assert _select() is False
+    assert os.environ["WITH_NVIDIA_PEERMEM"] == "0"
+
+
+def test_format_diagnosis_reports_the_value_mooncake_read(
+    registration_host, monkeypatch, stub_driver_facts
+):
+    registration_host(peermem=False, dmabuf=True)
+    _select("tcp")
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "0")
+
+    report = format_diagnosis(stub_driver_facts(_facts()), rank=0)
+    assert "WITH_NVIDIA_PEERMEM=None as Mooncake read it" in report
+    assert "is '0' in the environment now, which Mooncake ignores" in report
+    assert "nvidia_peermem is not loaded, so every range fails" in report
+
+
+# ---- worker registration ----
+
+
+def test_worker_registers_one_buffer_per_allocation(store_config, fake_store, mapped_pool):
+    lookup = mapped_pool()
+    with make_worker(fake_store, layout=make_pool_layout()) as worker:
+        assert worker.is_registered
+        expected = chunk_pieces(POOL_BASE, POOL_BASE + POOL_BYTES)
+        assert fake_store.registered == [(start, end - start) for start, end in expected]
+        for address, size in fake_store.registered:
+            base, length = lookup(address)
+            assert address + size <= base + length, "a registration crosses two allocations"
+
+
+def test_worker_page_buffers_stay_inside_one_allocation(store_config, fake_store, mapped_pool):
+    lookup = mapped_pool()
+    with make_worker(fake_store, layout=make_pool_layout()) as worker:
+        worker._put([RequestTransfers(1, [PageTransfer(b"\x01" * 16, 0, 0)])])
+    _, addresses, sizes = fake_store.put_calls[0]
+    assert sum(sizes[0]) == REGION_SIZE
+    for address, size in zip(addresses[0], sizes[0]):
+        base, length = lookup(address)
+        assert address + size <= base + length
+
+
+def test_worker_takes_back_earlier_pieces_when_one_fails(store_config, fake_store, mapped_pool):
+    mapped_pool()
+    fake_store.fail_register_at = 2
+
+    worker = MooncakeStoreConnectorWorker(make_llm_args())
+    fake_store.workers.append(worker)
+    with pytest.raises(RuntimeError, match="register_buffer failed") as excinfo:
+        worker.register_kv_cache_layout(make_pool_layout())
+
+    registered = [address for address, _ in fake_store.registered]
+    assert len(registered) == 2
+    # Latest first, and nothing left for shutdown to hand back.
+    assert fake_store.unregistered == list(reversed(registered))
+    worker.shutdown()
+    assert fake_store.unregistered == list(reversed(registered))
+
+    message = str(excinfo.value)
+    assert "WITH_NVIDIA_PEERMEM" in message
+    assert "gpuDirectRDMACapable" in message
+    assert "GPU registration diagnosis" in message
+
+
+def test_worker_unregisters_every_piece_at_shutdown_before_closing(
+    store_config, fake_store, mapped_pool
+):
+    mapped_pool()
+    with make_worker(fake_store, layout=make_pool_layout()):
+        assert not fake_store.unregistered
+    registered = [address for address, _ in fake_store.registered]
+    assert sorted(fake_store.unregistered) == sorted(registered)
+    assert fake_store.events[-1] == ("close",)
+    teardown = fake_store.events[len(fake_store.registered) :]
+    assert all(event[0] == "unregister" for event in teardown[:-1])
+
+
+def test_worker_says_when_it_cannot_resolve_the_allocations(store_config, fake_store, monkeypatch):
+    """Silence would leave a crossing range looking like a Mooncake failure."""
+    messages = []
+    monkeypatch.setattr(worker_module.logger, "warning", messages.append)
+
+    with make_worker(fake_store, layout=make_pool_layout()):
+        pass
+    assert any("could not ask the driver" in message for message in messages)
+    assert fake_store.registered == [(POOL_BASE, POOL_BYTES)]
+
+
+@pytest.mark.parametrize("debug", [False, True], ids=["default", "debug"])
+def test_worker_reports_the_driver_facts_only_at_debug_level(
+    store_config, fake_store, mapped_pool, monkeypatch, debug
+):
+    """The report queries the driver per range, so it is not even built otherwise."""
+    mapped_pool()
+    messages = []
+    built = []
+    real_format_diagnosis = worker_module.format_diagnosis
+
+    def format_diagnosis(*args, **kwargs):
+        built.append(args)
+        return real_format_diagnosis(*args, **kwargs)
+
+    # The logger does not propagate to the root logger, so caplog cannot see it.
+    monkeypatch.setattr(worker_module.logger, "is_debug_enabled", lambda: debug)
+    monkeypatch.setattr(worker_module.logger, "debug", messages.append)
+    monkeypatch.setattr(worker_module, "format_diagnosis", format_diagnosis)
+
+    with make_worker(fake_store, layout=make_pool_layout()):
+        pass
+    assert bool(built) is debug
+    assert any("GPU registration diagnosis" in message for message in messages) is debug
+
+
+def test_staging_never_asks_the_driver_about_the_pools(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    """Only the pinned slots are registered, so the pools are never cut."""
+    monkeypatch.setattr(
+        worker_module, "allocation_range", lambda _address: pytest.fail("driver consulted")
+    )
+    with make_staged_worker(fake_store, store_config, layout=make_pool_layout()) as worker:
+        assert worker._addressing.buffers(0, 0) == ([POOL_BASE], [REGION_SIZE])
+    assert POOL_BASE not in [address for address, _ in fake_store.registered]
 
 
 def test_worker_prefix_hit_needs_every_layer_group(store_config, fake_store):
@@ -327,9 +926,51 @@ def test_worker_prefix_hit_stops_at_the_first_gap(store_config, fake_store):
 def test_worker_load_raises_when_a_page_is_missing(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout()) as worker:
         transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
+        worker.bind_allocation_fence(AllocationFence(fake_store))
         worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
         with pytest.raises(RuntimeError, match="already"):
             worker.start_load_kv(None)
+
+
+def test_worker_zero_copy_load_refuses_to_run_unordered(store_config, fake_store):
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        bind_one_load(worker, fake_store, b"\x06" * 16)
+        with pytest.raises(RuntimeError, match="no allocation fence"):
+            worker.start_load_kv(None)
+    assert fake_store.get_calls == []
+
+
+class AllocationFence:
+    """Stands in for the KV cache manager's fence, noting each wait."""
+
+    def __init__(self, store):
+        self._store = store
+        self.reads_before_wait = []
+        self.waited_for = []
+
+    def __call__(self, request_ids):
+        self.reads_before_wait.append(len(self._store.get_calls))
+        self.waited_for.append(set(request_ids))
+
+
+def bind_one_load(worker, fake_store, block_hash):
+    fake_store.objects.add(worker._namespaces[0].key(block_hash))
+    worker.bind_connector_meta(
+        SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[])
+    )
+
+
+def test_worker_zero_copy_load_waits_for_the_allocation_first(store_config, fake_store):
+    """The NIC writes into pages the previous pass may still be writing."""
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        fence = AllocationFence(fake_store)
+        worker.bind_allocation_fence(fence)
+        bind_one_load(worker, fake_store, b"\x04" * 16)
+        worker.start_load_kv(None)
+    assert fence.reads_before_wait == [0]
+    # Only the loading request's pages, so other requests' pending work is not waited for.
+    assert fence.waited_for == [{7}]
+    assert len(fake_store.get_calls) == 1
 
 
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
@@ -519,6 +1160,17 @@ def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged
         # copying that onto the page would put unrelated bytes where the
         # runtime already promised computed KV.
         assert staged_copies == []
+
+
+def test_staging_load_leaves_the_ordering_to_the_stream(store_config, fake_store, staged_copies):
+    """The scatter is queued on the stream, behind the previous pass."""
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        fence = AllocationFence(fake_store)
+        worker.bind_allocation_fence(fence)
+        bind_one_load(worker, fake_store, b"\x05" * 16)
+        worker.start_load_kv(None)
+    assert fence.reads_before_wait == []
+    assert len(staged_copies) == 1
 
 
 def test_the_ranks_device_is_captured_and_adopted_by_the_save_thread(

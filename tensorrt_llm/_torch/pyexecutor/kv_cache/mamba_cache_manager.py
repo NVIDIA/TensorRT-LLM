@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -2658,7 +2659,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
@@ -2671,7 +2671,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             request_ids=request_ids,
             token_nums=token_nums,
             is_gen=is_gen,
-            prepare_resource=prepare_resource,
             max_num_draft_tokens=max_num_draft_tokens,
             kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,
@@ -3624,6 +3623,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -3633,6 +3633,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             is_dummy=is_dummy,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            kv_cache_retention_config=kv_cache_retention_config,
         )
         if (self.mapping.rank == 0 and kv_cache is not None
                 and input_tokens is not None and not is_dummy
@@ -4472,7 +4473,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         request_ids: List[int],
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
@@ -4485,7 +4485,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             request_ids=request_ids,
             token_nums=token_nums,
             is_gen=is_gen,
-            prepare_resource=prepare_resource,
             max_num_draft_tokens=max_num_draft_tokens,
             kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,
@@ -4494,7 +4493,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
         )
-        if requests and prepare_resource:
+        if requests:
             self._setup_state_indices(
                 requests, num_contexts=0 if is_gen else len(requests))
         return requests

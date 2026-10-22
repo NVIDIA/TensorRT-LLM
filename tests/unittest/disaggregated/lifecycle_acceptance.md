@@ -182,8 +182,10 @@ worlds. Each world has an active attention-DP rank and an idle peer. The tests
 use generic `KVCacheManagerV2` NVFP4/`SELFKONLY` allocations with explicit key and
 block-scale coverage and real KV/AUX transfers, without loading a model or
 introducing production fault-injection hooks. This deliberately excludes the
-unfinished dense FP4 MLA manager/serving integration: its high-precision tail,
-V-scale/packed-V roles, and replicated-role mapping are not qualified here.
+dense FP4 MLA manager's high-precision tail, local-only V-scale/packed-V roles,
+and replicated-role mapping, which are not qualified here under the bridge;
+[test_fp4_mla_kv_transfer.py](test_fp4_mla_kv_transfer.py) covers their transfer
+without it.
 A minimally initialized
 `PyExecutor` exercises its real cancellation gate and termination methods through
 the production coordinator and resource manager; no scheduler/serving loop or

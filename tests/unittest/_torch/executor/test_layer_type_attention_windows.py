@@ -159,7 +159,6 @@ def test_invalid_sliding_window_falls_back_to_default():
 # ---------------------------------------------------------------------------
 
 _FAMILY_PREDICATES = (
-    "is_gemma4_hybrid",
     "is_kimi_linear",
     "is_mla",
     "is_nemotron_hybrid",

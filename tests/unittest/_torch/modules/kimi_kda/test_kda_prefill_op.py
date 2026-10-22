@@ -611,8 +611,8 @@ def test_fused_prefill_does_not_depend_on_k1_warp_timing(
     barrier, so the other K1 warps run ahead into the next chunk before it
     reads sPartialLast. Outputs and states must equal the unpatched kernel's.
     """
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda import fused_k123
     from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops as kimi_k3_ops
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda import fused_k123
 
     source = Path(fused_k123.__file__).read_text()
     assert source.count(_K1_SCAN_READS) == 1, "fused_k123's K1 scan reads moved"
