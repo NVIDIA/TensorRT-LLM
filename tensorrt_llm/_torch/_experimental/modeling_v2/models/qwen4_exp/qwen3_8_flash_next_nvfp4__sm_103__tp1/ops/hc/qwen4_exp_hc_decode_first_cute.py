@@ -52,10 +52,12 @@ THREADS = 320
 _SMS = 152
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=128"
 #: ns the weight-register loads are held after a CTA starts (dependents released first).
-#: In a chain of sites the next site's first kernel becomes resident as this site's mix
-#: starts its critical path; holding its 6.6 MB weight burst ~0.5 us keeps that path's L2
-#: round trips short. 0 disables (the CTA must start > ~1.5 us before its wait to gain).
-_WEIGHT_DELAY_NS = int(os.environ.get("TRTLLM_HC_FIRST_WEIGHT_DELAY_NS", "500"))
+#: In a chain of sites alone the next site's first kernel becomes resident as this site's
+#: mix starts its critical path, and holding its 6.6 MB weight burst ~0.5 us keeps that
+#: path's L2 round trips short (-0.4 us a site in the chained micro-bench). In the full STP
+#: decode step it costs more than it saves (con1: 412.5 tok/s/user at 0, 399.0 at 500), so
+#: it is off by default.
+_WEIGHT_DELAY_NS = int(os.environ.get("TRTLLM_HC_FIRST_WEIGHT_DELAY_NS", "0"))
 
 
 @dsl_user_op
