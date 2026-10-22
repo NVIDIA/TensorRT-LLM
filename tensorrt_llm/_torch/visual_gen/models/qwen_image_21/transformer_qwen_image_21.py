@@ -20,7 +20,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.embeddings import TimestepEmbedding
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import RMSNorm
 
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -70,40 +70,16 @@ def apply_rotary_emb_qwen(
     return x_out.type_as(x)
 
 
-class QwenImage21TemporalTimesteps(nn.Module):
-    """Sinusoidal timestep embedding with cos channels followed by sin channels."""
-
-    def __init__(
-        self, timestep_dim: int, max_period: int = 10000, time_factor: float = 1000.0
-    ) -> None:
-        super().__init__()
-        self.timestep_dim = timestep_dim
-        self.time_factor = time_factor
-        half = timestep_dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        )
-        self.register_buffer("freqs", freqs, persistent=False)
-
-    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        timestep = self.time_factor * timestep.float()
-        args = timestep[:, None] * self.freqs[None].to(timestep.device)
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if self.timestep_dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding.to(timestep.dtype)
-
-
 class QwenImage21TimestepProjEmbeddings(nn.Module):
     def __init__(self, embedding_dim: int) -> None:
         super().__init__()
-        self.time_proj = QwenImage21TemporalTimesteps(timestep_dim=256)
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(
             in_channels=256, time_embed_dim=embedding_dim, sample_proj_bias=False
         )
 
     def forward(self, timestep: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        timesteps_proj = self.time_proj(timestep)
+        timesteps_proj = self.time_proj(timestep.float() * 1000.0)
         return self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))
 
 
