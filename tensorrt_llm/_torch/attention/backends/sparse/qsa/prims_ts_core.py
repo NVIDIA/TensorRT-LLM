@@ -4,7 +4,6 @@
 
 import bisect
 import functools
-import os
 import threading
 
 import torch
@@ -75,11 +74,13 @@ def use_prims_ts_indexer(
 ) -> bool:
     """Whether the indexer scoring runs on the PrimTS kernel instead of Triton.
 
-    Follows ``sparse_core_backend`` unless ``TLLM_QSA_INDEXER`` overrides it:
+    Follows ``sparse_core_backend`` unless ``indexer_backend`` is set:
     ``triton`` never, ``prims_ts`` always (raising if unsupported), ``auto``
     when the device and inputs qualify and decode batches are large enough.
     """
-    backend = os.environ.get("TLLM_QSA_INDEXER", params.sparse_core_backend)
+    backend = params.indexer_backend
+    if backend == "follow":
+        backend = params.sparse_core_backend
     if backend == "triton":
         return False
     if backend == "auto" and is_decode and q.shape[0] < _MIN_INDEXER_DECODE_ROWS:

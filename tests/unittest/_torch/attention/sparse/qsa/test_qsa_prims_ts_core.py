@@ -8,10 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import qsa_sparse_gqa_reference
-from tensorrt_llm._torch.attention.backends.sparse.qsa.params import (
-    QSA_SPARSE_CORE_ENV,
-    QSASparseParams,
-)
+from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
     align_prefill_chunk,
     prims_ts_available,
@@ -41,18 +38,14 @@ def _params(**overrides) -> QSASparseParams:
     return QSASparseParams(**kwargs)
 
 
-def test_sparse_core_backend_defaults_to_triton(monkeypatch) -> None:
-    monkeypatch.delenv(QSA_SPARSE_CORE_ENV, raising=False)
-    assert _params().sparse_core_backend == "triton"
-    assert _params(sparse_core_backend="prims_ts").sparse_core_backend == "prims_ts"
-
-
-def test_sparse_core_backend_env_override(monkeypatch) -> None:
-    monkeypatch.setenv(QSA_SPARSE_CORE_ENV, "Auto")
+def test_sparse_core_backend_defaults_to_auto() -> None:
     assert _params().sparse_core_backend == "auto"
-    monkeypatch.setenv(QSA_SPARSE_CORE_ENV, "bogus")
+    assert _params().indexer_backend == "follow"
+    assert _params(sparse_core_backend="prims_ts").sparse_core_backend == "prims_ts"
     with pytest.raises(ValueError, match="sparse_core_backend"):
-        _params()
+        _params(sparse_core_backend="bogus")
+    with pytest.raises(ValueError, match="indexer_backend"):
+        _params(indexer_backend="bogus")
 
 
 def _requires_prims_ts() -> None:
@@ -289,15 +282,13 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
         assert torch.equal(out, ref)
 
 
-def test_auto_gates_small_decode_batches(monkeypatch) -> None:
+def test_auto_gates_small_decode_batches() -> None:
     _requires_prims_ts()
     from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
         resolve_sparse_core_backend,
         use_prims_ts_indexer,
     )
 
-    monkeypatch.delenv("TLLM_QSA_SPARSE_CORE", raising=False)
-    monkeypatch.delenv("TLLM_QSA_INDEXER", raising=False)
     device = torch.device("cuda")
     k_cache = torch.empty(1, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device)
 
@@ -325,6 +316,10 @@ def test_auto_gates_small_decode_batches(monkeypatch) -> None:
     assert indexer("auto", 1, False)
     assert indexer("prims_ts", 1, True)
     assert not indexer("triton", 4096, False)
+    assert not use_prims_ts_indexer(
+        _params(sparse_core_backend="prims_ts", indexer_backend="triton"),
+        torch.empty(64, 4, 128, dtype=torch.bfloat16, device=device),
+    )
 
 
 def test_align_prefill_chunk() -> None:
