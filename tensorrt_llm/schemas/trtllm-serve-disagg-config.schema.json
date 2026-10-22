@@ -1416,8 +1416,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1588,8 +1588,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -6113,7 +6113,7 @@
       "description": "Configuration for NVFP4 GEMM backend selection.",
       "properties": {
         "allowed_backends": {
-          "description": "List of backends to consider for auto-selection. Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme performance at the cost of longer server launch time.",
+          "description": "List of backends to consider for auto-selection.",
           "items": {
             "enum": [
               "cutlass",
