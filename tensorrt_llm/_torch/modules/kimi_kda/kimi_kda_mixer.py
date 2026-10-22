@@ -499,7 +499,9 @@ class KimiKDALinearAttention(nn.Module):
         num_tokens = attn_metadata.num_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
         state_indices = mamba_metadata.state_indices[:batch_size]
-        cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
+        cu_seqlens = getattr(mamba_metadata, "kda_cu_seqlens", None)
+        if cu_seqlens is None or cu_seqlens.shape[0] != num_prefills + 1:
+            cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
         num_decodes = batch_size - num_prefills
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
@@ -884,6 +886,7 @@ class KimiKDALinearAttention(nn.Module):
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=getattr(mamba_metadata, "kda_cu_seqlens_cpu", None),
             state_pool=kernel_pool if use_indexed_state else None,
             state_indices=kernel_indices if use_indexed_state else None,
             max_seqlen=getattr(mamba_metadata, "kda_max_seqlen", 0),
