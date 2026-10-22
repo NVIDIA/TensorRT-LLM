@@ -351,7 +351,19 @@ class Embedding(LMHead):
             self.vocab_end_index = num_embeddings
 
     def forward(self, input):
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not torch.compiler.is_compiling():
+            # Outside torch.compile tracing, build the wrapper once per module:
+            # every torch.compile() call constructs an Inductor backend wrapper
+            # (deep-copying the Inductor config), even with disable=True, where
+            # it returns the plain function.
+            embedding_ops_func = self.__dict__.get("_pre_comm_ops_func")
+            if embedding_ops_func is None:
+                embedding_ops_func = (torch.compile(
+                    pre_comm_embedding_ops, options={"max-autotune": True})
+                                      if self.enable_torch_compile_for_embedding
+                                      else pre_comm_embedding_ops)
+                self._pre_comm_ops_func = embedding_ops_func
+        elif self.tp_size > 1:
             # Run the ops before all_reduce/all_gather.
             # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
             embedding_ops_func = torch.compile(
