@@ -145,7 +145,10 @@ def test_protobuf_warning_does_not_block_model_startup(
     with pytest.raises(RuntimeError, match="model startup reached"):
         launch("127.0.0.1", 50051, {"backend": "pytorch", "model": "test-model"})
     llm_factory.assert_called_once()
-    assert llm_factory.call_args.kwargs.items() >= {"backend": "pytorch", "model": "test-model"}.items()
+    assert (
+        llm_factory.call_args.kwargs.items()
+        >= {"backend": "pytorch", "model": "test-model"}.items()
+    )
 
 
 def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
