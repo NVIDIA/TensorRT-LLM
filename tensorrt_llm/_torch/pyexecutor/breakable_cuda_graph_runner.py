@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import bisect
 import contextlib
 from enum import Enum
 from typing import Any, Callable, Iterator, Optional
@@ -35,6 +36,7 @@ class BreakableCUDAGraphRunner:
     def __init__(self, layer_model: nn.Module) -> None:
         self.layer_model = layer_model
         self._graphs: dict[int, BreakableCUDAGraph] = {}
+        self._captured_num_tokens: list[int] = []
         self._outputs: dict[int, torch.Tensor] = {}
         self._memory_pool = None
         self._capture_stream = torch.cuda.Stream()
@@ -64,15 +66,24 @@ class BreakableCUDAGraphRunner:
     def has_graph(self, num_tokens: int) -> bool:
         return num_tokens in self._graphs
 
+    @property
+    def captured_num_tokens(self) -> list[int]:
+        """Token buckets with a captured graph, in ascending order."""
+        return self._captured_num_tokens
+
     def warmup(self, engine_forward: Callable[[], Any], steps: int = _WARMUP_STEPS) -> None:
         """Run the complete eager engine forward under the warmup state.
-        model_engine.forward will use state to determine what forward to do."""
+        model_engine.forward will use state to determine what forward to do.
+
+        The BCG flag covers the whole forward, as in capture and replay, so code
+        outside the captured body takes the same op path in all three."""
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot warm up BCG while runner is {self._state.value}")
         self._state = BreakableCUDAGraphRunnerState.WARMUP
         try:
-            for _ in range(steps):
-                engine_forward()
+            with enable_breakable_cuda_graph():
+                for _ in range(steps):
+                    engine_forward()
         finally:
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
@@ -111,7 +122,8 @@ class BreakableCUDAGraphRunner:
                     graph = BreakableCUDAGraph()
                     self._active_graph = graph
                     self._active_num_tokens = num_tokens
-                    output = engine_forward()
+                    with enable_breakable_cuda_graph():
+                        output = engine_forward()
                     torch.cuda.synchronize()
 
             current_stream.wait_stream(self._capture_stream)
@@ -121,6 +133,7 @@ class BreakableCUDAGraphRunner:
                 )
             assert graph is not None
             self._graphs[num_tokens] = graph
+            bisect.insort(self._captured_num_tokens, num_tokens)
             self._outputs[num_tokens] = make_weak_ref(output)
         except Exception:
             if graph is not None:
@@ -154,13 +167,25 @@ class BreakableCUDAGraphRunner:
             raise RuntimeError("BCG output registered outside capture")
         num_tokens = self._active_num_tokens
         if self._shared_output is None:
-            self._shared_output = make_weak_ref(output)
+            # Hold the largest bucket's output strongly. A weak reference would
+            # return its block to the shared pool, where a later bucket's output
+            # could land at an offset inside it and the copy below would then
+            # overlap its own source.
+            self._shared_output = output
             return self._shared_output
         if num_tokens > self._shared_output.shape[0]:
             raise ValueError(
                 "BCG buckets must be captured in descending order: "
                 f"{num_tokens} exceeds shared output size "
                 f"{self._shared_output.shape[0]}"
+            )
+        shared_begin = self._shared_output.data_ptr()
+        shared_end = shared_begin + self._shared_output.nbytes
+        output_begin = output.data_ptr()
+        output_end = output_begin + output.nbytes
+        if output_begin != shared_begin and output_begin < shared_end and shared_begin < output_end:
+            raise RuntimeError(
+                f"BCG output of bucket {num_tokens} overlaps the shared output buffer at an offset"
             )
         self._shared_output[:num_tokens].copy_(output[:num_tokens])
         return self._shared_output[:num_tokens]
@@ -227,6 +252,7 @@ class BreakableCUDAGraphRunner:
         for graph in self._graphs.values():
             graph.reset()
         self._graphs.clear()
+        self._captured_num_tokens.clear()
         self._outputs.clear()
         self._shared_output = None
         self._memory_pool = None
