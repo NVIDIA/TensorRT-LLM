@@ -13,7 +13,9 @@ from utils.util import skip_pre_hopper
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
@@ -168,12 +170,17 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
     torch.nn.Module.__init__(model)
     wrapper, _, _ = _create_prefill_compiled_model()
     model.model = wrapper if has_wrapper else torch.nn.Identity()
-    config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
+    config = SimpleNamespace(compile_only_piecewise_graphs=enabled, max_beam_width=1)
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
+
+    for component in ("DecoderInputBuffers", "DecoderMetadata", "DecoderWarmup"):
+        monkeypatch.setattr(runner_module, component, Mock())
     for method in (
-        "_allocate_decoder_buffers",
+        "_make_dummy_requests",
         "_init_decoder_state",
-        "_initialize_cuda_graph_runner",
-        "_initialize_breakable_cuda_graph_runner",
+        "_make_input_preparer",
+        "_make_cuda_graphs",
+        "_initialize_moe_workspace_reclaimer",
     ):
         monkeypatch.setattr(DecoderRunner, method, Mock())
     expected_error = (
@@ -216,24 +223,31 @@ def test_decoder_runner_nested_bypass_restores_after_exception() -> None:
 @pytest.mark.parametrize("enabled", [False, True])
 def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabled: bool) -> None:
     """Exercise the relocated warmup orchestration with eager/compiled routing."""
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as graphs_module
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
     from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
     model, _, _ = _create_prefill_compiled_model()
     runner = _create_compile_restricted_runner(model, enabled=enabled)
-    runner.model.config = SimpleNamespace(vocab_size=128)
-    runner.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
-    runner.guided_decoder = None
-    runner._metrics = {}
-    runner._warmup_timer = _WarmupTimer(rank=0)
-    runner.cuda_graph_runner = SimpleNamespace(
-        allow_capture=contextlib.nullcontext, preallocate_padding_dummies=Mock()
+    graphs = object.__new__(DecoderCudaGraphs)
+    graphs.cuda_graph_runner = SimpleNamespace(
+        allow_capture=contextlib.nullcontext,
+        enabled=False,
+        is_warmup_only=False,
+        padding_dummy_requests={},
     )
-    runner._agree_warmup_flag = lambda value: value
-    runner._agree_warmup_shapes = lambda shapes: shapes
-    runner._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
-    runner._get_max_shape_warmup_requests = Mock(return_value=[(8, 0)])
-    runner.no_cuda_graph = contextlib.nullcontext
+    graphs.preallocate_padding_dummies = Mock()
+    warmup = object.__new__(DecoderWarmup)
+    warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
+    warmup._inputs = SimpleNamespace(guided_decoder=None)
+    warmup._metrics = {}
+    warmup._warmup_timer = _WarmupTimer(rank=0)
+    warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
+    warmup._graphs = graphs
+    warmup._context_warmups_supported = True
+    warmup._torch_compile_bypass = runner._bypass_torch_compile
+    warmup._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
+    warmup._get_max_shape_warmup_requests = Mock(return_value=[(8, 0)])
     observed = []
 
     def observe(phase):
@@ -251,23 +265,21 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_warmup_cute_dsl_radix_topk",
         "_freeze_eager_workspace_floor",
     ):
-        monkeypatch.setattr(runner, method, Mock())
+        monkeypatch.setattr(warmup, method, Mock())
     for method in (
         "_run_attention_warmup",
         "_run_autotuner_warmup",
         "_run_mamba_hybrid_warmup",
         "_general_warmup",
-        "_run_cuda_graph_warmup",
     ):
-        monkeypatch.setattr(runner, method, observe(method))
-    monkeypatch.setattr(runner_module, "warmup_sampling_module", Mock())
-    monkeypatch.setattr(runner_module, "log_mem_snapshot", Mock())
-    monkeypatch.setattr(runner_module.AutoTuner, "get", Mock())
-    monkeypatch.setattr(
-        runner_module, "moe_a2a_steady_state_budget_for_capture", contextlib.nullcontext
-    )
+        monkeypatch.setattr(warmup, method, observe(method))
+    monkeypatch.setattr(graphs, "run_cuda_graph_warmup", observe("_run_cuda_graph_warmup"))
+    monkeypatch.setattr(warmup_module, "warmup_sampling_module", Mock())
+    monkeypatch.setattr(warmup_module, "log_mem_snapshot", Mock())
+    monkeypatch.setattr(warmup_module.AutoTuner, "get", Mock())
+    monkeypatch.setattr(graphs_module, "moe_comm_serving_timeouts", contextlib.nullcontext)
     monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
-    monkeypatch.setattr(runner_module, "gc", SimpleNamespace(collect=Mock()))
+    monkeypatch.setattr(warmup_module, "gc", SimpleNamespace(collect=Mock()))
     with (
         patch("tensorrt_llm._torch.bolt_profiling.maybe_bolt_clear_counters", Mock()),
         patch(
@@ -278,7 +290,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
             return_value=True,
         ),
     ):
-        runner._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
+        warmup._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
 
     assert observed == [
         ("_run_attention_warmup", not enabled),

@@ -82,7 +82,12 @@ from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
+    CacheTransceiverConfig,
+    KvCacheConfig,
+    KvPoolRebalanceConfig,
+)
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
@@ -192,7 +197,7 @@ class KvCacheConfigV2:
     disk_cache_path: Optional[str] = None
     onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
@@ -205,6 +210,10 @@ class KvCacheConfigV2:
     block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -2054,7 +2063,7 @@ def _offload_cycle_manager(
             enable_partial_reuse=enable_block_reuse,
             copy_on_partial_reuse=False,
             host_cache_size=host_cache_size,
-            secondary_offload_min_priority=0,
+            cold_tier_offload_min_priority=0,
         ),
         CacheTypeCpp.SELF,
         num_layers=NUM_LAYERS,

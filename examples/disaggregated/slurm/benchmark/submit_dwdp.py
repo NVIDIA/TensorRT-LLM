@@ -25,6 +25,7 @@ sbatch command construction.
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -160,7 +161,22 @@ def submit_dwdp_job(config, log_dir, dry_run):
         2 * ctx_world_size * gen_world_size if benchmark_config["mode"] == "e2e" else 0
     )
 
-    total_nodes = ctx_nodes + gen_nodes
+    # DWDP's context workers are TP=1 by construction, so the default
+    # "each worker owns whole nodes, no node sharing" rule spends one node per
+    # worker and leaves 3 of every 4 GPUs idle: a dwdp_size=16 group asks for
+    # 16 nodes instead of 4.  With --segment that also means demanding a whole
+    # NVLink block, which on a busy cluster simply never schedules.
+    # ``hardware.compact_packing`` mirrors the option submit.py already has
+    # (see its total_gpus/ceil branch); allocate_gpus' assign_server_compact
+    # walks a per-GPU cursor, which for a divisible layout lands each rank on
+    # exactly the (node, gpu) that SLURM block distribution would give it, so
+    # the block-distribution launcher below stays valid.
+    compact_packing = bool(hw_config.get("compact_packing", False))
+    if compact_packing:
+        total_gpus = ctx_world_size * ctx_num + gen_world_size * gen_num
+        total_nodes = math.ceil(total_gpus / gpus_per_node)
+    else:
+        total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
     dwdp_size = worker_config.get("ctx", {}).get("dwdp_config", {}).get("dwdp_size", 1)
@@ -220,6 +236,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
         num_ctx_servers=ctx_num,
         gen_world_size=gen_world_size,
         ctx_world_size=ctx_world_size,
+        compact_packing=compact_packing,
     )
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)

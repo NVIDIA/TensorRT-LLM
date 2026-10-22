@@ -165,7 +165,7 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
             _assert_matches_reference(actual, expected[:, :context_length], fp8)
 
         for request_id in range(batch):
-            manager.impl.add_token(request_id)
+            assert manager.kv_cache_map[request_id].capacity >= context_length + 1
         metadata = get_attention_backend("TRTLLM").Metadata(
             seq_lens=torch.ones(batch, dtype=torch.int),
             request_ids=list(range(batch)),

@@ -52,7 +52,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
-from .engine.runners.decoder.runner import uses_full_generation_page_table
+from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -954,6 +954,20 @@ def _create_py_executor(
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
 
+    if (kv_cache_config.enable_block_reuse
+            and model_engine.model.model_config.is_encoder_decoder
+            and getattr(model_engine.input_processor,
+                        "requires_encoder_features", False)):
+        # Both KV pools depend on encoder features, which have no token IDs
+        # or input discriminator to safely key reuse between requests.
+        logger.info(
+            "Disabling block reuse for the self- and cross-KV caches: "
+            "the encoder takes feature tensors, so requests carry no "
+            "encoder tokens or input discriminator to key cache entries.")
+        kv_cache_config.enable_block_reuse = False
+        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                       False)
+
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires
@@ -1056,14 +1070,15 @@ def _create_py_executor(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
 
-        # VSWA allocates one pool per window size, which only
-        # `register_kv_cache_layout` can describe.
+        # V1 registers a single pool. V2 checks its resolved layer groups
+        # during executor initialization.
         max_attention_window = kv_cache_config.max_attention_window
         if (uses_vswa_kv_cache_layout(max_attention_window)
                 and v2_selection is False):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
-                "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
+                "in this configuration. Use KVCacheManagerV2 with a connector "
+                "that implements the per-layer-group APIs, or use a single attention window."
             )
 
         if mapping.enable_attention_dp:

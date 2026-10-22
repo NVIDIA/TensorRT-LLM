@@ -107,6 +107,10 @@ class ConfigurableMoE(MoE):
         aux_stream_dict: Auxiliary CUDA streams for overlap
         weight_loading_mode: Weight loading mode
         layer_idx: Layer index
+        accepts_global_routed_output: Under attention TP with
+            ``reduce_results=False``, take a ``FUSED_COMM`` backend's globally
+            combined output on every rank instead of a rank partial. Only for
+            callers that skip the routed all-reduce for such backends.
         **kwargs: Additional arguments
             - tune_max_num_tokens: Max tokens for profiling (passed to backend)
             - Other backend-specific arguments
@@ -161,6 +165,7 @@ class ConfigurableMoE(MoE):
         moe_cls: Optional[Type] = None,
         communication_method: Optional[str] = None,
         unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
+        accepts_global_routed_output: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -183,6 +188,7 @@ class ConfigurableMoE(MoE):
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
         self.communication_method = communication_method
+        self.accepts_global_routed_output = accepts_global_routed_output
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -250,8 +256,14 @@ class ConfigurableMoE(MoE):
             self.event_dict = None
 
         # Validate configuration
-        self.validate_config()
-        self.validate_backend(self.backend)
+        validated = False
+        try:
+            self.validate_config()
+            self.validate_backend(self.backend)
+            validated = True
+        finally:
+            if not validated and self.comm is not None:
+                self.comm.destroy()
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -434,6 +446,16 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
+
+    @property
+    def returns_global_routed_output(self) -> bool:
+        """True only for a ``FUSED_COMM`` backend whose caller opted in with
+        ``accepts_global_routed_output``; ``FusedCommMoEScheduler`` otherwise
+        hands back a rank partial under attention TP."""
+        return (
+            self.accepts_global_routed_output
+            and self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
 
     @property
     def num_fused_shared_expert(self) -> int:
@@ -640,6 +662,7 @@ class ConfigurableMoE(MoE):
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
+            allow_alltoall=self.backend.supports_alltoall,
         )
 
     def forward_impl(
@@ -652,6 +675,7 @@ class ConfigurableMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -665,6 +689,9 @@ class ConfigurableMoE(MoE):
         4. Advances the EPLB ``repeat_idx``.
 
         DP-padding handling and chunking live in the scheduler.
+
+        ``input_ready_event``: ``x`` is written on another stream; the join is
+        deferred to the first kernel that reads ``x``, so routing overlaps it.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -695,6 +722,7 @@ class ConfigurableMoE(MoE):
             input_ids=input_ids,
             lora_params=lora_params,
             routing_aux=routing_aux,
+            input_ready_event=input_ready_event,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
