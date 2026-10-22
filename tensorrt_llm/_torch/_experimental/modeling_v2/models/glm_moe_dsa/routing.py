@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget
 
@@ -27,6 +28,7 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    kv_cache_quant_algo: Optional[Any],
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
@@ -62,7 +64,13 @@ def route(
         and spec_config.max_total_draft_tokens == spec_config.max_draft_len
     )
     # GLM-5.2-NVFP4 on 16 Rubin GPUs (sm107), tp16, MTP-Eagle or no speculation.
-    if compute_capability == (10, 7) and shape == _SHAPE and tp16 and mtp_eagle_or_none:
+    if (
+        compute_capability == (10, 7)
+        and shape == _SHAPE
+        and tp16
+        and mtp_eagle_or_none
+        and kv_cache_quant_algo == QuantAlgo.FP8
+    ):
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
@@ -77,7 +85,9 @@ def route(
         f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp} "
         f"pp={mapping.pp_size} cp={mapping.cp_size}, speculative decoding "
         f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}; "
+        f"KV cache {kv_cache_quant_algo or 'bf16'}; "
         "the one glm_moe_dsa target is GLM-5.2-NVFP4 on sm107, tp16 (16 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "
-        "MTP-Eagle as a linear chain or no speculative decoding"
+        "MTP-Eagle as a linear chain or no speculative decoding, and an fp8 latent "
+        "KV cache (not the packed fp8_ds_mla layout)"
     )

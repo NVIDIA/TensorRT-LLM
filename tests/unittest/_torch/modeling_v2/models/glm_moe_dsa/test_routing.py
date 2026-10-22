@@ -8,8 +8,15 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -39,10 +46,15 @@ def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
     return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
 
 
-def _model_config(pretrained_config, spec_config=None, **mapping_kwargs):
+def _model_config(
+    pretrained_config, spec_config=None, kv_cache_quant_algo=QuantAlgo.FP8, **mapping_kwargs
+):
     mapping = Mapping(**mapping_kwargs) if mapping_kwargs else Mapping()
     return ModelConfig(
-        pretrained_config=pretrained_config, mapping=mapping, spec_config=spec_config
+        pretrained_config=pretrained_config,
+        mapping=mapping,
+        spec_config=spec_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo),
     )
 
 
@@ -113,3 +125,28 @@ def test_glm52_on_sm103_does_not_match():
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("checkpoint_algo", [None, QuantAlgo.NVFP4])
+def test_glm52_fp8_kv_cache_override_matches(_on_sm107, mode, checkpoint_algo):
+    config = _model_config(_glm52_config(), kv_cache_quant_algo=checkpoint_algo, **_TP16)
+    args = _llm_args(mode, kv_cache_config=KvCacheConfig(dtype="fp8"))
+    assert _qualified(modeling_v2_resolve(config, args)) == _GLM52_TARGET
+
+
+@pytest.mark.parametrize(
+    "checkpoint_algo, dtype",
+    [
+        (None, "auto"),
+        (QuantAlgo.NVFP4, "auto"),
+        (QuantAlgo.FP8, "nvfp4"),
+        (QuantAlgo.FP8, "fp8_ds_mla"),
+    ],
+)
+def test_glm52_unsupported_kv_cache_does_not_match(_on_sm107, checkpoint_algo, dtype):
+    config = _model_config(_glm52_config(), kv_cache_quant_algo=checkpoint_algo, **_TP16)
+    args = dict(kv_cache_config=KvCacheConfig(dtype=dtype))
+    assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
+    with pytest.raises(ValueError, match="KV cache"):
+        modeling_v2_resolve(config, _llm_args("require", **args))
