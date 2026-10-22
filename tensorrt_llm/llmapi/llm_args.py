@@ -7091,7 +7091,8 @@ class TorchLlmArgs(BaseLlmArgs):
         if getattr(self.speculative_config, "use_dynamic_tree", False):
             raise NotImplementedError(
                 "Mixed-precision KV does not support dynamic-tree speculative "
-                "decoding, which moves accepted KV rows inside the cache pools.")
+                "decoding, which moves accepted KV rows inside the cache pools."
+            )
         return self
 
     @model_validator(mode="after")
