@@ -17,7 +17,7 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano)
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
-- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
+- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) needs more device memory than one H200 provides; use a higher-memory GPU, such as Blackwell, or `configs/cosmos3-super-4gpu-hopper.yaml` on a single 4-GPU Hopper node. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
 
@@ -32,33 +32,50 @@ them with `--revision`:
 ```bash
 python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
     --prompt_file prompts/t2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 ```
 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
-`../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
+`../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
-T2V, T2I, I2V and V2V are validated on a **single GPU**; every multi-GPU
-configuration is refused with an explicit error, so use BF16 there.
+Use a **single GPU** for Nano and Super FP8 T2V, T2I, I2V, V2V and T2AV;
+every multi-GPU generator configuration is refused with an explicit error, so
+use BF16 there. Static FP8 Reasoner serving has a separate deployment path; see
+[Reasoner serving](../../../models/core/cosmos3/README.md).
 
-These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
-rather than being refused — audio is quantized and generated like any other
-supported task. It simply has not been exercised as thoroughly as the four
-video/image tasks above, and no FP8 audio quality claim is made. FP8 output
-quality in general has not been benchmarked against BF16.
+For T2AV, use the same audio-enabled prompt as BF16 with the FP8 checkpoint:
+
+```bash
+python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
+    --prompt_file prompts/t2av.json \
+    --visual_gen_args ../../configs/cosmos3-fp8-1gpu.yaml \
+    --output_path cosmos3_fp8_t2av.mp4
+```
+
+Substitute `nvidia/Cosmos3-Super` for Super. For a local FP8 checkpoint, pass its
+directory as `--model` and omit `--revision`; the config's revision is ignored
+for local paths.
 
 ## Guardrails
 
 Guardrails are enabled by default (required by the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)). Install and authenticate as follows:
 
 ```bash
-pip install cosmos_guardrail==0.3.2 && pip uninstall opencv-python && pip install opencv-python-headless
+pip install cosmos_guardrail==0.3.2
+pip uninstall -y opencv-python
+pip install opencv-python-headless
 ```
 
 Accept the terms for the guardrail checkpoint at https://huggingface.co/nvidia/Cosmos-1.0-Guardrail and set a valid `HF_TOKEN` (the checkpoint is downloaded automatically on first run).
+
+The generator checks this dependency at startup, including for BF16 and FP8.
+Per-request `use_guardrails: false` (or `--disable_guardrails` in the example)
+does not bypass startup: without `cosmos_guardrail`, set the environment
+variable below before starting the engine if you take responsibility for
+deployment without guardrails.
 
 To run without guardrails (you are responsible for safe deployment):
 
@@ -68,7 +85,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 
 ## Media I/O dependencies
 
-- Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
+- Saving `.mp4` output, including video with audio, requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`). An explicit `output.save("output.mp4")` raises if ffmpeg is unavailable. Only automatic format selection falls back to `.avi`, which drops audio. This applies to BF16 and FP8.
 - Decoding MP4/AVI reference videos (V2V) happens in the worker processes on NVDEC via PyNvVideoCodec, a declared TensorRT-LLM dependency — nothing extra to install. Tested combinations: H.264 in MP4 and H.264 in AVI; other containers/codecs/profiles depend on the demuxer and the GPU's NVDEC capabilities and are best-effort.
 - Transfer's `edge`/`blur` controls are derived on the GPU from the reference video — nothing extra to install. Precomputed controls (`depth`/`seg`/`wsm`, or a precomputed `edge`/`blur`) are decoded like any other reference video.
 
@@ -77,7 +94,8 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 See `examples/visual_gen/configs/`:
 
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
-- `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
+- [cosmos3-super-4gpu.yaml](../../configs/cosmos3-super-4gpu.yaml) — default for 4 Blackwell GPUs (B200 / B300), CFG + Ulysses + parallel VAE
+- [cosmos3-super-4gpu-hopper.yaml](../../configs/cosmos3-super-4gpu-hopper.yaml) — 4 Hopper GPUs (H200), tensor parallel + Ulysses + parallel VAE to reduce per-GPU memory use
 - `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
@@ -154,12 +172,13 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step \
     --output_type image \
     --output_path output.png
 
-# I2V, distilled 4-step checkpoint (steps/guidance and the system-prompt
-# default come from the checkpoint automatically; defaults are the deployed
-# 720p x 189-frame shape, so no config is required)
+# I2V, distilled 4-step checkpoint on one node with 4 H200 GPUs. Steps,
+# guidance, and the system-prompt default come from the checkpoint; the config
+# supplies the parallel deployment for the default 720p x 189-frame shape.
 python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step \
     --prompt "The camera slowly pans right across the scene" \
     --image_path https://example.com/frame.jpg \
+    --visual_gen_args ../../configs/cosmos3-super-4gpu-hopper.yaml \
     --output_path output.mp4
 
 # Transfer: control-video conditioning — structure from the control video,
