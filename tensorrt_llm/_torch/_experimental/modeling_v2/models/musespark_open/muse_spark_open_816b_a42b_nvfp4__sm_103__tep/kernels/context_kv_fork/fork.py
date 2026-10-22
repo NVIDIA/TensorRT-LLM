@@ -296,6 +296,11 @@ class ContextKvFork:
                     base,
                     last,
                 )
+            # The built-in's _advance_ctx_len empties the dummy slot before the lengths are read.
+            worker._ctx_len[worker._dummy_slot].zero_()
+            if base is not None:
+                base[worker._dummy_slot].zero_()
+            torch.index_select(worker._ctx_len, 0, slots, out=num_ctx)
         return num_ctx
 
     def settle(self) -> None:
