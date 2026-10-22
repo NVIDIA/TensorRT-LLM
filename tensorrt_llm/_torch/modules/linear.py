@@ -497,6 +497,10 @@ class LinearMethodBase(ABC):
               bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
 
+    def supports_cublas_epilogues(self, module: Linear) -> bool:
+        """Whether cuBLASLt epilogues (bias, GELU, FP8 output) can serve this layer."""
+        return False
+
     def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
                     end: int) -> torch.Tensor:
         raise NotImplementedError(
@@ -839,6 +843,42 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             return module.input_scale
         return None
 
+    def supports_cublas_epilogues(self, module: Linear) -> bool:
+        """Whether cuBLASLt epilogues can serve this layer: a static input scale, BF16 output,
+        the cuBLAS GEMM path and no tensor-parallel output reduction."""
+        bias = getattr(module, "bias", None)
+        return (self.get_static_input_scale(module) is not None
+                and module.dtype == torch.bfloat16
+                and (bias is None or bias.dtype == torch.bfloat16)
+                and not module.reduces_output_across_ranks()
+                and not _fp8_per_tensor_uses_cute_dsl_sm107())
+
+    def apply_gelu_fp8_out(self, module: Linear, input: torch.Tensor,
+                           inv_out_scale: torch.Tensor) -> torch.Tensor:
+        """GELU(tanh)(input @ W^T + bias) quantized to e4m3 by inv_out_scale in the GEMM epilogue.
+
+        Needs supports_cublas_epilogues(module).
+        """
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+        if input.dtype != torch.float8_e4m3fn:
+            input, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                input, module.input_scale)
+        output = torch.ops.trtllm.cublas_scaled_mm(
+            input,
+            module.weight.t(),
+            scale_a=module.input_scale,
+            scale_b=module.weight_scale,
+            bias=module.bias,
+            out_dtype=torch.float8_e4m3fn,
+            epilogue=1,
+            d_scale=inv_out_scale.reshape(1),
+        )
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+        return output
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -930,12 +970,16 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 group=group,
             )
         else:
+            # Layers with enable_fp8_bias_epilogue() add the bias in the GEMM epilogue.
+            fused_bias = None
+            if module._fp8_fuse_bias:
+                fused_bias, bias = bias, None
             output = torch.ops.trtllm.cublas_scaled_mm(
                 qinput,
                 module.weight.t(),
                 scale_a=cur_input_scale,
                 scale_b=module.weight_scale,
-                bias=None,
+                bias=fused_bias,
                 out_dtype=module.dtype or input.dtype,
                 output_buffer_kind=output_buffer_kind,
                 group=group,
@@ -1222,6 +1266,10 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
                                                          torch.float16)
 
     requires_unquantized_activation: ClassVar[bool] = True
+
+    def supports_cublas_epilogues(self, module: Linear) -> bool:
+        """The activation stays 16-bit, so the FP8 GEMM epilogues never apply."""
+        return False
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
@@ -4313,6 +4361,8 @@ class Linear(nn.Module):
         self._weights_created = False
         self._weights_transformed = False
         self.reduce_output = reduce_output
+        # Set by enable_fp8_bias_epilogue(): the static FP8 GEMM adds the bias in its epilogue.
+        self._fp8_fuse_bias = False
         self._output_slice_cache: Optional[Fp8BlockScaleWeightSliceCache] = None
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
@@ -4792,6 +4842,30 @@ class Linear(nn.Module):
             output = self.apply_linear(input, self.bias, lora_params, layer_idx)
 
         return output
+
+    def enable_fp8_bias_epilogue(self) -> bool:
+        """Add the bias in the static FP8 GEMM's epilogue. Call after weights are loaded;
+        returns whether the quantization method supports it for this layer."""
+        self._fp8_fuse_bias = self.quant_method.supports_cublas_epilogues(self)
+        return self._fp8_fuse_bias
+
+    def reduces_output_across_ranks(self) -> bool:
+        """Whether forward() all-reduces partial outputs across tensor-parallel ranks."""
+        return (self.tp_mode == TensorParallelMode.ROW and self.reduce_output
+                and self.tp_size > 1)
+
+    def forward_without_bias(
+            self, input: Union[torch.Tensor,
+                               Fp4QuantizedTensor]) -> torch.Tensor:
+        """The output without the bias, for callers that add the bias in a later fused kernel.
+
+        Only for layers without a tensor-parallel output reduction.
+        """
+        if self.reduces_output_across_ranks() or self.gather_output:
+            raise ValueError(
+                "forward_without_bias does not support tensor-parallel output reduction."
+            )
+        return self.apply_linear(input, None, None, None)
 
     def load_weights(self,
                      weights: List[Dict],

@@ -160,6 +160,21 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit
     return {q8, k8, v8, v_descale};
 }
 
+// Whether fused_dit_qk_norm_rope_fp8 serves this layout on the current device, for RoPE tables
+// shared across heads and per head. False without a CUDA device.
+bool fused_dit_qk_norm_rope_fp8_supported(int64_t num_heads, int64_t head_dim)
+{
+    if (!at::cuda::is_available())
+    {
+        return false;
+    }
+    int const device = at::cuda::current_device();
+    return tensorrt_llm::kernels::fusedDiTQKNormRopeFp8Supported(
+               static_cast<int>(num_heads), static_cast<int>(head_dim), false, device)
+        && tensorrt_llm::kernels::fusedDiTQKNormRopeFp8Supported(
+            static_cast<int>(num_heads), static_cast<int>(head_dim), true, device);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -171,10 +186,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fused_dit_qk_norm_rope_fp8(Tensor qkv, int num_heads, int head_dim, float eps, Tensor q_weight, "
         "Tensor k_weight, Tensor cos_emb, Tensor sin_emb, bool interleave, float qk_mul, Tensor? v_amax) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("fused_dit_qk_norm_rope_fp8_supported(int num_heads, int head_dim) -> bool");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("dit_v_amax", &tensorrt_llm::torch_ext::dit_v_amax);
     m.impl("fused_dit_qk_norm_rope_fp8", &tensorrt_llm::torch_ext::fused_dit_qk_norm_rope_fp8);
+}
+
+// No tensor arguments, so dispatch cannot pick a backend from the inputs.
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("fused_dit_qk_norm_rope_fp8_supported", &tensorrt_llm::torch_ext::fused_dit_qk_norm_rope_fp8_supported);
 }
