@@ -562,15 +562,15 @@ _MTP_EMBED_BLOCK_ALL_STREAMS = True
 #: trunk's fused site, attention and projection launches (`DecodeTarget.mtp_forward`).
 _MTP_UNFUSED_ENV = "TRTLLM_MODELING_V2_MTP_UNFUSED"
 
-#: The draft head's lm_head: "bf16" (the checkpoint's, as the verify step reads it) or "fp8" (a
-#: per-vocabulary-row e4m3 copy read by cuBLASLt with per-token activation scales). The draft
-#: head only proposes tokens -- the verify step's bf16 head decides what is emitted -- so the
-#: copy can change acceptance, not outputs.
+#: The draft head's lm_head: "fp8" (default: a per-vocabulary-row e4m3 copy read by cuBLASLt with
+#: per-token activation scales) or "bf16" (the checkpoint's, as the verify step reads it). The
+#: draft head only proposes tokens -- the verify step's bf16 head decides what is emitted -- so
+#: the copy can change acceptance, not outputs (measured unchanged: gsm8k and pass-key AL).
 _MTP_DRAFT_HEAD_ENV = "TRTLLM_MODELING_V2_MTP_DRAFT_HEAD"
 
 
 def _mtp_draft_head_mode() -> str:
-    mode = os.environ.get(_MTP_DRAFT_HEAD_ENV, "bf16").lower()
+    mode = os.environ.get(_MTP_DRAFT_HEAD_ENV, "fp8").lower()
     assert mode in ("bf16", "fp8"), f"{_MTP_DRAFT_HEAD_ENV}={mode!r}: expected bf16 or fp8"
     return mode
 
