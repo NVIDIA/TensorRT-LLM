@@ -66,8 +66,15 @@ class _BounceProbe:
     def record_failure(self, rid_slice: tuple[int, int], peer_rank: int) -> None:
         self.failed_writers.append((rid_slice, peer_rank))
 
-    def reserve(self, _receiver_req, _num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
+    def reserve(
+        self,
+        _receiver_req,
+        _num_writers: int,
+        *,
+        extra_bytes: int = 0,
+        writers_split_layers: bool = True,
+    ) -> bool:
+        del extra_bytes, writers_split_layers
         return False
 
     def release_idle_reservation(self, _rid_slice: tuple[int, int]) -> None:
@@ -107,8 +114,15 @@ class _PartialFanInBounce(_BounceProbe):
         self.release_count = 0
         self.scatter_count = 0
 
-    def reserve(self, receiver_req, num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
+    def reserve(
+        self,
+        receiver_req,
+        num_writers: int,
+        *,
+        extra_bytes: int = 0,
+        writers_split_layers: bool = True,
+    ) -> bool:
+        del extra_bytes, writers_split_layers
         self.context = TransferContext(
             rid_slice=(receiver_req.unique_rid, receiver_req.slice_id),
             slot_id=0,

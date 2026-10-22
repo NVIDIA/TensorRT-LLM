@@ -235,13 +235,15 @@ class VmmBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        writers_split_layers: bool = True,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
         ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
-        neighboring slot."""
+        neighboring slot. ``writers_split_layers`` is False when every fan-in writer sends a head
+        slice of every layer (TP fan-in), True when the writers hold different layers (PP fan-in)."""
         total = 0
         has_state_group = False
         # Block tables are positional with -1 holes (see Chunk); only the
@@ -311,10 +313,12 @@ class VmmBounceTransport(BounceTransport):
                 f"({total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
                 warn_key="kv-bounce-uneven-fanin",
             )
-        if num_writers > 1:
+        if num_writers > 1 and writers_split_layers:
             # Fan-in gives each writer an equal share of the region, which only matches where it
-            # writes when all writers send the same bytes. Equal layer count guarantees that only
-            # when the per-block sizes match, so require that here, else fall back.
+            # writes when all writers send the same bytes. A TP fan-in writer sends 1/num_writers
+            # of every block of every group, so its share is exact for any per-group block sizes.
+            # PP fan-in writers send different layers, and an equal layer count gives equal bytes
+            # only when the per-block sizes match, so require that here, else fall back.
             # Exclude None entries (STATE groups) — they are already guarded above.
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
@@ -535,6 +539,7 @@ class NoBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        writers_split_layers: bool = True,
     ) -> bool:
         return False
 

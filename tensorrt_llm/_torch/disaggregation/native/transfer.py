@@ -3146,8 +3146,9 @@ class Receiver(ReceiverBase):
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
             list isn't available (shorter than the fan-in degree), be conservative and fall back.
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
+        Equal layer count means equal bytes only when the per-block sizes match; for PP fan-in
+        (writers_split_layers) reserve() rejects the mismatched case, so this only needs the count
+        to split evenly."""
         # Any duplicated head, rank-wide or in a single view pair, leaves some
         # writers without a share (sender side) or doubles one (receiver side).
         view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
@@ -3278,8 +3279,12 @@ class Receiver(ReceiverBase):
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=mamba_dst_slot,
                 )
+        # Fan-in writers split layers only across PP stages; read the overlap only for a fan-in.
         bounced = allow_bounce and self._bounce.reserve(
-            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+            receiver_req,
+            task.expected_transfers,
+            extra_bytes=extra_bytes,
+            writers_split_layers=task.expected_transfers > 1 and topo_overlap.overlap_pp_size > 1,
         )
         session = self._get_session(task._unique_rid)
         if session is None:

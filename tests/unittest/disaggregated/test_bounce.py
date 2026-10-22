@@ -446,6 +446,17 @@ class TestFanInReserve:
         assert t.reserve(req, num_writers=2) is False
         assert req.bounce_dst_base is None
 
+    def test_reserve_heterogeneous_tp_fanin_ok(self, monkeypatch):
+        # TP fan-in: each writer sends a head slice of every block of every group, so its bytes are
+        # total // num_writers for any per-group sizes (here a full-attention group of 16 layers and
+        # a sliding-window group of 46 layers, 64 KiB per layer and block, gathered by 4 writers).
+        t = _make_transport(monkeypatch, block_bytes_per_group=[16 << 16, 46 << 16])
+        req = _recv_req([3, 2])  # total = 3*16 + 2*46 = 140 layer-blocks of 64 KiB
+        assert t.reserve(req, num_writers=4, writers_split_layers=True) is False
+        assert t.reserve(req, num_writers=4, writers_split_layers=False) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        assert t.writer_base(rid_slice, 3) == 0x100000 + 3 * ((140 << 16) // 4)
+
     def test_reserve_uniform_multigroup_fanin_ok(self, monkeypatch):
         # Uniform slot bytes across present groups -> even byte split -> bounce allowed.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100, 100])
