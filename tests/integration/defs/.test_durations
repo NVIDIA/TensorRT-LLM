@@ -1432,7 +1432,7 @@
    "unittest/_torch/test_tensor_lru_cache.py": 25.821470489038788,
    "unittest/_torch/test_torch_multi_arange.py": 44.54385785953178,
    "unittest/_torch/test_utils.py": 23.818320714285715,
-   "unittest/_torch/thop/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise": 26.14916393442623,
+   "unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise": 26.14916393442623,
    "unittest/_torch/visual_gen/kernels/parallel": 22.710182181610506,
    "unittest/_torch/visual_gen/kernels/parallel_hw_agnostic": 21.48396672828096,
    "unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py": 35.379795608108104,
