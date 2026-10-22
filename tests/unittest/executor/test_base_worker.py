@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event, Lock
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -192,6 +196,209 @@ def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
     request = LoRARequest("missing", 1, missing_path)
 
     assert request.path == missing_path
+
+
+@pytest.fixture
+def lora_identity_worker() -> BaseWorker:
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = False
+    worker._lora_model_config = None
+    worker._lora_adapter_identities = {}
+    worker._lora_adapter_id_locks = {}
+    worker._lora_adapter_id_locks_guard = Lock()
+    worker._lora_manager = Mock()
+    worker._lora_manager.cpp_lora_weights = {}
+    worker._lora_manager.cpp_lora_config = {}
+    worker._lora_manager.load_from_ckpt.return_value = ["7"]
+    worker.engine = Mock()
+    return worker
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("change_source", [False, True])
+def test_lora_identity_rejects_conflicting_request(
+        lora_identity_worker: BaseWorker, tmp_path: Path,
+        change_source: bool) -> None:
+    worker = lora_identity_worker
+    path = str(tmp_path / "adapter")
+    worker._load_lora_adapter(LoRARequest("first", 7, path))
+    conflict = LoRARequest("second", 7,
+                           path if change_source else str(tmp_path / "other"),
+                           "nemo" if change_source else "hf")
+    with patch("tensorrt_llm.executor.base_worker.logger.warning") as warning:
+        with pytest.raises(RequestError, match="ID 7 is already bound"):
+            worker._enqueue_request(SimpleNamespace(id=1,
+                                                    lora_request=conflict))
+    assert warning.call_args.args[1:3] == ("7", (path, "hf"))
+    assert worker._lora_manager.load_from_ckpt.call_count == 1
+    worker.engine.enqueue_request.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_lora_identity_preserves_reuse(lora_identity_worker: BaseWorker,
+                                       tmp_path: Path,
+                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = lora_identity_worker
+    path = tmp_path / "adapter"
+    path.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(path, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    worker._load_lora_adapter(LoRARequest("first", 7, str(path)))
+    worker._lora_manager.load_from_ckpt.return_value = []
+    with patch.object(Path,
+                      "resolve",
+                      side_effect=AssertionError("unexpected resolve")):
+        worker._load_lora_adapter(LoRARequest("renamed", 7, str(path)))
+    for alternate in ("adapter", str(alias), ""):
+        worker._load_lora_adapter(LoRARequest("renamed", 7, alternate))
+    assert worker._lora_adapter_identities == {"7": (str(path), "hf")}
+    worker._lora_manager.load_from_ckpt.assert_called_with([""],
+                                                           model_config=None,
+                                                           uids=["7"],
+                                                           ckpt_source="hf")
+    worker._lora_manager.load_from_ckpt.return_value = ["8"]
+    worker._load_lora_adapter(
+        LoRARequest("independent", 8, str(tmp_path / "other")))
+
+
+@pytest.mark.cpu_only
+def test_lora_identity_preserves_id_only_first_use(
+        lora_identity_worker: BaseWorker, tmp_path: Path) -> None:
+    worker = lora_identity_worker
+    worker._lora_manager.load_from_ckpt.return_value = []
+    worker._load_lora_adapter(LoRARequest("cached", 7))
+    assert worker._lora_adapter_identities == {"7": ("", "hf")}
+    with pytest.raises(ValueError, match="already bound"):
+        worker._load_lora_adapter(LoRARequest("new", 7, str(tmp_path)))
+    assert worker._lora_manager.load_from_ckpt.call_count == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("empty_path", [False, True])
+def test_lora_identity_failed_lookup_is_retryable(
+        lora_identity_worker: BaseWorker, tmp_path: Path,
+        empty_path: bool) -> None:
+    worker = lora_identity_worker
+    worker._lora_manager.load_from_ckpt.side_effect = FileNotFoundError(
+        "missing")
+    with pytest.raises(FileNotFoundError, match="missing"):
+        worker._load_lora_adapter(
+            LoRARequest("missing", 7,
+                        "" if empty_path else str(tmp_path / "typo")))
+    assert worker._lora_adapter_identities == {}
+    worker._lora_manager.load_from_ckpt.side_effect = None
+    worker._load_lora_adapter(
+        LoRARequest("corrected", 7, str(tmp_path / "adapter")))
+    assert worker._lora_adapter_identities == {
+        "7": (str(tmp_path / "adapter"), "hf")
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("published_cache",
+                         ["cpp_lora_weights", "cpp_lora_config"])
+def test_lora_identity_retains_partial_binding(lora_identity_worker: BaseWorker,
+                                               tmp_path: Path,
+                                               published_cache: str) -> None:
+    worker = lora_identity_worker
+
+    def fail_after_publish(*args, **kwargs) -> None:
+        getattr(worker._lora_manager, published_cache)["7"] = []
+        raise RuntimeError("load failed")
+
+    worker._lora_manager.load_from_ckpt.side_effect = fail_after_publish
+    with pytest.raises(RuntimeError, match="load failed"):
+        worker._load_lora_adapter(LoRARequest("first", 7, str(tmp_path / "a")))
+    with pytest.raises(ValueError, match="already bound"):
+        worker._load_lora_adapter(LoRARequest("second", 7, str(tmp_path / "b")))
+    assert worker._lora_manager.load_from_ckpt.call_count == 1
+
+
+@pytest.mark.cpu_only
+def test_lora_identity_serializes_registration(lora_identity_worker: BaseWorker,
+                                               tmp_path: Path) -> None:
+    worker = lora_identity_worker
+    load_started = Event()
+    release_load = Event()
+
+    class SignalingLock:
+
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self._attempts_lock = Lock()
+            self._attempts = 0
+            self.second_attempted = Event()
+
+        def __enter__(self):
+            with self._attempts_lock:
+                self._attempts += 1
+                if self._attempts == 2:
+                    self.second_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self._lock.release()
+
+    def load_adapter(*args, **kwargs):
+        load_started.set()
+        assert release_load.wait(timeout=5)
+        return ["7"]
+
+    adapter_lock = SignalingLock()
+    worker._lora_adapter_id_locks["7"] = adapter_lock
+    worker._lora_manager.load_from_ckpt.side_effect = load_adapter
+    requests = [
+        LoRARequest("adapter", 7, str(tmp_path / name)) for name in ("a", "b")
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker._load_lora_adapter, requests[0])
+        assert load_started.wait(timeout=5)
+        second = pool.submit(worker._load_lora_adapter, requests[1])
+        try:
+            assert adapter_lock.second_attempted.wait(timeout=5)
+        finally:
+            release_load.set()
+        futures = [first, second]
+    assert sum(future.exception() is None for future in futures) == 1
+    errors = [future.exception() for future in futures if future.exception()]
+    assert isinstance(errors[0], ValueError)
+    assert "already bound" in str(errors[0])
+    assert worker._lora_manager.load_from_ckpt.call_count == 1
+
+
+@pytest.mark.cpu_only
+def test_lora_identity_allows_independent_registration(
+        lora_identity_worker: BaseWorker, tmp_path: Path) -> None:
+    worker = lora_identity_worker
+    first_started = Event()
+    release_first = Event()
+    second_loaded = Event()
+
+    def load_adapter(*args, uids, **kwargs):
+        adapter_id = uids[0]
+        if adapter_id == "7":
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        else:
+            second_loaded.set()
+        return [adapter_id]
+
+    worker._lora_manager.load_from_ckpt.side_effect = load_adapter
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker._load_lora_adapter,
+                            LoRARequest("first", 7, str(tmp_path / "a")))
+        assert first_started.wait(timeout=5)
+        second = pool.submit(worker._load_lora_adapter,
+                             LoRARequest("second", 8, str(tmp_path / "b")))
+        try:
+            assert second_loaded.wait(timeout=5)
+            assert second.result(timeout=5) is None
+        finally:
+            release_first.set()
+        assert first.result(timeout=5) is None
+    assert set(worker._lora_adapter_identities) == {"7", "8"}
 
 
 def create_fake_llm_args(engine_path, tp_size: int = 1):
