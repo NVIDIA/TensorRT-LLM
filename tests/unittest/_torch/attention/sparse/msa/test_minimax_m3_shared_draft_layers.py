@@ -544,6 +544,7 @@ def test_dense_layers_get_virtual_pools_without_speculation(monkeypatch):
     """Dense target layers need the same stride correction as draft layers."""
 
     def fake_base_prepare(self, index_mapper_capacity):
+        self._page_table_materializer = SimpleNamespace(uses_device_expansion=False)
         self._use_per_layer_page_tables = False
         self.kv_cache_pool_pointers = torch.tensor([[0x6000_0000, 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.tensor([[0, i] for i in range(4)], dtype=torch.int32)

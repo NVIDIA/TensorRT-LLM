@@ -2769,6 +2769,12 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
+        self._prepare_page_table_materializer(index_mapper_capacity)
+        if self._use_per_layer_page_tables:
+            self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
+    def _prepare_page_table_materializer(self, index_mapper_capacity: int) -> None:
+        """Initialize transport after a layout has allocated its host tables."""
         self._page_table_materializer = _BasePageTableMaterializer(
             self.host_kv_cache_block_offsets,
             self._stream,
@@ -2784,9 +2790,6 @@ class KVCacheManagerV2(BaseResourceManager):
             _check_page_table_is_gpu_addressable(
                 copy_idx=self.index_mapper.get_copy_index([], 0, 1)
             )
-        if self._use_per_layer_page_tables:
-            self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
-
         if self._page_table_materializer.uses_device_expansion:
             logger.info(
                 "[KVCacheManager] Expanding the V2 page table from device memory: "
