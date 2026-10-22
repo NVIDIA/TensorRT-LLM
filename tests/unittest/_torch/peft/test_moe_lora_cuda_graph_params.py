@@ -85,11 +85,12 @@ def test_workspace_reservation_uses_largest_token_capacity(
 class _ExtractStub:
     """Minimal stand-in for a CUTLASS LoRA leaf so the unbound extraction method
     can run without constructing a full MoE layer. The method reads
-    `self.layer_idx` and the shared slot-gathering helpers, borrowed from
-    `CutlassMoELoraMixin`."""
+    `self.layer_idx` and the shared slot-gathering and fc1/fc2 checking helpers,
+    borrowed from `CutlassMoELoraMixin`."""
 
     _gather_moe_lora_slots = CutlassMoELoraMixin._gather_moe_lora_slots
     _empty_kernel_slot_dict = staticmethod(CutlassMoELoraMixin._empty_kernel_slot_dict)
+    _require_fc1_fc2 = staticmethod(CutlassMoELoraMixin._require_fc1_fc2)
 
     def __init__(self, layer_idx):
         self.layer_idx = layer_idx
@@ -357,9 +358,8 @@ def test_extract_moe_lora_tensors_cuda_graph_wires_slot_tables():
 
 
 @requires_cuda
-def test_extract_returns_none_without_layer_or_required_modules():
-    rank = 8
-    params, _, _ = _make_params(max_rank=rank)
+def test_extract_returns_none_without_moe_lora_for_the_layer():
+    params, _, _ = _make_params(max_rank=8)
 
     # layer_idx None -> no MoE LoRA for this layer.
     none_layer = CutlassMoELoraMixin._extract_moe_lora_tensors_cuda_graph(
@@ -373,22 +373,32 @@ def test_extract_returns_none_without_layer_or_required_modules():
         is None
     )
 
-    # A layer that only carries fc1 (missing fc2) must bail out: the in-GEMM and
-    # out-GEMM are both required for a routed-expert LoRA delta.
+    # A layer the graph layer map does not carry -> None.
+    assert (
+        CutlassMoELoraMixin._extract_moe_lora_tensors_cuda_graph(
+            _ExtractStub(1), {"cuda_graph_params": params, "num_seqs": 1}
+        )
+        is None
+    )
+
+
+@requires_cuda
+def test_extract_rejects_a_layer_with_only_one_of_fc1_fc2():
+    """The kernel reads both the fc1 and fc2 tables, so a layer carrying only
+    one is an error, as on the per-request path, rather than a LoRA delta
+    silently dropped."""
     fc1_only_key = CudaGraphLoraParams.LoraLayerKey(
         layer_idx=0, module_ids=(int(LoraModuleType.MOE_H_TO_4H),)
     )
     fc1_only = CudaGraphLoraParams(
         max_batch_size=1,
         max_lora_size=1,
-        max_rank=rank,
+        max_rank=8,
         layer_info={
             fc1_only_key: CudaGraphLoraParams.LoraLayerInfo(module_num=1, output_sizes=[_INTER])
         },
     )
-    assert (
+    with pytest.raises(ValueError, match="moe_4h_to_h"):
         CutlassMoELoraMixin._extract_moe_lora_tensors_cuda_graph(
             _ExtractStub(0), {"cuda_graph_params": fc1_only, "num_seqs": 1}
         )
-        is None
-    )

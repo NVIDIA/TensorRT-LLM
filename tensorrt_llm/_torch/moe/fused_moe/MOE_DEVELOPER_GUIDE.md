@@ -577,8 +577,9 @@ quantization to `create_moe` as `override_quant_config`.
 it the way the `__post_init__` passes would (the `quant_config_dict` entry, by
 the match `apply_layerwise_quant_config` uses, then the `exclude_modules`
 match); every MoE model without a lookup of its own passes it at its
-`create_moe` call. GptOss does not: its `__post_init__` rewrites
-`exclude_modules` after the layers are built.
+`create_moe` call. The `exclude_modules` patterns must already name TRT-LLM
+modules by then, so GptOss translates its checkpoint names before it builds
+its layers.
 
 The model's `__post_init__` passes (`apply_layerwise_quant_config`,
 `apply_quant_config_exclude_modules`) can still rewrite a layer's

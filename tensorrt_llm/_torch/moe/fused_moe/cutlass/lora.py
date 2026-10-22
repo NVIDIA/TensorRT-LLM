@@ -325,7 +325,9 @@ class CutlassMoELoraMixin:
         Pulls per-module slot tables and token_to_slot out of
         CudaGraphLoraParams and returns the slot-indexed kwargs accepted by
         torch.ops.trtllm.fused_moe. Returns None when this layer does not
-        carry any MoE LoRA modules in the graph layer map.
+        carry any MoE LoRA modules in the graph layer map, and raises
+        ``ValueError`` when it carries only one of fc1 / fc2, as the
+        per-request path does.
 
         Returned tensor addresses are stable across captures and replays: they
         come from persistent pinned host buffers owned by CudaGraphLoraParams
@@ -343,8 +345,9 @@ class CutlassMoELoraMixin:
             return cuda_graph_params.get_moe_slot_inputs(self.layer_idx, int(module_type))
 
         slot_ranks, slot_ptrs = self._gather_moe_lora_slots(_source)
-        if slot_ranks["fc1"] is None or slot_ranks["fc2"] is None:
+        if slot_ranks["fc1"] is None and slot_ranks["fc2"] is None:
             return None
+        self._require_fc1_fc2(slot_ranks)
 
         num_seqs = lora_params["num_seqs"]
         tokens_per_seq = getattr(cuda_graph_params, "max_tokens_per_seq", 1)

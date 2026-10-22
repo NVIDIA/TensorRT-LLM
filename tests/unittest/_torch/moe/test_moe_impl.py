@@ -1685,6 +1685,67 @@ def test_llama4_min_latency_experts_keep_the_layer_quant_config(monkeypatch):
     assert fused_moe.call_args.kwargs["override_quant_config"] is nvfp4
 
 
+def test_gpt_oss_translates_exclusions_before_building_its_layers(monkeypatch):
+    """GPT-OSS checkpoints name modules ``block.N...``; the experts resolve
+    their exclusion while they are built, so the patterns are translated first."""
+    from tensorrt_llm._torch.models import modeling_gpt_oss
+
+    class _Built(Exception):
+        pass
+
+    seen = []
+
+    def transformer(model_config):
+        seen.append(list(model_config.quant_config.exclude_modules))
+        raise _Built
+
+    monkeypatch.setattr(modeling_gpt_oss, "Transformer", transformer)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.W4A8_MXFP4_FP8,
+            exclude_modules=["block.0.mlp.experts", "block.*.attn.qkv"],
+        ),
+    )
+
+    with pytest.raises(_Built):
+        modeling_gpt_oss.GptOssForCausalLM(model_config)
+
+    assert seen == [["model.block.0.mlp.experts", "model.block.*.attn.qkv_proj"]]
+
+
+def test_gpt_oss_excluded_experts_are_built_unquantized(monkeypatch):
+    """An excluded experts module resolves to the unquantized format at
+    construction, matching what ``__post_init__`` applies afterwards."""
+    from tensorrt_llm._torch.models import modeling_gpt_oss
+
+    for name in ("create_moe", "Linear", "RMSNorm"):
+        monkeypatch.setattr(modeling_gpt_oss, name, MagicMock())
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=8,
+            intermediate_size=16,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            torch_dtype=torch.bfloat16,
+        ),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.W4A8_MXFP4_FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            exclude_modules=["model.block.0.mlp.experts"],
+        ),
+    )
+
+    modeling_gpt_oss.MLPBlock(model_config, layer_idx=0)
+    excluded = modeling_gpt_oss.create_moe.call_args.kwargs["override_quant_config"]
+    assert excluded.quant_algo is None
+    assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
+
+    modeling_gpt_oss.MLPBlock(model_config, layer_idx=1)
+    assert modeling_gpt_oss.create_moe.call_args.kwargs["override_quant_config"] is None
+
+
 _HOPPER_FP8_BLOCK_SCALES_ID = "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales"
 _TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
 
