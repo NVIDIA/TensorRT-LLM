@@ -56,6 +56,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor import _util as util_module
 from tensorrt_llm._torch.pyexecutor import seq_slot_manager as seq_slot_manager_module
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -73,9 +74,10 @@ from tensorrt_llm._torch.pyexecutor._util import (
     should_enable_scheduler_aware_adp_dummy,
     validate_seq_slot_pool_covers_admission,
 )
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_deltas_cache
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
@@ -1017,3 +1019,72 @@ def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_he
     assert creator._get_penalty_workspace_reserve(SimpleNamespace(sampler=SimpleNamespace())) == 0
     # Nor does a mocked executor, as the KV-estimation tests pass in.
     assert creator._get_penalty_workspace_reserve(Mock()) == 0
+
+
+@pytest.mark.parametrize("old_capacity,new_capacity", [(None, 4), (4, 4), (4, 8), (8, 4)])
+def test_resource_factory_reuses_only_released_same_capacity_slots(
+    monkeypatch, old_capacity, new_capacity
+):
+    resources = {}
+    previous = None
+    if old_capacity is not None:
+        previous = SeqSlotManager(old_capacity)
+        previous.prepare_resources(
+            _batch(
+                _fake_req(CUDA_GRAPH_DUMMY_REQUEST_ID),
+                *[_fake_req(i) for i in range(old_capacity - 1)],
+            )
+        )
+        previous.shutdown()
+        previous.shutdown()  # Repeated teardown must not duplicate free slots.
+        resources[ResourceManagerType.SEQ_SLOT_MANAGER] = previous
+
+    monkeypatch.setattr(util_module, "set_low_latency_dispatch", lambda enabled: None)
+    monkeypatch.setattr(util_module, "SimpleUnifiedScheduler", Mock())
+    monkeypatch.setattr(util_module, "create_kv_cache_transceiver", Mock(return_value=None))
+    engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(model_type="llama"), is_encoder_decoder=False
+            )
+        )
+    )
+    scheduler_config = SimpleNamespace(
+        use_python_scheduler=True,
+        enable_prefix_aware_scheduling=True,
+        capacity_scheduler_policy=util_module.CapacitySchedulerPolicy.MAX_UTILIZATION,
+        waiting_queue_policy=util_module.WaitingQueuePolicy.FCFS,
+    )
+    kwargs = dict(
+        dist=SimpleNamespace(),
+        resources=resources,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        llm_args=SimpleNamespace(extra_resource_managers={}),
+        ctx_chunk_config=None,
+        model_engine=engine,
+        max_batch_size=2,
+        max_num_tokens=128,
+        max_num_sequences=new_capacity,
+        scheduler_config=scheduler_config,
+    )
+    bound = util_module.create_py_executor_resources(**kwargs)
+    manager = bound.resource_manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
+    assert (manager is previous) == (old_capacity == new_capacity)
+    assert manager.get_max_resource_count() == new_capacity
+    assert not manager.slot_manager.slot_mapping
+    cohort = [_fake_req(100 + i) for i in range(new_capacity)]
+    manager.prepare_resources(_batch(*cohort))
+    assert {r.seq_slot for r in cohort} == set(range(new_capacity))
+    extra_manager = object()
+    kwargs["llm_args"].extra_resource_managers = {"test_extra": extra_manager}
+    with pytest.raises(RuntimeError, match="Sequence slots must be released"):
+        util_module.create_py_executor_resources(**kwargs)
+    assert "test_extra" not in resources
+    kwargs["llm_args"].extra_resource_managers = {}
+    # Refusing to reuse live slots must not erase their ownership.
+    assert len(manager.slot_manager.slot_mapping) == new_capacity
+    manager.shutdown()
+    rebound = util_module.create_py_executor_resources(**kwargs)
+    assert (
+        rebound.resource_manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER] is manager
+    )
