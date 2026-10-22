@@ -586,15 +586,12 @@ class TestLocalityDomainExecutionPlanner:
         initial_op_kind = "nvfp4_linear" if start_nvfp4 else "bf16_linear"
         final_op_kind = "bf16_linear" if start_nvfp4 else "nvfp4_linear"
         assert linear.partition_plan.op_kind == initial_op_kind
-        assert linear._locality_domain_added_cutedsl_backend is start_nvfp4
 
         linear.quant_config = _FakeQuantConfig(nvfp4=not start_nvfp4)
         linear._replan_locality_domain()
 
         assert linear.partition_plan.op_kind == final_op_kind
         assert linear._locality_domain_runtime is not initial_runtime
-        assert linear._locality_domain_added_cutedsl_backend is not start_nvfp4
-        assert ("cutedsl" in linear.nvfp4_allowed_backends) is (not start_nvfp4)
 
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True

@@ -1,6 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import traceback
-from collections import deque
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Union)
@@ -137,8 +138,6 @@ class PostprocWorker:
             for i, addr in enumerate(push_pipe_addrs)
         ]
         self._to_stop = asyncio.Event()
-
-        self._q = deque()
 
         # Load the tokenizer and share in all records.
         # Guard against a None tokenizer_dir: transformers'

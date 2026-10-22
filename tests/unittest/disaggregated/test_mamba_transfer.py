@@ -679,7 +679,7 @@ def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
         batch.reset_context_requests([req])
         mgr.prepare_resources(batch)
 
-        mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID], is_gen=True, prepare_resource=True)
+        mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID], is_gen=True)
 
         assert mgr._impl.mamba_cache_free_blocks == []
         assert (

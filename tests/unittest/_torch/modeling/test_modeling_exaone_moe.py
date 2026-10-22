@@ -32,6 +32,7 @@ from tensorrt_llm._torch.models.modeling_exaone_moe import (
     get_exaone_swiglu_limit,
 )
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -421,7 +422,7 @@ class TestExaoneMoe(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key, lambda inputs: exaone_moe.forward(**inputs), inputs)
 
                 for _ in range(2):
