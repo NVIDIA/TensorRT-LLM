@@ -3057,6 +3057,8 @@ class PrefillTarget:
         ]
         stack = _stack_views(core)
         self._stack = stack._replace(fhc_norm_w1=_norm_w1(stack.fhc_norm))
+        # The draft sites' `(1 + w)` operands, by norm weight, formed on first use.
+        self._mtp_norm_w1: dict = {}
         # The step `prepare` built, read by the breaks.
         self._step: _PrefillStep | None = None
 
@@ -4297,6 +4299,23 @@ class PrefillTarget:
 
     # ------------------------------------------------------------- the draft ---
 
+    def _mtp_site(self, hc, block_out, inject, norm, first, up) -> tuple:
+        """One of the draft layer's hyper-connection sites on the trunk's prefill kernels:
+        `block_out` injected into the stream `hc`, then the mixer (with injection) from the
+        stored normed stream, or from its rstd from `_HC_RSTD_MIN_ROWS` rows. Returns
+        `(hc, mixed, inject)`."""
+        core = self.core
+        if hc.shape[0] < _HC_RSTD_MIN_ROWS:
+            hc, normed = qwen4_exp_hc_inject_norm(
+                hc, block_out, inject, norm, core.eps, core.hc_count
+            )
+            return (hc, *self._hc_mixer(normed, first, up, True))
+        w1 = self._mtp_norm_w1.get(norm.data_ptr())
+        if w1 is None:
+            w1 = self._mtp_norm_w1[norm.data_ptr()] = _norm_w1(norm)
+        hc, rstd = qwen4_exp_hc_inject_rstd(hc, block_out, inject, core.eps, core.hc_count)
+        return (hc, *self._hc_mixer_rstd(hc, rstd, norm, w1, first, up, True))
+
     def _mtp_moe_block(self, x, dt) -> torch.Tensor:
         """The draft layer's MoE: FP8 block-scale routed experts plus a bf16 shared expert.
 
@@ -4507,18 +4526,35 @@ class PrefillTarget:
             cublas_mm(torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h),
             [rows, core.stream],
         )
-        if _MTP_EMBED_BLOCK_ALL_STREAMS:
-            x = torch.add(x_h, torch.cat([x_e] * core.hc_count, -1))
-        else:
-            x = torch.add(
-                x_h,
-                nn.functional.pad(x_e, [0, core.stream - core.hidden], mode="constant", value=0.0),
+        # With the fused views both hyper-connection sites run the trunk's site and mixers,
+        # as `DecodeTarget._mtp_layer` does: the front end's per-stream `x_h + x_e` is the
+        # first site's injection at unit weight.
+        F = core._mtp_fused
+        fused = F is not None and not core._decode._mtp_unfused and _MTP_EMBED_BLOCK_ALL_STREAMS
+        if fused:
+            x, mixed, inject = self._mtp_site(
+                x_h, x_e, F.unit_inject[:rows], F.ahc_norm, F.ahc_first, F.ahc_up
             )
+        else:
+            if _MTP_EMBED_BLOCK_ALL_STREAMS:
+                x = torch.add(x_h, torch.cat([x_e] * core.hc_count, -1))
+            else:
+                x = torch.add(
+                    x_h,
+                    nn.functional.pad(
+                        x_e, [0, core.stream - core.hidden], mode="constant", value=0.0
+                    ),
+                )
 
         # ---- the decoder layer ----------------------------------------------
-        mixed, inject = qwen4_exp_gated_residual(
-            self._grouped_norm(x, M.ahc_norm), M.ahc_down, M.ahc_up, M.ahc_inject, core.hc_count
-        )
+        if not fused:
+            mixed, inject = qwen4_exp_gated_residual(
+                self._grouped_norm(x, M.ahc_norm),
+                M.ahc_down,
+                M.ahc_up,
+                M.ahc_inject,
+                core.hc_count,
+            )
         # The draft loop reads one row per request from this step: a context request's last
         # row and one row of each generation run (the worker's `gather_ids`). Every row writes
         # the layer's KV and index planes; past those writes only `keep` -- each context's
@@ -4743,11 +4779,19 @@ class PrefillTarget:
                 attn_out = attn_out[keep]
             out, inject = x, inject[keep]
             x = x[keep]
-        x = qwen4_exp_post_inject(x, cublas_mm(attn_out, M.o), inject)
-
-        mixed, inject = qwen4_exp_gated_residual(
-            self._grouped_norm(x, M.mhc_norm), M.mhc_down, M.mhc_up, M.mhc_inject, core.hc_count
-        )
+        if fused:
+            x, mixed, inject = self._mtp_site(
+                x, cublas_mm(attn_out, M.o), inject, F.mhc_norm, F.mhc_first, F.mhc_up
+            )
+        else:
+            x = qwen4_exp_post_inject(x, cublas_mm(attn_out, M.o), inject)
+            mixed, inject = qwen4_exp_gated_residual(
+                self._grouped_norm(x, M.mhc_norm),
+                M.mhc_down,
+                M.mhc_up,
+                M.mhc_inject,
+                core.hc_count,
+            )
         x = qwen4_exp_post_inject(x, self._mtp_moe_block(mixed, dt), inject)
         return x if keep is None else out.index_copy_(0, keep, x)
 
