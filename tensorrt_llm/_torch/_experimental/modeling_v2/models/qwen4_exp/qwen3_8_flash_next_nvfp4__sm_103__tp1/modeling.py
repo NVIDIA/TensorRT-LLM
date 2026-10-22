@@ -560,6 +560,19 @@ _MTP_EMBED_BLOCK_ALL_STREAMS = True
 #: trunk's fused site, attention and projection launches (`DecodeTarget.mtp_forward`).
 _MTP_UNFUSED_ENV = "TRTLLM_MODELING_V2_MTP_UNFUSED"
 
+#: The draft head's lm_head: "bf16" (the checkpoint's, as the verify step reads it) or "fp8" (a
+#: per-vocabulary-row e4m3 copy read by cuBLASLt with per-token activation scales). The draft
+#: head only proposes tokens -- the verify step's bf16 head decides what is emitted -- so the
+#: copy can change acceptance, not outputs.
+_MTP_DRAFT_HEAD_ENV = "TRTLLM_MODELING_V2_MTP_DRAFT_HEAD"
+
+
+def _mtp_draft_head_mode() -> str:
+    mode = os.environ.get(_MTP_DRAFT_HEAD_ENV, "bf16").lower()
+    assert mode in ("bf16", "fp8"), f"{_MTP_DRAFT_HEAD_ENV}={mode!r}: expected bf16 or fp8"
+    return mode
+
+
 #: Decode batches up to this many rows run each trunk hyper-connection site as
 #: `qwen4_exp_hc_decode_first_cute` + `qwen4_exp_hc_decode_mix_cute` (or its NVFP4
 #: variant at an MoE site; two GEMV launches); larger ones as `qwen4_exp_hc_inject_norm`
@@ -1525,6 +1538,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         self._mtp_fused: "_MtpFused | None" = None
+        # (e4m3 [vocab, hidden], fp32 [1, vocab] row scales) when the draft head reads FP8.
+        self._mtp_head_fp8: "tuple[torch.Tensor, torch.Tensor] | None" = None
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
@@ -6509,6 +6524,8 @@ class MTPLayer:
                 1,
             )
             final, _ = qwen4_exp_gated_residual(normed, M.fhc_down, M.fhc_up, None, core.hc_count)
+        if core._mtp_head_fp8 is not None:
+            lm_head = _Fp8DraftHead(*core._mtp_head_fp8)
         return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
 
     def forward(
@@ -6733,6 +6750,38 @@ class _WidenedHead:
         if logits.dtype == torch.bfloat16 and logits.is_contiguous():
             return bf16_to_fp32(logits)
         return logits
+
+
+class _Fp8DraftHead:
+    """The draft head's projection over an FP8 copy of `lm_head`: per-token e4m3 activations
+    (`quantize_e4m3_activation`) times the per-row e4m3 weight, scaled in cuBLASLt's epilogue,
+    bf16 out (`_WidenedHead` widens it as it does the bf16 head's)."""
+
+    def __init__(self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor) -> None:
+        self.weight_fp8, self.weight_scale = weight_fp8, weight_scale
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x8, xs = torch.ops.tensorrt_llm.quantize_e4m3_activation(hidden_states)
+        return torch._scaled_mm(
+            x8,
+            self.weight_fp8.t(),
+            scale_a=xs.float().reshape(-1, 1),
+            scale_b=self.weight_scale,
+            out_dtype=hidden_states.dtype,
+        )
+
+
+def _fp8_rowwise(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`weight` [rows, cols] bf16 -> (e4m3 [rows, cols], fp32 [1, rows]): one scale a row,
+    amax / 448, so each row's largest magnitude maps to e4m3's largest finite value."""
+    scale = torch.empty(weight.shape[0], dtype=torch.float32, device=weight.device)
+    w8 = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    for lo in range(0, weight.shape[0], 16384):
+        hi = min(lo + 16384, weight.shape[0])
+        chunk = weight[lo:hi].float()
+        scale[lo:hi] = (chunk.abs().amax(dim=1) / 448.0).clamp(min=1e-12)
+        w8[lo:hi] = (chunk / scale[lo:hi, None]).to(torch.float8_e4m3fn)
+    return w8, scale.reshape(1, -1).contiguous()
 
 
 class _WideningLogitsProcessor(LogitsProcessor):
@@ -7196,3 +7245,5 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()
+        if self.model.mtp_enabled and _mtp_draft_head_mode() == "fp8":
+            self.model._mtp_head_fp8 = _fp8_rowwise(self.lm_head.weight.data)
