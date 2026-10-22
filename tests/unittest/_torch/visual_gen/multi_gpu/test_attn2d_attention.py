@@ -954,6 +954,75 @@ class TestAttn2DAttentionFlashAttn4:
         )
 
 
+def _logic_attn2d_cudnn_vs_standard(rank, world_size):
+    """Attention2DAttention with CuDNN inner backend matches standard SDPA (2x2 mesh).
+
+    Regression guard for the LSE layout: _combine merges the N=2 partial results
+    assuming forward_with_lse returns LSE as [B, H, S].
+    """
+    pytest.importorskip("cudnn")
+    from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
+
+    row_size, col_size = 2, 2
+    batch, num_heads, head_dim = 1, 8, 128
+    seq_per_rank = 16
+    seq_full = seq_per_rank * world_size
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+
+    inner = CuDNNAttention(num_heads=num_heads, head_dim=head_dim, dtype=torch.bfloat16)
+    try:
+        attn = Attention2DAttention(inner, row_pg, col_pg)
+    except ImportError:
+        pytest.skip("flash_attn_combine JIT kernels not available")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+    q_shard = q_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+
+    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+
+    assert output.shape == q_shard.shape, (
+        f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    ref = (
+        F.scaled_dot_product_attention(
+            q_full.transpose(1, 2).float(),
+            k_full.transpose(1, 2).float(),
+            v_full.transpose(1, 2).float(),
+            scale=scale,
+        )
+        .transpose(1, 2)
+        .to(output.dtype)
+    )
+    expected_shard = ref[:, rank * seq_per_rank : (rank + 1) * seq_per_rank]
+    torch.testing.assert_close(
+        output,
+        expected_shard,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"Rank {rank}: cuDNN Attention2D output differs from standard attention",
+    )
+
+
+class TestAttn2DAttentionCuDNN:
+    """Attention2DAttention using CuDNN as the inner backend."""
+
+    def test_attn2d_cudnn_vs_standard(self):
+        """CuDNN inner backend: output matches standard full-sequence SDPA (2x2 mesh)."""
+        run_test_in_distributed(
+            world_size=4, test_fn=_logic_attn2d_cudnn_vs_standard, use_cuda=True
+        )
+
+
 def _logic_init_guard_no_lse(rank, world_size):
     """Inner backend with support_lse()=False raises RuntimeError."""
 

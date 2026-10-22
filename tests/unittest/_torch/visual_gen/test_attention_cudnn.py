@@ -76,7 +76,7 @@ def _reference(q, k, v, is_causal):
         seq_q, seq_kv = q.shape[2], k.shape[2]
         causal_mask = torch.ones(seq_q, seq_kv, device=q.device, dtype=torch.bool)
         logits = logits.masked_fill(causal_mask.triu(seq_kv - seq_q + 1), float("-inf"))
-    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1).transpose(1, 2)
+    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1)
 
 
 @pytest.mark.parametrize("quant_dtype", list(QUANT_CONFIGS), ids=["unquantized", "fp8", "mxfp8"])
@@ -105,7 +105,7 @@ def test_cudnn_attention(quant_dtype, shape, is_causal):
     ref_out, ref_lse = _reference(q, k, v, is_causal)
     assert output.shape == (batch, seq_q, num_heads, head_dim)
     assert output.dtype == torch.bfloat16
-    assert lse.shape == (batch, seq_q, num_heads)
+    assert lse.shape == (batch, num_heads, seq_q)
 
     cosine = F.cosine_similarity(output.float().flatten(), ref_out.flatten(), dim=0).item()
     assert cosine > MIN_COSINE[quant_dtype], (
