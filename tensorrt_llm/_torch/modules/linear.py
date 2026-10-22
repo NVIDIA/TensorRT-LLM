@@ -51,6 +51,8 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
+from .lowm_linear import (lowm_enabled, maybe_lowm_bf16_linear,
+                          maybe_lowm_fp8_linear)
 
 
 class WeightMode(str, enum.Enum):
@@ -616,6 +618,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Qwen3.5 decode-sized BF16 projections the model opted in (lowm_linear)
+        # come first; when they decline (shape not measured, too many rows) the
+        # generic low-M dispatcher below may still apply.
+        if getattr(module, "_q35_lowm_bf16", False) and lowm_enabled():
+            output = maybe_lowm_bf16_linear(module, input, bias)
+            if output is not None:
+                return output
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output
@@ -772,6 +781,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        if getattr(module, "_q35_lowm", False) and lowm_enabled():
+            # Qwen3.5 decode-sized W8A8 projections the model opted in: one
+            # low-M kernel, a BF16 input quantized in registers with the
+            # static input scale.
+            output = maybe_lowm_fp8_linear(module, input, bias)
+            if output is not None:
+                return output
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
