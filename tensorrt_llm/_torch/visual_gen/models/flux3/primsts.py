@@ -31,7 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     pack_nvfp4_swiglu_weight,
     pack_swiglu_weight,
     prepare_nvfp4_gemm,
-    qkv_gemm_config,
+    qkv_planes,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
     Flux3FP8RowwiseLinearMethod,
@@ -550,12 +550,7 @@ def qkv_forward(
         )
     else:
         output = fp8_qkv_qknorm_rope(*args, None)
-    width = output.shape[-1] // 3
-    config = qkv_gemm_config(
-        data, adapter.weight, 128, qkv_scale=getattr(adapter, "qkv_scale", None) is not None
+    planes = qkv_planes(
+        output, data, adapter.weight, 128, qkv_scale=getattr(adapter, "qkv_scale", None) is not None
     )
-    if config is not None and config.separate_qkv_output:
-        q, k, v = output.view(3, -1, width)
-    else:
-        q, k, v = output.split(width, dim=-1)
-    return tuple(t.reshape(*original.shape[:-1], width) for t in (q, k, v))
+    return tuple(t.reshape(*original.shape[:-1], t.shape[-1]) for t in planes)

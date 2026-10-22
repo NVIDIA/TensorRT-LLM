@@ -22,7 +22,7 @@ Quantized attention is configured through `VisualGenArgs.attention_config.quant_
 
 ### Recipes
 
-A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_size))`. Only the combinations below are accepted; `AttentionConfig` validates the recipe against the selected backend at construction time and raises `ValueError` otherwise (`tensorrt_llm/visual_gen/args.py`, `_validate_quant_attention_config`).
+A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_size))` together with the `vc_attention` flag: the PrimTS per-tensor FP8 rows and the VC-Attention rows share the same tuple and differ only in `vc_attention`. Only the combinations below are accepted; `AttentionConfig` validates the recipe against the selected backend at construction time and raises `ValueError` otherwise (`tensorrt_llm/visual_gen/args.py`, `_validate_quant_attention_config`).
 
 | Backend | `qk_dtype` | `v_dtype` | `(q, k, v)` block sizes | Common name |
 |---|---|---|---|---|

@@ -192,15 +192,16 @@ class AttentionConfig(StrictBaseModel):
         # VC-Attention stores V as E4M3 residuals around tile means with one scale per channel.
         # VC-Attention-QK16 keeps Q/K in BF16, VC-Attention-QK8 quantizes the Hadamard-rotated
         # Q/K to E4M3 with one scale per 128 tokens. The recipe fixes these block sizes, so the
-        # config names only the element formats.
+        # SageAttention block-size fields stay 0 and the rows differ from PRIMSTS_RECIPES only
+        # by the vc_attention flag.
         VC_ATTENTION_RECIPES = {
             100: {
-                ("bf16", "fp8"),
-                ("fp8", "fp8"),
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
             },
             103: {
-                ("bf16", "fp8"),
-                ("fp8", "fp8"),
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
             },
         }
         # Other recipes verify the hardware at corresponding backend implementations.
@@ -236,7 +237,6 @@ class AttentionConfig(StrictBaseModel):
                         "and do not apply to VC-Attention, which fixes its own block sizes. "
                         f"Leave them at 0, got {block_sizes!r}."
                     )
-                recipe = (q_config.qk_dtype, q_config.v_dtype)
                 recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
                 family = "VC-Attention"
             else:

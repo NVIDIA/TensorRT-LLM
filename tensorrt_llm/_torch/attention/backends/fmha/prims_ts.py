@@ -51,7 +51,9 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
     )
-    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import VCAttentionPreprocessor
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
+        VCAttentionPreprocessor,
+    )
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -157,42 +159,6 @@ def get_attention_feature_unsupported_reason(
     ):
         return "SageAttention is not supported."
     return None
-
-
-def vc_smooth_phase(denoise_step):
-    """V-Smooth phase of a denoise step as (smooth, refresh), the VCAttentionPreprocessor schedule.
-
-    No step, as in warm-up, counts as a refreshing smooth step. The CUDA graph runner keys the
-    transformer graph on this value so each phase replays its own capture.
-    """
-    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
-        VC_PERM_REFRESH_EVERY,
-        VC_SMOOTH_STEP_FRACTION,
-    )
-
-    if denoise_step is None:
-        return (True, True)
-    step_idx, num_steps = denoise_step
-    smooth = step_idx < math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps)
-    return (smooth, smooth and step_idx % VC_PERM_REFRESH_EVERY == 0)
-
-
-def vc_phase_denoise_step():
-    """A denoise step that puts the preprocessor in the phase of the current graph key.
-
-    Under CUDA graph replay the real step is unknown to the captured code, so the phase the
-    runner resolved on the host selects a representative step. Outside the runner the real step is used.
-    """
-    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
-    from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
-
-    phase = resolved_extra_key("flux3_vc_phase")
-    if phase is None:
-        return get_denoise_step()
-    smooth, refresh = phase
-    if not smooth:
-        return (7, 8)
-    return (0, 8) if refresh else (1, 8)
 
 
 class PrimsTSFmha(PhasedFmha):
@@ -937,7 +903,7 @@ class PrimsTSFmha(PhasedFmha):
 
                     self._vc_preprocessor = VCAttentionPreprocessor()
                 vc_operands = self._vc_preprocessor.prepare(
-                    k_bshd, v_bshd, q=vc_q, denoise_step=vc_phase_denoise_step()
+                    k_bshd, v_bshd, q=vc_q, denoise_step=forward_args.vc_denoise_step
                 )
             k_bshd, v_bshd, vc_params = vc_operands.k, vc_operands.v, vc_operands.params
             vc_demean = vc_operands.demean

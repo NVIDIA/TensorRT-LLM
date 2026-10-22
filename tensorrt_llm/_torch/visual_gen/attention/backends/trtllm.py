@@ -19,7 +19,8 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Optional, Union
+import math
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -38,7 +39,42 @@ from ....attention.backends.sparse.timestep_phase import graph_phase_for_timeste
 from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ...cuda_graph_runner import resolved_extra_key
+from ...denoise_step import get_denoise_step
 from .interface import AttentionBackend, AttentionTensorLayout
+
+
+def vc_smooth_phase(denoise_step: Optional[Tuple[int, int]]) -> Tuple[bool, bool]:
+    """V-Smooth phase of a denoise step as (smooth, refresh), the VCAttentionPreprocessor schedule.
+
+    No step, as in warm-up, counts as a refreshing smooth step. The CUDA graph runner keys the
+    transformer graph on this value so each phase replays its own capture.
+    """
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
+        VC_PERM_REFRESH_EVERY,
+        VC_SMOOTH_STEP_FRACTION,
+    )
+
+    if denoise_step is None:
+        return (True, True)
+    step_idx, num_steps = denoise_step
+    smooth = step_idx < math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps)
+    return (smooth, smooth and step_idx % VC_PERM_REFRESH_EVERY == 0)
+
+
+def vc_denoise_step() -> Optional[Tuple[int, int]]:
+    """The denoise step that puts the VC preprocessor in the phase of the current graph key.
+
+    Under CUDA graph replay the real step is unknown to the captured code, so the phase the
+    runner resolved on the host selects a representative step. Outside the runner the real step
+    is used.
+    """
+    phase = resolved_extra_key("flux3_vc_phase")
+    if phase is None:
+        return get_denoise_step()
+    smooth, refresh = phase
+    if not smooth:
+        return (7, 8)
+    return (0, 8) if refresh else (1, 8)
 
 
 class TrtllmAttentionMetadata:
@@ -236,6 +272,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
+        # Without the trtllm-gen fallback library (TLLM_FMHA_LIBS=prims_ts) dense attention
+        # is served by a cache-free FMHA that takes separate Q, K and V.
+        self._no_fallback_fmha = not any(
+            isinstance(fmha, FallbackFmha) for fmha in self._fmha_manager.fmha_libs
+        )
         if quant_attention_config is not None and quant_attention_config.vc_attention:
             if not any(fmha.supports_vc_attention for fmha in self._fmha_manager.fmha_libs):
                 raise RuntimeError(
@@ -394,17 +435,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # V only on the calls that run its sparse path. Its dense-layer and
         # dense-phase calls take the fused path: the TRTLLM kernel serves dense
         # self-attention from fused QKV only.
-        # Without the trtllm-gen fallback library (TLLM_FMHA_LIBS=prims_ts) dense attention is served by a
-        # cache-free FMHA that takes separate Q, K and V.
-        fmha_libs = getattr(getattr(self, "_fmha_manager", None), "fmha_libs", None)
-        no_fallback_fmha = isinstance(fmha_libs, (list, tuple)) and not any(
-            isinstance(fmha, FallbackFmha) for fmha in fmha_libs
-        )
         use_separate_qkv = (
             block_sparse_inputs is not None
             or self.quant_attention_config is not None
             or (not self.support_fused_qkv() and self.should_use_sparse(sparse_attn_phase))
-            or no_fallback_fmha
+            or self._no_fallback_fmha
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")
@@ -424,6 +459,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     "vc_attention": True,
                     "vc_attention_qk_fp8": quant_cfg.qk_dtype == "fp8",
                     "vc_repair_budget": quant_cfg.vc_repair_budget,
+                    "vc_denoise_step": vc_denoise_step(),
                 }
             elif quant_cfg is not None:
                 sage_kwargs = {

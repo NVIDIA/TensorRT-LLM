@@ -191,9 +191,7 @@ class TestAttentionConfigQuantValidation:
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
             attention = AttentionConfig(
                 backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(
-                    qk_dtype=qk_dtype, vc_attention=True
-                ),
+                quant_attention_config=QuantAttentionConfig(qk_dtype=qk_dtype, vc_attention=True),
             )
 
         assert attention.quant_attention_config.vc_attention

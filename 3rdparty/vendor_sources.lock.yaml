@@ -36,3 +36,14 @@ vendors:
     patch: 3rdparty/vendor_patches/sana-sol-attn.patch
     patch_digest: sha256:0d66669021683773aff34533abaf8f200abd09e3af93d19eed0e2a2e04f2f980
     digest: sha256-tree-v1:383f6085ca1bc2438e8d7d4796036af3a816dbfd396313704f7f4be2c06ac55b
+  flashinfer-prims-ts-gemm:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    branch: main
+    commit: 8b37094e149c27e112d415fc92d1920c950f9ebd
+    source: flashinfer/prims_ts/gemm
+    destination: tensorrt_llm/_torch/visual_gen/prims_ts/gemm
+    include:
+    - '**/*.py'
+    patch: 3rdparty/vendor_patches/flashinfer-prims-ts-gemm.patch
+    patch_digest: sha256:3550539e3287d87c76daa18f283dadea77f044634258b399c841a053c1bad92b
+    digest: sha256-tree-v1:614da6fe590c9243fce6674f1e47e104cef66b510d1fda30dbbf741fb8f18e2d

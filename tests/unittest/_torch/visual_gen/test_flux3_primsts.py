@@ -95,11 +95,8 @@ def test_fp8_fake_output_contracts():
 
 def _qkv_as_packed(out, activation, weight, qkv_scale=False):
     """Undo the Q, K and V planes when the config the op ran with writes them."""
-    config = ops.qkv_gemm_config(activation, weight, 128, qkv_scale=qkv_scale)
-    if config is None or not config.separate_qkv_output:
-        return out
-    m, n = out.shape
-    return out.view(3, m, n // 3).permute(1, 0, 2).reshape(m, n)
+    q, k, v = ops.qkv_planes(out, activation, weight, 128, qkv_scale=qkv_scale)
+    return torch.cat((q, k, v), dim=-1)
 
 
 @pytest.mark.parametrize("epilogue", ["linear", "swiglu", "qkv"])

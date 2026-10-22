@@ -202,6 +202,31 @@ def qkv_gemm_config(
     return _gemm_config(activation, weight, "qkv_qknorm_rope", head_dim, qkv_scale=qkv_scale)
 
 
+def qkv_planes(
+    output: torch.Tensor,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    head_dim: int,
+    *,
+    qkv_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q, K and V of a fused QKV GEMM ``output``, each [M, N/3], as the GEMM laid them out.
+
+    The QKV ops return the GEMM buffer itself because a custom op may not return views of
+    its own output, so this is the one place that reads the layout: under
+    separate_qkv_output the buffer holds three contiguous [M, N/3] planes, otherwise it is
+    the packed [M, N] tensor and is split along the last dimension. The config lookup is
+    memoized, so it costs a dictionary hit.
+    """
+    config = qkv_gemm_config(activation, weight, head_dim, qkv_scale=qkv_scale)
+    width = output.shape[-1] // 3
+    if config is not None and config.separate_qkv_output:
+        q, k, v = output.view(3, -1, width)
+    else:
+        q, k, v = output.split(width, dim=-1)
+    return q, k, v
+
+
 @torch.library.custom_op("trtllm::flux3_primsts_fp8_linear", mutates_args=(), device_types="cuda")
 def fp8_linear(
     activation: torch.Tensor,
@@ -274,7 +299,8 @@ def fp8_qkv_qknorm_rope(
     """FP8 QKV GEMM with BF16 per-head RMSNorm and interleaved RoPE.
 
     Norm weights are [128], cos_sin is FP32 [M,128] (half cos, half sin),
-    positions is int64 [M] or None for identity indices, and output is BF16 [M,3*heads*128].
+    positions is int64 [M] or None for identity indices, and output is BF16 [M,3*heads*128]
+    in the layout ``qkv_planes`` reads.
     The kernel has fixed RMSNorm epsilon 1e-6 and equal Q/KV head counts.
     """
     from tensorrt_llm._torch.visual_gen.prims_ts import gemm
@@ -535,6 +561,7 @@ def nvfp4_qkv_qknorm_rope(
     positions: torch.Tensor | None,
     qkv_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """NVFP4 QKV GEMM with per-head RMSNorm and RoPE, BF16 [M,N] in the layout ``qkv_planes`` reads."""
     if positions is None:
         positions = _token_positions(activation.shape[0], activation.device)
 

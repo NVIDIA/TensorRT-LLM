@@ -1108,7 +1108,7 @@ class Flux3Model(BaseDiffusionModel):
             and not quant_attention.vc_repair_budget
         ):
             # The tile-mean recipe follows the V-Smooth step schedule, so each phase gets its own graph.
-            from tensorrt_llm._torch.attention.backends.fmha.prims_ts import vc_smooth_phase
+            from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import vc_smooth_phase
             from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
 
             runner.register_extra_key_fn(

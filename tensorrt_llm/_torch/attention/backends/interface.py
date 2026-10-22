@@ -978,6 +978,9 @@ class AttentionForwardArgs:
     vc_attention: bool = False
     vc_attention_qk_fp8: bool = False
     vc_repair_budget: float = 0.0
+    # Denoise step as (step_index, num_steps) for the V-Smooth schedule of the
+    # tile-mean recipe. None means no step is active, as in warm-up.
+    vc_denoise_step: Optional[Tuple[int, int]] = None
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
