@@ -55,6 +55,10 @@ def test_k3_prepare_metadata_match_chunk_indices() -> None:
         cu_seqlens = metadata.query_start_loc_long[: len(context_lengths) + 1]
         legacy_chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size=64)
         torch.testing.assert_close(metadata.kda_chunk_indices, legacy_chunk_indices)
+        # The host copy FLA's chunked prefill reads instead of the device cu_seqlens.
+        assert metadata.kda_cu_seqlens_cpu.device.type == "cpu"
+        torch.testing.assert_close(metadata.kda_cu_seqlens_cpu, cu_seqlens.cpu())
+        torch.testing.assert_close(metadata.kda_cu_seqlens, cu_seqlens)
 
 
 def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
