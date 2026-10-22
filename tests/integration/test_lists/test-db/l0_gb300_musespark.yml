@@ -19,7 +19,8 @@ l0_gb300_musespark:
       stage: pre_merge
       backend: pytorch
   tests:
-  - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance
+  # Disabled: needs the DFlash2 draft model, which the CI model cache does not have.
+  # - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance
   # MuseSparkOpen decode-path fusions (random weights, no checkpoint). The finalize+all-reduce
   # parity, stress and lifecycle files stay unlisted, as in l0_gb300_multi_gpus.yml: they need
   # an external 4- or 8-rank MPI launch and every case skips under single-process pytest.
