@@ -4166,3 +4166,53 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+
+
+def _make_gen_only_stream_request(request_id, decoding_iter):
+    request = MagicMock()
+    request.py_request_id = request_id
+    request.is_attention_dp_dummy = False
+    request.py_kv_transfer_timed_out = False
+    request.is_generation_only_request = True
+    request.is_disagg_generation_transmission_in_progress = False
+    request.py_csa2_remote_tail_mode = None
+    request.py_draft_tokens = []
+    request.py_decoding_iter = decoding_iter
+    request.return_perf_metrics = False
+    request.is_finished = False
+    request.py_gen_first_emitted = False
+    request.py_total_draft_tokens = 0
+    return request
+
+
+def _make_stream_executor(requests, emit_first_step):
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = list(requests)
+    executor.perf_manager = MagicMock()
+    executor.iter_counter = 1
+    executor.stream_interval = 20
+    executor.disable_overlap_scheduler = False
+    executor.disagg_gen_emit_first_step = emit_first_step
+    executor.dist = types.SimpleNamespace(rank=0, world_size=1)
+    executor.kv_cache_transceiver = None
+    executor.enable_attention_dp = False
+    executor._enqueue_responses = MagicMock()
+    return executor
+
+
+@pytest.mark.parametrize("emit_first_step", [False, True])
+def test_disagg_gen_first_step_is_streamed_once(emit_first_step):
+    # Under the overlap scheduler a generation-only request skips iteration 1
+    # (the CTX returned the first token); its first GEN step is iteration 2.
+    request = _make_gen_only_stream_request(1, decoding_iter=2)
+    executor = _make_stream_executor([request], emit_first_step)
+
+    PyExecutor._handle_responses(executor)
+    assert request.create_response.call_count == (1 if emit_first_step else 0)
+    assert request.py_gen_first_emitted is emit_first_step
+
+    # Later steps follow stream_interval again.
+    request.py_decoding_iter = 3
+    executor.active_requests = [request]
+    PyExecutor._handle_responses(executor)
+    assert request.create_response.call_count == (1 if emit_first_step else 0)
