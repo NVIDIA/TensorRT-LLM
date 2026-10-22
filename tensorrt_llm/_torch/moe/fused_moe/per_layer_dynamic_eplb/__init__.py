@@ -7,8 +7,9 @@ migration. Per-layer dynamic EPLB instead produces one device-side replica plan
 for every MoE invocation and copies helper weights on a CUDA stream. It keeps
 the existing load-balancer seams: ``manager`` owns the layers and their GPU
 resources for the whole model, ``layer`` is the per-layer handle that plans each
-route and releases its plan, ``arena`` allocates the live-weight storage, and
-``planner`` submits HALO-Q and the TMA copy of its plan.
+route and releases its plan, ``arena`` allocates the live-weight storage,
+``planner`` submits HALO-Q and the TMA copy of its plan, and ``halo_r_planner``
+submits HALO-R and its relay copy.
 """
 
 from .layer import PerLayerDynamicMoeLayerLoadBalancer

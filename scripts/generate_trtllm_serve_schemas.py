@@ -133,6 +133,19 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_helper_slot_mode().
+    schema["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__].update(
+        {
+            "if": {"properties": {"planner": {"const": "halo_r"}}, "required": ["planner"]},
+            "then": {
+                "properties": {
+                    "helper_slot_mode": {"const": "shared_banks"},
+                    "auxiliary_sms": {"minimum": 2},
+                },
+                "required": ["helper_slot_mode"],
+            },
+        }
+    )
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

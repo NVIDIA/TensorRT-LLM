@@ -1085,6 +1085,15 @@
       "path": "moe_config.load_balancer.num_slots"
     },
     {
+      "allowed_values": [
+        "halo_q",
+        "halo_r"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.planner"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_config.max_num_tokens"
