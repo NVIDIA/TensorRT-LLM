@@ -23,6 +23,7 @@ from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .prims_ts import PrimsTSFmha
 from .triton_custom_mask import TritonCustomMaskFmha
+from .trtllm_gen_dense_fp8 import TrtllmGenDenseFp8Fmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
@@ -50,6 +51,9 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "msa_prefill": MsaPrefillFmha,
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "prims_ts": PrimsTSFmha,
+        # Per-tensor FP8 dense context attention for visual generation; after PrimTS so
+        # PrimTS keeps precedence where it is enabled.
+        "trtllm_gen_dense_fp8": TrtllmGenDenseFp8Fmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,

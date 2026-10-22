@@ -120,6 +120,9 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
         "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8",
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
+    # enable_fp8_block_fusions: static-FP8 checkpoints fuse each block's GEMM bias/GELU/FP8
+    # outputs and residual + norm + FP8 quantization (opt-in).
+    defaults={"enable_fp8_block_fusions": False},
     doc="Wan 2.1 & 2.2 text-to-video family.",
     supports_nvfp4_vae=True,
 )
