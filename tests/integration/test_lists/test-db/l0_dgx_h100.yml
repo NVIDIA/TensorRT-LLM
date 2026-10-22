@@ -266,6 +266,7 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_user_buffer[2proc-90]
+  - cpp/test_multi_gpu.py::test_nccl_utils[2proc-90]
 - condition:
     ranges:
       system_gpu_count:
@@ -293,7 +294,7 @@ l0_dgx_h100:
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
-    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp1]
+    - examples/test_ray.py::test_ray_disaggregated_serving[tp1]
 - condition:
     ranges:
       system_gpu_count:

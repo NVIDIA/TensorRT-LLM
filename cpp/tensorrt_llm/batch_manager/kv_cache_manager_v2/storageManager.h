@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
@@ -128,7 +129,8 @@ public:
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
-        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f);
+        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
+        Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -163,6 +165,12 @@ public:
 
     // Remove a page from the eviction queue.
     void excludeFromEviction(Page& page);
+
+    //! Change priority only while detached from its current priority queue.
+    void updatePriority(Page& page, Priority priority);
+    void cancelRetentionExpiry(Page& page);
+    void scheduleRetentionExpiry(Page& page);
+    void refreshRetention();
 
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
@@ -387,6 +395,8 @@ private:
 
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
 
+    void _prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+        MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
         PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
         DropRecorder const& dropRecorder = {});
@@ -416,6 +426,7 @@ private:
 
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
+    Priority mColdTierOffloadMinPriority;
     LifeCyclePoolGroupMapping mHotPoolGroupMapping;
     LifeCyclePoolGroupMapping mColdPoolGroupMapping;
     // Codec batching representative for each lifecycle.
@@ -462,6 +473,7 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
+    RetentionExpiryQueue mRetentionExpiries;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;

@@ -749,6 +749,34 @@ class TestLogIterationStatsKvCacheIteration:
             )
             for level, tier in enumerate(["gpu", "gpu", "host"])
         ] == [5, 2, 1]
+        # No connector serves tokens, so no connector series is reported.
+        assert not _has_series(
+            collector.counter_tokens_cached_prompt_by_tier,
+            {**collector.labels, "cache_level": "", "cache_tier": "connector"},
+        )
+
+    def test_connector_cached_tokens_logged_as_connector_tier(self):
+        collector = _make_kv_iter_collector()
+        connector_labels = {**collector.labels, "cache_level": "", "cache_tier": "connector"}
+
+        # The series is visible before the connector serves its first token.
+        collector.log_iteration_stats({"iterConnectorCachedTokens": 0})
+        assert _has_series(collector.counter_tokens_cached_prompt_by_tier, connector_labels)
+        assert (
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier, connector_labels
+            )
+            == 0
+        )
+
+        collector.log_iteration_stats({"iterConnectorCachedTokens": 6})
+        collector.log_iteration_stats({"iterConnectorCachedTokens": 4})
+        assert (
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier, connector_labels
+            )
+            == 10
+        )
 
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""
@@ -828,6 +856,7 @@ class TestLogIterationStatsKvCacheIteration:
                     "iterFullReusedBlocks": 4,
                     "iterPartialReusedBlocks": 1,
                     "iterMissedBlocks": 3,
+                    "iterConnectorReusedBlocks": 2,
                 },
                 "1": {
                     "kind": "ssm",
@@ -861,6 +890,9 @@ class TestLogIterationStatsKvCacheIteration:
 
         before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
         before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+        before_connector_reused = _get_counter_value(
+            collector, "kv_cache_iter_connector_reused_blocks"
+        )
         before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
         before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
 
@@ -874,6 +906,9 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_counter_value(
             collector, "kv_cache_iter_missed_blocks"
         ) - before_missed == pytest.approx(3)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_connector_reused_blocks"
+        ) - before_connector_reused == pytest.approx(2)
         assert _get_counter_value(
             collector, "kv_cache_gen_alloc_blocks_total"
         ) - before_gen_alloc == pytest.approx(2)
@@ -1044,6 +1079,11 @@ class TestLogIterationStatsKvCacheIteration:
 def _counter_value_with_labels(metric, labels: Dict[str, str]) -> float:
     """Get the current value of a Prometheus counter with extra labels."""
     return metric.labels(**labels)._value.get()
+
+
+def _has_series(metric, labels: Dict[str, str]) -> bool:
+    """Whether a labelled series exists, without creating it as ``metric.labels`` would."""
+    return tuple(labels[name] for name in metric._labelnames) in metric._metrics
 
 
 class TestPromptCacheMetrics:
