@@ -922,3 +922,477 @@ def test_indexer_slot_mappings_are_staged_with_a_stager():
     assert [name for name, _, _ in metadata.step_input_stager.calls] == ["copy", "copy"]
     assert bool((metadata.slot_mapping_fp8 == -1).all())
     assert bool((metadata.slot_mapping_scale == -1).all())
+
+
+# -- the step-input window in the decoder runner -------------------------------------------------
+
+
+class _ReferenceStager:
+    """A step-input stager that accepts every step it is offered and logs the window's lifecycle."""
+
+    def __init__(self, log: list, accept: bool = True, tokens: int = 3) -> None:
+        self.log, self.accept, self.tokens = log, accept, tokens
+
+    def begin_if_eligible(
+        self,
+        preparer,
+        requests,
+        attn_metadata,
+        spec_metadata,
+        new_tensors_device,
+        *,
+        graph_replay,
+        static_inputs,
+        is_dummy,
+        enable_spec_decode,
+        promoted,
+    ):
+        self.log.append(("begin", graph_replay, static_inputs))
+        return self if self.accept else None
+
+    def end(self, record_event: bool = True) -> None:
+        self.log.append(("end", record_event))
+
+    def discard(self) -> None:
+        self.log.append("discard")
+
+    def set_completion_event(self, event) -> None:
+        self.log.append(("completion_event", event))
+
+    def static_inputs_tokens(self) -> int:
+        return self.tokens
+
+
+class _WindowGraphs:
+    """The ``DecoderCudaGraphs`` calls ``_forward_decoder`` makes, with one selected graph key.
+
+    ``run`` follows ``DecoderCudaGraphs._run``: ``before_replay`` runs only right before the
+    replay of an already captured graph, and the replay consumes the staged static inputs.
+    """
+
+    def __init__(self, log: list, key, *, needs_capture=False, warmup_only=False, fail=None):
+        self.log, self.key, self.fail = log, key, fail
+        self.cuda_graph_runner = types.SimpleNamespace(
+            needs_capture=lambda key: needs_capture,
+            is_warmup_only=warmup_only,
+            shared_static_tensors={"input_ids": torch.zeros(4, dtype=torch.int64)},
+            staged_static_input_tokens=0,
+        )
+
+    def attention_dp_execution_batch(self, requests):
+        return requests
+
+    def promote_final_contexts(self, requests, kv_cache_manager, **kwargs):
+        return requests, frozenset()
+
+    def pad_batch(self, requests, resource_manager, runtime_draft_len):
+        return contextlib.nullcontext(requests)
+
+    def select(self, requests, resource_manager, **kwargs):
+        return types.SimpleNamespace(
+            key=self.key,
+            use_lora_graph=False,
+            attn_metadata=kwargs["attn_metadata"],
+            spec_metadata=None,
+        )
+
+    def captures_model_body(self, key) -> bool:
+        return False
+
+    def run(self, key, inputs, run_model, postprocess_inputs, *, before_replay=None, **kwargs):
+        runner = self.cuda_graph_runner
+        if self.fail == "before_replay":
+            raise RuntimeError("graph run failed")
+        if key is None:
+            self.log.append("eager")
+        elif runner.needs_capture(key) or runner.is_warmup_only:
+            self.log.append("capture")
+        else:
+            if before_replay is not None:
+                before_replay()
+            self.log.append(("replay", runner.staged_static_input_tokens))
+            runner.staged_static_input_tokens = 0
+            if self.fail == "replay":
+                raise RuntimeError("replay failed")
+        return "outputs"
+
+
+class _WindowPreparer:
+    """The ``DecoderInputPreparer`` calls ``_forward_decoder`` makes."""
+
+    def __init__(self, log: list, fail: bool = False) -> None:
+        self.log, self.fail = log, fail
+        self.input_copy_event = "input-copy-event"
+
+    def prepare_inputs(self, *args, **kwargs):
+        self.log.append("prepare")
+        if self.fail:
+            raise RuntimeError("preparation failed")
+        return types.SimpleNamespace(kwargs={}, runtime_draft_len=0, gather_ids=None)
+
+    def record_input_copy(self) -> None:
+        self.log.append("record_input_copy")
+
+    def postprocess_inputs(self, *args, **kwargs) -> None:
+        pass
+
+
+def _window_runner(monkeypatch, graphs, preparer, stager):
+    """A ``DecoderRunner`` with only what ``_forward_decoder`` reads (no speculation, no CED)."""
+    from tensorrt_llm._torch.pyexecutor import ced_replay
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+
+    monkeypatch.setattr(runner_module, "get_draft_kv_cache_manager", lambda *args: None)
+    monkeypatch.setattr(ced_replay, "uses_private_decoder_cache", lambda *args: False)
+    attn_metadata = types.SimpleNamespace()
+    runner = DecoderRunner.__new__(DecoderRunner)
+    runner._config = types.SimpleNamespace(spec_config=None, use_mrope=False, is_spec_decode=False)
+    runner._metadata = types.SimpleNamespace(
+        setup_attention=lambda *args: attn_metadata,
+        attn_metadata=attn_metadata,
+        spec_metadata=None,
+    )
+    runner._graphs = graphs
+    runner._inputs = preparer
+    runner._stage_in_graph_sampling = None
+    runner._cuda_graph_metadata_prepare_scope = lambda *args, **kwargs: contextlib.nullcontext()
+    runner._execute_logit_post_processors = lambda *args: None
+    runner.forward_pass_callable = None
+    runner.moe_load_balancer = None
+    runner.model = types.SimpleNamespace()
+    runner.kv_cache_manager_key = "kv_cache_manager"
+    runner.runtime_hooks = RuntimeHooks(step_input_stager=stager)
+    return runner
+
+
+def _decode_step(runner):
+    forward_inputs = types.SimpleNamespace(
+        batch=types.SimpleNamespace(num_context_requests=0),
+        new_tensors_device=None,
+        cache_indirection_buffer=None,
+        gather_context_logits=False,
+        enable_spec_decode=False,
+        runtime_draft_len=0,
+    )
+    resource_manager = types.SimpleNamespace(get_resource_manager=lambda key: object())
+    return runner._forward_decoder(forward_inputs, resource_manager, is_dummy=False)
+
+
+def _names(log: list) -> list:
+    return [entry if isinstance(entry, str) else entry[0] for entry in log]
+
+
+_GRAPH_KEY = (1, 0, False)
+_STAGED_STEP = ["begin", "prepare", "end", "record_input_copy", "completion_event", "replay"]
+
+
+def test_a_replay_issues_the_staged_preparation_before_the_replay(monkeypatch):
+    log = []
+    graphs = _WindowGraphs(log, _GRAPH_KEY)
+    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
+
+    assert _decode_step(runner) == "outputs"
+    assert log == [
+        ("begin", True, graphs.cuda_graph_runner.shared_static_tensors),
+        "prepare",
+        ("end", False),
+        "record_input_copy",
+        ("completion_event", "input-copy-event"),
+        ("replay", 3),
+    ]
+
+
+@pytest.mark.parametrize(
+    "key, needs_capture, warmup_only, ran",
+    [
+        (None, False, False, "eager"),
+        (_GRAPH_KEY, True, False, "capture"),
+        (_GRAPH_KEY, False, True, "capture"),
+    ],
+    ids=["eager", "initial_capture", "warmup_only"],
+)
+def test_a_step_that_is_not_a_replay_never_opens_a_window(
+    monkeypatch, key, needs_capture, warmup_only, ran
+):
+    log = []
+    graphs = _WindowGraphs(log, key, needs_capture=needs_capture, warmup_only=warmup_only)
+    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
+
+    _decode_step(runner)
+    assert log == ["prepare", "record_input_copy", ran]
+    assert graphs.cuda_graph_runner.staged_static_input_tokens == 0
+
+
+def test_a_declined_replay_prepares_natively(monkeypatch):
+    log = []
+    graphs = _WindowGraphs(log, _GRAPH_KEY)
+    stager = _ReferenceStager(log, accept=False)
+    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), stager)
+
+    _decode_step(runner)
+    assert _names(log) == ["begin", "prepare", "record_input_copy", "replay"]
+    assert log[-1] == ("replay", 0)
+
+
+def test_a_failed_preparation_discards_the_window(monkeypatch):
+    log = []
+    graphs = _WindowGraphs(log, _GRAPH_KEY)
+    runner = _window_runner(
+        monkeypatch, graphs, _WindowPreparer(log, fail=True), _ReferenceStager(log)
+    )
+
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        _decode_step(runner)
+    assert _names(log) == ["begin", "prepare", "discard"]
+
+
+@pytest.mark.parametrize(
+    "fail, expected",
+    [
+        ("before_replay", ["begin", "prepare", "discard"]),
+        ("replay", _STAGED_STEP),
+    ],
+    ids=["window_open", "window_closed"],
+)
+def test_a_failed_run_discards_only_a_window_still_open(monkeypatch, fail, expected):
+    log = []
+    graphs = _WindowGraphs(log, _GRAPH_KEY, fail=fail)
+    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
+
+    with pytest.raises(RuntimeError):
+        _decode_step(runner)
+    assert _names(log) == expected
+
+
+def test_replay_eager_replay_opens_one_window_per_replay(monkeypatch):
+    log = []
+    graphs = _WindowGraphs(log, _GRAPH_KEY)
+    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
+
+    _decode_step(runner)
+    graphs.key = None
+    _decode_step(runner)
+    graphs.key = _GRAPH_KEY
+    _decode_step(runner)
+    assert _names(log) == [
+        *_STAGED_STEP,
+        "prepare",
+        "record_input_copy",
+        "eager",
+        *_STAGED_STEP,
+    ]
+    assert [entry for entry in log if entry[0] == "replay"] == [("replay", 3), ("replay", 3)]
+
+
+def _replay_graphs(monkeypatch, log: list, *, needs_capture: bool, warmup_only: bool):
+    """A ``DecoderCudaGraphs`` with only what ``_run`` reads, logging capture and replay."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as graphs_module
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
+
+    monkeypatch.setattr(graphs_module, "prepare_attn_metadata_for_draft_replay", lambda *args: None)
+    monkeypatch.setattr(
+        graphs_module, "restore_attn_metadata_after_draft_replay", lambda *args: None
+    )
+    monkeypatch.setattr(
+        graphs_module, "MoeLoadBalancerIterContext", lambda balancer: contextlib.nullcontext()
+    )
+    graphs = DecoderCudaGraphs.__new__(DecoderCudaGraphs)
+    graphs.breakable_cuda_graph_runner = None
+    graphs._torch_compile_bypass = contextlib.nullcontext
+    graphs.cuda_graph_runner = types.SimpleNamespace(
+        needs_capture=lambda key: needs_capture,
+        is_warmup_only=warmup_only,
+        capture=lambda key, fn, inputs, **kwargs: log.append("capture"),
+        replay=lambda key, inputs, **kwargs: log.append("replay"),
+    )
+    return graphs
+
+
+@pytest.mark.parametrize(
+    "key, needs_capture, warmup_only, expected",
+    [
+        (_GRAPH_KEY, False, False, ["before_replay", "replay"]),
+        (_GRAPH_KEY, True, False, ["capture", "replay"]),
+        (_GRAPH_KEY, True, True, ["capture"]),
+        (None, False, False, ["eager"]),
+    ],
+    ids=["replay", "capture_then_replay", "warmup_only", "eager"],
+)
+def test_before_replay_runs_only_before_the_replay_of_a_captured_graph(
+    monkeypatch, key, needs_capture, warmup_only, expected
+):
+    log = []
+    graphs = _replay_graphs(monkeypatch, log, needs_capture=needs_capture, warmup_only=warmup_only)
+
+    graphs._run(
+        key,
+        {"input_ids": torch.zeros(2, dtype=torch.int64)},
+        lambda inputs: log.append("eager"),
+        lambda inputs: None,
+        attn_metadata=None,
+        draft_kv_cache_manager=None,
+        moe_load_balancer=None,
+        enable_spec_decode=True,
+        gather_context_logits=False,
+        position_id_offsets=None,
+        before_replay=lambda: log.append("before_replay"),
+    )
+    assert log == expected
+
+
+# -- the speculative sampler's store writer -----------------------------------------------------
+
+
+class _ReferenceStoreWriter:
+    """Stores like the native ``index_copy_`` path, then copies the store to the host tensors."""
+
+    def __init__(self, supported: bool = True) -> None:
+        self._supported = supported
+        self.calls = []
+
+    def supported(self, store, new_tokens, next_new_tokens, new_tokens_lens, next_draft_tokens):
+        self.calls.append("supported")
+        return self._supported
+
+    def store_and_copy_out(
+        self,
+        store,
+        slots,
+        new_tokens,
+        next_new_tokens,
+        new_tokens_lens,
+        next_draft_tokens,
+        host_new_tokens,
+        host_new_tokens_lens,
+        host_next_draft_tokens,
+        record_event=True,
+    ) -> None:
+        self.calls.append(("store_and_copy_out", list(slots), record_event))
+        index = torch.tensor(slots, dtype=torch.long)
+        store.new_tokens.squeeze(-1).T.index_copy_(0, index, new_tokens)
+        store.next_new_tokens.squeeze(-1).T.index_copy_(0, index, next_new_tokens)
+        store.new_tokens_lens.index_copy_(0, index, new_tokens_lens)
+        store.next_draft_tokens.index_copy_(0, index, next_draft_tokens)
+        host_new_tokens.copy_(store.new_tokens)
+        host_new_tokens_lens.copy_(store.new_tokens_lens)
+        host_next_draft_tokens.copy_(store.next_draft_tokens)
+
+    def set_completion_event(self, event) -> None:
+        self.calls.append(("completion_event", event))
+
+
+def _cpu_sampling(monkeypatch, *, pinned: bool) -> None:
+    """Run ``SpecSampler.sample_async`` on CPU: device transfers stay on the host."""
+    from tensorrt_llm._torch.speculative import spec_sampler_base
+
+    original_to = torch.Tensor.to
+    original_empty_like = torch.empty_like
+
+    def to_cpu(tensor, *args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            kwargs = {**kwargs, "device": "cpu"}
+        return original_to(tensor, *args, **kwargs)
+
+    def empty_like(tensor, *args, pin_memory=False, **kwargs):
+        # Pinning needs a CUDA context; the writer's host buffers are plain host tensors here.
+        return original_empty_like(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to_cpu)
+    monkeypatch.setattr(torch, "empty_like", empty_like)
+    monkeypatch.setattr(spec_sampler_base, "prefer_pinned", lambda: pinned)
+    monkeypatch.setattr(spec_sampler_base, "handle_stop_criteria", lambda *args, **kwargs: False)
+
+
+def _store_sampler(writer, *, async_worker: bool = False):
+    """A ``SpecSampler`` with a six-slot store, draft length 3 and the given store writer."""
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    sampler = SpecSampler.__new__(SpecSampler)
+    sampler.draft_len = 3
+    sampler.max_accepted_path_len = 4
+    sampler.max_seq_len = 128
+    sampler.store = types.SimpleNamespace(
+        new_tokens=torch.zeros(4, 6, 1, dtype=torch.int32),
+        next_new_tokens=torch.zeros(4, 6, 1, dtype=torch.int32),
+        next_draft_tokens=torch.zeros(6, 3, dtype=torch.int32),
+        new_tokens_lens=torch.zeros(6, dtype=torch.int32),
+    )
+    sampler.store_writer = writer
+    sampler._async_worker_active = lambda: async_worker
+    sampler._copy_to_host = lambda tensor: tensor.clone()
+    sampler._record_sampler_event = lambda: types.SimpleNamespace(cuda_event="sampler-event")
+    return sampler
+
+
+def _sample_generation_step(sampler, *, verify_lens: bool = False):
+    """Three generation requests in nonconsecutive slots 4, 1 and 3."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+    def request(request_id: int, slot: int):
+        return types.SimpleNamespace(
+            py_request_id=request_id,
+            py_seq_slot=slot,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            py_draft_tokens=[10, 11, 12],
+            py_draft_tokens_effective_len=None,
+            py_verify_len=None,
+            py_decoding_iter=0,
+        )
+
+    scheduled = types.SimpleNamespace(
+        context_requests_chunking=[],
+        context_requests_last_chunk=[],
+        generation_requests=[request(7, 4), request(8, 1), request(9, 3)],
+    )
+    outputs = dict(
+        new_tokens=torch.arange(12, dtype=torch.int32).reshape(3, 4) + 100,
+        new_tokens_lens=torch.tensor([1, 3, 2], dtype=torch.int32),
+        next_draft_tokens=torch.arange(9, dtype=torch.int32).reshape(3, 3) + 200,
+        next_new_tokens=torch.arange(12, dtype=torch.int32).reshape(3, 4) + 300,
+    )
+    if verify_lens:
+        outputs["verify_lens"] = torch.tensor([2, 3, 1], dtype=torch.int32)
+        outputs["verify_lens_in_output_order"] = True
+    return sampler.sample_async(scheduled, outputs, [])
+
+
+def _assert_same_stores(sampler, state, native, native_state) -> None:
+    for name in ("new_tokens", "next_new_tokens", "next_draft_tokens", "new_tokens_lens"):
+        assert torch.equal(getattr(sampler.store, name), getattr(native.store, name)), name
+    for name in ("new_tokens", "new_tokens_lens", "next_draft_tokens"):
+        assert torch.equal(getattr(state.host, name), getattr(native_state.host, name)), name
+
+
+def test_the_store_writer_matches_the_native_stores_on_nonconsecutive_slots(monkeypatch):
+    _cpu_sampling(monkeypatch, pinned=True)
+    native = _store_sampler(None)
+    writer = _ReferenceStoreWriter()
+    sampler = _store_sampler(writer)
+
+    native_state = _sample_generation_step(native)
+    state = _sample_generation_step(sampler)
+    assert writer.calls == [
+        "supported",
+        ("store_and_copy_out", [4, 1, 3], False),
+        ("completion_event", "sampler-event"),
+    ]
+    assert native.store.new_tokens_lens.tolist() == [0, 3, 0, 2, 1, 0]
+    _assert_same_stores(sampler, state, native, native_state)
+    assert state.host.verify_lens is None
+    assert state.device.new_tokens is sampler.store.next_new_tokens
+
+
+@pytest.mark.parametrize("case", ["declined", "verify_lens", "async_worker", "not_pinned"])
+def test_the_store_writer_falls_back_to_the_native_stores(monkeypatch, case):
+    _cpu_sampling(monkeypatch, pinned=case != "not_pinned")
+    native = _store_sampler(None)
+    writer = _ReferenceStoreWriter(supported=case != "declined")
+    sampler = _store_sampler(writer, async_worker=case == "async_worker")
+
+    native_state = _sample_generation_step(native, verify_lens=case == "verify_lens")
+    state = _sample_generation_step(sampler, verify_lens=case == "verify_lens")
+    assert writer.calls == (["supported"] if case == "declined" else [])
+    _assert_same_stores(sampler, state, native, native_state)
+    if case == "verify_lens":
+        assert state.host.verify_lens.tolist() == [2, 3, 1]

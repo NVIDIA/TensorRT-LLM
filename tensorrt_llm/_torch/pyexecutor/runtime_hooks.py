@@ -55,9 +55,15 @@ class StepInputStager(Protocol):
     ) -> Optional["StepInputStager"]:
         """Open the window for this step, or return None to keep the native preparation.
 
+        The engine calls this only for the replay of an already captured CUDA
+        graph, so ``graph_replay`` is always True: the window closes right
+        before the replay, and an eager step, an initial capture or a warmup
+        would run the model before the staged writes are issued. Those steps
+        always prepare natively.
+
         ``preparer`` is the ``DecoderInputPreparer`` whose writes the window
         records. ``static_inputs`` are the static input tensors of the CUDA
-        graph the step replays (None when it replays none).
+        graph the step replays.
         """
 
     def copy(
