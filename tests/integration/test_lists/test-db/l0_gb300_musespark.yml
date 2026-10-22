@@ -21,6 +21,11 @@ l0_gb300_musespark:
   tests:
   # Disabled: needs the DFlash2 draft model, which the CI model cache does not have.
   # - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance
+  # MuseSparkOpen GSM8K on the llm-models NVFP4 checkpoint; listed nowhere else.
+  - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus[eager]
+  - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus[cuda_graph]
+  - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus_sa_spec[sa2]
+  - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus_sa_spec[sa4]
   # MuseSparkOpen decode-path fusions (random weights, no checkpoint). The finalize+all-reduce
   # parity, stress and lifecycle files stay unlisted, as in l0_gb300_multi_gpus.yml: they need
   # an external 4- or 8-rank MPI launch and every case skips under single-process pytest.
