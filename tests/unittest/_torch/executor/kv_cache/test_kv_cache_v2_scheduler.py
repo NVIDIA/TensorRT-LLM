@@ -5083,3 +5083,82 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestPregrownContextCapacity:
+    """Capacity grown by a skipped forward is replayed exactly, first, under SWA scratch reuse."""
+
+    def _make(self, scratch=True):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.enable_swa_scratch_reuse = scratch
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    @staticmethod
+    def _req(mgr, request_id, remaining, kv_start=0, grown=0):
+        """grown: capacity held past kv_start by an earlier, skipped pass."""
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, is_first_context_chunk=kv_start == 0
+        )
+        req.context_current_position = kv_start
+        mgr.kv_cache_map[request_id].capacity = kv_start + grown + mgr.num_extra_kv_tokens
+        return req
+
+    def test_pregrown_tokens_are_computed_and_clamped(self):
+        sched, mgr = self._make()
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, kv_start=1_000)) == 0
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 768
+        mgr.num_extra_kv_tokens = 3
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 768
+        mgr.num_extra_kv_tokens = 0
+        # Never more than what is left to prefill.
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 500, 1_000, grown=768)) == 500
+        req = self._req(mgr, 0, 5_000, kv_start=1_000)
+        mgr.kv_cache_map[0].capacity = 900
+        assert sched._pregrown_context_tokens(req) == 0
+
+    def test_zero_without_scratch_reuse_or_active_cache(self):
+        sched, mgr = self._make(scratch=False)
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 5_000, 1_000, grown=768)
+        mgr.kv_cache_map[0].is_active = False
+        assert sched._pregrown_context_tokens(req) == 0
+        # A manager that does not define the flag reads as off.
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
+
+    def test_replays_exactly_the_pregrown_chunk(self):
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 512  # not the full 1024 budget
+        mgr.resize_context.assert_called_once_with(req, 512)
+
+    def test_skipped_when_the_budget_cannot_cover_it(self):
+        sched, mgr = self._make()
+        first = self._req(mgr, 0, 10_000, kv_start=1_024, grown=768)
+        second = self._req(mgr, 1, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 768
+        assert all(call.args[0] is not second for call in mgr.resize_context.call_args_list)
+
+    def test_pregrown_request_runs_first_when_reordered(self):
+        sched, mgr = self._make()
+        newcomer = self._req(mgr, 1, 256)
+        pregrown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([newcomer, pregrown], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert pregrown.context_chunk_size == 512
+        assert newcomer.context_chunk_size == 256
+
+    def test_order_unchanged_without_scratch_reuse(self):
+        sched, mgr = self._make(scratch=False)
+        short = self._req(mgr, 1, 256)
+        grown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([short, grown], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert grown.context_chunk_size == 768  # leftover budget, no clamp
