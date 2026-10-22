@@ -18,6 +18,7 @@ and runs the side effects that drive each region's state machine. Never imports 
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
@@ -49,9 +50,10 @@ if TYPE_CHECKING:
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
 _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop flag and reclaim
-# Send side: a sender (KV transfer worker thread) may wait this long for bounce space before
-# falling back to per-fragment writes.
-_RESERVE_TIMEOUT_S = 0.2
+# Send side: a sender (KV transfer worker thread, not the executor loop) may wait this long for
+# bounce space before falling back to per-fragment writes, which are ~18x slower on attention-DP
+# CTX -> TP GEN layouts. TRTLLM_KV_CACHE_BOUNCE_SEND_TIMEOUT_S overrides it.
+_RESERVE_TIMEOUT_S = float(os.environ.get("TRTLLM_KV_CACHE_BOUNCE_SEND_TIMEOUT_S", "") or 0.2)
 # Receive side: never wait. The receiver reserves on the executor thread while it admits
 # generation requests, so any wait pauses the whole iteration (and, under attention DP, every rank
 # of the group). If the recv region is full, use the per-fragment path right away; a timed-out
