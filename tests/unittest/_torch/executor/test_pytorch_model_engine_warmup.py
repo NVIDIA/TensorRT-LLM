@@ -27,15 +27,18 @@ import torch
 import tensorrt_llm
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
+import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -390,12 +393,10 @@ def test_compiled_mxfp8_warmup_backend_selection(
             spec_config=None,
         ),
         _completed_autotuner_warmup_num_tokens=None,
-        _agree_warmup_flag=lambda flag: flag,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
         _moe_workspace_reclaimer=None,
         is_warmup=True,
-        cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
             modules=lambda: [
                 SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -409,12 +410,17 @@ def test_compiled_mxfp8_warmup_backend_selection(
         kv_cache_manager_key="kv_cache",
         is_draft_model=False,
         guided_decoder=None,
-        no_cuda_graph=lambda: contextlib.nullcontext(),
-        _create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
-            num_gen_requests=num_gen_requests
+        _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True),
+        _dummy_requests=SimpleNamespace(
+            create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
+                num_gen_requests=num_gen_requests
+            ),
+            release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         ),
-        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
-        _should_run_warmup_batch=Mock(return_value=True),
+        _agreement=SimpleNamespace(
+            agree_flag=lambda flag: flag,
+            should_run_warmup_batch=Mock(return_value=True),
+        ),
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
     )
@@ -424,14 +430,14 @@ def test_compiled_mxfp8_warmup_backend_selection(
         get_resource_manager=lambda key: cache if key == "kv_cache" else None
     )
     tuner = Mock(profiling_cache={})
-    monkeypatch.setattr(decoder_runner_module.AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", lambda: tuner)
     monkeypatch.setattr(
-        decoder_runner_module, "autotune", lambda **kwargs: contextlib.nullcontext()
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
     )
     monkeypatch.setattr(MXFP8GemmRunner, "sync_all_tactic_caches", Mock())
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(decoder_runner_module, "clear_memory_buffers", lambda: None)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", lambda: None)
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
 
@@ -447,7 +453,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
 
     engine._forward_warmup.side_effect = forward
     with torch_compiling(compile_enabled):
-        DecoderRunner._run_autotuner_warmup(engine, resources)
+        DecoderWarmup._run_autotuner_warmup(engine, resources)
         assert is_torch_compiling() is compile_enabled
 
     expected_backend = backend or ("trtllm" if compile_mode == "all_batches" else "auto")
@@ -507,18 +513,21 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
             spec_config=None,
         ),
         _completed_autotuner_warmup_num_tokens=completed_num_tokens,
-        _agree_warmup_flag=Mock(side_effect=lambda flag: flag and peers_skip),
         _warmup_timer=_WarmupTimer(rank=0),
-        cuda_graph_runner=SimpleNamespace(enabled=False),
         model=SimpleNamespace(modules=lambda: []),
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
         kv_cache_manager_key="kv_cache",
         guided_decoder=None,
-        no_cuda_graph=lambda: contextlib.nullcontext(),
-        _create_warmup_request=Mock(return_value=object()),
-        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
-        _should_run_warmup_batch=Mock(return_value=True),
+        _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=False),
+        _dummy_requests=SimpleNamespace(
+            create_warmup_request=Mock(return_value=object()),
+            release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
+        ),
+        _agreement=SimpleNamespace(
+            agree_flag=Mock(side_effect=lambda flag: flag and peers_skip),
+            should_run_warmup_batch=Mock(return_value=True),
+        ),
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
     )
@@ -529,22 +538,22 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
     tuner = Mock(profiling_cache={})
     get_tuner = Mock(return_value=tuner)
     monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
-    monkeypatch.setattr(decoder_runner_module.AutoTuner, "get", get_tuner)
+    monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", get_tuner)
     monkeypatch.setattr(
-        decoder_runner_module, "autotune", lambda **kwargs: contextlib.nullcontext()
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     clear_buffers = Mock()
-    monkeypatch.setattr(decoder_runner_module, "clear_memory_buffers", clear_buffers)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", clear_buffers)
 
-    DecoderRunner._run_autotuner_warmup(engine, resources)
+    DecoderWarmup._run_autotuner_warmup(engine, resources)
 
     # Every rank votes with its local decision, skip or not.
-    engine._agree_warmup_flag.assert_called_once_with(completed_num_tokens == 16)
+    engine._agreement.agree_flag.assert_called_once_with(completed_num_tokens == 16)
     if expect_skip:
         get_tuner.assert_not_called()
-        engine._create_warmup_request.assert_not_called()
+        engine._dummy_requests.create_warmup_request.assert_not_called()
         engine._forward_warmup.assert_not_called()
     else:
         assert engine._forward_warmup.call_count == 2
@@ -650,6 +659,21 @@ class _DummyModelEngine(PyTorchModelEngine):
         )
 
 
+# KVCM2 requires a current CUDA context on whatever thread destroys it. A manager
+# left for the cyclic GC is freed on whichever thread runs the collection -- under
+# pytest's watchdog that thread has no context, and the first driver call in
+# teardown fails with CUDA error 201, poisoning KVCM2 for the rest of the process.
+# Releasing them here keeps teardown on the test's own thread.
+_KV_CACHE_MANAGERS_TO_SHUTDOWN = []
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_kv_cache_managers():
+    yield
+    while _KV_CACHE_MANAGERS_TO_SHUTDOWN:
+        _KV_CACHE_MANAGERS_TO_SHUTDOWN.pop().shutdown()
+
+
 def _build_engine_and_resource_manager():
     tokens_per_block = 1
     max_tokens = 258
@@ -678,6 +702,7 @@ def _build_engine_and_resource_manager():
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
+    _KV_CACHE_MANAGERS_TO_SHUTDOWN.append(kv_cache_manager)
     resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     return model_engine, resource_manager
 
@@ -700,24 +725,27 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
         max_draft_loop_tokens=config.tokens_per_gen_step - 1,
     )
     runner.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    requests = runner._dummy_requests
+    requests._config = runner._config
+    requests.get_runtime_tokens_per_gen_step = runner.get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
     # differs from that value and must synchronize the requests.
     batch_size = 2
 
     if draft_len is None:
         expected_draft_len = runner._config.max_draft_len
-        warmup_request = runner._create_warmup_request(
+        warmup_request = requests.create_warmup_request(
             resource_manager,
             num_tokens=batch_size * config.tokens_per_gen_step,
             num_gen_requests=batch_size,
         )
     else:
         expected_draft_len = draft_len
-        warmup_request = runner._create_cuda_graph_warmup_request(
+        warmup_request = requests.create_cuda_graph_warmup_request(
             resource_manager, batch_size, draft_len, max_seq_len=16
         )
 
-    with runner._release_batch_context(warmup_request, resource_manager) as batch:
+    with runner._dummy_requests.release_batch_context(warmup_request, resource_manager) as batch:
         assert batch is not None
         assert len(batch.generation_requests) == batch_size
         expected_buffer_width = config.get_runtime_tokens_per_gen_step(expected_draft_len) - 1
@@ -739,20 +767,22 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
 
     forward_warmup = Mock(side_effect=RuntimeError("capture failure") if fails else None)
     with (
-        patch.object(runner, "_get_graphs_to_capture", return_value=[(1, 0), (1, 2)]),
-        patch.object(runner, "_create_cuda_graph_warmup_request", side_effect=create_request),
+        patch.object(runner._graphs, "_get_graphs_to_capture", return_value=[(1, 0), (1, 2)]),
         patch.object(
-            runner,
-            "_release_batch_context",
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
+        patch.object(
+            runner._dummy_requests,
+            "release_batch_context",
             side_effect=lambda request, resources: contextlib.nullcontext(request),
         ),
-        patch.object(runner, "_forward_warmup", forward_warmup),
+        patch.object(runner._graphs, "_forward_warmup", forward_warmup),
     ):
         if fails:
             with pytest.raises(RuntimeError, match="capture failure"):
-                runner._capture_generation_cuda_graphs(resource_manager)
+                runner._graphs._capture_generation_cuda_graphs(resource_manager)
         else:
-            runner._capture_generation_cuda_graphs(resource_manager)
+            runner._graphs._capture_generation_cuda_graphs(resource_manager)
 
     expected_calls = [
         call(batches[2], resource_manager, enable_spec_decode=True, runtime_draft_len=2)
@@ -762,7 +792,7 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
             call(batches[0], resource_manager, enable_spec_decode=False, runtime_draft_len=0)
         )
     assert forward_warmup.call_args_list == expected_calls
-    assert runner._force_lora_graph_for_capture is None
+    assert runner._graphs.force_lora_graph_for_capture is None
 
 
 @pytest.mark.cpu_only
@@ -801,7 +831,7 @@ def test_flashinfer_mxfp8_graph_tuning_runs_once_per_shape(
         else:
             monkeypatch.setenv(name, value)
     monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
-    runner = object.__new__(DecoderRunner)
+    runner = object.__new__(DecoderCudaGraphs)
     runner._flashinfer_mxfp8_tuned_graph_shapes = set()
     runner._tuning_flashinfer_mxfp8_graphs = False
     tuned = []
@@ -844,13 +874,13 @@ def test_flashinfer_mxfp8_graph_tuning_runs_once_per_shape(
 
 @pytest.mark.cpu_only
 def test_cuda_graph_warmup_scopes_flashinfer_mxfp8_tuning_to_warmup_only_pass() -> None:
-    """_run_cuda_graph_warmup arms the per-shape FlashInfer MXFP8 tuning only
+    """run_cuda_graph_warmup arms the per-shape FlashInfer MXFP8 tuning only
     for the warmup-only pass of an engine with FlashInfer MXFP8 layers, and
     disarms it afterwards, including when the capture raises."""
     method = object.__new__(MXFP8LinearMethod)
     method.backend = "auto"
     method._flashinfer_mxfp8 = object()
-    runner = object.__new__(DecoderRunner)
+    runner = object.__new__(DecoderCudaGraphs)
     runner.model = SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)])
     runner._config = SimpleNamespace(
         enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED
@@ -871,24 +901,24 @@ def test_cuda_graph_warmup_scopes_flashinfer_mxfp8_tuning_to_warmup_only_pass() 
         patch.object(runner, "_capture_generation_cuda_graphs", side_effect=capture) as gen,
         patch.object(runner, "_capture_additional_cuda_graphs"),
     ):
-        runner._run_cuda_graph_warmup(resource_manager)
+        runner.run_cuda_graph_warmup(resource_manager)
         runner.cuda_graph_runner.is_warmup_only = False
         with patch.object(runner, "_capture_prefill_cuda_graphs"):
-            runner._run_cuda_graph_warmup(resource_manager)
+            runner.run_cuda_graph_warmup(resource_manager)
         assert armed == [True, False]
         assert runner._tuning_flashinfer_mxfp8_graphs is False
 
         runner.cuda_graph_runner.is_warmup_only = True
         gen.side_effect = RuntimeError("capture failed")
         with pytest.raises(RuntimeError, match="capture failed"):
-            runner._run_cuda_graph_warmup(resource_manager)
+            runner.run_cuda_graph_warmup(resource_manager)
         assert runner._tuning_flashinfer_mxfp8_graphs is False
 
         # Without FlashInfer MXFP8 layers the warmup-only pass does not tune.
         gen.side_effect = capture
         method._flashinfer_mxfp8 = None
         armed.clear()
-        runner._run_cuda_graph_warmup(resource_manager)
+        runner.run_cuda_graph_warmup(resource_manager)
         assert armed == [False]
 
 
@@ -902,59 +932,65 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
 
     with contextlib.ExitStack() as stack:
+        spec_decode_config = replace(runner._config, spec_config=spec_config, is_spec_decode=True)
+        for owner in (runner._warmup, runner._graphs):
+            stack.enter_context(patch.object(owner, "_config", spec_decode_config))
         stack.enter_context(
-            patch.object(
-                runner,
-                "_config",
-                replace(runner._config, spec_config=spec_config, is_spec_decode=True),
-            )
-        )
-        stack.enter_context(
-            patch.object(runner, "_create_warmup_request", Mock(return_value=batch))
+            patch.object(runner._dummy_requests, "create_warmup_request", Mock(return_value=batch))
         )
         stack.enter_context(
             patch.object(
-                runner,
-                "_release_batch_context",
+                runner._dummy_requests,
+                "release_batch_context",
                 side_effect=lambda request, resources: contextlib.nullcontext(request),
             )
         )
-        stack.enter_context(patch.object(runner, "_forward_warmup", forward_warmup))
+        for owner in (runner._warmup, runner._graphs):
+            stack.enter_context(patch.object(owner, "_forward_warmup", forward_warmup))
         if phase == "general":
-            runner._general_warmup_impl(resource_manager, [(4, 0)])
+            runner._warmup._general_warmup_impl(resource_manager, [(4, 0)])
         elif phase == "attention":
-            runner._run_attention_warmup(resource_manager)
+            runner._warmup._run_attention_warmup(resource_manager)
         elif phase == "mamba":
             stack.enter_context(
                 patch.object(
-                    decoder_runner_module, "MambaHybridCacheManager", type(kv_cache_manager)
+                    decoder_warmup_module, "MambaHybridCacheManager", type(kv_cache_manager)
                 )
             )
             stack.enter_context(
                 patch.object(kv_cache_manager, "get_num_available_tokens", return_value=8)
             )
             stack.enter_context(
-                patch.object(runner, "_config", replace(runner._config, enable_autotuner=False))
+                patch.object(
+                    runner._warmup,
+                    "_config",
+                    replace(runner._warmup._config, enable_autotuner=False),
+                )
             )
-            runner._run_mamba_hybrid_warmup(resource_manager)
+            runner._warmup._run_mamba_hybrid_warmup(resource_manager)
         else:
             stack.enter_context(
                 patch.object(
-                    runner,
+                    runner._graphs,
                     "_config",
                     replace(
-                        runner._config,
+                        runner._graphs._config,
                         prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
                         prefill_cuda_graph_num_tokens=[4],
                     ),
                 )
             )
-            runner._capture_prefill_cuda_graphs(resource_manager)
+            runner._graphs._capture_prefill_cuda_graphs(resource_manager)
 
+    jit_warmup = {"trtllm_gen_jit_warmup": True} if phase == "attention" else {}
     assert forward_warmup.call_count > 0
     assert (
         forward_warmup.call_args_list
-        == [call(batch, resource_manager, enable_spec_decode=True, runtime_draft_len=3)]
+        == [
+            call(
+                batch, resource_manager, enable_spec_decode=True, runtime_draft_len=3, **jit_warmup
+            )
+        ]
         * forward_warmup.call_count
     )
 
@@ -1001,31 +1037,31 @@ def _run_warmup_tracked(
     with (
         helix_ctx,
         patch.object(
-            model_engine._runner, "_general_warmup", side_effect=tracker("general_warmup")
+            model_engine._runner._warmup, "_general_warmup", side_effect=tracker("general_warmup")
         ),
         patch.object(
-            model_engine._runner, "_run_autotuner_warmup", side_effect=tracker("autotuner")
+            model_engine._runner._warmup, "_run_autotuner_warmup", side_effect=tracker("autotuner")
         ),
         patch.object(
-            model_engine._runner,
+            model_engine._runner._graphs,
             "_capture_generation_cuda_graphs",
             side_effect=tracker("generation_cuda_graph"),
         ),
         patch.object(
-            model_engine._runner,
+            model_engine._runner._graphs,
             "_capture_additional_cuda_graphs",
             side_effect=tracker("additional_cuda_graph"),
         ),
         patch.object(
-            model_engine._runner,
+            model_engine._runner._graphs,
             "_capture_prefill_cuda_graphs",
             side_effect=tracker("prefill_cuda_graph"),
         ),
         patch(
-            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.warmup_sampling_module",
             side_effect=tracker("sampling_warmup"),
         ),
-        patch.object(decoder_runner_module, "torch", tracked_torch),
+        patch.object(decoder_warmup_module, "torch", tracked_torch),
         patch(
             "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces",
             side_effect=tracker("moe_clear"),
@@ -1054,8 +1090,42 @@ def _capture_tllm_logs():
     def _record(*msg):
         records.append(" ".join(str(m) for m in msg))
 
-    with patch.object(decoder_runner_module.logger, "info", side_effect=_record):
+    with patch.object(decoder_warmup_module.logger, "info", side_effect=_record):
         yield records
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("schedule", [{4: 4, 8: 2, 16: 1}, {4: 2}, {16: 4}, {4: 0}])
+def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -> None:
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
+        compute_dynamic_draft_len_mapping,
+    )
+    from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
+
+    batch_sizes = [1, 2, 4, 8, 16]
+    runner = object.__new__(DecoderCudaGraphs)
+    mode = SimpleNamespace(support_dynamic_draft_len=lambda: True)
+    runner._config = SimpleNamespace(
+        spec_config=SimpleNamespace(draft_len_schedule=schedule, spec_dec_mode=mode),
+        cuda_graph_batch_sizes=batch_sizes,
+        original_max_draft_len=max(schedule.values()),
+    )
+    runner._dynamic_draft_len_mapping = compute_dynamic_draft_len_mapping(runner._config)
+    graphs = runner._get_graphs_to_capture(batch_sizes)
+    replay = object.__new__(CUDAGraphRunner)
+    replay.supported_batch_sizes = batch_sizes
+    replay.dynamic_draft_len_mapping = runner._dynamic_draft_len_mapping
+
+    reachable_graphs = set()
+    for batch_size in range(1, max(batch_sizes) + 1):
+        draft_len = get_draft_len_for_batch_size(schedule, batch_size, max(schedule.values()))
+        padded_size = replay._round_up_batch_size_with_draft_len(batch_size, draft_len)
+        assert padded_size >= batch_size
+        reachable_graphs.add((padded_size, draft_len))
+
+    assert set(graphs) == reachable_graphs
+    assert len(graphs) == len(reachable_graphs)
 
 
 class TestWarmupCleanup(unittest.TestCase):
@@ -1112,12 +1182,13 @@ class TestWarmupCleanup(unittest.TestCase):
         before the first warmup forward; with it off they never start. The
         engine's hook is unset again after warmup."""
         runner = object.__new__(DecoderRunner)
-        runner._warmup_timer = _WarmupTimer(rank=0)
-        runner._metrics = {}
-        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        runner.before_warmup_forwards_callable = None
+        warmup = runner._warmup = object.__new__(DecoderWarmup)
+        warmup._warmup_timer = _WarmupTimer(rank=0)
+        warmup._metrics = {}
+        warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        warmup.before_warmup_forwards_callable = None
         model_engine = object.__new__(PyTorchModelEngine)
-        model_engine._metrics = runner._metrics
+        model_engine._metrics = warmup._metrics
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
@@ -1133,17 +1204,20 @@ class TestWarmupCleanup(unittest.TestCase):
 
         with (
             patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.warmup_sampling_module",
                 side_effect=record("sampling"),
             ),
             patch(
                 "tensorrt_llm._torch.jit_prefetch.start_flashinfer_build",
                 return_value=False,
             ),
-            patch.object(runner, "_tunes_flashinfer_mxfp8", return_value=False),
-            patch.object(runner, "_prewarm_engram_kernels", side_effect=record("engram")),
-            patch.object(runner, "_prewarm_csa2_sparse_indexer", side_effect=record("csa2")),
-            patch.object(runner, "_warmup_scheduled_forwards", side_effect=record("forwards")),
+            patch.object(warmup, "_tunes_flashinfer_mxfp8", return_value=False),
+            patch.object(warmup, "_prewarm_engram_kernels", side_effect=record("engram")),
+            patch.object(warmup, "_prewarm_csa2_sparse_indexer", side_effect=record("csa2")),
+            patch.object(
+                warmup, "_prewarm_minimax_m3_msa_indexer", side_effect=record("msa_indexer")
+            ),
+            patch.object(warmup, "_warmup_scheduled_forwards", side_effect=record("forwards")),
             patch.object(
                 model_engine, "_start_deep_gemm_prefetch", side_effect=record("dg_helpers")
             ),
@@ -1166,10 +1240,10 @@ class TestWarmupCleanup(unittest.TestCase):
                         if not prefetch:
                             os.environ.pop("TLLM_JIT_AHEAD", None)
                         model_engine._warmup_impl(resource_manager)
-                    warmup = ["sampling", "engram", "csa2", "forwards"]
+                    phases = ["sampling", "engram", "csa2", "msa_indexer", "forwards"]
                     if prefetch:
-                        warmup = ["record", *warmup[:3], "dg_helpers", "forwards", "stop_record"]
-                    self.assertEqual(events, [*warmup, "init_prefetch"])
+                        phases = ["record", *phases[:4], "dg_helpers", "forwards", "stop_record"]
+                    self.assertEqual(events, [*phases, "init_prefetch"])
                     self.assertIsNone(runner.before_warmup_forwards_callable)
 
     @pytest.mark.cpu_only
@@ -1214,20 +1288,15 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         runner = object.__new__(DecoderRunner)
-        runner._moe_workspace_reclaimer = None
-        runner._eager_workspace_reclaim_supported = False
-        runner.mapping = SimpleNamespace(cp_size=1)
-        runner._warmup_timer = _WarmupTimer(rank=0)
-        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
-        runner._config = SimpleNamespace(
-            dtype=torch.float16,
-            cuda_graph_batch_sizes=[1, 4],
-            enable_in_graph_sampling=False,
-            is_spec_decode=False,
+        warmup = runner._warmup = object.__new__(DecoderWarmup)
+        warmup._warmup_timer = _WarmupTimer(rank=0)
+        warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        warmup.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
+        warmup._config = SimpleNamespace(
+            dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
         )
         model_engine = object.__new__(PyTorchModelEngine)
-        model_engine._metrics = runner._metrics = {}
+        model_engine._metrics = warmup._metrics = {}
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
@@ -1235,7 +1304,7 @@ class TestWarmupCleanup(unittest.TestCase):
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
         events = []
-        phase = runner._warmup_timer.phase
+        phase = warmup._warmup_timer.phase
 
         @contextlib.contextmanager
         def record_metric_scope(
@@ -1248,12 +1317,12 @@ class TestWarmupCleanup(unittest.TestCase):
 
         with (
             patch.object(
-                runner._warmup_timer,
+                warmup._warmup_timer,
                 "phase",
                 side_effect=record_metric_scope,
             ),
             patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.warmup_sampling_module",
                 side_effect=lambda: events.append("sampling"),
             ) as warmup_sampling,
             _capture_tllm_logs() as logs,
@@ -1262,7 +1331,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 with self.subTest(enable_in_graph_sampling=enabled):
                     events.clear()
                     warmup_sampling.reset_mock()
-                    runner._config.enable_in_graph_sampling = enabled
+                    warmup._config.enable_in_graph_sampling = enabled
                     runner._eager_workspace_reclaimer = object()
                     model_engine._warmup_impl(resource_manager)
                     self.assertEqual(
@@ -1318,18 +1387,27 @@ class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
     def test_cuda_graph_metrics_exclude_piecewise_stages(self) -> None:
         """Verify generation graph timing excludes prefill and includes LoRA warmup cleanup."""
-        runner = object.__new__(DecoderRunner)
-        runner.model = SimpleNamespace(modules=lambda: [])
-        runner._config = SimpleNamespace(
-            enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
+        graphs = DecoderCudaGraphs(
+            cuda_graph_runner=SimpleNamespace(enabled=True, is_warmup_only=False),
+            breakable_cuda_graph_runner=None,
+            config=SimpleNamespace(
+                enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
+            ),
+            mapping=None,
+            model=SimpleNamespace(modules=lambda: []),
+            sparse_attention_config=None,
+            metrics={},
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            dummy_requests=None,
+            agreement=None,
+            metadata=None,
+            get_runtime_tokens_per_gen_step=None,
+            dynamic_draft_len_mapping=None,
+            lora=SimpleNamespace(cuda_graph_manager=object()),
+            forward_warmup=None,
+            torch_compile_bypass=contextlib.nullcontext,
+            context_promotion_supported=True,
         )
-        runner._lora = SimpleNamespace(cuda_graph_manager=object())
-        runner.cuda_graph_runner = SimpleNamespace(
-            enabled=True,
-            is_warmup_only=False,
-        )
-        runner._metrics = {}
-        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         resource_manager = ResourceManager({})
         events = []
 
@@ -1356,11 +1434,11 @@ class TestWarmupCleanup(unittest.TestCase):
 
         with (
             patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.autotune",
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs.autotune",
                 side_effect=lambda **_: record_metric_scope("lora_autotune", {}),
             ),
             patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.AutoTuner.get",
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs.AutoTuner.get",
                 return_value=autotuner,
             ),
             patch(
@@ -1368,26 +1446,26 @@ class TestWarmupCleanup(unittest.TestCase):
                 side_effect=contextlib.nullcontext,
             ),
             patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.timing_metric",
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs.timing_metric",
                 side_effect=record_metric_scope,
             ),
             patch.object(
-                runner,
+                graphs,
                 "_capture_generation_cuda_graphs",
                 side_effect=lambda _: events.append(("stage", "generation")),
             ) as generation,
             patch.object(
-                runner,
+                graphs,
                 "_capture_additional_cuda_graphs",
                 side_effect=lambda _: events.append(("stage", "additional")),
             ),
             patch.object(
-                runner,
+                graphs,
                 "_capture_prefill_cuda_graphs",
                 side_effect=lambda _: events.append(("stage", "piecewise")),
             ) as piecewise,
         ):
-            runner._run_cuda_graph_warmup(resource_manager)
+            graphs.run_cuda_graph_warmup(resource_manager)
 
             self.assertEqual(
                 events,
@@ -1402,8 +1480,8 @@ class TestWarmupCleanup(unittest.TestCase):
 
             events.clear()
             piecewise.reset_mock()
-            runner.cuda_graph_runner.is_warmup_only = True
-            runner._run_cuda_graph_warmup(resource_manager)
+            graphs.cuda_graph_runner.is_warmup_only = True
+            graphs.run_cuda_graph_warmup(resource_manager)
 
             self.assertEqual(
                 events,
@@ -1420,7 +1498,7 @@ class TestWarmupCleanup(unittest.TestCase):
             events.clear()
             generation.side_effect = RuntimeError("warmup failed")
             with self.assertRaisesRegex(RuntimeError, "warmup failed"):
-                runner._run_cuda_graph_warmup(resource_manager)
+                graphs.run_cuda_graph_warmup(resource_manager)
             self.assertEqual(
                 events,
                 [
@@ -1433,9 +1511,9 @@ class TestWarmupCleanup(unittest.TestCase):
 
             events.clear()
             generation.reset_mock()
-            runner.cuda_graph_runner.enabled = False
-            runner._config.prefill_cuda_graph_backend = PrefillCudaGraphBackend.DISABLED
-            runner._run_cuda_graph_warmup(resource_manager)
+            graphs.cuda_graph_runner.enabled = False
+            graphs._config.prefill_cuda_graph_backend = PrefillCudaGraphBackend.DISABLED
+            graphs.run_cuda_graph_warmup(resource_manager)
             self.assertEqual(
                 events,
                 [
@@ -1528,20 +1606,23 @@ class TestWarmupCleanup(unittest.TestCase):
                 max_draft_len=3,
                 spec_config=None,
             ),
-            cuda_graph_runner=SimpleNamespace(enabled=False),
+            _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=False),
             model=SimpleNamespace(modules=lambda: []),
             kv_cache_manager_key="kv_cache",
             mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
             dist=object(),
             guided_decoder=None,
-            no_cuda_graph=lambda: contextlib.nullcontext(),
-            _create_warmup_request=Mock(return_value=object()),
-            _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
-            _should_run_warmup_batch=Mock(return_value=True),
+            _dummy_requests=SimpleNamespace(
+                create_warmup_request=Mock(return_value=object()),
+                release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+            ),
+            _agreement=SimpleNamespace(
+                agree_flag=lambda flag: flag,
+                should_run_warmup_batch=Mock(return_value=True),
+            ),
             _release_megamoe_profiling_scratch=Mock(),
             _forward_warmup=Mock(),
             _completed_autotuner_warmup_num_tokens=None,
-            _agree_warmup_flag=lambda flag: flag,
         )
         kv_cache_manager = SimpleNamespace(get_num_available_tokens=get_num_available_tokens)
         resource_manager = SimpleNamespace(
@@ -1549,24 +1630,18 @@ class TestWarmupCleanup(unittest.TestCase):
         )
 
         with (
-            patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.AutoTuner.get",
-                return_value=tuner,
-            ),
-            patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.autotune",
-                return_value=contextlib.nullcontext(),
-            ),
+            patch.object(decoder_warmup_module.AutoTuner, "get", return_value=tuner),
+            patch.object(decoder_warmup_module, "autotune", return_value=contextlib.nullcontext()),
             patch("torch.cuda.synchronize"),
             patch("torch.cuda.empty_cache"),
-            patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.clear_memory_buffers"
-            ),
+            patch.object(decoder_warmup_module, "clear_memory_buffers"),
         ):
-            DecoderRunner._run_autotuner_warmup(engine, resource_manager, generation_only=True)
+            DecoderWarmup._run_autotuner_warmup(engine, resource_manager, generation_only=True)
 
         # 100 tokens fit 25 requests of 1 + 3 tokens, below max_batch_size.
-        engine._create_warmup_request.assert_called_once_with(resource_manager, 100, 25)
+        engine._dummy_requests.create_warmup_request.assert_called_once_with(
+            resource_manager, 100, 25
+        )
         engine._forward_warmup.assert_called_once()
         get_num_available_tokens.assert_not_called()
         self.assertEqual(engine._completed_autotuner_warmup_num_tokens, 100)
@@ -1607,7 +1682,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
+                _graphs=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1615,7 +1690,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     ]
                 ),
             )
-            DecoderRunner._run_autotuner_warmup(engine, Mock())
+            DecoderWarmup._run_autotuner_warmup(engine, Mock())
 
         self.assertEqual(calls, [])
         self.assertEqual(method.backend, "trtllm")
@@ -1681,9 +1756,6 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
-                _completed_autotuner_warmup_num_tokens=None,
-                _agree_warmup_flag=lambda flag: flag,
-                cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1694,17 +1766,25 @@ class TestWarmupCleanup(unittest.TestCase):
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
-                no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
-                _release_batch_context=Mock(
-                    side_effect=[
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                    ]
+                _graphs=SimpleNamespace(
+                    no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True
                 ),
-                _should_run_warmup_batch=Mock(return_value=True),
+                _dummy_requests=SimpleNamespace(
+                    create_warmup_request=Mock(return_value=object()),
+                    release_batch_context=Mock(
+                        side_effect=[
+                            contextlib.nullcontext(object()),
+                            contextlib.nullcontext(object()),
+                            contextlib.nullcontext(object()),
+                            contextlib.nullcontext(object()),
+                        ]
+                    ),
+                ),
+                _completed_autotuner_warmup_num_tokens=None,
+                _agreement=SimpleNamespace(
+                    agree_flag=lambda flag: flag,
+                    should_run_warmup_batch=Mock(return_value=True),
+                ),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
@@ -1715,21 +1795,21 @@ class TestWarmupCleanup(unittest.TestCase):
 
             with (
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.AutoTuner.get",
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.AutoTuner.get",
                     return_value=tuner,
                 ),
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.autotune",
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.autotune",
                     side_effect=trtllm_autotune,
                 ),
                 patch.object(MXFP8GemmRunner, "sync_all_tactic_caches") as sync_tactics,
                 patch("torch.cuda.synchronize"),
                 patch("torch.cuda.empty_cache"),
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.clear_memory_buffers"
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.clear_memory_buffers"
                 ),
             ):
-                DecoderRunner._run_autotuner_warmup(engine, resource_manager)
+                DecoderWarmup._run_autotuner_warmup(engine, resource_manager)
 
         self.assertEqual(
             calls,
@@ -1805,9 +1885,6 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
-                _completed_autotuner_warmup_num_tokens=None,
-                _agree_warmup_flag=lambda flag: flag,
-                cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1818,17 +1895,25 @@ class TestWarmupCleanup(unittest.TestCase):
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
-                no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
-                _release_batch_context=Mock(
-                    side_effect=[
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                    ]
+                _graphs=SimpleNamespace(
+                    no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True
                 ),
-                _should_run_warmup_batch=Mock(return_value=False),
+                _dummy_requests=SimpleNamespace(
+                    create_warmup_request=Mock(return_value=object()),
+                    release_batch_context=Mock(
+                        side_effect=[
+                            contextlib.nullcontext(None),
+                            contextlib.nullcontext(None),
+                            contextlib.nullcontext(None),
+                            contextlib.nullcontext(None),
+                        ]
+                    ),
+                ),
+                _completed_autotuner_warmup_num_tokens=None,
+                _agreement=SimpleNamespace(
+                    agree_flag=lambda flag: flag,
+                    should_run_warmup_batch=Mock(return_value=False),
+                ),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
@@ -1839,20 +1924,20 @@ class TestWarmupCleanup(unittest.TestCase):
 
             with (
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.AutoTuner.get",
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.AutoTuner.get",
                     return_value=tuner,
                 ),
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.autotune",
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.autotune",
                     side_effect=trtllm_autotune,
                 ),
                 patch.object(MXFP8GemmRunner, "sync_all_tactic_caches") as sync_tactics,
                 patch("torch.cuda.empty_cache"),
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.clear_memory_buffers"
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.clear_memory_buffers"
                 ),
             ):
-                DecoderRunner._run_autotuner_warmup(engine, resource_manager)
+                DecoderWarmup._run_autotuner_warmup(engine, resource_manager)
 
         self.assertEqual(
             calls,
@@ -1914,9 +1999,6 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
-                _completed_autotuner_warmup_num_tokens=None,
-                _agree_warmup_flag=lambda flag: flag,
-                cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1927,10 +2009,18 @@ class TestWarmupCleanup(unittest.TestCase):
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
                 guided_decoder=None,
-                no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
-                _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
-                _should_run_warmup_batch=Mock(return_value=True),
+                _graphs=SimpleNamespace(
+                    no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True
+                ),
+                _dummy_requests=SimpleNamespace(
+                    create_warmup_request=Mock(return_value=object()),
+                    release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+                ),
+                _completed_autotuner_warmup_num_tokens=None,
+                _agreement=SimpleNamespace(
+                    agree_flag=lambda flag: flag,
+                    should_run_warmup_batch=Mock(return_value=True),
+                ),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
@@ -1941,21 +2031,21 @@ class TestWarmupCleanup(unittest.TestCase):
 
             with (
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.AutoTuner.get",
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.AutoTuner.get",
                     return_value=tuner,
                 ),
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.autotune",
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.autotune",
                     return_value=contextlib.nullcontext(),
                 ),
                 patch.object(MXFP8GemmRunner, "sync_all_tactic_caches") as sync_tactics,
                 patch("torch.cuda.synchronize"),
                 patch("torch.cuda.empty_cache"),
                 patch(
-                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.clear_memory_buffers"
+                    "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.clear_memory_buffers"
                 ),
             ):
-                DecoderRunner._run_autotuner_warmup(engine, resource_manager)
+                DecoderWarmup._run_autotuner_warmup(engine, resource_manager)
 
         dist.tp_allgather.assert_called_once_with(1)
         dist.pp_allgather.assert_called_once_with([1, 1])
@@ -1981,14 +2071,179 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
-                cuda_graph_runner=SimpleNamespace(enabled=False),
+                _graphs=SimpleNamespace(enabled=False),
                 model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
             )
 
-            DecoderRunner._run_autotuner_warmup(engine, Mock())
+            DecoderWarmup._run_autotuner_warmup(engine, Mock())
 
         self.assertFalse(method.use_native_autotuner)
         self.assertFalse(method.needs_native_autotune)
+
+
+def _indexer_q_prewarm_owner(modules: list, tp_size: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: iter(modules)),
+        mapping=SimpleNamespace(tp_size=tp_size),
+        dist=Mock(),
+    )
+
+
+def _deepseek_v4_indexer(
+    q_lora_rank: int = 256, with_wq_b: bool = True, fused_enabled: bool = True
+) -> Mock:
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4Indexer
+
+    indexer = Mock(spec=DeepseekV4Indexer)
+    indexer.wq_b = (
+        SimpleNamespace(weight=torch.empty((64, q_lora_rank), dtype=torch.bfloat16))
+        if with_wq_b
+        else None
+    )
+    indexer._is_fused_project_mxfp4_enabled.return_value = fused_enabled
+    return indexer
+
+
+def _other_pp_stage_indexer() -> Mock:
+    """Layers owned by another pipeline stage keep wq_b but lose its weight."""
+    indexer = _deepseek_v4_indexer()
+    indexer.wq_b = torch.nn.Linear(256, 64, bias=False)
+    remove_weights(indexer.wq_b)
+    return indexer
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_indexer_q_prewarm_runs_every_fallback_tactic(tp_size: int) -> None:
+    indexer = _deepseek_v4_indexer(q_lora_rank=256)
+    owner = _indexer_q_prewarm_owner([torch.nn.Linear(2, 2), indexer], tp_size)
+    events = []
+    indexer._project_and_quantize_q.side_effect = lambda *args: events.append("compile")
+    owner.dist.tp_allgather.side_effect = lambda *args: events.append("barrier")
+
+    with patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("synchronize")):
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    calls = indexer._project_and_quantize_q.call_args_list
+    assert [c.args[0].shape for c in calls] == [(4, 256), (8, 256), (16, 256)]
+    assert [c.args[1].shape for c in calls] == [(4,), (8,), (16,)]
+    # The fused path only accepts bf16 activations.
+    assert all(c.args[0].dtype == torch.bfloat16 for c in calls)
+    assert all(c.args[1].dtype == torch.int32 for c in calls)
+    indexer._is_fused_project_mxfp4_enabled.assert_called_once_with(torch.bfloat16)
+    # The barrier is only useful once every compile on this rank has finished.
+    expected_barrier = ["barrier"] if tp_size > 1 else []
+    assert events == ["compile"] * 3 + ["synchronize"] + expected_barrier
+    if tp_size > 1:
+        owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case", ["no_indexer", "indexer_without_wq_b", "indexer_of_other_pp_stage"]
+)
+def test_indexer_q_prewarm_is_noop_without_local_dsv4_indexer(case: str) -> None:
+    if case == "indexer_of_other_pp_stage":
+        indexer = _other_pp_stage_indexer()
+    else:
+        indexer = _deepseek_v4_indexer(with_wq_b=False)
+    model_modules = [torch.nn.Linear(2, 2)]
+    if case != "no_indexer":
+        model_modules.append(indexer)
+    owner = _indexer_q_prewarm_owner(model_modules, tp_size=2)
+
+    with patch.object(torch.cuda, "synchronize") as synchronize:
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    indexer._project_and_quantize_q.assert_not_called()
+    synchronize.assert_not_called()
+    owner.dist.tp_allgather.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_indexer_q_prewarm_without_fused_path_compiles_nothing_but_reaches_barrier() -> None:
+    """The fused-path check is rank-local, so it must not decide the TP barrier."""
+    indexer = _deepseek_v4_indexer(fused_enabled=False)
+    owner = _indexer_q_prewarm_owner([indexer], tp_size=2)
+
+    with (
+        patch.object(torch.cuda, "synchronize") as synchronize,
+        patch.object(decoder_warmup_module.logger, "info") as info,
+    ):
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    indexer._project_and_quantize_q.assert_not_called()
+    synchronize.assert_not_called()
+    info.assert_not_called()
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+def test_indexer_q_prewarm_compiles_first_fused_indexer() -> None:
+    unfused_indexer = _deepseek_v4_indexer(fused_enabled=False)
+    fused_indexer = _deepseek_v4_indexer()
+    later_fused_indexer = _deepseek_v4_indexer()
+    owner = _indexer_q_prewarm_owner(
+        [unfused_indexer, fused_indexer, later_fused_indexer], tp_size=2
+    )
+
+    with patch.object(torch.cuda, "synchronize"):
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    unfused_indexer._project_and_quantize_q.assert_not_called()
+    assert fused_indexer._project_and_quantize_q.call_count == 3
+    later_fused_indexer._project_and_quantize_q.assert_not_called()
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+def test_indexer_q_prewarm_failure_still_reaches_barrier() -> None:
+    """A per-shape failure must not skip the TP barrier the other ranks wait on."""
+    indexer = _deepseek_v4_indexer()
+    indexer._project_and_quantize_q.side_effect = [RuntimeError("compile"), None, None]
+    owner = _indexer_q_prewarm_owner([indexer], tp_size=2)
+
+    with (
+        patch.object(torch.cuda, "synchronize"),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    assert indexer._project_and_quantize_q.call_count == 3
+    warning.assert_called_once()
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+def test_indexer_q_prewarm_does_not_report_completion_when_every_compile_fails() -> None:
+    indexer = _deepseek_v4_indexer()
+    indexer._project_and_quantize_q.side_effect = RuntimeError("compile")
+    owner = _indexer_q_prewarm_owner([indexer], tp_size=2)
+
+    with (
+        patch.object(torch.cuda, "synchronize"),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+        patch.object(decoder_warmup_module.logger, "info") as info,
+    ):
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    assert warning.call_count == 3
+    info.assert_not_called()
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
+    remote_indexer = _other_pp_stage_indexer()
+    local_indexer = _deepseek_v4_indexer()
+    owner = _indexer_q_prewarm_owner([remote_indexer, local_indexer], tp_size=2)
+
+    with patch.object(torch.cuda, "synchronize"):
+        DecoderWarmup._prewarm_cute_dsl_indexer_q(owner)
+
+    remote_indexer._project_and_quantize_q.assert_not_called()
+    assert local_indexer._project_and_quantize_q.call_count == 3
+    owner.dist.tp_allgather.assert_called_once_with(1)
 
 
 if __name__ == "__main__":
@@ -2026,33 +2281,29 @@ def test_attention_warmup_skips_gen_fmha_grid_on_context_workers(
         else:
             monkeypatch.setenv(name, value)
     monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
-    runner = object.__new__(DecoderRunner)
-    runner._config = SimpleNamespace(
+    warmup = object.__new__(DecoderWarmup)
+    warmup._config = SimpleNamespace(
         attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
         max_total_draft_tokens=0,
         is_spec_decode=False,
         spec_config=None,
     )
-    runner.guided_decoder = None
-    runner._trtllm_gen_jit_warmup = False
-    runner._warmup_timer = _WarmupTimer(rank=0)
+    warmup._inputs = SimpleNamespace(guided_decoder=None)
+    warmup._warmup_timer = _WarmupTimer(rank=0)
+    warmup._dummy_requests = SimpleNamespace(
+        create_warmup_request=lambda *a, **k: object(),
+        release_batch_context=lambda *a, **k: contextlib.nullcontext(object()),
+    )
+    warmup._agreement = SimpleNamespace(should_run_warmup_batch=lambda *a, **k: True)
+    warmup._graphs = SimpleNamespace(no_cuda_graph=contextlib.nullcontext)
     seen = []
-    monkeypatch.setattr(runner, "_create_warmup_request", lambda *a, **k: object(), raising=False)
-    monkeypatch.setattr(
-        runner, "_release_batch_context", lambda *a, **k: contextlib.nullcontext(object()),
-        raising=False,
-    )  # fmt: skip
-    monkeypatch.setattr(runner, "_should_run_warmup_batch", lambda *a, **k: True, raising=False)
-    monkeypatch.setattr(runner, "no_cuda_graph", lambda: contextlib.nullcontext(), raising=False)
-    monkeypatch.setattr(
-        runner, "_forward_warmup", lambda *a, **k: seen.append(runner._trtllm_gen_jit_warmup),
-        raising=False,
-    )  # fmt: skip
+    warmup._forward_warmup = lambda *a, trtllm_gen_jit_warmup=False, **k: seen.append(
+        trtllm_gen_jit_warmup
+    )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     # A Mamba-hybrid model (Kimi K3) runs only the generation request here.
-    runner._run_attention_warmup(Mock(), can_run_general_warmup=False)
+    warmup._run_attention_warmup(Mock(), can_run_general_warmup=False)
     assert seen == [grid]
-    assert runner._trtllm_gen_jit_warmup is False
 
 
 @pytest.mark.cpu_only
@@ -2122,11 +2373,11 @@ def test_warmup_joins_the_sampling_build_the_model_loader_started(
     its own helper, as before."""
     from tensorrt_llm._torch import jit_prefetch as jp
 
-    runner = object.__new__(DecoderRunner)
-    runner._warmup_timer = _WarmupTimer(rank=0)
-    runner._metrics = {}
-    runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-    runner.before_warmup_forwards_callable = None
+    warmup = object.__new__(DecoderWarmup)
+    warmup._warmup_timer = _WarmupTimer(rank=0)
+    warmup._metrics = {}
+    warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    warmup.before_warmup_forwards_callable = None
     resource_manager = Mock()
     events = []
     monkeypatch.setattr(jp, "flashinfer_build_pending", lambda name: pending)
@@ -2134,21 +2385,22 @@ def test_warmup_joins_the_sampling_build_the_model_loader_started(
     monkeypatch.setattr(jp, "start_mxfp8_tune_builds", lambda *a: False)
     monkeypatch.setattr(jp, "cancel_flashinfer_build", lambda: events.append("cancel"))
     monkeypatch.setattr(
-        decoder_runner_module, "warmup_sampling_module", lambda: events.append("in_place")
+        decoder_warmup_module, "warmup_sampling_module", lambda: events.append("in_place")
     )
     for name in (
         "_tunes_flashinfer_mxfp8",
         "_prewarm_engram_kernels",
         "_prewarm_csa2_sparse_indexer",
+        "_prewarm_minimax_m3_msa_indexer",
     ):
-        monkeypatch.setattr(runner, name, lambda *a, **k: False, raising=False)
+        monkeypatch.setattr(warmup, name, lambda *a, **k: False, raising=False)
     monkeypatch.setattr(
-        runner,
+        warmup,
         "_warmup_scheduled_forwards",
         lambda rm, kv, sampling_in_helper: events.append(f"forwards(helper={sampling_in_helper})"),
         raising=False,
     )
-    runner._warmup_scheduled(resource_manager, Mock())
+    warmup._warmup_scheduled(resource_manager, Mock())
     assert events == (
         ["forwards(helper=True)", "cancel"]
         if pending

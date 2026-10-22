@@ -118,7 +118,8 @@
       "name": "ucxx",
       "git_repository": "https://github.com/rapidsai/ucxx",
       "git_tag": "16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5",
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "_comment": "When changing git_tag, check the GITHUB_MIRROR handling for UCXX in cpp/CMakeLists.txt, e.g. whether the hardcoded CPM version and MD5 need updating."
     },
     {
       "name": "xgrammar",

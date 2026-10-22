@@ -220,7 +220,7 @@ def _build_k123(s: Dict[str, Any]):
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl_kernels.blackwell.kimi_k3_kda.fused_k123 import make_host_function
+    from .attention.kernels.blackwell.kimi_k3_kda.fused_k123 import make_host_function
 
     H, K, BT = s["H"], _K_DIM, _BT
     T, NT, N = 337, 7, 3  # placeholders; see docstring
@@ -304,7 +304,7 @@ def _build_k4(s: Dict[str, Any]):
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import (
+    from .attention.kernels.blackwell.kimi_k3_kda.k4_persistent import (
         BYTES_PER_TENSORMAP,
         NUM_TENSORMAPS,
         make_host_fn,
@@ -564,8 +564,8 @@ def _build_fp8_gemm(s: Dict[str, Any]):
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import Sm100BlockwiseGemmKernel
-    from .cute_dsl_kernels.blackwell.utils import make_ptr
+    from .kernels.blackwell.blockwise_gemm.blockwise_gemm import Sm100BlockwiseGemmKernel
+    from .kernels.blackwell.utils import make_ptr
 
     gemm = Sm100BlockwiseGemmKernel(
         cutlass.Float32,
@@ -744,7 +744,7 @@ def device_props() -> Dict[str, Any]:
         "name": p.name,
     }
     try:  # the radix top-k cluster kernels clamp their cluster size to this
-        from .cute_dsl_kernels.blackwell.top_k import single_pass_multi_cta_radix_topk_cluster as c
+        from .kernels.blackwell.top_k import single_pass_multi_cta_radix_topk_cluster as c
 
         props["max_cluster_size"] = int(c._query_max_cluster_size())
     except Exception:  # noqa: BLE001 - CuTe DSL missing, or the query failed
@@ -794,7 +794,7 @@ def install_device_shim(props: Dict[str, Any]) -> None:
     if "max_cluster_size" in props:
         try:
             from .custom_ops import cute_dsl_custom_ops as ops
-            from .cute_dsl_kernels.blackwell.top_k import (
+            from .kernels.blackwell.top_k import (
                 single_pass_multi_cta_radix_topk_cluster as cluster_mod,
             )
         except ImportError:

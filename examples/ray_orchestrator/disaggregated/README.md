@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Disaggregated Serving with Ray orchestrator
 TensorRT-LLM supports a prototype [Ray orchestrator](../README.md) as an alternative to MPI.
 
@@ -12,11 +17,9 @@ This script is a shorthand to launch a single-GPU context and generation server,
 bash -e disagg_serving_local.sh
 ```
 
-KV cache transfer between the context and generation servers uses the NIXL backend by default. Pass `--transceiver_backend UCX` to use UCX instead. The C++ cache-transceiver runtime is used by default; with NIXL, pass `--transceiver_runtime PYTHON` to use the Python runtime instead:
-```bash
-bash -e disagg_serving_local.sh --transceiver_backend UCX
-bash -e disagg_serving_local.sh --transceiver_runtime PYTHON
-```
+The script defaults to the NIXL backend and Python transceiver runtime.
+Use `--transceiver_backend DEFAULT --transceiver_runtime auto` to follow the
+standard model-loading defaults instead.
 
 Run `bash disagg_serving_local.sh --help` for the full list of options (executor backend, model, tensor-parallel size, etc.).
 

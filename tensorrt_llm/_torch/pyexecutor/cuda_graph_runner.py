@@ -47,7 +47,7 @@ _STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
-# graphs, EncoderDecoderRunner._prepare_capture_batch temporarily runs each
+# graphs, EncoderDecoderCudaGraphs.prepare_capture_batch temporarily runs each
 # dummy generation request as a one-token context chunk to write its cross-KV
 # cache, so enc-dec dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
@@ -138,7 +138,6 @@ class CUDAGraphRunnerConfig:
     spec_config: Optional[DecodingBaseConfig]
     cuda_graph_mem_pool: Any
     use_mrope: bool
-    original_max_draft_len: int
     original_max_total_draft_tokens: int
     enable_attention_dp: bool
     is_encoder_decoder: bool
@@ -683,9 +682,6 @@ class CUDAGraphRunner:
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
-        # Preserve compatibility with direct callers that still pass a plain
-        # (batch_size, draft_len) generation-only tuple.
-        key = KeyType(*key)
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -791,7 +787,6 @@ class CUDAGraphRunner:
         ``position_id_offsets`` is a one-dimensional device tensor containing the
         position corrections applied inside the captured speculative preprocessing.
         """
-        key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:
@@ -994,7 +989,7 @@ class CUDAGraphRunner:
         would mis-associate every real request with another request's output,
         because three separate consumers hard-code "the generation rows start
         at index 0":
-          * ``DecoderRunner._prepare_tp_inputs`` skips the input_ids of
+          * ``DecoderInputPreparer.prepare_inputs`` skips the input_ids of
             CUDA-graph dummies and blits the overlap scheduler's tokens at
             ``input_ids_cuda[num_tokens:...]``, which only lines up with the
             per-row position_ids while every dummy sits after every real row;
@@ -1287,7 +1282,7 @@ class CUDAGraphRunner:
         """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
 
         The dynamic draft length mapping exists exactly when the dynamic draft
-        length feature is active (see _compute_dynamic_draft_len_mapping);
+        length feature is active (see compute_dynamic_draft_len_mapping);
         without it, this ignores draft_len and reduces to plain batch-size
         rounding.
         """

@@ -319,7 +319,7 @@ def test_mxfp8_tune_modules_predicted_at_load_as_warmup_decides(
     import torch
 
     from tensorrt_llm._torch import jit_prefetch as jp
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", object(), raising=False)
@@ -330,18 +330,19 @@ def test_mxfp8_tune_modules_predicted_at_load_as_warmup_decides(
         # The engine's resolved settings for these arguments (the compile
         # ones are PyTorchModelEngine's, see test_pcg_fx_fallback_policy_*).
         compile_mode = args_kw.get("compile_mode", "eager")
-        runner = SimpleNamespace(
+        warmup = SimpleNamespace(
             model=model,
             mapping=model.model_config.mapping,
-            cuda_graph_runner=SimpleNamespace(enabled=llm_args.cuda_graph_config is not None),
+            _context_warmups_supported=True,
+            _graphs=SimpleNamespace(enabled=llm_args.cuda_graph_config is not None),
             _config=SimpleNamespace(
                 enable_autotuner=llm_args.enable_autotuner,
                 torch_compile_enabled=compile_mode != "eager",
                 torch_compile_prefill_only=compile_mode == "prefill_only",
             ),
-            flashinfer_mxfp8_pass_selected=DecoderRunner.flashinfer_mxfp8_pass_selected,
+            flashinfer_mxfp8_pass_selected=DecoderWarmup.flashinfer_mxfp8_pass_selected,
         )
-        assert DecoderRunner._tunes_flashinfer_mxfp8(runner) is tunes
+        assert DecoderWarmup._tunes_flashinfer_mxfp8(warmup) is tunes
 
     monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     monkeypatch.setattr("tensorrt_llm._utils.is_sm_100f", lambda *a: True)
