@@ -14,6 +14,9 @@ from tensorrt_llm._utils import get_sm_version
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
+    _FP4_MLA_PACKED_MAX_SPLITS,
+    _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT,
+    _FP4_MLA_SPLIT_KV_ENV,
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_K_RESIDUAL_DIM,
@@ -21,6 +24,7 @@ from .config import (
     FP4_MLA_Q_LOGICAL_DIM,
     FP4_MLA_Q_PACKED_DIM,
     FP4_MLA_Q_RESIDUAL_DIM,
+    FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
     _ceil_div,
     _cutedsl_backend_available,
@@ -28,6 +32,7 @@ from .config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_cutedsl_kernel_module,
+    _fp4_mla_packed_rows_per_seq,
 )
 from .layout import (
     _ensure_workspace_tensor,
@@ -765,6 +770,178 @@ def _run_triton_attention_decode(
             )
 
 
+def _select_packed_split_count(
+    num_requests: int,
+    m_tiles: int,
+    device: torch.device,
+    *,
+    max_kv_len: int,
+    is_cuda_graph: bool,
+) -> int:
+    """KV splits per request tile: fill one wave of 2-CTA clusters.
+
+    The count depends only on the request count and tile count, so a CUDA
+    graph bucket always replays the same geometry. Eager calls know the real
+    longest KV and keep at least _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT KV tiles
+    per split. ``TRTLLM_FP4_MLA_SPLIT_KV`` overrides the count for testing.
+    """
+    override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+    if override != "auto":
+        return max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
+    clusters_per_wave = max(1, _get_sm_count(device) // 2)
+    splits = clusters_per_wave // max(1, num_requests * m_tiles)
+    splits = max(1, min(_FP4_MLA_PACKED_MAX_SPLITS, splits))
+    if not is_cuda_graph:
+        kv_tiles = _ceil_div(max(max_kv_len, 1), 256)
+        splits = max(1, min(splits, _ceil_div(kv_tiles, _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT)))
+    return splits
+
+
+def _run_cutedsl_packed_decode(
+    module: Any,
+    metadata: Any,
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    v_packed: torch.Tensor,
+    v_sf: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    q_global_scale: torch.Tensor,
+    src_page_ids: torch.Tensor,
+    page_indptr: torch.Tensor,
+    kv_lens: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    num_heads: int,
+    query_len: int,
+    num_requests: int,
+    rows_per_seq: int,
+    max_kv_len: int,
+    sm_scale: float,
+    v_page_offset: int,
+    helix_kv_bounds: torch.Tensor | None,
+    softmax_stats_tensor: torch.Tensor | None,
+) -> None:
+    """Packed CuTe DSL decode: one kernel over (split, request) tasks.
+
+    A single split writes the output (and Helix stats) directly; several
+    splits write FP32 partials that one reduction kernel folds into the
+    output and stats. Nothing pads, replicates, or copies Q or the output.
+    """
+    valid_m, physical_m = module.packed_query_rows(num_heads, query_len)
+    if physical_m != rows_per_seq:
+        raise RuntimeError(
+            f"FP4 MLA packed Q rows {rows_per_seq} do not match the kernel geometry {physical_m}."
+        )
+    if v_packed is None:
+        raise RuntimeError("FP4 MLA packed decode requires the persistent packed-V cache.")
+    if not output.is_contiguous() or output.numel() != num_requests * valid_m * 512:
+        raise RuntimeError(
+            "FP4 MLA packed decode requires a contiguous [tokens, heads, 512] output."
+        )
+    device = output.device
+    is_cuda_graph = bool(getattr(metadata, "is_cuda_graph", False))
+    splits = _select_packed_split_count(
+        num_requests,
+        physical_m // FP4_MLA_SCALE_ROW_GROUP,
+        device,
+        max_kv_len=max_kv_len,
+        is_cuda_graph=is_cuda_graph,
+    )
+    # The runtime KV profile only has to cover one split.
+    split_kv_len = max(_ceil_div(_ceil_div(max(max_kv_len, 1), 256), splits) * 256, 256)
+    output_rows = output.view(num_requests * valid_m, 512)
+    stats_rows = None
+    if softmax_stats_tensor is not None:
+        stats_rows = softmax_stats_tensor.view(num_requests * valid_m, 2)
+    common = dict(
+        max_kv_len=split_kv_len,
+        sm_scale=sm_scale,
+        num_heads=num_heads,
+        query_len=query_len,
+        num_requests=num_requests,
+        num_splits=splits,
+        q_global_scale=q_global_scale,
+        v_page_offset=v_page_offset,
+        helix_kv_bounds=helix_kv_bounds,
+    )
+    if splits == 1:
+        module.run_trtllm_fp4_mla_decode_packed(
+            q_fp4,
+            q_sf,
+            kv_cache,
+            sf_cache,
+            v_packed,
+            v_sf,
+            kv_global_scale,
+            src_page_ids,
+            page_indptr,
+            kv_lens,
+            output_rows,
+            softmax_stats=stats_rows,
+            **common,
+        )
+        return
+    from .fp4_mla_packed_reduce import reduce_packed_splits
+
+    tasks = splits * num_requests
+    # Graph buckets hold exactly their tasks; eager metadata grows on demand.
+    task_capacity = tasks if is_cuda_graph else max(tasks, 32)
+    partial = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_partial",
+        (task_capacity, physical_m, 512),
+        dtype=torch.float32,
+        device=device,
+    )[:tasks]
+    maxima = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_maxima",
+        (task_capacity, physical_m),
+        dtype=torch.float32,
+        device=device,
+    )[:tasks]
+    sums = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_sums",
+        (task_capacity, physical_m),
+        dtype=torch.float32,
+        device=device,
+    )[:tasks]
+    module.run_trtllm_fp4_mla_decode_packed(
+        q_fp4,
+        q_sf,
+        kv_cache,
+        sf_cache,
+        v_packed,
+        v_sf,
+        kv_global_scale,
+        src_page_ids,
+        page_indptr,
+        kv_lens,
+        output_rows,
+        split_kv_buffers=(partial, maxima, sums),
+        **common,
+    )
+    reduce_packed_splits(
+        partial,
+        maxima,
+        sums,
+        output_rows,
+        q_global_scale,
+        kv_global_scale,
+        num_requests=num_requests,
+        num_splits=splits,
+        valid_m=valid_m,
+        physical_m=physical_m,
+        sm_scale=sm_scale,
+        output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        stats=stats_rows,
+        sm_count=_get_sm_count(device),
+    )
+
+
 def run_fp4_mla_attention_decode(
     metadata: Any,
     layer_idx: int,
@@ -878,30 +1055,57 @@ def run_fp4_mla_attention_decode(
         )
 
     capacity = int(q_batch_capacity)
-    expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
-    expected_q_sf_shape = (
-        _get_fp4_mla_swizzled_scale_size(
-            capacity * num_heads,
-            FP4_MLA_Q_LOGICAL_DIM,
-        ),
+    # The fused generation update records the Q layout it produced; metadata
+    # that never went through it (contract tests) carries the legacy layout.
+    recorded_rows_per_seq = getattr(
+        getattr(metadata, "fp4_mla_state", None), "prequantized_q_rows_per_seq", None
     )
-    if (
-        q.dtype != torch.bfloat16
-        or capacity <= 0
-        or num_queries > capacity
-        or tuple(prequantized_q.shape) != expected_q_shape
-        or prequantized_q.dtype != torch.uint8
-        or not prequantized_q.is_contiguous()
-        or tuple(prequantized_q_sf.shape) != expected_q_sf_shape
-        or prequantized_q_sf.dtype != torch.float8_e4m3fn
-        or not prequantized_q_sf.is_contiguous()
+    packed_rows_per_seq = int(recorded_rows_per_seq or 0)
+    if recorded_rows_per_seq is not None and packed_rows_per_seq != _fp4_mla_packed_rows_per_seq(
+        num_heads, query_len_per_seq
     ):
-        raise ValueError("FP4 MLA prequantized Q does not satisfy the fused-Q contract.")
-    active_q_rows = num_queries * num_heads
+        raise RuntimeError(
+            "FP4 MLA prequantized Q layout does not match the packed decode "
+            f"configuration (rows per request {packed_rows_per_seq})."
+        )
+    if packed_rows_per_seq:
+        active_q_rows = num_gen_seqs * packed_rows_per_seq
+    else:
+        active_q_rows = num_queries * num_heads
     active_q_sf_bytes = _get_fp4_mla_swizzled_scale_size(
         active_q_rows,
         FP4_MLA_Q_LOGICAL_DIM,
     )
+    if packed_rows_per_seq:
+        q_contract_ok = (
+            prequantized_q.ndim == 2
+            and prequantized_q.shape[0] >= active_q_rows
+            and prequantized_q.shape[1] == FP4_MLA_Q_PACKED_DIM
+            and prequantized_q_sf.numel() >= active_q_sf_bytes
+        )
+    else:
+        expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
+        expected_q_sf_shape = (
+            _get_fp4_mla_swizzled_scale_size(
+                capacity * num_heads,
+                FP4_MLA_Q_LOGICAL_DIM,
+            ),
+        )
+        q_contract_ok = (
+            tuple(prequantized_q.shape) == expected_q_shape
+            and tuple(prequantized_q_sf.shape) == expected_q_sf_shape
+        )
+    if (
+        q.dtype != torch.bfloat16
+        or capacity <= 0
+        or num_queries > capacity
+        or not q_contract_ok
+        or prequantized_q.dtype != torch.uint8
+        or not prequantized_q.is_contiguous()
+        or prequantized_q_sf.dtype != torch.float8_e4m3fn
+        or not prequantized_q_sf.is_contiguous()
+    ):
+        raise ValueError("FP4 MLA prequantized Q does not satisfy the fused-Q contract.")
     q_fp4 = prequantized_q[:active_q_rows]
     q_sf = prequantized_q_sf[:active_q_sf_bytes]
     q_global_scale = _get_fp4_mla_q_global_scale(metadata, q.device)
@@ -959,7 +1163,8 @@ def run_fp4_mla_attention_decode(
         # Keep general cases on the original path. This specialization uses
         # the prepacked-V mufu16 core and linear six-query MTP only.
         fold_queries = (
-            num_heads == 6
+            not packed_rows_per_seq
+            and num_heads == 6
             and query_len_per_seq == 6
             and num_gen_seqs == 1
             and helix_kv_bounds is None
@@ -976,7 +1181,7 @@ def run_fp4_mla_attention_decode(
         physical_heads = 128
         kernel_q = q_fp4
         kernel_q_sf = q_sf
-        if num_heads < physical_heads and not fold_queries:
+        if not packed_rows_per_seq and num_heads < physical_heads and not fold_queries:
             kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
                 metadata,
                 num_queries,
@@ -1081,6 +1286,34 @@ def run_fp4_mla_attention_decode(
                     "Persistent FP4 MLA V-scale layer view does not match its "
                     "full-pool base and page offset."
                 )
+
+        if packed_rows_per_seq:
+            _run_cutedsl_packed_decode(
+                cutedsl_kernel,
+                metadata,
+                q_fp4,
+                q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                q_global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                output,
+                num_heads=num_heads,
+                query_len=query_len_per_seq,
+                num_requests=num_gen_seqs,
+                rows_per_seq=packed_rows_per_seq,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                v_page_offset=v_page_offset,
+                helix_kv_bounds=helix_kv_bounds,
+                softmax_stats_tensor=softmax_stats_tensor,
+            )
+            return
 
         from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
 

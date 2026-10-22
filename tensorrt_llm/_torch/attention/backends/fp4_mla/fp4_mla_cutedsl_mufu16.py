@@ -30,6 +30,12 @@ nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 CUDA_GRID_Z_MAX = 65535
 SUPPORTS_FOLDED_QUERIES = True
+# Packed decode rows: one batch entry per request holding [query token, head]
+# rows, KV split across grid.z tasks, per-row causal bounds (Helix per-token
+# bounds or the linear-MTP window), direct output/stats for one split and
+# FP32 partials for several.
+SUPPORTS_PACKED_QUERIES = True
+PACKED_MAX_M = 1024
 INT32_MAX = (1 << 31) - 1
 
 
@@ -995,6 +1001,12 @@ def fused_fp4_mla_decode_ctm(
     runtime_m: ctm.Int32,
     runtime_l: ctm.Int32,
     q_tma_l: ctm.Int32,
+    num_requests: ctm.Int32,
+    num_splits: ctm.Int32,
+    valid_m: ctm.Int32,
+    row_state_row_stride: ctm.Int32,
+    row_state_batch_stride: ctm.Int32,
+    page_table_len: ctm.Int32,
     num_cache_pages: ctm.Int32,
     num_v_cache_pages: ctm.Int32,
     v_page_offset: ctm.Int32,
@@ -1014,10 +1026,16 @@ def fused_fp4_mla_decode_ctm(
     write_softmax_stats: ctm.Constexpr = False,
     store_split: ctm.Constexpr = False,
     folded_query_heads: ctm.Constexpr = 0,
+    packed_query_heads: ctm.Constexpr = 0,
 ) -> None:
     n, k = problem_size
     m = runtime_m
     batch_size = runtime_l
+    num_sequences = batch_size // query_len_per_seq
+    bounds_len = batch_size
+    if cutlass.const_expr(packed_query_heads > 0):
+        num_sequences = num_requests
+        bounds_len = num_requests * ctm.Int32(query_len_per_seq)
     q_f4_tensor = cute.make_tensor(
         q_ptr,
         cute.make_layout(
@@ -1034,11 +1052,11 @@ def fused_fp4_mla_decode_ctm(
     )
     page_table_tensor = cute.make_tensor(
         cute.recast_ptr(page_table_ptr, dtype=cutlass.Int32),
-        cute.make_layout(((k // page_size) * (batch_size // query_len_per_seq),), stride=(1,)),
+        cute.make_layout((page_table_len,), stride=(1,)),
     )
     page_indptr_tensor = cute.make_tensor(
         cute.recast_ptr(page_indptr_ptr, dtype=cutlass.Int32),
-        cute.make_layout((batch_size // query_len_per_seq + 1,), stride=(1,)),
+        cute.make_layout((num_sequences + 1,), stride=(1,)),
     )
     q_global_scale_tensor = cute.make_tensor(
         cute.recast_ptr(q_global_scale_ptr, dtype=cutlass.Float32),
@@ -1050,11 +1068,11 @@ def fused_fp4_mla_decode_ctm(
     )
     valid_k_tensor = cute.make_tensor(
         cute.recast_ptr(valid_k_ptr, dtype=cutlass.Int32),
-        cute.make_layout((batch_size // query_len_per_seq,), stride=(1,)),
+        cute.make_layout((num_sequences,), stride=(1,)),
     )
     helix_kv_bounds_tensor = cute.make_tensor(
         cute.recast_ptr(helix_kv_bounds_ptr, dtype=cutlass.Int32),
-        cute.make_layout((batch_size,), stride=(1,)),
+        cute.make_layout((bounds_len,), stride=(1,)),
     )
     v_tma_tensor = cute.make_tensor(
         b_ptr,
@@ -1087,14 +1105,21 @@ def fused_fp4_mla_decode_ctm(
             ),
         ),
     )
+    # The direct output holds valid_m rows per batch entry (packed rows drop
+    # the padded tail); split partials keep the padded m rows per task.
+    c_batch_stride = cute.assume(valid_m * n, 512)
     c_layout = cute.make_layout(
+        (cute.assume(m, 32), cute.assume(n, 16), batch_size),
+        stride=(cute.assume(n, 16), 1, c_batch_stride),
+    )
+    accum_layout = cute.make_layout(
         (cute.assume(m, 32), cute.assume(n, 16), batch_size),
         stride=(cute.assume(n, 16), 1, cute.assume(m * n, 512)),
     )
     c_tensor = cute.make_tensor(c_ptr, c_layout)
-    accum_tensor = cute.make_tensor(accum_ptr, c_layout)
+    accum_tensor = cute.make_tensor(accum_ptr, accum_layout)
     row_state_layout = cute.make_layout(
-        (cute.assume(m, 32), batch_size), stride=(1, cute.assume(m, 32))
+        (cute.assume(m, 32), batch_size), stride=(row_state_row_stride, row_state_batch_stride)
     )
     row_max_tensor = cute.make_tensor(row_max_ptr, row_state_layout)
     row_sum_tensor = cute.make_tensor(row_sum_ptr, row_state_layout)
@@ -1335,6 +1360,10 @@ def fused_fp4_mla_decode_ctm(
         row_sum_tensor,
         problem_size,
         runtime_m,
+        num_requests,
+        num_splits,
+        valid_m,
+        c_batch_stride,
         v_page_offset,
         softmax_scale_log2,
         pv_output_scale,
@@ -1348,6 +1377,7 @@ def fused_fp4_mla_decode_ctm(
         write_softmax_stats,
         store_split,
         folded_query_heads,
+        packed_query_heads,
     ).launch(
         grid=(
             cute.ceil_div(c_tensor.shape[0], SMEM_P4_CTA_GROUP_M) * CLUSTER_SHAPE_MNK[0],
@@ -4551,6 +4581,8 @@ def _store_final_o_from_tmem(
     final_row_sum: ctm.Float32,
     final_stat_scale: ctm.Float32,
     output_normalizer: ctm.Float32,
+    valid_m: ctm.Int32,
+    c_batch_stride: ctm.Int32,
     write_softmax_stats: ctm.Constexpr = False,
     producer_warp_base: ctm.Constexpr = 0,
     store_split: ctm.Constexpr = False,
@@ -4573,14 +4605,17 @@ def _store_final_o_from_tmem(
         + cta_rank * ctm.Int32(SMEM_P4_BMM1_M)
         + local_row
     )
+    # Padded packed rows (row >= valid_m) are compute lanes only.
+    store_row = row < valid_m
     if cutlass.const_expr(store_split):
         # Both column bands have the same row state; export each row once.
         if col_band == ctm.Int32(0):
             mRowMax_ml[row, bidz] = final_row_max
             mRowSum_ml[row, bidz] = final_row_sum
     batch_offset = bidz * m * n
+    c_batch_offset = bidz * c_batch_stride
     if cutlass.const_expr(write_softmax_stats):
-        if col_band == ctm.Int32(0) and bidy == ctm.Int32(0):
+        if col_band == ctm.Int32(0) and bidy == ctm.Int32(0) and store_row:
             mRowMax_ml[row, bidz] = final_row_max * final_stat_scale
             mRowSum_ml[row, bidz] = final_row_sum
     n_tile_total = n // ctm.Int32(OUT_DIM)
@@ -4616,17 +4651,18 @@ def _store_final_o_from_tmem(
                     alignment=32,
                 )
         if cutlass.const_expr(not store_split):
-            output_linear_idx = row * n + col_base + batch_offset
-            output_vec_f32 = c_rmem[0:subtile_cols]
-            output_vec = (output_vec_f32 * output_normalizer).to(mC_mnl.element_type)
-            # The decode output is consumed after this kernel and has no in-kernel
-            # reuse.  Avoid allocating its streaming write in L1; on GR100 this
-            # preserves the 256-bit vector store while lowering it to
-            # STG.E.NA.ENL2.256.
-            gC_arr.subview(output_linear_idx).data_ptr().nvvm_store_ext(
-                output_vec,
-                evict=prims.EvictPriority.NOALLOCATE,
-            )
+            if store_row:
+                output_linear_idx = row * n + col_base + c_batch_offset
+                output_vec_f32 = c_rmem[0:subtile_cols]
+                output_vec = (output_vec_f32 * output_normalizer).to(mC_mnl.element_type)
+                # The decode output is consumed after this kernel and has no in-kernel
+                # reuse.  Avoid allocating its streaming write in L1; on GR100 this
+                # preserves the 256-bit vector store while lowering it to
+                # STG.E.NA.ENL2.256.
+                gC_arr.subview(output_linear_idx).data_ptr().nvvm_store_ext(
+                    output_vec,
+                    evict=prims.EvictPriority.NOALLOCATE,
+                )
 
 
 @cute.jit
@@ -5825,23 +5861,43 @@ def _stage_smem_p4_runtime_scale_pair(
 @cute.jit
 def _stage_smem_p4_page_id_plan(
     mPageTable_pl: cute.Tensor,
-    mPageIndptr_s: cute.Tensor,
     sPageIdPlan,
     tidx: ctm.Int32,
-    page_batch: ctm.Int32,
+    page_begin: ctm.Int32,
+    page_count: ctm.Int32,
     planned_page_count: ctm.Int32,
 ) -> None:
-    page_begin = cute.arch.make_warp_uniform(ctm.Int32(mPageIndptr_s[page_batch]))
-    page_count = cute.arch.make_warp_uniform(
-        ctm.Int32(mPageIndptr_s[page_batch + ctm.Int32(1)]) - page_begin
-    )
     logical_page_idx = tidx
     while logical_page_idx < planned_page_count:
         physical_page = _lookup_physical_page(
-            mPageTable_pl, logical_page_idx, page_batch, page_begin, page_count
+            mPageTable_pl, logical_page_idx, ctm.Int32(0), page_begin, page_count
         )
         (sPageIdPlan.data_ptr() + logical_page_idx).store(physical_page)
         logical_page_idx += ctm.Int32(THREADS_PER_CTA)
+
+
+@cute.jit
+def _packed_query_bound(
+    mHelixKvBounds_l: cute.Tensor,
+    request_idx: ctm.Int32,
+    query_idx: ctm.Int32,
+    request_valid_k: ctm.Int32,
+    query_len_per_seq: ctm.Constexpr,
+    use_helix_kv_bounds: ctm.Constexpr,
+) -> ctm.Int32:
+    """Visible KV count of one query token of a packed request.
+
+    Helix supplies a per-token rank-local bound; otherwise the linear MTP
+    window ends ``query_len - 1 - query_idx`` tokens before the request's KV end.
+    """
+    bound = ctm.Int32(0)
+    if cutlass.const_expr(use_helix_kv_bounds):
+        bound = ctm.Int32(mHelixKvBounds_l[request_idx * ctm.Int32(query_len_per_seq) + query_idx])
+    else:
+        bound = ctm.max(
+            request_valid_k - (ctm.Int32(query_len_per_seq - 1) - query_idx), ctm.Int32(0)
+        )
+    return bound
 
 
 @cute.jit
@@ -5872,6 +5928,10 @@ def _run_mla_decode_body(
     mRowSum_ml: cute.Tensor,
     problem_size: tuple,
     runtime_m: ctm.Int32,
+    num_requests: ctm.Int32,
+    num_splits: ctm.Int32,
+    valid_m: ctm.Int32,
+    c_batch_stride: ctm.Int32,
     v_page_offset: ctm.Int32,
     softmax_scale_log2: ctm.Float32,
     pv_output_scale: ctm.Float32,
@@ -5885,6 +5945,7 @@ def _run_mla_decode_body(
     write_softmax_stats: ctm.Constexpr = False,
     store_split: ctm.Constexpr = False,
     folded_query_heads: ctm.Constexpr = 0,
+    packed_query_heads: ctm.Constexpr = 0,
 ) -> None:
     pv_psf_rescale = ctm.Float32(FP4_MLA_P_GLOBAL_SCALE) * pv_output_scale
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -5894,18 +5955,74 @@ def _run_mla_decode_body(
     m = runtime_m
     page_batch = ctm.Int32(0)
     valid_k_for_l = ctm.Int32(0)
-    page_batch = cute.arch.make_warp_uniform(bidz // ctm.Int32(query_len_per_seq))
-    if cutlass.const_expr(folded_query_heads > 0):
-        valid_k_for_l = mValidK_l[page_batch]
-    elif cutlass.const_expr(use_helix_kv_bounds):
-        valid_k_for_l = mHelixKvBounds_l[bidz]
-    else:
-        query_offset = bidz - page_batch * ctm.Int32(query_len_per_seq)
-        valid_k_for_l = ctm.max(
-            mValidK_l[page_batch] - (ctm.Int32(query_len_per_seq - 1) - query_offset),
-            ctm.Int32(0),
+    q_batch = bidz
+    # Packed rows: grid.z enumerates (split, request) tasks, request fastest.
+    # Rows of this M tile are [query token, head] pairs of one request; the
+    # split owns KV tiles [split_tile_begin, split_tile_begin + split_tiles)
+    # and every bound below is relative to split_base_k.
+    split_tile_begin = ctm.Int32(0)
+    split_base_k = ctm.Int32(0)
+    first_valid_k = ctm.Int32(0)
+    packed_tile_row0 = ctm.Int32(0)
+    packed_request_valid_k = ctm.Int32(0)
+    if cutlass.const_expr(packed_query_heads > 0):
+        page_batch = cute.arch.make_warp_uniform(bidz % num_requests)
+        split_idx = cute.arch.make_warp_uniform(bidz // num_requests)
+        q_batch = page_batch
+        packed_tile_row0 = (bidx // ctm.Int32(CLUSTER_SHAPE_MNK[0])) * ctm.Int32(
+            SMEM_P4_CTA_GROUP_M
         )
+        packed_request_valid_k = cute.arch.make_warp_uniform(ctm.Int32(mValidK_l[page_batch]))
+        packed_last_query = ctm.Int32(query_len_per_seq - 1)
+        tile_first_query = ctm.min(
+            packed_tile_row0 // ctm.Int32(packed_query_heads), packed_last_query
+        )
+        tile_last_query = ctm.min(
+            (packed_tile_row0 + ctm.Int32(SMEM_P4_CTA_GROUP_M - 1))
+            // ctm.Int32(packed_query_heads),
+            packed_last_query,
+        )
+        tile_max_bound = _packed_query_bound(
+            mHelixKvBounds_l,
+            page_batch,
+            tile_last_query,
+            packed_request_valid_k,
+            query_len_per_seq,
+            use_helix_kv_bounds,
+        )
+        tile_min_bound = _packed_query_bound(
+            mHelixKvBounds_l,
+            page_batch,
+            tile_first_query,
+            packed_request_valid_k,
+            query_len_per_seq,
+            use_helix_kv_bounds,
+        )
+        k_tile_total = (tile_max_bound + ctm.Int32(KV_TILE - 1)) // ctm.Int32(KV_TILE)
+        tiles_per_split = (k_tile_total + num_splits - ctm.Int32(1)) // num_splits
+        split_tile_begin = split_idx * tiles_per_split
+        split_tile_end = ctm.min(k_tile_total, split_tile_begin + tiles_per_split)
+        split_tiles = ctm.max(split_tile_end - split_tile_begin, ctm.Int32(0))
+        split_base_k = split_tile_begin * ctm.Int32(KV_TILE)
+        valid_k_for_l = ctm.min(
+            ctm.max(tile_max_bound - split_base_k, ctm.Int32(0)),
+            split_tiles * ctm.Int32(KV_TILE),
+        )
+        first_valid_k = ctm.min(ctm.max(tile_min_bound - split_base_k, ctm.Int32(0)), valid_k_for_l)
+    else:
+        page_batch = cute.arch.make_warp_uniform(bidz // ctm.Int32(query_len_per_seq))
+        if cutlass.const_expr(folded_query_heads > 0):
+            valid_k_for_l = mValidK_l[page_batch]
+        elif cutlass.const_expr(use_helix_kv_bounds):
+            valid_k_for_l = mHelixKvBounds_l[bidz]
+        else:
+            query_offset = bidz - page_batch * ctm.Int32(query_len_per_seq)
+            valid_k_for_l = ctm.max(
+                mValidK_l[page_batch] - (ctm.Int32(query_len_per_seq - 1) - query_offset),
+                ctm.Int32(0),
+            )
     valid_k_for_l = cute.arch.make_warp_uniform(valid_k_for_l)
+    first_valid_k = cute.arch.make_warp_uniform(first_valid_k)
     folded_first_valid_k = ctm.Int32(0)
     if cutlass.const_expr(folded_query_heads > 0):
         folded_first_valid_k = cute.arch.make_warp_uniform(mHelixKvBounds_l[bidz])
@@ -5915,6 +6032,12 @@ def _run_mla_decode_body(
     csr_page_count = cute.arch.make_warp_uniform(
         ctm.Int32(mPageIndptr_s[page_batch + ctm.Int32(1)]) - csr_page_begin
     )
+    if cutlass.const_expr(packed_query_heads > 0):
+        # The split's page window starts at its first KV tile; lookups past
+        # the request's last page clamp inside _lookup_physical_page.
+        split_page_begin = split_tile_begin * ctm.Int32(SMEM_P4_PAGES_PER_KV_TILE)
+        csr_page_begin = csr_page_begin + split_page_begin
+        csr_page_count = ctm.max(csr_page_count - split_page_begin, ctm.Int32(0))
     raw_kv_tiles = (valid_k_for_l + ctm.Int32(KV_TILE - 1)) // ctm.Int32(KV_TILE)
     kv_tiles = ctm.max(raw_kv_tiles, ctm.Int32(1))
     planned_page_count = kv_tiles * ctm.Int32(SMEM_P4_PAGES_PER_KV_TILE)
@@ -6187,7 +6310,7 @@ def _run_mla_decode_body(
         )
     if cutlass.const_expr(use_smem_page_plan):
         _stage_smem_p4_page_id_plan(
-            mPageTable_pl, mPageIndptr_s, sPageIdPlan, tidx, page_batch, planned_page_count
+            mPageTable_pl, sPageIdPlan, tidx, csr_page_begin, csr_page_count, planned_page_count
         )
     cute.arch.cluster_arrive()
     cute.arch.cluster_wait()
@@ -6228,7 +6351,7 @@ def _run_mla_decode_body(
                     sSFA,
                     tidx,
                     bidx,
-                    bidz,
+                    q_batch,
                     cta_rank,
                     qk_kblock_idx=q_stage_kblock_idx,
                     stage=q_stage_idx,
@@ -6711,6 +6834,29 @@ def _run_mla_decode_body(
                     _mbarrier_arrive_release_cta_shared_cluster(qsf_done_peer_mbar)
         stream_li_total = kv_tiles
         producer_valid_k = valid_k_for_l
+        if cutlass.const_expr(packed_query_heads > 0 and query_len_per_seq > 1):
+            # Both producer column bands own the same score row. Each CTA owns
+            # 64 rows of the request's [query token, head] rows.
+            producer_row = (
+                cta_rank * ctm.Int32(SMEM_P4_BMM1_M)
+                + (warp_idx & ctm.Int32(1)) * ctm.Int32(32)
+                + (tidx & ctm.Int32(31))
+            )
+            producer_query = ctm.min(
+                (packed_tile_row0 + producer_row) // ctm.Int32(packed_query_heads),
+                ctm.Int32(query_len_per_seq - 1),
+            )
+            producer_bound = _packed_query_bound(
+                mHelixKvBounds_l,
+                page_batch,
+                producer_query,
+                packed_request_valid_k,
+                query_len_per_seq,
+                use_helix_kv_bounds,
+            )
+            producer_valid_k = ctm.min(
+                ctm.max(producer_bound - split_base_k, ctm.Int32(0)), valid_k_for_l
+            )
         if cutlass.const_expr(folded_query_heads > 0):
             # Both producer column bands own the same score row. Each CTA owns
             # 64 head rows; packed rows are [logical query, logical head].
@@ -6756,6 +6902,12 @@ def _run_mla_decode_body(
                 producer_needs_mask = folded_first_valid_k < (
                     (stream_li_idx + ctm.Int32(1)) * ctm.Int32(KV_TILE)
                 )
+            if cutlass.const_expr(packed_query_heads > 0 and query_len_per_seq > 1):
+                # Rows of one tile differ by at most query_len tokens, so only
+                # tiles past the earliest row bound need per-row masking.
+                producer_needs_mask = first_valid_k < (
+                    (stream_li_idx + ctm.Int32(1)) * ctm.Int32(KV_TILE)
+                )
             running_row_max, running_row_anchor, carried_dq1024, carried_old_scale = (
                 _runtime_t336_producer_tile_v23(
                     sAtomicRunningRowMax,
@@ -6789,7 +6941,7 @@ def _run_mla_decode_body(
                     producer_needs_mask,
                     False,
                     use_mixed_imlp,
-                    folded_query_heads > 0,
+                    folded_query_heads > 0 or (packed_query_heads > 0 and query_len_per_seq > 1),
                 )
             )
             stream_li_idx = stream_li_idx + ctm.Int32(1)
@@ -6798,6 +6950,8 @@ def _run_mla_decode_body(
         tail_needs_mask = valid_k_for_l < final_tile_k_end
         if cutlass.const_expr(folded_query_heads > 0):
             tail_needs_mask = folded_first_valid_k < final_tile_k_end
+        if cutlass.const_expr(packed_query_heads > 0 and query_len_per_seq > 1):
+            tail_needs_mask = first_valid_k < final_tile_k_end
         running_row_max, running_row_anchor, carried_dq1024, carried_old_scale = (
             _runtime_t336_producer_tile_v23(
                 sAtomicRunningRowMax,
@@ -6877,6 +7031,26 @@ def _run_mla_decode_body(
                 pass
             final_row_state_local_row = corr_row_band * ctm.Int32(32) + (tidx & ctm.Int32(31))
             final_anchor_row_sum = sFinalAnchorRowSum[final_row_state_local_row]
+            # Packed rows may be empty while their tile is not (Helix tokens
+            # whose KV lives on another rank); judge emptiness per row.
+            row_valid_k = valid_k_for_l
+            if cutlass.const_expr(packed_query_heads > 0 and query_len_per_seq > 1):
+                corr_packed_row = cta_rank * ctm.Int32(SMEM_P4_BMM1_M) + final_row_state_local_row
+                corr_query = ctm.min(
+                    (packed_tile_row0 + corr_packed_row) // ctm.Int32(packed_query_heads),
+                    ctm.Int32(query_len_per_seq - 1),
+                )
+                corr_bound = _packed_query_bound(
+                    mHelixKvBounds_l,
+                    page_batch,
+                    corr_query,
+                    packed_request_valid_k,
+                    query_len_per_seq,
+                    use_helix_kv_bounds,
+                )
+                row_valid_k = ctm.min(
+                    ctm.max(corr_bound - split_base_k, ctm.Int32(0)), valid_k_for_l
+                )
             final_stat_scale = ctm.Float32(1.0)
             final_row_sum = final_anchor_row_sum
             final_row_max = running_row_max
@@ -6886,7 +7060,7 @@ def _run_mla_decode_body(
                     (running_row_anchor - running_row_max) * softmax_scale_log2,
                     fastmath=True,
                 )
-                if valid_k_for_l == ctm.Int32(0):
+                if row_valid_k == ctm.Int32(0) or final_anchor_row_sum == ctm.Float32(0.0):
                     final_stat_scale = ctm.Float32(1.0)
                     final_row_max = ctm.Float32(-ctm.Float32.inf)
                     final_row_sum = ctm.Float32(0.0)
@@ -6894,14 +7068,16 @@ def _run_mla_decode_body(
                 # Convert the lazy-anchor numerator and denominator to the
                 # true row maximum expected by the shared reduction kernel.
                 # Empty splits avoid evaluating -inf - -inf.
-                if final_anchor_row_sum != ctm.Float32(0.0):
+                if row_valid_k != ctm.Int32(0) and final_anchor_row_sum != ctm.Float32(0.0):
                     final_stat_scale = cute.exp2(
                         (running_row_anchor - running_row_max) * softmax_scale_log2,
                         fastmath=True,
                     )
                     final_row_sum = final_anchor_row_sum * final_stat_scale
+                else:
+                    final_row_sum = ctm.Float32(0.0)
             output_normalizer = ctm.Float32(0.0)
-            if valid_k_for_l != ctm.Int32(0) and final_anchor_row_sum != ctm.Float32(0.0):
+            if row_valid_k != ctm.Int32(0) and final_anchor_row_sum != ctm.Float32(0.0):
                 output_normalizer = cute.arch.rcp_approx(final_anchor_row_sum) * pv_output_scale
             last_pv_li_idx = stream_li_total - ctm.Int32(1)
             last_pv_slot = last_pv_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
@@ -6931,6 +7107,8 @@ def _run_mla_decode_body(
                 final_row_sum=final_row_sum,
                 final_stat_scale=final_stat_scale,
                 output_normalizer=output_normalizer,
+                valid_m=valid_m,
+                c_batch_stride=c_batch_stride,
                 write_softmax_stats=write_softmax_stats,
                 store_split=store_split,
                 producer_warp_base=SMEM_P4_CORRECTION_WARP_ID_BEGIN,
@@ -6974,6 +7152,10 @@ def kernel(
     mRowSum_ml: cute.Tensor,
     problem_size: tuple,
     runtime_m: ctm.Int32,
+    num_requests: ctm.Int32,
+    num_splits: ctm.Int32,
+    valid_m: ctm.Int32,
+    c_batch_stride: ctm.Int32,
     v_page_offset: ctm.Int32,
     softmax_scale_log2: ctm.Float32,
     pv_output_scale: ctm.Float32,
@@ -6987,6 +7169,7 @@ def kernel(
     write_softmax_stats: ctm.Constexpr,
     store_split: ctm.Constexpr = False,
     folded_query_heads: ctm.Constexpr = 0,
+    packed_query_heads: ctm.Constexpr = 0,
 ) -> None:
     _run_mla_decode_body(
         mPageTable_pl,
@@ -7015,6 +7198,10 @@ def kernel(
         mRowSum_ml,
         problem_size,
         runtime_m,
+        num_requests,
+        num_splits,
+        valid_m,
+        c_batch_stride,
         v_page_offset,
         softmax_scale_log2,
         pv_output_scale,
@@ -7028,6 +7215,7 @@ def kernel(
         write_softmax_stats,
         store_split,
         folded_query_heads,
+        packed_query_heads,
     )
 
 
@@ -7057,6 +7245,7 @@ def _make_fused_ptrs(
     q_global_scale_data_ptr: int,
     kv_global_scale_data_ptr: int,
     output_dtype: torch.dtype = torch.float16,
+    row_state_align: int = 32,
 ) -> tuple[cute.Pointer, ...]:
     return (
         make_ptr(cutlass.Float4E2M1FN, q_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
@@ -7076,8 +7265,12 @@ def _make_fused_ptrs(
             assumed_align=32,
         ),
         make_ptr(cutlass.Float32, accum_data_ptr, cute.AddressSpace.gmem, assumed_align=32),
-        make_ptr(cutlass.Float32, row_max_data_ptr, cute.AddressSpace.gmem, assumed_align=32),
-        make_ptr(cutlass.Float32, row_sum_data_ptr, cute.AddressSpace.gmem, assumed_align=32),
+        make_ptr(
+            cutlass.Float32, row_max_data_ptr, cute.AddressSpace.gmem, assumed_align=row_state_align
+        ),
+        make_ptr(
+            cutlass.Float32, row_sum_data_ptr, cute.AddressSpace.gmem, assumed_align=row_state_align
+        ),
         make_ptr(cutlass.Int32, page_indptr_data_ptr, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(
             cutlass.Float32,
@@ -7284,6 +7477,8 @@ def _compile_fused(
     use_helix_kv_bounds: bool = False,
     store_split: bool = False,
     folded_query_heads: int = 0,
+    packed_query_heads: int = 0,
+    row_state_align: int = 32,
 ) -> Callable:
     if type(kv) is not int:
         raise TypeError(f"runtime-KV compile K must be an int, got {type(kv).__name__}")
@@ -7314,6 +7509,8 @@ def _compile_fused(
         use_helix_kv_bounds,
         store_split,
         folded_query_heads,
+        packed_query_heads,
+        row_state_align,
     )
     cached = _FUSED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
@@ -7337,6 +7534,7 @@ def _compile_fused(
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
         output_dtype,
+        row_state_align,
     )
     compiled = _compile_cutedsl(
         fused_fp4_mla_decode_ctm,
@@ -7344,6 +7542,12 @@ def _compile_fused(
         (n, kv),
         ctm.Int32(SMEM_P4_CTA_GROUP_M),
         ctm.Int32(1),
+        ctm.Int32(1),
+        ctm.Int32(1),
+        ctm.Int32(1),
+        ctm.Int32(SMEM_P4_CTA_GROUP_M),
+        ctm.Int32(1),
+        ctm.Int32(SMEM_P4_CTA_GROUP_M),
         ctm.Int32(1),
         ctm.Int32(1),
         ctm.Int32(1),
@@ -7364,6 +7568,7 @@ def _compile_fused(
         write_softmax_stats=write_softmax_stats,
         store_split=store_split,
         folded_query_heads=folded_query_heads,
+        packed_query_heads=packed_query_heads,
         options="--opt-level 2 --ptxas-options '--uumn'",
     )
     _FUSED_COMPILE_CACHE[cache_key] = compiled
@@ -7400,12 +7605,31 @@ def run_trtllm_fp4_mla_decode_page_native(
     helix_kv_bounds: torch.Tensor | None = None,
     split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     folded_query_heads: int = 0,
+    packed_query_heads: int = 0,
+    num_requests: int = 0,
+    num_splits: int = 1,
+    softmax_stats: torch.Tensor | None = None,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
     if v_pack_block not in (128, 256):
         raise ValueError(
             f"mufu16 page-native decode requires v_pack_block in (128, 256), got {v_pack_block}"
+        )
+    # Packed mode: q_internal holds one [M, 320, request] entry per request whose
+    # M rows are [query token, head] pairs padded to a multiple of 128; grid.z
+    # covers num_requests * num_splits tasks.
+    packed = packed_query_heads > 0
+    if packed and (
+        folded_query_heads
+        or query_len_per_seq <= 0
+        or num_requests <= 0
+        or num_splits <= 0
+        or not 0 < packed_query_heads <= SMEM_P4_CTA_GROUP_M
+    ):
+        raise ValueError(
+            "packed queries require 1-128 heads, positive query length, request "
+            "and split counts, and no folded queries"
         )
     if not math.isfinite(sm_scale) or sm_scale <= 0.0:
         raise ValueError(f"sm_scale must be finite and positive, got {sm_scale}")
@@ -7453,11 +7677,47 @@ def run_trtllm_fp4_mla_decode_page_native(
             "q_internal must be a uint8 [M, Q640/2, L] tensor, "
             f"got dtype={q_internal.dtype} shape={tuple(q_internal.shape)}"
         )
-    physical_m, q_bytes, l_batch = q_internal.shape
+    physical_m, q_bytes, q_rows = q_internal.shape
+    l_batch = q_rows
+    valid_m = physical_m
+    if packed:
+        if q_rows != num_requests:
+            raise ValueError(f"packed Q must hold {num_requests} requests, got {q_rows}")
+        valid_m = packed_query_heads * query_len_per_seq
+        if (
+            physical_m % SMEM_P4_CTA_GROUP_M != 0
+            or physical_m > PACKED_MAX_M
+            or not valid_m <= physical_m < valid_m + SMEM_P4_CTA_GROUP_M
+        ):
+            raise ValueError(
+                f"packed M must pad {valid_m} rows to the next multiple of "
+                f"{SMEM_P4_CTA_GROUP_M} (<= {PACKED_MAX_M}), got {physical_m}"
+            )
+        l_batch = num_requests * num_splits
     if (softmax_row_max is None) != (softmax_row_sum is None):
         raise ValueError("softmax_row_max and softmax_row_sum must be provided together")
     write_softmax_stats = softmax_row_max is not None
-    if write_softmax_stats:
+    row_state_row_stride = 1
+    row_state_batch_stride = physical_m
+    row_state_align = 32
+    if softmax_stats is not None:
+        # Interleaved [request * valid_m, 2] (max, sum) written in place.
+        if not packed or num_splits != 1 or write_softmax_stats:
+            raise ValueError("softmax_stats requires packed single-split decode without row stats")
+        if (
+            softmax_stats.dtype != torch.float32
+            or softmax_stats.shape != (num_requests * valid_m, 2)
+            or not softmax_stats.is_contiguous()
+        ):
+            raise ValueError(
+                f"softmax_stats must be contiguous float32 [{num_requests * valid_m}, 2]"
+            )
+        _validate_tensor_pointer_alignment("softmax_stats", softmax_stats, alignment_bytes=8)
+        write_softmax_stats = True
+        row_state_row_stride = 2
+        row_state_batch_stride = valid_m * 2
+        row_state_align = 4
+    if softmax_row_max is not None:
         expected_stats_shape = (l_batch, physical_m)
         for name, tensor in (
             ("softmax_row_max", softmax_row_max),
@@ -7475,33 +7735,36 @@ def run_trtllm_fp4_mla_decode_page_native(
     if l_batch <= 0 or l_batch > CUDA_GRID_Z_MAX:
         raise ValueError(f"queries must be in [1, {CUDA_GRID_Z_MAX}], got {l_batch}")
     if q_batch_capacity is None:
-        q_batch_capacity = l_batch
+        q_batch_capacity = q_rows
     if not isinstance(q_batch_capacity, int):
         raise TypeError(
             f"q_batch_capacity must be an int or None, got {type(q_batch_capacity).__name__}"
         )
-    if q_batch_capacity < l_batch or q_batch_capacity > CUDA_GRID_Z_MAX:
+    if q_batch_capacity < q_rows or q_batch_capacity > CUDA_GRID_Z_MAX:
         raise ValueError(
             "q_batch_capacity must cover active queries and fit grid.z: "
-            f"queries={l_batch}, capacity={q_batch_capacity}, limit={CUDA_GRID_Z_MAX}"
+            f"queries={q_rows}, capacity={q_batch_capacity}, limit={CUDA_GRID_Z_MAX}"
         )
-    if query_len_per_seq <= 0 or l_batch % query_len_per_seq != 0:
-        raise ValueError(f"query_len_per_seq={query_len_per_seq} must divide queries={l_batch}")
-    num_sequences = l_batch // query_len_per_seq
+    if packed:
+        num_sequences = num_requests
+    else:
+        if query_len_per_seq <= 0 or l_batch % query_len_per_seq != 0:
+            raise ValueError(f"query_len_per_seq={query_len_per_seq} must divide queries={l_batch}")
+        num_sequences = l_batch // query_len_per_seq
     if q_bytes != QK_LOGICAL_DIM // 2:
         raise ValueError(f"q_internal dimension 1 must be {QK_LOGICAL_DIM // 2}, got {q_bytes}")
     expected_q_l_stride = physical_m * (QK_LOGICAL_DIM // 2)
     if q_internal.stride()[:2] != (QK_LOGICAL_DIM // 2, 1) or (
-        l_batch > 1 and q_internal.stride(2) != expected_q_l_stride
+        q_rows > 1 and q_internal.stride(2) != expected_q_l_stride
     ):
         raise ValueError(
             f"q_internal must use batch-slow [M,320,L] storage, got strides {q_internal.stride()}"
         )
-    if physical_m not in SMEM_P4_PIPELINE_DIRECT_TARGET_M_OPTIONS:
+    if not packed and physical_m not in SMEM_P4_PIPELINE_DIRECT_TARGET_M_OPTIONS:
         raise ValueError(
             f"page-native decode M must be in {SMEM_P4_PIPELINE_DIRECT_TARGET_M_OPTIONS}, got {physical_m}"
         )
-    if q_batch_capacity > l_batch:
+    if q_batch_capacity > q_rows:
         q_storage_bytes = (
             q_internal.untyped_storage().nbytes()
             - q_internal.storage_offset() * q_internal.element_size()
@@ -7511,13 +7774,16 @@ def run_trtllm_fp4_mla_decode_page_native(
             raise ValueError(
                 f"q_internal storage has {q_storage_bytes}B, requires {required_q_storage_bytes}B"
             )
-    if output.shape != (physical_m, TRTLLM_V_HEAD_DIM, l_batch):
+    expected_output_shape = (physical_m, TRTLLM_V_HEAD_DIM, l_batch)
+    if packed:
+        expected_output_shape = (valid_m, TRTLLM_V_HEAD_DIM, num_requests)
+    if output.shape != expected_output_shape:
         raise ValueError(
-            f"output must use [M,512,L] batch-slow metadata, got {tuple(output.shape)}"
+            f"output must use {expected_output_shape} batch-slow metadata, got {tuple(output.shape)}"
         )
-    expected_output_l_stride = physical_m * TRTLLM_V_HEAD_DIM
+    expected_output_l_stride = expected_output_shape[0] * TRTLLM_V_HEAD_DIM
     if output.stride()[:2] != (TRTLLM_V_HEAD_DIM, 1) or (
-        l_batch > 1 and output.stride(2) != expected_output_l_stride
+        expected_output_shape[2] > 1 and output.stride(2) != expected_output_l_stride
     ):
         raise ValueError(f"output must be batch-slow contiguous, got strides {output.stride()}")
     if src_page_ids.dtype != torch.int32 or src_page_ids.dim() != 1:
@@ -7551,14 +7817,15 @@ def run_trtllm_fp4_mla_decode_page_native(
             f"got dtype={valid_k.dtype} shape={tuple(valid_k.shape)} "
             f"stride={valid_k.stride()}"
         )
+    expected_bounds_len = num_requests * query_len_per_seq if packed else l_batch
     if helix_kv_bounds is not None and (
         helix_kv_bounds.dtype != torch.int32
-        or helix_kv_bounds.shape != (l_batch,)
+        or helix_kv_bounds.shape != (expected_bounds_len,)
         or helix_kv_bounds.stride(0) != 1
     ):
         raise ValueError(
             "helix_kv_bounds must be contiguous int32 with shape "
-            f"[{l_batch}], got dtype={helix_kv_bounds.dtype} "
+            f"[{expected_bounds_len}], got dtype={helix_kv_bounds.dtype} "
             f"shape={tuple(helix_kv_bounds.shape)} stride={helix_kv_bounds.stride()}"
         )
     cache_layout = _validate_v_packed_cache_args(
@@ -7586,7 +7853,8 @@ def run_trtllm_fp4_mla_decode_page_native(
             "bucketed CSR capacity exceeds the Int32 layout limit: "
             f"{page_table_capacity} > {INT32_MAX}"
         )
-    if src_page_id_count > page_table_capacity:
+    if not packed and src_page_id_count > page_table_capacity:
+        # Packed tasks address the page list by its real length.
         raise ValueError(
             f"src_page_ids exceeds the bucketed CSR capacity, got {src_page_id_count} > {page_table_capacity}"
         )
@@ -7626,11 +7894,11 @@ def run_trtllm_fp4_mla_decode_page_native(
     if (
         q_sf_internal.element_size() != 1
         or not q_sf_internal.is_contiguous()
-        or q_sf_internal.numel() < physical_m * QK_SF_GROUPS * l_batch
+        or q_sf_internal.numel() < physical_m * QK_SF_GROUPS * q_rows
     ):
         raise ValueError("q_sf_internal must be a contiguous byte-sized QSF buffer")
     ksf_payload_bytes = page_size * TRTLLM_K_SF_GROUPS
-    if q_batch_capacity > l_batch:
+    if q_batch_capacity > q_rows:
         q_sf_storage_bytes = (
             q_sf_internal.untyped_storage().nbytes()
             - q_sf_internal.storage_offset() * q_sf_internal.element_size()
@@ -7677,8 +7945,10 @@ def run_trtllm_fp4_mla_decode_page_native(
         q_global_scale,
         kv_global_scale,
     )
-    if write_softmax_stats:
+    if softmax_row_max is not None:
         tensors += (softmax_row_max, softmax_row_sum)
+    if softmax_stats is not None:
+        tensors += (softmax_stats,)
     if helix_kv_bounds is not None:
         tensors += (helix_kv_bounds,)
     if device.type != "cuda" or any((tensor.device != device for tensor in tensors)):
@@ -7719,8 +7989,15 @@ def run_trtllm_fp4_mla_decode_page_native(
     k_sf_data_ptr = sf_cache.data_ptr()
     b_data_ptr = v_packed.data_ptr()
     scratch_ptr = output.data_ptr()
-    row_max_data_ptr = softmax_row_max.data_ptr() if write_softmax_stats else scratch_ptr
-    row_sum_data_ptr = softmax_row_sum.data_ptr() if write_softmax_stats else scratch_ptr
+    row_max_data_ptr = scratch_ptr
+    row_sum_data_ptr = scratch_ptr
+    if softmax_row_max is not None:
+        row_max_data_ptr = softmax_row_max.data_ptr()
+        row_sum_data_ptr = softmax_row_sum.data_ptr()
+    elif softmax_stats is not None:
+        row_max_data_ptr = softmax_stats.data_ptr()
+        row_sum_data_ptr = softmax_stats.data_ptr() + softmax_stats.element_size()
+    kernel_num_requests = num_requests if packed else num_sequences
     sfb_data_ptr = v_sf.data_ptr()
     page_table_data_ptr = src_page_ids.data_ptr()
     valid_k_data_ptr = valid_k.data_ptr()
@@ -7776,6 +8053,8 @@ def run_trtllm_fp4_mla_decode_page_native(
         use_helix_kv_bounds=helix_kv_bounds is not None,
         store_split=split_kv_buffers is not None,
         folded_query_heads=folded_query_heads,
+        packed_query_heads=packed_query_heads,
+        row_state_align=row_state_align,
     )
     supports_prepared = _class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
@@ -7804,6 +8083,13 @@ def run_trtllm_fp4_mla_decode_page_native(
         physical_m,
         l_batch,
         q_batch_capacity,
+        kernel_num_requests,
+        num_splits,
+        valid_m,
+        row_state_row_stride,
+        row_state_batch_stride,
+        src_page_id_count,
+        packed_query_heads,
         num_cache_pages,
         num_v_cache_pages,
         v_page_offset,
@@ -7839,6 +8125,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
         output.dtype,
+        row_state_align,
     )
     runtime_args = (
         *ptrs,
@@ -7846,6 +8133,12 @@ def run_trtllm_fp4_mla_decode_page_native(
         ctm.Int32(physical_m),
         ctm.Int32(l_batch),
         ctm.Int32(q_batch_capacity),
+        ctm.Int32(kernel_num_requests),
+        ctm.Int32(num_splits),
+        ctm.Int32(valid_m),
+        ctm.Int32(row_state_row_stride),
+        ctm.Int32(row_state_batch_stride),
+        ctm.Int32(src_page_id_count),
         ctm.Int32(num_cache_pages),
         ctm.Int32(num_v_cache_pages),
         ctm.Int32(v_page_offset),
@@ -7885,6 +8178,112 @@ def run_trtllm_fp4_mla_decode_page_native(
         ),
     )
     prepared.run()
+
+
+def packed_query_rows(num_heads: int, query_len: int) -> tuple[int, int]:
+    """Return (valid rows, 128-padded rows) of one request's [query, head] rows."""
+    if num_heads <= 0 or query_len <= 0:
+        raise ValueError(
+            f"packed rows need positive heads/query length, got {num_heads}/{query_len}"
+        )
+    valid_m = num_heads * query_len
+    physical_m = _ceil_div(valid_m, SMEM_P4_CTA_GROUP_M) * SMEM_P4_CTA_GROUP_M
+    if physical_m > PACKED_MAX_M:
+        raise ValueError(f"packed rows {valid_m} exceed the {PACKED_MAX_M}-row kernel limit")
+    return valid_m, physical_m
+
+
+def run_trtllm_fp4_mla_decode_packed(
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    v_packed: torch.Tensor,
+    v_sf: torch.Tensor,
+    global_scale: torch.Tensor,
+    src_page_ids: torch.Tensor,
+    paged_kv_indptr_decode: torch.Tensor,
+    kv_lens: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    max_kv_len: int,
+    sm_scale: float,
+    num_heads: int,
+    query_len: int,
+    num_requests: int,
+    num_splits: int = 1,
+    q_global_scale: torch.Tensor | None = None,
+    v_pack_block: int = SMEM_P4_V_N_PER_CTA,
+    v_page_offset: int = 0,
+    enable_mxi_imlp: bool = True,
+    helix_kv_bounds: torch.Tensor | None = None,
+    softmax_stats: torch.Tensor | None = None,
+    split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """Packed decode: ``q_fp4``/``q_sf`` hold ``num_requests`` entries of
+    ``physical_m`` rows ([query token, head] pairs, 128-padded), ``output`` is
+    ``[num_requests * num_heads * query_len, 512]``, ``kv_lens`` is per request
+    and ``helix_kv_bounds`` (optional) is per query token. ``max_kv_len`` is
+    the per-split KV length the runtime profile must cover. With
+    ``num_splits > 1`` the kernel writes FP32 partials into ``split_kv_buffers``
+    and leaves ``output`` untouched."""
+    valid_m, physical_m = packed_query_rows(num_heads, query_len)
+    if num_requests <= 0 or num_splits <= 0:
+        raise ValueError("packed decode needs positive request and split counts")
+    if q_fp4.dtype != torch.uint8 or not q_fp4.is_contiguous():
+        raise ValueError("q_fp4 must be a contiguous uint8 tensor")
+    expected_q_bytes = num_requests * physical_m * (QK_LOGICAL_DIM // 2)
+    if q_fp4.numel() < expected_q_bytes:
+        raise ValueError(f"q_fp4 must contain {expected_q_bytes} bytes, got {q_fp4.numel()}")
+    if q_sf.element_size() != 1 or not q_sf.is_contiguous():
+        raise ValueError("q_sf must be a contiguous byte-sized tensor")
+    expected_q_sf_bytes = num_requests * physical_m * QK_SF_GROUPS
+    if q_sf.numel() < expected_q_sf_bytes:
+        raise ValueError(f"q_sf must contain {expected_q_sf_bytes} bytes, got {q_sf.numel()}")
+    _validate_tensor_pointer_alignment("q_fp4", q_fp4, alignment_bytes=16)
+    _validate_tensor_pointer_alignment("q_sf", q_sf, alignment_bytes=16)
+    if global_scale.dtype != torch.float32 or global_scale.numel() != 1:
+        raise TypeError("global_scale must be a scalar FP32 CUDA tensor")
+    if output.shape != (num_requests * valid_m, TRTLLM_V_HEAD_DIM) or not output.is_contiguous():
+        raise ValueError(
+            f"packed output must be contiguous [{num_requests * valid_m}, {TRTLLM_V_HEAD_DIM}], "
+            f"got {tuple(output.shape)}"
+        )
+    q_batch_slow = (
+        q_fp4.flatten()[:expected_q_bytes]
+        .view(num_requests, physical_m, QK_LOGICAL_DIM // 2)
+        .permute(1, 2, 0)
+    )
+    q_sf_rows = q_sf.flatten()[:expected_q_sf_bytes]
+    output_batch_slow = output.view(num_requests, valid_m, TRTLLM_V_HEAD_DIM).permute(1, 2, 0)
+    run_trtllm_fp4_mla_decode_page_native(
+        q_batch_slow,
+        q_sf_rows,
+        kv_cache,
+        sf_cache,
+        v_packed,
+        v_sf,
+        src_page_ids,
+        paged_kv_indptr_decode,
+        kv_lens,
+        output_batch_slow,
+        max_kv_len=max_kv_len,
+        sm_scale=sm_scale,
+        q_global_scale=global_scale if q_global_scale is None else q_global_scale,
+        kv_global_scale=global_scale,
+        page_size=TRTLLM_PAGE_SIZE,
+        query_len_per_seq=query_len,
+        v_pack_block=v_pack_block,
+        v_page_offset=v_page_offset,
+        q_batch_capacity=num_requests,
+        enable_mxi_imlp=enable_mxi_imlp,
+        helix_kv_bounds=helix_kv_bounds,
+        split_kv_buffers=split_kv_buffers,
+        packed_query_heads=num_heads,
+        num_requests=num_requests,
+        num_splits=num_splits,
+        softmax_stats=softmax_stats,
+    )
 
 
 def run_trtllm_fp4_mla_decode_page_native_from_raw(

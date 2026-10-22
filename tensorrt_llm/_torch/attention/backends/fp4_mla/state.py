@@ -52,6 +52,7 @@ class Fp4MlaState:
     prequantized_q: torch.Tensor | None = None
     prequantized_q_sf: torch.Tensor | None = None
     q_batch_capacity: int | None = None
+    prequantized_q_rows_per_seq: int | None = None
     fp8_context_state: tuple[_Fp8MlaContextScratch, TrtllmAttentionMetadata] | None = None
     _paged_kv_indptr: torch.Tensor | None = None
     paged_kv_indptr_decode: torch.Tensor | None = None

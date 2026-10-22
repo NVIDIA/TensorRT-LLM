@@ -28,6 +28,7 @@ from .config import (
     _ceil_div,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
+    _fp4_mla_packed_rows_per_seq,
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
@@ -128,8 +129,14 @@ def _prepare_fp4_mla_q_buffers(
     num_queries: int,
     num_heads: int,
     device: torch.device,
+    rows_per_seq: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Return manager-owned, fixed-capacity packed-Q staging buffers."""
+    """Return manager-owned, fixed-capacity packed-Q staging buffers.
+
+    With ``rows_per_seq`` the buffers hold ``max_num_sequences`` request blocks
+    of that many rows (zero-filled so padded rows stay finite); otherwise one
+    row per (token, head) up to the token capacity.
+    """
     if num_queries <= 0:
         raise ValueError(f"FP4 MLA Q buffer preparation needs queries, got {num_queries}.")
     owner = getattr(metadata, "kv_cache_manager", None)
@@ -166,12 +173,16 @@ def _prepare_fp4_mla_q_buffers(
 
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     canonical_device = torch.device("cuda", device_index)
-    expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
-    expected_q_sf_shape = (
-        _get_fp4_mla_swizzled_scale_size(capacity * num_heads, FP4_MLA_Q_LOGICAL_DIM),
-    )
-    q_key = f"q_{num_heads}"
-    q_sf_key = f"q_sf_{num_heads}"
+    if rows_per_seq > 0:
+        q_rows = max_num_sequences * rows_per_seq
+        q_key = f"q_{num_heads}_p{rows_per_seq}"
+        q_sf_key = f"q_sf_{num_heads}_p{rows_per_seq}"
+    else:
+        q_rows = capacity * num_heads
+        q_key = f"q_{num_heads}"
+        q_sf_key = f"q_sf_{num_heads}"
+    expected_q_shape = (q_rows, FP4_MLA_Q_PACKED_DIM)
+    expected_q_sf_shape = (_get_fp4_mla_swizzled_scale_size(q_rows, FP4_MLA_Q_LOGICAL_DIM),)
     q_storage = buffers.get(q_key)
     q_sf_storage = buffers.get(q_sf_key)
     if q_storage is None and q_sf_storage is None:
@@ -180,8 +191,9 @@ def _prepare_fp4_mla_q_buffers(
                 "Cannot allocate FP4 MLA Q buffers while capturing a CUDA graph. "
                 "Run a warmup forward first."
             )
-        q_storage = torch.empty(expected_q_shape, dtype=torch.uint8, device=canonical_device)
-        q_sf_storage = torch.empty(
+        allocate = torch.zeros if rows_per_seq > 0 else torch.empty
+        q_storage = allocate(expected_q_shape, dtype=torch.uint8, device=canonical_device)
+        q_sf_storage = allocate(
             expected_q_sf_shape,
             dtype=torch.float8_e4m3fn,
             device=canonical_device,
@@ -586,6 +598,12 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         )
     num_q_heads = q_pe.shape[1]
     q_head_blocks = _ceil_div(num_q_heads, block_q_heads)
+    q_rows_per_seq = _fp4_mla_packed_rows_per_seq(num_q_heads, max_gen_len)
+    if q_rows_per_seq and q_fp4_out.shape[0] < num_gen * q_rows_per_seq:
+        raise RuntimeError(
+            "FP4 MLA packed Q buffer is smaller than the generation batch: "
+            f"{q_fp4_out.shape[0]} rows < {num_gen} x {q_rows_per_seq}."
+        )
     max_gen_tiles = _ceil_div(max_gen_len + FP4_BLOCK_SIZE - 1, FP4_BLOCK_SIZE)
     rotary_table = rotary_cos_sin
     q_global_scale = _get_fp4_mla_q_global_scale(metadata, latent_cache.device)
@@ -700,6 +718,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             Q_SF_COLS=FP4_MLA_Q_SF_GROUPS,
             WRITE_Q=True,
             Q1_KV_BLOCKS_PER_PROGRAM=q1_kv_blocks_per_program_variant,
+            Q_ROWS_PER_SEQ=q_rows_per_seq,
             maxnreg=56,
         )
 
@@ -772,6 +791,7 @@ def scatter_fp4_mla_kv_cache(
         metadata.fp4_mla_state.prequantized_q = None
         metadata.fp4_mla_state.prequantized_q_sf = None
         metadata.fp4_mla_state.q_batch_capacity = None
+        metadata.fp4_mla_state.prequantized_q_rows_per_seq = None
     if latent_cache.numel() == 0:
         raise ValueError("FP4 MLA cache scatter requires at least one latent token.")
     if q_context is not None and not latent_cache.is_contiguous():
@@ -867,15 +887,23 @@ def scatter_fp4_mla_kv_cache(
                 "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
                 "scale mode, or backend."
             )
+        num_gen_for_q = metadata.num_seqs - metadata.num_contexts
+        q_rows_per_seq = 0
+        if num_gen_for_q > 0 and num_tokens % num_gen_for_q == 0:
+            q_rows_per_seq = _fp4_mla_packed_rows_per_seq(
+                q_quant_input.shape[1], num_tokens // num_gen_for_q
+            )
         q_fp4_out, q_sf_out, q_batch_capacity = _prepare_fp4_mla_q_buffers(
             metadata,
             num_tokens,
             q_quant_input.shape[1],
             q_quant_input.device,
+            rows_per_seq=q_rows_per_seq,
         )
         metadata.fp4_mla_state.prequantized_q = q_fp4_out
         metadata.fp4_mla_state.prequantized_q_sf = q_sf_out
         metadata.fp4_mla_state.q_batch_capacity = q_batch_capacity
+        metadata.fp4_mla_state.prequantized_q_rows_per_seq = q_rows_per_seq
         hp_pool_updated = True
     cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
     fused_v_transpose = cutedsl_backend and _fp4_mla_cutedsl_fused_v_transpose_enabled()

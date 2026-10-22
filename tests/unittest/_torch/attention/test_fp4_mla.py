@@ -1893,6 +1893,8 @@ def _assert_fp4_mla_attention_decode_accuracy(
     query_len_per_seq: int = 1,
     enable_helix: bool = False,
     enable_block_reuse: bool = False,
+    packed_queries: bool = False,
+    split_kv: int | None = None,
 ) -> None:
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
@@ -1900,6 +1902,10 @@ def _assert_fp4_mla_attention_decode_accuracy(
         FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
         str(int(fused_v_transpose)),
     )
+    # Packed decode rows are the default; the legacy padded path stays covered
+    # by the existing cases, which opt out explicitly.
+    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_PACKED_Q_ENV, str(int(packed_queries)))
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "auto" if split_kv is None else str(split_kv))
     (
         kv_cache_manager,
         metadata,
@@ -2049,6 +2055,58 @@ def test_fp4_mla_attention_decode_cutedsl_helix_mtp5_matches_reference(
         seed=37,
         query_len_per_seq=6,
         enable_helix=True,
+    )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,enable_helix,split_kv,seq_lens",
+    [
+        (128, 1, False, 1, [131, 512]),
+        (128, 4, False, 2, [131, 512]),
+        (96, 8, False, 1, [131, 2100]),
+        (96, 8, True, 1, [131, 2100]),
+        (96, 8, True, 4, [131, 2100]),
+        (96, 1, True, 4, [131, 2100]),
+        (12, 8, False, 4, [131, 900]),
+        (12, 8, True, 2, [131, 900]),
+        (6, 6, False, 3, [131, 700]),
+    ],
+    ids=[
+        "h128-q1-s1",
+        "h128-q4-s2",
+        "h96-q8-s1",
+        "h96-q8-helix-s1",
+        "h96-q8-helix-s4",
+        "h96-q1-helix-s4",
+        "h12-q8-s4",
+        "h12-q8-helix-s2",
+        "h6-q6-s3",
+    ],
+)
+def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    enable_helix: bool,
+    split_kv: int,
+    seq_lens: list[int],
+) -> None:
+    """Packed [query, head] rows, in-kernel KV splits, per-row (Helix) bounds."""
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+        packed_queries=True,
+        split_kv=split_kv,
     )
 
 
