@@ -1308,10 +1308,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
     )
     use_cute_dsl_paged_mqa_logits: bool = Field(
-        default=False,
+        default=True,
         description=
-        "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM."
-    )
+        "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family "
+        "GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 "
+        "family or when the cutlass-dsl package is missing.")
     q_split_threshold: int = Field(
         default=8192,
         description=
@@ -1971,12 +1972,9 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 class Nvfp4GemmConfig(StrictBaseModel):
     """Configuration for NVFP4 GEMM backend selection."""
     allowed_backends: List[Nvfp4Backend] = Field(
-        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'],
         min_length=1,
-        description="List of backends to consider for auto-selection. "
-        "Default excludes 'cutedsl' for faster build time. "
-        "Add 'cutedsl' for extreme performance at the cost of longer server launch time."
-    )
+        description="List of backends to consider for auto-selection.")
 
 
 class AttentionDpConfig(StrictBaseModel):
@@ -2597,8 +2595,8 @@ class MooncakeStoreConfig(StrictBaseModel):
         "both",
         description="What this server does with the pool. 'both' reads and "
         "writes, 'producer' only writes, 'consumer' only reads, and "
-        "'capacity' does neither: its ranks lend memory without moving any "
-        "KV, so they pin no staging buffers and pay no per-request cost.")
+        "'capacity' does neither: its ranks lend memory without registering "
+        "any KV cache, so it needs no GPUDirect RDMA.")
     segment_size: Union[int, str] = Field(
         "16GiB",
         description="Host memory each of this server's ranks contributes to "
@@ -2622,12 +2620,12 @@ class MooncakeStoreConfig(StrictBaseModel):
         "disagree read each other's pages as their own, so it has no default "
         "and must be unique per checkpoint.")
     stage_through_host: bool = Field(
-        True,
+        False,
         telemetry=False,
         description="Copy pages through a pinned host buffer instead of "
-        "registering the KV pools with Mooncake. The only transfer path "
-        "supported today, so 'false' is ignored with a warning. Costs a copy "
-        "each way and needs no GPUDirect RDMA.")
+        "registering the KV pools with Mooncake. For a host whose HCA cannot "
+        "pin GPU pages; costs a copy each way. Ignored when role is "
+        "'capacity'.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2650,17 +2648,6 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
-
-    @field_validator("stage_through_host", mode="after")
-    @classmethod
-    def _force_host_staging(cls, value):
-        """Say here what the workers would otherwise each say after bringup."""
-        if not value:
-            logger.warning(
-                "Ignoring mooncake_store.stage_through_host=False: pages pass "
-                "through pinned host memory, which is the only transfer path "
-                "this connector supports today.")
-        return True
 
     @field_validator("segment_size", mode="after")
     @classmethod
@@ -3261,14 +3248,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE (two-model) feeds captured target hidden states into the
-        # separate draft engine, so the shared Eagle3ResourceManager must
-        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
-        # the target model's hidden_states straight to the MTP layer
-        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
-        # both gated on self.is_mtp_eagle), so no capture buffer is needed
-        # and we should skip allocation to avoid disabling post-MLP/MoE
-        # fusion via the layer-capture hook.
+        # MTP_EAGLE_ONE_MODEL passes the target model's hidden_states straight
+        # to the MTP layer (see Eagle3OneModelWorker.prepare_1st_drafter_inputs
+        # / _run_draft_forward, both gated on self.is_mtp_eagle), so no capture
+        # buffer is needed and we skip allocation to avoid disabling
+        # post-MLP/MoE fusion via the layer-capture hook.
         return 0
 
     @property

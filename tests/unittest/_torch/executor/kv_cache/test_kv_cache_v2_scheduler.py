@@ -119,10 +119,11 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     manager.kv_connector_manager = Mock()
     manager._connector_reservations_enabled = Mock(return_value=True)
     manager._accept_connector_prefix_reservations = order.accept
+    manager._on_allocation_stream = set()
     order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
     order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
-    scheduled = Mock()
+    scheduled = Mock(context_requests=[])
     manager.report_batch_to_connector(scheduled)
     assert order.mock_calls == [
         call.accept(scheduled),
