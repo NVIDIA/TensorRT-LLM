@@ -324,7 +324,10 @@ work of kind 1.
   implementation of an entry, write a new kernel as a new entry, or fuse
   consecutive entries into one. One entry or one fusion per task, naming the
   values to measure at. A `perf` task that finds no win is still `DONE`; it
-  lands only a change that measured faster.
+  lands only a change that measured faster. Do not ask a `perf` task to match
+  the baseline bit for bit: a faster implementation may differ in the last
+  bits, and that is acceptable while its error stays as small as its
+  arithmetic explains.
 - **Give parallel tasks disjoint edits.** Two tasks rewriting the same part
   of `modeling.py` leave a conflict for their merge task. Give each its own
   entry file and its own call site, and say so in the task sections.

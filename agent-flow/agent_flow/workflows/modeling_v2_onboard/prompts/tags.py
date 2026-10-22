@@ -219,6 +219,14 @@ fused into one — at the values the target actually passes. The task names it.
    `FAILED` only when the plan is wrong (the op is not where the task says,
    an input is missing).
 
+Matching the baseline bit for bit is not a goal. A new implementation, a
+new kernel or a fusion may accumulate in another order and so differ from the
+current entry, and from the whole model's earlier outputs, in the last bits.
+That is fine as long as the difference is the small error its arithmetic
+explains: the entry still passes its band against `reference`. Never keep a
+slower design, or turn down a faster one, only to reproduce the baseline's
+bits.
+
 Never trade accuracy for speed: no wider tolerance, no lower precision, no
 dropped cell, unless the task explicitly asks for it. A later
 `e2e_accuracy` task re-checks the whole model, so name every change of
