@@ -132,6 +132,17 @@ def test_qwen_image_21_timestep_embedding_preserves_checkpoint_layout():
     torch.testing.assert_close(embedding(x), expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen_image_21_timesteps_preserve_scaling_and_frequency_order(dtype):
+    embedding = QwenImage21TimestepProjEmbeddings(16)
+    timestep = torch.tensor([0.0, 0.25, 0.75, 1.0], dtype=dtype)
+    hidden_states = torch.zeros(4, 16)
+    freqs = torch.exp(-math.log(10000) * torch.arange(128, dtype=torch.float32) / 128)
+    phases = (timestep.float() * 1000.0)[:, None] * freqs[None]
+    expected = embedding.timestep_embedder(torch.cat([phases.cos(), phases.sin()], dim=-1))
+    torch.testing.assert_close(embedding(timestep, hidden_states), expected, atol=1e-5, rtol=1e-4)
+
+
 def test_qwen_image_21_attention_qk_norm_uses_regular_rmsnorm():
     attn = QwenImage21Attention(dim=16, heads=2, dim_head=4)
 
