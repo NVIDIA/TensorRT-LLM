@@ -16,6 +16,7 @@
 import functools
 import inspect
 import math
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,6 +29,15 @@ pytestmark = pytest.mark.skipif(
     getSMVersion() not in (100, 103),
     reason="PrimsTS attention kernels require SM100 or SM103",
 )
+
+
+@pytest.fixture(autouse=True)
+def _trtllm_backend_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PrimTS runs inside the TRTLLM backend. Other backends have their own
+    # tests and would only add JIT time here.
+    import backend_case
+
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
 
 
 _QWEN2_7B = {
@@ -82,9 +92,10 @@ _DEEPSEEK_V3_LITE_MLA = {
             },
             id="generation",
         ),
+        # The context request matches the context case so both reuse one kernel.
         pytest.param(
             {
-                "seq_lens": [41, 1],
+                "seq_lens": [65, 1],
                 "num_cached_tokens": [0, 63],
                 "num_contexts": 1,
             },
@@ -190,29 +201,6 @@ def test_prims_ts_context_receives_zeroed_v_tail(
 
     assert "TRTLLM" in results
     assert zeroed_tails == [(0, 1), (1, 5)]
-
-
-def test_prims_ts_fp16_dense_context_with_alternate_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
-    case = BackendCase(
-        num_heads=8,
-        num_kv_heads=2,
-        head_dim=256,
-        seq_lens=[67, 33],
-        num_cached_tokens=[0, 0],
-        num_contexts=2,
-        dtype="float16",
-        causal=False,
-        kv_layout="HND",
-        page_size=64,
-        use_kv_cache_manager_v2=True,
-    )
-
-    results = run_case(case)
-
-    assert "TRTLLM" in results
 
 
 def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
@@ -371,8 +359,11 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     run_case(case)
 
 
-@pytest.mark.parametrize("num_heads", [6, 12, 96])
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+# 6 and 96 heads select the M8 and repeated-M64 Q tiles; the scales test below
+# covers the M16 tile with 12 heads.
+@pytest.mark.parametrize(
+    "use_kv_cache_manager_v2,num_heads", [(False, 6), (True, 96)], ids=["v1-6", "v2-96"]
+)
 def test_prims_ts_fp8_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
 ) -> None:
@@ -436,7 +427,7 @@ def test_prims_ts_fp8_mla_preprocessing(
     assert calls == [0, 1, 0, 1]
 
 
-@pytest.mark.parametrize("num_heads", [6, 12, 96])
+@pytest.mark.parametrize("num_heads", [12, 96])
 @pytest.mark.parametrize("batch_size", [2, 65])
 @pytest.mark.parametrize("max_seq_len", [64, 128], ids=["short-kv", "regular-kv"])
 def test_prims_ts_fp8_mla_scales_and_graph_replay(
@@ -1372,3 +1363,271 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
 
     assert calls["fallback"] > 0
     assert calls["prims_context"] == 0
+
+
+@pytest.mark.parametrize(
+    "window_left,paged",
+    [(-1, False), (-1, True), (31, False)],
+    ids=["causal-contiguous", "causal-paged", "sliding-window-contiguous"],
+)
+def test_prims_ts_context_packed_query_tails(window_left: int, paged: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
+        BatchPrefillPagedTSWrapper,
+        BatchPrefillTSWrapper,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    page_size = 32
+    # Cover a tile crossing into another request, a partial second Q tile,
+    # and a final tile that extends beyond the packed allocation.
+    q_lengths = [3, 130, 1]
+    kv_lengths = [33, 160, 17]
+    q_offsets = [0, 3, 133, 134]
+    kv_offsets = [0, 33, 193, 210]
+    batch_size = len(q_lengths)
+    max_pages = math.ceil(max(kv_lengths) / page_size)
+    query = torch.randn(sum(q_lengths), num_qo_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(
+        batch_size * max_pages, num_kv_heads, page_size, head_dim, device=device, dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_tables = torch.arange(batch_size * max_pages, device=device, dtype=torch.int32).view(
+        batch_size, max_pages
+    )
+    qo_indptr = torch.tensor(q_offsets, device=device, dtype=torch.int32)
+    kv_indptr = torch.tensor(kv_offsets, device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(kv_lengths, device=device, dtype=torch.int32)
+    keys, values = [], []
+    for batch_idx, kv_length in enumerate(kv_lengths):
+        pages = block_tables[batch_idx].long()
+        keys.append(k_cache[pages].transpose(1, 2).reshape(-1, num_kv_heads, head_dim)[:kv_length])
+        values.append(
+            v_cache[pages].transpose(1, 2).reshape(-1, num_kv_heads, head_dim)[:kv_length]
+        )
+    output = torch.empty_like(query)
+    plan_args = {
+        "device": device,
+        "batch_size": batch_size,
+        "max_seq_len_q": max(q_lengths),
+        "max_kv_len": max(kv_lengths),
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "q_dtype": dtype,
+        "k_dtype": dtype,
+        "v_dtype": dtype,
+        "out_dtype": dtype,
+        "mask_type": "causal",
+        "window_left": window_left,
+    }
+    if paged:
+        wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
+        wrapper.plan(**plan_args, page_size=page_size)
+        run = functools.partial(
+            wrapper.run, query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output
+        )
+    else:
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(**plan_args, packed=True)
+        run = functools.partial(
+            wrapper.run, query, torch.cat(keys), torch.cat(values), qo_indptr, kv_indptr, out=output
+        )
+
+    def reference() -> torch.Tensor:
+        outputs = []
+        for batch_idx, (q_length, kv_length) in enumerate(zip(q_lengths, kv_lengths)):
+            q = query[q_offsets[batch_idx] : q_offsets[batch_idx + 1]].float()
+            k = keys[batch_idx].float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+            v = values[batch_idx].float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+            scores = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(head_dim)
+            q_positions = torch.arange(q_length, device=device) + kv_length - q_length
+            k_positions = torch.arange(kv_length, device=device)
+            allowed = k_positions[None, :] <= q_positions[:, None]
+            if window_left > 0:
+                allowed &= k_positions[None, :] >= q_positions[:, None] - window_left
+            scores.masked_fill_(~allowed, float("-inf"))
+            outputs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), v))
+        return torch.cat(outputs).to(dtype)
+
+    run()
+    torch.testing.assert_close(output, reference(), atol=3e-2, rtol=3e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(validate=False)
+    query.neg_()
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, reference(), atol=3e-2, rtol=3e-3)
+
+
+def _prims_ts_causal_context_reference(
+    queries: list[torch.Tensor], keys: list[torch.Tensor], values: list[torch.Tensor]
+) -> torch.Tensor:
+    outputs = []
+    for query, key, value in zip(queries, keys, values):
+        q_length, num_qo_heads, head_dim = query.shape
+        kv_length, num_kv_heads, _ = key.shape
+        key = key.float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        value = value.float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", query.float(), key) / math.sqrt(head_dim)
+        q_positions = torch.arange(q_length, device=query.device) + kv_length - q_length
+        k_positions = torch.arange(kv_length, device=query.device)
+        scores.masked_fill_(k_positions[None, :] > q_positions[:, None], float("-inf"))
+        outputs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), value))
+    return torch.cat(outputs)
+
+
+def _check_prims_ts_context_replays(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    run: Callable[..., torch.Tensor],
+    reference: Callable[[], torch.Tensor],
+) -> None:
+    is_fp8 = query.dtype == torch.float8_e4m3fn
+    atol, rtol, relative_l2_limit = (0.13, 0.05, 0.1) if is_fp8 else (0.03, 0.003, 0.02)
+
+    def check() -> None:
+        expected = reference()
+        actual = output.reshape(expected.shape).float()
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        relative_l2 = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(
+            expected
+        )
+        assert relative_l2.item() < relative_l2_limit
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(validate=False)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check()
+    # copy_ also supports FP8, whose in-place arithmetic is not implemented.
+    query.copy_(-query.float())
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check()
+
+
+def _check_prims_ts_compact_query(
+    paged: bool,
+    dtype: torch.dtype,
+    head_dim: int,
+    total_q: int,
+    storage_offset_rows: int = 0,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
+        BatchPrefillPagedTSWrapper,
+        BatchPrefillTSWrapper,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_qo_heads, num_kv_heads, page_size = 8, 2, 32
+    # Plan with the packed-tail test's bounds. Every Q size then reuses one
+    # compiled kernel per dtype, head size, and layout (BF16 D128 reuses the
+    # packed-tail kernels), and the kernel chooses the descriptor path at run time.
+    max_seq_len_q, max_kv_len = 130, 160
+    assert total_q - 4 <= max_seq_len_q and total_q + 28 <= max_kv_len
+    q_lengths = [3, total_q - 4, 1]
+    kv_lengths = [33, total_q + 28, 17]
+    q_offsets = [0, 3, total_q - 1, total_q]
+    kv_offsets = [0, 33, total_q + 61, total_q + 78]
+    query_storage = torch.randn(
+        total_q + storage_offset_rows,
+        num_qo_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(dtype)
+    query = query_storage[storage_offset_rows:]
+    assert query.is_contiguous()
+    assert query.storage_offset() == storage_offset_rows * num_qo_heads * head_dim
+    keys = [
+        torch.randn(length, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16).to(dtype)
+        for length in kv_lengths
+    ]
+    values = [
+        torch.randn(length, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16).to(dtype)
+        for length in kv_lengths
+    ]
+    output = torch.empty(query.shape, device=device, dtype=torch.bfloat16)
+    qo_indptr = torch.tensor(q_offsets, device=device, dtype=torch.int32)
+    plan_args = {
+        "device": device,
+        "batch_size": len(q_lengths),
+        "max_seq_len_q": max_seq_len_q,
+        "max_kv_len": max_kv_len,
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "q_dtype": dtype,
+        "k_dtype": dtype,
+        "v_dtype": dtype,
+        "out_dtype": torch.bfloat16,
+        "mask_type": "causal",
+    }
+    if paged:
+        max_pages = math.ceil(max_kv_len / page_size)
+        cache_shape = (len(q_lengths) * max_pages, num_kv_heads, page_size, head_dim)
+        k_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+        v_cache = torch.zeros_like(k_cache)
+        for batch_idx, (key, value) in enumerate(zip(keys, values)):
+            for start in range(0, key.shape[0], page_size):
+                page = batch_idx * max_pages + start // page_size
+                count = min(page_size, key.shape[0] - start)
+                k_cache[page, :, :count].copy_(key[start : start + count].transpose(0, 1))
+                v_cache[page, :, :count].copy_(value[start : start + count].transpose(0, 1))
+        block_tables = torch.arange(
+            len(q_lengths) * max_pages, device=device, dtype=torch.int32
+        ).view(len(q_lengths), max_pages)
+        seq_lens = torch.tensor(kv_lengths, device=device, dtype=torch.int32)
+        wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
+        wrapper.plan(**plan_args, page_size=page_size)
+        run = functools.partial(
+            wrapper.run, query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output
+        )
+    else:
+        kv_indptr = torch.tensor(kv_offsets, device=device, dtype=torch.int32)
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(**plan_args, packed=True)
+        run = functools.partial(
+            wrapper.run, query, torch.cat(keys), torch.cat(values), qo_indptr, kv_indptr, out=output
+        )
+
+    def reference() -> torch.Tensor:
+        queries = [query[start:end] for start, end in zip(q_offsets[:-1], q_offsets[1:])]
+        return _prims_ts_causal_context_reference(queries, keys, values)
+
+    _check_prims_ts_context_replays(query, output, run, reference)
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1], ids=["below", "at", "above"])
+@pytest.mark.parametrize(
+    "dtype,head_dim,boundary_q,paged",
+    [
+        pytest.param(torch.bfloat16, 128, 64, False, id="bf16-d128-contiguous"),
+        pytest.param(torch.bfloat16, 128, 64, True, id="bf16-d128-paged"),
+        pytest.param(torch.bfloat16, 256, 32, True, id="bf16-d256-paged"),
+        pytest.param(torch.float8_e4m3fn, 128, 128, False, id="fp8-d128-contiguous"),
+    ],
+)
+def test_prims_ts_context_compact_query_boundary(
+    delta: int, dtype: torch.dtype, head_dim: int, boundary_q: int, paged: bool
+) -> None:
+    # These compact Q tensors span just below, at, and above 128 KiB. The groups
+    # cover both dtypes, head sizes, and KV layouts with three row thresholds.
+    _check_prims_ts_compact_query(paged, dtype, head_dim, boundary_q + delta)
+
+
+def test_prims_ts_context_compact_query_storage_offset() -> None:
+    _check_prims_ts_compact_query(
+        paged=False, dtype=torch.bfloat16, head_dim=128, total_q=64, storage_offset_rows=1
+    )

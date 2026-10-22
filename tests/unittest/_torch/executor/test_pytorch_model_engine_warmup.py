@@ -95,6 +95,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         encoder_max_batch_size=None,
         encoder_max_num_tokens=None,
         enable_in_graph_sampling=False,
+        enable_return_routed_experts=False,
         multimodal_config=SimpleNamespace(video_pruning_rate=None),
         checkpoint_format="HF",
         trust_remote_code=False,

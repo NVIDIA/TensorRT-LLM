@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
@@ -220,6 +221,34 @@ def test_nemotron_h_dense_pattern_survives_autoconfig(tmp_path):
     assert cfg.mamba_head_dim == 80
     assert cfg.rms_norm_eps == 1e-5
     assert cfg.num_nextn_predict_layers == 0
+
+
+@pytest.mark.parametrize(
+    "declared_dtype, expected_dtype",
+    [
+        (None, torch.bfloat16),
+        ("float32", torch.float32),
+    ],
+)
+def test_nemotron_h_dense_ssm_cache_dtype_follows_checkpoint(
+    tmp_path, declared_dtype, expected_dtype
+):
+    # NemotronHConfig must not invent an SSM cache dtype: without a declared one
+    # the recurrent-state cache is sized in the model dtype, as with the
+    # checkpoint's own remote-code config.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import resolve_auto_ssm_cache_dtype
+
+    config_dict = _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    config_dict["torch_dtype"] = "bfloat16"
+    if declared_dtype is not None:
+        config_dict["mamba_ssm_cache_dtype"] = declared_dtype
+
+    cfg = AutoConfig.from_pretrained(_write_config(tmp_path, "nemotron_h_ssm", config_dict))
+
+    assert isinstance(cfg, NemotronHConfig)
+    assert cfg.mamba_ssm_cache_dtype == declared_dtype
+    assert resolve_auto_ssm_cache_dtype(cfg, torch.float16) == expected_dtype
 
 
 def test_nemotron_h_representable_pattern_uses_native_config(tmp_path):

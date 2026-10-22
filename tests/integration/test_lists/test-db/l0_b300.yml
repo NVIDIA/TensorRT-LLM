@@ -24,11 +24,14 @@ l0_b300:
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
   # The sparse/dsa/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  # test_prims_ts_attention_backend.py keeps its own entry so its kernel JIT time does not
+  # count against this entry's timeout.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/test_prims_ts_attention_backend.py
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  - unittest/_torch/attention/test_prims_ts_attention_backend.py
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
