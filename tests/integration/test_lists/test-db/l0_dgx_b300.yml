@@ -78,7 +78,7 @@ l0_dgx_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-tp4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
   # modeling_v2 GLM-5.2-NVFP4 sm_103 tep4 target: identity and MTP1 GSM8K paired in one test,
   # with the MTP1 acceptance gate on the second leg.
-  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Tep4::test_gsm8k_identity_vs_mtp1_and_acceptance TIMEOUT (180)
+  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Tep4::test_gsm8k_identity_vs_mtp1_and_acceptance TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:
