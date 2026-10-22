@@ -184,6 +184,11 @@ def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+// [MuseSpark CI trim] feat/musespark-open-agentx always runs the full MuseSpark stages
+// (MUSESPARK_ONLY_STAGES in L0_Test.groovy). CBTS narrowing could drop the GB300
+// multi-GPU stage or shrink its test list, so it is off here. Revert before mergeback.
+@Field
+def MUSESPARK_ONLY_DISABLE_CBTS = true
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
 // for every eligible PR, but only these authors receive coverage-based narrowing.
 // Keep the policy in the infra-owned Groovy boundary so rollout requires infra review.
@@ -1149,6 +1154,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     if (testFilter[(DISABLE_CBTS)]) {
         pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
         _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        return null
+    }
+    if (MUSESPARK_ONLY_DISABLE_CBTS) {
+        pipeline.echo("CBTS: disabled — MuseSpark-only CI on feat/musespark-open-agentx")
+        _cbtsReportDecision(pipeline, globalVars, "disabled", "MuseSpark-only feature branch", null)
         return null
     }
 

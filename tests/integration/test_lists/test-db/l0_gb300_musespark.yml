@@ -1,0 +1,34 @@
+version: 0.0.1
+# [MuseSpark CI trim] Pre-merge MuseSpark coverage for feat/musespark-open-agentx.
+# Same entries as the MuseSpark cases in l0_gb300_multi_gpus.yml (post_merge only),
+# promoted to pre_merge so a bare `/bot run` exercises them. Run by the
+# GB300-4_GPUs-PyTorch-MuseSpark-1 stage in jenkins/L0_Test.groovy.
+l0_gb300_musespark:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - accuracy/modeling_v2/test_musespark_open.py::TestModelingV2MuseSparkOpenNvfp4Tep4::test_dflash2_gsm8k_and_acceptance
+  # MuseSparkOpen decode-path fusions (random weights, no checkpoint). The finalize+all-reduce
+  # parity, stress and lifecycle files stay unlisted, as in l0_gb300_multi_gpus.yml: they need
+  # an external 4- or 8-rank MPI launch and every case skips under single-process pytest.
+  - unittest/_torch/modeling/test_musespark_open_router_projection.py
+  - unittest/_torch/modeling/test_musespark_open_full_routing.py
+  - unittest/_torch/modeling/test_musespark_open_norm_gate.py
+  - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
+  - unittest/_torch/modeling/test_musespark_open_cluster_boundary.py
+  - unittest/_torch/modeling/test_musespark_open_pre_expert_quant.py
+  - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
+  - unittest/_torch/modeling/test_musespark_open_fusion_switches.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_local.py
