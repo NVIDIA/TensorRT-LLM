@@ -308,7 +308,7 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
         "FP32 input is not supported when writing an NVFP4 MLA cache.");
     int head_size = lora_size + rope_size;
     TLLM_CHECK_WITH_INFO(residual_dim == 0 || residual_dim == rope_size,
-        "MLA KV residual_dim must be 0 or rope_size (%ld), got %ld", rope_size, residual_dim);
+        "MLA KV residual_dim must be 0 or rope_size ({}), got {}", rope_size, residual_dim);
     TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp4KvCache() || residual_dim == 0,
         "MLA KV residual quantization requires an NVFP4 KV cache.");
     int const storage_head_size = head_size + static_cast<int>(residual_dim);

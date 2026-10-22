@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
+
+#include <source_location>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -41,16 +43,14 @@ TRTLLM_NAMESPACE_END
     do                                                                                                                 \
     {                                                                                                                  \
         TLLM_LIKELY(static_cast<bool>(val))                                                                            \
-        ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                              \
+        ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(std::source_location::current(), #val);                 \
     } while (0)
 
 #define TLLM_CHECK_WITH_INFO(val, info, ...)                                                                           \
     do                                                                                                                 \
     {                                                                                                                  \
         TLLM_LIKELY(static_cast<bool>(val))                                                                            \
-        ? ((void) 0)                                                                                                   \
-        : tensorrt_llm::common::throwRuntimeError(                                                                     \
-            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                            \
+        ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(std::source_location::current(), info, ##__VA_ARGS__);  \
     } while (0)
 
 #define TLLM_CHECK_DEBUG(val)                                                                                          \
@@ -59,7 +59,7 @@ TRTLLM_NAMESPACE_END
         if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                                           \
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
-            ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                          \
+            ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(std::source_location::current(), #val);             \
         }                                                                                                              \
     } while (0)
 
@@ -70,7 +70,6 @@ TRTLLM_NAMESPACE_END
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
             ? ((void) 0)                                                                                               \
-            : tensorrt_llm::common::throwRuntimeError(                                                                 \
-                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                        \
+            : tensorrt_llm::common::throwRuntimeError(std::source_location::current(), info, ##__VA_ARGS__);           \
         }                                                                                                              \
     } while (0)

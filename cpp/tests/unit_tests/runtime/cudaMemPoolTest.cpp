@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,8 @@ TEST(CudaMemPool, TestPrimaryPoolState)
         if (!deviceSupportsMemoryPools)
         {
             TLLM_LOG_INFO(
-                "Testing primary memory pool state for device %i skipped as it does not support memory pools.");
+                "Testing primary memory pool state for device {} skipped as it does not support memory pools.",
+                deviceId);
             continue;
         }
         auto const primaryPool = tensorrt_llm::runtime::CudaMemPool::getPrimaryPoolForDevice(deviceId);

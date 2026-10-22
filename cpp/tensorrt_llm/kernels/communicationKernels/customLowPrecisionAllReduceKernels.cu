@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1309,7 +1309,7 @@ void lowPrecisionAllReduceDispatchType(kernels::LowPrecisionAllReduceParams& par
     case 2: lowPrecisionAllReduceDispatchRanksPerNode<T, __nv_fp8_e4m3, 2>(param, stream); break;
     case 4: lowPrecisionAllReduceDispatchRanksPerNode<T, __nv_fp8_e4m3, 4>(param, stream); break;
     case 8: lowPrecisionAllReduceDispatchRanksPerNode<T, __nv_fp8_e4m3, 8>(param, stream); break;
-    default: TLLM_THROW("Custom LowPrecision all reduce only supported on {2, 4, 8} GPUs per node.");
+    default: TLLM_THROW("Custom LowPrecision all reduce only supported on {{2, 4, 8}} GPUs per node.");
     }
 #else
     TLLM_THROW("Can't Use Low Precision Allreduce When Compile Without ENABLE_FP8");
@@ -1367,13 +1367,13 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize(
     // Check initialization
     if (!static_buffers->initialized || static_buffers->tpSize != tpSize)
     {
-        TLLM_THROW("Static buffers for TP size %zu not initialized", tpSize);
+        TLLM_THROW("Static buffers for TP size {} not initialized", tpSize);
     }
 
     // Use the stored flag pointer
     *(static_buffers->flag_ptr) += 1;
 
-    TLLM_LOG_TRACE("AllReduceParams's flag value is %d", *(static_buffers->flag_ptr));
+    TLLM_LOG_TRACE("AllReduceParams's flag value is {}", *(static_buffers->flag_ptr));
     uint64_t flag_value = *(static_buffers->flag_ptr);
     LowPrecisionAllReduceParams params;
     // Even plugins use ping buffers, odd plugins use pong.
@@ -1411,13 +1411,13 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize_hier(
     // Check initialization
     if (!static_buffers->initialized || static_buffers->tpSize != tpSize)
     {
-        TLLM_THROW("Static buffers for TP size %zu not initialized", tpSize);
+        TLLM_THROW("Static buffers for TP size {} not initialized", tpSize);
     }
 
     // Use the stored flag pointer
     *(static_buffers->flag_ptr) += 1;
 
-    TLLM_LOG_TRACE("AllReduceParams's flag value is %d", *(static_buffers->flag_ptr));
+    TLLM_LOG_TRACE("AllReduceParams's flag value is {}", *(static_buffers->flag_ptr));
     uint64_t flag_value = *(static_buffers->flag_ptr);
     LowPrecisionAllReduceParams params;
     // Even plugins use ping buffers, odd plugins use pong.

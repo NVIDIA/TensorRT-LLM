@@ -379,7 +379,7 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
         case 64: LAUNCH_PER_HEAD_KERNEL(64, true); break;
         case 128: LAUNCH_PER_HEAD_KERNEL(128, true); break;
         case 256: LAUNCH_PER_HEAD_KERNEL(256, true); break;
-        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRope: %d", head_dim);
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRope: {}", head_dim);
         }
     }
     else
@@ -389,7 +389,7 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
         case 64: LAUNCH_PER_HEAD_KERNEL(64, false); break;
         case 128: LAUNCH_PER_HEAD_KERNEL(128, false); break;
         case 256: LAUNCH_PER_HEAD_KERNEL(256, false); break;
-        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRope: %d", head_dim);
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRope: {}", head_dim);
         }
     }
 #undef LAUNCH_PER_HEAD_KERNEL
@@ -424,7 +424,7 @@ void launchFusedDiTQKNormRopeQuantFp8(void const* qkv, void* q_out, void* k_out,
         case 64: LAUNCH_QUANT_KERNEL(64, true); break;
         case 128: LAUNCH_QUANT_KERNEL(128, true); break;
         case 256: LAUNCH_QUANT_KERNEL(256, true); break;
-        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: %d", head_dim);
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: {}", head_dim);
         }
     }
     else
@@ -434,7 +434,7 @@ void launchFusedDiTQKNormRopeQuantFp8(void const* qkv, void* q_out, void* k_out,
         case 64: LAUNCH_QUANT_KERNEL(64, false); break;
         case 128: LAUNCH_QUANT_KERNEL(128, false); break;
         case 256: LAUNCH_QUANT_KERNEL(256, false); break;
-        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: %d", head_dim);
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: {}", head_dim);
         }
     }
 #undef LAUNCH_QUANT_KERNEL
@@ -755,8 +755,8 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
     bool interleave, bool per_head_cos, bool cos_is_bf16, int cos_seq_per_batch, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(num_heads_q == num_heads_k,
-        "fusedDiTQKNormRopeFullDim: requires num_heads_q == num_heads_k (got %d, %d)", num_heads_q, num_heads_k);
-    TLLM_CHECK_WITH_INFO(num_heads_q <= 64, "fusedDiTQKNormRopeFullDim: num_heads must be <= 64, got %d", num_heads_q);
+        "fusedDiTQKNormRopeFullDim: requires num_heads_q == num_heads_k (got {}, {})", num_heads_q, num_heads_k);
+    TLLM_CHECK_WITH_INFO(num_heads_q <= 64, "fusedDiTQKNormRopeFullDim: num_heads must be <= 64, got {}", num_heads_q);
 
     int const N = num_heads_q * head_dim;
     constexpr int ROWS_PER_BLOCK = 2;
@@ -796,7 +796,7 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
         {                                                                                                              \
         case 64: LAUNCH(64, INTERLEAVE, PER_HEAD, COS_T); break;                                                       \
         case 128: LAUNCH(128, INTERLEAVE, PER_HEAD, COS_T); break;                                                     \
-        default: TLLM_THROW("Unsupported head_dim for fusedDiTQKNormRopeFullDim: %d", head_dim);                       \
+        default: TLLM_THROW("Unsupported head_dim for fusedDiTQKNormRopeFullDim: {}", head_dim);                       \
         }                                                                                                              \
     } while (0)
 #define DISPATCH_DTYPE(INTERLEAVE, PER_HEAD)                                                                           \

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -546,7 +546,7 @@ void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t
         "gathered_o must be 16-byte aligned for async memcpy");
     // TODO: Figure out why this constraint is specific to this implementation and not the legacy one.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) <= MAX_KV_LORA_BYTES,
-        "kv_lora_rank * sizeof(T) must be <= %zu bytes", static_cast<size_t>(MAX_KV_LORA_BYTES));
+        "kv_lora_rank * sizeof(T) must be <= {} bytes", static_cast<size_t>(MAX_KV_LORA_BYTES));
     // Check that kv_lora_rank * sizeof(T) is a multiple of 16.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) % 16 == 0,
         "kv_lora_rank * sizeof(T) must be a multiple of 16 for async memcpy");
@@ -582,7 +582,7 @@ void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t
         "gathered_o must be 16-byte aligned for async memcpy");
     // TODO: Figure out why this constraint is specific to this implementation and not the legacy one.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) <= MAX_KV_LORA_BYTES,
-        "kv_lora_rank * sizeof(T) must be <= %zu bytes", static_cast<size_t>(MAX_KV_LORA_BYTES));
+        "kv_lora_rank * sizeof(T) must be <= {} bytes", static_cast<size_t>(MAX_KV_LORA_BYTES));
     // Check that kv_lora_rank * sizeof(T) is a multiple of 16.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) % 16 == 0,
         "kv_lora_rank * sizeof(T) must be a multiple of 16 for async memcpy");

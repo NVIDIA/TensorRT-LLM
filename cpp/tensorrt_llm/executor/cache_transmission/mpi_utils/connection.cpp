@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,7 +43,7 @@ MpiConnectionManager::MpiConnectionManager(mpi::MpiComm const* comm)
     TLLM_CHECK(mComm);
     mCommState = CommState{
         tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), mpi::MpiComm::session().getRank()};
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "MpiConnectionManager::MpiConnectionManager, commState:%s",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "MpiConnectionManager::MpiConnectionManager, commState:{}",
         mCommState.toString().c_str());
 }
 

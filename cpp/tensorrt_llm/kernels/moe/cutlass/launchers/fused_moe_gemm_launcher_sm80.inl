@@ -94,7 +94,7 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
     dim3 block(GemmType::kThreadCount);
     fused_moe_oss::run_global<GemmType><<<grid, block, GemmType::kSmemSize, stream>>>(params);
     auto result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "Fail to execute fused moe kernel, cuda error %d\n", (int) (result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "Fail to execute fused moe kernel, cuda error {}\n", (int) (result));
 }
 } // namespace kernels::cutlass_kernels_oss
 

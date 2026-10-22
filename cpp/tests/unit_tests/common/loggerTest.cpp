@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/logger.h"
 
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 #include <thread>
 
 using namespace tensorrt_llm::common;
@@ -69,4 +71,44 @@ TEST(LoggerModuleTest, PerModuleFilterGainControl)
     t.join();
 
     unsetenv("TLLM_LOG_LEVEL_BY_MODULE");
+}
+
+TEST(LoggerFormatTest, FormatsValuesAndLiteralBraces)
+{
+    std::thread t(
+        []
+        {
+            auto* logger = Logger::getLogger();
+            logger->setLevel(Logger::INFO);
+            logger->setRank(-1);
+
+            testing::internal::CaptureStdout();
+            logger->log(Logger::INFO, Logger::Module{"runtime"}, 2,
+                "name={}, count={}, hex={:x}, ratio={:.2f}%, shape={{{}, {}}}", "model", 4294967296ULL, 255, 12.345, 2,
+                3);
+            EXPECT_EQ(testing::internal::GetCapturedStdout(),
+                "[TRT-LLM] [I] [runtime][RANK 2] name=model, count=4294967296, hex=ff, ratio=12.35%, shape={2, 3}\n");
+        });
+    t.join();
+}
+
+TEST(LoggerFormatTest, PreservesRuntimeMessageText)
+{
+    std::thread t(
+        []
+        {
+            auto* logger = Logger::getLogger();
+            logger->setLevel(Logger::INFO);
+            logger->setRank(-1);
+            std::string const message = "literal {braces}, %s, %d, 100%";
+
+            testing::internal::CaptureStdout();
+            logger->log(Logger::INFO, "{}", message);
+            EXPECT_EQ(testing::internal::GetCapturedStdout(), "[TRT-LLM] [I] " + message + "\n");
+
+            testing::internal::CaptureStderr();
+            logger->log(std::runtime_error{message});
+            EXPECT_EQ(testing::internal::GetCapturedStderr(), "[TRT-LLM] [E] std::runtime_error: " + message + "\n");
+        });
+    t.join();
 }

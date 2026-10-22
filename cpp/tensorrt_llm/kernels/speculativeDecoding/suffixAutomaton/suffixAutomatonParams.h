@@ -198,7 +198,7 @@ struct SuffixAutomatonGlobalSearchParams
         TLLM_CHECK_WITH_INFO(
             maxSlots <= 1024, "Global search kernel supports at most 1024 slots (one CUDA thread per slot)");
         TLLM_CHECK_WITH_INFO(maxNgramSize == -1 || (maxNgramSize >= 1 && maxNgramSize <= kMaxGlobalSuffixLen),
-            "maxNgramSize must be -1 (longest match) or in [1, %d], got %d", kMaxGlobalSuffixLen, maxNgramSize);
+            "maxNgramSize must be -1 (longest match) or in [1, {}], got {}", kMaxGlobalSuffixLen, maxNgramSize);
         TLLM_CHECK(maxSeqLen > 0);
         TLLM_CHECK(slots != nullptr);
         TLLM_CHECK(batchIndices != nullptr);

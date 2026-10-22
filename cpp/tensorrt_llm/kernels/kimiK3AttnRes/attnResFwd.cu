@@ -1787,8 +1787,8 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     int dev = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&dev));
     int num_sm = attn_res_fwd_grid_size(dev);
-    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res_fwd: failed to query the SM count of device %d", dev);
-    TLLM_CHECK_WITH_INFO(N <= N_MAX, "attn_res_fwd: unsupported N=%d (max %d)", N, N_MAX);
+    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res_fwd: failed to query the SM count of device {}", dev);
+    TLLM_CHECK_WITH_INFO(N <= N_MAX, "attn_res_fwd: unsupported N={} (max {})", N, N_MAX);
 
     if (H == 8192)
     {
@@ -1876,7 +1876,7 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "attn_res_fwd: unsupported hidden size H=%d", H);
+        TLLM_CHECK_WITH_INFO(false, "attn_res_fwd: unsupported hidden size H={}", H);
     }
 }
 
@@ -1926,7 +1926,7 @@ static void invokeAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
     // a configuration this kernel was never instantiated for.
     default:
         TLLM_CHECK_WITH_INFO(false,
-            "Kimi K3 attn-res fused epilogue has no instantiation for numCandidates=%d (supported: 1-12)",
+            "Kimi K3 attn-res fused epilogue has no instantiation for numCandidates={} (supported: 1-12)",
             params.numCandidates);
         break;
     }

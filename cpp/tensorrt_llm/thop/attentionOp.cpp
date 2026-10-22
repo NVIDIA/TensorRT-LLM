@@ -999,7 +999,7 @@ public:
             int32_t const num_requests = batch_beam / beam_width;
 
             TLLM_CHECK_WITH_INFO(num_tokens % num_seqs == 0,
-                "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens, num_seqs);
+                "seq_len should be same for all generation requests, num_tokens={}, num_seqs={}", num_tokens, num_seqs);
             int32_t const input_seq_length = num_tokens / num_seqs;
 
             common_enqueue_params.input_seq_length = input_seq_length;
@@ -1134,13 +1134,13 @@ static std::shared_ptr<AttentionOp> get_attention_op(
 
     if (auto iter = op_cache.find(cache_key); iter != op_cache.end())
     {
-        TLLM_LOG_TRACE("Attention op for layer %lld is cached", local_layer_idx);
+        TLLM_LOG_TRACE("Attention op for layer {} is cached", local_layer_idx);
         return iter->second;
     }
 
     read_lock.unlock();
     TLLM_LOG_TRACE(
-        "Attention op for layer %lld is not cached, cache key: %s", local_layer_idx, to_string(cache_key).c_str());
+        "Attention op for layer {} is not cached, cache key: {}", local_layer_idx, to_string(cache_key).c_str());
     std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
     op->initialize();
     // initialize() ends with mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported(), so the flag
@@ -1165,14 +1165,14 @@ static std::shared_ptr<AttentionOp> get_attention_op(
         "Paged-context attention (chunked prefill, KV cache reuse or speculative draft tokens) is not supported with "
         "relative position embedding: that attention always runs unfused, and the unfused path cannot attend to "
         "cached KV. Disable chunked prefill, KV cache reuse and speculative decoding for this model. "
-        "Attention configuration: %s",
+        "Attention configuration: {}",
         to_string(cache_key).c_str());
     TLLM_CHECK_WITH_INFO(!needs_fused_paged_context || op->mEnableContextFMHA,
         "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
         "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
         "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
         "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding. "
-        "Attention configuration: %s",
+        "Attention configuration: {}",
         to_string(cache_key).c_str());
     runner->prepare(*op);
     auto [iter, _] = op_cache.try_emplace(cache_key, op);
@@ -1230,7 +1230,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
     double skip_correction_threshold, std::optional<bool> uses_spcompress)
 {
-    TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
+    TLLM_LOG_TRACE("Attention op starts at layer {}", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
@@ -1530,7 +1530,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t const workspace_size
         = runner->getWorkspaceSize(*op, num_contexts, num_ctx_tokens, max_context_q_len, maxCrossKvLength,
             num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
-    TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
+    TLLM_LOG_TRACE("Expected workspace size is {} bytes", workspace_size);
 
     torch::Tensor workspace;
     if (workspace_.has_value())
@@ -1540,9 +1540,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             auto const capacity = workspace_.value().storage().nbytes();
             if (capacity < static_cast<size_t>(workspace_size))
             {
-                TLLM_LOG_WARNING(
-                    "Attention workspace size is not enough, increase the size from %zu bytes to %ld bytes", capacity,
-                    workspace_size);
+                TLLM_LOG_WARNING("Attention workspace size is not enough, increase the size from {} bytes to {} bytes",
+                    capacity, workspace_size);
             }
             workspace_.value().resize_({workspace_size});
         }
@@ -1550,7 +1549,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
     else
     {
-        TLLM_LOG_TRACE("Allocate new attention workspace with size %ld bytes", workspace_size);
+        TLLM_LOG_TRACE("Allocate new attention workspace with size {} bytes", workspace_size);
         workspace = torch::empty({workspace_size}, torch::dtype(torch::kByte).device(qkv_or_q.device()));
     }
 
@@ -1601,7 +1600,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
     }
 
-    TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
+    TLLM_LOG_TRACE("Attention op stops at layer {}", local_layer_idx);
 }
 
 bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
@@ -1645,7 +1644,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     }
     else
     {
-        TLLM_LOG_TRACE("Caching attention op runtime check with cache key: %s", to_string(cache_key).c_str());
+        TLLM_LOG_TRACE("Caching attention op runtime check with cache key: {}", to_string(cache_key).c_str());
         op->initialize();
         op_cache[cache_key] = op->supportsNvFp4Output();
     }

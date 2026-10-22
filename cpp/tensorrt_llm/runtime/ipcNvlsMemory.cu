@@ -271,8 +271,8 @@ static CUmemAllocationHandleType getMemHandleType()
     // Check if the fabric is fully initialized.
     if (fabric_state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_status != NVML_SUCCESS)
     {
-        TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state=%u status=%u.", fabric_state,
-            fabric_status);
+        TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state={} status={}.",
+            static_cast<unsigned int>(fabric_state), static_cast<unsigned int>(fabric_status));
         return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
 
@@ -293,7 +293,7 @@ static CUmemAllocationHandleType getMemHandleType()
     CUresult err = cuMemCreate(&handle, alloc_size, &prop, 0);
     if (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED)
     {
-        TLLM_LOG_TRACE("checking fabric support... cuMemCreate failed with not %s.",
+        TLLM_LOG_TRACE("checking fabric support... cuMemCreate failed with not {}.",
             err == CUDA_ERROR_NOT_PERMITTED ? "permitted" : "supported");
         return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
@@ -314,7 +314,8 @@ static CUmemAllocationHandleType getMemHandleType()
         return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
 
-    TLLM_LOG_TRACE("fabric status: device=%d, state=%u status=%u", device_id, fabric_state, fabric_status);
+    TLLM_LOG_TRACE("fabric status: device={}, state={} status={}", device_id, static_cast<unsigned int>(fabric_state),
+        static_cast<unsigned int>(fabric_status));
 
     CUCHECK(cuMemRelease(imported_handle));
     CUCHECK(cuMemRelease(handle));
@@ -340,7 +341,7 @@ public:
         }
 
         TLLM_CHECK_WITH_INFO(group_comm->getSize() == ranks.size(),
-            "[ipcNvlsAllocate] group communicator size (%u) does not match the number of ranks (%zu).",
+            "[ipcNvlsAllocate] group communicator size ({}) does not match the number of ranks ({}).",
             group_comm->getSize(), ranks.size());
 
         // Globally unique process ids, used only to name the per-process IPC sockets.
@@ -564,7 +565,7 @@ bool ipcNvlsSupported()
             CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, current_dev));
             if (!multicast_supported)
             {
-                TLLM_LOG_DEBUG("CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED not supported on GPU%d.", cuda_dev);
+                TLLM_LOG_DEBUG("CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED not supported on GPU{}.", cuda_dev);
                 return false;
             }
         }
@@ -619,7 +620,7 @@ bool ipcNvlsFabricUsable()
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_DEBUG("NVLS fabric probe could not run, assuming usable: %s", e.what());
+            TLLM_LOG_DEBUG("NVLS fabric probe could not run, assuming usable: {}", e.what());
         }
 #endif // !ENABLE_NVSHMEM
         return true;
@@ -676,7 +677,7 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group, std::shared_ptr
         handle->ipc_uc_ptrs.push_back(reinterpret_cast<uintptr_t>(nvshmem_ptr(ptr, i)));
     }
 
-    TLLM_LOG_INFO("Rank %d NVLS allocate %zu bytes, uc_ptr:%p mc_ptr:%p", COMM_SESSION.getRank(), size,
+    TLLM_LOG_INFO("Rank {} NVLS allocate {} bytes, uc_ptr:{:p} mc_ptr:{:p}", COMM_SESSION.getRank(), size,
         (void*) handle->uc_ptr, (void*) handle->mc_ptr);
 
     MPI_Group_free(&new_group);
@@ -688,7 +689,8 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group, std::shared_ptr
     // free of MPI when a ProcessGroup-backed collective is supplied.
     auto handle = NVLSCudaAllocator::allocate(size, ranks, group_comm);
 
-    TLLM_LOG_INFO("NVLS allocate %zu bytes, uc_ptr:%p mc_ptr:%p", size, (void*) handle->uc_ptr, (void*) handle->mc_ptr);
+    TLLM_LOG_INFO(
+        "NVLS allocate {} bytes, uc_ptr:{:p} mc_ptr:{:p}", size, (void*) handle->uc_ptr, (void*) handle->mc_ptr);
 
 #endif // ENABLE_NVSHMEM
 

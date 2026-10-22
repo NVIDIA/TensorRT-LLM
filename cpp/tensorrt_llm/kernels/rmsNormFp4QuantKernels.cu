@@ -398,7 +398,7 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::
     // routes those to the unfused path).
     int const sm = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(sm >= 100 && sm < 120,
-        "residualRmsNormFp4Quant requires SM 10.x (Blackwell); got SM %d. The fused NVFP4 epilogue is unsupported on "
+        "residualRmsNormFp4Quant requires SM 10.x (Blackwell); got SM {}. The fused NVFP4 epilogue is unsupported on "
         "this arch.",
         sm);
     TLLM_CHECK_WITH_INFO(params.quant_out != nullptr && params.scale_out != nullptr,

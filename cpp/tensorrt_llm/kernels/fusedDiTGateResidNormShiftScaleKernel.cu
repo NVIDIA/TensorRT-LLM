@@ -986,11 +986,11 @@ namespace
 template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_NORM, bool HAS_SHIFT_SCALE, int NUM_OUT, bool HAS_QUANT>
 void launchFusedDiTGateResidNormShiftScaleKernelImpl(AdaLNNormParams const& params, int hidden_dim, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(params.num_tokens >= 1, "num_tokens must be >= 1, got %d", params.num_tokens);
+    TLLM_CHECK_WITH_INFO(params.num_tokens >= 1, "num_tokens must be >= 1, got {}", params.num_tokens);
     TLLM_CHECK_WITH_INFO(
-        params.tokens_per_batch >= 1, "tokens_per_batch must be >= 1, got %d", params.tokens_per_batch);
+        params.tokens_per_batch >= 1, "tokens_per_batch must be >= 1, got {}", params.tokens_per_batch);
     TLLM_CHECK_WITH_INFO(params.num_tokens % params.tokens_per_batch == 0,
-        "num_tokens (%d) must be divisible by tokens_per_batch (%d)", params.num_tokens, params.tokens_per_batch);
+        "num_tokens ({}) must be divisible by tokens_per_batch ({})", params.num_tokens, params.tokens_per_batch);
 
     // Production tile selected via NCU sweep at D=4096, B=1, T=15360: 1-row/CTA, 256 threads/CTA
     // gives 2 CTAs/SM (regs <= 80) and the highest per-element bench rate among {2r256, 1r256, 1r512}.
@@ -1075,7 +1075,7 @@ void launchFusedDiTGateResidNormShiftScaleKernelImpl(AdaLNNormParams const& para
     case 4096: LAUNCH(4096); break;
     default:
         TLLM_THROW(
-            "Unsupported hidden_dim for fusedDiTGateResidNormShiftScaleKernel: %d (only 2048, 4096)", hidden_dim);
+            "Unsupported hidden_dim for fusedDiTGateResidNormShiftScaleKernel: {} (only 2048, 4096)", hidden_dim);
     }
 #undef LAUNCH
 }
@@ -1106,8 +1106,8 @@ void launchFusedDiTGateResidNormShiftScaleKernel(AdaLNNormParams const& params, 
 #undef DISPATCH
 
     TLLM_THROW(
-        "Unsupported fusedDiTGateResidNormShiftScale variant: residual=%d gate=%d norm=%d shift_scale=%d "
-        "quant=%d (op-side validation should have rejected this)",
+        "Unsupported fusedDiTGateResidNormShiftScale variant: residual={} gate={} norm={} shift_scale={} "
+        "quant={} (op-side validation should have rejected this)",
         residual, gate, norm, shift_scale, quant);
 }
 

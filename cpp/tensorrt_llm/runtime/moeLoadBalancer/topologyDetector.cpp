@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -116,7 +116,7 @@ void TopologyDetector::detectCpuTopology()
         struct bitmask* cpus = numa_allocate_cpumask();
         if (!cpus)
         {
-            TLLM_LOG_WARNING("Failed to allocate cpumask for NUMA node query. Skipping node %d.", i);
+            TLLM_LOG_WARNING("Failed to allocate cpumask for NUMA node query. Skipping node {}.", i);
             continue; // Skip to the next node if allocation fails
         }
 
@@ -199,15 +199,15 @@ void TopologyDetector::detectGpuTopology()
                 else
                 {
                     // Fallback if sysfs path is not available or readable
-                    TLLM_LOG_DEBUG("Could not open %s to determine NUMA node for GPU %d. Defaulting to node 0.",
+                    TLLM_LOG_DEBUG("Could not open {} to determine NUMA node for GPU {}. Defaulting to node 0.",
                         pciPath, deviceId);
                     numaNode = 0;
                 }
-                TLLM_LOG_INFO("GPU %d is on NUMA node %d", deviceId, numaNode);
+                TLLM_LOG_INFO("GPU {} is on NUMA node {}", deviceId, numaNode);
             }
             else
             {
-                TLLM_LOG_WARNING("Failed to get properties for GPU %d. Defaulting to NUMA node 0.", deviceId);
+                TLLM_LOG_WARNING("Failed to get properties for GPU {}. Defaulting to NUMA node 0.", deviceId);
                 numaNode = 0;
             }
         }
@@ -273,7 +273,7 @@ void TopologyDetector::precomputeCpuAffinityMasks()
         auto itGpuNuma = mGpuToNumaMap.find(gpuId);
         if (itGpuNuma == mGpuToNumaMap.end())
         {
-            TLLM_LOG_WARNING("GPU %d not found in mGpuToNumaMap during mask precomputation. Skipping.", gpuId);
+            TLLM_LOG_WARNING("GPU {} not found in mGpuToNumaMap during mask precomputation. Skipping.", gpuId);
             continue;
         }
         int gpuNumaNode = itGpuNuma->second;
@@ -288,7 +288,7 @@ void TopologyDetector::precomputeCpuAffinityMasks()
                 if (numa_node_to_cpus(gpuNumaNode, strictMask) != 0)
                 {
                     TLLM_LOG_WARNING(
-                        "Failed to get CPUs for GPU %d's NUMA node %d for strict mask. Strict mask will be empty.",
+                        "Failed to get CPUs for GPU {}'s NUMA node {} for strict mask. Strict mask will be empty.",
                         gpuId, gpuNumaNode);
                     numa_bitmask_clearall(strictMask); // Ensure it's empty on failure
                 }
@@ -297,7 +297,7 @@ void TopologyDetector::precomputeCpuAffinityMasks()
         }
         else
         {
-            TLLM_LOG_WARNING("Failed to allocate strict CPU mask for GPU %d.", gpuId);
+            TLLM_LOG_WARNING("Failed to allocate strict CPU mask for GPU {}.", gpuId);
         }
     }
 }
@@ -355,7 +355,7 @@ void TopologyDetector::bindThreadByCurrentGpu()
                 bitmask_copy_manual(mutableCopyForAffinity, targetMask);
                 if (numa_sched_setaffinity(0, mutableCopyForAffinity) == -1)
                 { // 0 refers to the current thread
-                    TLLM_LOG_WARNING("Failed to set thread affinity for GPU %d using precomputed mask. Error: %s",
+                    TLLM_LOG_WARNING("Failed to set thread affinity for GPU {} using precomputed mask. Error: {}",
                         currentDevice, strerror(errno));
                 }
                 numa_free_cpumask(mutableCopyForAffinity);
@@ -363,18 +363,18 @@ void TopologyDetector::bindThreadByCurrentGpu()
             else
             {
                 TLLM_LOG_WARNING(
-                    "Failed to allocate temporary bitmask for setting affinity. Cannot bind thread for GPU %d.",
+                    "Failed to allocate temporary bitmask for setting affinity. Cannot bind thread for GPU {}.",
                     currentDevice);
             }
         }
         else
         {
-            TLLM_LOG_DEBUG("Target affinity mask for GPU %d is empty. Not setting affinity.", currentDevice);
+            TLLM_LOG_DEBUG("Target affinity mask for GPU {} is empty. Not setting affinity.", currentDevice);
         }
     }
     else
     {
-        TLLM_LOG_WARNING("Precomputed CPU affinity mask not found for GPU %d. Cannot bind thread.", currentDevice);
+        TLLM_LOG_WARNING("Precomputed CPU affinity mask not found for GPU {}. Cannot bind thread.", currentDevice);
     }
 
 #else
@@ -394,7 +394,7 @@ int TopologyDetector::getCurrentGpuNumaCpuCount()
         }
     }
     TLLM_LOG_DEBUG(
-        "CPU count for GPU's NUMA node %d not found or node invalid. Returning total hardware concurrency.", numaId);
+        "CPU count for GPU's NUMA node {} not found or node invalid. Returning total hardware concurrency.", numaId);
     return std::thread::hardware_concurrency();
 }
 
@@ -408,7 +408,7 @@ int TopologyDetector::getCurrentGpuNumaId()
     {
         return it->second;
     }
-    TLLM_LOG_WARNING("NUMA node for current GPU %d not found in map. Defaulting to node 0.", currentDevice);
+    TLLM_LOG_WARNING("NUMA node for current GPU {} not found in map. Defaulting to node 0.", currentDevice);
     return 0;
 }
 
@@ -423,7 +423,7 @@ int TopologyDetector::getCurrentGpuMemoryNumaId()
         return it->second;
     }
     TLLM_LOG_WARNING(
-        "NUMA node for current GPU Memory %d not found in map. Defaulting to node -1 (No Memory Node).", currentDevice);
+        "NUMA node for current GPU Memory {} not found in map. Defaulting to node -1 (No Memory Node).", currentDevice);
     return -1;
 }
 

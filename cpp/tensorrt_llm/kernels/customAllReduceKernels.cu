@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1725,7 +1725,7 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
 {
     TLLM_CHECK_WITH_INFO(
         (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM),
-        "Unsupported AllReduceFusionOp: %d", static_cast<int>(fusionOp));
+        "Unsupported AllReduceFusionOp: {}", static_cast<int>(fusionOp));
     if (algo == AllReduceStrategyType::ONESHOT)
     {
         reduce_fusion::one_shot_all_reduce_norm_kernel_launcher<T, RANKS_PER_NODE, Bias, Affine>(
@@ -1891,7 +1891,7 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream); break;
     case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream); break;
     case 16: AllReduceDispatchRanksPerNode<T, 16>(strat, config, fusionOp, params, stream); break;
-    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8, 16} GPUs per node.");
+    default: TLLM_THROW("Custom all reduce only supported on {{2, 4, 6, 8, 16}} GPUs per node.");
     }
 }
 

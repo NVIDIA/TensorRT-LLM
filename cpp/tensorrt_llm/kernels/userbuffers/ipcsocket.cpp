@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,7 +87,7 @@ ipcSocketResult_t ipcSocketInit(IpcSocketHandle* handle, int rank, uint64_t hash
 #endif
     if (bind(fd, (struct sockaddr*) &cliaddr, sizeof(cliaddr)) < 0)
     {
-        TLLM_LOG_WARNING("UDS: Binding to socket %s failed", temp);
+        TLLM_LOG_WARNING("UDS: Binding to socket {} failed", temp);
         close(fd);
         return ipcSocketSystemError;
     }
@@ -191,7 +191,7 @@ ipcSocketResult_t ipcSocketRecvMsg(IpcSocketHandle* handle, void* hdr, int hdrLe
             if ((cmptr->cmsg_level != SOL_SOCKET) || (cmptr->cmsg_type != SCM_RIGHTS))
             {
                 errno = EBADMSG;
-                TLLM_LOG_WARNING("UDS: Receiving data over socket %s failed", handle->socketName);
+                TLLM_LOG_WARNING("UDS: Receiving data over socket {} failed", handle->socketName);
                 return ipcSocketSystemError;
             }
 
@@ -200,7 +200,7 @@ ipcSocketResult_t ipcSocketRecvMsg(IpcSocketHandle* handle, void* hdr, int hdrLe
         else
         {
             errno = ENOMSG;
-            TLLM_LOG_WARNING("UDS: Receiving data over socket %s failed", handle->socketName);
+            TLLM_LOG_WARNING("UDS: Receiving data over socket {} failed", handle->socketName);
             return ipcSocketSystemError;
         }
     }
@@ -287,7 +287,7 @@ ipcSocketResult_t ipcSocketSendMsg(
     {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         {
-            TLLM_LOG_WARNING("UDS: Sending data over socket %s failed", temp);
+            TLLM_LOG_WARNING("UDS: Sending data over socket {} failed", temp);
             return ipcSocketSystemError;
         }
         if (handle->abortFlag && *handle->abortFlag)

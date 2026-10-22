@@ -1142,7 +1142,7 @@ bool launch_cascade_attention(
     if (ws_out_p == nullptr || ws_m_p == nullptr || ws_l_p == nullptr)
     {
         TLLM_LOG_WARNING(
-            "cascade_attention: cascade workspace not provisioned by AttentionOp (need %zu bytes), falling back",
+            "cascade_attention: cascade workspace not provisioned by AttentionOp (need {} bytes), falling back",
             out_bytes + 2 * stat_bytes);
         return false;
     }

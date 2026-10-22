@@ -210,11 +210,11 @@ public:
                     if (std::chrono::steady_clock::now() >= deadline)
                     {
                         TLLM_LOG_ERROR(
-                            "Timed out shutting down asynchronous context-transfer coordinator; rank=%d "
-                            "peer_closes=%zu/%d ack=%d pending_sends=%zu. Aborting to avoid freeing active MPI "
+                            "Timed out shutting down asynchronous context-transfer coordinator; rank={} "
+                            "peer_closes={}/{} ack={} pending_sends={}. Aborting to avoid freeing active MPI "
                             "requests.",
-                            mComm->getRank(), mClosedPeers.size(), mComm->getSize() - 1, mCloseAcknowledged,
-                            mPendingSends.size());
+                            mComm->getRank(), mClosedPeers.size(), mComm->getSize() - 1,
+                            static_cast<int>(mCloseAcknowledged), mPendingSends.size());
                         std::abort();
                     }
                     std::this_thread::yield();
@@ -223,7 +223,7 @@ public:
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Failed to shut down asynchronous context-transfer coordinator: %s", error.what());
+            TLLM_LOG_ERROR("Failed to shut down asynchronous context-transfer coordinator: {}", error.what());
             std::abort();
         }
         catch (...)

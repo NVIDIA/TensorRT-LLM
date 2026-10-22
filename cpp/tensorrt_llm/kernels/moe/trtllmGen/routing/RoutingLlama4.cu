@@ -585,10 +585,10 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
             && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
         "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= {}, got {}",
         MaxNumTopExperts, data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
-        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
+        "Routing kernel expects #experts {} to be no more than {}", data.mNumExperts, MaxSupportedExperts);
     // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
     // static_assert(MaxNumExperts <= numThreadsHist, "#experts must be bounded by #threads");
     // After this point, mPtrTopKIds is guaranteed to be nullptr.

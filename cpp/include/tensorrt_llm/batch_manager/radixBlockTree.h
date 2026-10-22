@@ -116,7 +116,7 @@ public:
                 = nodeMatches.exactMatches.back().node->trySetValue(windowSize, block, /*overwrite=*/false);
             if (!wasInserted)
             {
-                TLLM_LOG_DEBUG("insertBlock: slot for windowSize=%d already occupied; insertion skipped", windowSize);
+                TLLM_LOG_DEBUG("insertBlock: slot for windowSize={} already occupied; insertion skipped", windowSize);
             }
         }
     }
@@ -215,7 +215,7 @@ public:
     void insertBlocks(PrefixKey const& prefix, int windowSize, std::vector<BlockPtr> const& blocks)
     {
         TLLM_CHECK_WITH_INFO(blocks.size() == prefix.size(),
-            "insertBlocks: blocks.size()=%zu must equal prefix.size()=%zu", blocks.size(), prefix.size());
+            "insertBlocks: blocks.size()={} must equal prefix.size()={}", blocks.size(), prefix.size());
         auto nodeMatches = insertNodes(prefix);
         for (size_t i = 0; i < nodeMatches.exactMatches.size(); ++i)
         {
@@ -226,7 +226,7 @@ public:
                 if (!wasInserted)
                 {
                     TLLM_LOG_DEBUG(
-                        "insertBlocks: slot at index %zu for windowSize=%d already occupied; "
+                        "insertBlocks: slot at index {} for windowSize={} already occupied; "
                         "insertion skipped",
                         i, windowSize);
                 }

@@ -604,7 +604,7 @@ void refineFromNvml(int device, bool& coherent, double& c2cBandwidthGBs, double&
         // getInstance() throws exactly this for the two expected conditions: libnvidia-ml.so.1
         // absent, or a required symbol missing. Anything else propagates rather than being
         // silently downgraded to "no NVML".
-        TLLM_LOG_DEBUG("NVML unavailable, falling back to CUDA-only link detection: %s", error.what());
+        TLLM_LOG_DEBUG("NVML unavailable, falling back to CUDA-only link detection: {}", error.what());
         return;
     }
     if (nvml->nvmlInit() != NVML_SUCCESS)
@@ -643,7 +643,7 @@ void refineFromNvml(int device, bool& coherent, double& c2cBandwidthGBs, double&
                     // training, a driver that predates the field, or a virtualized or
                     // permission-restricted environment. The count already settles the topology;
                     // only the tuning input is missing.
-                    TLLM_LOG_DEBUG("NVML reported %d C2C link(s) but no max bandwidth; using the default.", linkCount);
+                    TLLM_LOG_DEBUG("NVML reported {} C2C link(s) but no max bandwidth; using the default.", linkCount);
                 }
             }
         }

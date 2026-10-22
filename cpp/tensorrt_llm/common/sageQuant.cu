@@ -445,9 +445,9 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
             constexpr uint32_t GridZ = VStage_ == 0 ? 1U : (SmoothK_ && VStage_ == 1 ? 3U : 2U);
             dim3 const launchGrid{gridX, static_cast<uint32_t>(numHeadSeqs), GridZ};
             auto status = cudaLaunchKernel(kernelFunc, launchGrid, dim3{64U, 1U, 1U}, kernelArgs, 0, params.stream);
-            TLLM_CHECK_WITH_INFO(status == cudaSuccess, "%s", cudaGetErrorString(status));
+            TLLM_CHECK_WITH_INFO(status == cudaSuccess, "{}", cudaGetErrorString(status));
             status = cudaPeekAtLastError();
-            TLLM_CHECK_WITH_INFO(status == cudaSuccess, "%s", cudaGetErrorString(status));
+            TLLM_CHECK_WITH_INFO(status == cudaSuccess, "{}", cudaGetErrorString(status));
         };
 
         switch (params.vStage)
@@ -473,7 +473,7 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
                 launchKernel(cute::false_type{}, Int<2>{});
             }
             return;
-        default: TLLM_THROW("Unsupported SageQuantV stage %d", params.vStage);
+        default: TLLM_THROW("Unsupported SageQuantV stage {}", params.vStage);
         }
     };
 
@@ -501,7 +501,7 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
 #undef TLLM_SAGE_DISPATCH_HEAD_DIM
     TLLM_THROW(
         "Unsupported SageQuant dispatch config (head_dim must be 64, 128, or 256; contiguous token_block_size must "
-        "be 1, 4, or 16): headDim=%d partition=%d tokenBlockSize=%d",
+        "be 1, 4, or 16): headDim={} partition={} tokenBlockSize={}",
         params.headDim, static_cast<int>(params.partition), params.tokenBlockSize);
 }
 

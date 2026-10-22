@@ -601,7 +601,7 @@ std::tuple<int, int, int> computeChannelAndGroupCount(int cpSize, HelixFieldInfo
         totalDynamicShmemSize = singleShmSize * groupCountPerCta;
     }
 
-    TLLM_CHECK_WITH_INFO(totalDynamicShmemSize <= maxDynamicShmSize, "Single packed size %d exceeds limit %d",
+    TLLM_CHECK_WITH_INFO(totalDynamicShmemSize <= maxDynamicShmSize, "Single packed size {} exceeds limit {}",
         singleShmSize, maxDynamicShmSize);
 
     // Set shared memory attribute if needed
@@ -636,13 +636,13 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
 {
     int maxChannelCount = computeHelixMaxChannelCount(params.cpSize);
     TLLM_CHECK_WITH_INFO(params.maxChannelCount == maxChannelCount,
-        "maxChannelCount %d does not match computed maxChannelCount %d", params.maxChannelCount, maxChannelCount);
+        "maxChannelCount {} does not match computed maxChannelCount {}", params.maxChannelCount, maxChannelCount);
     auto [channelCount, groupCountPerCta, totalDynamicShmemSize]
         = computeChannelAndGroupCount<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(params.cpSize, params.sendFields);
     if (params.channelCount > 0)
     {
         channelCount = params.channelCount;
-        TLLM_CHECK_WITH_INFO(channelCount <= maxChannelCount, "channelCount %d exceeds maxChannelCount %d",
+        TLLM_CHECK_WITH_INFO(channelCount <= maxChannelCount, "channelCount {} exceeds maxChannelCount {}",
             channelCount, maxChannelCount);
     }
 
@@ -711,7 +711,7 @@ void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableFi
     // The sender divides the entry index by this to index the mask, so a
     // nonpositive divisor would be an integer division by zero on device.
     TLLM_CHECK_WITH_INFO(params.zeroKvMask == nullptr || params.zeroKvMaskDivisor > 0,
-        "zeroKvMaskDivisor must be positive when zeroKvMask is set, got %d", params.zeroKvMaskDivisor);
+        "zeroKvMaskDivisor must be positive when zeroKvMask is set, got {}", params.zeroKvMaskDivisor);
     if (allowVariableField1)
     {
         constexpr uintptr_t kBulkCopyAlignment = 16;

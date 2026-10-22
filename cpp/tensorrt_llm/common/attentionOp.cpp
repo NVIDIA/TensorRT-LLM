@@ -1267,7 +1267,7 @@ int AttentionOp::mlaGeneration(
                     // sequences that can select a multi-CTA kernel which addresses
                     // beyond the compact page table.
                     TLLM_CHECK_WITH_INFO(tllmRunnerParams.mSparseTopK > 0,
-                        "Static sparse MLA requires a positive TopK, got %d", tllmRunnerParams.mSparseTopK);
+                        "Static sparse MLA requires a positive TopK, got {}", tllmRunnerParams.mSparseTopK);
                     int32_t const originalMaxSeqLenKv = tllmRunnerParams.mMaxSeqLenKv;
                     int32_t const effectiveMaxSeqLenKv = std::min(originalMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
                     tllmRunnerParams.mMaxSeqLenKv = effectiveMaxSeqLenKv;
@@ -1276,9 +1276,9 @@ int AttentionOp::mlaGeneration(
                     int64_t const sumOfSeqLensKv
                         = static_cast<int64_t>(tllmRunnerParams.mBatchSize) * effectiveMaxSeqLenKv;
                     TLLM_CHECK_WITH_INFO(sumOfSeqLensKv <= std::numeric_limits<int32_t>::max(),
-                        "Static sparse MLA cumulative KV length exceeds int32 capacity: %ld", sumOfSeqLensKv);
+                        "Static sparse MLA cumulative KV length exceeds int32 capacity: {}", sumOfSeqLensKv);
                     tllmRunnerParams.mSumOfSeqLensKv = static_cast<int32_t>(sumOfSeqLensKv);
-                    TLLM_LOG_DEBUG("Clamp static sparse MLA max KV length from %d to %d (TopK=%d)", originalMaxSeqLenKv,
+                    TLLM_LOG_DEBUG("Clamp static sparse MLA max KV length from {} to {} (TopK={})", originalMaxSeqLenKv,
                         effectiveMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
                 }
             }
@@ -1951,14 +1951,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         else if (useSageAttnSeparateQkv)
         {
             TLLM_CHECK_WITH_INFO(mMaskType == AttentionMaskType::PADDING,
-                "SageAttention only supports dense (padding) mask, got mask type %d.", static_cast<int>(mMaskType));
+                "SageAttention only supports dense (padding) mask, got mask type {}.", static_cast<int>(mMaskType));
             TLLM_CHECK_WITH_INFO(
                 mSageAttnNumEltsPerBlkQ > 0 && mSageAttnNumEltsPerBlkK > 0 && mSageAttnNumEltsPerBlkV == 1,
                 "SageQuant requires positive block sizes for Q and K while the block size for V must be 1.");
             // A zero stride means the quantizer has no kernel for this block size, which would
             // otherwise surface as an empty scale buffer deep inside invokeSageQuant().
             TLLM_CHECK_WITH_INFO(q_max_n_blk > 0 && k_max_n_blk > 0,
-                "No SageQuant kernel on sm_%d for block sizes (q, k, v) = (%d, %d, %d) with qk_int8=%s. SM90 "
+                "No SageQuant kernel on sm_{} for block sizes (q, k, v) = ({}, {}, {}) with qk_int8={}. SM90 "
                 "requires (2, 16, 1) together with INT8 Q/K; SM100 requires q/k block sizes of 1, 4 or 16.",
                 mSM, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV,
                 mSageAttnQkInt8 ? "true" : "false");
@@ -2982,7 +2982,7 @@ int AttentionOp::initialize() noexcept
     }
     else if (!mmha_supported(getHeadSize()) && !mIsMLAEnabled)
     {
-        TLLM_CHECK_WITH_INFO(false, "Head size %d is not supported by MMHA.", getHeadSize());
+        TLLM_CHECK_WITH_INFO(false, "Head size {} is not supported by MMHA.", getHeadSize());
     }
 
     if (mIsMLAEnabled)
@@ -3369,9 +3369,9 @@ int AttentionOp::initialize() noexcept
 #if ENABLE_MULTI_DEVICE
     if (mCpSize > 1 && COMM_SESSION.getSize() > 1)
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mCpNcclComm = getComm(mCpGroup);
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     }
 #endif // ENABLE_MULTI_DEVICE
     return 0;

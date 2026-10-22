@@ -1119,7 +1119,7 @@ bool attnResPersistentFusedSupported(AttnResFwdParams const& params)
 void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(attnResPersistentFusedSupported(params),
-        "attn_res persistent fused: unsupported shape (H=%d, B=%d, N=%d, T=%d) or a required tensor is null",
+        "attn_res persistent fused: unsupported shape (H={}, B={}, N={}, T={}) or a required tensor is null",
         params.hiddenSize, params.batchSize, params.numCandidates, params.seqLen);
     // The per-candidate diagnostics have no place to come from here: this
     // kernel keeps the softmax state in registers across the persistent token
@@ -1131,7 +1131,7 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     TLLM_CUDA_CHECK(cudaGetDevice(&dev));
     int num_sm = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev));
-    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res persistent fused: failed to query the SM count of device %d", dev);
+    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res persistent fused: failed to query the SM count of device {}", dev);
 
     using namespace sm100::fwd_prod_v2;
 
@@ -1143,7 +1143,7 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     int const block_stride_m = 7168;
     long long const block_stride_r = static_cast<long long>(T) * 7168;
     TLLM_CHECK_WITH_INFO(block_stride_r <= std::numeric_limits<int>::max(),
-        "attn_res persistent fused: candidate stride %lld overflows the kernel's int stride", block_stride_r);
+        "attn_res persistent fused: candidate stride {} overflows the kernel's int stride", block_stride_r);
     // One candidate step is not the largest address the kernel forms.
     // ``residual_addr`` widens the token term but evaluates
     // ``source * block_stride_r`` in int arithmetic, and ``source`` reaches
@@ -1153,7 +1153,7 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     // upstream bounds T.
     long long const max_candidate_offset = block_stride_r * (params.numCandidates - 2);
     TLLM_CHECK_WITH_INFO(max_candidate_offset <= std::numeric_limits<int>::max(),
-        "attn_res persistent fused: candidate offset %lld (T=%d, N=%d) overflows the kernel's int stride",
+        "attn_res persistent fused: candidate offset {} (T={}, N={}) overflows the kernel's int stride",
         max_candidate_offset, T, params.numCandidates);
 
     bool const has_delta = params.layerResidualAdd != nullptr;
@@ -1217,7 +1217,7 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
         case 9: dispatch3(std::integral_constant<int, 9>{}); break;
         default:
             TLLM_CHECK_WITH_INFO(
-                false, "attn_res persistent fused: unsupported N=%d (must be in [2, 9])", params.numCandidates);
+                false, "attn_res persistent fused: unsupported N={} (must be in [2, 9])", params.numCandidates);
         }
     }
     TLLM_CUDA_CHECK(cudaGetLastError());

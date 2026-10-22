@@ -208,13 +208,13 @@ std::vector<Grant> CreditScheduler::schedule()
                 if (mDrainAbandonWarnedFlows.insert(*mDrainFlow).second)
                 {
                     TLLM_LOG_WARNING(
-                        "CreditScheduler: abandoning drain for flow %s (want=%u bytes) after %lld ms "
+                        "CreditScheduler: abandoning drain for flow {} (want={} bytes) after {} ms "
                         "without room; resuming round-robin grants (further abandons logged at DEBUG)",
                         readable.c_str(), want, waitedMs);
                 }
                 else
                 {
-                    TLLM_LOG_DEBUG("CreditScheduler: abandoning drain for flow %s (want=%u bytes) after %lld ms",
+                    TLLM_LOG_DEBUG("CreditScheduler: abandoning drain for flow {} (want={} bytes) after {} ms",
                         readable.c_str(), want, waitedMs);
                 }
                 st.blockedAtGrantSequence = mGrantSequence;

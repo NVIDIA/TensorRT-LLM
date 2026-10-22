@@ -904,13 +904,13 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
 
     auto result = cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: {}", cudaGetErrorString(result));
 
     ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>
         <<<grid, block, kSmemSize, stream>>>(shape_m, shape_n, shape_k, mat_a, mat_b, mat_d, scales_a, scales_b);
 
     result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: {}", cudaGetErrorString(result));
 }
 
 template <int TileM, int TileN, int NumStages>
@@ -953,7 +953,7 @@ void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride
 
     cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
     auto result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel cannot launch: {}", cudaGetErrorString(result));
 
     cudaLaunchConfig_t launch_config;
     cudaLaunchAttribute attrs[1];
@@ -970,7 +970,7 @@ void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride
     cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
 
     result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: {}", cudaGetErrorString(result));
 }
 
 void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
@@ -1146,7 +1146,7 @@ void grouped_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __n
 
     cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
     auto result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 moe gemm kernel cannot launch: %s", cudaGetErrorString(result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 moe gemm kernel cannot launch: {}", cudaGetErrorString(result));
 
     cudaLaunchConfig_t launch_config;
     cudaLaunchAttribute attrs[1];
@@ -1163,7 +1163,7 @@ void grouped_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __n
     cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
 
     result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 moe gemm kernel runtime error: %s", cudaGetErrorString(result));
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 moe gemm kernel runtime error: {}", cudaGetErrorString(result));
 }
 
 void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a,
@@ -1313,7 +1313,7 @@ void strided_batch_gemm_dispatch_sm89(__nv_fp8_e4m3* mat_a, int ld_a, int stride
         cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
         auto result = cudaGetLastError();
-        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: {}", cudaGetErrorString(result));
     }
     ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel><<<grid, block, kSmemSize, stream>>>(shape_m, shape_n,
         shape_k, mat_a, mat_b, mat_d, scales_a, scales_b, stride_a, stride_b, stride_d, stride_scales_a,

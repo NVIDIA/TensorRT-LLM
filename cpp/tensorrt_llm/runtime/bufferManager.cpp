@@ -175,10 +175,10 @@ void BufferManager::copy(IBuffer const& src, void* dst, MemoryType dstType) cons
 
 void BufferManager::copy(IBuffer const& src, IBuffer& dst) const
 {
-    TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(),
-        tc::fmtstr("Incompatible data types: %s != %s", src.getDataTypeName(), dst.getDataTypeName()));
-    TLLM_CHECK_WITH_INFO(src.getSizeInBytes() == dst.getSizeInBytes(),
-        tc::fmtstr("Incompatible buffer sizes: %lu != %lu", src.getSizeInBytes(), dst.getSizeInBytes()));
+    TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(), "Incompatible data types: {} != {}",
+        src.getDataTypeName(), dst.getDataTypeName());
+    TLLM_CHECK_WITH_INFO(src.getSizeInBytes() == dst.getSizeInBytes(), "Incompatible buffer sizes: {} != {}",
+        src.getSizeInBytes(), dst.getSizeInBytes());
     copy(src, dst.data(), dst.getMemoryType());
 }
 
@@ -236,7 +236,7 @@ std::size_t BufferManager::memoryPoolReserved() const
     if (!static_cast<bool>(mPool))
     {
         TLLM_LOG_TRACE(
-            "Operation '%s' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
+            "Operation '{}' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
         return 0;
     }
     mStream->synchronize();
@@ -248,7 +248,7 @@ std::size_t BufferManager::memoryPoolUsed() const
     if (!static_cast<bool>(mPool))
     {
         TLLM_LOG_TRACE(
-            "Operation '%s' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
+            "Operation '{}' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
         return 0;
     }
     mStream->synchronize();
@@ -260,7 +260,7 @@ std::size_t BufferManager::memoryPoolFree() const
     if (!static_cast<bool>(mPool))
     {
         TLLM_LOG_TRACE(
-            "Operation '%s' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
+            "Operation '{}' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
         return 0;
     }
     mStream->synchronize();
@@ -271,7 +271,7 @@ void BufferManager::memoryPoolTrimTo(std::size_t size)
 {
     if (!static_cast<bool>(mPool))
     {
-        TLLM_LOG_TRACE("Operation '%s' does not do anything on this system as it does not support memory pools.",
+        TLLM_LOG_TRACE("Operation '{}' does not do anything on this system as it does not support memory pools.",
             __PRETTY_FUNCTION__);
         return;
     }

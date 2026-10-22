@@ -1157,7 +1157,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     if (params.enable_rank_mask)
     {
         TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
+            "active_rank_mask must mark the local ep_rank ({}) as active", params.ep_rank);
     }
 
     // Prepare kernel pointers struct
@@ -1254,7 +1254,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             TLLM_CUDA_CHECK(cudaGetDevice(&deviceIdx));
             TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&maxOptinBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, deviceIdx));
             TLLM_CHECK_WITH_INFO(shared_bytes <= maxOptinBytes,
-                "MoE all-to-all CFT dispatch needs %d bytes of shared memory per block, above the %d byte maximum on "
+                "MoE all-to-all CFT dispatch needs {} bytes of shared memory per block, above the {} byte maximum on "
                 "this device. Reduce the per-token payload size or disable CFT counted writes.",
                 shared_bytes, maxOptinBytes);
         }
@@ -2053,7 +2053,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     if (params.enable_rank_mask)
     {
         TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
+            "active_rank_mask must mark the local ep_rank ({}) as active", params.ep_rank);
     }
 
     // ---- CFT combine path (one block per token). ----

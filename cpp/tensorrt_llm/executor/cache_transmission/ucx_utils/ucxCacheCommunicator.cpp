@@ -310,7 +310,7 @@ UcxConnectionManager::UcxConnectionManager()
             {
                 mRank = worldPg->getRank();
                 mWorldSize = worldPg->getSize();
-                TLLM_LOG_DEBUG(mRank, "UCX using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+                TLLM_LOG_DEBUG(mRank, "UCX using Torch process group - rank: {}, world size: {}", mRank, mWorldSize);
             }
             else
             {
@@ -333,7 +333,7 @@ UcxConnectionManager::UcxConnectionManager()
         catch (std::exception const& e)
         {
             std::string error = "Error creating worker and starting progress thread for rank " + std::string(e.what());
-            TLLM_THROW(error);
+            TLLM_THROW("{}", error);
         }
         auto workerAddressPtr = mWorkersPool.front()->getAddress();
         mWorkerAddress = workerAddressPtr->getString();
@@ -348,14 +348,14 @@ UcxConnectionManager::UcxConnectionManager()
 
             localIp = "[" + localIp + "]";
         }
-        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager localIp: %s", localIp.c_str());
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager localIp: {}", localIp.c_str());
         mZmqRepSocket.bind("tcp://" + localIp + ":*");
         mZmqRepEndpoint = mZmqRepSocket.get(zmq::sockopt::last_endpoint);
-        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: %s", mZmqRepEndpoint.c_str());
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: {}", mZmqRepEndpoint.c_str());
         auto parse_result = parse_zmq_endpoint(mZmqRepEndpoint);
         TLLM_CHECK_WITH_INFO(parse_result.has_value(), "Failed to parse ZMQ endpoint");
         auto [ip, port] = parse_result.value();
-        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager ip: %s, port: %d", ip.c_str(), port);
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager ip: {}, port: {}", ip.c_str(), port);
 
         SocketState socketState{static_cast<uint16_t>(port), ip};
         std::vector<executor::kv_cache::SocketState> socketStates(mWorldSize);
@@ -397,7 +397,7 @@ UcxConnectionManager::UcxConnectionManager()
                     su::VectorWrapBuf<char> strbuf(serBuffer);
                     std::istream is(&strbuf);
                     socketStates[i] = su::deserialize<executor::kv_cache::SocketState>(is);
-                    TLLM_LOG_DEBUG(mRank, " recv  socketStates[%d]: %s", i, socketStates[i].toString().c_str());
+                    TLLM_LOG_DEBUG(mRank, " recv  socketStates[{}]: {}", i, socketStates[i].toString().c_str());
                 }
             }
             else
@@ -421,12 +421,12 @@ UcxConnectionManager::UcxConnectionManager()
                     su::VectorWrapBuf<char> strbuf(serBuffer);
                     std::istream is(&strbuf);
                     socketStates[r] = su::deserialize<executor::kv_cache::SocketState>(is);
-                    TLLM_LOG_DEBUG(mRank, " recv socketStates[%d]: %s", r, socketStates[r].toString().c_str());
+                    TLLM_LOG_DEBUG(mRank, " recv socketStates[{}]: {}", r, socketStates[r].toString().c_str());
                 }
             }
         }
         mCommState = CommState(socketStates, mRank);
-        TLLM_LOG_DEBUG(mRank, " ***** UCX    mCommState: %s", mCommState.toString().c_str());
+        TLLM_LOG_DEBUG(mRank, " ***** UCX    mCommState: {}", mCommState.toString().c_str());
 
         mZmqRepThread = std::thread(
             [this]()
@@ -464,7 +464,7 @@ UcxConnectionManager::UcxConnectionManager()
                     }
                     else
                     {
-                        TLLM_THROW("Zmq recv unknown message: %s", recvMessage.c_str());
+                        TLLM_THROW("Zmq recv unknown message: {}", recvMessage.c_str());
                     }
                 }
             });
@@ -472,7 +472,7 @@ UcxConnectionManager::UcxConnectionManager()
     catch (std::exception const& e)
     {
         std::string error = std::string("Error in UcxConnectionManager initialization for rank ") + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 
@@ -534,7 +534,7 @@ void UcxConnectionManager::addConnection(std::string const& workerAddress)
     catch (std::exception const& e)
     {
         std::string error = "Error in addConnection(connRequest) for rank " + std::to_string(mRank) + ": " + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 
@@ -600,7 +600,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     {
         std::string error = "Error in addConnection(ip) for rank " + std::to_string(mRank) + " ip: " + ip
             + " port: " + std::to_string(port) + ": " + e.what();
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 
@@ -648,18 +648,18 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         = *reinterpret_cast<UcxConnection::ConnectionIdType*>(state->mBuffer.data() + size);
     std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
     TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
-        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
+        "connectionFuture not found In recvConnect connectionId : {} , worldRank: {}", connectionId, mRank);
     if (mConnectionFutures.at(connectionId).valid())
     {
         // wait for the connection to be created
         mConnectionFutures.at(connectionId).get();
     }
     TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
-        "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId, mRank);
+        "Connection not found In recvConnect connectionId: {} , worldRank: {}", connectionId, mRank);
 
     TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
 
-    TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
+    TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: {} , sendIDData:{}", connectionId,
         *reinterpret_cast<uint64_t*>(state->mBuffer.data()));
 
     return mConnections[connectionId].get();
@@ -714,7 +714,7 @@ std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> makeUcxConn
     catch (std::exception const& e)
     {
         std::string error = "Error in makeUcxConnectionManager: " + std::string(e.what());
-        TLLM_THROW(error);
+        TLLM_THROW("{}", error);
     }
 }
 

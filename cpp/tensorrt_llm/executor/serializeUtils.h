@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -380,7 +380,7 @@ T deserializeVariantByIndex(std::istream& is, std::size_t index, std::index_sequ
     bool found = ((Is == index ? (result = deserialize<std::variant_alternative_t<Is, T>>(is), true) : false) || ...);
     if (!found)
     {
-        TLLM_THROW("Invalid variant index during deserialization: " + std::to_string(index));
+        TLLM_THROW("Invalid variant index during deserialization: {}", index);
     }
     return result;
 }

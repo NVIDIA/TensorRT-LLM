@@ -462,7 +462,7 @@ protected:
             if (!almostEqual(e, o, 1e-3, 1e-3))
             {
                 TLLM_LOG_ERROR(
-                    "Mismatch input value. Position of inputs: %d, expected value: %f, output value: %f", i, e, o);
+                    "Mismatch input value. Position of inputs: {}, expected value: {:f}, output value: {:f}", i, e, o);
                 return false;
             }
         }

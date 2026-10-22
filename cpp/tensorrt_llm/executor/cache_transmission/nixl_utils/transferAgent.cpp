@@ -154,7 +154,7 @@ void NixlTransferAgent::maybeInitBounce(
         if (!bounceParams.empty())
         {
             TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
+                "NixlTransferAgent({}): agent_bounce_params set but the bounce arena size is 0 "
                 "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
                 "disabled and the params are ignored",
                 mName.c_str());
@@ -168,7 +168,7 @@ void NixlTransferAgent::maybeInitBounce(
     // applies a second clamp to the buddy allocator's smaller usable capacity when necessary.
     if (cfg.maxChunkSizeBytes > cfg.arenaSizeBytes)
     {
-        TLLM_LOG_WARNING("NixlTransferAgent(%s): maxChunkSizeBytes (%zu) > arenaSizeBytes (%zu) -> clamping to arena",
+        TLLM_LOG_WARNING("NixlTransferAgent({}): maxChunkSizeBytes ({}) > arenaSizeBytes ({}) -> clamping to arena",
             mName.c_str(), cfg.maxChunkSizeBytes, cfg.arenaSizeBytes);
         cfg.maxChunkSizeBytes = cfg.arenaSizeBytes;
     }
@@ -177,7 +177,7 @@ void NixlTransferAgent::maybeInitBounce(
     if (cfg.maxChunkSizeBytes > std::numeric_limits<std::uint32_t>::max())
     {
         TLLM_LOG_WARNING(
-            "NixlTransferAgent(%s): maxChunkSizeBytes (%zu) > 4 GiB -> clamping "
+            "NixlTransferAgent({}): maxChunkSizeBytes ({}) > 4 GiB -> clamping "
             "(chunk size is 32-bit)",
             mName.c_str(), cfg.maxChunkSizeBytes);
         cfg.maxChunkSizeBytes = std::numeric_limits<std::uint32_t>::max();
@@ -194,7 +194,7 @@ void NixlTransferAgent::maybeInitBounce(
             // Don't silently bind the arena/exec to device 0 on a multi-GPU host — warn and clear the
             // sticky error; the enclosing try still proceeds (best-effort) with dev=0.
             (void) cudaGetLastError();
-            TLLM_LOG_WARNING("NixlTransferAgent(%s): cudaGetDevice failed; bounce assuming device 0", mName.c_str());
+            TLLM_LOG_WARNING("NixlTransferAgent({}): cudaGetDevice failed; bounce assuming device 0", mName.c_str());
         }
         auto st = std::make_unique<bounce::NixlBounceState>();
         st->cfg = cfg;
@@ -225,7 +225,7 @@ void NixlTransferAgent::maybeInitBounce(
             // Arena couldn't be NIXL-registered -> bounce can't move data. Leave mBounce null so the
             // agent falls back transparently to the standard per-desc NIXL path (no partial enable).
             TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): bounce arena registerMem failed -> bounce disabled "
+                "NixlTransferAgent({}): bounce arena registerMem failed -> bounce disabled "
                 "(NIXL fallback)",
                 mName.c_str());
             return;
@@ -238,12 +238,12 @@ void NixlTransferAgent::maybeInitBounce(
         // chunk cap is printed as the transport's EFFECTIVE value (after its clamp to the usable arena
         // capacity — the one advertised in the handshake) next to the configured one.
         TLLM_LOG_INFO(
-            "NixlTransferAgent(%s): bounce v2 enabled (arenaSizeBytes=%zu arenaAllocationGranularityBytes=%zu "
-            "maxChunkSizeBytes(effective)=%zu (before the buddy usable-capacity clamp: %zu) "
-            "maxInflightChunksPerRequest=%u "
-            "copyStreamCount=%u scatterWorkerCount=%u minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu "
-            "requestTimeoutMs=%d receiverFlowTimeoutMs=%d quarantineMs=%d disableFabricMemory=%d "
-            "enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
+            "NixlTransferAgent({}): bounce v2 enabled (arenaSizeBytes={} arenaAllocationGranularityBytes={} "
+            "maxChunkSizeBytes(effective)={} (before the buddy usable-capacity clamp: {}) "
+            "maxInflightChunksPerRequest={} "
+            "copyStreamCount={} scatterWorkerCount={} minDescriptorCount={} maxAverageDescriptorSizeBytes={} "
+            "requestTimeoutMs={} receiverFlowTimeoutMs={} quarantineMs={} disableFabricMemory={} "
+            "enableEagerGather={} useZeroCopyArguments={} control={})",
             mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, st->transport->maxChunkSizeBytes(),
             cfg.maxChunkSizeBytes, static_cast<unsigned>(cfg.maxInflightChunksPerRequest),
             static_cast<unsigned>(cfg.copyStreamCount), static_cast<unsigned>(cfg.scatterWorkerCount),
@@ -254,7 +254,7 @@ void NixlTransferAgent::maybeInitBounce(
         {
             // Make "enabled but nothing routed" visible once; the per-rejection log stays DEBUG-only.
             TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): bounce gate disabled by max_average_descriptor_size=0: no outbound write "
+                "NixlTransferAgent({}): bounce gate disabled by max_average_descriptor_size=0: no outbound write "
                 "will use bounce; arena/handshake still active",
                 mName.c_str());
         }
@@ -263,7 +263,7 @@ void NixlTransferAgent::maybeInitBounce(
     catch (std::exception const& e)
     {
         mBounce.reset();
-        TLLM_LOG_WARNING("NixlTransferAgent(%s): bounce init failed (%s) -> bounce disabled (NIXL fallback)",
+        TLLM_LOG_WARNING("NixlTransferAgent({}): bounce init failed ({}) -> bounce disabled (NIXL fallback)",
             mName.c_str(), e.what());
     }
 }
@@ -370,8 +370,8 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
         if (tunable)
         {
             TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): bounce declined a write to %s (reason=%s, descs=%zu, avgDescBytes=%llu; gate: "
-                "min_descriptor_count=%zu, max_average_descriptor_size=%zu) -> standard NIXL path. Further rejections "
+                "NixlTransferAgent({}): bounce declined a write to {} (reason={}, descs={}, avgDescBytes={}; gate: "
+                "min_descriptor_count={}, max_average_descriptor_size={}) -> standard NIXL path. Further rejections "
                 "for this reason are logged at DEBUG; tune agent_bounce_params min_descriptor_count / "
                 "max_average_descriptor_size if bounce was expected to engage",
                 mName.c_str(), request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size(),
@@ -381,8 +381,8 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
         else
         {
             TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): bounce declined a write to %s (reason=%s, descs=%zu, "
-                "avgDescBytes=%llu) -> standard NIXL path. Further rejections for this reason are "
+                "NixlTransferAgent({}): bounce declined a write to {} (reason={}, descs={}, "
+                "avgDescBytes={}) -> standard NIXL path. Further rejections for this reason are "
                 "logged at DEBUG",
                 mName.c_str(), request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size(),
                 static_cast<unsigned long long>(avg));
@@ -390,7 +390,7 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     }
     else
     {
-        TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce declined request to %s (reason=%s, descs=%zu)", mName.c_str(),
+        TLLM_LOG_DEBUG("NixlTransferAgent({}): bounce declined request to {} (reason={}, descs={})", mName.c_str(),
             request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size());
     }
     return false;
@@ -417,7 +417,7 @@ void NixlTransferAgent::maybeInitBounce(
     if (!bounceParams.empty())
     {
         TLLM_LOG_WARNING(
-            "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
+            "NixlTransferAgent({}): agent_bounce_params set but the bounce arena size is 0 "
             "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
             "disabled and the params are ignored",
             mName.c_str());
@@ -488,13 +488,13 @@ public:
         fd_ = open(lockFile_.c_str(), O_CREAT | O_WRONLY, 0644);
         if (fd_ == -1)
         {
-            TLLM_LOG_ERROR("Failed to open lock file: %s", lockFile_.c_str());
+            TLLM_LOG_ERROR("Failed to open lock file: {}", lockFile_.c_str());
             return false;
         }
 
         if (flock(fd_, LOCK_EX) == -1)
         {
-            TLLM_LOG_ERROR("Failed to acquire file lock: %s", lockFile_.c_str());
+            TLLM_LOG_ERROR("Failed to acquire file lock: {}", lockFile_.c_str());
             close(fd_);
             fd_ = -1;
             return false;
@@ -633,10 +633,10 @@ void NixlHelper::posixGpuToFileFallback(MemoryDescs const& memoryDescs, FileDesc
 
         cudaError_t cpyErr = cudaMemcpy(
             hostBuffer.data(), reinterpret_cast<void*>(memDesc.getAddr()), numBytes, cudaMemcpyDeviceToHost);
-        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error={}", cpyErr);
 
         ssize_t written = ::write(fileDesc.getFd(), hostBuffer.data(), numBytes);
-        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error={}", written);
     }
 }
 
@@ -655,11 +655,11 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
         std::vector<uint8_t> hostBuffer(numBytes);
 
         ssize_t bytesRead = ::read(fileDesc.getFd(), hostBuffer.data(), numBytes);
-        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error=%zd", bytesRead);
+        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error={}", bytesRead);
 
         cudaError_t cpyErr = cudaMemcpy(
             reinterpret_cast<void*>(memDesc.getAddr()), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
-        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error={}", cpyErr);
     }
 }
 
@@ -684,7 +684,7 @@ NixlTransferStatus::~NixlTransferStatus() noexcept
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw: %s", e.what());
+        TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw: {}", e.what());
     }
     catch (...)
     {
@@ -796,7 +796,7 @@ nixl_status_t NixlTransferStatus::queryStatus() const
         return true;
     }
 
-    TLLM_LOG_WARNING("NIXL releaseXferReq failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    TLLM_LOG_WARNING("NIXL releaseXferReq failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
     return false;
 }
 
@@ -811,9 +811,9 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     {
         mRank = config.rank.value();
         mWorldSize = config.worldSize.value();
-        TLLM_CHECK_WITH_INFO(mWorldSize > 0, "NIXL world size must be positive, got %d", mWorldSize);
+        TLLM_CHECK_WITH_INFO(mWorldSize > 0, "NIXL world size must be positive, got {}", mWorldSize);
         TLLM_CHECK_WITH_INFO(
-            mRank >= 0 && mRank < mWorldSize, "NIXL rank must be in [0, %d), got %d", mWorldSize, mRank);
+            mRank >= 0 && mRank < mWorldSize, "NIXL rank must be in [0, {}), got {}", mWorldSize, mRank);
     }
     else if (config.useListenThread && mpiEnabled)
     {
@@ -866,11 +866,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
     {
-        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
+        TLLM_LOG_WARNING("Unsupported NIXL backend: {}, fallback to UCX", nixlBackend.c_str());
         nixlBackend = "UCX";
     }
 
-    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());
+    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: {}", nixlBackend.c_str());
 
     // Get default plugin params first, then override with user-provided backendParams
     // NOTE: getPluginParams overwrites init1, so we must call it BEFORE setting user params
@@ -883,16 +883,16 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     for (auto const& [key, value] : config.backendParams)
     {
         init1[key] = value;
-        TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: %s: %s", key.c_str(), value.c_str());
+        TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: {}: {}", key.c_str(), value.c_str());
     }
 
     status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)
     {
-        TLLM_THROW("Failed to create NIXL backend: %s", nixlBackend.c_str());
+        TLLM_THROW("Failed to create NIXL backend: {}", nixlBackend.c_str());
     }
     mExtraParams.backends.push_back(mRawBackend);
-    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
+    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: {}", mAddress.c_str());
 
     // Bring up bounce v2 now, if enabled, so its shared arena is registered before any peer fetches
     // our metadata. This is a no-op when bounce is disabled or not built.
@@ -951,7 +951,7 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
-        name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+        name == remoteName, "loadRemoteAgent gets error agent name: {} != {}", name.c_str(), remoteName.c_str());
 #ifdef TLLM_BOUNCE_V2
     // Validate the peer's bounce capability handshake from AgentDesc and register its control
     // channel. Only peers with the same wire version, control kind, effective maxChunkSizeBytes and
@@ -1046,7 +1046,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         // Debug-level so it's silent by default but lets ops confirm the bounce fast path actually
         // engaged for a given write (enable via TLLM_LOG_LEVEL_BY_MODULE "debug:executor").
         // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.
-        TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce path engaged for write to %s (%zu descs)", mName.c_str(),
+        TLLM_LOG_DEBUG("NixlTransferAgent({}): bounce path engaged for write to {} ({} descs)", mName.c_str(),
             request.getRemoteName().c_str(), request.getSrcDescs().getDescs().size());
         auto fut = mBounce->transport->submit(request.getSrcDescs(), request.getDstDescs(), request.getRemoteName());
         return std::make_unique<BounceTransferStatus>(std::move(fut));
@@ -1070,7 +1070,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
     auto status = postXferRequest(request.getOp(), xferSrc, xferDst, request.getRemoteName(), request.getSyncMessage());
     TLLM_CHECK_WITH_INFO(status != nullptr,
-        " rank: %d createXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
+        " rank: {} createXferReq failed (see warning above) selfname: {} remoteAgent name: {}", mRank, mName.c_str(),
         request.getRemoteName().c_str());
     return status;
 }
@@ -1103,7 +1103,7 @@ std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op
     }
     if (status != NIXL_SUCCESS)
     {
-        TLLM_LOG_WARNING("NixlTransferAgent(%s): createXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+        TLLM_LOG_WARNING("NixlTransferAgent({}): createXferReq to {} failed: {}", mName.c_str(), remoteName.c_str(),
             nixlEnumStrings::statusStr(status).c_str());
         if (handle != nullptr)
         {
@@ -1117,7 +1117,7 @@ std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op
     }
     if (status != NIXL_SUCCESS && status != NIXL_IN_PROG)
     {
-        TLLM_LOG_WARNING("NixlTransferAgent(%s): postXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+        TLLM_LOG_WARNING("NixlTransferAgent({}): postXferReq to {} failed: {}", mName.c_str(), remoteName.c_str(),
             nixlEnumStrings::statusStr(status).c_str());
         // The status object still owns the handle; its release()/dtor retries the backend release.
     }
@@ -1132,7 +1132,7 @@ bool NixlTransferAgent::registerRegionImpl(void* base, std::size_t bytes, int de
     if (st != NIXL_SUCCESS)
     {
         TLLM_LOG_WARNING(
-            "NixlTransferAgent(%s): registerMem failed: %s", mName.c_str(), nixlEnumStrings::statusStr(st).c_str());
+            "NixlTransferAgent({}): registerMem failed: {}", mName.c_str(), nixlEnumStrings::statusStr(st).c_str());
         return false;
     }
     return true;
@@ -1147,13 +1147,13 @@ void NixlTransferAgent::deregisterRegionImpl(void* base, std::size_t bytes, int 
         nixl_status_t const st = mRawAgent->deregisterMem(list);
         if (st != NIXL_SUCCESS)
         {
-            TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem failed: %s", mName.c_str(),
+            TLLM_LOG_WARNING("NixlTransferAgent({}): deregisterMem failed: {}", mName.c_str(),
                 nixlEnumStrings::statusStr(st).c_str());
         }
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem threw: %s", mName.c_str(), e.what());
+        TLLM_LOG_WARNING("NixlTransferAgent({}): deregisterMem threw: {}", mName.c_str(), e.what());
     }
 }
 
@@ -1163,7 +1163,7 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::notifySyncMessage called after shutdown");
     auto status = mRawAgent->genNotif(name, syncMessage);
     TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        status == NIXL_SUCCESS, "genNotif failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()
@@ -1173,7 +1173,7 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     nixl_notifs_t notifs;
     auto status = mRawAgent->getNotifs(notifs);
     TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "getNotifs failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        status == NIXL_SUCCESS, "getNotifs failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
 
     return notifs;
 }
@@ -1192,23 +1192,23 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
     // Bounce bootstrap is handled on the AgentDesc overload, which is the production path.
     auto const separator = connectionInfo.rfind(':');
     TLLM_CHECK_WITH_INFO(separator != std::string::npos,
-        "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': %s", connectionInfo.c_str());
+        "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': {}", connectionInfo.c_str());
     std::string ip = connectionInfo.substr(0, separator);
     std::string port = connectionInfo.substr(separator + 1);
     if (ip.size() >= 2 && ip.front() == '[' && ip.back() == ']')
     {
         ip = ip.substr(1, ip.size() - 2);
     }
-    TLLM_LOG_DEBUG(mRank, "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s",
+    TLLM_LOG_DEBUG(mRank, "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to {} remoteagent name: {}",
         connectionInfo.c_str(), name.c_str());
-    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
+    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: {}",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
     md_extra_params.ipAddr = ip;
     md_extra_params.port = std::stoi(port);
     auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
     TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
     // status = mRawAgent->sendLocalMD(&md_extra_params);
     // TLLM_CHECK_WITH_INFO(
     //     status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
@@ -1219,14 +1219,14 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
     {
         status = mRawAgent->checkRemoteMD(name, descs);
         TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND,
-            "checkRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+            "checkRemoteMD failed with status: {}", nixlEnumStrings::statusStr(status).c_str());
         if (status == NIXL_ERR_NOT_FOUND)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     TLLM_LOG_DEBUG(mRank,
-        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s success status: %s",
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to {} remoteagent name: {} success status: {}",
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
 
@@ -1235,7 +1235,7 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::checkRemoteDescs called after shutdown");
     auto status = mRawAgent->checkRemoteMD(name, NixlHelper::convertXferDist(memoryDescs));
-    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: %s",
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: {}",
         nixlEnumStrings::statusStr(status).c_str());
     return status == NIXL_SUCCESS;
 }
@@ -1274,7 +1274,7 @@ void NixlTransferAgent::shutdown() noexcept
             catch (std::exception const& e)
             {
                 TLLM_LOG_WARNING(
-                    "NixlTransferAgent::shutdown: invalidateRemoteMD(%s) threw: %s", name.c_str(), e.what());
+                    "NixlTransferAgent::shutdown: invalidateRemoteMD({}) threw: {}", name.c_str(), e.what());
             }
             catch (...)
             {
@@ -1290,7 +1290,7 @@ void NixlTransferAgent::shutdown() noexcept
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw: %s", e.what());
+        TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw: {}", e.what());
     }
     catch (...)
     {
@@ -1323,13 +1323,13 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
     {
         status = mRawAgent->createBackend("GDS_MT", init, backend);
         if (status != NIXL_SUCCESS || !backend)
-            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = %d", status);
+            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = {}", status);
     }
     else
     {
         status = mRawAgent->createBackend("GDS", init, backend);
         if (status != NIXL_SUCCESS || !backend)
-            TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
+            TLLM_THROW("Failed to create NIXL GDS backend, status = {}", status);
     }
 }
 
@@ -1347,7 +1347,7 @@ void NixlLoopbackAgent::shutdown() noexcept
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_WARNING("NixlLoopbackAgent::shutdown: ~nixlAgent threw: %s", e.what());
+        TLLM_LOG_WARNING("NixlLoopbackAgent::shutdown: ~nixlAgent threw: {}", e.what());
     }
     catch (...)
     {

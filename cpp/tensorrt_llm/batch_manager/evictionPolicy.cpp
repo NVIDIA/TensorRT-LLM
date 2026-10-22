@@ -121,20 +121,20 @@ bool LRUEvictionPolicy::verifyQueueIntegrity() const
                 bool const valid = levelValidators[queueLevel](block);
                 if (!valid)
                 {
-                    TLLM_LOG_WARNING("Block (id %d) has level=%s, but misplaced at queueLevel %s", block->getBlockId(),
+                    TLLM_LOG_WARNING("Block (id {}) has level={}, but misplaced at queueLevel {}", block->getBlockId(),
                         levelToStr[queueLevel], levelToStr[queueLevel]);
                     queueCompromised = true;
                 }
                 if (block->hasRefs())
                 {
-                    TLLM_LOG_WARNING("Found block (id %d) with references at queueLevel %s", block->getBlockId(),
+                    TLLM_LOG_WARNING("Found block (id {}) with references at queueLevel {}", block->getBlockId(),
                         levelToStr[queueLevel]);
                     queueCompromised = true;
                 }
             }
         }
     }
-    TLLM_LOG_DEBUG("LRUEvictionPolicy queues are %s", queueCompromised ? "compromised" : "not compromised");
+    TLLM_LOG_DEBUG("LRUEvictionPolicy queues are {}", queueCompromised ? "compromised" : "not compromised");
     return !queueCompromised;
 }
 

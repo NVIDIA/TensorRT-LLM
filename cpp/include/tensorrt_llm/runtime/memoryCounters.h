@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -115,7 +115,7 @@ public:
         }
         else
         {
-            TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
+            TLLM_THROW("Unknown memory type: {}", MemoryTypeString<T>::value);
         }
     }
 
@@ -152,7 +152,7 @@ public:
         }
         else
         {
-            TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
+            TLLM_THROW("Unknown memory type: {}", MemoryTypeString<T>::value);
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ c10::intrusive_ptr<c10d::ProcessGroup> get_local_pg()
 void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
     c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_local)
 {
-    TLLM_LOG_DEBUG(process_group_world->getRank(), "Init process group on rank %d", process_group_world->getRank());
+    TLLM_LOG_DEBUG(process_group_world->getRank(), "Init process group on rank {}", process_group_world->getRank());
     pg_world = process_group_world;
     pg_local = process_group_local;
 }

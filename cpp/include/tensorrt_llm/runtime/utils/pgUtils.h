@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <source_location>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/torch.h>
 #include <vector>
@@ -31,12 +32,12 @@
 
 // Check async op.
 inline c10::intrusive_ptr<c10d::Work> pgCheckHelper(
-    c10::intrusive_ptr<c10d::Work> work, char const* const file, int const line, char const* info)
+    c10::intrusive_ptr<c10d::Work> work, std::source_location const& location, char const* info)
 {
     if (work == nullptr)
     {
-        auto const msg = std::string("[TensorRT-LLM][ERROR] empty work returned from: ") + info;
-        tensorrt_llm::common::throwRuntimeError(file, line, msg);
+        auto const msg = std::format("[TensorRT-LLM][ERROR] empty work returned from: {}", info);
+        tensorrt_llm::common::throwRuntimeError(location, msg);
     }
 
     try
@@ -45,24 +46,24 @@ inline c10::intrusive_ptr<c10d::Work> pgCheckHelper(
     }
     catch (...)
     {
-        auto msg = std::string("[TensorRT-LLM][ERROR] Torch distributed operation error: ") + info;
-        std::throw_with_nested(tensorrt_llm::common::TllmException(file, line, msg.c_str()));
+        auto msg = std::format("[TensorRT-LLM][ERROR] Torch distributed operation error: {}", info);
+        std::throw_with_nested(tensorrt_llm::common::TllmException(location, msg));
     }
 
     return work;
 }
 
 // Check sync op.
-inline void pgCheckHelper(bool success, char const* const file, int const line, char const* info)
+inline void pgCheckHelper(bool success, std::source_location const& location, char const* info)
 {
     if (!success)
     {
-        throw std::runtime_error(std::string("[TensorRT-LLM][ERROR] Torch distributed operation error: ") + info);
+        throw std::runtime_error(std::format("[TensorRT-LLM][ERROR] Torch distributed operation error: {}", info));
     }
 }
 
-#define PGCHECK_THROW(op) pgCheckHelper(op, __FILE__, __LINE__, #op)
-#define PGCHECK_THROW_WITH_INFO(op, info) pgCheckHelper(op, __FILE__, __LINE__, info)
+#define PGCHECK_THROW(op) pgCheckHelper(op, std::source_location::current(), #op)
+#define PGCHECK_THROW_WITH_INFO(op, info) pgCheckHelper(op, std::source_location::current(), info)
 
 inline bool useMPI()
 {

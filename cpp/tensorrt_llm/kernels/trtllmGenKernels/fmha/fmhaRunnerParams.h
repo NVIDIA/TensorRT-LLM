@@ -406,7 +406,7 @@ struct TllmGenFmhaRunnerParams
             mMaskType = TrtllmGenAttentionMaskType::Custom;
             break;
         default:
-            TLLM_THROW("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
+            TLLM_THROW("ContextAttentionMaskType {} cannot be mapped to TrtllmGenAttentionMaskType",
                 static_cast<int>(maskType));
         }
         return *this;

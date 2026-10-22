@@ -41,7 +41,7 @@ BounceArena::BounceArena(std::size_t bytes, int deviceId, bool allowFabric)
     {
         mFabric = std::make_unique<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory>(bytes);
         mBase = mFabric->getPtr();
-        TLLM_LOG_DEBUG("BounceArena: %zuB backed by fabric memory", bytes);
+        TLLM_LOG_DEBUG("BounceArena: {}B backed by fabric memory", bytes);
     }
     else
     {

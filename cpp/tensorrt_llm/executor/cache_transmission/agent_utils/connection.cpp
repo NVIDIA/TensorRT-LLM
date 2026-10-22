@@ -106,7 +106,7 @@ void validateConnectionIdx(
     int connectionIdx, TargetRanksInfo const& targetInfo, char const* bufferKind, std::string const& remoteAgentName)
 {
     TLLM_CHECK_WITH_INFO(static_cast<size_t>(connectionIdx) < targetInfo.mIRanks.size(),
-        "AgentConnectionManager received %s connection index %d outside target rank count %zu from agent '%s'",
+        "AgentConnectionManager received {} connection index {} outside target rank count {} from agent '{}'",
         bufferKind, connectionIdx, targetInfo.mIRanks.size(), remoteAgentName.c_str());
 }
 
@@ -186,7 +186,7 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         "AgentConnection::send destination address overflow");
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
-        "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
+        "send dstDesc: {:#x}, size: {} ,validSegmentIdx: {}", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
     TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName};
     auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
@@ -212,9 +212,9 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
             {
                 bool const released = status->release();
                 TLLM_LOG_WARNING(
-                    "AgentConnection::send cancelled while transfer was in progress (ctx tag=%d, remote=%s, "
-                    "releaseAccepted=%d)",
-                    ctx.getTag(), mRemoteAgentName.c_str(), released);
+                    "AgentConnection::send cancelled while transfer was in progress (ctx tag={}, remote={}, "
+                    "releaseAccepted={})",
+                    ctx.getTag(), mRemoteAgentName.c_str(), static_cast<int>(released));
                 TLLM_CHECK_WITH_INFO(
                     released, "AgentConnection::send cancel could not release the backend transfer handle");
                 TLLM_THROW("AgentConnection::send cancelled mid-transfer");
@@ -226,9 +226,9 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     {
         bool const released = status->release();
         TLLM_LOG_WARNING(
-            "AgentConnection::send cancelled after transfer completed but before notify (ctx tag=%d, remote=%s, "
-            "releaseAccepted=%d)",
-            ctx.getTag(), mRemoteAgentName.c_str(), released);
+            "AgentConnection::send cancelled after transfer completed but before notify (ctx tag={}, remote={}, "
+            "releaseAccepted={})",
+            ctx.getTag(), mRemoteAgentName.c_str(), static_cast<int>(released));
         TLLM_CHECK_WITH_INFO(
             released, "AgentConnection::send pre-notify cancel could not release the backend transfer handle");
         TLLM_THROW("AgentConnection::send cancelled pre-notify");
@@ -246,7 +246,7 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
     if (common::getEnvDisaggEnableInflightCancel())
     {
         TLLM_CHECK_WITH_INFO(received,
-            "AgentConnection::recv ended before receiving sync notification (ctx tag=%d, remote=%s)", ctx.getTag(),
+            "AgentConnection::recv ended before receiving sync notification (ctx tag={}, remote={})", ctx.getTag(),
             mRemoteAgentName.c_str());
     }
 }
@@ -409,7 +409,7 @@ AgentConnectionManager::AgentConnectionManager(
             mRank = worldPg->getRank();
             mWorldSize = worldPg->getSize();
             TLLM_LOG_DEBUG(
-                mRank, "Cache transceiver using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+                mRank, "Cache transceiver using Torch process group - rank: {}, world size: {}", mRank, mWorldSize);
         }
         else
         {
@@ -483,7 +483,7 @@ AgentConnectionManager::AgentConnectionManager(
                 su::VectorWrapBuf<char> strbuf(serBuffer);
                 std::istream is(&strbuf);
                 agentStates[r] = su::deserialize<executor::kv_cache::AgentState>(is);
-                TLLM_LOG_DEBUG(mRank, " recv agentStates[%d]: %s", r, agentStates[r].toString().c_str());
+                TLLM_LOG_DEBUG(mRank, " recv agentStates[{}]: {}", r, agentStates[r].toString().c_str());
             }
         }
         else
@@ -504,7 +504,7 @@ AgentConnectionManager::AgentConnectionManager(
                 su::VectorWrapBuf<char> strbuf(serBuffer);
                 std::istream is(&strbuf);
                 agentStates[r] = su::deserialize<executor::kv_cache::AgentState>(is);
-                TLLM_LOG_DEBUG(mRank, " recv agentStates[%d]: %s", r, agentStates[r].toString().c_str());
+                TLLM_LOG_DEBUG(mRank, " recv agentStates[{}]: {}", r, agentStates[r].toString().c_str());
             }
         }
     }
@@ -514,7 +514,7 @@ AgentConnectionManager::AgentConnectionManager(
     }
     mCommState = CommState(agentStates, mRank);
     TLLM_LOG_DEBUG(
-        mRank, " ***** AgentConnectionManager::AgentConnectionManager mCommState: %s", mCommState.toString().c_str());
+        mRank, " ***** AgentConnectionManager::AgentConnectionManager mCommState: {}", mCommState.toString().c_str());
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
@@ -552,13 +552,13 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto const& bufferKindsRef = requestAndBufferInfo.mBufferKinds;
 
                     TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
-                        "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
+                        "AgentConnectionManager received RequestAndBufferInfo from '{}' with embedded agent '{}'",
                         agent.c_str(), remoteAgentName.c_str());
                     auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
                     if (expectedAgentState != nullptr)
                     {
                         TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
-                            "AgentConnectionManager received mismatched connection info for agent '%s'",
+                            "AgentConnectionManager received mismatched connection info for agent '{}'",
                             remoteAgentName.c_str());
                     }
                     else
@@ -566,25 +566,25 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
                         auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
                         TLLM_CHECK_WITH_INFO(inserted || remoteInfoIt->second == address,
-                            "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
+                            "AgentConnectionManager received mismatched connection info for dynamic agent '{}'",
                             remoteAgentName.c_str());
                     }
                     TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
-                        "AgentConnectionManager received negative connection index for agent '%s'",
+                        "AgentConnectionManager received negative connection index for agent '{}'",
                         remoteAgentName.c_str());
                     TLLM_CHECK_WITH_INFO(!bufferDescsRef.empty(),
-                        "AgentConnectionManager received empty destination descriptors from agent '%s'",
+                        "AgentConnectionManager received empty destination descriptors from agent '{}'",
                         remoteAgentName.c_str());
                     TLLM_CHECK_WITH_INFO(bufferDescsRef.size() == bufferKindsRef.size(),
-                        "AgentConnectionManager received %zu descriptors but %zu buffer kinds from agent '%s'",
+                        "AgentConnectionManager received {} descriptors but {} buffer kinds from agent '{}'",
                         bufferDescsRef.size(), bufferKindsRef.size(), remoteAgentName.c_str());
                     TLLM_CHECK_WITH_INFO(bufferDescsRef.size() <= mCacheTransBufferManagers.size(),
-                        "AgentConnectionManager received too many destination descriptors from agent '%s'",
+                        "AgentConnectionManager received too many destination descriptors from agent '{}'",
                         remoteAgentName.c_str());
                     for (auto const kind : bufferKindsRef)
                     {
                         TLLM_CHECK_WITH_INFO(isValidBufferKind(kind),
-                            "AgentConnectionManager received invalid buffer kind %u from agent '%s'",
+                            "AgentConnectionManager received invalid buffer kind {} from agent '{}'",
                             static_cast<unsigned>(kind), remoteAgentName.c_str());
                         bool isConfiguredKind = false;
                         for (auto const configuredKind : mBufferKinds)
@@ -596,21 +596,21 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                             }
                         }
                         TLLM_CHECK_WITH_INFO(isConfiguredKind,
-                            "AgentConnectionManager received unconfigured buffer kind %u from agent '%s'",
+                            "AgentConnectionManager received unconfigured buffer kind {} from agent '{}'",
                             static_cast<unsigned>(kind), remoteAgentName.c_str());
                     }
                     TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCacheState().has_value(),
-                        "AgentConnectionManager received request without cache state from agent '%s'",
+                        "AgentConnectionManager received request without cache state from agent '{}'",
                         remoteAgentName.c_str());
                     TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCommState().has_value(),
-                        "AgentConnectionManager received request without comm state from agent '%s'",
+                        "AgentConnectionManager received request without comm state from agent '{}'",
                         remoteAgentName.c_str());
 
-                    TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
+                    TLLM_LOG_DEBUG(" recv Address:{}", address.c_str());
                     auto connection = connect(remoteAgentName, address, metadataOpt, true);
                     TLLM_CHECK_WITH_INFO(
                         m_Agent->checkRemoteDescs(remoteAgentName, MemoryDescs{MemoryType::kVRAM, bufferDescsRef}),
-                        "AgentConnectionManager received unregistered destination descriptors from agent '%s'",
+                        "AgentConnectionManager received unregistered destination descriptors from agent '{}'",
                         remoteAgentName.c_str());
                     auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
                     auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
@@ -752,7 +752,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     std::optional<std::string> metadata, bool isSender)
 {
 
-    TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
+    TLLM_LOG_DEBUG(mRank, "mAgentName: {} connect to {}", mAgentName.c_str(), remoteAgentName.c_str());
     std::scoped_lock lock(mConnectionsMutex);
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
@@ -778,7 +778,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     {
         if (metadata.has_value())
         {
-            TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
+            TLLM_LOG_DEBUG(mRank, "mAgentName: {} connect to {} with loadRemoteAgent", mAgentName.c_str(),
                 remoteAgentName.c_str());
             m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
             hasLoadRemoteAgent = true;
@@ -786,7 +786,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
         else
         {
             TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call loadRemoteAgent");
-            TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
+            TLLM_LOG_DEBUG(mRank, "mAgentName: {} connect to {} with loadRemoteAgent", mAgentName.c_str(),
                 remoteAgentName.c_str());
             m_Agent->loadRemoteAgent(remoteAgentName, connectionInfo);
         }

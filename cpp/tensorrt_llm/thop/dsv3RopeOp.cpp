@@ -192,7 +192,7 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
     TLLM_CHECK_WITH_INFO(residual_dim >= 0 && residual_dim <= qk_rope_head_dim && residual_dim % 16 == 0,
-        "MLA KV residual_dim must be a multiple of 16 in [0, qk_rope_head_dim], got %ld", residual_dim);
+        "MLA KV residual_dim must be a multiple of 16 in [0, qk_rope_head_dim], got {}", residual_dim);
     TORCH_CHECK(helix_tensor_params.size() == 2 || helix_tensor_params.size() == 3,
         "Expecting 2 or 3 tensors for helix_tensor_params: helix_position_offsets, helix_is_inactive_rank "
         "and optionally helix_local_slots (per-token KV write slots for speculative verify groups).");
@@ -369,7 +369,7 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Unsupported input dtype: %s", c10::toString(input_dtype));
+        TLLM_CHECK_WITH_INFO(false, "Unsupported input dtype: {}", c10::toString(input_dtype));
     }
 }
 

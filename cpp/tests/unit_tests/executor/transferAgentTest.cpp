@@ -783,7 +783,7 @@ public:
         auto dirPath = fs::absolute(filename);
         std::error_code ec;
         fs::create_directories(dirPath, ec);
-        TLLM_CHECK_WITH_INFO(!ec, "Failed to create test directory: %s", ec.message().c_str());
+        TLLM_CHECK_WITH_INFO(!ec, "Failed to create test directory: {}", ec.message().c_str());
         mDirectory = dirPath.string();
     }
 
@@ -824,7 +824,7 @@ TEST_P(LoopbackAgentTest, FileToGpu)
     std::string filename = getDirectory() + std::string("/file2gpu.bin");
 
     int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0664);
-    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for writing", filename.c_str());
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '{}' for writing", filename.c_str());
 
     std::vector<char> fileData(100, 10);
     ssize_t bytesWritten = ::write(fd, fileData.data(), fileData.size());
@@ -874,7 +874,7 @@ TEST_P(LoopbackAgentTest, GpuToFile)
     }
 
     int fd = ::open(filename.c_str(), O_RDONLY, 0664);
-    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for reading", filename.c_str());
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '{}' for reading", filename.c_str());
 
     std::vector<char> fileData(100);
     ssize_t bytesRead = ::read(fd, fileData.data(), fileData.size());

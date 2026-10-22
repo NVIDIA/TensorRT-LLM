@@ -29,6 +29,7 @@
 
 #include <functional>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -57,7 +58,7 @@ namespace
 ncclUniqueId getUniqueId(std::set<int> const& group)
 {
     auto const rank = COMM_SESSION.getRank();
-    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
+    TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, rank);
     ncclUniqueId id;
     if (rank == *group.begin())
     {
@@ -71,7 +72,7 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
     {
         COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kDefault);
     }
-    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
+    TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, rank);
     return id;
 }
 } // namespace
@@ -79,7 +80,7 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 {
     auto const rank = COMM_SESSION.getRank();
-    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
+    TLLM_LOG_TRACE("{} start for rank {}", __PRETTY_FUNCTION__, rank);
     static std::map<std::set<int>, std::shared_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -99,11 +100,11 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     if (it != commMap.end())
     {
         auto ncclComm = it->second;
-        TLLM_LOG_TRACE("NCCL comm for group(%s) is cached for rank %d", groupStr.c_str(), rank);
+        TLLM_LOG_TRACE("NCCL comm for group({}) is cached for rank {}", groupStr.c_str(), rank);
         return ncclComm;
     }
 
-    TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
+    TLLM_LOG_TRACE("Init NCCL comm for group({}) for rank {}", groupStr.c_str(), rank);
     // Finish every environment update before getUniqueId(): on the group root, ncclGetUniqueId() starts NCCL's
     // bootstrap thread, which reads the environment with getenv(), and a concurrent setenv() may reallocate
     // environ underneath it.
@@ -158,7 +159,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
                     // Logging may fail during static destruction, so wrap in try-catch
                     try
                     {
-                        TLLM_LOG_WARNING("ncclCommDestroy failed with error: %d", result);
+                        TLLM_LOG_WARNING("ncclCommDestroy failed with error: {}", result);
                     }
                     catch (...)
                     {
@@ -181,7 +182,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     commMap[group] = ncclComm;
-    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
+    TLLM_LOG_TRACE("{} stop for rank {}", __PRETTY_FUNCTION__, rank);
     return ncclComm;
 }
 #endif // ENABLE_MULTI_DEVICE
@@ -250,7 +251,8 @@ public:
         std::shared_ptr<T> result = (*mObservers)[key].lock();
         if (result == nullptr)
         {
-            TLLM_LOG_TRACE("creating singleton instance for CUDA context %lu and thread %lu", ctx, thread);
+            TLLM_LOG_TRACE("creating singleton instance for CUDA context {} and thread {}",
+                static_cast<void const*>(ctx), (std::ostringstream{} << thread).str());
             // Create the resource and register with an observer.
             result = std::shared_ptr<T>{mCreator().release(),
                 [this, key](T* obj)
@@ -289,7 +291,8 @@ public:
         }
         else
         {
-            TLLM_LOG_TRACE("singleton instance for CUDA context %d and thread %d is cached", ctx, thread);
+            TLLM_LOG_TRACE("singleton instance for CUDA context {} and thread {} is cached",
+                static_cast<void const*>(ctx), (std::ostringstream{} << thread).str());
         }
         return result;
     }
@@ -329,8 +332,8 @@ MemoryInfo getMemoryInfo()
 void logMemoryUsage(char const* operation, CUcontext ctx)
 {
     auto const mem = getMemoryInfo();
-    TLLM_LOG_DEBUG("%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx, mem.free_mb,
-        mem.free_percent, mem.total_mb);
+    TLLM_LOG_DEBUG("{}: Context={:p}, Free Memory={} MB ({:.1f}%), Total={} MB", operation,
+        static_cast<void const*>(ctx), mem.free_mb, mem.free_percent, mem.total_mb);
 }
 
 // Helper function to throw
@@ -338,10 +341,10 @@ void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasSta
 {
     auto const mem = getMemoryInfo();
     TLLM_THROW(
-        "Failed to create %s. "
-        "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+        "Failed to create {}. "
+        "Status: {}, Context: {:p}, Free Memory: {} MB ({:.1f}%), Total: {} MB. "
         "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
-        operation, status, ctx, mem.free_mb, mem.free_percent, mem.total_mb);
+        operation, status, static_cast<void const*>(ctx), mem.free_mb, mem.free_percent, mem.total_mb);
 }
 
 } // namespace
@@ -369,7 +372,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
             auto status = cublasDestroy(*handle);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: %d", status);
+                TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: {}", status);
             }
             delete handle;
             handle = nullptr;
@@ -400,7 +403,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
             auto status = cublasLtDestroy(*handle);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: %d", status);
+                TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: {}", status);
             }
             delete handle;
             handle = nullptr;

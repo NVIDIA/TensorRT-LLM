@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -179,8 +179,7 @@ public:
     [[nodiscard]] ITensorPtr copyFrom(std::vector<T> const& src, tensorrt_llm::Dims dims, MemoryType memoryType) const
     {
         TLLM_CHECK_WITH_INFO(src.size() == ITensor::volumeNonNegative(dims),
-            common::fmtstr("[TensorRT-LLM][ERROR] Incompatible size %lu and dims %s", src.size(),
-                ITensor::toString(dims).c_str()));
+            "[TensorRT-LLM][ERROR] Incompatible size {} and dims {}", src.size(), ITensor::toString(dims).c_str());
         return copyFrom(src.data(), dims, memoryType);
     }
 

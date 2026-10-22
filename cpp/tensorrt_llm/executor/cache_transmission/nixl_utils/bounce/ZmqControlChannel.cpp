@@ -85,7 +85,7 @@ bool ZmqControlChannel::addPeer(std::string const& peer, std::string const& endp
     }
     if (endpoint.empty())
     {
-        TLLM_THROW("ZmqControlChannel(%s): peer %s requires a non-empty endpoint", mSelfName.c_str(), peer.c_str());
+        TLLM_THROW("ZmqControlChannel({}): peer {} requires a non-empty endpoint", mSelfName.c_str(), peer.c_str());
     }
     try
     {
@@ -103,7 +103,7 @@ bool ZmqControlChannel::addPeer(std::string const& peer, std::string const& endp
     catch (zmq::error_t const& e)
     {
         TLLM_THROW(
-            "ZmqControlChannel(%s): peer %s has an invalid endpoint: %s", mSelfName.c_str(), peer.c_str(), e.what());
+            "ZmqControlChannel({}): peer {} has an invalid endpoint: {}", mSelfName.c_str(), peer.c_str(), e.what());
     }
 }
 
@@ -126,7 +126,7 @@ void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
     if (it == mDealers.end())
     {
         TLLM_LOG_WARNING(
-            "ZmqControlChannel(%s): sendTo unknown peer %s (call addPeer first)", mSelfName.c_str(), peer.c_str());
+            "ZmqControlChannel({}): sendTo unknown peer {} (call addPeer first)", mSelfName.c_str(), peer.c_str());
         return;
     }
     zmq::message_t msg(blob.data(), blob.size());
@@ -141,13 +141,13 @@ void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
         auto const sent = it->second.send(msg, zmq::send_flags::dontwait);
         if (!sent.has_value())
         {
-            TLLM_LOG_WARNING("ZmqControlChannel(%s): send to %s dropped (queue full / peer stalled)", mSelfName.c_str(),
+            TLLM_LOG_WARNING("ZmqControlChannel({}): send to {} dropped (queue full / peer stalled)", mSelfName.c_str(),
                 peer.c_str());
         }
     }
     catch (zmq::error_t const& e)
     {
-        TLLM_LOG_WARNING("ZmqControlChannel(%s): send to %s failed: %s", mSelfName.c_str(), peer.c_str(), e.what());
+        TLLM_LOG_WARNING("ZmqControlChannel({}): send to {} failed: {}", mSelfName.c_str(), peer.c_str(), e.what());
     }
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ public:
         }
         catch (c10::Error const& e)
         {
-            TLLM_THROW("%s", e.what_without_backtrace());
+            TLLM_THROW("{}", e.what_without_backtrace());
         }
         mDims = dims;
         if (auto const newSize = volumeNonNegative(dims); mCapacity < newSize)

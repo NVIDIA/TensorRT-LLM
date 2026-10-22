@@ -37,8 +37,10 @@
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/CudaArchDecl.h"
 #include "trtllm/gen/DtypeDecl.h"
+#include <source_location>
 #include <nlohmann/json.hpp>
 #include <cassert>
+#include <cstdio>
 #include <sstream>
 
 namespace fmha {
@@ -85,7 +87,7 @@ inline std::string checkErrorStr(Args const&... args) {
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
       tensorrt_llm::common::throwRuntimeError(                                                     \
-          __FILE__, __LINE__, ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());                  \
+          std::source_location::current(), ::fmha::detail::checkErrorStr(__VA_ARGS__));             \
     }                                                                                              \
   } while (0)
 #endif
@@ -94,19 +96,32 @@ inline std::string checkErrorStr(Args const&... args) {
 #define TLLM_CHECK_INFO(cond, ...)                                                                 \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
-      TLLM_LOG_INFO("[FMHA] %s", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());              \
+      TLLM_LOG_INFO("[FMHA] {}", ::fmha::detail::checkErrorStr(__VA_ARGS__));                      \
     }                                                                                              \
   } while (0)
 #endif
 
-// Printf-style check macro (used by KernelTraits.h).
+// Printf-style check macro (used by KernelTraits.h, which is copied verbatim from trtllm-gen and
+// therefore keeps printf format strings).
+namespace detail {
+template <typename... Args>
+inline std::string printfStr(char const* fmt, Args... args) {
+  int const size = std::snprintf(nullptr, 0, fmt, args...);
+  if (size < 0) {
+    return fmt;
+  }
+  std::string result(static_cast<size_t>(size), '\0');
+  std::snprintf(result.data(), result.size() + 1, fmt, args...);
+  return result;
+}
+} // namespace detail
+
 #ifndef TLLM_CHECK_ERROR_FMT
 #define TLLM_CHECK_ERROR_FMT(cond, fmt, ...)                                                       \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
       tensorrt_llm::common::throwRuntimeError(                                                     \
-          __FILE__, __LINE__,                                                                      \
-          tensorrt_llm::common::fmtstr(fmt, __VA_ARGS__).c_str());                                 \
+          std::source_location::current(), ::fmha::detail::printfStr(fmt, __VA_ARGS__));            \
     }                                                                                              \
   } while (0)
 #endif

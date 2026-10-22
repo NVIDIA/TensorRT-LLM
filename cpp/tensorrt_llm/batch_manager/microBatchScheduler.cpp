@@ -26,7 +26,7 @@ namespace
 
 void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
 
     auto sortByLoraId = [](RequestVector::iterator begin, RequestVector::iterator end)
     {
@@ -51,7 +51,7 @@ void sortRequests(RequestVector& contextRequests, RequestVector& generationReque
     }
     sortByLoraId(generationRequests.begin(), generationRequests.end());
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
 }
 
 } // namespace
@@ -131,7 +131,7 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
             SizeType32 const draftTokensToDiscard = llmReq->getNumDraftTokens() - remainingSpaceForDraftTokens;
             if (draftTokensToDiscard > 0)
             {
-                TLLM_LOG_DEBUG("Discarding %d draft tokens", draftTokensToDiscard);
+                TLLM_LOG_DEBUG("Discarding {} draft tokens", draftTokensToDiscard);
                 llmReq->discardDraftTokens(draftTokensToDiscard);
             }
         }
@@ -278,7 +278,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     if (maxContextLength && maxContextLength.value() < chunkUnitSize)
     {
         TLLM_THROW(
-            "The forced chunk size (%d) exceeds the max context length (%d)", chunkUnitSize, maxContextLength.value());
+            "The forced chunk size ({}) exceeds the max context length ({})", chunkUnitSize, maxContextLength.value());
     }
     SizeType32 totalTokens{0};
     for (auto& llmReq : contextsToBeChunked)
@@ -363,7 +363,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     ReqIdsSet const& inflightReqIds, SizeType32 maxBatchSizeRuntime,
     std::optional<SizeType32> maxNumTokensRuntime) const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(microBatcherScheduleRequests);
 
     RequestVector contextRequests, generationRequests;
@@ -397,13 +397,13 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         {
             reqNumTokens = llmReq->getEncoderOutputLen();
             TLLM_CHECK_WITH_INFO(!mMaxContextLength || reqNumTokens <= mMaxContextLength.value(),
-                "The number of encoder tokens (%d) exceeds the limit value (%d)", reqNumTokens,
+                "The number of encoder tokens ({}) exceeds the limit value ({})", reqNumTokens,
                 mMaxContextLength.value());
             if (maxNumTokensRuntime && batchNumTokens + reqNumTokens > maxNumTokensRuntime.value())
             {
                 break;
             }
-            TLLM_LOG_DEBUG("encoder request scheduled: ID %u", llmReq->mRequestId);
+            TLLM_LOG_DEBUG("encoder request scheduled: ID {}", llmReq->mRequestId);
             contextRequests.emplace_back(llmReq);
             batchNumTokens += reqNumTokens;
         }
@@ -423,13 +423,13 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                     = reuse_adjusted_compute(contextTokens, reusable, llmReq->getContextRemainingLength());
                 SizeType32 const computeTokens = std::max(1, contextCompute + draftTokens);
                 TLLM_CHECK_WITH_INFO(!mMaxContextLength || computeTokens <= mMaxContextLength.value(),
-                    "Context compute tokens (%d) exceeds the limit value (%d)", computeTokens,
+                    "Context compute tokens ({}) exceeds the limit value ({})", computeTokens,
                     mMaxContextLength.value());
                 if (maxNumTokensRuntime && batchNumTokens + computeTokens > maxNumTokensRuntime.value())
                 {
                     break;
                 }
-                TLLM_LOG_DEBUG("context request scheduled: ID %u (reusable %d)", llmReq->mRequestId, reusable);
+                TLLM_LOG_DEBUG("context request scheduled: ID {} (reusable {})", llmReq->mRequestId, reusable);
                 contextRequests.emplace_back(llmReq);
                 batchNumTokens += computeTokens;
             }
@@ -454,7 +454,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                 contextsToBeChunked.emplace_back(llmReq);
                 numChunkedComputeTokens += computeTokens;
                 TLLM_LOG_DEBUG(
-                    "contexts-to-be-chunked request scheduled: ID %u (reusable %d)", llmReq->mRequestId, reusable);
+                    "contexts-to-be-chunked request scheduled: ID {} (reusable {})", llmReq->mRequestId, reusable);
             }
         }
         else // (llmReq->isGenerationInProgressState())
@@ -472,11 +472,11 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
             else if (scheduledBeamWidth != reqBeamWidth) // Skip request with different beam width
             {
                 TLLM_LOG_DEBUG(
-                    "generation request skipped: ID %u since its beam width (%d) is different from scheduled ones (%d)",
+                    "generation request skipped: ID {} since its beam width ({}) is different from scheduled ones ({})",
                     llmReq->mRequestId, reqBeamWidth, scheduledBeamWidth);
                 continue;
             }
-            TLLM_LOG_DEBUG("generation request scheduled: ID %u with beam width %d", llmReq->mRequestId, reqBeamWidth);
+            TLLM_LOG_DEBUG("generation request scheduled: ID {} with beam width {}", llmReq->mRequestId, reqBeamWidth);
             generationRequests.emplace_back(llmReq);
             batchNumTokens += reqNumTokens;
         }
@@ -516,7 +516,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
             SizeType32 const computeTokens
                 = reuse_adjusted_compute(llmReq->getContextChunkSize(), reusable, llmReq->getContextRemainingLength());
             batchNumTokens += computeTokens;
-            TLLM_LOG_DEBUG("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
+            TLLM_LOG_DEBUG("context request scheduled: ID {}, chunk size {}{}", llmReq->mRequestId,
                 llmReq->getContextChunkSize(), reusable > 0 ? (", reusable " + std::to_string(reusable)).c_str() : "");
         }
     }
@@ -524,15 +524,15 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
 
     TLLM_LOG_DEBUG(
-        "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());
-    TLLM_LOG_DEBUG("batchNumTokens (num ctx/enc input tokens + num gen input tokens) / maxNumTokens: %d / %d",
+        "batchSize (num ctx/enc requests + num gen requests): {}", contextRequests.size() + generationRequests.size());
+    TLLM_LOG_DEBUG("batchNumTokens (num ctx/enc input tokens + num gen input tokens) / maxNumTokens: {} / {}",
         batchNumTokens, maxNumTokensRuntime.value_or(0));
     TLLM_LOG_DEBUG(
-        "[Summary] Micro Batch scheduler schedules %d context/encoder requests, %d generation requests. "
-        "%d requests inflight with the model already",
+        "[Summary] Micro Batch scheduler schedules {} context/encoder requests, {} generation requests. "
+        "{} requests inflight with the model already",
         contextRequests.size(), generationRequests.size(), inflightReqIds.size());
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("{} stop", __PRETTY_FUNCTION__);
     return {std::move(contextRequests), std::move(generationRequests)};
 }
 

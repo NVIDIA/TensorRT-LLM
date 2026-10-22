@@ -351,12 +351,12 @@ protected:
                 int genRank = 1;
                 int64_t bufferSize = buffer.size();
                 TLLM_LOG_DEBUG(
-                    tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d", bufferSize, genRank);
+                    tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: {} to {}", bufferSize, genRank);
                 tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
                 tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
-                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
+                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to {}", genRank);
                 mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
             }
             else
@@ -364,12 +364,12 @@ protected:
                 int64_t bufferSize;
                 tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                     &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
-                TLLM_LOG_DEBUG(
-                    tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
+                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: {} from 0", bufferSize);
                 std::vector<char> recvBuffer(bufferSize);
                 tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                     recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
-                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
+                TLLM_LOG_DEBUG(
+                    tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0, size: {}", bufferSize);
                 std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
                 su::VectorWrapBuf<char> strbuf(recvBuffer);
                 std::istream is(&strbuf);
@@ -699,7 +699,7 @@ protected:
             return;
         }
         TLLM_LOG_INFO(
-            "Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, ContextCp: %d, GenTp: %d, GenPp:%d, GenCp:%d",
+            "Run cacheTransceiverTest for ContextTp: {}, ContextPp: {}, ContextCp: {}, GenTp: {}, GenPp:{}, GenCp:{}",
             contextTp, contextPp, contextCp, genTp, genPp, genCp);
         mComm = std::addressof(mParticipatingComm);
 
@@ -913,7 +913,7 @@ protected:
             blocksPerWindow[windowAttentionToken] = {attentionNumBlocks, blocksInSecondaryPool};
             maxAttentionWindowVec.push_back(windowAttentionToken);
         }
-        TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
+        TLLM_LOG_DEBUG(" cacheManager isWindowAttention: {}", static_cast<int>(mIsWindowAttention));
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
             blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, dataType, sinkTokenLength, stream,
             maxAttentionWindow, maxAttentionWindow, enableBlockReuse, cacheType, std::nullopt, nullptr,
@@ -968,7 +968,7 @@ protected:
             // Skip tests for MOONCAKE when on Rocky8
             bool isRocky8 = std::filesystem::exists("/etc/redhat-release");
             isMooncake = isMooncake && !isRocky8;
-            TLLM_LOG_INFO("Enable %s KV cache transport.",
+            TLLM_LOG_INFO("Enable {} KV cache transport.",
                 isUcx            ? "UCX"
                     : isNixl     ? "NIXL"
                     : isMooncake ? "MOONCAKE"
@@ -979,7 +979,7 @@ protected:
                 std::lock_guard<std::mutex> lock(mDllMutex);
                 void* WrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
                 TLLM_CHECK_WITH_INFO(
-                    WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. dlerror: %s", dlerror());
+                    WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. dlerror: {}", dlerror());
                 auto load_sym = [](void* handle, char const* name)
                 {
                     void* ret = dllGetSym(handle, name);
@@ -1011,7 +1011,7 @@ protected:
                 mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
             }
 
-            TLLM_LOG_DEBUG("setUpCacheTransceiver mIsMLA: %d", mIsMLA);
+            TLLM_LOG_DEBUG("setUpCacheTransceiver mIsMLA: {}", static_cast<int>(mIsMLA));
             auto makeFormatter
                 = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
@@ -1049,13 +1049,13 @@ protected:
                     for (int genRank = mContextRankSize; genRank < mContextRankSize + mGenRankSize; genRank++)
                     {
                         int64_t bufferSize = buffer.size();
-                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
+                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: {} to {}",
                             bufferSize, genRank);
                         tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
                         tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
-                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
+                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to {}", genRank);
                     }
                 }
 
@@ -1065,11 +1065,12 @@ protected:
                     tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                     TLLM_LOG_DEBUG(
-                        tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
+                        tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: {} from 0", bufferSize);
                     std::vector<char> recvBuffer(bufferSize);
                     tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
-                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
+                    TLLM_LOG_DEBUG(
+                        tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0, size: {}", bufferSize);
                     std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
                     su::VectorWrapBuf<char> strbuf(recvBuffer);
                     std::istream is(&strbuf);
@@ -1082,7 +1083,7 @@ protected:
                     mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
                 }
 
-                TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "mContextCommState: %s",
+                TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "mContextCommState: {}",
                     mContextCommState->toString().c_str());
             }
             else
@@ -1176,19 +1177,19 @@ protected:
             auto const& cpData = request->mCPMetaData.value();
             initial = cpData.mTotalSeqLenAcrossCPRanks;
         }
-        TLLM_LOG_DEBUG(" addRequestAndTransportCacheForContext mManager numPools: %d", numPools);
+        TLLM_LOG_DEBUG(" addRequestAndTransportCacheForContext mManager numPools: {}", numPools);
         auto const& windowSizes = blockRange.getWindowSizes();
         int blockIdx = 0;
         for (auto const& windowSize : windowSizes)
         {
             auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
-            TLLM_LOG_DEBUG("update windowSize: %d", windowSize);
+            TLLM_LOG_DEBUG("update windowSize: {}", windowSize);
             for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
                 fillBlockData(*it, blockIdx, initial, windowSize);
                 blockIdx++;
             }
-            TLLM_LOG_DEBUG("windowSize: %d finish fill block data", windowSize);
+            TLLM_LOG_DEBUG("windowSize: {} finish fill block data", windowSize);
         }
         if (mManager->isEnableIndexerKCache())
         {
@@ -1202,7 +1203,7 @@ protected:
         }
 
         TLLM_LOG_DEBUG(
-            "addRequestAndTransportCacheForContext blockManager numPools: %d finish fill block data", numPools);
+            "addRequestAndTransportCacheForContext blockManager numPools: {} finish fill block data", numPools);
         auto const& blockManager = mManager->getBlockManager();
 
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
@@ -1601,7 +1602,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             for (auto len : lenList)
             {
                 requests.emplace_back(makeLlmRequest(len));
-                TLLM_LOG_DEBUG("setUpCacheTransceiver makeLlmRequest len: %d", len);
+                TLLM_LOG_DEBUG("setUpCacheTransceiver makeLlmRequest len: {}", len);
             }
 
             if (mIsContext)
@@ -1917,7 +1918,7 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
                     }
                     catch (std::exception const& e)
                     {
-                        TLLM_LOG_ERROR(mRank, "Error resetting mSender: %s", e.what());
+                        TLLM_LOG_ERROR(mRank, "Error resetting mSender: {}", e.what());
                         EXPECT_TRUE(false);
                     }
                     break;
@@ -1940,7 +1941,7 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
                     }
                     catch (std::exception const& e)
                     {
-                        TLLM_LOG_ERROR(mRank, "Error resetting mRequester: %s", e.what());
+                        TLLM_LOG_ERROR(mRank, "Error resetting mRequester: {}", e.what());
                         EXPECT_TRUE(false);
                     }
                     break;

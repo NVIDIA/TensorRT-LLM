@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,11 @@
 #include <cuda.h>
 
 #include <cstdio>
+#include <format>
 #include <memory>
+#include <source_location>
+#include <string>
+#include <string_view>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -35,6 +39,10 @@ class CUDADriverWrapper
 {
 public:
     static std::shared_ptr<CUDADriverWrapper> getInstance();
+
+    //! The live wrapper, or nullptr when none exists. Unlike getInstance(), this never loads the driver, so it is
+    //! safe during process teardown.
+    static std::shared_ptr<CUDADriverWrapper> getInstanceIfLoaded();
 
     ~CUDADriverWrapper();
     CUDADriverWrapper(CUDADriverWrapper const&) = delete;
@@ -144,48 +152,62 @@ private:
 };
 
 template <typename T>
-void checkDriver(
-    T result, CUDADriverWrapper const& wrap, char const* const func, char const* const file, int const line)
+void checkDriver(T result, char const* const func, std::source_location const& location)
 {
     if (result)
     {
-        char const* errorName = nullptr;
-        char const* errorString = nullptr;
-        wrap.cuGetErrorName(result, &errorName);
-        wrap.cuGetErrorString(result, &errorString);
-        throw TllmException(file, line,
-            fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %s: %s.", func, errorName, errorString).c_str());
+        // Load the driver so the CUresult formatter can name the error.
+        CUDADriverWrapper::getInstance();
+        throw TllmException(location, "[TensorRT-LLM][ERROR] CUDA driver error in {}: {}.", func, result);
     }
 }
 
 template <typename T>
-void checkDriverExitSafe(T result, char const* const func, char const* const file, int const line)
+void checkDriverExitSafe(T result, char const* const func, std::source_location const& location)
 {
     if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED)
     {
         throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %d.", func, result).c_str());
+            location, "[TensorRT-LLM][ERROR] CUDA driver error in {}: {}.", func, static_cast<int>(result));
     }
 }
 
 } // namespace common
 
 TRTLLM_NAMESPACE_END
+
+//! Format CUDA driver results by name, e.g. "CUDA_ERROR_INVALID_VALUE". The name comes from the driver, so the numeric
+//! code is printed when no CUDADriverWrapper is alive, as during process teardown.
+template <>
+struct std::formatter<CUresult> : std::formatter<std::string_view>
+{
+    template <typename Context>
+    auto format(CUresult const result, Context& context) const
+    {
+        char const* name = nullptr;
+        auto const driver = tensorrt_llm::common::CUDADriverWrapper::getInstanceIfLoaded();
+        if (driver == nullptr || driver->cuGetErrorName(result, &name) != CUDA_SUCCESS || name == nullptr)
+        {
+            return std::formatter<std::string_view>::format(std::to_string(static_cast<int>(result)), context);
+        }
+        return std::formatter<std::string_view>::format(name, context);
+    }
+};
+
 /*
  * Macros compliant with TensorRT coding conventions
  */
 #define TLLM_CU_CHECK(stat)                                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::checkDriver(                                                                             \
-            (stat), *tensorrt_llm::common::CUDADriverWrapper::getInstance(), #stat, __FILE__, __LINE__);               \
+        tensorrt_llm::common::checkDriver((stat), #stat, std::source_location::current());                             \
     } while (0)
 
 // Avoid using CUDADriverWrapper when freeing resource, during which the global instance may already be freed.
 #define TLLM_CU_CHECK_FREE_RESOURCE(stat)                                                                              \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::checkDriverExitSafe((stat), #stat, __FILE__, __LINE__);                                  \
+        tensorrt_llm::common::checkDriverExitSafe((stat), #stat, std::source_location::current());                     \
     } while (0)
 
 #endif // CUDA_DRIVER_WRAPPER_H

@@ -349,7 +349,7 @@ void launchKernelWithModuleCount(int32_t* in_sizes, int32_t* out_sizes, int64_t*
             a_base, d_base, d_prime_base, slot_counts, slot_ranks, slot_offsets, module_out_sizes, module_out_prefix,
             b_ptrs, b_prime_ptrs, input_cast, sorted_ids);
         break;
-    default: TLLM_CHECK_WITH_INFO(false, "Unsupported module_count: %d (max 4)", module_count);
+    default: TLLM_CHECK_WITH_INFO(false, "Unsupported module_count: {} (max 4)", module_count);
     }
 }
 
@@ -398,7 +398,7 @@ void launchLoraGroupGEMMParamFillRowReorderFusion(int32_t* in_sizes, int32_t* ou
     else
     {
         TLLM_CHECK_WITH_INFO(false,
-            "Unsupported threads_per_block: %d (calculated from max_lora_count=%d * module_count=%d)",
+            "Unsupported threads_per_block: {} (calculated from max_lora_count={} * module_count={})",
             threads_per_block, max_lora_count, module_count);
     }
 

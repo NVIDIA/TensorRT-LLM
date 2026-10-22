@@ -659,7 +659,7 @@ protected:
         decoderParams.rotaryEmbeddingInvFreq = rotary_inv_freq_buf;
         decoderParams.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
-        TLLM_LOG_DEBUG(decoderParams.toString());
+        TLLM_LOG_DEBUG("{}", decoderParams.toString());
         invokeBuildDecoderInfo(decoderParams, this->mStream->get());
         sync_check_cuda_error(this->mStream->get());
     }
@@ -862,7 +862,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
     this->buildKVCaches();
     this->buildPreprocessingParams();
 
-    TLLM_LOG_DEBUG(this->preprocessingParams.toString());
+    TLLM_LOG_DEBUG("{}", this->preprocessingParams.toString());
 
     bool allEqual{true};
     BufferManager::ITensorPtr reference_qkv_buf
@@ -874,7 +874,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
         if (!almostEqual(static_cast<float>(this->attention_input[iAssert]), static_cast<float>(reference_qkv[iAssert]),
                 1e-3, 1e-3))
         {
-            TLLM_LOG_ERROR("Mismatch input value. Position of inputs: %d, expected value: %f, output value: %f",
+            TLLM_LOG_ERROR("Mismatch input value. Position of inputs: {}, expected value: {:f}, output value: {:f}",
                 iAssert, static_cast<float>(this->attention_input[iAssert]),
                 static_cast<float>(reference_qkv[iAssert]));
             allEqual = false;
@@ -900,18 +900,18 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
 
     calculateMeanAndStdDev(this->attention_input, this->qkv_size, mean, stdDev);
 
-    TLLM_LOG_DEBUG("Output Mean: %e, Standard Deviation: %e", mean, stdDev);
+    TLLM_LOG_DEBUG("Output Mean: {:e}, Standard Deviation: {:e}", mean, stdDev);
 
     calculateMeanAndStdDevOfDifferences(this->attention_input, reference_qkv, this->qkv_size, mean, stdDev);
 
-    TLLM_LOG_DEBUG("Output Abs difference Mean: %e, Standard Deviation: %e", mean, stdDev);
+    TLLM_LOG_DEBUG("Output Abs difference Mean: {:e}, Standard Deviation: {:e}", mean, stdDev);
     bool resultsEqual{true};
     for (SizeType32 iAssert = 0; iAssert < this->qkv_size; iAssert++)
     {
         if (!almostEqual(static_cast<float>(this->attention_input[iAssert]), static_cast<float>(reference_qkv[iAssert]),
                 1e-5, 0.01f))
         {
-            TLLM_LOG_ERROR("Mismatch output value. Position of outputs: %d, expected value: %e, output value: %e",
+            TLLM_LOG_ERROR("Mismatch output value. Position of outputs: {}, expected value: {:e}, output value: {:e}",
                 iAssert, static_cast<float>(this->attention_input[iAssert]),
                 static_cast<float>(reference_qkv[iAssert]));
             resultsEqual = false;
@@ -983,8 +983,9 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
         auto const actual = getKVCacheVal(iAssert, floatKernelKV);
         if (!almostEqual(actual, ref, 1e-5, 0.01f))
         {
-            TLLM_LOG_ERROR("Mismatch kv cache value. Position in kv cache: %d, expected value: %e, output value: %e",
-                iAssert, actual, ref);
+            TLLM_LOG_ERROR(
+                "Mismatch kv cache value. Position in kv cache: {}, expected value: {:e}, output value: {:e}", iAssert,
+                actual, ref);
             if (++numMismatched > maxAllowedMismatch)
             {
                 break;
@@ -1006,8 +1007,9 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
             if (!almostEqual(actual, ref, 1e-5, 0.01f))
             {
                 TLLM_LOG_ERROR(
-                    "Mismatch kv cache block scale value. Position in kv cache: %d, expected value: %e, output value: "
-                    "%e",
+                    "Mismatch kv cache block scale value. Position in kv cache: {}, expected value: {:e}, output "
+                    "value: "
+                    "{:e}",
                     iAssert, actual, ref);
                 kvCacheBlockScalesEqual = false;
                 break;

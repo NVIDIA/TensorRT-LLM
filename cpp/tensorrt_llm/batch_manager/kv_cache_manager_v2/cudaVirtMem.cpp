@@ -107,7 +107,7 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
     {
         // Otherwise this surfaces only later, as an opaque RDMA registration failure.
         TLLM_LOG_WARNING(
-            "PooledPhysMemAllocator: device %d refused gpuDirectRDMACapable for KV cache memory with handle type %d, "
+            "PooledPhysMemAllocator: device {} refused gpuDirectRDMACapable for KV cache memory with handle type {}, "
             "so the pools are allocated without it. nvidia_peermem (ibv_reg_mr) cannot register this memory for "
             "GPUDirect RDMA; dma-buf registration still can.",
             static_cast<int>(mDeviceId), static_cast<int>(mProp.requestedHandleTypes));

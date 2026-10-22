@@ -890,7 +890,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
     }
 
     TLLM_CHECK_WITH_INFO(rotary_dim > 0 && rotary_dim <= head_dim && rotary_dim % 2 == 0,
-        "rotary_dim must be positive, even and no greater than head_dim (got rotary_dim=%d, head_dim=%d)", rotary_dim,
+        "rotary_dim must be positive, even and no greater than head_dim (got rotary_dim={}, head_dim={})", rotary_dim,
         head_dim);
     // Skipping V leaves the output's V slots untouched, which is only meaningful in place.
     TLLM_CHECK_WITH_INFO(process_v || static_cast<void const*>(qkv_in) == static_cast<void const*>(qkv_out),
@@ -899,7 +899,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
     {
         // To allow warp-level pairing for partial rope
         TLLM_CHECK_WITH_INFO(
-            (rotary_dim * 16) % head_dim == 0, "Unsupported rotary dimension for fusedQKNormRope: %d", rotary_dim);
+            (rotary_dim * 16) % head_dim == 0, "Unsupported rotary dimension for fusedQKNormRope: {}", rotary_dim);
     }
 
     constexpr int blockSize = 256;
@@ -940,7 +940,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
                 mrope_section2);
         });
         break;
-    default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
+    default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: {}", head_dim);
     }
 }
 

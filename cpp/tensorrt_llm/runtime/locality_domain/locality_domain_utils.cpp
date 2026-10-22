@@ -71,7 +71,7 @@ LocalityDomainStreamCreateMethod parseStreamCreateMethod()
     }
 
     TLLM_LOG_WARNING(
-        "[Localization] Unknown TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD=%s; using public strict Green Context split",
+        "[Localization] Unknown TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD={}; using public strict Green Context split",
         value);
     return LocalityDomainStreamCreateMethod::kStrict;
 }
@@ -152,7 +152,7 @@ CUresult queryCurrentDeviceAndContext(int* device, CUcontext* context)
     if (runtimeResult != cudaSuccess)
     {
         TLLM_LOG_WARNING(
-            "[Localization] Failed to initialize the current CUDA context: %s", cudaGetErrorString(runtimeResult));
+            "[Localization] Failed to initialize the current CUDA context: {}", cudaGetErrorString(runtimeResult));
         return CUDA_ERROR_INVALID_CONTEXT;
     }
 
@@ -161,7 +161,7 @@ CUresult queryCurrentDeviceAndContext(int* device, CUcontext* context)
     if (deviceResult != cudaSuccess)
     {
         TLLM_LOG_WARNING(
-            "[Localization] Failed to query the current CUDA device: %s", cudaGetErrorString(deviceResult));
+            "[Localization] Failed to query the current CUDA device: {}", cudaGetErrorString(deviceResult));
         return CUDA_ERROR_INVALID_DEVICE;
     }
 
@@ -192,7 +192,7 @@ bool loadDriverProc(char const* name, Proc* proc)
         = cuGetProcAddress(name, &address, kLocalityDomainApiVersion, CU_GET_PROC_ADDRESS_DEFAULT, &queryResult);
     if (result != CUDA_SUCCESS || queryResult != CU_GET_PROC_ADDRESS_SUCCESS || address == nullptr)
     {
-        TLLM_LOG_WARNING("[Localization] CUDA 13.4 driver entry point %s is unavailable (result=%d, status=%d)", name,
+        TLLM_LOG_WARNING("[Localization] CUDA 13.4 driver entry point {} is unavailable (result={}, status={})", name,
             static_cast<int>(result), static_cast<int>(queryResult));
         *proc = nullptr;
         return false;
@@ -259,7 +259,7 @@ public:
         CUresult result = mApi.deviceGetDevResource(device, &fullResource, CU_DEV_RESOURCE_TYPE_SM);
         if (result != CUDA_SUCCESS)
         {
-            TLLM_LOG_WARNING("[Localization] cuDeviceGetDevResource failed (result=%d)", static_cast<int>(result));
+            TLLM_LOG_WARNING("[Localization] cuDeviceGetDevResource failed (result={})", result);
             return false;
         }
         if (fullResource.type != CU_DEV_RESOURCE_TYPE_SM || fullResource.sm.smCount == 0)
@@ -275,7 +275,7 @@ public:
             {
                 TLLM_LOG_WARNING(
                     "[Localization] Balanced public split requires an even per-group SM count, got "
-                    "total SM count %u",
+                    "total SM count {}",
                     fullResource.sm.smCount);
                 return false;
             }
@@ -287,8 +287,7 @@ public:
             /*flags=*/0, groupParams.data());
         if (result != CUDA_SUCCESS)
         {
-            TLLM_LOG_WARNING(
-                "[Localization] Public locality-domain SM split failed (result=%d)", static_cast<int>(result));
+            TLLM_LOG_WARNING("[Localization] Public locality-domain SM split failed (result={})", result);
             return false;
         }
 
@@ -300,7 +299,7 @@ public:
                 || (resource.sm.flags & CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID) == 0)
             {
                 TLLM_LOG_WARNING(
-                    "[Localization] Public split returned an invalid resource for locality domain%d", localityDomainId);
+                    "[Localization] Public split returned an invalid resource for locality domain{}", localityDomainId);
                 reset();
                 return false;
             }
@@ -308,9 +307,9 @@ public:
             if (method == LocalityDomainStreamCreateMethod::kStrict && resource.sm.smCount != localityDomainSmCount)
             {
                 TLLM_LOG_WARNING(
-                    "[Localization] Strict public split returned %u SMs for locality domain%d, expected "
+                    "[Localization] Strict public split returned {} SMs for locality domain{}, expected "
                     "locality-domain "
-                    "attribute value %u",
+                    "attribute value {}",
                     resource.sm.smCount, localityDomainId, localityDomainSmCount);
                 reset();
                 return false;
@@ -320,7 +319,7 @@ public:
                 && resource.sm.smCount != fullResource.sm.smCount / static_cast<unsigned int>(kLocalityDomainCount))
             {
                 TLLM_LOG_WARNING(
-                    "[Localization] Balanced public split returned %u SMs for locality domain%d, expected %u",
+                    "[Localization] Balanced public split returned {} SMs for locality domain{}, expected {}",
                     resource.sm.smCount, localityDomainId,
                     fullResource.sm.smCount / static_cast<unsigned int>(kLocalityDomainCount));
                 reset();
@@ -334,7 +333,7 @@ public:
             {
                 TLLM_LOG_WARNING(
                     "[Localization] Strict public split counts do not match two complete locality domains "
-                    "(total=%u, per-domain=%u, remainder=%u)",
+                    "(total={}, per-domain={}, remainder={})",
                     fullResource.sm.smCount, localityDomainSmCount, getRemainderSmCount());
                 reset();
                 return false;
@@ -343,14 +342,14 @@ public:
         else if (getRemainderSmCount() != 0)
         {
             TLLM_LOG_WARNING(
-                "[Localization] Balanced public split unexpectedly left %u remainder SMs", getRemainderSmCount());
+                "[Localization] Balanced public split unexpectedly left {} remainder SMs", getRemainderSmCount());
             reset();
             return false;
         }
 
         TLLM_LOG_INFO(
-            "[Localization] Public %s split: total=%u SM, locality domain 0=%u SM, locality domain 1=%u SM, "
-            "remainder=%u SM",
+            "[Localization] Public {} split: total={} SM, locality domain 0={} SM, locality domain 1={} SM, "
+            "remainder={} SM",
             method == LocalityDomainStreamCreateMethod::kStrict ? "strict" : "balanced", fullResource.sm.smCount,
             mLocalizedResources[0].sm.smCount, mLocalizedResources[1].sm.smCount, getRemainderSmCount());
 
@@ -365,7 +364,7 @@ public:
             }
             if (result != CUDA_SUCCESS)
             {
-                TLLM_LOG_WARNING("[Localization] Failed to create Green Context for locality domain%d (result=%d)",
+                TLLM_LOG_WARNING("[Localization] Failed to create Green Context for locality domain{} (result={})",
                     localityDomainId, static_cast<int>(result));
                 reset();
                 return false;
@@ -388,7 +387,7 @@ public:
             if (result != CUDA_SUCCESS)
             {
                 TLLM_LOG_WARNING(
-                    "[Localization] Failed to create strict split remainder Green Context/stream (result=%d)",
+                    "[Localization] Failed to create strict split remainder Green Context/stream (result={})",
                     static_cast<int>(result));
                 reset();
                 return false;
@@ -479,8 +478,7 @@ private:
                 CUresult const result = cuStreamDestroy(stream);
                 if (result != CUDA_SUCCESS)
                 {
-                    TLLM_LOG_WARNING(
-                        "[Localization] Failed to destroy localized stream (result=%d)", static_cast<int>(result));
+                    TLLM_LOG_WARNING("[Localization] Failed to destroy localized stream (result={})", result);
                 }
                 stream = nullptr;
             }
@@ -491,8 +489,7 @@ private:
             CUresult const result = cuStreamDestroy(mRemainderStream);
             if (result != CUDA_SUCCESS)
             {
-                TLLM_LOG_WARNING(
-                    "[Localization] Failed to destroy remainder stream (result=%d)", static_cast<int>(result));
+                TLLM_LOG_WARNING("[Localization] Failed to destroy remainder stream (result={})", result);
             }
             mRemainderStream = nullptr;
         }
@@ -502,8 +499,7 @@ private:
             CUresult const result = mApi.greenCtxDestroy(mRemainderGreenContext);
             if (result != CUDA_SUCCESS)
             {
-                TLLM_LOG_WARNING(
-                    "[Localization] Failed to destroy remainder Green Context (result=%d)", static_cast<int>(result));
+                TLLM_LOG_WARNING("[Localization] Failed to destroy remainder Green Context (result={})", result);
             }
             mRemainderGreenContext = nullptr;
         }
@@ -517,8 +513,7 @@ private:
                     CUresult const result = mApi.greenCtxDestroy(greenContext);
                     if (result != CUDA_SUCCESS)
                     {
-                        TLLM_LOG_WARNING(
-                            "[Localization] Failed to destroy Green Context (result=%d)", static_cast<int>(result));
+                        TLLM_LOG_WARNING("[Localization] Failed to destroy Green Context (result={})", result);
                     }
                     greenContext = nullptr;
                 }
@@ -885,8 +880,8 @@ private:
         if (result != CUDA_SUCCESS || localityDomainCount < kLocalityDomainCount)
         {
             TLLM_LOG_INFO(
-                "[Localization] Device %d does not expose two public locality domains (result=%d, "
-                "count=%d)",
+                "[Localization] Device {} does not expose two public locality domains (result={}, "
+                "count={})",
                 mDevice, static_cast<int>(result), localityDomainCount);
             return;
         }
@@ -906,7 +901,7 @@ private:
             &localityDomainSmCount, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_MULTIPROCESSOR_COUNT, mDevice);
         if (result != CUDA_SUCCESS || localityDomainSmCount <= 0)
         {
-            TLLM_LOG_WARNING("[Localization] Failed to query locality-domain SM count (result=%d, count=%d)",
+            TLLM_LOG_WARNING("[Localization] Failed to query locality-domain SM count (result={}, count={})",
                 static_cast<int>(result), localityDomainSmCount);
             return;
         }
@@ -920,7 +915,7 @@ private:
                 "partitioning is unavailable");
         }
 #else
-        TLLM_LOG_INFO("[Localization] Built with CUDA %d; public locality-domain support requires CUDA 13.4 headers",
+        TLLM_LOG_INFO("[Localization] Built with CUDA {}; public locality-domain support requires CUDA 13.4 headers",
             CUDA_VERSION);
 #endif
     }

@@ -255,10 +255,10 @@ HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const&
         return;
     }
     TLLM_CHECK_WITH_INFO(
-        initialSize <= vmSize, "HostMem initial size %zu exceeds reserved size %zu", initialSize, vmSize);
+        initialSize <= vmSize, "HostMem initial size {} exceeds reserved size {}", initialSize, vmSize);
     size_t const granularity = mBacking.commitGranularity();
     TLLM_CHECK_WITH_INFO(initialSize % granularity == 0,
-        "HostMem size %zu is not a multiple of the commit granularity %zu", initialSize, granularity);
+        "HostMem size {} is not a multiple of the commit granularity {}", initialSize, granularity);
     mChunkSize = roundUp(kFillChunkSize, granularity);
 
     try
@@ -326,9 +326,9 @@ void HostMem::resize(size_t newSize)
     }
 
     TLLM_CHECK_WITH_INFO(newSize % mBacking.commitGranularity() == 0,
-        "HostMem size %zu is not a multiple of the commit granularity %zu", newSize, mBacking.commitGranularity());
+        "HostMem size {} is not a multiple of the commit granularity {}", newSize, mBacking.commitGranularity());
     TLLM_CHECK_WITH_INFO(newSize <= mVmSize,
-        "HostMem resize to %zu exceeds the reserved maximum of %zu; raise the tier's maxQuota", newSize, mVmSize);
+        "HostMem resize to {} exceeds the reserved maximum of {}; raise the tier's maxQuota", newSize, mVmSize);
 
     if (newSize < mSize)
     {

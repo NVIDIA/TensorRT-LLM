@@ -136,10 +136,10 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
     // single 4-byte word per token, written by thread 0.
     constexpr int32_t VEC_SIZE = 4;
     TLLM_CHECK_WITH_INFO(head_dim == 128 || head_dim == 64,
-        "head_dim must be 128 (FP8) or 64 (FP4 packed) for the indexer cache (got %d)", head_dim);
-    TLLM_CHECK_WITH_INFO(head_dim % VEC_SIZE == 0, "head_dim (%d) must be a multiple of %d", head_dim, VEC_SIZE);
+        "head_dim must be 128 (FP8) or 64 (FP4 packed) for the indexer cache (got {})", head_dim);
+    TLLM_CHECK_WITH_INFO(head_dim % VEC_SIZE == 0, "head_dim ({}) must be a multiple of {}", head_dim, VEC_SIZE);
     TLLM_CHECK_WITH_INFO(scale_size == 4,
-        "scale_size must equal 4 bytes (packed UE8M0 x4 for FP4, 1 float32 for FP8, got %d)", scale_size);
+        "scale_size must equal 4 bytes (packed UE8M0 x4 for FP4, 1 float32 for FP8, got {})", scale_size);
 
     int32_t const threads_per_block = head_dim / VEC_SIZE;
 

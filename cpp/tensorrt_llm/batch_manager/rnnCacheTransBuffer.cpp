@@ -86,8 +86,8 @@ size_t RnnCacheTransBufferManager::computeTransferBufferSizeFromPool(
     size_t bufferSize = static_cast<size_t>(maxRealBlocksPerSeq) * bufferSizePerBlock;
 
     TLLM_LOG_DEBUG(
-        "RNN computeTransferBufferSizeFromPool: numLocalLayers=%d, convBytesPerLayer=%lu, ssmBytesPerLayer=%lu, "
-        "bufferSizePerBlock=%lu, maxRealBlocksPerSeq=%d, totalBufferSize=%lu",
+        "RNN computeTransferBufferSizeFromPool: numLocalLayers={}, convBytesPerLayer={}, ssmBytesPerLayer={}, "
+        "bufferSizePerBlock={}, maxRealBlocksPerSeq={}, totalBufferSize={}",
         numLocalLayers, convBytesPerLayer, ssmBytesPerLayer, bufferSizePerBlock, maxRealBlocksPerSeq, bufferSize);
 
     return bufferSize > 0 ? bufferSize : common::getEnvMemSizeForKVCacheTransferBuffer();

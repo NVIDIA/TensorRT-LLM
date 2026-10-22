@@ -161,7 +161,7 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
         if (cur_dev != device_id)
         {
             TLLM_LOG_INFO(
-                "[UserBuffer] rank %d: device used %d[%d] ,resetting device to %d", myrank, cur_dev, ndev, device_id);
+                "[UserBuffer] rank {}: device used {}[{}] ,resetting device to {}", myrank, cur_dev, ndev, device_id);
         }
         TLLM_CUDA_CHECK(cudaSetDevice(device_id));
         cur_dev = device_id;
@@ -284,9 +284,9 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
                     errorString = cudaErrorString;
                 }
                 TLLM_LOG_WARNING(
-                    "[UserBuffer] multicast mapping failed with CUDA error %ld (%s); falling back to "
+                    "[UserBuffer] multicast mapping failed with CUDA error {} ({}); falling back to "
                     "unicast user buffers",
-                    collectiveMapError, errorString);
+                    static_cast<int>(collectiveMapError), errorString);
             }
         }
         else
@@ -300,8 +300,8 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
             (*comm)->mc_baseptr = reinterpret_cast<void*>(mc_va);
             if ((*comm)->tp_rank == 0)
             {
-                TLLM_LOG_INFO("[UserBuffer] rank %d, MC initialized successfully, window size = %ld", (*comm)->nvrank,
-                    mc_maxsize);
+                TLLM_LOG_INFO(
+                    "[UserBuffer] rank {}, MC initialized successfully, window size = {}", (*comm)->nvrank, mc_maxsize);
             }
         }
         ub_barrier((*comm)->comm_world);
@@ -309,7 +309,7 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
     else
     {
         if ((*comm)->tp_rank == 0)
-            TLLM_LOG_WARNING("[UserBuffer] rank %d, MC NOT initialized and used", (*comm)->nvrank);
+            TLLM_LOG_WARNING("[UserBuffer] rank {}, MC NOT initialized and used", (*comm)->nvrank);
         (*comm)->mc_maxsize = 0;
         (*comm)->mc_offset = 0;
         (*comm)->use_mc = 0;
@@ -458,8 +458,8 @@ error:
     }
     else if (comm->myrank == 0)
     {
-        TLLM_LOG_WARNING("[UserBuffer] warning region %d size %ld MB registered without MC access", hndl,
-            aligned_size / 1024 / 1024);
+        TLLM_LOG_WARNING(
+            "[UserBuffer] warning region {} size {} MB registered without MC access", hndl, aligned_size / 1024 / 1024);
     }
     comm->mem_size[hndl] = aligned_size;
     comm->mem_ptr[hndl] = *gpubuff;

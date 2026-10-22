@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -131,8 +131,7 @@ private:
 public:
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)
     {
-        TLLM_CHECK_WITH_INFO(mBlockIdsPerWindow.find(windowSize) != mBlockIdsPerWindow.end(),
-            "Window size %d should exists", windowSize);
+        TLLM_CHECK_WITH_INFO(mBlockIdsPerWindow.contains(windowSize), "Window size {} should exists", windowSize);
         mBlockIdsPerWindow[windowSize] = std::move(blockIds);
     }
 
@@ -140,8 +139,7 @@ public:
     {
         for (auto const& [windowSize, blockIds] : blockIdsPerWindow)
         {
-            TLLM_CHECK_WITH_INFO(
-                mPoolsPerWindow.find(windowSize) != mPoolsPerWindow.end(), "Window size %d should exists", windowSize);
+            TLLM_CHECK_WITH_INFO(mPoolsPerWindow.contains(windowSize), "Window size {} should exists", windowSize);
         }
         mBlockIdsPerWindow = std::move(blockIdsPerWindow);
     }
@@ -164,8 +162,7 @@ public:
 
     BlockRangeForWindow getBlockRangeForWindow(SizeType32 windowSize, bool useIndexerKCache = false) const
     {
-        TLLM_CHECK_WITH_INFO(
-            mPoolsPerWindow.find(windowSize) != mPoolsPerWindow.end(), "Window size %d not found", windowSize);
+        TLLM_CHECK_WITH_INFO(mPoolsPerWindow.contains(windowSize), "Window size {} not found", windowSize);
         auto pool = mPoolsPerWindow.at(windowSize).front();
         auto blockIds = mBlockIdsPerWindow.at(windowSize);
         if (useIndexerKCache)

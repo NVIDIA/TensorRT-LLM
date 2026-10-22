@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -100,7 +100,7 @@ public:
         {
             return it->second;
         }
-        TLLM_CHECK_WITH_INFO(false, "Unknown NodeType string '%s'", typeStr.c_str());
+        TLLM_CHECK_WITH_INFO(false, "Unknown NodeType string '{}'", typeStr.c_str());
         return NodeType::kCHATBOT;
     }
 
@@ -121,7 +121,7 @@ public:
         {
             return it->second(level, params);
         }
-        TLLM_CHECK_WITH_INFO(false, "No creator registered for node type: %d", static_cast<SizeType32>(type));
+        TLLM_CHECK_WITH_INFO(false, "No creator registered for node type: {}", static_cast<SizeType32>(type));
         return nullptr;
     }
 
@@ -171,7 +171,7 @@ public:
         : mAgentRatio(agentRatio)
         , mChildNodeTypes(childNodeTypes)
     {
-        TLLM_CHECK_WITH_INFO(agentRatio >= 0.0f && agentRatio <= 1.0f, "Invalid agent ratio: %f", agentRatio);
+        TLLM_CHECK_WITH_INFO(agentRatio >= 0.0f && agentRatio <= 1.0f, "Invalid agent ratio: {:f}", agentRatio);
     }
 
     [[nodiscard]] float getAgentRatio() const noexcept

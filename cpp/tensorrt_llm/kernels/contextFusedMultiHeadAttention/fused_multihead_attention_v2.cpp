@@ -181,7 +181,7 @@ TFusedMHAKernelFactory<TFusedMHAKernelList>& TFusedMHAKernelFactory<TFusedMHAKer
 {
     static std::unique_ptr<TFusedMHAKernelFactory<TFusedMHAKernelList>> s_factory[32] = {nullptr};
     int const device_id = tensorrt_llm::common::getDevice();
-    TLLM_CHECK_WITH_INFO(device_id < 32, "Invalid device_id %d (must be < 32)", device_id);
+    TLLM_CHECK_WITH_INFO(device_id < 32, "Invalid device_id {} (must be < 32)", device_id);
     if (s_factory[device_id] == nullptr)
     {
         s_factory[device_id] = std::make_unique<TFusedMHAKernelFactory<TFusedMHAKernelList>>(
@@ -358,7 +358,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
                << std::dec << "\n\n";
         }
 
-        TLLM_CHECK_WITH_INFO(false, "%s", ss.str().c_str());
+        TLLM_CHECK_WITH_INFO(false, "{}", ss.str().c_str());
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
@@ -516,7 +516,7 @@ bool FusedMultiHeadAttentionXMMAKernelV2::checkIfKernelExist(MHARunnerFixedParam
                << std::dec << "\n\n";
         }
 
-        TLLM_LOG_WARNING(ss.str().c_str());
+        TLLM_LOG_WARNING("{}", ss.str().c_str());
     }
     return found;
 }
@@ -570,7 +570,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::getStepSize(uint32_t& out_step_q, uint
                << std::dec << "\n\n";
         }
 
-        TLLM_CHECK_WITH_INFO(false, "%s", ss.str().c_str());
+        TLLM_CHECK_WITH_INFO(false, "{}", ss.str().c_str());
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];

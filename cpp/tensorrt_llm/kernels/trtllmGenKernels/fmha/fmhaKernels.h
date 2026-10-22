@@ -47,13 +47,13 @@
 
 // Switch to streaming-style TLLM_LOG_* macros for trtllm-gen export headers,
 // which use streaming syntax (e.g., TLLM_LOG_INFO("val=", x)) instead of
-// TRT-LLM's printf-style (e.g., TLLM_LOG_INFO("val=%d", x)).
+// TRT-LLM's std::format-style (e.g., TLLM_LOG_INFO("val={}", x)).
 #include "trtllmGen_fmha_export/FmhaAutoTuner.h"
 #include "trtllmGen_fmha_export/FmhaInterface.h"
 #include "trtllmGen_fmha_export/FmhaOptions.h"
 #include "trtllmGen_fmha_export/KernelParams.h"
 #include "trtllmGen_fmha_export/trtllmGenLogCompat.h"
-// Restore original printf-style TLLM_LOG_* macros for the rest of this file.
+// Restore original std::format-style TLLM_LOG_* macros for the rest of this file.
 #include "trtllmGen_fmha_export/trtllmGenLogCompatEnd.h"
 
 namespace
@@ -222,10 +222,12 @@ public:
                         char const* errorString = nullptr;
                         mDriver->cuGetErrorName(result, &errorName);
                         mDriver->cuGetErrorString(result, &errorString);
-                        TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
-                            + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
-                            + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
-                            + std::string(errorString != nullptr ? errorString : "unknown"));
+                        TLLM_LOG_WARNING("{}",
+                            "Skipping FMHA kernel due to cuFuncSetAttribute failure: "
+                                + std::string(kernelMeta.mFuncName)
+                                + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
+                                + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
+                                + std::string(errorString != nullptr ? errorString : "unknown"));
                         continue;
                     }
                 }
@@ -238,7 +240,7 @@ public:
                 {
                     auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
                     TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
-                        "The kernel's hashId conflicts with another kernel in the same variant: existing=%s, new=%s.",
+                        "The kernel's hashId conflicts with another kernel in the same variant: existing={}, new={}.",
                         existingKernelMeta.mFuncName, kernelMeta.mFuncName);
                     // Prefer specific SM version over family version
                     if (existingKernelMeta.mSM == kSM_100f)
@@ -338,10 +340,10 @@ public:
         auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
         if (functions.find(hashId) == functions.end())
         {
-            TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
+            TLLM_LOG_WARNING("{}", "Trtllm-gen kernels not found: " + info);
             return std::make_pair(false, info);
         }
-        TLLM_LOG_DEBUG("TRTLLM-Gen kernel traits: %s", info.c_str());
+        TLLM_LOG_DEBUG("TRTLLM-Gen kernel traits: {}", info.c_str());
 
         return std::make_pair(true, info);
     }
@@ -437,7 +439,7 @@ private:
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
             {
                 auto const& kernelName = fmhaConfig.mFunctionName;
-                TLLM_LOG_INFO("JIT Warmup: Warmup for %s took %.3f ms", kernelName.c_str(), compileElapsedMs);
+                TLLM_LOG_INFO("JIT Warmup: Warmup for {} took {:.3f} ms", kernelName.c_str(), compileElapsedMs);
             }
         }
     }
@@ -460,8 +462,8 @@ private:
         int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
 
         TLLM_LOG_DEBUG(
-            "TRTLLM-Gen Fmha Warmup Params: maxBatchSize=%d, maxSeqLenKv=%d, useGenKernelForPrefill=%d, maxSeqLenQ=%d",
-            maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
+            "TRTLLM-Gen Fmha Warmup Params: maxBatchSize={}, maxSeqLenKv={}, useGenKernelForPrefill={}, maxSeqLenQ={}",
+            maxBatchSize, maxSeqLenKv, static_cast<int>(useGenKernelForPrefill), maxSeqLenQ);
         TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
             "TRTLLM-Gen Fmha Warmup Param is invalid.");
 
@@ -607,8 +609,9 @@ public:
             {
                 auto const& kernelName = fmhaConfig.mFunctionName;
                 TLLM_LOG_WARNING(
-                    "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took %.3f ms, kernelName=%s, "
-                    "batchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d. This could affect performance measurement.",
+                    "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took {:.3f} ms, "
+                    "kernelName={}, "
+                    "batchSize={}, maxSeqLenQ={}, maxSeqLenKv={}. This could affect performance measurement.",
                     compileElapsedMs, kernelName.c_str(), params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
             }
             mFmhaInterface.run(fmhaConfig, fmhaData, params.stream, params.mMultiProcessorCount, 0);
@@ -719,12 +722,12 @@ private:
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
-            "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
-            "headDimV=%d",
+            "Expect (32 <= headDim <= 1024), got headDimPerCtaV={}, headDimQk={}, "
+            "headDimV={}",
             headDimPerCtaV, headDimQk, headDimV);
         // The numTokensPerPage must be 0 (non-paged layouts) or a power of 2 (paged layouts).
         TLLM_CHECK_WITH_INFO(numTokensPerPage == 0 || (numTokensPerPage & (numTokensPerPage - 1)) == 0,
-            "The numTokensPerPage must be 0 or power of 2, got %d.", numTokensPerPage);
+            "The numTokensPerPage must be 0 or power of 2, got {}.", numTokensPerPage);
         TLLM_CHECK_WITH_INFO(tileSizeQ <= 128 && tileSizeKv <= 128, "The tileSizeQ and tileSizeKv must be <= 128.");
         TLLM_CHECK_WITH_INFO((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
             "The tileSizeQ and tileSizeKv must be power of 2.");
@@ -732,7 +735,7 @@ private:
         // Only (1,1), (2,1), and (1,2) are supported by FmhaOptions.
         TLLM_CHECK_WITH_INFO(
             (numInstsQ == 1 || numInstsQ == 2) && (numInstsKv == 1 || numInstsKv == 2) && (numInstsQ * numInstsKv <= 2),
-            "Expect numInstsQ/Kv in {(1,1),(2,1),(1,2)}, got numInstsQ=%d, numInstsKv=%d", numInstsQ, numInstsKv);
+            "Expect numInstsQ/Kv in {{(1,1),(2,1),(1,2)}}, got numInstsQ={}, numInstsKv={}", numInstsQ, numInstsKv);
         // Format of the hash key:
         // Bit 0  - 3 : qkvLayout.
         // Bit 4  - 7 : maskType.
@@ -773,7 +776,7 @@ private:
     {
         TLLM_CHECK_WITH_INFO(kernelMeta.mTileSizeQ > 0 && kernelMeta.mTileSizeKv > 0
                 && kernelMeta.mStepQ % kernelMeta.mTileSizeQ == 0 && kernelMeta.mStepKv % kernelMeta.mTileSizeKv == 0,
-            "Invalid step/tile sizes in FMHA kernel meta: stepQ=%d tileSizeQ=%d stepKv=%d tileSizeKv=%d",
+            "Invalid step/tile sizes in FMHA kernel meta: stepQ={} tileSizeQ={} stepKv={} tileSizeKv={}",
             kernelMeta.mStepQ, kernelMeta.mTileSizeQ, kernelMeta.mStepKv, kernelMeta.mTileSizeKv);
         int const numInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
         int const numInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
@@ -816,7 +819,7 @@ private:
             + (options.mFusesDsv4InvRopeFp8Quant ? (options.mUsesDsv4Ue8m0ScaleO ? "dsv4-ue8m0" : "dsv4-fp32")
                                                  : "plain");
 
-        TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
+        TLLM_LOG_DEBUG("{}", "Searching for kernel traits: " + info);
 
         // The fp16-softmax and 2:4 activation-sparsity variants are Rubin-only kernel selectors; the
         // FmhaOptions fields carrying them exist only under TLLM_RUBIN_FEATURES. They must be hashed
@@ -1326,15 +1329,15 @@ private:
         launch_config.sharedMemBytes = kernelMeta.mSharedMemBytes;
 
         // Debug info.
-        TLLM_LOG_DEBUG("TRTLLM-Gen launch info: kernelName = %s", kernelMeta.mFuncName);
+        TLLM_LOG_DEBUG("TRTLLM-Gen launch info: kernelName = {}", kernelMeta.mFuncName);
         TLLM_LOG_DEBUG(
-            "TRTLLM-Gen launch info: maxSeqLenQ = %d, "
-            "maxSeqLenKv = %d, "
-            "numHeadsQ = %d, "
-            "numHeadsKv = %d, batchSize = %d, kernelType = %d",
+            "TRTLLM-Gen launch info: maxSeqLenQ = {}, "
+            "maxSeqLenKv = {}, "
+            "numHeadsQ = {}, "
+            "numHeadsKv = {}, batchSize = {}, kernelType = {}",
             options.mMaxSeqLenQ, options.mMaxSeqLenKv, options.mNumHeadsQ, options.mNumHeadsKv, options.mBatchSize,
             static_cast<int>(options.mFmhaKernelType));
-        TLLM_LOG_DEBUG("TRTLLM-Gen launch info: numCtasX = %d, numCtasY = %d, numCtasZ = %d, clusterDimX = %d",
+        TLLM_LOG_DEBUG("TRTLLM-Gen launch info: numCtasX = {}, numCtasY = {}, numCtasZ = {}, clusterDimX = {}",
             launch_config.gridDimX, launch_config.gridDimY, launch_config.gridDimZ, launchedClusterDimX);
 
         CUlaunchAttribute launch_attribute[3];
@@ -1390,7 +1393,7 @@ private:
             + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) + ", numInstsQ=1, numInstsKv=1"
             + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mDsv4EpilogueFusion.enabled);
 
-        TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
+        TLLM_LOG_DEBUG("{}", "Searching for kernel traits: " + info);
 
         // Legacy path: SelectKernelParams has no groupsHeadsQ/numInsts fields; default them.
         return std::make_pair(
@@ -1535,7 +1538,7 @@ public:
     {
         static std::unique_ptr<TllmFmhaKernelFactory> sFactory[32] = {nullptr};
         int const deviceId = tensorrt_llm::common::getDevice();
-        TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId %d (must be < 32)", deviceId);
+        TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId {} (must be < 32)", deviceId);
         if (sFactory[deviceId] == nullptr)
         {
             sFactory[deviceId] = std::make_unique<TllmFmhaKernelFactory>(TllmFmhaKernelFactory());

@@ -392,9 +392,9 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     int const convDimDomainTP = convDimLocal / (domainTPSize / targetRankInfo.mPeerDupHeadFactor);
 
     TLLM_LOG_DEBUG(
-        "splitRnnConvState - numLayers: %d, convDimLocal: %d, dConvMinus1: %d, "
-        "domainPPSize: %d, domainTPSize: %d, convDimDomainTP: %d, "
-        "outputCacheNum: %zu, inputBlockNum: %zu, peerDupHeadFactor: %d",
+        "splitRnnConvState - numLayers: {}, convDimLocal: {}, dConvMinus1: {}, "
+        "domainPPSize: {}, domainTPSize: {}, convDimDomainTP: {}, "
+        "outputCacheNum: {}, inputBlockNum: {}, peerDupHeadFactor: {}",
         numLayers, convDimLocal, dConvMinus1, domainPPSize, domainTPSize, convDimDomainTP, outputSplitBlocks.size(),
         inputBlockNum, targetRankInfo.mPeerDupHeadFactor);
 
@@ -520,9 +520,9 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     int const headNumDomainTP = numHeadsLocal / (domainTPSize / targetRankInfo.mPeerDupHeadFactor);
 
     TLLM_LOG_DEBUG(
-        "splitRnnSsmState - numLayers: %d, numHeadsLocal: %d, headDim: %d, dState: %d, "
-        "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d, "
-        "outputCacheNum: %zu, peerDupHeadFactor: %d",
+        "splitRnnSsmState - numLayers: {}, numHeadsLocal: {}, headDim: {}, dState: {}, "
+        "domainPPSize: {}, domainTPSize: {}, headNumDomainTP: {}, "
+        "outputCacheNum: {}, peerDupHeadFactor: {}",
         numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP,
         outputSplitBlocks.size(), targetRankInfo.mPeerDupHeadFactor);
 
@@ -645,8 +645,8 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     int const convDimDomainTP = convDimLocal / (domainTPSize / targetRankInfo.mPeerDupHeadFactor);
 
     TLLM_LOG_DEBUG(
-        "concatRnnConvState - numLayers: %d, convDimLocal: %d, dConvMinus1: %d, "
-        "domainPPSize: %d, domainTPSize: %d, convDimDomainTP: %d",
+        "concatRnnConvState - numLayers: {}, convDimLocal: {}, dConvMinus1: {}, "
+        "domainPPSize: {}, domainTPSize: {}, convDimDomainTP: {}",
         numLayers, convDimLocal, dConvMinus1, domainPPSize, domainTPSize, convDimDomainTP);
 
     T** outputConvPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
@@ -768,9 +768,9 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     int const headNumDomainTP = numHeadsLocal / (domainTPSize / targetRankInfo.mPeerDupHeadFactor);
 
     TLLM_LOG_DEBUG(
-        "concatRnnSsmState - numLayers: %d, numHeadsLocal: %d, headDim: %d, dState: %d, "
-        "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d, "
-        "inputCacheNum: %zu, peerDupHeadFactor: %d",
+        "concatRnnSsmState - numLayers: {}, numHeadsLocal: {}, headDim: {}, dState: {}, "
+        "domainPPSize: {}, domainTPSize: {}, headNumDomainTP: {}, "
+        "inputCacheNum: {}, peerDupHeadFactor: {}",
         numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP, inputSplitBlocks.size(),
         targetRankInfo.mPeerDupHeadFactor);
 
@@ -1828,7 +1828,7 @@ void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
         splitUnifiedPoolSsm<int8_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("splitUnifiedPoolSsmDispatch: unsupported SSM data type size %zu", dataSize);
+    default: TLLM_THROW("splitUnifiedPoolSsmDispatch: unsupported SSM data type size {}", dataSize);
     }
 }
 
@@ -1853,7 +1853,7 @@ void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
         splitUnifiedPoolConv<int8_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("splitUnifiedPoolConvDispatch: unsupported conv data type size %zu", dataSize);
+    default: TLLM_THROW("splitUnifiedPoolConvDispatch: unsupported conv data type size {}", dataSize);
     }
 }
 
@@ -1877,7 +1877,7 @@ void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
         concatUnifiedPoolSsm<int8_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("concatUnifiedPoolSsmDispatch: unsupported SSM data type size %zu", dataSize);
+    default: TLLM_THROW("concatUnifiedPoolSsmDispatch: unsupported SSM data type size {}", dataSize);
     }
 }
 
@@ -1901,7 +1901,7 @@ void concatUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
         concatUnifiedPoolConv<int8_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("concatUnifiedPoolConvDispatch: unsupported conv data type size %zu", dataSize);
+    default: TLLM_THROW("concatUnifiedPoolConvDispatch: unsupported conv data type size {}", dataSize);
     }
 }
 
