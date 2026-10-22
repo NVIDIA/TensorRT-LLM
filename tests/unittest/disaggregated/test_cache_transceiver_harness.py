@@ -98,6 +98,7 @@ def _load_driver_ownership_helpers() -> types.ModuleType:
         "_first_reason",
         "_exchange_release_decision",
         "_hard_abort_process",
+        "_rank_info_auth_key_from_env",
     }
     return _load_driver_subset(
         "cache_transceiver_harness_ownership",
@@ -121,6 +122,18 @@ def _load_driver_ownership_helpers() -> types.ModuleType:
 
 
 OWNERSHIP = _load_driver_ownership_helpers()
+
+
+def test_rank_info_auth_key_from_env():
+    encoded_key = "ab" * 32
+
+    assert OWNERSHIP._rank_info_auth_key_from_env(
+        {"TRTLLM_DISAGG_RANK_INFO_AUTH_KEY": encoded_key}
+    ) == bytes.fromhex(encoded_key)
+    with pytest.raises(RuntimeError, match="Missing launcher-provisioned"):
+        OWNERSHIP._rank_info_auth_key_from_env({})
+    with pytest.raises(RuntimeError, match="Invalid launcher-provisioned"):
+        OWNERSHIP._rank_info_auth_key_from_env({"TRTLLM_DISAGG_RANK_INFO_AUTH_KEY": "not-hex"})
 
 
 def _load_driver_request_flow() -> types.ModuleType:
@@ -709,6 +722,7 @@ def test_single_node_transfer(tmp_path):
             "CTT_SWEEP": "0",
             "CTT_SWEEP_NAME": "default",
             "CUDA_VISIBLE_DEVICES": "0",
+            "TRTLLM_DISAGG_RANK_INFO_AUTH_KEY": "ab" * 32,
             # Emit protocol-selection tables while transfers are active so the
             # report can deterministically identify the CUDA KV-data transport.
             "UCX_PROTO_INFO": "y",

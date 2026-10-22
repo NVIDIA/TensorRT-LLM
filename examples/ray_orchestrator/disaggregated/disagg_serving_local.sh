@@ -88,11 +88,18 @@ if [[ "$ATTACH_MODE" == "true" ]]; then
     echo "Attach mode enabled - will not manage ray cluster"
 fi
 
+# All independently launched workers and the proxy must share this secret.
+INTERNAL_REQUEST_AUTH_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+ORIGINAL_UMASK=$(umask)
+umask 077
+trap 'rm -f extra_llm_config.yaml disagg_config_local.yaml' EXIT
+
 # Generate extra_llm_config.yaml based on executor type
 echo "Generating extra_llm_config.yaml for executor: $BACKEND"
 if [[ "$BACKEND" == "ray" ]]; then
     cat > extra_llm_config.yaml << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
+internal_request_auth_key: "$INTERNAL_REQUEST_AUTH_KEY"
 cache_transceiver_config:
     backend: "$TRANSCEIVER_BACKEND"
     transceiver_runtime: "$TRANSCEIVER_RUNTIME"
@@ -104,6 +111,7 @@ EOF
 else
     cat > extra_llm_config.yaml << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
+internal_request_auth_key: "$INTERNAL_REQUEST_AUTH_KEY"
 cache_transceiver_config:
     backend: "$TRANSCEIVER_BACKEND"
     transceiver_runtime: "$TRANSCEIVER_RUNTIME"
@@ -121,6 +129,7 @@ port: 8000
 model: $MODEL_DIR
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
+internal_request_auth_key: "$INTERNAL_REQUEST_AUTH_KEY"
 disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
@@ -143,6 +152,8 @@ generation_servers:
   urls:
       - "localhost:8002"
 EOF
+
+umask "$ORIGINAL_UMASK"
 
 # Conditionally start ray head if using ray backend and not in attach mode
 RAY_STARTED=false
@@ -185,5 +196,4 @@ if [[ "$RAY_STARTED" == "true" && "$ATTACH_MODE" != "true" ]]; then
     ray stop
 fi
 
-echo "Cleaning up generated extra_llm_config.yaml..."
-rm -f extra_llm_config.yaml
+echo "Cleaning up generated configuration files..."

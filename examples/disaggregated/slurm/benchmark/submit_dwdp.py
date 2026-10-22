@@ -43,8 +43,10 @@ from submit import (
     get_server_health_timeout,
     load_config,
     replace_env_in_file,
+    resolve_internal_request_auth_key,
     save_env_file,
     save_worker_config,
+    write_private_yaml,
 )
 
 
@@ -63,7 +65,13 @@ def parse_args():
 
 
 def generate_mpi_worker_config(
-    worker_config, allocations, env_config, disagg_hostname, disagg_port, output_path
+    worker_config,
+    allocations,
+    env_config,
+    disagg_hostname,
+    disagg_port,
+    output_path,
+    internal_request_auth_key,
 ):
     """Generate a config YAML compatible with ``trtllm-serve disaggregated_mpi_worker``."""
 
@@ -92,13 +100,12 @@ def generate_mpi_worker_config(
         "port": disagg_port,
         "backend": "pytorch",
         "max_retries": 100,
+        "internal_request_auth_key": internal_request_auth_key,
         "context_servers": ctx_section,
         "generation_servers": gen_section,
     }
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    write_private_yaml(output_path, config)
 
 
 def submit_dwdp_job(config, log_dir, dry_run):
@@ -111,6 +118,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
     env_config = config["environment"]
     worker_config = config["worker_config"]
     benchmark_config = config["benchmark"]
+    internal_request_auth_key = resolve_internal_request_auth_key(config)
 
     if "work_dir" in env_config and os.path.isdir(env_config["work_dir"]):
         script_dir = env_config["work_dir"]
@@ -210,8 +218,8 @@ def submit_dwdp_job(config, log_dir, dry_run):
 
     ctx_config_path = os.path.join(log_dir, "ctx_config.yaml")
     gen_config_path = os.path.join(log_dir, "gen_config.yaml")
-    save_worker_config(worker_config["ctx"], ctx_config_path)
-    save_worker_config(worker_config["gen"], gen_config_path)
+    save_worker_config(worker_config["ctx"], ctx_config_path, internal_request_auth_key)
+    save_worker_config(worker_config["gen"], gen_config_path, internal_request_auth_key)
 
     allocations = allocate_gpus(
         total_nodes=total_nodes,
@@ -291,8 +299,8 @@ def submit_dwdp_job(config, log_dir, dry_run):
     print("=" * 72)
 
     server_config = convert_allocations_to_server_config(allocations)
-    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
-        yaml.dump(server_config, f)
+    server_config["internal_request_auth_key"] = internal_request_auth_key
+    write_private_yaml(os.path.join(log_dir, "server_config_base.yaml"), server_config)
     disagg_server_hostname = server_config["hostname"]
     disagg_server_port = server_config["port"]
 
@@ -311,6 +319,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
         disagg_server_hostname,
         disagg_server_port,
         mpi_config_base_path,
+        internal_request_auth_key,
     )
 
     total_mpi_tasks = ctx_num * ctx_world_size + gen_num * gen_world_size
