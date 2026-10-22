@@ -380,15 +380,32 @@ def _selected_raw_logprobs_kernel(
     rank = tl.sum(((columns < VOCAB) & (logprobs > sampled)).to(tl.int32), 0)
     tl.store(sampled_values + row, sampled)
     tl.store(sampled_ranks + row, rank)
-    available = columns < VOCAB
-    for k in range(TOP_K):
-        value = tl.max(tl.where(available, logprobs, -float("inf")), 0)
-        index = tl.min(
-            tl.where(available & ((logprobs == value) | (value != value)), columns, 2147483647), 0
+    if TOP_K >= 64:
+        bits = logprobs.to(tl.uint32, bitcast=True)
+        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+        keys = (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - columns.to(tl.uint64))
+        SORT_K: tl.constexpr = triton.next_power_of_2(TOP_K)
+        keys = tl.topk(keys, SORT_K)
+        ordered = (keys >> 32).to(tl.uint32)
+        bits = tl.where((ordered & 0x80000000) != 0, ordered ^ 0x80000000, ~ordered)
+        offsets = tl.arange(0, SORT_K)
+        tl.store(
+            top_values + row * TOP_K + offsets, bits.to(tl.float32, bitcast=True), offsets < TOP_K
         )
-        tl.store(top_values + row * TOP_K + k, value)
-        tl.store(top_tokens + row * TOP_K + k, index)
-        available = available & (columns != index)
+        tl.store(
+            top_tokens + row * TOP_K + offsets, 0xFFFFFFFF - (keys & 0xFFFFFFFF), offsets < TOP_K
+        )
+    else:
+        available = columns < VOCAB
+        for k in range(TOP_K):
+            value = tl.max(tl.where(available, logprobs, -float("inf")), 0)
+            index = tl.min(
+                tl.where(available & ((logprobs == value) | (value != value)), columns, 2147483647),
+                0,
+            )
+            tl.store(top_values + row * TOP_K + k, value)
+            tl.store(top_tokens + row * TOP_K + k, index)
+            available = available & (columns != index)
 
 
 @triton.jit
@@ -432,6 +449,23 @@ def _raw_logprobs_partials_kernel(
         destination = (row * TILES + tile) * TOP_K + offsets
         tl.store(candidates + destination, sorted_values, offsets < TOP_K)
         tl.store(candidate_ids + destination, sorted_ids, offsets < TOP_K)
+    elif TOP_K >= 3:
+        bits = values.to(tl.uint32, bitcast=True)
+        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+        keys = (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - columns.to(tl.uint64))
+        keys = tl.where(columns < VOCAB, keys, 0)
+        for k in range(TOP_K):
+            key = tl.max(keys, 0)
+            ordered_value = (key >> 32).to(tl.uint32)
+            value_bits = tl.where(
+                (ordered_value & 0x80000000) != 0, ordered_value ^ 0x80000000, ~ordered_value
+            )
+            value = value_bits.to(tl.float32, bitcast=True)
+            index = (0xFFFFFFFF - (key & 0xFFFFFFFF)).to(tl.int32)
+            offset = (row * TILES + tile) * TOP_K + k
+            tl.store(candidates + offset, value)
+            tl.store(candidate_ids + offset, index)
+            keys = tl.where(columns == index, 0, keys)
     else:
         available = columns < VOCAB
         for k in range(TOP_K):
