@@ -1094,7 +1094,7 @@ def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath=
 //  - getFileChanges -> map of path to diff, for the paths in `filePaths`
 def getMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
     def result
-    if (globalVars[GITHUB_PR_API_URL] != null) {
+    if (globalVars[GITHUB_PR_API_URL]) {
         result = getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath, filePaths)
     } else if (globalVars[BASE_COMMIT]) {
         result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
