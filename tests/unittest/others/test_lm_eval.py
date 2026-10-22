@@ -47,9 +47,12 @@ from click.testing import CliRunner
 
 from tensorrt_llm.evaluate.covost2 import CoVoST2
 from tensorrt_llm.evaluate.lm_eval import (
+    AIME2025,
+    AIME2026,
     GSM8K,
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
     MAX_IN_FLIGHT_ENV_VAR,
+    LmEvalEvaluator,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
     _override_stop_strings,
@@ -1497,11 +1500,14 @@ _E2E_RESPONSES = [
 ]
 
 
-def _toy_task():
+def _toy_task(max_gen_toks: int | None = None):
     """A real generate_until ConfigurableTask over an in-memory dataset."""
     import datasets
     from lm_eval.api.task import ConfigurableTask
 
+    generation_kwargs = {"until": ["\n"], "do_sample": False}
+    if max_gen_toks is not None:
+        generation_kwargs["max_gen_toks"] = max_gen_toks
     return ConfigurableTask(
         config={
             "task": "toy_arith",
@@ -1512,7 +1518,7 @@ def _toy_task():
             "output_type": "generate_until",
             "doc_to_text": "Q: {{question}}\nA:",
             "doc_to_target": "{{answer}}",
-            "generation_kwargs": {"until": ["\n"], "do_sample": False},
+            "generation_kwargs": generation_kwargs,
             "filter_list": [
                 {
                     "name": "strict-match",
@@ -1534,7 +1540,11 @@ def _toy_task():
 
 
 def _canned_llm(responses):
-    """LLM whose generate_async yields the canned texts in submission order."""
+    """LLM whose generate_async yields the canned texts in submission order.
+
+    generate_async is a MagicMock, so tests can inspect the sampling params of
+    each request via ``llm.generate_async.call_args_list``.
+    """
     llm = MagicMock()
     llm.tokenizer = MagicMock()
     response_iter = iter(responses)
@@ -1545,7 +1555,7 @@ def _canned_llm(responses):
         output.result.return_value = _text_result(text)
         return output
 
-    llm.generate_async = generate_async
+    llm.generate_async = MagicMock(side_effect=generate_async)
     return llm
 
 
@@ -1867,3 +1877,68 @@ def test_stop_strings_cli_rejects_non_list_of_strings(value):
     result = CliRunner().invoke(GSM8K.command, ["--stop_strings", value], standalone_mode=False)
     assert isinstance(result.exception, click.BadParameter)
     assert "JSON list of strings" in result.exception.message
+
+
+# ===========================================================================
+# preserve_caller_max_tokens — caller max_tokens vs the task yaml's max_gen_toks
+# ===========================================================================
+#
+# ``--max_output_length`` reaches the wrapper as ``SamplingParams.max_tokens``,
+# which the task yaml's ``max_gen_toks`` (32768 for aime25 / aime26) replaces
+# unless ``preserve_caller_max_tokens`` is set and the caller's value is larger.
+
+
+@pytest.mark.parametrize(
+    "preserve_caller_max_tokens, caller_max_tokens, expected_max_tokens",
+    [
+        pytest.param(True, 4096, 4096, id="preserve_keeps_larger_caller_value"),
+        pytest.param(True, 8, 16, id="preserve_keeps_larger_task_value"),
+        pytest.param(False, 4096, 16, id="default_uses_task_yaml"),
+    ],
+)
+def test_text_evaluator_forwards_preserve_caller_max_tokens(
+    preserve_caller_max_tokens, caller_max_tokens, expected_max_tokens
+):
+    """A text-task ``LmEvalEvaluator`` honors ``preserve_caller_max_tokens``.
+
+    Runs the real evaluator (constructor + ``evaluate()``) and lm-eval loop
+    over a toy task whose yaml sets ``max_gen_toks: 16``, then checks the
+    max_tokens of every request that reaches the LLM. With the flag set, the
+    larger of the caller's and the task's budget wins.
+    """
+    with (
+        patch("tensorrt_llm.evaluate.lm_eval.TaskManager"),
+        patch(
+            "lm_eval.tasks.get_task_dict",
+            return_value={"toy_arith": _toy_task(max_gen_toks=16)},
+        ),
+    ):
+        evaluator = LmEvalEvaluator(
+            "toy_arith", preserve_caller_max_tokens=preserve_caller_max_tokens
+        )
+    llm = _canned_llm(_E2E_RESPONSES)
+    evaluator.evaluate(llm, SamplingParams(max_tokens=caller_max_tokens))
+    max_tokens = [
+        call.kwargs["sampling_params"].max_tokens for call in llm.generate_async.call_args_list
+    ]
+    assert max_tokens == [expected_max_tokens] * len(_E2E_DOCS)
+
+
+@pytest.mark.parametrize("evaluator_cls", [AIME2025, AIME2026], ids=["aime25", "aime26"])
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        pytest.param(["--preserve_caller_max_tokens"], True, id="flag_passed"),
+        pytest.param([], False, id="flag_absent"),
+    ],
+)
+def test_aime_cli_accepts_preserve_caller_max_tokens(evaluator_cls, args, expected):
+    """``aime25`` / ``aime26`` expose ``--preserve_caller_max_tokens``.
+
+    Command-level: the real click command parses the flag (default off) and
+    passes it to ``command_harness``.
+    """
+    with patch.object(evaluator_cls, "command_harness") as mock_harness:
+        result = CliRunner().invoke(evaluator_cls.command, args, standalone_mode=False)
+    assert result.exception is None
+    assert mock_harness.call_args.kwargs["preserve_caller_max_tokens"] is expected
