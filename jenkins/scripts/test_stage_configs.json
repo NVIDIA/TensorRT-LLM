@@ -504,7 +504,7 @@
       "slurm": true,
       "platform": "auto:dgx-b200-flex",
       "testDB": "l0_b200_multi_gpus_perf_sanity",
-      "splits": 4,
+      "splits": 3,
       "gpuCount": 8,
       "nodeCount": 1,
       "runWithSbatch": true
@@ -608,7 +608,7 @@
       "slurm": true,
       "platform": "auto:gb200-x4",
       "testDB": "l0_gb200_multi_gpus_perf_sanity",
-      "splits": 5,
+      "splits": 1,
       "gpuCount": 4
     },
     {
@@ -617,7 +617,7 @@
       "slurm": true,
       "platform": "auto:gb300-x4",
       "testDB": "l0_gb300_multi_gpus_perf_sanity",
-      "splits": 7,
+      "splits": 6,
       "gpuCount": 4,
       "nodeCount": 1,
       "runWithSbatch": true
@@ -673,7 +673,7 @@
       "target": "multiNodesSBSA",
       "platform": "auto:gb200-flex",
       "testDB": "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-      "splits": 3,
+      "splits": 2,
       "gpuCount": 8,
       "nodeCount": 2
     },
@@ -700,59 +700,15 @@
       "nodeCount": 3
     },
     {
-      "name": "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "auto:gb200-flex",
-      "testDB": "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-      "splits": 1,
-      "gpuCount": 12,
-      "nodeCount": 3
-    },
-    {
-      "name": "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "auto:gb200-flex",
-      "testDB": "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-      "splits": 1,
-      "gpuCount": 16,
-      "nodeCount": 4
-    },
-    {
-      "name": "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "auto:gb200-flex",
-      "testDB": "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-      "splits": 1,
-      "gpuCount": 20,
-      "nodeCount": 5
-    },
-    {
       "name": "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
       "arch": "SBSA",
       "slurm": true,
       "target": "multiNodesSBSA",
       "platform": "auto:gb200-flex",
       "testDB": "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
-      "splits": 3,
+      "splits": 1,
       "gpuCount": 8,
       "nodeCount": 2
-    },
-    {
-      "name": "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "auto:gb200-flex",
-      "testDB": "l0_gb200_multi_nodes_perf_sanity_gen1_node4_gpu16",
-      "splits": 1,
-      "gpuCount": 16,
-      "nodeCount": 4
     },
     {
       "name": "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
@@ -761,31 +717,9 @@
       "target": "multiNodesSBSA",
       "platform": "auto:gb300-flex",
       "testDB": "l0_gb300_multi_nodes_perf_sanity_node2_gpu8",
-      "splits": 4,
+      "splits": 2,
       "gpuCount": 8,
       "nodeCount": 2
-    },
-    {
-      "name": "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "auto:gb300-flex",
-      "testDB": "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-      "splits": 2,
-      "gpuCount": 12,
-      "nodeCount": 3
-    },
-    {
-      "name": "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "gb300-flex-aws-cmh",
-      "testDB": "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-      "splits": 2,
-      "gpuCount": 20,
-      "nodeCount": 5
     },
     {
       "name": "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
