@@ -56,6 +56,11 @@ THREADS = WARPS * 32
 KW = KHW // WARPS  # K a warp
 CL = KH * 4  # cluster size
 RPO = M // CL
+#: Item iterations a thread whose activation loads issue together (all of them at <= 16 rows).
+GROUP_IT = 10
+#: Rows of First2's A stage allocated at least: its shared-memory footprint (~90 KB at 2..8
+#: rows, ~118 KB at 16) leaves room beside it for the mix kernel's CTAs of the same site.
+A_MIN_ROWS = 8
 BLOCK_H = 16
 
 
@@ -67,6 +72,51 @@ def _st_dsmem_f32(addr, val, *, loc=None, ip=None):
         [cutlass.Int32(addr), cutlass.Float32(val)],
         "{ st.shared::cluster.f32 [$1], $2; mov.u32 $0, 0; }",
         "=r,r,f",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _st_async_f32(addr, val, mbar, *, loc=None, ip=None):
+    """4 bytes into a cluster CTA's shared memory, completing on that CTA's mbarrier."""
+    _asm(
+        T.i32(),
+        [cutlass.Int32(addr), cutlass.Float32(val), cutlass.Int32(mbar)],
+        "{ st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$1], $2, [$3]; "
+        "mov.u32 $0, 0; }",
+        "=r,r,f,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _mbar_init_tx(mbar, nbytes, *, loc=None, ip=None):
+    """Init an mbarrier (one arrival), make it visible to the cluster, arrive expecting
+    `nbytes` of transactions."""
+    _asm(
+        T.i32(),
+        [cutlass.Int32(mbar), cutlass.Int32(nbytes)],
+        "{ mbarrier.init.shared::cta.b64 [$1], 1; fence.mbarrier_init.release.cluster; "
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $2; mov.u32 $0, 0; }",
+        "=r,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _mbar_wait0(mbar, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(mbar)],
+        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.shared::cta.b64 p, [$1], 0; "
+        "@!p bra WAIT; mov.u32 $0, 0; }",
+        "=r,r",
         loc,
         ip,
         side_effects=True,
@@ -85,11 +135,12 @@ class _First2:
         def r(n):
             return -(-n // 128) * 128
 
-        b = r(NC * self.ld * 2) + r(M * self.ld * 2)
-        b += r(M * (KHW // VEC) * 4)
-        b += r(WARPS * M * NC * 4) + r(M * NC * 4)
-        b += r(CL * RPO * self.rld * 4) + r(M * 4) * 3
-        return b + 256
+        assert WARPS * M * NC * 4 + M * NC * 4 <= NC * self.ld * 2
+        b = r(max(self.rows, A_MIN_ROWS) * self.ld * 2) + r(NC * self.ld * 2)
+        b += r(self.rows * (KHW // VEC) * 4)
+        b += r(CL * RPO * self.rld * 4) + r(M * 4)
+        b += r(KHW * 2)  # the norm-weight slice
+        return b + 256 + 128
 
     @cute.jit
     def __call__(
@@ -170,42 +221,56 @@ class _First2:
         k0 = kh * KHW
         n0 = nc * NC
         me = kh + KH * s  # cluster rank
-        cute.arch.cluster_arrive_relaxed()
 
         smem = cutlass.utils.SmemAllocator()
+        # sA holds the R live rows only; the MMA's 16-row A view runs on into sW (rows past R
+        # are garbage, their outputs discarded: the MMA's rows are independent).
+        sA = smem.allocate_tensor(
+            cutlass.BFloat16,
+            cute.make_layout((max(rows, A_MIN_ROWS), KHW), stride=(ld, 1)),
+            byte_alignment=128,
+        )
         sW = smem.allocate_tensor(
             cutlass.BFloat16, cute.make_layout((NC, KHW), stride=(ld, 1)), byte_alignment=128
         )
-        sA = smem.allocate_tensor(
-            cutlass.BFloat16, cute.make_layout((M, KHW), stride=(ld, 1)), byte_alignment=128
-        )
         sSs = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((M, nvec), stride=(nvec, 1)), byte_alignment=128
+            cutlass.Float32, cute.make_layout((rows, nvec), stride=(nvec, 1)), byte_alignment=128
         )
-        sWp = smem.allocate_tensor(
-            cutlass.Float32,
-            cute.make_layout((WARPS, M, NC), stride=(M * NC, NC, 1)),
-            byte_alignment=128,
-        )
-        sAcc = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((M, NC), stride=(NC, 1)), byte_alignment=128
-        )
+        # The warps' partials and their sum reuse sW once every warp holds its B fragment.
+        wp_ptr = cute.recast_ptr(sW.iterator, dtype=cutlass.Float32)
+        sWp = cute.make_tensor(wp_ptr, cute.make_layout((WARPS, M, NC), stride=(M * NC, NC, 1)))
+        sAcc = cute.make_tensor(wp_ptr + WARPS * M * NC, cute.make_layout((M, NC), stride=(NC, 1)))
         sRed = smem.allocate_tensor(
             cutlass.Float32,
             cute.make_layout((CL, RPO, rld), stride=(RPO * rld, rld, 1)),
             byte_alignment=128,
         )
-        sInj = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((M,), stride=(1,)), byte_alignment=128
-        )
-        sSg = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((M,), stride=(1,)), byte_alignment=128
-        )
         sSsr = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((M,), stride=(1,)), byte_alignment=128
         )
+        sNw = smem.allocate_tensor(
+            cutlass.BFloat16, cute.make_layout((1, KHW), stride=(KHW, 1)), byte_alignment=128
+        )
+        sBar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), byte_alignment=8)
+        rbar = cutlass.Int32(sBar.iterator.toint())
+        # This CTA receives rows [me * RPO, me * RPO + RPO) of the cluster's partials from all CL
+        # CTAs, by st.async on `rbar` (no cluster barrier, no fence, after the pushes).
+        rows_me = cutlass.max(cutlass.min(cutlass.Int32(RPO), rows - me * RPO), cutlass.Int32(0))
+        if tidx == 0:
+            _mbar_init_tx(rbar, rows_me * (CL * (NC + 1) * 4))
+        cute.arch.cluster_arrive()
 
-        # 1. Before the wait: the CTA's 24 weight rows over its K half; zero A rows past R.
+        # 1. Before the wait: the norm weight's slice (its own cp.async group, waited on right
+        # after the PDL wait), then the CTA's 24 weight rows over its K half.
+        nw_vec = cute.logical_divide(mNorm, (None, VEC))
+        snw_vec = cute.logical_divide(sNw, (None, VEC))
+        if tidx < KHW // VEC:
+            cute.copy(
+                g2s,
+                nw_vec[0, (None, (s * hidden + k0) // VEC + tidx)],
+                snw_vec[0, (None, tidx)],
+            )
+        cute.arch.cp_async_commit_group()
         w_vec = cute.logical_divide(mW, (None, VEC))
         sw_vec = cute.logical_divide(sW, (None, VEC))
         pieces: cutlass.Constexpr = NC * nvec
@@ -217,90 +282,127 @@ class _First2:
                 p = c % nvec
                 cute.copy(g2s, w_vec[n0 + n, (None, col0 + p)], sw_vec[n, (None, p)])
         cute.arch.cp_async_commit_group()
-        for i in cutlass.range_constexpr(-(-((M - rows) * KHW) // THREADS)):
-            e = tidx + i * THREADS
-            if e < (M - rows) * KHW:
-                sA[rows + e // KHW, e % KHW] = cutlass.BFloat16(0.0)
         if const_expr(self.pdl):
             cute.arch.griddepcontrol_launch_dependents()
             cute.arch.griddepcontrol_wait()
 
-        # 2. Scalars; the K half's injection, sums of squares, y (bf16) into sA.
-        if tidx < rows:
-            if const_expr(self.inject):
-                sInj[tidx] = mInj[tidx, s].to(cutlass.Float32)
-                if const_expr(self.combine):
-                    z = mGate[tidx].to(cutlass.Float32)
-                    sSg[tidx] = 1.0 / (1.0 + cute.math.exp(-z))
-        cute.arch.sync_threads()
+        # 2. The K half's injection, sums of squares, y (bf16) into sA. Every activation load of
+        # a group of up to GROUP_IT items a thread (the row's injection weight and gate logit
+        # included) issues before the first is used: one L2 round trip a group.
         hc_vec = cute.logical_divide(mHc, (None, VEC))
         b_vec = cute.logical_divide(mBlock, (None, VEC))
         sh_vec = cute.logical_divide(mShared, (None, VEC))
         o_vec = cute.logical_divide(mHcOut, (None, VEC))
-        nw_vec = cute.logical_divide(mNorm, (None, VEC))
         sa_vec = cute.logical_divide(sA, (None, VEC))
         items: cutlass.Constexpr = rows * nvec
-        xr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
-        br = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
-        shr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
+        n_it: cutlass.Constexpr = -(-items // THREADS)
+        cute.arch.cp_async_wait_group(1)  # the norm slice (the weights may still be landing)
+        cute.arch.sync_threads()
         nwr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
         outr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
         yr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
-        for it in cutlass.range_constexpr(-(-items // THREADS)):
-            c = tidx + it * THREADS
-            if c < items:
+        for g0 in cutlass.range_constexpr(0, n_it, GROUP_IT):
+            g_n: cutlass.Constexpr = min(GROUP_IT, n_it - g0)
+            xg = cute.make_rmem_tensor(
+                cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
+            )
+            bg = cute.make_rmem_tensor(
+                cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
+            )
+            shg = cute.make_rmem_tensor(
+                cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
+            )
+            ig = cute.make_rmem_tensor(cute.make_layout((g_n,), stride=(1,)), cutlass.Float32)
+            zg = cute.make_rmem_tensor(cute.make_layout((g_n,), stride=(1,)), cutlass.Float32)
+            for k in cutlass.range_constexpr(g_n):
+                # Past the last item a thread reads the last item's operands (unused).
+                c = cutlass.min(tidx + (g0 + k) * THREADS, cutlass.Int32(items - 1))
                 r = c // nvec
                 p = c % nvec
-                cute.autovec_copy(hc_vec[r, (None, col0 + p)], xr)
-                cute.autovec_copy(nw_vec[0, (None, col0 + p)], nwr)
-                ssum = cutlass.Float32(0.0)
+                cute.autovec_copy(hc_vec[r, (None, col0 + p)], xg[k, None])
                 if const_expr(self.inject):
-                    cute.autovec_copy(b_vec[r, (None, k0 // VEC + p)], br)
-                    g = sInj[r]
+                    cute.autovec_copy(b_vec[r, (None, k0 // VEC + p)], bg[k, None])
+                    ig[k] = mInj[r, s].to(cutlass.Float32)
                     if const_expr(self.combine):
-                        cute.autovec_copy(sh_vec[r, (None, k0 // VEC + p)], shr)
-                        sg = sSg[r]
-                    for v in cutlass.range_constexpr(VEC):
-                        bv = br[v].to(cutlass.Float32)
+                        cute.autovec_copy(sh_vec[r, (None, k0 // VEC + p)], shg[k, None])
+                        zg[k] = mGate[r].to(cutlass.Float32)
+            for k in cutlass.range_constexpr(g_n):
+                c = tidx + (g0 + k) * THREADS
+                if c < items:
+                    r = c // nvec
+                    p = c % nvec
+                    cute.autovec_copy(snw_vec[0, (None, p)], nwr)
+                    ssum = cutlass.Float32(0.0)
+                    if const_expr(self.inject):
+                        g = ig[k]
                         if const_expr(self.combine):
-                            bv = (
-                                cute.math.fma(sg, shr[v].to(cutlass.Float32), bv)
-                                .to(cutlass.BFloat16)
-                                .to(cutlass.Float32)
+                            sg = 1.0 / (1.0 + cute.math.exp(-zg[k]))
+                        for v in cutlass.range_constexpr(VEC):
+                            bv = bg[k, v].to(cutlass.Float32)
+                            if const_expr(self.combine):
+                                bv = (
+                                    cute.math.fma(sg, shg[k, v].to(cutlass.Float32), bv)
+                                    .to(cutlass.BFloat16)
+                                    .to(cutlass.Float32)
+                                )
+                            outr[v] = cute.math.fma(bv, g, xg[k, v].to(cutlass.Float32)).to(
+                                cutlass.BFloat16
                             )
-                        outr[v] = cute.math.fma(bv, g, xr[v].to(cutlass.Float32)).to(
-                            cutlass.BFloat16
-                        )
-                    if nc == 0:
-                        cute.autovec_copy(outr, o_vec[r, (None, col0 + p)])
-                else:
+                        if nc == 0:
+                            cute.autovec_copy(outr, o_vec[r, (None, col0 + p)])
+                    else:
+                        for v in cutlass.range_constexpr(VEC):
+                            outr[v] = xg[k, v]
                     for v in cutlass.range_constexpr(VEC):
-                        outr[v] = xr[v]
-                for v in cutlass.range_constexpr(VEC):
-                    xv = outr[v].to(cutlass.Float32)
-                    ssum = xv * xv + ssum
-                    yr[v] = (xv * (1.0 + nwr[v].to(cutlass.Float32))).to(cutlass.BFloat16)
-                cute.autovec_copy(yr, sa_vec[r, (None, p)])
-                sSs[r, p] = ssum
+                        xv = outr[v].to(cutlass.Float32)
+                        ssum = xv * xv + ssum
+                        yr[v] = (xv * (1.0 + nwr[v].to(cutlass.Float32))).to(cutlass.BFloat16)
+                    cute.autovec_copy(yr, sa_vec[r, (None, p)])
+                    sSs[r, p] = ssum
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
         # 3. Warp w: rows x its 160-wide K slice x the 24 columns; the warps' partials summed in
         # warp order; the K half's sums of squares per row.
-        a_w = cute.make_tensor(sA.iterator + warp_i * KW, cute.make_layout((M, KW), stride=(ld, 1)))
+        # The warp's K slice: 320-byte offsets, so 16-byte aligned (ldmatrix rows).
+        a_w = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.BFloat16,
+                sA.iterator.toint() + warp_i * (KW * 2),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            ),
+            cute.make_layout((M, KW), stride=(ld, 1)),
+        )
         b_w = cute.make_tensor(
-            sW.iterator + warp_i * KW, cute.make_layout((NC, KW), stride=(ld, 1))
+            cute.make_ptr(
+                cutlass.BFloat16,
+                sW.iterator.toint() + warp_i * (KW * 2),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            ),
+            cute.make_layout((NC, KW), stride=(ld, 1)),
         )
         thr = mma.get_slice(lane)
         tCsA = thr.partition_A(a_w)
         tCrA = thr.make_fragment_A(tCsA)
-        cute.autovec_copy(tCsA, tCrA)
         tCsB = thr.partition_B(b_w)
         tCrB = thr.make_fragment_B(tCsB)
-        cute.autovec_copy(tCsB, tCrB)
+        # Fragments by ldmatrix (4 / 2 8x8 matrices an instruction).
+        ldsm_a = cute.make_tiled_copy_A(
+            cute.make_copy_atom(warp.LdMatrix8x8x16bOp(False, 4), cutlass.BFloat16), mma
+        )
+        ldsm_b = cute.make_tiled_copy_B(
+            cute.make_copy_atom(warp.LdMatrix8x8x16bOp(False, 2), cutlass.BFloat16), mma
+        )
+        cpa = ldsm_a.get_slice(lane)
+        cpb = ldsm_b.get_slice(lane)
+        cute.copy(ldsm_a, cpa.partition_S(a_w), cpa.retile(tCrA))
+        cute.copy(ldsm_b, cpb.partition_S(b_w), cpb.retile(tCrB))
         acc = cute.make_rmem_tensor(thr.partition_shape_C((M, NC)), cutlass.Float32)
         acc.fill(0.0)
         cute.gemm(mma, acc, tCrA, tCrB, acc)
+        cute.arch.sync_threads()  # every warp's fragments are loaded: sW may be reused
         co = thr.partition_C(cute.make_identity_tensor((M, NC)))
         for j in cutlass.range_constexpr(cute.size(acc)):
             rr, nn = co[j]
@@ -311,8 +413,9 @@ class _First2:
         rq = tidx // segs
         sq = tidx % segs
         t = cutlass.Float32(0.0)
-        for p in cutlass.range_constexpr(per_seg):
-            t = t + sSs[rq, sq * per_seg + p]
+        if rq < rows:
+            for p in cutlass.range_constexpr(per_seg):
+                t = t + sSs[rq, sq * per_seg + p]
         t = cute.arch.warp_reduction_sum(t, threads_in_group=segs)
         if sq == 0:
             if rq < rows:
@@ -348,9 +451,8 @@ class _First2:
                     else:
                         v = sSsr[rr]
                     dst = red_addr + ((me * RPO + rl) * rld + nn) * 4
-                    _st_dsmem_f32(_mapa(dst, o), v)
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
+                    _st_async_f32(_mapa(dst, o), v, _mapa(rbar, o))
+        _mbar_wait0(rbar)
 
         # 5. Rank `me` finishes rows (2 me, 2 me + 1): rstd per stream, the logits, low / injection.
         for it in cutlass.range_constexpr(-(-(RPO * NC) // THREADS)):
@@ -595,15 +697,21 @@ class _Mix2:
             sG[tidx] = 1.0 + mNorm[0, (tidx // BLOCK_H) * hidden + i0 + tidx % BLOCK_H].to(
                 cutlass.Float32
             )
-        for i in cutlass.range_constexpr(-(-((M - rows) * rank) // THREADS)):
-            e = tidx + i * THREADS
-            if e < (M - rows) * rank:
-                sL[rows + e // rank, e % rank] = cutlass.BFloat16(0.0)
+        # Rows of sL past R are never written (MMA rows are independent; discarded).
         gs = cutlass.Float32(0.0)
         if const_expr(self.fp4):
             gs = mGs[0]
+        # Before the wait as well: the up rows land, and every thread's B fragments go to
+        # registers (the post-wait MMA then reads only its A fragments from shared memory).
         if const_expr(self.pdl):
             cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+        thr = mma.get_slice(tidx)
+        tCsB = thr.partition_B(sU)
+        tCrB = thr.make_fragment_B(tCsB)
+        cute.autovec_copy(tCsB, tCrB)
+        if const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
 
         # low rows (16-byte pieces), rstd, this CTA's residual elements.
@@ -641,13 +749,13 @@ class _Mix2:
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        thr = mma.get_slice(tidx)
         tCsA = thr.partition_A(sL)
         tCrA = thr.make_fragment_A(tCsA)
-        cute.autovec_copy(tCsA, tCrA)
-        tCsB = thr.partition_B(sU)
-        tCrB = thr.make_fragment_B(tCsB)
-        cute.autovec_copy(tCsB, tCrB)
+        ldsm_a = cute.make_tiled_copy_A(
+            cute.make_copy_atom(warp.LdMatrix8x8x16bOp(False, 4), cutlass.BFloat16), mma
+        )
+        cpa = ldsm_a.get_slice(tidx)
+        cute.copy(ldsm_a, cpa.partition_S(sL), cpa.retile(tCrA))
         acc = cute.make_rmem_tensor(thr.partition_shape_C((M, nrow)), cutlass.Float32)
         acc.fill(0.0)
         cute.gemm(mma, acc, tCrA, tCrB, acc)
