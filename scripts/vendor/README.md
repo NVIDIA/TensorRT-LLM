@@ -28,6 +28,9 @@ lock and is not migrated by this change.
 flowchart TD
     candidate[Lock-changing PR for the configured consumer and base branch] --> classify{Selected vendor change}
     classify -->|new pin on temporary branch| metadata[Author lists upstream PRs in description]
+    classify -->|pin on configured upstream branch| ancestry{Live dev tip <= pin <= upstream tip?}
+    ancestry -->|yes, no PR list needed| verify
+    ancestry -->|no| feedback
     classify -->|temporary reference at current canonical pin| restore[Author restores canonical URL and branch only]
     restore --> cleanup[Reconcile obsolete bot feedback without approving code]
     classify -->|no promotion needed| cleanup
@@ -55,6 +58,45 @@ Promotion preserves the source SHA, selected files, compatibility patch, and
 digests. It does not re-vendor code. A periodic upstream refresh is a separate
 code-changing operation and must not use the promotion CI-skip path.
 
+### Upstream-main fast-forward exception
+
+A source update can pin the configured `--upstream-repo` and `--upstream-branch`
+(normally `main`) directly, provided immutable Git ancestry proves:
+
+```text
+previous canonical lock pin <= live canonical dev tip <= reviewed source pin <= observed upstream tip
+```
+
+Here `<=` means ancestor-or-equal, not patch similarity. The source pin may be
+older than the upstream tip. Other upstream branches/tags do not qualify, and a
+fork branch named `main` still uses normal contributor metadata. Divergent dev
+and upstream histories require a temporary fork based on dev or an explicitly
+audited maintainer refresh; do not rebase upstream or force-push dev.
+
+For a qualifying vendor, no `vendor-promotion` block entry, upstream PR list, or
+`unpaired_reason` is required. Existing metadata for that vendor is not parsed
+or matched. Other vendors in the same consumer PR still need their own normal
+metadata unless they independently qualify. The exception does not bypass
+source/include selection checks, materialization verification, normal source-PR
+review/CI, or canonical publishing-fork checks. Upstream merge commits are allowed;
+temporary-fork updates still require linear history.
+
+After merge, promotion advances dev to the **reviewed pin**, never to the moving
+upstream tip, then restores the canonical URL/branch in a lock-only PR. Live
+ancestry is rechecked before valid feedback and publication steps; ref movement
+that invalidates it stops promotion without force-pushing. This is not a permanent
+switch to tracking upstream and does not select a new canonical branch.
+
+New upstream-main promotions use `VENDOR PROMOTION V2` commit-message provenance:
+`source_mode: upstream-main`, the prior pin, `checked_canonical_tip`, `promoted`,
+`upstream_observed_main`, repository/branch identities, and attribution scope.
+They contain no synthetic unpaired commits or PR mappings. Retries verify and
+reuse the original immutable proof; mutable refs cannot rewrite published
+provenance. V1 temporary-fork records remain supported. A future refresh must
+verify that its **actual chosen upstream target contains the promoted pin**
+before omitting these commits; an old observation of upstream is not permission
+to drop them after an upstream history rewrite or an older target selection.
+
 ## Operator setup
 
 Use your own approved GitHub credentials (`gh auth login`, `GH_CONFIG_DIR`, or
@@ -80,8 +122,9 @@ selecting an arbitrary newer pin.
 
 ## Contributor metadata
 
-Source-update PRs must pin a temporary branch in a fork of the configured
-upstream, not the upstream repository itself (including upstream `main`).
+Source-update PRs normally pin a temporary branch in a fork of the configured
+upstream. The upstream-main exception below also permits the configured upstream
+repository/branch when Git ancestry proves that it contains the dev history.
 The pinned commit must contain the **latest canonical dev-branch tip**, even
 when the consumer's lock still names an older commit. Fetch and rebase onto
 the dev branch, push the temporary branch, then regenerate the consumer lock
@@ -89,8 +132,9 @@ and vendor snapshot at the new SHA. Updating only the temporary branch or PR
 description is insufficient. A broader upstream refresh uses the separate,
 explicitly configured maintainer refresh workflow.
 
-Authors add exactly one block to the source-update PR description. Multiple
-vendors can share it; each monitor reads its configured vendor entry:
+For temporary-fork updates, authors add exactly one block to the source-update
+PR description. Multiple vendors can share it; each monitor reads its configured
+vendor entry:
 
 ````markdown
 <!-- vendor-promotion:start -->
@@ -147,7 +191,7 @@ Commits with no lock-selected changes need no upstream attribution or author
 resolution. Empty selected patches never count as an upstream match; omit PRs
 that cover only excluded changes. The promotion record saves `attribution_scope`
 and marks excluded-only commits `outside-vendor-scope`, in an unpaired group with
-`refresh_policy: retain`. All source commits still undergo the linear-history
+`refresh_policy: retain`. Temporary-fork source commits still undergo the linear-history
 and ancestry checks, and the promoted SHA and vendored-tree verification remain
 unchanged. Scoped attribution does not prove whole-commit equivalence or authorize
 dropping changes to excluded files during a future source-branch refresh.
@@ -491,11 +535,19 @@ assertions but cannot accompany automatic matching. `--source-repo` selects a
 local immutable source checkout for materialization; `--worktree` overrides the
 follow-up checkout location. `--wait` optionally waits for and verifies merge.
 
+For the verified upstream-main exception, omit all three attribution options
+(`--from-pr-description`, `--upstream-pr`, `--unpaired-reason`). The engine infers
+the mode from the reviewed lock and verifies live ancestry; no additional opt-in
+flag or PR list is needed. If `--from-pr-description` is supplied, it is ignored
+only for this qualifying mode. Omitting attribution for an ordinary fork update
+still fails with instructions to provide it.
+
 Publication checks the merged source PR, expected previous canonical lock,
-linear fast-forward ancestry, current consumer pin, complete materialization,
+fast-forward ancestry (linear for temporary forks), current consumer pin, complete materialization,
 and full lock-only diff. It uses non-force pushes and DCO-signed commits. The
 `VENDOR PROMOTION V1` JSON block in the commit/squash message records vendor,
 source/consumer identities, source SHAs, upstream snapshots, and attribution.
+Upstream-main promotions use the V2 ancestry record described above instead.
 Historical `PRIMTS PROMOTION V1` messages remain readable. No provenance file is
 added to the consumer repository.
 

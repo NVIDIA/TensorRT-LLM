@@ -1247,6 +1247,64 @@ def test_valid_feedback_is_rechecked_when_only_dev_tip_changes(
     assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
 
 
+def test_upstream_main_reconciles_obsolete_review_without_sqlite(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor._feedback(monitor.gh.pr, _issue("Upstream is not a personal fork"))
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/org/library.git", "main")
+    api = monitor.gh.api
+    upstream_tip = "c" * 40
+
+    def get(endpoint, **kwargs):
+        if endpoint == "repos/org/library/git/ref/heads/main":
+            return {"object": {"sha": upstream_tip}}
+        return api(endpoint, **kwargs)
+
+    monkeypatch.setattr(monitor.gh, "api", get)
+    monkeypatch.setattr(
+        monitor.gh, "compare", lambda repo, base, head: {"merge_base_commit": {"sha": base}}
+    )
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, monitor.gh, store)
+        monkeypatch.setattr(restarted, "_inputs", lambda pr: (previous, reviewed))
+        restarted.inspect(7)
+        assert store.get("observation:7")["state"] == "metadata_valid"
+        assert len(monitor.gh.comments) == len(monitor.gh.reviews) == 1
+        assert monitor.gh.reviews[0]["state"] == "DISMISSED"
+        assert "Upstream-main source ancestry is valid" in monitor.gh.comments[0]["body"]
+        assert reviewed.commit in monitor.gh.comments[0]["body"]
+        writes = copy.deepcopy(monitor.gh.writes)
+        restarted.inspect(7)
+        assert monitor.gh.writes == writes
+
+        # Same PR and pin, but upstream no longer contains it: invalidate feedback.
+        monkeypatch.setattr(
+            monitor.gh,
+            "compare",
+            lambda repo, base, head: {"merge_base_commit": {"sha": previous.commit}},
+        )
+        restarted.inspect(7)
+        assert store.get("observation:7")["state"] == "blocked"
+        assert len(monitor.gh.comments) == 1
+        assert "not reachable" in monitor.gh.comments[0]["body"]
+        assert monitor.gh.reviews[-1]["state"] == "CHANGES_REQUESTED"
+
+
+def test_upstream_exception_does_not_waive_other_vendors_metadata(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The description mentions an upstream-main update for another vendor only.
+    monitor.gh.pr["body"] = m.template("other-vendor", "org/library")
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "main")
+    monkeypatch.setattr(monitor, "_inputs", lambda pr: (previous, reviewed))
+    monitor.inspect(7)
+    assert monitor.store.get("observation:7")["state"] == "blocked"
+    assert "vendors.toy" in monitor.gh.comments[0]["body"]
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+
+
 @pytest.mark.parametrize("change", ["other-vendor", "patch-only", "vendor-created"])
 def test_refresh_ignores_prs_without_selected_source_pin_change(
     monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, change: str
