@@ -338,6 +338,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -345,6 +346,9 @@ class TRTLLMOpBackend(MoEOpBackend):
         # produced them. Flattening is this provider's ABI detail.
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale.flatten()
+        # prerouted: (flat int32 routing tables, tile, top-k ids, bf16 top-k
+        # weights) from q35_fused_front; the op skips its routing kernel when
+        # its tactic uses that tile.
         hidden_size = gemm1_weights.shape[-1] * 2
         if gated_act_type == int(ActType_TrtllmGen.SiTu):
             # Fused SiTu FC1 cubins exist for two input formats: NVFP4
@@ -448,8 +452,25 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    **(
+                        dict(
+                            prerouted=prerouted[0],
+                            prerouted_tile=prerouted[1],
+                            prerouted_ids=prerouted[2],
+                            prerouted_weights=prerouted[3],
+                        )
+                        if prerouted is not None
+                        else {}
+                    ),
                 )
                 if not do_finalize:
+                    if prerouted is not None and outputs[1].numel() == 0:
+                        # The op returned placeholders for the caller's tensors.
+                        from .q35_fused_front import q35_prerouted_unfinalized
+
+                        outputs = q35_prerouted_unfinalized(
+                            outputs, prerouted[0], top_k, prerouted[3]
+                        )
                     return outputs
                 else:
                     final_hidden_states = outputs[0]

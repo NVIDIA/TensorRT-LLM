@@ -129,6 +129,15 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
     ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
+        # (flat routing tables, tile, top-k ids, bf16 top-k weights) from
+        # q35_fused_front.q35_routed_forward; the logits still drive the tactic lookup.
+        prerouted = self.__dict__.pop("_q35_prerouted_pending", None)
+        if prerouted is not None and (
+            k.token_selected_experts is not None
+            or k.router_logits is None
+            or prerouted[2].shape[0] != k.x.shape[0]
+        ):
+            prerouted = None
 
         act_type = to_trtllm_gen_act_type(self.activation_type)
         factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
@@ -179,6 +188,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            **({"prerouted": prerouted} if prerouted is not None else {}),
         )
 
         if not k.do_finalize:
