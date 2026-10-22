@@ -44,6 +44,7 @@ __all__ = ["OpenEngineServer", "launch_server"]
 # it still guards against pathological payloads.
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 _HEALTH_CHECK_INTERVAL_SECONDS = 1.0
+_HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
 _SERVER_OPTIONS = [
     ("grpc.max_receive_message_length", _MAX_MESSAGE_BYTES),
     ("grpc.max_send_message_length", _MAX_MESSAGE_BYTES),
@@ -115,8 +116,11 @@ class OpenEngineServer:
         self._frontend = frontend
         self._stopping = False
         self._health_task: asyncio.Task | None = None
+        self._engine_health_task: asyncio.Task[bool] | None = None
         self._health_refresh_lock = asyncio.Lock()
         self._inference_serving = False
+        self._engine_healthy = False
+        self._fatal_engine_failure = False
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
@@ -180,21 +184,57 @@ class OpenEngineServer:
             ready = False
             if not self._stopping:
                 try:
-                    ready = await asyncio.to_thread(self._control._engine_is_healthy)
+                    ready = await self._check_engine_health()
+                    self._engine_healthy = ready
                     if ready and self._frontend is not None:
                         status = await self._frontend.request("status")
                         ready = bool(status["ready"] and not status["stopping"])
                 except (RuntimeError, ValueError, OSError, CoordinationError) as error:
                     logger.warning(f"OpenEngine inference health check failed: {error}")
-            if self._stopping or ready == self._inference_serving:
+                    self._engine_healthy = False
+                executor = getattr(self._llm, "_executor", None)
+                if executor is not None and (
+                    getattr(executor, "_fatal_error", None) is not None
+                    or getattr(executor, "_engine_dead", False)
+                ):
+                    self._fatal_engine_failure = True
+            if self._stopping:
                 return
-            self._inference_serving = ready
-            await self._health.set(
-                "inference",
-                health_pb2.HealthCheckResponse.SERVING
-                if ready
-                else health_pb2.HealthCheckResponse.NOT_SERVING,
-            )
+            ready = ready and not self._fatal_engine_failure
+            if ready != self._inference_serving:
+                self._inference_serving = ready
+                await self._health.set(
+                    "inference",
+                    health_pb2.HealthCheckResponse.SERVING
+                    if ready
+                    else health_pb2.HealthCheckResponse.NOT_SERVING,
+                )
+            if self._fatal_engine_failure:
+                await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
+
+    async def _check_engine_health(self) -> bool:
+        task = self._engine_health_task
+        if task is not None:
+            if not task.done():
+                return False
+            self._engine_health_task = None
+            # The timed-out result is stale; start a fresh check instead.
+            task.exception()
+
+        task = asyncio.create_task(asyncio.to_thread(self._control._engine_is_healthy))
+        self._engine_health_task = task
+        task.add_done_callback(self._consume_engine_health_result)
+        done, _ = await asyncio.wait((task,), timeout=_HEALTH_CHECK_TIMEOUT_SECONDS)
+        if not done:
+            logger.warning("OpenEngine inference health check timed out")
+            return False
+        self._engine_health_task = None
+        return task.result()
+
+    @staticmethod
+    def _consume_engine_health_result(task: asyncio.Task[bool]) -> None:
+        if not task.cancelled():
+            task.exception()
 
     async def _monitor_inference_health(self) -> None:
         while not self._stopping:
@@ -203,6 +243,7 @@ class OpenEngineServer:
                 await self._refresh_inference_health()
             except Exception as error:
                 logger.error(f"OpenEngine inference health monitor failed: {error}")
+                self._engine_healthy = False
                 self._inference_serving = False
                 await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
 
@@ -306,13 +347,21 @@ def launch_server(
         }
 
         def healthy() -> bool:
-            try:
-                return not stop_event.is_set() and bool(llm._check_health())
-            except (RuntimeError, ValueError, OSError):
-                return False
+            return (
+                not stop_event.is_set()
+                and server is not None
+                and server._engine_healthy
+                and not server._fatal_engine_failure
+            )
+
+        def terminal_engine_failure() -> bool:
+            executor = getattr(llm, "_executor", None)
+            return executor is not None and (
+                getattr(executor, "_fatal_error", None) is not None
+                or getattr(executor, "_engine_dead", False)
+            )
 
         async def supervise() -> None:
-            group_was_ready = False
             while not stop_event.is_set():
                 if mode.is_attached_frontend and os.getppid() != parent_pid:
                     fail("OpenEngine launcher parent exited")
@@ -320,8 +369,16 @@ def launch_server(
                 if any(child.poll() is not None for child in children):
                     fail("An OpenEngine frontend exited; stopping the serving group")
                     return
-                if not healthy():
-                    fail("OpenEngine engine health check failed")
+                if server is None:
+                    engine_ready = await asyncio.wait_for(
+                        asyncio.to_thread(llm._check_health),
+                        timeout=_HEALTH_CHECK_TIMEOUT_SECONDS,
+                    )
+                    if server is None and not engine_ready:
+                        fail("OpenEngine engine health check failed during startup")
+                        return
+                if terminal_engine_failure():
+                    fail("OpenEngine terminal engine failure")
                     return
                 if frontend is not None:
                     try:
@@ -331,10 +388,6 @@ def launch_server(
                     if status["stopping"]:
                         stop_event.set()
                         return
-                    if group_was_ready and not status["ready"]:
-                        fail("OpenEngine frontend group became unavailable")
-                        return
-                    group_was_ready = status["ready"]
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=1.0)
                 except asyncio.TimeoutError:

@@ -35,12 +35,8 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
         last_status = None
         while True:
             async with self._changed:
-                status = (
-                    health_pb2.HealthCheckResponse.NOT_SERVING
-                    if self._shutting_down
-                    else self._statuses.get(
-                        request.service, health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
-                    )
+                status = self._statuses.get(
+                    request.service, health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
                 )
                 shutting_down = self._shutting_down
                 if status == last_status:
@@ -67,6 +63,6 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
             if self._shutting_down:
                 return
             self._shutting_down = True
-            for service in self._statuses:
-                self._statuses[service] = health_pb2.HealthCheckResponse.NOT_SERVING
+            self._statuses["inference"] = health_pb2.HealthCheckResponse.NOT_SERVING
+            self._statuses[""] = health_pb2.HealthCheckResponse.NOT_SERVING
             self._changed.notify_all()
