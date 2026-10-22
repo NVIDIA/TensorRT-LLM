@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Literal
@@ -23,6 +24,7 @@ from transformers import PretrainedConfig
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -731,6 +733,15 @@ _QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_SKIP_MROPE_COS_SIN
+    # Skip the packed mrope cos/sin table: the Qwen3.5 decoder never reads mrope_config (its fused
+    # qk-norm/rope/gate kernel applies RoPE from position_ids). Position deltas are still kept.
+    _Q35_SKIP_MROPE_COS_SIN = os.environ.get("TRTLLM_Q35_SKIP_MROPE_COS_SIN", "0") == "1"
+
+
 class _Qwen3_5VLModel(Qwen3VLModelBase):
     """Shared VLM wrapper composing the Qwen3 vision encoder with a Qwen3.5
     (Qwen3Next-based) text decoder.
@@ -782,6 +793,15 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_ids",
             "mrope_config.mrope_position_deltas",
         ]
+
+    def prepare_mrope_config(
+        self, multimodal_params, num_generation_requests, position_ids, **kwargs
+    ):
+        if _Q35_SKIP_MROPE_COS_SIN:
+            position_ids = None  # skips only the cos/sin table
+        return super().prepare_mrope_config(
+            multimodal_params, num_generation_requests, position_ids, **kwargs
+        )
 
     def load_weights(
         self,
