@@ -283,7 +283,6 @@ def test_accepts_paged_pools_and_per_layer_state_fragments() -> None:
     "address,size",
     [
         (_PAGED_BASE + 2 * 256, 8),  # The positional block table has a hole here.
-        (_PAGED_BASE + 256 + 120, 9),
         (_SECOND_POOL_BASE + 2 * 64, 8),
         (_STATE_BASE + 1 * 64, 8),
         (_STATE_BASE + 2 * 64 + 24, 8),
@@ -295,13 +294,19 @@ def test_rejects_regions_outside_the_piece(address: int, size: int) -> None:
         _validate(_grant(), [address], [size])
 
 
+def test_rejects_fragment_running_past_the_end_of_its_slot() -> None:
+    with pytest.raises(ValueError, match="runs past its end"):
+        _validate(_grant(), [_PAGED_BASE + 256 + 120], [9])
+
+
 def test_one_fragment_cannot_span_adjacent_slots() -> None:
+    """Touching slots are kept separate on purpose: a fragment belongs to exactly one slot."""
     grant = ReceiveBounds.from_chunk(
         _chunk(paged_ids=(1, 2), state_ids=()),
         _page_table(),
         {3: (_WRITER_BASE, 128)},
     )
-    with pytest.raises(ValueError, match="outside this receive piece"):
+    with pytest.raises(ValueError, match="may not span adjacent slots"):
         _validate(grant, [_SECOND_POOL_BASE + 64 + 60], [8])
 
 

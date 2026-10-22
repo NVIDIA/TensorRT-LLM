@@ -88,6 +88,11 @@ def _destination_intervals(chunk: Chunk, page_table: KVCachePageTable) -> list[t
             raise ValueError(f"unsupported cache kind for layer group {group_idx}")
 
     intervals.sort()
+    # Merge only overlapping intervals. Intervals that merely touch (adjacent slots, or
+    # adjacent per-layer state ranges) deliberately stay separate: every mapper emits a
+    # fragment inside one slot, so a fragment that runs from one slot into the next is a
+    # malformed result and must be rejected, not accepted because the neighbour happens to
+    # belong to the same request.
     merged: list[tuple[int, int]] = []
     for start, end in intervals:
         if merged and start < merged[-1][1]:
@@ -194,8 +199,13 @@ class ReceiveBounds:
         if np.any(indices < 0):
             raise ValueError("bounce fragment lies outside this receive piece")
         limits = ends[indices]
-        if np.any(addresses >= limits) or np.any(sizes.view(np.uint64) > limits - addresses):
+        if np.any(addresses >= limits):
             raise ValueError("bounce fragment lies outside this receive piece")
+        if np.any(sizes.view(np.uint64) > limits - addresses):
+            raise ValueError(
+                "bounce fragment starts inside a receive slot but runs past its end; "
+                "a fragment may not span adjacent slots"
+            )
 
         # The result arrays may outlive the decoded message while scatter runs on another thread.
         checked_ptrs = dst_ptrs.copy()
