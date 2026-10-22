@@ -1399,7 +1399,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             frozenset())
 
     def test_generation_lora_request_selects_lora_graph(self) -> None:
-        key = (1, 0, False, False, True, True)
+        key = KeyType(batch_size=1, draft_len=0, use_lora_graph=True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         engine._runner._lora = engine._runner._graphs._lora = SimpleNamespace(
             cuda_graph_manager=object())

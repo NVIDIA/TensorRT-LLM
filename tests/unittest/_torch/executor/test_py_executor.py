@@ -3834,7 +3834,7 @@ class TestOneModelMTPDraftTokenScheduling:
         disaggregated serving in one shot.
 
         The fix's state filter is {GENERATION_IN_PROGRESS,
-        DISAGG_GENERATION_INIT}, mirroring the two-model normalization, so a
+        DISAGG_GENERATION_INIT}, mirroring the drafter normalization, so a
         single fix covers the aggregated decode path (GENERATION_IN_PROGRESS)
         and the disagg decode-worker path (DISAGG_GENERATION_INIT). Context
         requests (CONTEXT_INIT) are not generation requests and must be left

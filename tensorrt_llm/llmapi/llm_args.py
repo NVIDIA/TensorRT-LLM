@@ -3265,14 +3265,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE (two-model) feeds captured target hidden states into the
-        # separate draft engine, so the shared Eagle3ResourceManager must
-        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
-        # the target model's hidden_states straight to the MTP layer
-        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
-        # both gated on self.is_mtp_eagle), so no capture buffer is needed
-        # and we should skip allocation to avoid disabling post-MLP/MoE
-        # fusion via the layer-capture hook.
+        # MTP_EAGLE_ONE_MODEL passes the target model's hidden_states straight
+        # to the MTP layer (see Eagle3OneModelWorker.prepare_1st_drafter_inputs
+        # / _run_draft_forward, both gated on self.is_mtp_eagle), so no capture
+        # buffer is needed and we skip allocation to avoid disabling
+        # post-MLP/MoE fusion via the layer-capture hook.
         return 0
 
     @property
