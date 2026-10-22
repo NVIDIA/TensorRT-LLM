@@ -525,7 +525,7 @@ def test_launch_server_disables_gc_only_when_requested(
 
     class _Llm:
         def __init__(self, **kwargs) -> None:
-            del kwargs
+            seen["engine_id"] = kwargs["_openengine_discovery"]["engine_id"]
             self.llm_id = "test-instance"
 
         def shutdown(self) -> None:
@@ -533,7 +533,7 @@ def test_launch_server_disables_gc_only_when_requested(
 
     class _Server:
         def __init__(self, **kwargs) -> None:
-            del kwargs
+            seen["instance_id"] = kwargs["instance_id"]
 
         async def start(self) -> None:
             seen["gc_enabled"] = gc.isenabled()
@@ -556,3 +556,4 @@ def test_launch_server_disables_gc_only_when_requested(
             gc.disable()
 
     assert seen["gc_enabled"] is gc_enabled
+    assert seen["instance_id"] == seen["engine_id"]

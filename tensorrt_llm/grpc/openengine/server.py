@@ -412,7 +412,7 @@ def launch_server(
                     raise RuntimeError(failure)
                 return
             logger.info("Model loaded successfully")
-            instance_id = str(llm.llm_id)
+            instance_id = llm_args["_openengine_discovery"]["engine_id"]
             if mode.is_launcher:
                 directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
                 longest_name = max("coordinator", f"frontend-{mode.num_frontends - 1}", key=len)
