@@ -4074,12 +4074,14 @@ class Linear(nn.Module):
                 and self.weights_loading_config.weight_mode
                 == WeightMode.FUSED_QKV_LINEAR):
             # INT8 kernels share one per-layer scale between K and V.
-            self.kv_cache_scaling_factor = Parameter(torch.ones(
-                1, dtype=torch.float32),
-                                                     requires_grad=False)
-            self.inv_kv_cache_scaling_factor = Parameter(torch.ones(
-                1, dtype=torch.float32),
+            # Version counters invalidate attention validation after reloads,
+            # including when model construction runs in inference mode.
+            with torch.inference_mode(False):
+                self.kv_cache_scaling_factor = Parameter(torch.ones(
+                    1, dtype=torch.float32),
                                                          requires_grad=False)
+                self.inv_kv_cache_scaling_factor = Parameter(
+                    torch.ones(1, dtype=torch.float32), requires_grad=False)
 
         self._weights_created = True
         self._weights_transformed = False
@@ -4350,8 +4352,8 @@ class Linear(nn.Module):
             raise ValueError(
                 "INT8 KV cache scale and reciprocal must be finite and "
                 "positive in float32.")
-        copy_weight(self.kv_cache_scaling_factor, scale)
-        copy_weight(self.inv_kv_cache_scaling_factor, inverse)
+        self.kv_cache_scaling_factor.copy_(scale)
+        self.inv_kv_cache_scaling_factor.copy_(inverse)
 
     def process_weights_after_loading(self):
         self.quant_method.process_weights_after_loading(self)

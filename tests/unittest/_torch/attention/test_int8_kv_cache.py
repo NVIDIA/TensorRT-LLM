@@ -4,6 +4,7 @@
 
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import replace
 
 import pytest
@@ -344,10 +345,12 @@ def test_int8_kv_rejects_invalid_scale_tensor(
         inputs = generate_inputs(case, seed=29)
         attention = _backend(case)
         metadata = _metadata(case, manager, case.token_nums)
-        scale = torch.tensor([1 / 32], dtype=torch.float32, device="cuda")
+        with torch.inference_mode(False):
+            scale = torch.tensor([1 / 32], dtype=torch.float32, device="cuda")
+            inverse = scale.reciprocal()
         forward_args = AttentionForwardArgs(
             attention_mask=PredefinedAttentionMask.CAUSAL,
-            kv_scale_orig_quant=scale.reciprocal(),
+            kv_scale_orig_quant=inverse,
             kv_scale_quant_orig=scale,
         )
         qkv = torch.cat((inputs["q"], inputs["new_k"], inputs["new_v"]), dim=-1)
@@ -437,6 +440,93 @@ def test_int8_kv_rejects_unsupported_forward_inputs(
         manager.shutdown()
 
 
+@pytest.fixture
+def validated_int8_inputs() -> Iterator[
+    tuple[TrtllmAttention, torch.Tensor, TrtllmAttentionMetadata, AttentionForwardArgs]
+]:
+    """Warm the native backend with versioned scales and a prepared context batch."""
+    case = BackendCase(
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_lens=[2],
+        num_cached_tokens=[0],
+        num_contexts=1,
+        page_size=64,
+    )
+    manager = _build_kv_cache_manager(case, "TRTLLM", torch.int8)
+    try:
+        manager.add_dummy_requests([0], case.token_nums)
+        metadata = _metadata(case, manager, case.token_nums)
+        inputs = generate_inputs(case, seed=29)
+        qkv = torch.cat((inputs["q"], inputs["new_k"], inputs["new_v"]), dim=-1)
+        attention = _backend(case)
+        with torch.inference_mode(False):
+            scale = torch.tensor([1 / 32], dtype=torch.float32, device="cuda")
+            inverse = scale.reciprocal()
+        args = AttentionForwardArgs(kv_scale_orig_quant=inverse, kv_scale_quant_orig=scale)
+        attention.forward(qkv, None, None, metadata, forward_args=args)
+        yield attention, qkv, metadata, args
+    finally:
+        manager.shutdown()
+
+
+def test_int8_kv_warm_validation_avoids_tensor_operations(validated_int8_inputs) -> None:
+    """Repeated invariant validation launches no tensor work or device-to-host copies."""
+    attention, qkv, metadata, args = validated_int8_inputs
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        for _ in range(10):
+            attention._validate_int8_kv_cache_inputs(qkv, metadata, args)
+    assert not [event.name for event in profile.events() if event.name.startswith("aten::")]
+
+
+@pytest.mark.parametrize("scale_field", ["kv_scale_orig_quant", "kv_scale_quant_orig"])
+@pytest.mark.parametrize("invalid_value", [0.0, float("nan"), 2.0])
+@pytest.mark.parametrize("inference_tensor", [False, True])
+@torch.inference_mode()
+def test_int8_kv_revalidates_mutated_scales(
+    validated_int8_inputs, scale_field: str, invalid_value: float, inference_tensor: bool
+) -> None:
+    """In-place mutation remains checked with and without tensor version counters."""
+    attention, qkv, metadata, args = validated_int8_inputs
+    if inference_tensor:
+        args.kv_scale_orig_quant = args.kv_scale_orig_quant.clone()
+        args.kv_scale_quant_orig = args.kv_scale_quant_orig.clone()
+    attention.forward(qkv, None, None, metadata, forward_args=args)
+    getattr(args, scale_field).fill_(invalid_value)
+    with pytest.raises(ValueError, match="finite, positive, reciprocal KV scales"):
+        attention.forward(qkv, None, None, metadata, forward_args=args)
+
+
+@pytest.mark.parametrize("change", ["dtype", "cache", "cross", "helix", "paged", "prefix"])
+def test_int8_kv_warm_validation_rejects_changed_inputs(validated_int8_inputs, change: str) -> None:
+    """A cache hit cannot hide changed input properties or batch-specific restrictions."""
+    attention, qkv, metadata, args = validated_int8_inputs
+    if change == "dtype":
+        qkv = qkv.float()
+    elif change == "cache":
+        metadata.kv_cache_params.use_cache = False
+    elif change == "cross":
+        metadata.seq_lens_kv = metadata.seq_lens.clone()
+    elif change == "helix":
+        metadata.enable_helix = True
+    elif change == "paged":
+        metadata.use_paged_context_fmha = True
+    else:
+        metadata.kv_cache_params.num_cached_tokens_per_seq[0] = 1
+    with pytest.raises(ValueError, match="INT8 KV cache"):
+        attention.forward(qkv, None, None, metadata, forward_args=args)
+
+
+def test_int8_kv_quant_config_update_invalidates_validation(validated_int8_inputs) -> None:
+    """Reconfiguring a backend requires scale validation again."""
+    attention, qkv, metadata, args = validated_int8_inputs
+    attention.update_quant_config(QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8))
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        attention._validate_int8_kv_cache_inputs(qkv, metadata, args)
+    assert any(event.name == "aten::stack" for event in profile.events())
+
+
 @pytest.mark.parametrize("scale_value", [0.1, 1e-20, 1e20])
 @torch.inference_mode()
 def test_int8_kv_scale_values_cuda_graph(scale_value: float) -> None:
@@ -464,13 +554,27 @@ def test_int8_kv_scale_graph_rejects_invalid_replay(scale_field: int, invalid_va
     script = """
 import sys
 import torch
-from tensorrt_llm._torch.attention.backends.trtllm import _validate_int8_kv_scale_values
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 scales = [torch.tensor([32.0], device="cuda"), torch.tensor([1 / 32], device="cuda")]
-_validate_int8_kv_scale_values(*scales)
+attention = TrtllmAttention(
+    layer_idx=0, num_heads=4, num_kv_heads=2, head_dim=128,
+    quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8),
+)
+q = torch.empty((1, 512), device="cuda", dtype=torch.float16)
+metadata = TrtllmAttentionMetadata(
+    num_contexts=0, max_num_requests=1, max_num_tokens=1,
+    kv_cache_params=KVCacheParams(use_cache=True),
+)
+args = AttentionForwardArgs(kv_scale_orig_quant=scales[0], kv_scale_quant_orig=scales[1])
+attention._validate_int8_kv_cache_inputs(q, metadata, args)
 graph = torch.cuda.CUDAGraph()
 with torch.cuda.graph(graph):
-    _validate_int8_kv_scale_values(*scales)
+    attention._validate_int8_kv_cache_inputs(q, metadata, args)
 graph.replay()
 torch.cuda.synchronize()
 scales[int(sys.argv[1])].fill_(float(sys.argv[2]))

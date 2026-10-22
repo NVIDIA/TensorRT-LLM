@@ -67,6 +67,27 @@ def test_int8_kv_load_and_partial_reload() -> None:
     )
 
 
+@torch.inference_mode()
+def test_int8_kv_scale_reload_advances_versions_in_inference_mode() -> None:
+    """Checkpoint reloads invalidate validation without changing graph pointers."""
+    qkv = _qkv()
+    scales = (qkv.kv_cache_scaling_factor, qkv.inv_kv_cache_scaling_factor)
+    assert all(not scale.is_inference() for scale in scales)
+    pointers = tuple(scale.data_ptr() for scale in scales)
+    versions = tuple(scale._version for scale in scales)
+    qkv.load_weights(_weights())
+    assert all(scale._version > version for scale, version in zip(scales, versions))
+    versions = tuple(scale._version for scale in scales)
+    qkv.load_weights(
+        [{}, {"k_scale": torch.tensor(0.125)}, {"v_scale": torch.tensor(0.25)}],
+        allow_partial_loading=True,
+    )
+    assert all(scale._version > version for scale, version in zip(scales, versions))
+    assert pointers == tuple(scale.data_ptr() for scale in scales)
+    assert scales[0].item() == 0.25
+    assert scales[1].item() == 4
+
+
 @pytest.mark.parametrize(
     "bad_scale", [0.0, -1.0, float("nan"), float("inf"), 1e-45, 1e40, [0.1, 0.2]]
 )
