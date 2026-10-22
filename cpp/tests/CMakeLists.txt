@@ -42,7 +42,7 @@ endforeach()
 
 function(add_tllm_gtest test_name)
   set(options FULL_STACK NO_GTEST_MAIN REQUIRES_GPU)
-  set(one_value_args TIMEOUT OWNER)
+  set(one_value_args TIMEOUT OWNER TEST_PREFIX)
   set(multi_value_args SOURCES LINK_LIBRARIES LABELS)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "${options}" "${one_value_args}"
                         "${multi_value_args}")
@@ -88,8 +88,13 @@ function(add_tllm_gtest test_name)
   if(ARG_TIMEOUT)
     list(APPEND test_properties TIMEOUT "${ARG_TIMEOUT}")
   endif()
-  gtest_discover_tests(${test_name} DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30
-                       PROPERTIES LABELS "${ARG_LABELS}" ${test_properties})
+  set(discovery_args)
+  if(NOT "${ARG_TEST_PREFIX}" STREQUAL "")
+    list(APPEND discovery_args TEST_PREFIX "${ARG_TEST_PREFIX}")
+  endif()
+  gtest_discover_tests(
+    ${test_name} ${discovery_args} DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30
+    PROPERTIES LABELS "${ARG_LABELS}" ${test_properties})
 
   add_dependencies(google-tests ${test_name})
   if(ARG_OWNER)
@@ -127,9 +132,12 @@ function(add_gtest test_name test_src)
     list(APPEND test_properties TIMEOUT "${ARGS_TIMEOUT}")
   endif()
 
+  set(discovery_args)
+  if(NOT "${ARGS_TEST_PREFIX}" STREQUAL "")
+    list(APPEND discovery_args TEST_PREFIX "${ARGS_TEST_PREFIX}")
+  endif()
   gtest_discover_tests(
-    ${test_name}
-    TEST_PREFIX "${ARGS_TEST_PREFIX}"
+    ${test_name} ${discovery_args}
     PROPERTIES ${test_properties}
                DISCOVERY_MODE
                PRE_TEST # WAR for DLL discovery on windows.
