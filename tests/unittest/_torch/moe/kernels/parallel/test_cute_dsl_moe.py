@@ -2842,6 +2842,32 @@ def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
     assert calls == [False]
 
 
+@pytest.mark.parametrize("num_tokens, reaches_aux_stream_check", [(1024, True), (1025, False)])
+def test_quantize_input_async_token_cap_boundary(
+    monkeypatch, num_tokens: int, reaches_aux_stream_check: bool
+):
+    """With the production cap, a 1024-token batch is still eligible for the
+    aux stream and a 1025-token batch (prefill) is quantized synchronously."""
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", True)
+    assert fused_moe_cute_dsl.ASYNC_INPUT_QUANT_MAX_TOKENS == 1024
+    aux_stream_checks = []
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        quantize_input=lambda x, post_quant_comm: (x, None),
+        # Declining the aux stream keeps the test on CPU; whether the check is
+        # reached shows which side of the cap the batch is on.
+        _has_moe_output_memset_aux_stream=lambda: aux_stream_checks.append(1) or False,
+    )
+    x = torch.empty(num_tokens, 4)
+
+    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+
+    assert x_q is x and x_sf is None and event is None
+    assert bool(aux_stream_checks) == reaches_aux_stream_check
+
+
 def test_join_pending_x_ready_waits_once():
     from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
 
