@@ -134,8 +134,8 @@ class MixedPrecisionKVStaging:
             non_blocking=True,
         )
         self.max_new_tokens_per_request = max(seq_lens, default=0)
-        # A captured graph bakes the launch geometry in, so it converts the full
-        # span; eager batches only convert up to their longest sequence.
+        # A captured graph cannot change this cap per replay, so it passes the
+        # full span; the kernel itself only visits the tokens each request has.
         self.read_capacity = (
             self.max_blocks_per_seq if capture_graph else max(self.page_counts, default=0)
         ) * self.tokens_per_block

@@ -100,6 +100,11 @@ class _PagedMixedPrecisionKV:
         self.write = write
         self.codec = codec
 
+    # Tokens covered by one pass of a request's threads; longer requests loop. The grid
+    # therefore does not grow with the capacity, which a CUDA graph freezes at the longest
+    # sequence: a 128K capacity would otherwise launch 131072 blocks per request and layer.
+    tokens_per_pass = 4096
+
     @cute.jit
     def __call__(
         self,
@@ -109,11 +114,12 @@ class _PagedMixedPrecisionKV:
         tables: cute.Tensor,
         lengths: cute.Tensor,
         capacity: cutlass.Int32,
+        span: cutlass.Int32,
         stream,
     ):
-        """Launch one thread per (token, kv, head, 16-element group) of the staging span."""
+        """Launch one thread per (token, kv, head, 16-element group) of a ``span``-token pass."""
         groups = (
-            cutlass.Int64(capacity)
+            cutlass.Int64(span)
             * pool.shape[1]
             * pool.shape[3]
             * (pool.shape[4] // self.codec.group_size)
@@ -132,56 +138,61 @@ class _PagedMixedPrecisionKV:
         lengths: cute.Tensor,
         capacity: cutlass.Int32,
     ):
-        """Move one 16-element group between its staging row and its pool page."""
+        """Move this request's 16-element groups between staging rows and pool pages."""
         thread, _, _ = cute.arch.thread_idx()
         block, request, _ = cute.arch.block_idx()
-        index = cutlass.Int64(block) * 128 + thread
+        blocks, _, _ = cute.arch.grid_dim()
         request = cutlass.Int64(request)
         groups = pool.shape[4] // self.codec.group_size
-        group = index % groups
-        row = index // groups
-        head = row % pool.shape[3]
-        kv = row // pool.shape[3] % pool.shape[1]
-        token = row // (pool.shape[1] * pool.shape[3])
+        rows_per_token = pool.shape[1] * pool.shape[3]
         pages_per_request = pool.shape[0] // lengths.shape[1]
-        position = token
+        start = lengths[0, request]
+        # Only the tokens this request really has are visited, read from device memory so
+        # a replayed graph follows the current lengths.
+        count = start
         if cutlass.const_expr(self.write):
-            position += lengths[0, request]
-        if token < capacity:
+            count = lengths[1, request] - start
+        count = cutlass.min(count, capacity)
+        total = count * (rows_per_token * groups)
+        stride = cutlass.Int32(blocks) * 128
+        for index in cutlass.range(cutlass.Int32(block) * 128 + thread, total, stride):
+            group = index % groups
+            row = index // groups
+            head = row % pool.shape[3]
+            kv = row // pool.shape[3] % pool.shape[1]
+            position = row // rows_per_token
+            if cutlass.const_expr(self.write):
+                position += start
             view_page = request * pages_per_request + position // pool.shape[2]
             view_row = pool[view_page, kv, position % pool.shape[2], head, None]
             view_tile = cute.local_tile(view_row, (self.codec.group_size,), (group,))
             page = position // low.shape[2]
             offset = position % low.shape[2]
-            valid = position < lengths[0, request]
+            low_page = cutlass.Int64(tables[0, request, page])
+            high_page = cutlass.Int64(tables[1, request, page])
             if cutlass.const_expr(self.write):
-                valid = position < lengths[1, request]
-            if valid:
-                low_page = cutlass.Int64(tables[0, request, page])
-                high_page = cutlass.Int64(tables[1, request, page])
-                if cutlass.const_expr(self.write):
-                    self.codec.encode(
-                        view_row,
+                self.codec.encode(
+                    view_row,
+                    low[low_page, kv, offset, head, None],
+                    group,
+                )
+                if high_page >= 0:
+                    high_row = high[high_page, kv, offset, head, None]
+                    _copy_native(
+                        view_tile, cute.local_tile(high_row, (self.codec.group_size,), (group,))
+                    )
+            else:
+                if high_page >= 0:
+                    high_row = high[high_page, kv, offset, head, None]
+                    _copy_native(
+                        cute.local_tile(high_row, (self.codec.group_size,), (group,)), view_tile
+                    )
+                else:
+                    self.codec.decode(
                         low[low_page, kv, offset, head, None],
                         group,
+                        view_tile,
                     )
-                    if high_page >= 0:
-                        high_row = high[high_page, kv, offset, head, None]
-                        _copy_native(
-                            view_tile, cute.local_tile(high_row, (self.codec.group_size,), (group,))
-                        )
-                else:
-                    if high_page >= 0:
-                        high_row = high[high_page, kv, offset, head, None]
-                        _copy_native(
-                            cute.local_tile(high_row, (self.codec.group_size,), (group,)), view_tile
-                        )
-                    else:
-                        self.codec.decode(
-                            low[low_page, kv, offset, head, None],
-                            group,
-                            view_tile,
-                        )
 
 
 _LOW_PRECISION_CODECS = {DataType.NVFP4: _NVFP4Codec}
@@ -249,7 +260,9 @@ def convert_mixed_precision_kv(
                 _PagedMixedPrecisionKV(write, codec),
                 *fake_tensors,
                 cutlass.Int32(capacity),
+                cutlass.Int32(capacity),
                 make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-    _compiled_kernels[key](*tensors, capacity)
+    span = min(capacity, _PagedMixedPrecisionKV.tokens_per_pass)
+    _compiled_kernels[key](*tensors, capacity, span)

@@ -601,6 +601,19 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
             False, capacity, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
         )
     assert kernels._compiled_kernels == compiled
+    # A small pass makes every thread loop over several tokens; the result must not change.
+    pool.copy_(torch.zeros_like(pool))
+    original_pass = kernels._PagedMixedPrecisionKV.tokens_per_pass
+    kernels._PagedMixedPrecisionKV.tokens_per_pass = 8
+    try:
+        convert_mixed_precision_kv(
+            False, 192, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+        )
+    finally:
+        kernels._PagedMixedPrecisionKV.tokens_per_pass = original_pass
+    expected[130:] = 0
+    actual = pool.transpose(1, 2).reshape_as(values)
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
 @pytest.mark.cpu_only
