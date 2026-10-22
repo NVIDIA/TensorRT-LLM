@@ -115,9 +115,13 @@ class TestDecideDoSampleFrames:
         # Target = floor(duration * fps) = floor(4.0 * 2.0) = 8 → no resample.
         vd_match = _fake_video({"duration": 4.0}, n_frames=8)
         assert _decide_do_sample_frames([vd_match], {"fps": 2.0}) is False
-        # Target = floor(4.0 * 4.0) = 16 ≠ 8 → resample.
+        # FPS sampling still delegates its frame cap to HF.
         vd_diff = _fake_video({"duration": 4.0}, n_frames=8)
         assert _decide_do_sample_frames([vd_diff], {"fps": 4.0}) is True
+
+    @pytest.mark.parametrize("n,target", [(10, 32), (40, 100)])
+    def test_oversized_num_frames_does_not_request_upsampling(self, n, target):
+        assert not _decide_do_sample_frames([_fake_video({}, n_frames=n)], {"num_frames": target})
 
     def test_silent_caller_io_loaded_all_triggers_fallback_sampling(self):
         # No num_frames/fps from caller, IO loaded every source frame
