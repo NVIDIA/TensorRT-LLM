@@ -29,6 +29,15 @@ drafter reads are the built-in's bytes. The fork point: right after the
 target's LM-head GEMM (``llm.lm_head``'s ``apply_linear``, bound on the
 instance), before its column gather.
 
+Over a windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``: the worker keeps
+the last ``_ctx_keep`` columns of each slot, physical column 0 holding logical
+token ``_ctx_base``) the side chain stores at the physical columns the
+built-in uses (``ctx_len - base + r``, clamped to the arena), with the
+logical RoPE positions. Without ``drafter_window_compact`` (``compacts_after_join``
+False) the commit is ``ops/spec/context_kv_commit_windowed.py``: the zeroing, the
+length update, then the built-in's compaction of each slot to its window and the
+physical lengths the drafter reads, all on the side stream.
+
 ``DecodeTarget.forward`` arms the fork with the step's metadata, so only
 decode steps (no context rows) fork; the step must also be one the side chain
 reproduces (``ContextKvFork.plan``: the dense arena, the captured features,
@@ -47,9 +56,9 @@ join -- and every other step reaches this class's prepare unchanged.
 No stream priority is set: the side stream is a default-priority stream of
 its own (``dedicated_stream``), never one of PyTorch's pooled streams.
 
-Over the windowed drafter context arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA=1``,
-composed with ``drafter_window_compact``) a slot's physical column 0 holds its
-logical token ``_ctx_base[slot]``, and the built-in stores row ``r`` at column
+Over the windowed drafter context arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA=1``)
+composed with ``drafter_window_compact`` (``compacts_after_join``), a slot's
+physical column 0 holds its logical token ``_ctx_base[slot]``, and the built-in stores row ``r`` at column
 ``min(_ctx_len - _ctx_base + r, capacity - 1)``, then compacts the slot's
 window (``_compact_ctx_window``) and hands the drafter ``_ctx_len - _ctx_base``.
 The side chain and the commit address those columns (``arena_columns``), and
@@ -75,9 +84,20 @@ from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
+from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
 
 #: Where the side chain forks: right after the LM head's GEMM.
 POINT = "head"
+
+
+def column_limit(worker: DFlashWorker) -> int:
+    """One past the last column the built-in stores a context row at, on a windowed-capable arena.
+
+    The arena's capacity when it keeps a window (``_ctx_keep``), else ``_max_ctx``
+    (an arena that may be windowed but keeps everything, whose base stays 0).
+    """
+    return worker._ctx_k_buf.size(2) if worker._ctx_keep else worker._max_ctx
+
 
 #: The built-ins this module writes out or relies on:
 #: ``DFlashWorker.prepare_1st_drafter_inputs`` (written out in
@@ -138,15 +158,34 @@ def arena_columns(worker) -> tuple[Optional[torch.Tensor], int]:
     return worker._ctx_base, worker._max_ctx - 1
 
 
+def compacts_after_join(worker) -> bool:
+    """Whether the worker's own window compaction follows the join over a windowed arena.
+
+    True when ``drafter_window_compact`` re-classed the worker
+    (``WindowCompactDFlashWorker``, installed after this fork): the commit then
+    only zeroes and advances the lengths (``context_kv_commit`` with the bases),
+    and the prepare runs that compaction and reads the physical lengths on the main
+    stream after the join (``drafter_lengths``). Otherwise the commit is
+    ``context_kv_commit_windowed``, which compacts and writes the physical lengths
+    itself on the side stream.
+    """
+    from ..drafter_window_compact.compact import WindowCompactDFlashWorker
+
+    return isinstance(worker, WindowCompactDFlashWorker)
+
+
 def drafter_lengths(worker, slots: torch.Tensor, new_lengths: torch.Tensor) -> torch.Tensor:
     """The built-in prepare's end once this step's rows are stored: ``num_ctx_per_req``.
 
-    ``new_lengths`` are ``_ctx_len[slots]`` after the update, which is what the
-    drafter reads over the dense arena. Over the windowed arena the built-in
-    compacts the slots' windows first (``_compact_ctx_window``) and reads the
-    physical lengths ``_ctx_len[slots] - _ctx_base[slots]``.
+    ``new_lengths`` are what the commit returned: ``_ctx_len[slots]`` after the
+    update, which is what the drafter reads over the dense arena, or the physical
+    lengths after the compaction when the windowed commit compacted
+    (``compacts_after_join`` False). When the worker's compaction follows the join,
+    over the windowed arena the built-in compacts the slots' windows first
+    (``_compact_ctx_window``) and reads the physical lengths
+    ``_ctx_len[slots] - _ctx_base[slots]``.
     """
-    if worker._ctx_base is None:
+    if worker._ctx_base is None or not compacts_after_join(worker):
         return new_lengths
     if worker._ctx_keep and not worker._ctx_paged:
         worker._compact_ctx_window(slots)
@@ -283,7 +322,7 @@ class ContextKvFork:
                     launched.k + 1,
                     worker._max_ctx,
                 )
-            else:
+            elif compacts_after_join(worker):
                 context_kv_commit(
                     worker._ctx_k_buf,
                     worker._ctx_v_buf,
@@ -295,6 +334,20 @@ class ContextKvFork:
                     worker._max_ctx,
                     base,
                     last,
+                )
+            else:
+                context_kv_commit_windowed(
+                    worker._ctx_k_buf,
+                    worker._ctx_v_buf,
+                    worker._ctx_len,
+                    worker._ctx_base,
+                    slots,
+                    num_accepted,
+                    num_ctx,
+                    launched.k + 1,
+                    worker._max_ctx,
+                    column_limit(worker),
+                    worker._ctx_keep,
                 )
         return num_ctx
 
@@ -365,7 +418,7 @@ class ContextKvFork:
         if base is None:
             col = positions.clamp(max=last)
         else:
-            # Windowed arena: physical columns.
+            # Windowed arena: physical columns, clamped as the built-in clamps them.
             col = ((ctx_len - base[slots]).unsqueeze(1) + offsets.unsqueeze(0)).clamp(max=last)
         # The built-in's get_hidden_states(num_tokens)[0 : rows]: the same view.
         gen_hs = spec_metadata.captured_hidden_states[

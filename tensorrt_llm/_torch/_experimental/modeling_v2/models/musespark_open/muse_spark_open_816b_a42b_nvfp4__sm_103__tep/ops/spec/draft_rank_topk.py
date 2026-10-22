@@ -86,7 +86,7 @@ class DraftRankTopK(OpWrapper):
     Integer selection: exact.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
     note = (
         "Used with draft_topk_merge after the draft head's MNNVL fp32 all-reduce "
         "(wide_draft_topk's RankTopKExchange, from 33 rows): the sum of "

@@ -551,11 +551,12 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         clamped -- is launched first, the noise block runs on the main stream
         meanwhile, and the main stream joins the side stream before returning.
         The commit returns the new lengths, which are ``_ctx_len[slots]`` after
-        the built-in store; the side chain's plan admits only the dense arena
-        (full-length or windowed), where the built-in neither clamps them to an
-        allocation nor indexes by batch row. Over a windowed arena the built-in's
-        window compaction and its read of the physical lengths follow the join
-        (``context_kv_fork.drafter_lengths``).
+        the built-in store (less ``_ctx_base[slots]`` after the compaction when the
+        windowed commit compacts); the side chain's plan admits only the dense
+        (unpaged) arena, full-length or windowed, where the built-in neither clamps
+        them to an allocation nor indexes by batch row. When ``drafter_window_compact``
+        compacts the windowed arena, the built-in's window compaction and its read of
+        the physical lengths follow the join (``context_kv_fork.drafter_lengths``).
         """
         num_gens = fold.accepted.shape[0]
         if (
@@ -609,10 +610,10 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         """The built-in ``if has_target_features:`` block of ``prepare_1st_drafter_inputs``, unchanged.
 
         Projects this step's captured target rows, writes their context K/V
-        into the drafter's arena (rows past the accepted count zeroed) and
-        advances ``_ctx_len``; over a windowed arena it then compacts the slots'
-        windows. ``gen_num_accepted_long`` is the fold's copy of
-        ``gen_num_accepted.long()``.
+        into the drafter's arena (rows past the accepted count zeroed; at the
+        physical columns over a windowed arena) and advances ``_ctx_len``, then
+        compacts a windowed arena's slots to their window as the built-in does.
+        ``gen_num_accepted_long`` is the fold's copy of ``gen_num_accepted.long()``.
         """
         gen_start = attn_metadata.num_ctx_tokens
         # Target now processes exactly K+1 tokens per gen req, so the
