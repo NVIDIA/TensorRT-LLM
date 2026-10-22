@@ -219,9 +219,15 @@ def _decide_do_sample_frames(
 
     if not has_num_frames and not has_fps:
         return any(
-            (vd.metadata or {}).get("frames_indices") is None
-            # A decoded prefix can also be a clip truncated by a failed frame.
-            or list(vd.metadata["frames_indices"]) == list(range(len(vd.frames)))
+            getattr(vd, "is_sampled", None) is False
+            or (
+                getattr(vd, "is_sampled", None) is None
+                and (
+                    (vd.metadata or {}).get("frames_indices") is None
+                    # A decoded prefix can also be a clip truncated by a failed frame.
+                    or list(vd.metadata["frames_indices"]) == list(range(len(vd.frames)))
+                )
+            )
             for vd in video_datas
         )
 
@@ -236,7 +242,7 @@ def _decide_do_sample_frames(
                 n_target = min(n_target, math.floor(duration * user_fps))
             n_target = max(1, n_target)
         elif has_num_frames:
-            n_target = user_num_frames if user_num_frames > 0 else n_decoded
+            n_target = min(user_num_frames, n_decoded) if user_num_frames > 0 else n_decoded
         else:  # has_fps
             n_target = math.floor(duration * user_fps) if user_fps > 0 else n_decoded
         if n_target != n_decoded:
@@ -470,6 +476,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                     sample_num_frames, sample_fps = n_decoded, None
                     per_video_kwargs["num_frames"] = n_decoded
                     per_video_kwargs.pop("fps", None)
+                elif num_frames is not None:
+                    # HF's explicit frame-count path does not cap at the
+                    # available frames and would repeat decoded positions.
+                    sample_num_frames = min(num_frames, n_decoded)
+                    per_video_kwargs["num_frames"] = sample_num_frames
                 if _decide_do_sample_frames([vd], per_video_kwargs):
                     sampling_metadata = VideoMetadata(
                         total_num_frames=n_decoded, fps=n_decoded / duration
@@ -511,6 +522,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         video: List[Image.Image],
         video_grid_thw: Optional[torch.Tensor] = None,
         video_metadata: Optional[Dict[str, Any]] = None,
+        video_is_sampled: Optional[bool] = None,
         **kwargs,
     ) -> int:
         merge = self.config.vision_config.spatial_merge_size
@@ -529,7 +541,13 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # for encoder inputs when the caller cannot supply the processed grid.
         processed = self._preprocess(
             "<|vision_start|><|video_pad|><|vision_end|>",
-            {"video": [VideoData(frames=video, metadata=video_metadata or {})]},
+            {
+                "video": [
+                    VideoData(
+                        frames=video, metadata=video_metadata or {}, is_sampled=video_is_sampled
+                    )
+                ]
+            },
             kwargs,
         )
         vgt = processed.get("video_grid_thw")
