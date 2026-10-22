@@ -9028,6 +9028,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     from ..attention.kernels.blackwell.paged_mqa_logits import (
         FP4MQALogitsKernel, FP8MQALogitsKernel)
+    from ..attention.kernels.blackwell.paged_mqa_logits.fp4_paged_mqa_logits import \
+        _max_n_tile as _fp4_max_n_tile
+    from ..attention.kernels.blackwell.paged_mqa_logits.mqa_logits_util import (
+        is_uneven_split, legal_atoms, validate_atom_split)
 
     class CuteDSLPagedMQALogitsRunner:
         """Runner for CuTe DSL FP8 Paged MQA Logits kernel (SM100 family).
@@ -9039,18 +9043,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
 
         @classmethod
-        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
-                     next_n, num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                     output_dtype):
+        def _compile(cls,
+                     compute_block_kv,
+                     phys_block_kv,
+                     num_heads,
+                     head_dim,
+                     next_n,
+                     num_sms,
+                     num_epi_subtiles,
+                     epi_dtype,
+                     acc_dtype,
+                     output_dtype,
+                     num_next_n_atoms=1,
+                     atom=None):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                   output_dtype)
+                   output_dtype, num_next_n_atoms, atom)
             if key in cls.kernel_cache:
                 return
 
             to_cutlass = _TORCH_TO_CUTLASS_DTYPE
-            N = next_n * num_heads
+            # In-kernel split: Q / weights carry one atom per L row; an uneven
+            # split uses flat per-token views (TMA zero-fills past the end).
+            uneven = is_uneven_split(next_n, num_next_n_atoms, atom)
+            N = (atom or next_n // num_next_n_atoms) * num_heads
             block_bytes = phys_block_kv * (head_dim + 4)
 
             sym_num_phys_blocks = cute.sym_int()
@@ -9069,25 +9086,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
                 stride=(cute.sym_int64(), 1))
 
-            q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8,
-                                                           (N, head_dim, sym_B),
-                                                           stride_order=(1, 0,
-                                                                         2))
-
             w_dtype = (cutlass.Float16
                        if epi_dtype == torch.float16 else to_cutlass[epi_dtype])
-            w_fake = cute.runtime.make_fake_compact_tensor(w_dtype, (N, sym_B),
-                                                           stride_order=(0, 1))
+            if uneven:
+                q_fake = cute.runtime.make_fake_tensor(
+                    cutlass.Uint8, (sym_B, head_dim, 1),
+                    stride=(head_dim, 1, cute.sym_int64()))
+                w_fake = cute.runtime.make_fake_tensor(w_dtype, (sym_B, ),
+                                                       stride=(1, ))
+            else:
+                q_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Uint8, (N, head_dim, sym_B), stride_order=(1, 0, 2))
+                w_fake = cute.runtime.make_fake_compact_tensor(w_dtype,
+                                                               (N, sym_B),
+                                                               stride_order=(0,
+                                                                             1))
+            # block_table / context_lens stay [batch]; Q's L dim is batch * atoms.
+            sym_batch = cute.sym_int()
 
             logits_fake = cute.runtime.make_fake_tensor(
                 to_cutlass[output_dtype], (cute.sym_int(), max_ctx),
                 stride=(cute.sym_int64(), 1))
 
             bt_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0))
+                cutlass.Int32, (sym_batch, max_blocks_per_seq),
+                stride_order=(1, 0))
 
             cl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
-                                                            (sym_B, ),
+                                                            (sym_batch, ),
                                                             stride_order=(0, ))
 
             sm_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
@@ -9103,6 +9129,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_heads=num_heads,
                 head_dim=head_dim,
                 next_n=next_n,
+                num_next_n_atoms=num_next_n_atoms,
+                atom=atom,
                 num_sms=num_sms,
                 num_epi_subtiles=num_epi_subtiles,
                 epi_dtype=to_cutlass[epi_dtype],
@@ -9143,6 +9171,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             epi_dtype: torch.dtype = torch.float32,
             acc_dtype: torch.dtype = torch.float32,
             output_dtype: torch.dtype = torch.float32,
+            num_next_n_atoms: int = 1,
+            atom: Optional[int] = None,
         ) -> torch.Tensor:
             """Execute FP8 paged MQA logits kernel.
 
@@ -9158,25 +9188,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 epi_dtype: epilogue compute dtype
                 acc_dtype: MMA accumulator dtype
                 output_dtype: output logits dtype
+                num_next_n_atoms: in-kernel split of next_n into atoms; the
+                    schedule must enumerate B * num_next_n_atoms atom rows
+                atom: tile width, required when the split is uneven
             Returns:
                 logits: [B*next_n, max_context_len] output_dtype
             """
             B, next_n, H, D = q.shape
-            N = next_n * H
+            atom = validate_atom_split(next_n, H, num_next_n_atoms, atom,
+                                       legal_atoms(H, 256, 8))
+            uneven = is_uneven_split(next_n, num_next_n_atoms, atom)
+            exp_B = B * num_next_n_atoms
+            N = atom * H
             phys_block_kv = kv_fused.shape[1]
             compute_block_kv = 128
             num_phys_blocks = kv_fused.shape[0]
             num_sms = _get_num_sms()
 
-            # Reshape Q: [B, next_n, H, D] -> [B, N, D] -> [N, D, B]
-            q_3d = q.reshape(B, N, D).permute(1, 2, 0)
-
-            # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B]
-            if epi_dtype == torch.float16:
-                # TODO: move type conversion to weight loading
-                w_2d = weights.reshape(B, N).half().t()
+            # TODO: move type conversion to weight loading
+            w_src = weights.half() if epi_dtype == torch.float16 else weights
+            if uneven:
+                R = B * next_n * H
+                q_3d = q.reshape(-1).as_strided((R, D, 1), (D, 1, R * D))
+                w_2d = w_src.reshape(-1)
             else:
-                w_2d = weights.reshape(B, N).t()
+                # [B, next_n, H, D] -> [N, D, B * atoms], one atom per L row
+                q_3d = q.reshape(-1).as_strided((N, D, exp_B), (D, 1, N * D))
+                w_2d = w_src.reshape(-1).as_strided((N, exp_B), (1, N))
 
             # Flatten fused KV to [num_phys_blocks, block_bytes]
             kv_flat = kv_fused.reshape(num_phys_blocks, -1)
@@ -9198,11 +9236,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
-                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
+                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype,
+                   num_next_n_atoms, atom)
             if key not in cls.kernel_cache:
                 cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
                              num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                             output_dtype)
+                             output_dtype, num_next_n_atoms, atom)
             compiled = cls.kernel_cache[key]
 
             # FP8 q needs uint8 view to match compile-time dtype
@@ -9211,7 +9250,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
             compiled(kv_flat, q_for_ffi, w_2d, logits, block_table,
-                     context_lens, schedule_meta, num_phys_blocks, B)
+                     context_lens, schedule_meta, num_phys_blocks, exp_B)
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
@@ -9229,6 +9268,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         epi_dtype: torch.dtype = torch.float32,
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        num_next_n_atoms: int = 1,
+        atom: Optional[int] = None,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -9260,7 +9301,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_epi_subtiles=num_epi_subtiles,
             epi_dtype=epi_dtype,
             acc_dtype=acc_dtype,
-            output_dtype=output_dtype)
+            output_dtype=output_dtype,
+            num_next_n_atoms=num_next_n_atoms,
+            atom=atom)
 
     @torch.library.register_fake("trtllm::cute_dsl_fp8_paged_mqa_logits")
     def _(
@@ -9275,6 +9318,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         epi_dtype: torch.dtype = torch.float32,
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        num_next_n_atoms: int = 1,
+        atom: Optional[int] = None,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
@@ -11351,18 +11396,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      emit_cand=False,
                      cand_cap=5120,
                      emit_cand_bucketed=False,
-                     accept_cap=8192):
+                     accept_cap=8192,
+                     num_next_n_atoms=1,
+                     atom=None):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap)
+                   emit_cand_bucketed, accept_cap, num_next_n_atoms, atom)
             if key in cls.kernel_cache:
                 return
 
             to_cutlass = _TORCH_TO_CUTLASS_DTYPE
-            N = next_n * num_heads
+            # Same split contract as the FP8 runner (flat views when uneven).
+            uneven = is_uneven_split(next_n, num_next_n_atoms, atom)
+            N = (atom or next_n // num_next_n_atoms) * num_heads
             half_head_dim = head_dim // 2
             # FP4 fused per-block bytes: data (phys_block_kv * D/2) + SF (phys_block_kv * 4)
             block_bytes = phys_block_kv * (half_head_dim + 4)
@@ -11383,18 +11432,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
                 stride=(cute.sym_int64(), 1))
 
-            # Q is FP4 packed bytes: head_dim/2 bytes per row
-            q_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Uint8, (N, half_head_dim, sym_B),
-                stride_order=(1, 0, 2))
-
-            # sf_q has shape (N, B); kernel TMA descriptor tile = real N
-            # (no GMEM pad). SMEM/UTCCP padding to N_padded is handled inside
-            # the kernel.
-            sf_q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
-                                                              (N, sym_B),
-                                                              stride_order=(0,
-                                                                            1))
+            # Q is FP4 packed bytes: head_dim/2 bytes per row; sf_q / weights
+            # tile = real N (SMEM/UTCCP padding is handled inside the kernel).
+            if uneven:
+                q_fake = cute.runtime.make_fake_tensor(
+                    cutlass.Uint8, (sym_B, half_head_dim, 1),
+                    stride=(half_head_dim, 1, cute.sym_int64()))
+                sf_q_fake = cute.runtime.make_fake_tensor(cutlass.Int32,
+                                                          (sym_B, ),
+                                                          stride=(1, ))
+            else:
+                q_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Uint8, (N, half_head_dim, sym_B),
+                    stride_order=(1, 0, 2))
+                sf_q_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (N, sym_B), stride_order=(0, 1))
+            sym_batch = cute.sym_int()
 
             if epi_dtype == torch.float16:
                 w_dtype = cutlass.Float16
@@ -11402,18 +11455,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 w_dtype = cutlass.BFloat16
             else:
                 w_dtype = cutlass.Float32
-            w_fake = cute.runtime.make_fake_compact_tensor(w_dtype, (N, sym_B),
-                                                           stride_order=(0, 1))
+            if uneven:
+                w_fake = cute.runtime.make_fake_tensor(w_dtype, (sym_B, ),
+                                                       stride=(1, ))
+            else:
+                w_fake = cute.runtime.make_fake_compact_tensor(w_dtype,
+                                                               (N, sym_B),
+                                                               stride_order=(0,
+                                                                             1))
 
             logits_fake = cute.runtime.make_fake_tensor(
                 to_cutlass[output_dtype], (cute.sym_int(), max_ctx),
                 stride=(cute.sym_int64(), 1))
 
             bt_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0))
+                cutlass.Int32, (sym_batch, max_blocks_per_seq),
+                stride_order=(1, 0))
 
             cl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
-                                                            (sym_B, ),
+                                                            (sym_batch, ),
                                                             stride_order=(0, ))
 
             sm_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
@@ -11436,7 +11496,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         stride_order=(1, 0),
                         assumed_align=16)
                     hit_bitmap_fake = cute.runtime.make_fake_compact_tensor(
-                        cutlass.Int32, (sym_B, cute.sym_int()),
+                        cutlass.Int32, (sym_batch, cute.sym_int()),
                         stride_order=(1, 0),
                         assumed_align=16)
             cand_fake = None
@@ -11504,6 +11564,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_heads=num_heads,
                 head_dim=head_dim,
                 next_n=next_n,
+                num_next_n_atoms=num_next_n_atoms,
+                atom=atom,
                 num_sms=num_sms,
                 num_epi_subtiles=num_epi_subtiles,
                 epi_dtype=to_cutlass[epi_dtype],
@@ -11578,6 +11640,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             accept_cap: int = 8192,
             cand_idx_out: Optional[torch.Tensor] = None,
             cand_cur_out: Optional[torch.Tensor] = None,
+            num_next_n_atoms: int = 1,
+            atom: Optional[int] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -11614,7 +11678,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             eager / CUDA-graph only.
             """
             B, next_n, H, half_D = q.shape
-            N = next_n * H
+            # num_next_n_atoms / atom: in-kernel split, as in the FP8 runner.
+            atom = validate_atom_split(next_n, H, num_next_n_atoms, atom,
+                                       legal_atoms(H, _fp4_max_n_tile(), 8))
+            uneven = is_uneven_split(next_n, num_next_n_atoms, atom)
+            exp_B = B * num_next_n_atoms
+            N = atom * H
             D = half_D * 2
             phys_block_kv = kv_fused.shape[1]
             compute_block_kv = 128
@@ -11627,26 +11696,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # cache (which assumes stride_order with half_D innermost).
             # The permute view alone gives strides (half_D, 1, N*half_D) which
             # are B-independent and match the compile-time fake stride.
-            q_3d = q.reshape(B, N, half_D).permute(1, 2, 0)
-
-            # Reshape sf_q: [B, next_n, H] -> [B, N] -> [N, B]
-            # No GMEM pad — kernel TMA descriptor uses tile=N (real), so TMA
-            # only fetches N int32 from GMEM. SMEM is still N_padded for UTCCP
-            # alignment; the SMEM tail (N..N_padded) is left as garbage and
-            # never read by MMA (UMMA_N=N) or epilogue (acc cols [0,N) only).
-            # Mirrors DeepGEMM's pattern (kRealNumSFQAtom=N, kNumSFQAtom=N_pad).
-            sf_q_2d = sf_q.reshape(B, N).t()  # (N, B), strides (1, N)
-
-            # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B] (cast to epi_dtype)
-            # NOTE: no .contiguous() — same reason as q_3d above.
             if epi_dtype == torch.float16:
-                w_2d = weights.reshape(B, N).half().t()
+                w_src = weights.half()
             elif epi_dtype == torch.bfloat16:
-                w_2d = weights.reshape(B, N).bfloat16().t()
+                w_src = weights.bfloat16()
             else:
-                w_2d = weights.reshape(B, N).t()
+                w_src = weights
+            if uneven:
+                R = B * next_n * H
+                q_3d = q.reshape(-1).as_strided((R, half_D, 1),
+                                                (half_D, 1, R * half_D))
+                sf_q_2d = sf_q.reshape(-1)
+                w_2d = w_src.reshape(-1)
+            else:
+                # [B, next_n, H, *] -> [N, *, B * atoms], one atom per L row
+                q_3d = q.reshape(-1).as_strided((N, half_D, exp_B),
+                                                (half_D, 1, N * half_D))
+                sf_q_2d = sf_q.reshape(-1).as_strided((N, exp_B), (1, N))
+                w_2d = w_src.reshape(-1).as_strided((N, exp_B), (1, N))
 
-            # Flatten fused KV to [num_phys_blocks, block_bytes]
             kv_flat = kv_fused.reshape(num_phys_blocks, -1)
 
             # Allocate output with alignment padding
@@ -11811,7 +11879,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap)
+                   emit_cand_bucketed, accept_cap, num_next_n_atoms, atom)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -11831,7 +11899,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_cand=emit_cand,
                     cand_cap=cand_cap,
                     emit_cand_bucketed=emit_cand_bucketed,
-                    accept_cap=accept_cap)
+                    accept_cap=accept_cap,
+                    num_next_n_atoms=num_next_n_atoms,
+                    atom=atom)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -11843,7 +11913,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          cand_cur_out)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
-                     context_lens, schedule_meta, num_phys_blocks, B, None,
+                     context_lens, schedule_meta, num_phys_blocks, exp_B, None,
                      None, None, None, None, None, None, None, None)
             return logits
 
@@ -11872,6 +11942,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cand_ctl_out: Optional[torch.Tensor] = None,
         cand_cur_out: Optional[torch.Tensor] = None,
         accept_cap: int = 8192,
+        num_next_n_atoms: int = 1,
+        atom: Optional[int] = None,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -11920,7 +11992,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_out=cand_out,
             cand_idx_out=cand_idx_out,
             cand_ctl_out=cand_ctl_out,
-            cand_cur_out=cand_cur_out)
+            cand_cur_out=cand_cur_out,
+            num_next_n_atoms=num_next_n_atoms,
+            atom=atom)
         # with emission on the runner returns a tuple; the op returns
         # logits only (emission buffers are caller-owned)
         return ret[0] if isinstance(ret, tuple) else ret
@@ -11946,6 +12020,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cand_ctl_out: Optional[torch.Tensor] = None,
         cand_cur_out: Optional[torch.Tensor] = None,
         accept_cap: int = 8192,
+        num_next_n_atoms: int = 1,
+        atom: Optional[int] = None,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]

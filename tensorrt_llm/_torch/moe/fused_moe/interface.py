@@ -229,6 +229,20 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
     # imported *by* this module.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
     supports_routing_aux: bool = False
+    # Set by callers that compose a ``FUSED_COMM`` backend's globally combined
+    # routed output themselves; read through ``returns_global_routed_output``.
+    accepts_global_routed_output: bool = False
+
+    @property
+    def returns_global_routed_output(self) -> bool:
+        """Whether ``forward`` returns the routed output already combined
+        across the attention-TP group on every rank.
+
+        Callers with ``reduce_results=False`` skip their routed all-reduce
+        exactly when this is True; otherwise the output is a rank partial for
+        that all-reduce. Layers that own their communication return False.
+        """
+        return False
 
     @classmethod
     @abstractmethod
