@@ -13,9 +13,7 @@ def test_fp8_rowwise_linear(dtype):
     HIDDEN_SIZE = 128
     torch.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
-    x_fp8, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
-    x_fp8 = x_fp8.view(torch.float8_e4m3fn)
-    x_scale = x_scale.float().squeeze()
+    x_fp8, x_scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)
     w = torch.randn((HIDDEN_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
     w_fp8, w_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(w)
     w_fp8 = w_fp8.view(torch.float8_e4m3fn)

@@ -1222,7 +1222,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 qinput, cur_input_scale = torch.ops.trtllm.tunable_fp8_per_token_quant(
                     input)
             else:
-                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(
                     input)
 
         # This op does not support bias now.
