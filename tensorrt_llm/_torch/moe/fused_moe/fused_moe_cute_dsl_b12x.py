@@ -180,7 +180,7 @@ class CuteDslB12xFusedMoEBase:
     # support; the gates still decline EPLB explicitly because the inherited
     # ``_supports_load_balancer()`` answers True. Router weights folded into the
     # input are out too: the decode path hands ``token_final_scales`` straight to
-    # the b12x wrapper, which has no defined behaviour for the ``None`` the fold
+    # the b12x wrapper, which has not been run on the unit placeholders the fold
     # leaves there.
     capabilities = MoEStaticCapability(
         supports_moe_lora=False,

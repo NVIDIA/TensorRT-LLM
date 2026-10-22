@@ -90,13 +90,7 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         del workspace  # The Triton kernel allocates its own intermediates.
         require_comm_plan(self, ctx)
-
-        # The scheduler leaves token_final_scales as None when the router
-        # weights were already folded into x; ones make the per-token scaling a
-        # no-op rather than a missing operand.
         token_final_scales = ctx.token_final_scales
-        if token_final_scales is None:
-            token_final_scales = torch.ones_like(ctx.token_selected_experts, dtype=torch.float32)
 
         # The kernel indexes local experts; zero the scale of every pair this
         # rank does not own.

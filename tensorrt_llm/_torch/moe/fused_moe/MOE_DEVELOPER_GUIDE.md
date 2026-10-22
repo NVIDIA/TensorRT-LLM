@@ -128,6 +128,8 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`.
 
+`apply_router_weight_on_input` (top-1 only) always takes separated routing, even for a backend that could route internally: the scheduler folds the routing weight into `x` before quantization and hands `run_moe` unit `token_final_scales`. The ones are made after dispatch, so a strategy that can dispatch without scales (NVLink, AllGather) carries none; DeepEP, DeepEPLowLatency and NcclEP get ones to dispatch. `MoERunContext.token_final_scales` is therefore `None` only when `token_selected_experts` is, and a backend needs no fallback of its own.
+
 `unfinalized_combine_fn` is a constructor argument (`create_moe(..., unfinalized_combine_fn=...)`) for a model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum. Once registered it runs on **every** `do_finalize=False` forward, with or without a comm strategy, so the forward's return type (dense tensor vs. unfinalized triple) depends only on static config. Under a comm strategy the scheduler runs it on the dispatched rows and the combine reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. That reordering is only sound for a combine that is an unweighted row sum over a dense per-token tensor; `DeepEPLowLatency.combine` is not one (it consumes expert-major rows and applies the routing weights itself), which is what `Communication.supports_finalize_before_combine()` declares. `ConfigurableMoE.validate_backend` rejects at construction: a backend without `supports_unfinalized_output()`, a comm without `supports_finalize_before_combine()`, and `apply_router_weight_on_input`. With no hook registered, `do_finalize=False` plus a comm strategy stays a named runtime refusal instead of a crash inside the comm layer.
 
 ### Fused-comm execution flow (MegaMoE-style)
@@ -401,7 +403,7 @@ package-level modules. `fused_moe_cute_dsl.py`, `fused_moe_cute_dsl_fc12.py` and
 | File | Role |
 |------|------|
 | `identity.py` | the identity segments (`PROVIDER_TRTLLM`, `TECHNIQUE_CUTEDSL`, `KERNEL_*`), and the grouped-GEMM query and id helper |
-| `kernel_inputs.py` | what more than one kernel takes, as free functions taking the impl: `NvFp4WeightView`, `finalize_routing_scales`, and `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input` |
+| `kernel_inputs.py` | what more than one kernel takes, as free functions taking the impl: `NvFp4WeightView` and `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input` |
 | `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, and BF16 |
 | `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the two grouped-GEMM leaves: construction, the output-memset overlap stream, the locality-domain plan, the weight lifecycle |
 | `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |

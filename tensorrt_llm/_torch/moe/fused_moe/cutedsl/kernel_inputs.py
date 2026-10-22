@@ -24,7 +24,6 @@ import torch
 
 from ....utils import Fp4QuantizedTensor
 from ..impl_base import MoEImplBase
-from ..impl_contract import MoERunContext
 
 
 @dataclass
@@ -45,21 +44,6 @@ class NvFp4WeightView:
     fc2_global_scale: torch.Tensor
     expert_size_per_partition: int
     slot_start: int
-
-
-def finalize_routing_scales(backend: MoEImplBase, ctx: MoERunContext) -> torch.Tensor:
-    """Per-token expert weights for a CuteDSL finalize epilogue.
-
-    With ``apply_router_weight_on_input`` the scheduler has already folded the
-    top-1 weight into ``x`` and may pass no scales; ones keep the finalize from
-    weighting twice.
-    """
-    if ctx.token_final_scales is not None:
-        return ctx.token_final_scales
-    assert backend.apply_router_weight_on_input, (
-        "token_final_scales is None without apply_router_weight_on_input"
-    )
-    return torch.ones_like(ctx.token_selected_experts, dtype=torch.float32)
 
 
 def quantize_input_nvfp4(

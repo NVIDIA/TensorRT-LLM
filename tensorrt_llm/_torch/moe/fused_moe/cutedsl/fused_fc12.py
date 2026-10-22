@@ -25,8 +25,8 @@ itself, and owns the four abstract methods. The NVFP4 weight layout, quant metho
 (``NVFP4CuteDslFusedMoEMethod``) and weight view are the ones
 ``TrtllmCutedslGroupedGemmNvfp4Impl`` uses for its two-op path, restated here
 rather than inherited so this class carries no two-op or locality-domain entry
-points it cannot execute; input quantization and the finalize routing scales are
-the shared ``quantize_input_nvfp4`` and ``finalize_routing_scales``. The outer
+points it cannot execute; input quantization is the shared
+``quantize_input_nvfp4``. The outer
 autotune runner reuses ``CuteDslFusedMoENvfp4Runner`` with the tile set narrowed
 to what the fused kernel supports. Locality domains (uGPU) are not enabled for
 this backend.
@@ -64,7 +64,7 @@ from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from ..routing import BaseMoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from .kernel_inputs import NvFp4WeightView, quantize_input_nvfp4
 from .runners import CuteDslFusedMoENvfp4Runner
 
 
@@ -301,7 +301,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         return self.run_moe_nvfp4(
             x=ctx.x,
             token_selected_experts=ctx.token_selected_experts,
-            token_final_scales=finalize_routing_scales(self, ctx),
+            token_final_scales=ctx.token_final_scales,
             x_sf=ctx.x_sf,
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,

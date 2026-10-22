@@ -41,7 +41,7 @@ from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
 from ...quantization import NVFP4CuteDslFusedMoEMethod
 from ..identity import grouped_gemm_identity
-from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from ..kernel_inputs import NvFp4WeightView, quantize_input_nvfp4
 from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
@@ -199,7 +199,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         return self.run_moe_nvfp4(
             x=ctx.x,
             token_selected_experts=ctx.token_selected_experts,
-            token_final_scales=finalize_routing_scales(self, ctx),
+            token_final_scales=ctx.token_final_scales,
             x_sf=ctx.x_sf,
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,

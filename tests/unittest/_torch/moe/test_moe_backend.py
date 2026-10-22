@@ -55,6 +55,8 @@ from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
+    Llama4RenormalizeMoeRoutingMethod,
+    MoEImplBase,
     RenormalizeMoeRoutingMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
@@ -738,6 +740,140 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
         assert plan.recv_expert_count is None
         assert plan.deep_ep_expert_capacity is None
     assert plan.use_deep_ep_direct_metadata is expected
+
+
+# =====================================================================
+# apply_router_weight_on_input: the scheduler folds the top-1 weight into
+# x and hands every backend unit scales in its place.
+# =====================================================================
+
+_FOLD_NUM_TOKENS = 3
+_FOLD_HIDDEN = 4
+_FOLD_NUM_EXPERTS = 4
+
+# Every external-comm implementation that admits a folded router weight.
+_FOLDING_LEAVES = [
+    cls
+    for cls in IMPL_PRIORITY
+    if issubclass(cls, MoEImplBase)
+    and cls.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM
+    and cls.capabilities.supports_apply_router_weight_on_input
+]
+
+
+def _capturing_backend(leaf_cls: type) -> Tuple[MoEImplBase, dict]:
+    """``leaf_cls`` as the scheduler sees it, with ``run_moe`` recording its context.
+
+    The class's declarations (``input_requirement``, ``capabilities``,
+    ``_supports_load_balancer``) are the real ones; input quantization and the
+    kernel are not what is under test.
+    """
+    seen = {}
+    backend = leaf_cls.__new__(leaf_cls)
+    backend.quantize_input = lambda x, post_quant_comm=True: (x, None)
+    backend.get_workspaces = lambda sizes: [{} for _ in sizes]
+    backend.run_moe = lambda ctx, *, workspace=None: seen.setdefault("ctx", ctx).x
+    return backend, seen
+
+
+def _folding_moe(backend: MoEImplBase, comm=None) -> SimpleNamespace:
+    """A single-chunk, EPLB-free Llama4 MoE layer as the scheduler reads it."""
+    return SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        # Does not ask for separated routing on its own.
+        routing_method=Llama4RenormalizeMoeRoutingMethod(top_k=1),
+        apply_router_weight_on_input=True,
+        hidden_size=_FOLD_HIDDEN,
+        num_slots=_FOLD_NUM_EXPERTS,
+        layer_idx=0,
+        repeat_idx=0,
+        repeat_count=1,
+        use_dp=False,
+        parallel_size=1,
+        enable_alltoall=False,
+        enable_dummy_allreduce=False,
+        layer_load_balancer=None,
+        unfinalized_combine_fn=None,
+        calculate_num_chunks=lambda all_rank_num_tokens: 1,
+        determine_communication_method=lambda all_rank_num_tokens, num_chunks: None,
+        _using_load_balancer=lambda: False,
+        _load_balancer_start_wait_gpu_stage=lambda is_first_call: None,
+        _load_balancer_start_set_cpu_stage=lambda is_last_call: None,
+        _load_balancer_done_set_cpu_stage=lambda is_last_call: None,
+    )
+
+
+def _run_folding_forward(moe: SimpleNamespace) -> torch.Tensor:
+    """Run one forward; return the input with its routing weight folded in."""
+    x = torch.randn(_FOLD_NUM_TOKENS, _FOLD_HIDDEN, dtype=torch.bfloat16)
+    router_logits = torch.randn(_FOLD_NUM_TOKENS, _FOLD_NUM_EXPERTS)
+    _, weights = moe.routing_method.apply(router_logits)
+    ExternalCommMoEScheduler(moe).forward(
+        x,
+        router_logits,
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+    )
+    return x * weights.to(x.dtype)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("leaf_cls", _FOLDING_LEAVES, ids=lambda cls: cls.__name__)
+def test_a_folded_router_weight_reaches_the_backend_as_unit_scales(leaf_cls: type) -> None:
+    """The finalize still multiplies by ``token_final_scales`` once the weight is in ``x``.
+
+    So every backend gets float32 ones from the scheduler, never ``None``, and
+    needs no fallback of its own. Marlin declines the load balancer and Llama4
+    routing does not ask for separated routing, so the fold itself is what makes
+    the scheduler route first: otherwise Marlin routes internally and weights
+    its output instead of its input.
+    """
+    backend, seen = _capturing_backend(leaf_cls)
+    folded_x = _run_folding_forward(_folding_moe(backend))
+
+    ctx = seen["ctx"]
+    torch.testing.assert_close(ctx.x, folded_x, atol=0, rtol=0)
+    assert ctx.token_selected_experts.shape == (_FOLD_NUM_TOKENS, 1)
+    torch.testing.assert_close(
+        ctx.token_final_scales, torch.ones(_FOLD_NUM_TOKENS, 1, dtype=torch.float32)
+    )
+
+
+@pytest.mark.cpu_only
+def test_a_dispatch_without_a_scales_payload_still_hands_the_backend_unit_scales() -> None:
+    """NVLink dispatch moves no routing weights once they are in ``x``.
+
+    The unit scales are made after dispatch, one per dispatched row, so they
+    also cover the rows other ranks sent.
+    """
+    ep_size = 2
+    comm = MagicMock(spec=NVLinkOneSided)
+    comm.supports_post_quant_dispatch.return_value = True
+    comm.uses_internal_dispatch_quantization.return_value = False
+
+    def dispatch(*, hidden_states, hidden_states_sf, token_selected_slots, token_final_scales, **_):
+        # Every rank sends the same rows, so this one receives ep_size copies.
+        return (
+            hidden_states.repeat(ep_size, 1),
+            hidden_states_sf,
+            token_selected_slots.repeat(ep_size, 1),
+            token_final_scales,
+        )
+
+    comm.dispatch.side_effect = dispatch
+    comm.combine.side_effect = lambda payload, **_: payload[:_FOLD_NUM_TOKENS]
+    backend, seen = _capturing_backend(DeepGemmFusedMoE)
+    folded_x = _run_folding_forward(_folding_moe(backend, comm=comm))
+
+    assert comm.dispatch.call_args.kwargs["token_final_scales"] is None
+    ctx = seen["ctx"]
+    torch.testing.assert_close(ctx.x, folded_x.repeat(ep_size, 1), atol=0, rtol=0)
+    torch.testing.assert_close(
+        ctx.token_final_scales, torch.ones(ep_size * _FOLD_NUM_TOKENS, 1, dtype=torch.float32)
+    )
 
 
 # =====================================================================
@@ -1504,49 +1640,6 @@ def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
     else:
         with pytest.raises(ValueError, match="pre-quant activation scale"):
             method.transform_weights(module)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "leaf_cls,run_fn",
-    [
-        (TrtllmCutedslGroupedGemmNvfp4Impl, "run_moe_nvfp4"),
-        (TrtllmCutedslGroupedGemmBf16Impl, "run_moe_bf16"),
-        (CuteDslFc12FusedMoE, "run_moe_nvfp4"),
-    ],
-    ids=["grouped_gemm_nvfp4", "grouped_gemm_bf16", "fused_fc12"],
-)
-def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_cls, run_fn):
-    """The scheduler folds the top-1 weight into ``x`` and passes no scales.
-
-    The finalize epilogue multiplies by per-token scales regardless, so it gets ones.
-    """
-    captured = {}
-    backend = SimpleNamespace(
-        apply_router_weight_on_input=True,
-        _build_local_weight_view=lambda: None,
-        **{run_fn: lambda **kwargs: captured.update(kwargs)},
-    )
-    ctx = SimpleNamespace(
-        x=torch.zeros(2, 8),
-        x_sf=None,
-        x_ready_event=None,
-        token_selected_experts=torch.tensor([[3], [1]], dtype=torch.int32),
-        token_final_scales=None,
-        comm_plan=SimpleNamespace(
-            moe_output=None,
-            enable_alltoall=False,
-            recv_expert_count=None,
-            deep_ep_expert_capacity=None,
-            use_deep_ep_direct_metadata=False,
-        ),
-    )
-    leaf_cls.run_moe(backend, ctx)
-    torch.testing.assert_close(captured["token_final_scales"], torch.ones(2, 1))
-
-    backend.apply_router_weight_on_input = False
-    with pytest.raises(AssertionError, match="apply_router_weight_on_input"):
-        leaf_cls.run_moe(backend, ctx)
 
 
 # The CuteDSL NVFP4 leaves serve NVFP4_AWQ / NVFP4_ARC layers too

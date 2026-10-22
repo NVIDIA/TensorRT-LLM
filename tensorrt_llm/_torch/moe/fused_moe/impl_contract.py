@@ -665,7 +665,9 @@ class MoERunContext:
     # the same shape when EPLB is enabled. None when the impl routes internally
     # from ``router_logits`` instead.
     token_selected_experts: Optional[torch.Tensor]
-    token_final_scales: Optional[torch.Tensor]  # routing weights [num_tokens, top_k]
+    # Routing weights, same shape. None exactly when token_selected_experts is;
+    # ones when apply_router_weight_on_input has already folded them into x.
+    token_final_scales: Optional[torch.Tensor]
     # produced by quantize_input
     x: torch.Tensor  # activations [num_tokens, hidden_size]
     x_sf: Optional[torch.Tensor]  # scale factors, when the input is quantized

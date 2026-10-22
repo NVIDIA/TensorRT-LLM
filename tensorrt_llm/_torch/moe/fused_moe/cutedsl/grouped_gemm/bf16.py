@@ -39,7 +39,6 @@ from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind, _reject
 from ...quantization import BF16CuteDslFusedMoEMethod
 from ..identity import grouped_gemm_identity
-from ..kernel_inputs import finalize_routing_scales
 from ..runners import CuteDslFusedMoEBF16Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
@@ -116,7 +115,7 @@ class TrtllmCutedslGroupedGemmBf16Impl(CuteDslFusedMoEBase):
         return self.run_moe_bf16(
             x=ctx.x,
             token_selected_experts=ctx.token_selected_experts,
-            token_final_scales=finalize_routing_scales(self, ctx),
+            token_final_scales=ctx.token_final_scales,
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,
         )

@@ -430,16 +430,22 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # External dispatch (Step 5) sends per-token expert/scale payloads, so
         # routing must be precomputed whenever a comm strategy is active — even
         # for backends whose run_moe can otherwise route internally from
-        # router_logits (e.g. MarlinFusedMoE under attention-DP + EP).
+        # router_logits (e.g. MarlinFusedMoE under attention-DP + EP). Folding
+        # the router weight into x needs the weights before run_moe too; a
+        # backend routing internally would apply them to its output instead.
         requires_separated_routing = (
             moe.backend._supports_load_balancer()
             or moe.routing_method.requires_separated_routing
             or moe.comm is not None
             or FORCE_SEPARATED_ROUTING
             or routing_aux is not None
+            or moe.apply_router_weight_on_input
         )
         supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
+        # Set when apply_router_weight_on_input folds the routing weights into x:
+        # the dtype of the unit scales the backend gets in their place.
+        folded_scales_dtype: Optional[torch.dtype] = None
         if requires_separated_routing:
             # ``MoEImplBase`` declines a fused route+quant path by default. The
             # conditions are the scheduler's: a fused result skips the separate
@@ -508,8 +514,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
                 x = x * token_final_scales.to(x.dtype)
-                # These strategies need non-None token_final_scales, so feed
-                # all-ones after folding the real weights into x.
+                folded_scales_dtype = token_final_scales.dtype
+                # Only these strategies need routing scales to dispatch. The
+                # others then carry no scales payload, and the backend's unit
+                # scales are made after dispatch (Step 5).
                 if isinstance(moe.comm, (DeepEP, DeepEPLowLatency, NcclEP)):
                     token_final_scales = torch.ones_like(token_final_scales)
                 else:
@@ -641,6 +649,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             elif not used_fused_route_quant:
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
+        if folded_scales_dtype is not None and token_final_scales is None:
+            # The routing weights are already in x. Unit scales, one per
+            # dispatched (token, expert) pair, keep every backend's finalize
+            # from weighting them twice without a fallback of its own.
+            token_final_scales = torch.ones_like(token_selected_slots, dtype=folded_scales_dtype)
+
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
         ctx = self._build_run_context(
@@ -752,8 +766,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
         if token_final_scales is None:
             raise NotImplementedError(
                 "unfinalized_combine_fn needs the dispatched routing weights, but "
-                "token_final_scales is None (apply_router_weight_on_input folds them "
-                "into the activations). The two are not combinable."
+                f"token_final_scales is None: {type(moe.backend).__name__} routes "
+                "internally from router_logits."
             )
         gemm2_output, _expert_weights, expanded_idx_to_permuted_idx = unfinalized
         num_tokens = token_final_scales.shape[0]

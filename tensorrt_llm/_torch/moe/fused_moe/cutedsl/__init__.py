@@ -19,7 +19,7 @@ kernel, one module per quant where a kernel serves several. Bottom to top:
 
 * :mod:`.identity` -- the provider / technique / kernel strings.
 * :mod:`.kernel_inputs` -- what the kernels of more than one leaf take, as free
-  functions: the NVFP4 weight view, input quantization, the finalize scales.
+  functions: the NVFP4 weight view and input quantization.
 * :mod:`.runners` -- the outer autotune runners.
 * :mod:`.grouped_gemm` -- FC1 and FC2 as two grouped-GEMM launches: an abstract
   root and one leaf per quant.

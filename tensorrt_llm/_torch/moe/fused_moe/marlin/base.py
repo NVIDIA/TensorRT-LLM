@@ -314,10 +314,6 @@ class MarlinFusedMoEBase(MoEImplBase):
                 token_selected_experts < slot_start + local_n
             )
             token_selected_experts = (token_selected_experts - slot_start).clamp(0, local_n - 1)
-            if token_final_scales is None:
-                token_final_scales = torch.ones(
-                    num_tokens, top_k, dtype=torch.float32, device=x.device
-                )
             token_final_scales = token_final_scales * is_local.to(token_final_scales.dtype)
         num_experts = local_n
 
@@ -343,10 +339,7 @@ class MarlinFusedMoEBase(MoEImplBase):
             num_tokens_post_pad,
         )
 
-        if token_final_scales is not None:
-            topk_weights = token_final_scales.float().contiguous()
-        else:
-            topk_weights = torch.ones(num_tokens, top_k, dtype=torch.float32, device=x.device)
+        topk_weights = token_final_scales.float().contiguous()
 
         hidden_size = x.shape[1]
         k1 = hidden_size
