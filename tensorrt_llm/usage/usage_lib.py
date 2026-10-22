@@ -85,6 +85,14 @@ _ARCHITECTURE_HASH_PREFIX = "sha256:"
 _T = TypeVar("_T")
 
 
+def _get_disagg_deployment_id() -> str:
+    """Return the environment's deployment UUID as lowercase hex, or empty if invalid."""
+    try:
+        return uuid.UUID(os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, "")).hex
+    except ValueError:
+        return ""
+
+
 @dataclass(frozen=True)
 class TerminalOutcome:
     """One typed process-boundary or previously observed terminal outcome."""
@@ -794,7 +802,7 @@ class _TelemetrySession:
         if not self.disagg_role:
             self.disagg_role = os.environ.get(_DISAGG_ROLE_ENV, "")
         if not self.deployment_id:
-            self.deployment_id = os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, "")
+            self.deployment_id = _get_disagg_deployment_id()
 
         normalized_role = self.disagg_role.lower()
         if self.component == "server" and (
@@ -1071,9 +1079,7 @@ def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
     return {
         "ingressPoint": _clamp_str(usage_context, schema._SHORT_STR),
         "disaggRole": _clamp_str(os.environ.get(_DISAGG_ROLE_ENV, ""), schema._SHORT_STR),
-        "deploymentId": _clamp_str(
-            os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, ""), schema._SHORT_STR
-        ),
+        "deploymentId": _get_disagg_deployment_id(),
         "llmInitializationAttempts": 0,
         "llmInstancesCreated": 0,
         "activeLlmInstances": 0,
