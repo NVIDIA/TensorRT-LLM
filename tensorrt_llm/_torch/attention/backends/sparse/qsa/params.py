@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Internal sparse-attention parameters for QSA."""
 
-import os
 from dataclasses import dataclass
 
 from ..params import SparseMetadataParams, SparseParams
 from .constants import QSA_INDEX_KV_HEADS
 
 QSA_SPARSE_CORE_BACKENDS = ("auto", "triton", "prims_ts")
-QSA_SPARSE_CORE_ENV = "TLLM_QSA_SPARSE_CORE"
+QSA_INDEXER_BACKENDS = ("follow", *QSA_SPARSE_CORE_BACKENDS)
 
 
 def _validate_selection_geometry(token_topk: int, compress_ratio: int) -> None:
@@ -45,19 +44,22 @@ class QSASparseParams(SparseParams):
     enable_heuristic_topk: bool = False
     # Reuse one indexer selection across the MTP draft loop.
     mtp_index_share: bool = False
-    # Sparse core attention kernel: "triton", "prims_ts", or "auto" (PrimTS
-    # for prefill and large decode batches on SM100/SM103/SM107, else Triton).
-    # TLLM_QSA_SPARSE_CORE overrides the configured value.
-    sparse_core_backend: str = "triton"
+    # Sparse core attention kernel: "auto" (PrimTS on SM100/SM103/SM107 except
+    # for small decode batches, else Triton), "triton", or "prims_ts".
+    sparse_core_backend: str = "auto"
+    # Indexer scorer kernel; "follow" uses the sparse core selection.
+    indexer_backend: str = "follow"
 
     def __post_init__(self) -> None:
-        env_backend = os.environ.get(QSA_SPARSE_CORE_ENV)
-        if env_backend:
-            self.sparse_core_backend = env_backend.strip().lower()
         if self.sparse_core_backend not in QSA_SPARSE_CORE_BACKENDS:
             raise ValueError(
                 f"QSA sparse_core_backend must be one of {QSA_SPARSE_CORE_BACKENDS}, "
                 f"got {self.sparse_core_backend!r}"
+            )
+        if self.indexer_backend not in QSA_INDEXER_BACKENDS:
+            raise ValueError(
+                f"QSA indexer_backend must be one of {QSA_INDEXER_BACKENDS}, "
+                f"got {self.indexer_backend!r}"
             )
         values = {
             "index_n_heads": self.index_n_heads,

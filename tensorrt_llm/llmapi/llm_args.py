@@ -967,6 +967,14 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "recompute; compressed groups that complete during the loop are "
         "appended at lookup. When omitted, the checkpoint config supplies the "
         "value, defaulting to off.")
+    sparse_core_backend: Literal["auto", "triton", "prims_ts"] = Field(
+        default="auto",
+        description=
+        "Kernel for the QSA sparse core attention and indexer scorer. 'auto' "
+        "runs the PrimTS (CUTLASS task-scheduling) kernels on SM100/SM103/"
+        "SM107 and keeps Triton for small decode batches, 'triton' always "
+        "uses the Triton kernels, 'prims_ts' always uses PrimTS and raises "
+        "when the device does not support it.")
     # Index projection dimensions, compression, and selection budget are part
     # of the checkpoint contract rather than serving-time tuning knobs.
     _resolved_params: Optional["QSASparseParams"] = PrivateAttr(default=None)
@@ -1030,6 +1038,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             seq_len_threshold=seq_len_threshold,
             enable_heuristic_topk=self.enable_heuristic_topk,
             mtp_index_share=self._mtp_index_share(pretrained_config),
+            sparse_core_backend=self.sparse_core_backend,
         )
 
     def _mtp_index_share(self, pretrained_config: object) -> bool:

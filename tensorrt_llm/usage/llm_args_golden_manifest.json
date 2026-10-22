@@ -1526,6 +1526,16 @@
       "path": "sparse_attention_config.sparse_block_size"
     },
     {
+      "allowed_values": [
+        "auto",
+        "triton",
+        "prims_ts"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.sparse_core_backend"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.sparse_disable_index_value"
