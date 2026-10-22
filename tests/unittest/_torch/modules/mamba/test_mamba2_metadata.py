@@ -26,6 +26,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_PNAT,
     REPLAY_WORK_POSITION_IN_DECODE_BATCH,
     Mamba2Metadata,
+    _build_kda_replay_work_items,
     _build_replay_work_items_torch,
     _build_replay_work_items_triton,
     cu_seqlens_to_chunk_indices_offsets,
@@ -57,6 +58,36 @@ class _GdnReplayCacheManager:
             replay_step_width=6,
             replay_history_size=MIN_REPLAY_HISTORY_SIZE,
         )
+
+
+class _KdaReplayCacheManager:
+    use_replay_state_update = True
+    use_gdn_cached_replay_all_layer_commit = False
+    use_kda_replay_update = True
+
+    def __init__(self, history_len):
+        self.history_len = history_len
+
+    def get_replay_state_update_metadata(self):
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=self.history_len,
+            cache_buf_idx=None,
+            replay_step_width=3,
+            replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+        )
+
+
+def _kda_reference_work_items(state_indices, history_len):
+    positions = torch.arange(state_indices.numel(), dtype=torch.int32, device=state_indices.device)
+    return torch.stack(
+        (
+            positions,
+            state_indices,
+            history_len[state_indices.to(torch.long)],
+            torch.zeros_like(positions),
+        ),
+        dim=1,
+    )
 
 
 def _torch_reference_work_items(state_indices, prev_num_accepted_tokens, cache_buf_idx):
@@ -195,6 +226,47 @@ class TestMamba2Metadata:
         assert actual[0, REPLAY_WORK_CACHE_SLOT] == 3
         assert actual[0, REPLAY_WORK_PNAT] == 11
         assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
+
+    @pytest.mark.parametrize("num_decodes", [1, 16, 17, 255, 256, 257])
+    def test_kda_replay_work_items_match_reference(self, num_decodes):
+        num_slots = num_decodes + 7
+        history_len = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
+        work_items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")
+        n_writes = torch.ones(1, dtype=torch.int32, device="cuda")
+
+        _build_kda_replay_work_items(
+            state_indices,
+            history_len,
+            work_items,
+            n_writes,
+        )
+
+        torch.testing.assert_close(
+            work_items, _kda_reference_work_items(state_indices, history_len)
+        )
+        torch.testing.assert_close(n_writes.cpu(), torch.zeros(1, dtype=torch.int32))
+
+    def test_prepare_kda_replay_work_items_uses_decode_slice(self):
+        num_contexts, num_decodes = 3, 40
+        num_slots = num_contexts + num_decodes + 7
+        history_len = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        state_indices = torch.randperm(num_slots, device="cuda")[: num_contexts + num_decodes].to(
+            torch.int32
+        )
+        manager = _KdaReplayCacheManager(history_len)
+        metadata = Mamba2Metadata(max_batch_size=num_contexts + num_decodes, chunk_size=8)
+        metadata.state_indices[: num_contexts + num_decodes].copy_(state_indices)
+
+        metadata._prepare_replay_work_items(manager, num_contexts + num_decodes, num_contexts)
+
+        torch.testing.assert_close(
+            metadata.replay_work_items[:num_decodes],
+            _kda_reference_work_items(state_indices[num_contexts:], history_len),
+        )
+        torch.testing.assert_close(
+            metadata.replay_n_writes.cpu(), torch.zeros(1, dtype=torch.int32)
+        )
 
     @pytest.mark.parametrize("num_decodes", [16, 17, 40, 255, 256])
     def test_replay_work_items_triton_matches_torch(self, num_decodes):
