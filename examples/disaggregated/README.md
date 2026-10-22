@@ -256,17 +256,21 @@ generation_servers:
       - "localhost:8003"
 ```
 
-The Python/native KV-cache transceiver requires the same non-empty
-`internal_request_auth_key` on all context workers, generation workers, and the
-proxy to authenticate its ZMQ RankInfo exchange. This also applies to managed MPI
-launches: supply the key in the shared disaggregated configuration. No key is
-generated automatically; a native worker without one fails during initialization.
+The supplied SLURM benchmark, simple-example, service-discovery, and local Ray/MPI
+launch scripts generate a fresh shared authentication key for each deployment.
+They provision it in private worker/proxy configuration files; users do not need
+to supply a key. The service-discovery script retains its generated configuration
+directory so additional workers can reuse that deployment's configuration.
+The shared `disaggregated_mpi_worker` job uses the launcher's key when present;
+otherwise rank 0 generates a native RankInfo key and broadcasts it before the
+job splits into context and generation groups. The generated MPI key is internal
+to those workers, not an HTTP key for a separately started proxy.
 Upgrade communicating workers together because the authenticated RankInfo
 protocol is incompatible with older workers.
 
-Programmatic native-transceiver callers must set the same secret bytes on each
-`CacheTransceiverConfig._rank_info_auth_key` before constructing their LLMs.
-This internal attribute is carried with the configuration object, not through YAML.
+Automatic provisioning here covers these launchers, not manual commands or
+Kubernetes. Programmatic native-transceiver callers must still provision matching
+`CacheTransceiverConfig._rank_info_auth_key` bytes before constructing their LLMs.
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated

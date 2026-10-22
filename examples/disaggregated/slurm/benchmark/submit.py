@@ -19,6 +19,7 @@ import glob
 import json
 import math
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -69,11 +70,24 @@ def get_server_health_timeout(env_config: Dict[str, Any]) -> int:
     return timeout
 
 
-def save_worker_config(worker_config, output_path):
+def write_private_yaml(config, output_path):
+    """Write a secret-bearing config without exposing it through default file modes."""
+    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.truncate(0)
+        yaml.safe_dump(config, stream, default_flow_style=False)
+
+
+def save_worker_config(worker_config,
+                       output_path,
+                       internal_request_auth_key=None):
     """Save worker config to a separate YAML file."""
+    worker_config = dict(worker_config)
+    if internal_request_auth_key is not None:
+        worker_config['internal_request_auth_key'] = internal_request_auth_key
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        yaml.dump(worker_config, f, default_flow_style=False)
+    write_private_yaml(worker_config, output_path)
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
@@ -442,6 +456,7 @@ def submit_job(config, log_dir, dry_run):
     env_config = config['environment']
     worker_config = config['worker_config']
     benchmark_config = config['benchmark']
+    internal_request_auth_key = secrets.token_hex(32)
 
     if 'work_dir' in env_config and os.path.isdir(env_config['work_dir']):
         script_dir = env_config['work_dir']
@@ -582,8 +597,10 @@ def submit_job(config, log_dir, dry_run):
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
-    save_worker_config(worker_config['ctx'], ctx_config_path)
-    save_worker_config(worker_config['gen'], gen_config_path)
+    save_worker_config(worker_config['ctx'], ctx_config_path,
+                       internal_request_auth_key)
+    save_worker_config(worker_config['gen'], gen_config_path,
+                       internal_request_auth_key)
 
     # Prepare allocation template
     allocations = allocate_gpus(
@@ -605,8 +622,9 @@ def submit_job(config, log_dir, dry_run):
     # Merge server_config_extra into disagg server config
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])
-    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
-        yaml.dump(server_config, f)
+    server_config['internal_request_auth_key'] = internal_request_auth_key
+    write_private_yaml(server_config,
+                       os.path.join(log_dir, "server_config_base.yaml"))
     disagg_server_hostname = server_config['hostname']
     disagg_server_port = server_config['port']
 

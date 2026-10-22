@@ -472,3 +472,26 @@ def test_rank_info_key_is_carried_by_transceiver_config():
     assert pickle.loads(pickle.dumps(config))._rank_info_auth_key == b"shared-key"
     assert "_rank_info_auth_key" not in args
     assert "_rank_info_auth_key" not in config.model_dump()
+
+
+def test_rank_info_key_is_shared_with_mpi_ranks_and_spawned_client(monkeypatch):
+    config = SimpleNamespace(internal_request_auth_key=None)
+    comm = mock.Mock()
+    comm.Get_rank.return_value = 0
+    comm.bcast.side_effect = lambda key, root: key
+    key = serve._resolve_rank_info_auth_key(config, False, comm)
+    assert len(key) == 32
+    assert serve._resolve_rank_info_auth_key(config, False, comm) != key
+
+    comm.Get_rank.return_value = 1
+    comm.bcast.side_effect = None
+    comm.bcast.return_value = key
+    assert serve._resolve_rank_info_auth_key(config, False, comm) == key
+    comm.bcast.assert_called_with(None, root=0)
+
+    env_name = serve.DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY
+    monkeypatch.setenv(env_name, key.hex())
+    comm.reset_mock()
+    assert serve._resolve_rank_info_auth_key(config, True, comm) == key
+    comm.bcast.assert_not_called()
+    assert env_name not in os.environ
