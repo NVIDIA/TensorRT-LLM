@@ -1156,6 +1156,11 @@ def nvfp4_sparse_gqa_decode(
     assert block_table.stride(0) == block_table.shape[1], "row-contiguous block table"
     assert selected_tokens.dtype == torch.int32 and selected_tokens.is_contiguous()
     assert request_indices.is_contiguous() and request_indices.dtype in (torch.int32, torch.int64)
+    if selected_tokens.data_ptr() % 16:
+        # The kernel reads the selection with 16-byte loads. A row slice of a 2051-wide
+        # selection (a mixed step's generation rows after its context rows) starts 16-byte
+        # aligned only at every fourth row, so an unaligned one is copied (rows x 8 KB).
+        selected_tokens = selected_tokens.clone()
     group = num_q_heads // num_kv_heads
     width = selected_tokens.shape[1]
     out = torch.empty((rows, num_q_heads, head_dim), dtype=torch.bfloat16, device=q.device)

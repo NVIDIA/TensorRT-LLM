@@ -163,6 +163,19 @@ def test_certified_cells(cell) -> None:
         assert ok, f"vs QSA bf16 kernel: {el:.2f} ulp element, {rms:.2f} ulp RMS"
 
 
+def test_unaligned_row_slice_of_the_selection() -> None:
+    """A mixed step hands its generation rows as a row slice of the step's 2051-wide
+    selection, 16-byte aligned only at every fourth row: an unaligned slice gives the same
+    rows as an aligned copy."""
+    args = build(tuple((3000 + 211 * i, 1) for i in range(9)), seed=4242)
+    aligned = dict(args)
+    for name in ("q", "selected_tokens", "request_indices"):
+        args[name] = args[name][1:]
+        aligned[name] = args[name].clone()
+    assert args["selected_tokens"].data_ptr() % 16
+    assert torch.equal(op(**args), op(**aligned))
+
+
 def test_calls_are_bitwise_deterministic() -> None:
     args = build(tuple((4000 + 37 * i, 2) for i in range(4)), seed=8800)
     assert torch.equal(op(**args), op(**args))
