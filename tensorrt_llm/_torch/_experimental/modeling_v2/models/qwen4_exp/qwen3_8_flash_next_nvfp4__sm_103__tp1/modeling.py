@@ -1576,6 +1576,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
+        self._moe_memset_stream: torch.cuda.Stream | None = None
         self.vision_tower: VisionTower | None = None
         # Everything derived from the KV cache manager (`_bind_cache_manager`);
         # None until the first forward.
@@ -1709,6 +1710,11 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
 
         # The CPU-only load checks build the targets over host weights; they launch nothing.
         self._side_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        # The prefill CuteDSL MoE's output memset, beside its FC1 (`fp4_moe_renorm_cute_dsl`):
+        # its own stream, so the join before FC2 does not also wait for the shared expert.
+        self._moe_memset_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
         self.vision_tower = VisionTower(self)
@@ -3044,6 +3050,7 @@ class PrefillTarget:
                 L.global_sf_cd,
                 core.num_experts,
                 core.topk,
+                memset_stream=core._moe_memset_stream,
             )
         else:
             routed = fp4_block_scale_moe_renorm_routed(
