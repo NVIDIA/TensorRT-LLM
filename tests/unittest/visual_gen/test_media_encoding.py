@@ -14,6 +14,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tensorrt_llm.media import encoding
 from tensorrt_llm.media.encoding import (
     image_to_bytes,
     resolve_video_format,
@@ -274,3 +275,41 @@ def test_save_videos_path_list_no_extension_appends(tmp_path):
     paths_out = save_videos(batched, paths_in, format="avi")
     assert paths_out[0].endswith(".avi")
     assert Path(paths_out[0]).exists()
+
+
+# ---------------------------------------------------------------------------
+# libx264 preset (TRTLLM_VIDEO_ENCODING_X264_PRESET)
+# ---------------------------------------------------------------------------
+
+_PRESET_ENV = "TRTLLM_VIDEO_ENCODING_X264_PRESET"
+
+
+def test_x264_preset_default_is_medium(monkeypatch):
+    monkeypatch.delenv(_PRESET_ENV, raising=False)
+    assert encoding._x264_preset() == "medium"
+
+
+def test_x264_preset_override_normalizes_case_and_whitespace(monkeypatch):
+    monkeypatch.setenv(_PRESET_ENV, "  UltraFast ")
+    assert encoding._x264_preset() == "ultrafast"
+
+
+def test_x264_preset_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv(_PRESET_ENV, "turbo")
+    with pytest.raises(ValueError, match="not a libx264 preset"):
+        encoding._x264_preset()
+
+
+def test_ffmpeg_encoder_passes_preset_to_ffmpeg(monkeypatch, tmp_path):
+    monkeypatch.setenv(_PRESET_ENV, "veryfast")
+    process = mock.Mock(returncode=0)
+    process.communicate.return_value = (b"", b"")
+    with (
+        mock.patch.object(encoding, "_get_ffmpeg_path", return_value="ffmpeg"),
+        mock.patch.object(encoding.subprocess, "Popen", return_value=process) as popen,
+    ):
+        encoding._FfmpegCliEncoder().encode_video(
+            _dummy_video(), str(tmp_path / "out.mp4"), frame_rate=16.0
+        )
+    cmd = popen.call_args.args[0]
+    assert cmd[cmd.index("-preset") + 1] == "veryfast"
