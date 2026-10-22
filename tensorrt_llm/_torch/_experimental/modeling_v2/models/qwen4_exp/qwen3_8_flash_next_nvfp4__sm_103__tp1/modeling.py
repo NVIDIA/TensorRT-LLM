@@ -4689,12 +4689,26 @@ class PrefillTarget:
                 **_CALL_CONSTANTS,
             )
         fused_sigmoid_mul_inplace(attn_out, gate)
+        # Past the attention the draft loop reads one row per request: a context request's
+        # last row and one row of each generation run (the worker's `gather_ids`). The other
+        # context rows exist for the KV and index planes they wrote above, so only each
+        # context's last row and every generation row go on; the rest of the returned rows
+        # keep the layer's input stream.
+        keep = None
+        if num_ctx > md.num_contexts:
+            ctx_lens = md.seq_lens_cuda[: md.num_contexts].to(torch.long)
+            keep = torch.cat(
+                [torch.cumsum(ctx_lens, 0) - 1, torch.arange(num_ctx, rows, device=dev)]
+            )
+            out, attn_out, inject = x, attn_out[keep], inject[keep]
+            x = x[keep]
         x = qwen4_exp_post_inject(x, cublas_mm(attn_out, M.o), inject)
 
         mixed, inject = qwen4_exp_gated_residual(
             self._grouped_norm(x, M.mhc_norm), M.mhc_down, M.mhc_up, M.mhc_inject, core.hc_count
         )
-        return qwen4_exp_post_inject(x, self._mtp_moe_block(mixed, dt), inject)
+        x = qwen4_exp_post_inject(x, self._mtp_moe_block(mixed, dt), inject)
+        return x if keep is None else out.index_copy_(0, keep, x)
 
 
 class DecodeTarget:
