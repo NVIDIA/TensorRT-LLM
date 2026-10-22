@@ -109,14 +109,10 @@ class MixedPrecisionKVStaging:
             if owner in self.page_tables:
                 self.page_tables[layer_idx] = self.page_tables[owner]
                 continue
-            page_tables = manager.get_mixed_precision_page_tables(request_ids, owner)
             tables = torch.full(
                 (2, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
-            for role, rows in enumerate(page_tables):
-                for row, pages in enumerate(rows):
-                    count = min(len(pages), max_pages)
-                    tables[role, row, :count] = torch.tensor(pages[:count], dtype=torch.int32)
+            manager.fill_mixed_precision_page_tables(request_ids, owner, tables.numpy())
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,

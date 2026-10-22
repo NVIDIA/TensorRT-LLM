@@ -3311,19 +3311,38 @@ class KVCacheManagerV2(BaseResourceManager):
             shape[2], shape[3] = shape[3], shape[2]
         return convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
 
+    def fill_mixed_precision_page_tables(
+        self, request_ids: List[int], layer_idx: int, out: np.ndarray
+    ) -> None:
+        """Write the low (``out[0]``) and high (``out[1]``) page tables of a mixed-precision layer.
+
+        ``out`` is ``(2, batch, pages)`` int32; entries past a request's blocks are left as they
+        are. The page indices are read as whole arrays from the cache's zero-copy buffers, so
+        this costs a few vector operations per request instead of one Python operation per page.
+        """
+        local = self.layer_offsets[layer_idx]
+        for role, layer in enumerate((local, self.high_layers[local])):
+            pool_id = int(self.impl.get_layer_group_id(layer))
+            scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
+            for row, req_id in enumerate(request_ids):
+                kv_cache = self.kv_cache_map[req_id]
+                count = min(kv_cache.num_blocks, out.shape[2])
+                base = kv_cache.get_base_page_indices(pool_id)[:count]
+                np.copyto(
+                    out[role, row, :count],
+                    np.where(
+                        base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor
+                    ),
+                )
+
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
     ) -> tuple[list[list[int]], ...]:
-        """Return the low and high page tables of a mixed-precision layer for this batch."""
-        local = self.layer_offsets[layer_idx]
-        return tuple(
-            self._get_batch_cache_indices_by_pool_id(
-                request_ids,
-                pool_id=int(self.impl.get_layer_group_id(layer)),
-                index_scale=int(self.impl.get_page_index_converter(layer, Role.KEY).scale),
-            )
-            for layer in (local, self.high_layers[local])
-        )
+        """Return the low and high page tables of a mixed-precision layer as lists."""
+        counts = [self.kv_cache_map[req_id].num_blocks for req_id in request_ids]
+        out = np.full((2, len(request_ids), max(counts, default=0)), BAD_PAGE_INDEX, dtype=np.int32)
+        self.fill_mixed_precision_page_tables(request_ids, layer_idx, out)
+        return tuple([row[:count].tolist() for row, count in zip(role, counts)] for role in out)
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
