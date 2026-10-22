@@ -56,6 +56,9 @@ coupled target semantics. A nonpositive value disables that target when both
 are supplied. Explicit `do_sample_frames=False` disables this
 resampling. Fully decoded videos and decoded frame prefixes, which may result
 from a decoding failure, retain Hugging Face's default sampling and frame cap.
+Without an explicit frame target, indexed inputs above the video processor's
+`max_frames` also use its default sampling, with selected frames mapped back
+to source timestamps. Explicitly disabled sampling remains respected.
 
 ## Examples
 
