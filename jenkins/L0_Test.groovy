@@ -930,7 +930,12 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
+            // Keep the job workspace (job-output.log etc.) for debugging; the
+            // PruneSlurmOutputs job removes it after the retention period. Drop the
+            // S3 spool and anything holding credentials right away: the launch
+            // script embeds HF/GitHub tokens and OpenSearch credentials, and the
+            // netrc files hold the Artifactory credentials.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
