@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import weakref
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch import q35_env
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -74,6 +76,23 @@ def _(q, attention_mask, layer_idx):
     return create_attn_outputs_impl(q, attention_mask, layer_idx)
 
 
+def _q35_direct_call(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+@q35_env.register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _q35_op_call, _Q35_CTX_ATTN_PLAN
+    # TRTLLM_Q35_CUSTOM_OP_EAGER=1: run this piecewise-excluded op with dynamo's eval-frame hook off, so the Python
+    # frames it creates inside the compiled region skip dynamo's frame callback.
+    _q35_op_call = (torch._dynamo.disable(
+        _q35_direct_call, recursive=True) if os.environ.get(
+            "TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
+    # TRTLLM_Q35_CTX_ATTN_PLAN=1 (see backends/trtllm.py): here it only caches the layer's quantization constants.
+    _Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN", "0") == "1"
+
+
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
                          mutates_args=("output", "output_sf"))
 def attn_custom_op_inplace(
@@ -101,7 +120,8 @@ def attn_custom_op_inplace(
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
         attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(
+    _q35_op_call(
+        attn_layer._attn_impl,
         q,
         k,
         v,
@@ -619,8 +639,21 @@ class Attention(nn.Module):
         assert self.num_heads % (tp_size * cp_size) == 0
         self.num_heads = self.num_heads // tp_size
         self.num_heads_tp_cp = self.num_heads // cp_size
+        q35_total_kv_heads = self.num_key_value_heads
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
+        # Qwen3.5 CP-lite decode (backends/fmha/q35_cp.py): the TP ranks that replicate this rank's KV head.
+        self.q35_cp_group = None
+        self.q35_cp_rank = 0
+        if (q35_env.fast_paths_enabled() and cp_size == 1 and dp_size == 1
+                and tp_size > q35_total_kv_heads
+                and tp_size % q35_total_kv_heads == 0):
+            rep = tp_size // q35_total_kv_heads
+            kvh = mapping.tp_rank // rep
+            self.q35_cp_group = [
+                mapping.tp_group[kvh * rep + i] for i in range(rep)
+            ]
+            self.q35_cp_rank = mapping.tp_rank % rep
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
@@ -781,6 +814,12 @@ class Attention(nn.Module):
             attention_chunk_size=self.attention_chunk_size,
             sparse_params=sparse_params,
         )
+        self.attn.q35_cp_group = self.q35_cp_group
+        self.attn.q35_cp_rank = self.q35_cp_rank
+        self.attn.q35_cp_mapping = (self.mapping
+                                    if self.q35_cp_group is not None else None)
+        # Set only during forward() for the module-side FP8 KV append in preprocess_qkv.
+        self._q35_attn_metadata = None
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
 
@@ -876,6 +915,15 @@ class Attention(nn.Module):
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
         return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
+
+    def _q35_attn_consts(self) -> Tuple[bool, bool]:
+        """Cached (_use_quantize_output(), has FP4 KV cache); both depend only on the loaded quant config."""
+        consts = self.__dict__.get("_q35_consts")
+        if consts is None:
+            consts = (self._use_quantize_output(), self.quant_config is not None
+                      and self.quant_config.layer_quant_mode.has_fp4_kv_cache())
+            self._q35_consts = consts
+        return consts
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
@@ -974,14 +1022,20 @@ class Attention(nn.Module):
         # not populated yet at this call site.
         out_scale = None
         out_scale_sf = None
-        if self._use_quantize_output() and not has_lora:
+        if _Q35_CTX_ATTN_PLAN:
+            quantize_output, fp4_kv_cache = self._q35_attn_consts()
+        else:
+            quantize_output = self._use_quantize_output()
+            fp4_kv_cache = (
+                self.quant_config is not None
+                and self.quant_config.layer_quant_mode.has_fp4_kv_cache())
+        if quantize_output and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
         kv_scale_orig_quant = None
         kv_scale_quant_orig = None
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
-        ):
+        if fp4_kv_cache:
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
 
@@ -1106,7 +1160,11 @@ class Attention(nn.Module):
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
         if output_gate is not None:
-            output = self.apply_output_gate(output, output_gate)
+            if getattr(self.attn, "q35_gate_applied", False):
+                # A Qwen3.5 decode path already applied the gate offered in forward().
+                self.attn.q35_gate_applied = False
+            else:
+                output = self.apply_output_gate(output, output_gate)
 
         return output
 
@@ -1169,8 +1227,27 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
+        # Qwen3.5 decode: preprocess_qkv may also write the FP8 query and append FP8 K / V for a generation-only
+        # step; the hand-over to the backend (attn.q35_kv_appended) is cleared after the call.
+        q35_fast_paths = q35_env.fast_paths_enabled()
+        q35_kv_append = q35_fast_paths and getattr(
+            self, "_fuse_qk_norm_rope_gate", False)
+        if q35_kv_append:
+            self.attn.q35_kv_appended = None
+            self._q35_attn_metadata = attn_metadata
         q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
+        if q35_kv_append:
+            self._q35_attn_metadata = None
         q, k, v = self.convert_qkv(q, k, v)
+
+        # Qwen3.5 decode: offer the output gate to the backend; a path that fuses it sets attn.q35_gate_applied and
+        # forward_impl then skips apply_output_gate.
+        q35_offer_gate = (q35_fast_paths and self.attn_output_gate
+                          and gate is not None
+                          and self.sparse_attn_hooks is None)
+        if q35_offer_gate:
+            self.attn.q35_pending_gate = gate
+            self.attn.q35_gate_applied = False
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", (
@@ -1195,6 +1272,12 @@ class Attention(nn.Module):
             output_gate=gate,
             **kwargs,
         )
+
+        if q35_kv_append:
+            self.attn.q35_kv_appended = None
+        if q35_offer_gate:
+            self.attn.q35_pending_gate = None
+            self.attn.q35_gate_applied = False
 
         if self.sparse_attn_hooks is not None:
             sparse_output = self.sparse_attn_hooks.project_output(
