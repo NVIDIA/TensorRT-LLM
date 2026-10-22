@@ -26,6 +26,7 @@ Order of work inside a CTA (`OUTS` weight rows x one stream):
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda_drv
@@ -33,8 +34,10 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -48,6 +51,29 @@ THREADS = 320
 #: Streaming multiprocessors the one-wave grid must fit (GB300).
 _SMS = 152
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=128"
+#: ns the weight-register loads are held after a CTA starts (dependents released first).
+#: In a chain of sites the next site's first kernel becomes resident as this site's mix
+#: starts its critical path; holding its 6.6 MB weight burst ~0.5 us keeps that path's L2
+#: round trips short. 0 disables (the CTA must start > ~1.5 us before its wait to gain).
+_WEIGHT_DELAY_NS = int(os.environ.get("TRTLLM_HC_FIRST_WEIGHT_DELAY_NS", "500"))
+
+
+@dsl_user_op
+def _spin_ns(ns, *, loc=None, ip=None):
+    """Spin (nanosleep 64) for `ns` nanoseconds of %globaltimer."""
+    llvm.inline_asm(
+        T.i32(),
+        [cutlass.Int32(ns).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred p; .reg .u64 t0, t, e; .reg .u64 d; mov.u64 t0, %globaltimer; "
+        "cvt.u64.u32 d, $1; add.u64 e, t0, d; SPIN: mov.u64 t, %globaltimer; "
+        "setp.lt.u64 p, t, e; @!p bra DONE; nanosleep.u32 64; bra SPIN; DONE: mov.u32 $0, 0; }",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def outs_for(n_cols: int, hc_count: int) -> int:
@@ -159,6 +185,10 @@ class _FirstKernel:
         hc_vec = cute.logical_divide(mHc, (None, VEC))
         nw_vec = cute.logical_divide(mNorm, (None, VEC))
 
+        if const_expr(_WEIGHT_DELAY_NS > 0):
+            if const_expr(self.pdl):
+                cute.arch.griddepcontrol_launch_dependents()
+            _spin_ns(_WEIGHT_DELAY_NS)
         # 1. Static operands, before the wait.
         w_reg = cute.make_rmem_tensor(
             cute.make_layout((outs, VEC), stride=(VEC, 1)), cutlass.BFloat16
