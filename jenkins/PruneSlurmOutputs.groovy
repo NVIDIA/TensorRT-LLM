@@ -25,6 +25,9 @@ import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.Utils
 
 UBUNTU_24_04_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
+// Clusters left out of the default list: computelab does not accept
+// svc_tensorrt logins from this job. They can still be named in CLUSTERS.
+DEFAULT_EXCLUDED_CLUSTERS = ["computelab"]
 
 def createKubernetesPodConfig(image)
 {
@@ -82,6 +85,7 @@ def defaultClusterNames() {
         .findAll { !it.credentialId }
         .collect { it.clusterName }
         .unique()
+        .findAll { !(it in DEFAULT_EXCLUDED_CLUSTERS) }
         .sort()
 }
 
@@ -136,7 +140,7 @@ pipeline {
         string(
             name: 'CLUSTERS',
             defaultValue: '',
-            description: 'Comma-separated SLURM cluster names to prune. Empty means every cluster CI submits to.')
+            description: "Comma-separated SLURM cluster names to prune. Empty means every cluster CI submits to, except ${DEFAULT_EXCLUDED_CLUSTERS.join(', ')}.")
         booleanParam(
             name: 'DRY_RUN',
             defaultValue: false,
