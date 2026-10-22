@@ -385,6 +385,92 @@ def test_workspace_growth_refuses_to_trace(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    "max_num_tokens,hidden_size,tp_size,num_tokens,hidden_dim,expected_bytes",
+    [
+        (17, 8192, 4, 16, 8192, 1048576),
+        (26, 5120, 4, 26, 4992, 1038336),
+        (4, 5120, 32, 4, 4096, 1048576),
+    ],
+)
+def test_mnnvl_preallocation_covers_one_shot_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_tokens: int,
+    hidden_size: int,
+    tp_size: int,
+    num_tokens: int,
+    hidden_dim: int,
+    expected_bytes: int,
+) -> None:
+    """Smaller token or hidden dimensions must fit without growth during fullgraph tracing."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0)
+    real_device = torch.device
+    _patch_workspace_dependencies(monkeypatch)
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", lambda *args, **kwargs: _FakeMcastBuffer())
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_max_num_tokens", max_num_tokens)
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_hidden_size", hidden_size)
+    MNNVLAllReduce(mapping, torch.bfloat16)
+    workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
+    required = MNNVLAllReduce.get_required_workspace_size(
+        num_tokens, hidden_dim, tp_size, torch.bfloat16
+    )
+    assert required == expected_bytes
+    monkeypatch.setattr(ops_module.torch, "device", real_device)
+
+    def lookup(x: torch.Tensor) -> torch.Tensor:
+        cached = get_or_scale_allreduce_mnnvl_workspace(
+            mapping, torch.bfloat16, buffer_size_bytes=required
+        )
+        return x + cached["buffer_flags"][0].float()
+
+    torch._dynamo.reset()
+    try:
+        result = torch.compile(lookup, fullgraph=True, backend="eager")(torch.ones(2))
+        assert result.tolist() == [1.0, 1.0]
+    finally:
+        torch._dynamo.reset()
+    assert workspace["buffer_size_bytes"] >= required
+    assert MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping] is workspace
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("hidden_size", [7680, 8192])
+def test_mnnvl_preallocation_bounds_shape_range(
+    monkeypatch: pytest.MonkeyPatch, tp_size: int, dtype: torch.dtype, hidden_size: int
+) -> None:
+    """Check capacity across smaller shapes and maxima on either side of the crossover."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0)
+    _patch_workspace_dependencies(monkeypatch)
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", lambda *args, **kwargs: _FakeMcastBuffer())
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_hidden_size", hidden_size)
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    boundary = 1048576 // (hidden_size * tp_size * elem_size)
+    for max_num_tokens in (boundary - 1, boundary, boundary + 1, 2 * boundary + 1):
+        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {})
+        monkeypatch.setattr(AllReduceRunner, "_prealloc_max_num_tokens", max_num_tokens)
+        MNNVLAllReduce(mapping, dtype)
+        capacity = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]["buffer_size_bytes"]
+        for num_tokens in range(1, max_num_tokens + 1):
+            for hidden_dim in range(128, hidden_size + 1, 128):
+                required = MNNVLAllReduce.get_required_workspace_size(
+                    num_tokens, hidden_dim, tp_size, dtype
+                )
+                assert capacity >= required, (
+                    max_num_tokens,
+                    num_tokens,
+                    hidden_dim,
+                    capacity,
+                    required,
+                )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "max_num_tokens,hidden_size",
     [
         # Larger than the default initial buffer, below the limit: sized exactly.

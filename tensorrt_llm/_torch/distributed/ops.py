@@ -858,18 +858,27 @@ class MNNVLAllReduce(nn.Module):
         # Size the workspace for the largest all-reduce the model can issue when
         # the model-level prealloc attributes are known (set on AllReduceRunner
         # by AllReduce.__init__), so it never has to grow inside a CUDA graph
-        # capture or a torch.compile trace. Warmup reaches that size anyway.
+        # capture or a torch.compile trace.
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
             AllReduceRunner
         max_num_tokens = AllReduceRunner._prealloc_max_num_tokens
         hidden_size = AllReduceRunner._prealloc_hidden_size
         buffer_size_bytes = None
         if max_num_tokens and hidden_size:
+            # Workspace requirements can decrease at the one-shot/two-shot
+            # transition. Bound one-shot requests across both dimensions;
+            # two-shot requirements are monotone in token and hidden counts.
+            elem_size = torch.tensor([], dtype=dtype).element_size()
+            one_shot_bytes = min(
+                _MNNVL_ONE_SHOT_THRESHOLD_BYTES,
+                max_num_tokens * hidden_size * mapping.tp_size * elem_size)
             # Capped at the largest workspace forward accepts: shapes beyond it
             # are rejected there, so a bigger buffer could never be used.
             buffer_size_bytes = min(
-                MNNVLAllReduce.get_required_workspace_size(
-                    max_num_tokens, hidden_size, mapping.tp_size, dtype),
+                max(
+                    one_shot_bytes,
+                    MNNVLAllReduce.get_required_workspace_size(
+                        max_num_tokens, hidden_size, mapping.tp_size, dtype)),
                 _MNNVL_MAX_WORKSPACE_BYTES)
         get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype,
                                                buffer_size_bytes)

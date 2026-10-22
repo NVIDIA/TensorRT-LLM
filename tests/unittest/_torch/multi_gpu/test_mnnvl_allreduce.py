@@ -24,6 +24,7 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
@@ -722,12 +723,20 @@ def row_linear_residual_norm_fusion_forward(
         torch.cuda.empty_cache()
 
 
-def _run_row_linear_residual_norm_fusion_body(x_list, residual_list,
-                                              reference_output_list,
-                                              hidden_size, tensor_parallel_size,
-                                              tensor_parallel_rank, dtype,
-                                              strategy, fusion, compile,
-                                              norm_weight, eps):
+def _run_row_linear_residual_norm_fusion_body(
+    x_list: list[torch.Tensor],
+    residual_list: list[torch.Tensor],
+    reference_output_list: list[tuple[torch.Tensor, ...]],
+    hidden_size: int,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    dtype: torch.dtype,
+    strategy: AllReduceStrategy,
+    fusion: bool,
+    compile: bool,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> None:
     """Construct the all-reduce, optionally compile it, and check every sequence length."""
     # Create a single AllReduce instance to be reused for all sequence lengths
     allreduce = AllReduce(
@@ -855,8 +864,8 @@ def _run_row_linear_residual_norm_fusion(seq_len,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("fusion", FUSION_CASES, ids=["fusion", "no_fusion"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_mnnvl_row_linear_residual_norm_fusion_compiled(fusion,
-                                                        mpi_pool_executor):
+def test_mnnvl_row_linear_residual_norm_fusion_compiled(
+        fusion: bool, mpi_pool_executor: MPIPoolExecutor) -> None:
     """The MNNVL all-reduce inside a torch.compile(fullgraph=True) region: the
     workspace lookup must trace, the kernel's custom op must functionalize and
     the workspace must not need to grow while tracing."""
