@@ -1983,9 +1983,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch blocks for up to its timeout, so it runs on the
+                # metrics thread, which /metrics leaves idle while this loop runs.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
+                    for llm_stat in await asyncio.get_running_loop(
+                    ).run_in_executor(self._metrics_stats_executor,
+                                      self.generator.get_stats, 0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
                         # Tee into the /metrics snapshot buffer so the HTTP
                         # handler can serve without competing for the engine
