@@ -4,7 +4,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 
 
 class DecoderLayer(nn.Module, ABC):

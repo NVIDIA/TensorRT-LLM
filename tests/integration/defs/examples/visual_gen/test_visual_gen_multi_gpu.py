@@ -40,6 +40,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _run_wan_lpips_pipeline,
     _save_lpips_video_mp4,
 )
+from test_common.llm_data import get_checkpoint
 
 
 def _parallel_config(**kwargs):
@@ -52,24 +53,95 @@ def _parallel_config(**kwargs):
     return ParallelConfig(**kwargs)
 
 
-# Keep it as 0.25 as the worst case scenario at NVL72 scale
-WAN_MULTI_GPU_LPIPS_THRESHOLD = 0.25
+# Primary gate: within-build parallelism check. The invariant these tests
+# protect is "parallelism does not change the output", so every variant is
+# scored against a fully-eager single-GPU reference generated in this test
+# session at the current build (wan22_within_build_reference fixture). Both
+# sides of that comparison shift together under benign whole-build numerics
+# changes -- e.g. PR #17693 moved GELU onto the cuBLASLt fp32 accumulator and
+# shifted the entire bf16 rounding trajectory, stepping the frozen-golden
+# score of [attn2d_2x2] 0.2243 -> 0.2795 (nvbug 6655990) with no quality
+# change -- so this gate fails only when parallelism itself changes the
+# output relative to the same build's single-GPU run.
+#
+# Calibration (4xB200, nvbug 6655990 repro workspace; rc24 image +- the
+# #17693 mlp.py hunks, torch 2.12.0a0+...nv26.05) showed the within-build
+# scores are bimodal, so each variant carries its class threshold:
+#   * EXACT class -- CFG splitting, Ulysses head repartition, and the attn2d
+#     head-dim split reproduce the single-GPU output bit-exactly (LPIPS
+#     0.000000 measured for ulysses4, cfg2_ulysses2 and
+#     cfg2_ulysses2_attn2d_2x1; GEMM rows and attention heads are
+#     reduction-order invariant under these decompositions). 0.05 keeps
+#     margin for codec jitter while any real defect lands at 0.2+.
+#   * REDUCTION-REORDERING class -- TP-split GEMMs (allreduce) and the
+#     attn2d sequence-KV split change floating-point reduction order; the
+#     one-ULP seed amplifies over the denoising steps to a saturation band
+#     (measured: tp2-family 0.2098, attn2d_2x2-family 0.2597, tp3 0.2618;
+#     stable composition -- cfg/ulysses/attn2d-head add exactly 0 on top).
+#     0.30 gives ~0.04 headroom over the measured worst case; genuinely
+#     broken output (wrong seed control run) measures far above it.
+WAN_MULTI_GPU_EXACT_WITHIN_BUILD_LPIPS_THRESHOLD = 0.05
+WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.30
+# Backstop gate: loose catastrophic-quality bound vs the frozen golden. The
+# frozen golden drifts away from the current trajectory whenever bf16
+# numerics legitimately change (even the single-GPU fully-eager run -- the
+# golden's own configuration -- measures 0.2223 against it on the current
+# trajectory), so this bound intentionally has large headroom and exists
+# only to catch outputs that are far from everything.
+WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD = 0.32
+# MiniMax-H3's iterative denoising amplifies the benign BF16 differences from
+# repartitioning attention heads.  The 384x384 L0 cases measured 0.117972 on
+# two GPUs and 0.203348 on four GPUs.  These topology-specific bounds keep
+# roughly 0.03-0.05 headroom while still rejecting visibly unrelated output.
+MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLDS = {2: 0.15, 4: 0.25}
 WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
 WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
+# (variant name, parallel kwargs, within-build LPIPS bound) -- pick the bound
+# per the class rationale above when adding a variant.
 WAN22_LPIPS_MULTI_GPU_VARIANTS = [
-    ("ulysses4", {"ulysses_size": 4}),
-    ("cfg2_ulysses2", {"cfg_size": 2, "ulysses_size": 2}),
-    ("attn2d_2x2", {"attn2d_size": (2, 2)}),
-    ("cfg2_ulysses2_attn2d_2x1", {"cfg_size": 2, "ulysses_size": 2, "attn2d_size": (2, 1)}),
-    ("attn2d_2x2_ulysses2", {"attn2d_size": (2, 2), "ulysses_size": 2}),
+    ("ulysses4", {"ulysses_size": 4}, WAN_MULTI_GPU_EXACT_WITHIN_BUILD_LPIPS_THRESHOLD),
+    (
+        "cfg2_ulysses2",
+        {"cfg_size": 2, "ulysses_size": 2},
+        WAN_MULTI_GPU_EXACT_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
+    ("attn2d_2x2", {"attn2d_size": (2, 2)}, WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD),
+    (
+        "cfg2_ulysses2_attn2d_2x1",
+        {"cfg_size": 2, "ulysses_size": 2, "attn2d_size": (2, 1)},
+        WAN_MULTI_GPU_EXACT_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
+    (
+        "attn2d_2x2_ulysses2",
+        {"attn2d_size": (2, 2), "ulysses_size": 2},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
 ]
 
 WAN22_LPIPS_TP_VARIANTS = [
-    ("tp2", {"tp_size": 2}),
-    ("tp3", {"tp_size": 3}),
-    ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
-    ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
-    ("tp2_attn2d_2x1", {"tp_size": 2, "attn2d_size": (2, 1)}),
+    ("tp2", {"tp_size": 2}, WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD),
+    ("tp3", {"tp_size": 3}, WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD),
+    (
+        "cfg2_tp2",
+        {"cfg_size": 2, "tp_size": 2},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
+    (
+        "tp2_ulysses2",
+        {"tp_size": 2, "ulysses_size": 2},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
+    (
+        "tp2_attn2d_2x1",
+        {"tp_size": 2, "attn2d_size": (2, 1)},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
+    # Token-sharded TP: bitwise equal to all-reduce TP at TP2; the worker asserts it engaged.
+    (
+        "cfg2_tp2_ts",
+        {"cfg_size": 2, "tp_size": 2, "tp_layout": "token_sharded"},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
 ]
 
 
@@ -85,7 +157,7 @@ def _cleanup_mpi_env():
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -141,11 +213,9 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs, tllm_s
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
-    try:
-        import tensorrt_llm.bindings as tllm_bindings
-        from tensorrt_llm._utils import get_free_port
-    except ImportError:
-        pytest.skip("Required modules not available")
+    import tensorrt_llm.bindings as tllm_bindings
+    from tensorrt_llm._utils import get_free_port
+
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
@@ -173,6 +243,66 @@ def _skip_if_insufficient_gpus_for_parallel(parallel):
         pytest.skip(
             f"Insufficient GPUs for parallel={parallel}: requires {required}, available {available}"
         )
+
+
+def _wan22_reference_media_worker(rank, kwargs, tllm_site):
+    # mp.spawn target: generate the fully-eager single-GPU reference in a child
+    # process so the pytest parent stays CUDA-free for the distributed spawns.
+    # Applies the same installed-wheel sys.path fix as _distributed_worker; no
+    # torch.distributed init — this is the plain single-GPU pipeline path.
+    tllm_site = _validated_tllm_site(tllm_site)
+    sys.path[:] = [path for path in sys.path if os.path.realpath(path) != tllm_site]
+    sys.path.insert(0, tllm_site)
+    torch.cuda.set_device(0)
+    video = _run_wan_lpips_pipeline(
+        kwargs["model_path"],
+        WAN22_LPIPS_PROMPT,
+        WAN22_LPIPS_NEGATIVE_PROMPT,
+        WAN22_LPIPS_HEIGHT,
+        WAN22_LPIPS_WIDTH,
+        WAN22_LPIPS_NUM_FRAMES,
+        WAN22_LPIPS_NUM_INFERENCE_STEPS,
+        WAN22_LPIPS_GUIDANCE_SCALE,
+        WAN22_LPIPS_SEED,
+        attention_backend=WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND,
+        parallel=None,
+        fully_eager=True,
+    )
+    assert video is not None, "Single-GPU within-build reference run produced no video"
+    _save_lpips_video_mp4(video, kwargs["reference_path"], frame_rate=WAN22_LPIPS_FRAME_RATE)
+
+
+@pytest.fixture(scope="session")
+def wan22_within_build_reference(tmp_path_factory):
+    """Fully-eager single-GPU WAN2.2 reference video cut at the current build.
+
+    Session-scoped: one extra generation amortized over every multi-GPU/TP
+    variant in the session. Scoring each variant against this reference
+    (instead of only the frozen golden) isolates the parallelism invariant
+    from whole-build numerics drift: both sides of the comparison shift
+    together when bf16 numerics legitimately change (nvbug 6655990).
+    """
+    if torch.cuda.device_count() < 1:
+        pytest.skip("Within-build reference generation requires a GPU")
+
+    import tensorrt_llm.bindings as tllm_bindings
+
+    model_path = get_checkpoint("Wan2.2-T2V-A14B-Diffusers")
+    tllm_site = _validated_tllm_site(
+        os.path.dirname(os.path.dirname(os.path.abspath(tllm_bindings.__file__)))
+    )
+    reference_path = (
+        tmp_path_factory.mktemp("wan22_within_build_ref")
+        / "wan22_t2v_fa4_fully_eager_within_build_reference.mp4"
+    )
+    mp.spawn(
+        _wan22_reference_media_worker,
+        args=({"model_path": model_path, "reference_path": str(reference_path)}, tllm_site),
+        nprocs=1,
+        join=True,
+    )
+    assert reference_path.is_file(), f"Reference generation did not produce {reference_path}"
+    return reference_path
 
 
 def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> None:
@@ -208,7 +338,9 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
         dist.barrier()
 
 
-def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
+def _run_wan22_t2v_lpips_case(
+    tmp_path, variant_name, parallel, within_build_reference, within_build_threshold
+):
     _skip_if_insufficient_gpus_for_parallel(parallel)
     parallel_cfg = _parallel_config(**parallel)
     generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
@@ -236,7 +368,17 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     )
 
     assert generated_path.is_file(), f"Distributed run did not produce {generated_path}"
-    score = _run_lpips_eval(
+    # Compute both scores before asserting so a failure log always carries the
+    # full picture (which gate tripped, and where the other one stood).
+    within_build_score = _run_lpips_eval(
+        tmp_path,
+        f"wan22_t2v_{variant_name}_within_build",
+        "video",
+        WAN22_LPIPS_PROMPT,
+        within_build_reference,
+        generated_path,
+    )
+    golden_score = _run_lpips_eval(
         tmp_path,
         f"wan22_t2v_{variant_name}",
         "video",
@@ -244,24 +386,127 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(
+        within_build_score,
+        within_build_threshold,
+        label=f"{variant_name} vs within-build single-GPU reference (parallelism gate)",
+    )
+    _assert_lpips_below_threshold(
+        golden_score,
+        WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD,
+        label=f"{variant_name} vs frozen golden (catastrophic backstop)",
+    )
 
 
 @pytest.mark.parametrize(
-    "variant_name,parallel",
+    "variant_name,parallel,within_build_threshold",
     WAN22_LPIPS_MULTI_GPU_VARIANTS,
-    ids=[name for name, _ in WAN22_LPIPS_MULTI_GPU_VARIANTS],
+    ids=[variant[0] for variant in WAN22_LPIPS_MULTI_GPU_VARIANTS],
 )
 def test_wan22_t2v_lpips_against_golden_multi_gpu(
-    _visual_gen_deps, tmp_path, variant_name, parallel
+    _visual_gen_deps,
+    tmp_path,
+    variant_name,
+    parallel,
+    within_build_threshold,
+    wan22_within_build_reference,
 ):
-    _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
+    # Test name kept (test-db lists and waives.txt reference it); the primary
+    # gate is now the within-build parallelism check, with the frozen golden
+    # retained as a loose catastrophic backstop.
+    _run_wan22_t2v_lpips_case(
+        tmp_path, variant_name, parallel, wan22_within_build_reference, within_build_threshold
+    )
 
 
 @pytest.mark.parametrize(
-    "variant_name,parallel",
+    "variant_name,parallel,within_build_threshold",
     WAN22_LPIPS_TP_VARIANTS,
-    ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
+    ids=[variant[0] for variant in WAN22_LPIPS_TP_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_name, parallel):
-    _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
+def test_wan22_t2v_lpips_against_golden_tp(
+    _visual_gen_deps,
+    tmp_path,
+    variant_name,
+    parallel,
+    within_build_threshold,
+    wan22_within_build_reference,
+):
+    _run_wan22_t2v_lpips_case(
+        tmp_path, variant_name, parallel, wan22_within_build_reference, within_build_threshold
+    )
+
+
+@pytest.mark.parametrize(
+    "ulysses_size,vae_size,backend", [(2, 2, "VANILLA"), (4, 3, "VANILLA"), (2, 2, "FA4")]
+)
+def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
+    """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
+    from defs.examples.visual_gen.test_minimax_h3_e2e import (
+        MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD,
+        _mean_lpips_distance,
+        _minimax_h3_checkpoint_path,
+        _multi_resolution_log_stft_distance,
+    )
+
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+
+    if torch.cuda.device_count() < ulysses_size:
+        pytest.skip(f"Requires {ulysses_size} CUDA GPUs")
+    prompt = "A woman smiles and waves in a sunlit park, with birds chirping."
+    videos, audios = [], []
+    for size, decode_size in ((1, 1), (ulysses_size, 1), (ulysses_size, vae_size)):
+        args = VisualGenArgs(
+            model=_minimax_h3_checkpoint_path(),
+            parallel_config={"ulysses_size": size, "parallel_vae_size": decode_size},
+            attention_config={"backend": backend},
+            torch_compile_config={"enable": True},
+            cuda_graph_config={"enable": False},
+            compilation_config={"skip_warmup": True},
+        )
+        engine = VisualGen(model=args.model, args=args)
+        try:
+            output = engine.generate(
+                inputs=prompt,
+                params=VisualGenParams(
+                    height=384, width=384, num_frames=124, num_inference_steps=28, seed=42
+                ),
+            )
+            video = torch.as_tensor(output.video).cpu()
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            assert video.shape == (1, 124, 384, 384, 3)
+            assert video.float().std() > 1
+            assert torch.isfinite(torch.as_tensor(output.audio)).all()
+            torch.save(
+                {"video": video, "audio": output.audio},
+                tmp_path / f"h3_ulysses{size}_vae{decode_size}.pt",
+            )
+            videos.append(video)
+            audios.append(torch.as_tensor(output.audio).cpu())
+        finally:
+            engine.shutdown()
+    # The tiled decoder batches a rank's tiles into one call, so the two runs decode with
+    # different batch shapes; compiled kernels may then round a pixel to the adjacent uint8
+    # level. Audio takes no tile batching and stays exact.
+    torch.testing.assert_close(videos[2], videos[1], atol=1, rtol=0)
+    torch.testing.assert_close(audios[2], audios[1])
+    for decode_size, audio in zip((1, vae_size), audios[1:]):
+        audio_score = _multi_resolution_log_stft_distance(audio, audios[0])
+        print(
+            f"H3 Ulysses={ulysses_size} + parallel_vae_size={decode_size} vs single GPU: "
+            f"audio log-STFT={audio_score:.6f}"
+        )
+        assert audio_score < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD, (
+            f"H3 parallelism changed audio: log-STFT={audio_score:.6f} "
+            f">= {MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD}"
+        )
+    reference = videos[0].permute(0, 1, 4, 2, 3).float().div(255)
+    score = _mean_lpips_distance(videos[2], reference)
+    print(
+        f"H3 Ulysses={ulysses_size} + parallel_vae_size={vae_size} vs single GPU: mean LPIPS={score:.6f}"
+    )
+    lpips_threshold = MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLDS[ulysses_size]
+    assert score < lpips_threshold, (
+        f"H3 parallelism changed output: mean LPIPS={score:.6f} >= {lpips_threshold}"
+    )

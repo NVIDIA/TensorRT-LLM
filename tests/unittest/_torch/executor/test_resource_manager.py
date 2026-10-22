@@ -17,19 +17,20 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
-    _merge_kv_cache_pool_pointers,
+    _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.bindings.internal.batch_manager import \
-    PeftTaskNotCachedException
+from tensorrt_llm.bindings.internal.batch_manager import (
+    LinearCacheType, PeftTaskNotCachedException)
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
@@ -44,8 +45,6 @@ LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
-
-sys.path.append(str(root_dir / "tests" / "integration"))
 
 
 def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
@@ -73,6 +72,80 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+def test_minimum_blocks_per_window_aligns_attention_pool_capacity() -> None:
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    local_blocks = {
+        64: (8, 4),
+        128: (7, 3),
+        recurrent_window: (20, 0),
+    }
+    rank_blocks = [
+        local_blocks,
+        {
+            64: (5, 2),
+            128: (6, 1),
+        },
+        {
+            64: (6, 3),
+            128: (9, 2),
+            recurrent_window: (18, 0),
+        },
+    ]
+
+    assert _get_minimum_blocks_per_window(
+        local_blocks,
+        rank_blocks,
+        [{64, 128}, {64, 128}, {64, 128}],
+    ) == {
+        64: (5, 2),
+        128: (6, 1),
+        recurrent_window: (18, 0),
+    }
+
+
+def test_minimum_blocks_per_window_rejects_asymmetric_hosted_windows() -> None:
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    # Linear-attention sizing emits a positive placeholder key even when the
+    # rank only hosts recurrent-state layers. The hosted-window set, not the
+    # sizing keys, must expose the PP asymmetry.
+    with pytest.raises(RuntimeError, match="Asymmetrical pipeline parallelism"):
+        _get_minimum_blocks_per_window(
+            {
+                128: (8, 4),
+                recurrent_window: (20, 0),
+            },
+            [
+                {
+                    128: (8, 4),
+                    recurrent_window: (20, 0),
+                },
+                {
+                    128: (5, 2)
+                },
+            ],
+            [set(), {128}],
+        )
+
+
+def test_v1_window_resolution_and_grouping_use_local_layer_order() -> None:
+    manager = object.__new__(KVCacheManager)
+    manager.pp_layers = [3, 5]
+    manager.num_local_layers = 2
+    config = KvCacheConfig(max_attention_window=[64, 128, 512])
+
+    manager.max_attention_window_vec = manager._resolve_max_attention_window_vec(
+        config,
+        max_seq_len=256,
+    )
+
+    assert manager.max_attention_window_vec == [64, 256]
+    assert config.max_attention_window == [64, 128, 512]
+    assert manager._get_window_size_to_layers() == {
+        64: [0],
+        256: [1],
+    }
 
 
 class TestMergeKVCachePoolPointers(unittest.TestCase):
@@ -942,8 +1015,8 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
-    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
-        """V1 truncates packed beam cache indices to the requested blocks."""
+    def test_batch_cache_indices_honor_requested_blocks_for_beam0(self):
+        """V1 returns and truncates only beam 0's cache indices."""
         kv_cache_manager = KVCacheManager(
             kv_cache_config=KvCacheConfig(max_tokens=256,
                                           enable_block_reuse=False),
@@ -964,11 +1037,10 @@ class TestResourceManager(unittest.TestCase):
                                                 max_beam_width=2)
 
             full_indices = kv_cache_manager.get_batch_cache_indices(
-                [request_id], beam_width=2)
+                [request_id])
             requested_blocks = 4
             truncated_indices = kv_cache_manager.get_batch_cache_indices(
                 [request_id],
-                beam_width=2,
                 num_blocks_per_seq=[requested_blocks],
             )
 
@@ -1108,6 +1180,59 @@ class TestResourceManager(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+class TestKVCacheManagerConnectorReporting(unittest.TestCase):
+    """Which allocations the V1 manager reports to an attached connector."""
+
+    @staticmethod
+    def _make_manager(connector) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.is_draft = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.kv_connector_manager = connector
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        manager.get_cache_indices = MagicMock(return_value=[4, 5])
+        return manager
+
+    @staticmethod
+    def _context_batch() -> ScheduledRequests:
+        request = SimpleNamespace(py_request_id=1,
+                                  prompt_len=64,
+                                  py_beam_width=1,
+                                  py_draft_tokens=[],
+                                  is_first_context_chunk=True,
+                                  is_last_context_chunk=True)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_a_fresh_allocation_is_reported(self):
+        connector = MagicMock(capacity_only=False)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        connector.update_state_after_alloc.assert_called_once()
+        self.assertEqual(connector.update_state_after_alloc.call_args.args[1],
+                         [4, 5])
+
+    def test_a_capacity_only_connector_is_told_of_no_allocation(self):
+        """It cannot reach these blocks, so gathering indices is wasted."""
+        connector = MagicMock(capacity_only=True)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        manager.get_cache_indices.assert_not_called()
+        connector.update_state_after_alloc.assert_not_called()
+
+
+@pytest.mark.cpu_only
 class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
 
     @staticmethod
@@ -1182,8 +1307,13 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
         """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
-        kv_cache_config = KvCacheConfig(max_tokens=64,
-                                        secondary_offload_min_priority=0)
+        for config_type in (KvCacheConfig, tllm.KvCacheConfig):
+            with self.subTest(config_type=config_type):
+                self._check_offload_priority_forwarding(config_type)
+
+    def _check_offload_priority_forwarding(self, config_type):
+        kv_cache_config = config_type(max_tokens=64,
+                                      secondary_offload_min_priority=0)
 
         mock_impl = MagicMock()
         mock_impl.get_block_pool_pointers.return_value = torch.empty(0)

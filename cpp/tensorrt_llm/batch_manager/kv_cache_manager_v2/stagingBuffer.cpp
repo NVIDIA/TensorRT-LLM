@@ -35,7 +35,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-using MemoryOwner = std::variant<HostMem, CudaUniqPtr>;
+using MemoryOwner = std::variant<StaticHostMem, CudaUniqPtr>;
 
 CudaUniqPtr allocateDeviceMemory(size_t size)
 {
@@ -49,7 +49,7 @@ MemoryOwner makeMemoryOwner(size_t size, StagingBufferMemory memory)
     TLLM_CHECK_WITH_INFO(size > 0, "Staging buffer size must be non-zero");
     switch (memory)
     {
-    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<HostMem>, size};
+    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<StaticHostMem>, size};
     case StagingBufferMemory::kDevice: return MemoryOwner{std::in_place_type<CudaUniqPtr>, allocateDeviceMemory(size)};
     default: throw std::invalid_argument("StagingBufferManager received an invalid memory kind");
     }
@@ -157,23 +157,20 @@ StagingBufferManager::StagingBufferManager(size_t size, StagingBufferMemory memo
 
 StagingBufferManager::~StagingBufferManager() noexcept
 {
-    terminateOnException("Failed to destroy staging-buffer manager safely",
-        [&]()
+    KVCM2_POISON_ON_EXCEPT(
+        [&]
         {
-            std::vector<CachedCudaEvent*> readyEvents;
-            readyEvents.reserve(mRanges.size());
             for (auto& range : mRanges)
             {
                 TLLM_CHECK_WITH_INFO(range.retired, "Destroying a staging-buffer manager with a live buffer");
-                readyEvents.push_back(&range.readyEvent);
+                range.readyEvent.synchronize();
             }
-            synchronizeAll(readyEvents);
         });
 }
 
 MemAddress StagingBufferManager::baseAddress() const noexcept
 {
-    if (auto const* host = std::get_if<HostMem>(&mMemoryOwner))
+    if (auto const* host = std::get_if<StaticHostMem>(&mMemoryOwner))
     {
         return host->address();
     }
@@ -182,8 +179,8 @@ MemAddress StagingBufferManager::baseAddress() const noexcept
 
 StagingBufferMemory StagingBufferManager::memory() const noexcept
 {
-    return std::holds_alternative<HostMem>(mMemoryOwner) ? StagingBufferMemory::kPinnedHost
-                                                         : StagingBufferMemory::kDevice;
+    return std::holds_alternative<StaticHostMem>(mMemoryOwner) ? StagingBufferMemory::kPinnedHost
+                                                               : StagingBufferMemory::kDevice;
 }
 
 StagingBuffer StagingBufferManager::acquire(
@@ -280,26 +277,24 @@ StagingBufferRange* StagingBufferManager::reserve(
                 auto payloadBegin = splitRange(runBegin, dataBegin);
                 auto payloadEnd = splitRange(payloadBegin, end);
 
-                auto collectEvents = [&](auto& readyEvents)
+                if (stream.has_value())
                 {
+                    std::vector<CUevent> readyEvents;
                     readyEvents.reserve(numRunRanges);
                     for (auto range = payloadBegin; range != payloadEnd; ++range)
                     {
                         TLLM_CHECK_DEBUG(range->retired);
-                        readyEvents.push_back(&range->readyEvent);
+                        readyEvents.push_back(range->readyEvent.handle());
                     }
-                };
-                if (stream.has_value())
-                {
-                    std::vector<CachedCudaEvent const*> readyEvents;
-                    collectEvents(readyEvents);
-                    streamWaitEvents(reinterpret_cast<CudaStream>(*stream), readyEvents);
+                    streamWaitEvents(reinterpret_cast<CudaStream>(*stream), std::move(readyEvents));
                 }
                 else
                 {
-                    std::vector<CachedCudaEvent*> readyEvents;
-                    collectEvents(readyEvents);
-                    synchronizeAll(readyEvents);
+                    for (auto range = payloadBegin; range != payloadEnd; ++range)
+                    {
+                        TLLM_CHECK_DEBUG(range->retired);
+                        range->readyEvent.synchronize();
+                    }
                 }
 
                 mRanges.erase(payloadBegin, payloadEnd);

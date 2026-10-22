@@ -98,6 +98,12 @@ FALLBACK_KV_SHAPE = {
 }
 
 
+def _dwdp_ctx(cfg):
+    """True when the ctx side is a DWDP group (dwdp_config.dwdp_size > 1)."""
+    ctx = (cfg.get("worker_config", {}) or {}).get("ctx", {}) or {}
+    return int((ctx.get("dwdp_config") or {}).get("dwdp_size", 1) or 1) > 1
+
+
 def _side_cfg(cfg, role):
     worker_config = cfg.get("worker_config", {}) or {}
     side = worker_config.get(role, {}) or {}
@@ -274,7 +280,9 @@ def precheck_prefix_lines(
     # A selected pytest case that is SKIP-waived must not run its precheck.
     # This takes precedence over the global force-enable knob because there
     # will be no corresponding test execution to gate.
-    enabled = precheck_enabled(cfg) and not skip_precheck
+    # A DWDP ctx side is one MPI step of single-GPU servers, a topology the
+    # gate's one-srun-per-ctx-server launch does not reproduce, so skip it too.
+    enabled = precheck_enabled(cfg) and not skip_precheck and not _dwdp_ctx(cfg)
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
@@ -350,7 +358,9 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
     benchmark = cfg.get("benchmark", {}) or {}
 
     yaml_mode = str(benchmark.get("mode", ""))
-    if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+    if benchmark_mode == "gen_only_no_context" or (
+        benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
+    ):
         # No ctx workers at launch -> no KV transfer in the real test either.
         return {"skip": True, "skip_reason": "gen_only_no_context mode has no KV transfer"}
 
@@ -447,7 +457,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         # True/False from the yaml wins; absent means "auto", which the
         # driver resolves against the model class's manager preference at
         # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
-        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
+        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", True)
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan
 

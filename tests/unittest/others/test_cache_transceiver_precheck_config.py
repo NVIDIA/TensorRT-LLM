@@ -27,20 +27,11 @@ import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import precheck_config as pcfg
+import run_precheck as rp
 
-import precheck_config as pcfg  # noqa: E402
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+_PRECHECK_DIR = os.path.dirname(os.path.abspath(pcfg.__file__))
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -150,6 +141,18 @@ def test_gen_only_no_context_skips():
     plan = pcfg.resolve_plan(cfg, benchmark_mode="gen_only")
     assert plan["skip"]
     # e2e over the same yaml still runs (ctx servers are launched there).
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
+
+
+def test_gen_only_no_context_test_id_skips_over_an_ordinary_yaml():
+    """The primary entry path: the test id names the mode, the yaml does not."""
+    cfg = _disagg_yaml(benchmark={"mode": "e2e", "input_length": 1024})
+
+    plan = pcfg.resolve_plan(cfg, benchmark_mode="gen_only_no_context")
+    assert plan["skip"]
+    assert "gen_only_no_context" in plan["skip_reason"]
+
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="gen_only")["skip"]
     assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
 
 
@@ -286,9 +289,9 @@ def test_use_kv_cache_manager_v2_flags():
     # Absent -> "auto" (the driver resolves it against the model's
     # get_preferred_kv_cache_manager_version at runtime, like serving).
     plan = pcfg.resolve_plan(_disagg_yaml())
-    assert plan["ctx_use_kv_cache_manager_v2"] == "auto"
-    assert plan["gen_use_kv_cache_manager_v2"] == "auto"
-    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] == "auto"
+    assert plan["ctx_use_kv_cache_manager_v2"] is True
+    assert plan["gen_use_kv_cache_manager_v2"] is True
+    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] is True
 
     # Explicit yaml values win, per side.
     plan = pcfg.resolve_plan(
@@ -541,7 +544,7 @@ def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
     )
 
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     commands = result.stdout.splitlines()
 
@@ -582,7 +585,7 @@ def test_precheck_commands_split_pytest_common_vars(monkeypatch):
     )
 
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     tokens = shlex.split(result.stdout.splitlines()[0])
 
@@ -633,6 +636,7 @@ def test_precheck_commands_export_model_root_safely(model_root, monkeypatch):
         text=True,
         capture_output=True,
         check=True,
+        timeout=60,
     )
     assert result.stdout == model_root
 
@@ -678,6 +682,24 @@ def test_precheck_enabled_helper(monkeypatch):
     assert pcfg.precheck_enabled({}) is False
     monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "true")
     assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is True
+
+
+@pytest.mark.parametrize("force_enable", [False, True])
+def test_dwdp_ctx_disables_precheck(monkeypatch, force_enable):
+    # A DWDP ctx side is one MPI step of single-GPU servers, which the gate's
+    # one-srun-per-ctx-server launch cannot reproduce: skip it, even when the
+    # env var forces the precheck on, and without demanding a model root.
+    if force_enable:
+        monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    cfg = _disagg_yaml()
+    cfg["worker_config"]["ctx"]["dwdp_config"] = {"dwdp_size": 4, "num_groups": 1}
+
+    lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
+
+    assert "export ctPrecheckEnabled=0" in lines
+    assert not any(line.startswith("export LLM_MODELS_ROOT=") for line in lines)
 
 
 def test_skip_waived_case_overrides_force_enable(monkeypatch):
@@ -744,11 +766,19 @@ def test_gate_library_content(tmp_path):
         pcfg.gate_library_content("/nowhere/draft.sh", str(tmp_path / "empty"))
 
 
+@pytest.mark.parametrize("driver_status", (None, "PASS", "RUNNING", "FAIL"))
 @pytest.mark.parametrize(
     ("exit_code", "expected_verdict"),
     ((124, "EXTERNAL_TIMEOUT"), (137, "EXTERNAL_KILL")),
 )
-def test_gate_records_external_timeout_verdict(tmp_path, exit_code, expected_verdict):
+def test_gate_records_external_timeout_verdict(
+    tmp_path, exit_code, expected_verdict, driver_status
+):
+    """A killed step gets the gate's verdict unless the driver already wrote a FAIL verdict.
+
+    A stale PASS or a RUNNING status left by a dead driver is replaced, and the junit excerpt
+    still shows the driver's error markers after they scrolled out of the log tail.
+    """
     gate = os.path.join(
         os.path.dirname(_PRECHECK_DIR),
         "..",
@@ -763,7 +793,18 @@ def test_gate_records_external_timeout_verdict(tmp_path, exit_code, expected_ver
     gate = os.path.abspath(gate)
     shell_script = f"""
 source {shlex.quote(gate)}
-timeout() {{ return {exit_code}; }}
+timeout() {{
+    local name="${{DISAGG_SERVING_TYPE/_PRECHECK_/_}}"
+    name="${{name,,}}"  # GEN_PRECHECK_0 -> gen_0
+    if [ -n "{driver_status or ""}" ]; then
+        echo "{driver_status} $name" > "$precheckDir/status/$name.status"
+    fi
+    echo "[precheck $name r0] UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists"
+    echo "[precheck $name] STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error"
+    seq 100  # later output pushes the marker out of the log tail
+    printf '\\0'  # an aborted MPI job can leave a NUL byte in the log
+    return {exit_code}
+}}
 sleep() {{ :; }}
 cleanup_on_failure() {{ :; }}
 ctPrecheckEnabled=1
@@ -785,19 +826,26 @@ pytestCommandCTXPrecheck=ctx-command
 precheckRunScript=/unused
 run_cache_transceiver_precheck
 """
-    subprocess.run(["bash"], input=shell_script, capture_output=True, check=True, text=True)
+    subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
 
     status_dir = tmp_path / "output" / "cache_transceiver_precheck" / "status"
     for name in ("gen_0", "ctx_0"):
         verdict = (status_dir / f"{name}.status").read_text()
+        if driver_status == "FAIL":
+            assert verdict == f"FAIL {name}\n"  # the driver's root cause wins over the exit code
+            continue
         assert verdict.startswith(f"{expected_verdict} {name}:")
         if exit_code == 124:
             assert "1200s total-runtime backstop" in verdict
         else:
             assert "possibly timeout -k escalation" in verdict
     junit = (tmp_path / "workspace" / "results-ct-precheck.xml").read_text()
-    assert expected_verdict in junit
+    assert ("FAIL gen_0" if driver_status == "FAIL" else expected_verdict) in junit
     assert "NO_STATUS" not in junit
+    assert "UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists" in junit
+    assert "STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error" in junit
 
 
 def test_gate_scopes_precheck_launch_environment(tmp_path):
@@ -847,7 +895,7 @@ run_cache_transceiver_precheck
 printf '%s\n%s\n' "$DISAGG_SERVING_TYPE" "$pytestCommand"
 """
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     assert result.stdout.splitlines()[-2:] == ["REAL_PERF_PARENT", "real-perf-command"]
 
@@ -922,7 +970,6 @@ class TestMultiPeerOrchestration:
         fail_ctx=False,
         wave_delay_s=0,
     ):
-        import sys
         import types
 
         # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
@@ -1240,7 +1287,6 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
     delivered via bcast the rank must raise; with a clean (None) broadcast it
     must return normally.
     """
-    import sys
     import types
 
     monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))

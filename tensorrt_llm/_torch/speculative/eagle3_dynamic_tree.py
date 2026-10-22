@@ -23,8 +23,7 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
-from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler.ops.flashinfer import sample_from_logits_op
+from ..attention.backends import AttentionMetadata
 from .eagle3 import Eagle3OneModelWorker
 
 if TYPE_CHECKING:
@@ -426,20 +425,37 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "update_kv_cache_draft_token_location_2d requires uniform num_kv_heads across all layers, "
             f"but got {cache_mgr.num_kv_heads_per_layer}"
         )
+        assert len(set(cache_mgr.max_attention_window_vec)) == 1, (
+            "update_kv_cache_draft_token_location_2d requires uniform "
+            "attention windows across all local layers, but got "
+            f"{cache_mgr.max_attention_window_vec}"
+        )
+        max_attention_window = cache_mgr.max_attention_window_vec[0]
+        if max_attention_window is None:
+            max_attention_window = cache_mgr.max_seq_len
+        local_pool_ids = {
+            int(cache_mgr.kv_cache_pool_mapping[layer_idx][0])
+            for layer_idx in range(cache_mgr.num_local_layers)
+        }
+        assert len(local_pool_ids) == 1, (
+            "update_kv_cache_draft_token_location_2d requires all local "
+            f"layers in one KV pool, got pools {sorted(local_pool_ids)}"
+        )
+        pool_idx = local_pool_ids.pop()
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
             self._accepted_draft_indices_tensor[:batch_size],
             self._num_accepted_tokens_buf[:batch_size],
             attn_metadata.kv_lens_cuda[:batch_size],
             True,
-            cache_mgr.num_layers,
+            cache_mgr.num_local_layers,
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
             # total so the C++ kernel computes correct strides and grid dims.
             cache_mgr.num_kv_heads_per_layer[0],
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
-            cache_mgr.max_attention_window_vec[0],
-            cache_mgr.kv_cache_pool_pointers,
-            attn_metadata.kv_cache_block_offsets,
+            max_attention_window,
+            cache_mgr.kv_cache_pool_pointers[pool_idx],
+            attn_metadata.kv_cache_block_offsets[pool_idx],
             cache_mgr.max_blocks_per_seq,
             cache_mgr.tokens_per_block,
             None,
@@ -500,6 +516,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             spec_metadata.gather_ids,
             accepted_tokens,
             num_contexts,
+            prompt_lookahead_tokens=(spec_metadata.context_prompt_lookahead_tokens),
         )
 
         if num_gens > 0:
@@ -765,14 +782,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         num_flat_tokens = logits.shape[0]
         if not spec_metadata.is_all_greedy_sample:
-            # Non-greedy: sample target tokens with per-request temperature/top_k/top_p.
-            top_ks = spec_metadata.top_ks[:num_flat_tokens]
+            # Non-greedy: sample target tokens with per-token sampling params.
             seed, offset = self._rng_state_per_token(spec_metadata, num_flat_tokens)
-            sampled = sample_from_logits_op(
+            sampled = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
                 logits,
                 spec_metadata.temperatures[:num_flat_tokens],
-                top_ks,
+                spec_metadata.top_ks[:num_flat_tokens],
                 spec_metadata.top_ps[:num_flat_tokens],
+                spec_metadata.min_ps[:num_flat_tokens],
                 seed=seed,
                 offset=offset,
             )
@@ -847,8 +865,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         Context tokens are sampled directly (they bypass the rejection kernel).
         Gen tokens are handled entirely by the rejection kernel, which samples
-        from the target distribution internally — so only the raw logits (not
-        pre-sampled token IDs) are passed to the kernel.
+        from the target distribution internally — so it is given the filtered
+        target probs, not pre-sampled token IDs.
         """
         if num_gens > self._max_batch_size:
             raise RuntimeError(
@@ -868,13 +886,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Context tokens bypass the rejection kernel — sample them directly.
         if num_contexts > 0:
-            top_ks_ctx = spec_metadata.top_ks[:num_contexts]
             seed_ctx, offset_ctx = self._rng_state_per_token(spec_metadata, num_contexts)
-            sampled_ctx = sample_from_logits_op(
+            sampled_ctx = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
                 logits[:num_contexts],
                 spec_metadata.temperatures[:num_contexts],
-                top_ks_ctx,
+                spec_metadata.top_ks[:num_contexts],
                 spec_metadata.top_ps[:num_contexts],
+                spec_metadata.min_ps[:num_contexts],
                 seed=seed_ctx,
                 offset=offset_ctx,
             )
@@ -896,11 +915,20 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             target_logits_tree = logits[-num_gens * N :].reshape(-1, vocab_size)
             gen_slice = slice(num_contexts, num_contexts + num_gens)
-            temps = spec_metadata.request_temperatures[gen_slice]
-            top_ks_rej = spec_metadata.request_top_ks[gen_slice]
-            top_ps_rej = spec_metadata.request_top_ps[gen_slice]
+            # Every node of a request's tree is filtered with that request's params.
+            target_probs = self._compute_probs_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                target_logits_tree,
+                spec_metadata.request_temperatures[gen_slice].repeat_interleave(N),
+                spec_metadata.request_top_ks[gen_slice].repeat_interleave(N),
+                spec_metadata.request_top_ps[gen_slice].repeat_interleave(N),
+                spec_metadata.request_min_ps[gen_slice].repeat_interleave(N),
+            ).reshape(num_gens, N, vocab_size)
             seed_rej, offset_rej = self._rng_state_per_request(
-                spec_metadata, num_contexts, num_contexts + num_gens
+                spec_metadata,
+                num_contexts,
+                num_contexts + num_gens,
+                slot=spec_metadata.rng_accept_slot,
             )
 
             slot_storage = spec_tree_manager.slot_storage
@@ -914,13 +942,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_rejection_out(
                     spec_metadata.draft_tokens.reshape(num_gens, N - 1).long(),
-                    target_logits_tree,
+                    target_probs,
                     retrieve_next_token,
                     retrieve_next_sibling,
                     tree_valid,
-                    temps,
-                    top_ks_rej,
-                    top_ps_rej,
                     num_gens,
                     self._max_path_len,
                     seed=seed_rej,

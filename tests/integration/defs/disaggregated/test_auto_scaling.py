@@ -29,22 +29,7 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
-    if sm == 90:
-        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
-        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
-        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
-        return "^gdr_copy"
     return "^ib,gdr_copy"
-
-
-# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 @pytest.fixture
@@ -57,8 +42,7 @@ def worker_env():
 
 @pytest.fixture
 def model_name():
-    model_path = os.path.join(llm_models_root(),
-                              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3/Qwen3-0.6B")
     assert os.path.exists(model_path), f"Model path {model_path} does not exist"
     return model_path
 

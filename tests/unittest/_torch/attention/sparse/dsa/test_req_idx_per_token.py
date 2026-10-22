@@ -28,7 +28,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSAtrtllmAttentionMetadata,
     build_req_idx_per_token,
 )
@@ -70,7 +70,6 @@ def test_on_update_kv_lens_invalidates_base_mla_state() -> None:
     md.enable_flash_mla = False
     md._mla_scheduler_buffers_valid = True
     md._mla_ctx_cu_seqlens_valid = True
-    md._cute_dsl_mla_staging_key = object()
     md._invalidate_pool_view_cache = Mock()
     md._num_tokens = 0
     md._num_generations = 0
@@ -83,7 +82,6 @@ def test_on_update_kv_lens_invalidates_base_mla_state() -> None:
 
     assert not md._mla_scheduler_buffers_valid
     assert not md._mla_ctx_cu_seqlens_valid
-    assert md._cute_dsl_mla_staging_key is None
 
 
 def test_on_update_kv_lens_rebuilds_stale_map() -> None:
@@ -100,6 +98,12 @@ def test_on_update_kv_lens_rebuilds_stale_map() -> None:
     # __init__ (bypassed by object.__new__) defaults this to False;
     # on_update_kv_lens() reads it since #16925.
     md.in_mtp_draft_loop = False
+    # Same reason: `_invalidate_pool_view_cache` clears this unconditionally, and
+    # unlike the sibling test above we exercise the real method rather than a Mock
+    # (the map rebuild happens downstream of it). A dict, not a Mock, so that a
+    # future attribute added to that method fails loudly here instead of being
+    # absorbed.
+    md._group_remap_batched = {}
     # Stub collaborators unrelated to the map rebuild (test_dsa_indexer.py style).
     md.kv_lens_cuda = torch.tensor([100, 200, 300], dtype=torch.int32, device=device)
     md._compute_kv_lens_row_reorder = Mock()

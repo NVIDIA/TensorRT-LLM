@@ -1,5 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pickle
 import sys
+from unittest.mock import Mock
 
 import cloudpickle
 import pytest
@@ -7,6 +23,7 @@ import torch
 from mpi4py import MPI
 from utils.util import check_accuracy, skip_no_hopper
 
+import tensorrt_llm._torch.modules.triton_linear as triton_linear_module
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.triton_linear import TritonLinear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -99,7 +116,7 @@ def test_linear_fp8qdq(linear_cls):
 @skip_no_hopper
 @pytest.mark.parametrize("activation_dtype",
                          [torch.bfloat16, torch.float8_e4m3fn])
-def test_linear_mxfp4(activation_dtype):
+def test_linear_mxfp4(activation_dtype, monkeypatch):
     if activation_dtype == torch.float8_e4m3fn:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
 
@@ -180,3 +197,15 @@ def test_linear_mxfp4(activation_dtype):
 
     # Compare outputs with more relaxed tolerance for MXFP4
     check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.95)
+
+    matmul_spy = Mock(wraps=triton_linear_module.matmul)
+    monkeypatch.setattr(triton_linear_module, "matmul", matmul_spy)
+    method = triton_linear_module.TritonMXFP4LinearMethod(activation_dtype)
+    direct_output = method.apply(linear, x, linear.bias)
+
+    matmul_spy.assert_called_once()
+    precision_config = matmul_spy.call_args.kwargs["precision_config"]
+    assert precision_config.b_microblock_size == (
+        triton_linear_module.MXFP_BLOCK_SIZE.value) == 32
+    assert precision_config.b_mx_scale is linear.weight_scale
+    check_accuracy(direct_output, ref_output, rtol=0.2, atol=0.2, percent=0.95)

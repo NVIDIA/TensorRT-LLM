@@ -76,7 +76,7 @@ measured: []
 - **Rollback:** `enable_chunked_prefill=False`. Trigger: accuracy mismatch at chunk
   boundaries, or no memory benefit at the target ISL.
 - **Prior art:** PRs #9376, #10552. Files:
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (`_gather_k_cache_for_chunk`,
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/indexer.py` (`_gather_k_cache_for_chunk`,
   `enable_context_mla_with_cached_kv`, `split_prefill_chunks`, chunk-spec alignment),
   `cpp/tensorrt_llm/kernels/mlaKernels.cu` (`applyMLARopeAndAssignQKVKernelOptContext`,
   cache offset). Owning skills: **trtllm-serve-config-guide** (knob),

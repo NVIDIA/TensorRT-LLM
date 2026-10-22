@@ -14,12 +14,13 @@
 # limitations under the License.
 import asyncio
 import json
-from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
 from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
@@ -37,16 +38,25 @@ from tensorrt_llm.serve.resource_governor import ResourceGovernor
 pytestmark = pytest.mark.cpu_only
 
 
+# BaseLLM.__init__ builds a model and executor. This lightweight subclass keeps
+# these method-level tests CPU-only while using the production argument types.
+class _TestLLM(BaseLLM):
+    def __init__(self, **args_overrides: Any) -> None:
+        self.args = TorchLlmArgs(
+            model="dummy",
+            skip_tokenizer_init=True,
+            **args_overrides,
+        )
+
+
 def _apply_generation_config_sampling_defaults(
     mode: str,
     sampling_params: SamplingParams,
     generation_config_explicit_values: dict,
 ) -> SamplingParams:
-    llm = SimpleNamespace(
-        args=SimpleNamespace(backend="pytorch", generation_config=mode),
-        _generation_config_explicit_values=generation_config_explicit_values,
-    )
-    BaseLLM._apply_generation_config_sampling_defaults(llm, sampling_params)
+    llm = _TestLLM(generation_config=mode)
+    llm._generation_config_explicit_values = generation_config_explicit_values
+    llm._apply_generation_config_sampling_defaults(sampling_params)
     return sampling_params
 
 

@@ -94,14 +94,8 @@ class GuidedDecodingParams:
 
 class LogprobParams(NamedTuple):
     prompt_logprobs: Optional[int] = None
-    logprobs: Optional[int] = None
     # Drop the logits once the logprobs are computed
     drop_context_logits: bool = False
-    # Drop the geneation_logits once the logprobs are computed
-    drop_generation_logits: bool = False
-    # Return generation logprobs as `list[float]` instead of the default
-    # `list[dict[int, Logprob]]`. Only valid when logprobs == 0.
-    logprobs_simple_format: bool = False
     # Return prompt logprobs as `list[float]` instead of the default
     # `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.
     prompt_logprobs_simple_format: bool = False
@@ -257,9 +251,9 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
+        return_routed_experts (bool): Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids for train/inference routing alignment in MoE reinforcement learning. Requires the engine-level enable_return_routed_experts. Defaults to False.
         additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
-        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
@@ -330,6 +324,12 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
+    # Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids
+    # on this request's output (via additional_generation_outputs["routed_experts"]),
+    # for train/inference routing alignment in MoE reinforcement learning. Requires
+    # the engine-level enable_return_routed_experts. Separated-routing MoE backends
+    # only (fused backends fail closed).
+    return_routed_experts: bool = False
     additional_model_outputs: Optional[List[str]] = None
 
     # Decoder tokens moved from generated output into the input prefix. The
@@ -337,17 +337,6 @@ class SamplingParams:
     _decoder_output_token_prefix: Tuple[int, ...] = field(
         default_factory=tuple, init=False, repr=False
     )
-
-    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
-    # Can be deprecated after migration to PyTorch backend.
-    _context_logits_auto_enabled: bool = False
-    _generation_logits_auto_enabled: bool = False
-
-    # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
-    _return_log_probs: bool = False
-
-    # Lookahead decoding config
-    lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
@@ -504,7 +493,7 @@ class SamplingParams:
         self._validate()
 
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
+    #     sampling_resolution.resolve_row_params) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.
@@ -577,14 +566,6 @@ class SamplingParams:
             min_p=self.min_p,
             top_p_decay=self.top_p_decay,
         )
-
-    @property
-    def _need_return_context_logits(self) -> bool:
-        return self.return_context_logits and not self._context_logits_auto_enabled
-
-    @property
-    def _need_return_generation_logits(self) -> bool:
-        return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
@@ -702,7 +683,7 @@ class SamplingParams:
 
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
-    def _get_output_config(self, is_pytorch_backend: bool = False) -> tllme.OutputConfig:
+    def _get_output_config(self) -> tllme.OutputConfig:
         sampling_param_fields = set(dir(SamplingParams))
         fields = [
             f
@@ -712,24 +693,21 @@ class SamplingParams:
 
         config_kwargs = {f: getattr(self, f) for f in fields}
 
-        if is_pytorch_backend:
-            config_kwargs["return_log_probs"] = self.logprobs is not None
-            if self.prompt_logprobs is not None and not self.return_context_logits:
-                logger.info(
-                    "Since prompt_logprobs is requested but return_context_logits is False, "
-                    "internally enabling context logits for prompt logprobs computation. "
-                    "context logits will be dropped after computation as the user didn't explicitly request them."
-                )
-                # TODO: Find a more elegant way to do this.
-                # NOTE: This is an internal hack, so we can entirely avoid introducing
-                # `prompt_logprobs` into the executor bindings and further into
-                # model engine / sampler.
-                # This is because, prompt_logprobs is a derived quantity from
-                # context logits, and the capability to post-compute it
-                # already exists in the worker. (see _get_logprobs in worker.py)
-                config_kwargs["return_context_logits"] = True
-        else:
-            config_kwargs["return_log_probs"] = self._return_log_probs
+        config_kwargs["return_log_probs"] = self.logprobs is not None
+        if self.prompt_logprobs is not None and not self.return_context_logits:
+            logger.info(
+                "Since prompt_logprobs is requested but return_context_logits is False, "
+                "internally enabling context logits for prompt logprobs computation. "
+                "context logits will be dropped after computation as the user didn't explicitly request them."
+            )
+            # TODO: Find a more elegant way to do this.
+            # NOTE: This is an internal hack, so we can entirely avoid introducing
+            # `prompt_logprobs` into the executor bindings and further into
+            # model engine / sampler.
+            # This is because, prompt_logprobs is a derived quantity from
+            # context logits, and the capability to post-compute it
+            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:
             config_kwargs["additional_model_outputs"] = [

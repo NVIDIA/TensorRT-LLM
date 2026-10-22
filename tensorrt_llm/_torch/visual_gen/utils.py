@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utility functions for visual generation pipelines."""
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -9,6 +24,29 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+
+
+def make_noise_generator(seed: int, device: torch.device | str) -> torch.Generator:
+    """Create the RNG used to sample a pipeline's initial noise.
+
+    Defaults to an **on-device** generator (``device``), matching mainstream
+    diffusion serving (vLLM-omni and SGLang-Diffusion default the noise generator
+    to the compute device) and TRT-LLM's own LLM sampling path, so a fixed seed
+    reproduces the same latent as before on a given GPU.
+
+    Set ``TLLM_VISUALGEN_CPU_RNG=1`` to force a **CPU** generator instead: the
+    caller samples on CPU and copies to the device (``diffusers.randn_tensor`` does
+    this automatically), so a fixed seed yields an identical latent across GPU
+    archs -- an on-device ``torch.randn`` keys its Philox stream to an
+    SM-count-dependent thread grid, so e.g. sm_100 and sm_107 draw different noise
+    for the same seed. Useful for cross-hardware validation or bit-reproducible
+    serving, at the cost of one small host draw plus an H2D copy.
+
+    If a per-request device choice is ever needed, promote this to a
+    ``generator_device`` request/config field (as vLLM-omni / SGLang-Diffusion do).
+    """
+    gen_device = "cpu" if os.environ.get("TLLM_VISUALGEN_CPU_RNG") == "1" else device
+    return torch.Generator(device=gen_device).manual_seed(seed)
 
 
 @torch.compile
@@ -123,6 +161,9 @@ class SequenceSharder:
     leak in (the sole exception is :meth:`shard_rope`, which infers the
     seq axis from a ``seq_len`` argument).
     """
+
+    # True on TokenShardedSequenceSharder (parallel/token_sharded_tp.py).
+    token_sharded_tp = False
 
     def __init__(
         self,
@@ -262,6 +303,14 @@ class SequenceSharder:
         # A dim>=1 block slice is non-contiguous when a leading dim is >1 (e.g.
         # batched CFG B=2); fused DiT kernels need a dense buffer. No-op at B==1.
         return tensor[tuple(idx)].contiguous()
+
+    def shard_per_sample(self, table: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Return the per-sample ``[B, ...]`` table for the local tokens.
+
+        Unchanged here: every rank holds all ``B`` samples (token-sharded TP slices it to the
+        rank's sample groups).
+        """
+        return table
 
     def shard_rope(
         self,

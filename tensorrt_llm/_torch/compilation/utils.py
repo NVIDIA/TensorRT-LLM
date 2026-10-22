@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -64,6 +67,7 @@ def capture_piecewise_cuda_graph(enable: bool):
 
 
 def inplace_info():
+    """Map functionalized mutation outputs to their original argument names."""
     inplace_map = {
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default: {
             1: "input",
@@ -103,6 +107,9 @@ def inplace_info():
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
+        torch.ops.trtllm.moe_output_memset_from_expert_counts_inplace.default: {
+            1: "input"
+        },
         torch.ops.trtllm.megamoe_prepare.default: {
             1: "x_out",
             2: "x_sf_out",
@@ -138,16 +145,20 @@ def inplace_info():
             2: "paged_score",
             3: "output"
         },
+        # Must list every mutable argument of the op schema, in order:
+        # remove_copy_pass rebuilds the call from these names only.
         torch.ops.trtllm.compressor_postprocess_scatter.default: {
             1: "kv_out",
             2: "kv_cache",
-            3: "quant_output",
-            4: "scale_output"
+            3: "kv_cache_scale",
+            4: "quant_output",
+            5: "scale_output"
         },
         torch.ops.trtllm.mhc_big_fuse.default: {
             1: "post_mix",
             2: "comb_mix",
-            3: "layer_input"
+            3: "layer_input",
+            4: "pre_mix_out"
         },
         torch.ops.trtllm.mhc_gemm_sqrsum_fma.default: {
             1: "y",
@@ -166,10 +177,21 @@ def inplace_info():
             4: "layer_input_cur",
             5: "y_acc_workspace",
             6: "r_acc_workspace",
-            7: "done_counter_workspace"
+            7: "done_counter_workspace",
+            8: "pre_mix_out"
         },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
+        },
+        # kda_decode mutates three conv caches, the recurrent state and its
+        # output. Keys follow the ``Tensor(a!)..Tensor(e!)`` declaration order,
+        # not the positional argument index.
+        torch.ops.trtllm.kda_decode.default: {
+            1: "conv_state_q",
+            2: "conv_state_k",
+            3: "conv_state_v",
+            4: "state",
+            5: "output"
         },
         torch.ops.trtllm.verify_dynamic_tree_rejection_out_op.default: {
             5: "acceptIndex",
@@ -191,8 +213,30 @@ def inplace_info():
         "gdn_custom_op_inplace": {
             1: "output"
         },
+        # Registered lazily: the op only exists once mamba2_mixer is imported
+        # (Mamba2/NemotronH family). Void boundary op mutating ssm_out:
+        # auto_functionalized returns (None, ssm_out), hence index 1.
+        "mamba2_custom_op_inplace": {
+            1: "ssm_out"
+        },
+        # Registered lazily: the op only exists once mamba2_mixer is
+        # imported (Mamba2/NemotronH family). Void op mutating (state, out):
+        # auto_functionalized returns (None, state, out), hence indices 1/2.
+        # Without this entry the pass leaves the functionalization clone of
+        # the full per-layer SSM state cache in every decode graph.
+        "flashinfer_selective_state_update": {
+            1: "state",
+            2: "out"
+        },
         "minimax_m3_attn_custom_op_inplace": {
             1: "output"
+        },
+        # The ordinary outputs are compact Q/index-Q; the next
+        # three outputs of auto_functionalized are the mutated paged caches.
+        "minimax_m3_fused_sparse_qkv_producer": {
+            2: "kv_cache",
+            3: "index_k_cache",
+            4: "kv_scale_cache"
         },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"
@@ -206,6 +250,27 @@ def inplace_info():
         },
         "fp8_block_scaling_bmm_out": {
             1: "out"
+        },
+        "cute_dsl_bf16_bmm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_locality_domain_inplace_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_bmm_locality_domain_inplace_rubin": {
+            1: "output"
+        },
+        "cute_dsl_fp8_bmm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_nvfp4_gemm_inplace_rubin": {
+            1: "output_tensor"
+        },
+        "cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin": {
+            1: "output_tensor"
         },
         "gate_forward": {
             1: "out_weights",

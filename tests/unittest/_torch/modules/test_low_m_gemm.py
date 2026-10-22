@@ -12,8 +12,12 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
-from tensorrt_llm._torch.modules import linear as linear_module
-from tensorrt_llm._torch.modules.low_m_gemm import _BACKEND_ENV, LowMGemmDispatcher, _parse_enabled
+from tensorrt_llm._torch.modules.low_m_gemm import (
+    _BACKEND_ENV,
+    LOW_M_GEMM_OPT_IN_ATTR,
+    LowMGemmDispatcher,
+    _parse_enabled,
+)
 from tensorrt_llm._utils import is_sm_100f
 
 # ---------------------------------------------------------------------------
@@ -74,16 +78,31 @@ def test_prepare_labels_modules(monkeypatch) -> None:
     assert module._low_m_gemm_dispatcher is dispatcher
 
 
+def test_attach_reaches_the_router_gate(monkeypatch) -> None:
+    """The gate sets the attribute literally; attach() reads it by constant."""
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextGate
+
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    root = torch.nn.Module()
+    root.gate = Qwen3NextGate(hidden_size=8, num_experts=4, top_k=2, dtype=torch.bfloat16)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher.attach(root)
+
+    assert getattr(Qwen3NextGate, LOW_M_GEMM_OPT_IN_ATTR, False)
+    assert root.gate._low_m_gemm_dispatcher is dispatcher
+    assert root.gate._low_m_gemm_name == "gate"
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------
 
 
 def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
-    monkeypatch.setattr(linear_module, "LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
 
-    assert linear_module._should_apply_low_m_gemm(torch.empty((32, 128)))
-    assert not linear_module._should_apply_low_m_gemm(torch.empty((33, 128)))
+    assert _mod._should_apply_low_m_gemm(torch.empty((32, 128)))
+    assert not _mod._should_apply_low_m_gemm(torch.empty((33, 128)))
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +132,7 @@ def test_apply_routes_correct_shapes(monkeypatch) -> None:
     splitk_module.run_splitk_dense = fake_run_splitk_dense
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk",
         splitk_module,
     )
 
@@ -196,7 +215,7 @@ def test_apply_force_active_bypasses_low_m_gemm_active(monkeypatch) -> None:
     splitk_module.run_splitk_dense = fake_run
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk",
         splitk_module,
     )
 
@@ -246,7 +265,7 @@ def test_direct_runner_no_tactics_when_bias_present(monkeypatch) -> None:
     direct_module.autotune_tactics = MagicMock(return_value=[])
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_direct",
         direct_module,
     )
 
@@ -280,7 +299,7 @@ def test_direct_runner_tactics_serialisable(monkeypatch) -> None:
     direct_module.default_tactic = lambda m, n, k: FakeTactic()
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_direct",
         direct_module,
     )
 
@@ -294,6 +313,92 @@ def test_direct_runner_tactics_serialisable(monkeypatch) -> None:
     for t in tactics:
         assert isinstance(t, tuple) and len(t) == 3
         assert all(isinstance(v, int) for v in t)
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_cached_direct_tactic_uses_exact_small_m_and_validates_large_m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-trip exact M=3 and reject an incompatible M=16-bucket tactic."""
+    from tensorrt_llm._torch.autotuner import TuningConfig
+    from tensorrt_llm._torch.modules.low_m_gemm import (
+        _M_DIM_SPEC,
+        _M_TUNING_BUCKETS,
+        _CuBLASGemmRunner,
+        _DirectGemmRunner,
+        _SplitKGemmRunner,
+    )
+
+    n, k = 256, 8192
+    tactics = {3: (256, 2, 3), 10: (256, 2, 8)}
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    direct = _DirectGemmRunner(pdl=False)
+    splitk = _SplitKGemmRunner(has_bias=False, pdl=False)
+    cublas = _CuBLASGemmRunner(has_bias=False)
+    direct.forward = MagicMock(wraps=direct.forward)
+    splitk.forward = MagicMock(wraps=splitk.forward)
+    cublas.forward = MagicMock(wraps=cublas.forward)
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(_M_DIM_SPEC,))
+    tuner = _mod.AutoTuner()
+    profiles = tuner._optimization_profiles(
+        tuning_config,
+        [torch.empty((1, k), dtype=torch.bfloat16, device="cuda"), weight.t()],
+    )
+    assert tuple(int(profile.get_opt_shapes()[0][0]) for profile in profiles) == _M_TUNING_BUCKETS
+
+    custom_op = "test::low_m_exact_cache_round_trip"
+    input_shapes = (torch.Size((3, k)), torch.Size((k, n)))
+    cache_key = tuner.profiling_cache.get_cache_key(
+        custom_op,
+        direct,
+        input_shapes,
+        tuning_config,
+        apply_map_to_tuning_buckets=False,
+    )
+    tuner.profiling_cache[cache_key] = (2, tactics[3], 0.0)
+    cache_hit, runner_id, cached_tactic, _ = tuner.profiling_cache.search_cache(
+        custom_op,
+        [cublas, splitk, direct],
+        input_shapes,
+        tuning_config,
+    )
+    assert (cache_hit, runner_id, cached_tactic) == (True, 2, tactics[3])
+
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._prepared = True
+    dispatcher._direct = direct
+    dispatcher._runner_no_bias = splitk
+    dispatcher._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=False)
+    dispatcher._cublas_no_bias = cublas
+    dispatcher._cublas_with_bias = _CuBLASGemmRunner(has_bias=True)
+    dispatcher._tuning_config = tuning_config
+
+    mock_at = MagicMock()
+    mock_at.choose_one.side_effect = lambda _op, _runners, _config, inputs, **_: (
+        direct,
+        tactics[int(inputs[0].shape[0])],
+    )
+    monkeypatch.setattr(_mod, "AutoTuner", MagicMock(get=staticmethod(lambda: mock_at)))
+
+    assert all(_M_DIM_SPEC.map_to_tuning_buckets(m) == m for m in range(1, 9))
+    assert _M_DIM_SPEC.map_to_tuning_buckets(10) == 16
+
+    module = torch.nn.Linear(1, 1)
+    module._low_m_gemm_name = "direct_tactic_cache"
+    # M=3 retrieves its exact tactic. M=10 shares the M=16 cache bucket and
+    # must reject that bucket's incompatible row-8 direct tactic.
+    for m in (3, 10):
+        a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+        actual = dispatcher.apply(module, a, weight, None, force_active=True)
+        torch.testing.assert_close(actual, torch.mm(a, weight.t()), rtol=1e-2, atol=5e-3)
+
+    assert direct.forward.call_args.kwargs["tactic"] == tactics[3]
+    assert direct.forward.call_count == 1
+    assert cublas.forward.call_args.kwargs["tactic"] == -1
+    assert cublas.forward.call_count == 1
+    splitk.forward.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +416,7 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     splitk_module.autotune_tactics = lambda m, n, k: []
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk",
         splitk_module,
     )
 

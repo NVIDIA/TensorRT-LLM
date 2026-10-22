@@ -4,7 +4,7 @@ description: >-
   Review, design, and refactor TensorRT-LLM PyTorch MoE code for architecture fit,
   clean code, maintainability, and testability. Always use for any modification,
   review, refactor, or design planning that touches MoE modules, including
-  tensorrt_llm/_torch/modules/fused_moe, ConfigurableMoE, MoE backends,
+  tensorrt_llm/_torch/moe/fused_moe, ConfigurableMoE, MoE backends,
   MoEScheduler/moe_scheduler.py, forward execution/chunking, communication
   strategies, EPLB, quantization/weight
   handling, routing, factories, MoE docs, or MoE tests. Also use when the user
@@ -26,9 +26,9 @@ style cleanup.
 Before proposing or editing MoE code, read:
 
 1. `CODING_GUIDELINES.md`
-2. `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md`
+2. `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md`
 3. The target files being changed
-4. The relevant tests under `tests/unittest/_torch/modules/moe/`
+4. The relevant tests under `tests/unittest/_torch/moe/`
 
 Also inspect these files when the area is relevant:
 
@@ -36,13 +36,13 @@ Also inspect these files when the area is relevant:
   `interface.py`, backend `run_moe`/`quantize_input` paths, and communication code.
 - MegaMoE/fused communication: inspect `moe_scheduler.py`, `mega_moe/`,
   `configurable_moe.py`, `quantization.py`, and communication code.
-- Communication: `tensorrt_llm/_torch/modules/fused_moe/communication/base.py`
+- Communication: `tensorrt_llm/_torch/moe/fused_moe/communication/base.py`
   and `communication_factory.py`.
-- Quantization and weights: `tensorrt_llm/_torch/modules/fused_moe/quantization.py`.
+- Quantization and weights: `tensorrt_llm/_torch/moe/fused_moe/quantization.py`.
 - EPLB/load balancing: `interface.py`, `moe_load_balancer.py`, `quantization.py`,
   `moe_scheduler.py`, current forward-execution/chunking code, and
   `test_moe_module.py`.
-- Test matrix/helpers: `tests/unittest/_torch/modules/moe/moe_test_utils.py` and
+- Test matrix/helpers: `tests/unittest/_torch/moe/moe_test_utils.py` and
   `quantize_utils.py` when adding backend, quantization, skip, or parameter
   coverage.
 
@@ -470,7 +470,7 @@ Main APIs / references:
 
 - `communication/base.py`: `Communication`, `is_platform_supported`,
   `is_workload_feasible`, `supports_post_quant_dispatch`, `prepare_dispatch`,
-  `dispatch`, `combine`.
+  `dispatch`, `combine`, `checkpoint_blocked_reason`.
 - `communication/communication_factory.py`: strategy selection.
 - Existing strategies: `nvlink_one_sided.py`, `nvlink_two_sided.py`, `deep_ep.py`,
   `allgather_reducescatter.py`.
@@ -483,6 +483,9 @@ Checklist:
   before dispatch.
 - `dispatch()` and `combine()` maintain enough internal state for the pair to be
   correct.
+- `checkpoint_blocked_reason()` returns `None` by default, meaning the strategy
+  can be checkpointed. Override it when a configuration blocks checkpointing;
+  `PyExecutor.__init__` uses it to reject `sleep_config` before the engine serves.
 - EPLB statistics gathered by the communication strategy are fed back to the
   load balancer through the forward-execution path.
 - Add/update `test_moe_comm.py` or module-level tests when changing strategy
@@ -557,10 +560,10 @@ Role:
 
 Main APIs / references:
 
-- `tests/unittest/_torch/modules/moe/moe_test_utils.py`: `MoeBackendType`,
+- `tests/unittest/_torch/moe/moe_test_utils.py`: `MoeBackendType`,
   `get_backend_class`, `get_quick_skip_reason`, backend-specific
   `should_skip_*`, `iter_base_test_configs`, CI acceleration logic.
-- `tests/unittest/_torch/modules/moe/quantize_utils.py`: quantized test weight
+- `tests/unittest/_torch/moe/quantize_utils.py`: quantized test weight
   generation and quant-parameter setup.
 - `test_moe_backend.py`: backend interface tests for `quantize_input` and
   `run_moe`.
@@ -667,13 +670,13 @@ If there are no findings, say so and list remaining test or performance risk.
 
 Prefer the unified MoE tests:
 
-- Shared test matrix/helper changes: inspect `tests/unittest/_torch/modules/moe/moe_test_utils.py` and `quantize_utils.py`, then run the affected backend/module tests below.
-- Backend interface changes: `pytest tests/unittest/_torch/modules/moe/test_moe_backend.py -k '<backend or quant>'`.
-- Module/create/forward changes: `pytest tests/unittest/_torch/modules/moe/test_moe_module.py -k '<backend or feature>'`.
-- Communication changes: `pytest tests/unittest/_torch/modules/moe/test_moe_comm.py -k '<strategy>'`.
-- Routing changes: `pytest tests/unittest/_torch/modules/test_moe_routing.py -k '<routing>'`.
-- Load balancer changes: `pytest tests/unittest/_torch/modules/test_moe_load_balancer.py -k '<case>'`.
-- Multi-GPU EP/all-to-all behavior: `pytest tests/unittest/_torch/multi_gpu/test_moe_a2a.py -k '<case>'`.
+- Shared test matrix/helper changes: inspect `tests/unittest/_torch/moe/moe_test_utils.py` and `quantize_utils.py`, then run the affected backend/module tests below.
+- Backend interface changes: `pytest tests/unittest/_torch/moe/test_moe_backend.py -k '<backend or quant>'`.
+- Module/create/forward changes: `pytest tests/unittest/_torch/moe/test_moe_module.py -k '<backend or feature>'`.
+- Communication changes: `pytest tests/unittest/_torch/moe/test_moe_comm.py -k '<strategy>'`.
+- Routing changes: `pytest tests/unittest/_torch/moe/test_moe_routing.py -k '<routing>'`.
+- Load balancer changes: `pytest tests/unittest/_torch/moe/test_moe_load_balancer.py -k '<case>'`.
+- Multi-GPU EP/all-to-all behavior: `pytest tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py -k '<case>'`.
 
 When GPU resources are required, use the TRT-LLM GPU allocation/test-runner
 skills first and record skipped tests with reasons.

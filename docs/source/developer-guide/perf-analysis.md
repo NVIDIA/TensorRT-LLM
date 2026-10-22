@@ -9,6 +9,49 @@ Given the potential long runtimes of Large Languages Models (LLMs) and the diver
 
 ## Feature Descriptions
 
+### Workspace Reclamation
+
+`TRTLLM_RECLAIM_WORKSPACE=1` (the default) reduces retained eager attention
+workspace memory on supported PyTorch fallback paths. After three consecutive
+underfilled model forwards, excess capacity is released to the PyTorch allocator,
+without shrinking below the warmup baseline. CUDA graph workspace is unchanged.
+
+This can reduce memory retained after workload spikes, but demand tracking and
+repeated reclamation/reallocation can affect performance. It does not reduce the
+initial spike's allocation requirement or necessarily reduce allocator-reserved
+memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
+this behavior if it causes performance regression. This setting also controls eager CUTLASS MoE runner workspace reclamation.
+CUTLASS uses its native workspace sizing to accumulate the maximum demand across
+all layers and chunks in a model forward. After three successful forwards using at most half the retained capacity, it
+replaces the backing with the larger of that window's maximum demand and the
+capacity established by successful warmup. Like attention, it never shrinks
+below this warmup floor. Runner/stream discovery happens in native inference
+calls; Python only opens and closes a scope at model-forward boundaries.
+Previously observed demand is reserved at the next model-forward entry so model
+intermediates do not consume and fragment the released burst-sized block first.
+This reduces active allocations; allocator-reserved and device memory can remain
+unchanged even when the released capacity is successfully reused.
+Runners/streams first encountered after warmup are not reclaimed. Captured
+workspace, cross-engine sharing, and use outside the tracked forward opt out;
+speculative, CP, encoder-decoder, compiled, breakable-graph and multi-stream
+execution are excluded. CUDA graph allocations remain unchanged. This setting
+does not control all GPU memory management.
+
+#### CUTLASS reclamation validation
+
+`pytest tests/unittest/_torch/moe/test_workspace_cuda.py` checks BF16 output
+parity through growth, reclamation and regrowth, plus CUDA graph replay. It
+requires native libraries built from the same source revision. Run with each
+allocator separately using `PYTORCH_CUDA_ALLOC_CONF=backend:native` or
+`PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`.
+
+For performance measurements, compare enabled/disabled arms within the same
+allocator. Keep attention reclamation fixed when isolating the MoE change,
+since the shared environment variable controls both. Operator measurements do
+not establish model throughput or lower reserved/device memory peaks.
+
+### Profiling Features
+
 The main functionality:
   * Relies on toggling the CUDA profiler runtime API on and off.
   * (PyTorch workflow only) Toggling the PyTorch profiler on and off.
@@ -88,7 +131,7 @@ For the per-mode specifics, see `parse_profile_range` in
 
 ### Visualize the PyTorch profiler results
 
-Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+Use `chrome://tracing/` to inspect the saved profile.
 
 
 ## Examples
@@ -128,7 +171,7 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
 
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
-The PyTorch profiler results will be saved to `trace.json`. Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+The PyTorch profiler results will be saved to `trace.json`. Use `chrome://tracing/` to inspect the saved profile.
 
 ## MoE Expert Load Balance Analysis (Perfect Router)
 

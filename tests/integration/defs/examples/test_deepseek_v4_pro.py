@@ -121,7 +121,6 @@ def _run_token_id_smoke_wave(llm, prompt_lengths, max_tokens, vocab_size):
     ]
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
-        min_tokens=max_tokens,
         temperature=0,
         ignore_eos=True,
         detokenize=False,

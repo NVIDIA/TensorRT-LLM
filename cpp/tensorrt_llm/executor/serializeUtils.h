@@ -141,22 +141,17 @@ static_assert(hasSerializedSize<kv_cache::SocketState>(size_t()));
 static_assert(hasSerializedSize<kv_cache::CacheState>(size_t()));
 static_assert(hasSerializedSize<DataTransceiverState>(size_t()));
 static_assert(hasSerializedSize<ContextPhaseParams>(size_t()));
-static_assert(hasSerializedSize<ExternalDraftTokensConfig>(size_t()));
 static_assert(hasSerializedSize<Tensor>(size_t()));
 static_assert(hasSerializedSize<SpeculativeDecodingFastLogitsInfo>(size_t()));
 static_assert(hasSerializedSize<Result>(size_t()));
 static_assert(hasSerializedSize<Response>(size_t()));
 static_assert(hasSerializedSize<KvCacheConfig>(size_t()));
 static_assert(hasSerializedSize<SchedulerConfig>(size_t()));
-static_assert(hasSerializedSize<ParallelConfig>(size_t()));
 static_assert(hasSerializedSize<PeftCacheConfig>(size_t()));
 static_assert(hasSerializedSize<DecodingMode>(size_t()));
 static_assert(hasSerializedSize<LookaheadDecodingConfig>(size_t()));
-static_assert(hasSerializedSize<EagleConfig>(size_t()));
 static_assert(hasSerializedSize<KvCacheRetentionConfig>(size_t()));
 static_assert(hasSerializedSize<DecodingConfig>(size_t()));
-static_assert(hasSerializedSize<DebugConfig>(size_t()));
-static_assert(hasSerializedSize<SpeculativeDecodingConfig>(size_t()));
 static_assert(hasSerializedSize<GuidedDecodingConfig>(size_t()));
 static_assert(hasSerializedSize<GuidedDecodingParams>(size_t()));
 static_assert(!hasSerializedSize<std::string>(size_t()));
@@ -258,19 +253,15 @@ static_assert(hasSerialize<PromptTuningConfig>(nullptr));
 static_assert(hasSerialize<MultimodalInput>(nullptr));
 static_assert(hasSerialize<MropeConfig>(nullptr));
 static_assert(hasSerialize<LoraConfig>(nullptr));
-static_assert(hasSerialize<ExternalDraftTokensConfig>(nullptr));
 static_assert(hasSerialize<Tensor>(nullptr));
 static_assert(hasSerialize<SpeculativeDecodingFastLogitsInfo>(nullptr));
 static_assert(hasSerialize<Result>(nullptr));
 static_assert(hasSerialize<Response>(nullptr));
 static_assert(hasSerialize<KvCacheConfig>(nullptr));
 static_assert(hasSerialize<SchedulerConfig>(nullptr));
-static_assert(hasSerialize<ParallelConfig>(nullptr));
 static_assert(hasSerialize<PeftCacheConfig>(nullptr));
 static_assert(hasSerialize<DecodingMode>(nullptr));
 static_assert(hasSerialize<LookaheadDecodingConfig>(nullptr));
-static_assert(hasSerialize<EagleConfig>(nullptr));
-static_assert(hasSerialize<SpeculativeDecodingConfig>(nullptr));
 static_assert(hasSerialize<GuidedDecodingConfig>(nullptr));
 static_assert(hasSerialize<GuidedDecodingParams>(nullptr));
 static_assert(hasSerialize<KvCacheRetentionConfig>(nullptr));
@@ -434,10 +425,6 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeAdditionalModelOutput(is);
     }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ExternalDraftTokensConfig>)
-    {
-        return Serialization::deserializeExternalDraftTokensConfig(is);
-    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::PromptTuningConfig>)
     {
         return Serialization::deserializePromptTuningConfig(is);
@@ -518,17 +505,9 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeExtendedRuntimePerfKnobConfig(is);
     }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ParallelConfig>)
-    {
-        return Serialization::deserializeParallelConfig(is);
-    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::PeftCacheConfig>)
     {
         return Serialization::deserializePeftCacheConfig(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::OrchestratorConfig>)
-    {
-        return Serialization::deserializeOrchestratorConfig(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::DecodingMode>)
     {
@@ -537,14 +516,6 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::LookaheadDecodingConfig>)
     {
         return Serialization::deserializeLookaheadDecodingConfig(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::EagleConfig>)
-    {
-        return Serialization::deserializeEagleConfig(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpeculativeDecodingConfig>)
-    {
-        return Serialization::deserializeSpeculativeDecodingConfig(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::GuidedDecodingConfig>)
     {
@@ -566,10 +537,6 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeDecodingConfig(is);
     }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::DebugConfig>)
-    {
-        return Serialization::deserializeDebugConfig(is);
-    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KvCacheStats>)
     {
         return Serialization::deserializeKvCacheStats(is);
@@ -589,10 +556,6 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::IterationStats>)
     {
         return Serialization::deserializeIterationStats(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ExecutorConfig>)
-    {
-        return Serialization::deserializeExecutorConfig(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::DisServingRequestStats>)
     {

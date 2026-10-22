@@ -77,6 +77,16 @@ class KVCacheV2LifeCycleIterationStats:
     window_size: int | None
     kind: str
     stats: Any
+    # Reuse block counts split by the cache level the reused pages were resident on. Indexed by
+    # CacheLevel, so entry i is the i-th configured tier -- a deployment with a hot and a cold GPU
+    # level gets two distinct entries rather than one merged "gpu" bucket. Empty when the life
+    # cycle recorded no reuse this iteration.
+    full_reused_blocks_by_level: list[int] = field(default_factory=list)
+    partial_reused_blocks_by_level: list[int] = field(default_factory=list)
+    # The share of `stats.iter_full_reused_blocks` a KV connector loaded from an external store
+    # rather than matching on device. Those blocks sit on no cache level, so they are the part of
+    # the full reuse count that `full_reused_blocks_by_level` does not cover.
+    connector_reused_blocks: int = 0
 
 
 @dataclass(slots=True)
@@ -114,6 +124,24 @@ class KVCacheV2IterationStatsReport:
     ] = field(default_factory=dict)
     # Keyed by *cold* pool-group id, which is unrelated to the hot ids used by by_pool_group.
     by_cold_pool_group: dict[int, KVCacheV2PoolGroupIterationStats] = field(default_factory=dict)
+    # Preemption counters for this iteration. resumed_requests counts recoveries
+    # only -- a request's initial admission also drives a SUSPENDED->ACTIVE
+    # transition internally, but it is not a preemption and is excluded.
+    suspended_requests: int = 0
+    resumed_requests: int = 0
+    # Blocks the disk-prefetch mechanism actually migrated from disk to host during this
+    # iteration. Counts prefetch movement only, not reuse hits served from disk.
+    disk_prefetch_blocks: int = 0
+    # Initial current-residency cached-token attribution for requests admitted during this
+    # iteration, indexed by cache level so entry i is the i-th configured tier.
+    cached_tokens_by_level: list[int] = field(default_factory=list)
+    # Readable tier name per cache level, in level order. Lets consumers label the level-indexed
+    # counters above without hard-coding a gpu/host/disk split.
+    cache_level_tiers: list[str] = field(default_factory=list)
+    # Prompt tokens a KV connector loaded from an external store for requests admitted during
+    # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
+    # None when no connector can serve tokens.
+    connector_cached_tokens: int | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -203,6 +231,15 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     if by_pool_group is None:
         return
 
+    stats_dict["iterSuspendedRequests"] = kv_iter_stats.suspended_requests
+    stats_dict["iterResumedRequests"] = kv_iter_stats.resumed_requests
+    stats_dict["iterDiskPrefetchBlocks"] = kv_iter_stats.disk_prefetch_blocks
+    stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
+    if kv_iter_stats.cache_level_tiers:
+        stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
+    if kv_iter_stats.connector_cached_tokens is not None:
+        stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
+
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {
             "poolGroupId": stats.pool_group_id,
@@ -249,5 +286,13 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
             serialized.update(
                 serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS)
             )
+            # Indexed by cache level, so the arrays are as long as the configured tier list.
+            if stats.full_reused_blocks_by_level:
+                serialized["iterFullReusedBlocksByLevel"] = list(stats.full_reused_blocks_by_level)
+            if stats.partial_reused_blocks_by_level:
+                serialized["iterPartialReusedBlocksByLevel"] = list(
+                    stats.partial_reused_blocks_by_level
+                )
+            serialized["iterConnectorReusedBlocks"] = stats.connector_reused_blocks
         stats_by_life_cycle[str(life_cycle_id)] = serialized
     stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle

@@ -4,6 +4,7 @@
 
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,10 +12,12 @@ from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
     MultimodalInput,
+    MultimodalParams,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
 )
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.inputs.registry import (
     MultimodalEncoderItemMetadata,
     create_input_processor_with_hash,
@@ -72,6 +75,13 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
     assert multimodal_data["multimodal_embedding_lengths"] == [2]
     assert "multimodal_item_refs" not in multimodal_data
     assert "multimodal_encoder_token_lengths" not in multimodal_data
+
+    params = MultimodalParams(multimodal_data=multimodal_data)
+    params.to_handle("multimodal_data")
+    assert isinstance(
+        params.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY],
+        MultimodalEncoderItemMetadata,
+    )
 
 
 def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
@@ -347,6 +357,40 @@ def test_find_mm_token_lengths_preserves_2d_grid_rows_per_video():
         FakeVideoProcessor(),
         multimodal_data={"video": {"video_grid_thw": torch.tensor([[1, 8, 10], [2, 8, 10]])}},
     ) == {"video": [1, 2]}
+
+
+def test_find_mm_token_lengths_accepts_stacked_numpy_video_frames():
+    """VideoMediaIO's optimized numpy format is normalized to frame lists."""
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, **kwargs):
+            assert isinstance(video, list)
+            assert len(video) == 2
+            assert all(isinstance(frame, np.ndarray) for frame in video)
+            assert all(frame.shape == (4, 6, 3) for frame in video)
+            return len(video)
+
+    video = VideoData(
+        frames=np.zeros((2, 4, 6, 3), dtype=np.uint8),
+        metadata={},
+    )
+
+    assert find_mm_token_lengths(
+        {"video": [video]},
+        FakeVideoProcessor(),
+    ) == {"video": [2]}
+
+
+def test_find_mm_token_lengths_rejects_undecoded_video_string():
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, **kwargs):
+            raise AssertionError("Processor must not receive undecoded video")
+
+    with pytest.raises(ValueError, match="decoded frames"):
+        find_mm_token_lengths(
+            {"video": ["video.mp4"]},
+            FakeVideoProcessor(),
+        )
 
 
 def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():

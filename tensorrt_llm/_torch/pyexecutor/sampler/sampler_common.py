@@ -21,11 +21,11 @@ log-probs) build on:
 
 * the per-request queries that read an ``LlmRequest``'s sampling config into
   :class:`UtilsSamplingParams`, plus the predicates over it
-  (``top_p_decay_active``, ``_request_sampling_params_cachable``);
+  (``top_p_decay_active``);
 * the shared step/beam index constants and beam-width accessors;
 * tensor helpers (``int_tensor``, ``add_token``);
 * plain data types passed *between* modules that no single feature owns --
-  :class:`RequestSeeds` (seed manager -> strategy impls) and
+  :class:`RequestSeeds` (seed manager -> sampler) and
   :class:`_BatchedSamplingResult` (sampler -> log-probs).
 
 That last group follows the package's dependency rule: a type shared across
@@ -33,11 +33,12 @@ features belongs here, so that a lower-layer module never has to import a
 higher-layer one to name it. A type owned by a single feature belongs with that
 feature instead -- the ``*Store`` classes all live in their own modules.
 
-Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
+Resolving a request's sampling params lives in ``sampling_resolution``.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, TypeAlias, TypeVar, cast
+from enum import Enum, auto
+from typing import Optional, TypeAlias, cast
 
 import torch
 
@@ -45,14 +46,36 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..llm_request import LlmRequest
 
-T = TypeVar("T")
-
 # Beam index to use when no beam search is used but a beam index is required
 DEFAULT_BEAM_IDX = 0
 # Step index to use when no speculative decoding is used but a step index is required
 DEFAULT_STEP_IDX = 0
 
 FinishReasonsList: TypeAlias = list[list[list[int]]]
+
+
+class SampleType(Enum):
+    """Sampling tiers, ordered by capability.
+
+    A batch is dispatched to the simplest tier its requests allow:
+
+    - ``FAST``: only temperature / top_p / top_k / min_p. Sampled inside the graph.
+    - ``FULL``: every sampling feature. Sampled eagerly after the forward.
+
+    There is deliberately no argmax tier: greedy sampling is two cheap kernels,
+    so capturing it saves about as much launch overhead as staging for it costs
+    (measured on Qwen2-0.5B it was a wash), and greedy batches take the eager
+    stable-greedy fast path instead.
+
+    Lives in this base module so the CUDA graph runner can key its graph cache
+    on the tier without importing the sampler orchestration module and its heavy
+    dependency chain. The tier set is expected to change: beam search may become
+    one of its own, and ``FAST`` should grow as more features gain
+    graph-capturable kernels.
+    """
+
+    FAST = auto()
+    FULL = auto()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -118,13 +141,6 @@ def add_token(
     return new_token
 
 
-def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
-    if p is None:
-        return None
-    (t,) = p
-    return t
-
-
 def _get_beam_width_in(request: LlmRequest) -> int:
     return (
         1
@@ -141,20 +157,14 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     sampling_config = request.sampling_config
     max_beam_width = cast(int, sampling_config.beam_width)
     # The array holds at most kMaxBeamWidthArrayLength (8) entries, so reduce it
-    # on the host. The C++ field is OptVec<vector<SizeType32>>, so it may arrive
-    # as [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength];
-    # unwrap the per-request row before reducing.
+    # on the host.
     #
-    # Both `[]` and `[[]]` mean "no schedule" -- checkBeamWidthArray bounds only
-    # the array's length, so an empty one passes admission -- and must fall
-    # through to beam_width rather than reduce over nothing. Hence truthiness
-    # rather than `is not None`, and hence a second guard after the unwrap:
-    # the same two checks LlmRequest.get_beam_width_by_iter and
+    # An empty array means "no schedule" -- checkBeamWidthArray bounds only the
+    # array's length, so an empty one passes admission -- and must fall through
+    # to beam_width rather than reduce over nothing. Hence truthiness rather
+    # than `is not None`, the same check LlmRequest.get_beam_width_by_iter and
     # PyExecutor._validate_request make.
     beam_width_array = sampling_config.beam_width_array
-    if beam_width_array:
-        if isinstance(beam_width_array[0], (list, tuple)):
-            beam_width_array = beam_width_array[0]
     if beam_width_array:
         max_beam_width = max(max_beam_width, *map(int, beam_width_array))
     return max_beam_width
@@ -163,11 +173,9 @@ def _get_max_beam_width(request: LlmRequest) -> int:
 def request_random_seed(request: LlmRequest) -> Optional[int]:
     """The request's user-specified ``SamplingParams.seed``, if any.
 
-    Deliberately kept out of ``UtilsSamplingParams``: that struct backs the
-    sampling-strategy cache key, and a per-request seed there would make every
-    seeded request its own strategy group, defeating batched sampling. The seed
-    does not change *which* distribution is sampled, only the RNG stream, so it
-    is read separately and applied as per-row RNG state.
+    Deliberately kept out of ``UtilsSamplingParams``: the seed does not change
+    *which* distribution is sampled, only the RNG stream, so it is read
+    separately and applied as per-row RNG state.
 
     The C++ ``SamplingConfig.randomSeed`` is ``uint64``, so a user seed in
     ``[2**63, 2**64)`` (e.g. from ``random.getrandbits(64)``) does not fit the
@@ -176,7 +184,7 @@ def request_random_seed(request: LlmRequest) -> Optional[int]:
     opaque bit pattern, so this keeps distinct seeds distinct, and it avoids an
     overflow that would abort the whole sampling step rather than one request.
     """
-    seed = _unwrap_singleton(cast(Optional[list[int]], request.sampling_config.random_seed))
+    seed = cast(Optional[int], request.sampling_config.seed)
     if seed is None:
         return None
     return seed - (1 << 64) if seed >= (1 << 63) else seed
@@ -184,29 +192,22 @@ def request_random_seed(request: LlmRequest) -> Optional[int]:
 
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
-    # These sampling fields live on the C++ SamplingConfig as optional<vector<T>>
-    # (a shape designed for the batched TRT-LLM sampler); the torch sampler consumes
-    # them per request, so we unwrap the singleton lists into scalars here. When the
-    # TRT-LLM sampler is removed, this SamplingConfig-based plumbing should be removed
-    # too in favor of reading the values directly from the per-request params.
-    temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
-    top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
-    top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
-    min_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.min_p))
-    top_p_decay = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_decay))
-    top_p_min = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_min))
-    top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
+    temperature = sampling_config.temperature
+    top_p = sampling_config.top_p
+    top_k = sampling_config.top_k
+    min_p = sampling_config.min_p
+    top_p_decay = sampling_config.top_p_decay
+    top_p_min = sampling_config.top_p_min
+    top_p_reset_ids = sampling_config.top_p_reset_ids
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
     # ModelEngine lays generation rows out at the static admission width; see
     # the row_stride note in _beam_step_preprocess.
     row_stride = 1 if request.is_context_init_state else request.py_beam_width
     use_beam_search = _get_max_beam_width(request) > 1
-    length_penalty = _unwrap_singleton(cast(Optional[list[float]], sampling_config.length_penalty))
-    beam_search_diversity_rate = _unwrap_singleton(
-        cast(Optional[list[float]], sampling_config.beam_search_diversity_rate)
-    )
-    early_stopping = _unwrap_singleton(cast(Optional[list[int]], sampling_config.early_stopping))
+    length_penalty = sampling_config.length_penalty
+    beam_search_diversity_rate = sampling_config.beam_search_diversity_rate
+    early_stopping = sampling_config.early_stopping
 
     return UtilsSamplingParams(
         temperature=temperature,
@@ -226,27 +227,14 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     )
 
 
-def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
-    return not params.use_beam_search
-
-
 @dataclass(kw_only=True)
 class RequestSeeds:
-    """Per-request RNG state for user-specified ``SamplingParams.seed``.
+    """Per-row Philox state for one sampling call.
 
-    Threaded alongside ``generator`` through the strategy impls and handed to
-    the flashinfer sampling ops as their stateless ``seed``/``offset`` pair.
-    Both tensors are int64 and 1-D with one entry per group row, matching the
-    per-row shape flashinfer documents; a row whose request did not specify a
-    seed carries the sampler's global seed, so unseeded requests keep their
-    previous behavior only in distribution, not token-for-token (see
-    ``_SeedManager``).
-
-    NB: the pinned flashinfer (0.6.15) accepts these per-row tensors but reads
-    only element 0 of each, separating rows by ``blockIdx.x``. The per-row
-    values below are therefore carried end-to-end but not yet honored for
-    batched requests; see the warning on ``_SeedManager`` and the upstream fix
-    at https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    Handed to the fused sampling op as its ``seed``/``offset`` pair. Both
+    tensors are int64 and 1-D with one entry per group row. A row whose request
+    did not specify a seed carries the sampler's global seed and an offset from
+    the shared unseeded counter (see ``_SeedManager``).
 
     ``offset`` advances per request per sampling step, which is what makes a
     seeded request's stream depend on how many tokens it has drawn rather than

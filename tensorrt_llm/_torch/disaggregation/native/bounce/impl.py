@@ -49,7 +49,14 @@ if TYPE_CHECKING:
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
 _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop flag and reclaim
-_RESERVE_TIMEOUT_S = 0.2  # max wait for a bounce region before falling back to per-fragment
+# Send side: a sender (KV transfer worker thread) may wait this long for bounce space before
+# falling back to per-fragment writes.
+_RESERVE_TIMEOUT_S = 0.2
+# Receive side: never wait. The receiver reserves on the executor thread while it admits
+# generation requests, so any wait pauses the whole iteration (and, under attention DP, every rank
+# of the group). If the recv region is full, use the per-fragment path right away; a timed-out
+# wait ends in the same fallback, and the transfer stays asynchronous either way.
+_RECV_RESERVE_TIMEOUT_S = 0.0
 _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
@@ -233,7 +240,7 @@ class VmmBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
@@ -244,8 +251,13 @@ class VmmBounceTransport(BounceTransport):
         neighboring slot."""
         total = 0
         has_state_group = False
-        for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
-            if int(block_ids.size) == 0:
+        # Block tables are positional with -1 holes (see Chunk); only the
+        # slots the receiver actually accepts are written into the region.
+        valid_counts = [
+            int((block_ids >= 0).sum()) for block_ids in recv_req.block_ids_per_layer_groups
+        ]
+        for g, n_valid in enumerate(valid_counts):
+            if n_valid == 0:
                 continue
             if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(
@@ -257,7 +269,7 @@ class VmmBounceTransport(BounceTransport):
                 # its size is accounted for by extra_bytes below, not per-block math.
                 has_state_group = True
                 continue
-            total += int(block_ids.size) * self._block_bytes_per_group[g]
+            total += n_valid * self._block_bytes_per_group[g]
         if has_state_group and num_writers > 1:
             # Fan-in with recurrent-state groups is unsafe: each writer may
             # append its own state fragments (different PP stages hold different
@@ -286,7 +298,7 @@ class VmmBounceTransport(BounceTransport):
         # TODO(TRTLLM-15194): investigate whether the byte-only gate is
         # safe (or better) for plain-KV payloads too, so this special case can be removed and
         # both payload kinds share one gate.
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        nblocks = sum(valid_counts)
         if extra_bytes > 0:
             if total < self._min_bytes:
                 return self._skip_bounce(
@@ -313,8 +325,8 @@ class VmmBounceTransport(BounceTransport):
             # Exclude None entries (STATE groups) — they are already guarded above.
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
-                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
-                if int(block_ids.size) > 0 and self._block_bytes_per_group[g]
+                for g, n_valid in enumerate(valid_counts)
+                if n_valid > 0 and self._block_bytes_per_group[g]
             }
             if len(present_slot_bytes) > 1:
                 return self._skip_bounce(
@@ -378,6 +390,13 @@ class VmmBounceTransport(BounceTransport):
         The write can't be aborted, so quarantine the region (reclaimed later) rather than releasing
         or leaking it. Idempotent; a no-op once the transfer has settled."""
         self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
+
+    def abort_publication(self, rid_slice: RidSlice, published_writers: set[int]) -> None:
+        """Retain a failed fan-out until every successfully published writer drains."""
+        self._apply(
+            rid_slice,
+            lambda ctx: ctx.abort_publication(published_writers),
+        )
 
     def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
@@ -510,7 +529,7 @@ class NoBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
     ) -> bool:
         return False
@@ -525,6 +544,9 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def orphan_reservation(self, rid_slice) -> None:
+        pass
+
+    def abort_publication(self, rid_slice, published_writers: set[int]) -> None:
         pass
 
     def record_result(

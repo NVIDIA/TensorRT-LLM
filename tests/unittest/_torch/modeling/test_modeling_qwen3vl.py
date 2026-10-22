@@ -24,6 +24,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -233,7 +234,7 @@ class TestQwen3VL(TestModelingMultimodal):
             # Prepare metadata before capture (like in working Qwen2.5-VL test)
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0, False)
+            key = KeyType(batch_size=1, draft_len=0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),
@@ -505,6 +506,45 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
 
     assert result is metadata
     assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
+
+    config = SimpleNamespace(
+        patch_size=4,
+        temporal_patch_size=2,
+        in_channels=3,
+        hidden_size=8,
+    )
+    patch_embed = Qwen3VLVisionPatchEmbed(config)
+    pixel_values = torch.randn(6, 3 * 2 * 4 * 4)
+    expected = patch_embed(pixel_values)
+    # The model must reuse the Conv3d parameters as a GEMM, not run the Conv3d.
+    patch_embed.proj.register_forward_pre_hook(
+        lambda module, args: pytest.fail("patch projection ran the Conv3d")
+    )
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision.patch_embed = patch_embed
+    vision.attn_metadata = object()
+    vision._rope_position_ids_buffer = None
+    vision.rot_pos_emb = lambda grid: (
+        torch.empty(6, 0),
+        torch.empty(6, 0),
+    )
+    vision.fast_pos_embed_interpolate = lambda grid: torch.zeros_like(expected)
+    vision.prepare_attn_metadata = lambda seq_lens, metadata: metadata
+    vision.blocks = torch.nn.ModuleList()
+    vision._deepstack_layer_to_merger_idx = {}
+    vision.merger = torch.nn.Identity()
+
+    actual, deepstack = vision(pixel_values, torch.tensor([[1, 2, 3]]))
+
+    torch.testing.assert_close(actual, expected)
+    assert deepstack == []
 
 
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
@@ -1090,7 +1130,7 @@ def test_qwen3vl_vision_block_forward_end_to_end():
     error in `apply_rope`."""
     from transformers import Qwen3VLConfig
 
-    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionBlock
 

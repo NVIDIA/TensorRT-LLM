@@ -17,20 +17,23 @@
 
 import torch
 
+from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
     import cuda.tile as ct
 
-    from ..cuda_tile_kernels import (
-        rms_norm_fuse_residual_kernel,
-        rms_norm_fuse_residual_kernel_gather,
-        rms_norm_fuse_residual_kernel_static_persistent,
+    from ..cuda_tile_utils import ceil_div, next_power_of_2
+    from ..kernels.rms_norm import (
         rms_norm_kernel,
         rms_norm_kernel_gather,
         rms_norm_kernel_static_persistent,
     )
-    from ..cuda_tile_utils import ceil_div, next_power_of_2
+    from ..kernels.rms_norm_fuse_residual import (
+        rms_norm_fuse_residual_kernel,
+        rms_norm_fuse_residual_kernel_gather,
+        rms_norm_fuse_residual_kernel_static_persistent,
+    )
 
     @torch.library.custom_op("trtllm::cuda_tile_rms_norm", mutates_args=())
     def cuda_tile_rms_norm(
@@ -41,6 +44,9 @@ if IS_CUDA_TILE_AVAILABLE:
         gather: bool,
         use_gemma: bool,
     ) -> torch.Tensor:
+        if (sm_version := get_sm_version()) in [107]:
+            raise RuntimeError(f"Cuda tile custom ops are not supported on SM {sm_version}.")
+
         x = x.contiguous()
         weight = weight.contiguous()
 
@@ -126,6 +132,9 @@ if IS_CUDA_TILE_AVAILABLE:
         gather: bool,
         use_gemma: bool,
     ) -> None:
+        if (sm_version := get_sm_version()) in [107]:
+            raise RuntimeError(f"Cuda tile custom ops are not supported on SM {sm_version}.")
+
         assert x.is_contiguous(), "x must be contiguous for in-place operation"
         assert residual.is_contiguous(), "residual must be contiguous for in-place operation"
         weight = weight.contiguous()

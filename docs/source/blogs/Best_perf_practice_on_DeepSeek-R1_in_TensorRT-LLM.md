@@ -38,7 +38,7 @@ In this blog, we share the configurations and procedures about how to reproduce 
 
 This section can be skipped if you already have TensorRT LLM installed and have already downloaded the DeepSeek R1 model checkpoint.
 
-#### 1. Download TensorRT LLM
+### 1. Download TensorRT LLM
 
 **You can also find more comprehensive instructions to install TensorRT LLM in this [TensorRT LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html), refer to that guide for common issues if you encounter any here.**
 
@@ -59,7 +59,7 @@ git lfs pull
 ```
 **Note**: Replace `<*_PATH>` to your actual path.
 
-#### 2. Download the DeepSeek R1 models
+### 2. Download the DeepSeek R1 models
 
 For NVIDIA Blackwell GPUs, it's recommended to use the [FP4 quantized version of DeepSeek R1](https://huggingface.co/nvidia/DeepSeek-R1-FP4) to get the best performance.
 For NVIDIA Hopper GPUs, it's recommended to use the FP8 version of the DeepSeek R1 model.
@@ -80,7 +80,7 @@ git clone https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2
 git clone https://huggingface.co/deepseek-ai/DeepSeek-R1
 ```
 
-#### 3. Build and run TensorRT LLM container
+### 3. Build and run TensorRT LLM container
 
 ``` bash
 cd TensorRT-LLM
@@ -88,7 +88,7 @@ make -C docker run LOCAL_USER=1 DOCKER_RUN_ARGS="-v $YOUR_MODEL_PATH:$YOUR_MODEL
 ```
 Here we set `LOCAL_USER=1` argument to set up the local user instead of root account inside the container, you can remove it if running as root inside container is fine.
 
-#### 4. Compile and Install TensorRT LLM
+### 4. Compile and Install TensorRT LLM
 Here we compile the source inside the container:
 
 ``` bash
@@ -104,14 +104,14 @@ export PATH=${HOME}/.local/bin:${PATH}
 export PYTHONPATH=`pwd`
 ```
 
-#### 5. Optional: Tune GPU clocks
+### 5. Optional: Tune GPU clocks
 ```
 sudo nvidia-smi -pm 0; sudo nvidia-smi -pm 1; sudo nvidia-smi boost-slider --vboost 4
 ```
 The boost-slider option will tune the GPU clock and can get you slight perf increase, for B200 min-latency scenarios it's about 8 TPS/USER.
 This is not a required step, it's provided here to make sure the perf numbers in this doc can be reproduced more closely to our internal run.
 
-#### 6. Dataset preparation
+### 6. Dataset preparation
 
 The trtllm-bench tool requires a dataset file to read prompts and output sequence length of each prompt. Format details of this dataset file can be seen in [preparing a dataset](
 https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html#preparing-a-dataset).
@@ -211,7 +211,8 @@ cuda_graph_config:
   - 2
   - 1
 print_iter_log: true
-kv_cache_dtype: fp8
+kv_cache_config:
+  dtype: fp8
 enable_attention_dp: true
 EOF
 trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
@@ -293,6 +294,8 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --config ./config.yml
 ```
 
+(expected-result-format-1)=
+
 #### Expected Result Format
 The perf might be different from different datasets and machines
 ```
@@ -331,6 +334,8 @@ trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     --concurrency 1 \
     --config ./config.yml
 ```
+
+(expected-result-format-2)=
 
 #### Expected Result Format
 
@@ -386,6 +391,8 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
     --config ./config.yml
 ```
+
+(expected-result-format-3)=
 
 #### Expected Result Format
 The perf might be different from different datasets and machines

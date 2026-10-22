@@ -1,0 +1,38 @@
+schema_version: 1
+vendors:
+  flashinfer-prims-ts:
+    url: https://github.com/yuxianq/flashinfer.git
+    branch: trtllm-prims-ts-dev-20261012
+    commit: ae312f7cc1723b06fda5168105ade0f328ee47d8
+    source: flashinfer/attention/prims_ts
+    destination: tensorrt_llm/_torch/attention/backends/prims_ts
+    include:
+    - '**/*.py'
+    patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
+    patch_digest: sha256:a4360ca506d25545db408d22875e678871970fec94bdc1166dd6108d3b504d1c
+    digest: sha256-tree-v1:1bd57713d2487e94c0fc4b134bed4f7eff275282cb8ef471775e87db503ded03
+  openengine-proto:
+    url: https://github.com/ai-dynamo/openengine.git
+    tag: v0.1.0
+    commit: b5f2bd93721f7b888d3e2440679e0ae7012939d1
+    source: proto/openengine/v1
+    destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
+    include:
+    - '*.proto'
+    digest: sha256-tree-v1:54c95724673b50dee9f27ba72f98ed13b3009209f858f80e044ccd13974770f4
+  sana-sol-attn:
+    url: https://github.com/NVlabs/Sana.git
+    branch: sol-engine
+    commit: 5fe5febdf0f59fee1c0b44a5ce6665df0dabd247
+    source: techniques/sparse_backends
+    destination: tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell
+    include:
+    - sol_attn/THIRD_PARTY_NOTICES.md
+    - sol_attn/__init__.py
+    - sol_attn/common/*
+    - sol_attn/interface.py
+    - sol_attn/preprocess.py
+    - sol_attn/sm100/*
+    patch: 3rdparty/vendor_patches/sana-sol-attn.patch
+    patch_digest: sha256:0d66669021683773aff34533abaf8f200abd09e3af93d19eed0e2a2e04f2f980
+    digest: sha256-tree-v1:383f6085ca1bc2438e8d7d4796036af3a816dbfd396313704f7f4be2c06ac55b

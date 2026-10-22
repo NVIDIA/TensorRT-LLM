@@ -400,7 +400,7 @@ NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
     return instance;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
+NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream)
 {
     if (!isNcclWindowSupported())
     {
@@ -452,7 +452,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     }
 
     // No available buffer found, avoid registration during CUDA graph capture
-    auto stream = at::cuda::getCurrentCUDAStream();
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
     if (capture_err != cudaSuccess)
@@ -470,7 +469,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_LOG_TRACE(
         "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
     int handle = static_cast<int>(commBuffers.size());
-    NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle);
+    NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle, stream);
     // Only cache valid buffers. allocateAndRegisterBuffer returns an empty buffer when any rank
     // failed ncclMemAlloc (collective fallback to plain allreduce); caching it would leak a
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
@@ -607,7 +606,8 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
     return comm != nullptr;
 }
 
-NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
+NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
+    ncclComm_t comm, size_t size, int handle, cudaStream_t stream)
 {
     // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
     // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
@@ -618,7 +618,6 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     int* rankSyncFlag = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
     CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
     TLLM_CUDA_CHECK(cudaMemsetAsync(rankSyncFlag, 0, sizeof(int), stream));
 
     // Step 2: Allocate symmetric memory. This per-rank, non-collective call can fail

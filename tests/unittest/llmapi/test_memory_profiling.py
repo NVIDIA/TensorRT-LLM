@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -20,7 +35,7 @@ def test_profile_kvcache():
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.9)
     cuda_graph_config = CudaGraphConfig(max_batch_size=512)
-    VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
+    VLM_MODEL = "Qwen3/Qwen3-VL-2B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
 
     dynamic_batch_config = DynamicBatchConfig(
@@ -82,8 +97,7 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
 
     Both components must use the same stream for proper synchronization.
     """
-    # Use a simple model for testing
-    MODEL = "llama-3.2-models/Llama-3.2-1B-Instruct"
+    MODEL = "Qwen3/Qwen3-0.6B"
     MODEL_PATH = get_model_path(MODEL)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,

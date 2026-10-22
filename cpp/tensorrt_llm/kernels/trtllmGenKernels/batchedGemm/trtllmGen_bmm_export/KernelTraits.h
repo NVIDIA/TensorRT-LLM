@@ -16,14 +16,14 @@
  */
 #pragma once
 
-#include "Enums.h"
-#include "trtllm/gen/CommonUtils.h"
+#include <cassert>
+#include <stdexcept>
+#include <cstdio>
 #include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/MmaDecl.h"
 #include "trtllm/gen/SparsityDecl.h"
-#include <cassert>
-#include <cstdio>
-#include <stdexcept>
+#include "Enums.h"
 
 namespace batchedGemm
 {
@@ -185,8 +185,11 @@ inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK, 
     }
     if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
     {
-        (void) mmaK;
-        (void) isSparseA;
+        // SM107 2x-mmaK kernels keep MxE2m1 unpadded in smem.
+        if ((!isSparseA && mmaK >= 64) || (isSparseA && mmaK >= 128))
+        {
+            return tg::dtypeGetNumBits(dtype);
+        }
         return 8;
     }
     else

@@ -7,6 +7,7 @@ from .deepseekv3_parser import DeepSeekV3Parser
 from .deepseekv4_parser import DeepSeekV4Parser
 from .deepseekv31_parser import DeepSeekV31Parser
 from .deepseekv32_parser import DeepSeekV32Parser
+from .deepseekv41_parser import DeepSeekV41Parser
 from .gemma4_parser import Gemma4ToolParser
 from .glm4_parser import Glm4ToolParser
 from .glm47_parser import Glm47ToolParser
@@ -28,6 +29,8 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek_v3",
     "deepseek_v32": "deepseek_v32",
     "deepseek_v4": "deepseek_v4",
+    "deepseek_v41": "deepseek_v41",
+    "deepseek_v41_text": "deepseek_v41",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k2",
     "kimi_k3": "kimi_k3",
@@ -39,6 +42,10 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "gemma4_text": "gemma4",
     "laguna": "poolside_v1",
     "minimax_m3_vl": "minimax_m3",
+    # Nemotron 3.5 Super VL. Its chat template instructs the model to emit
+    # the Qwen3-Coder <tool_call><function=...><parameter=...> XML shape,
+    # not JSON, so it shares that parser.
+    "nemotron_h_omni": "qwen3_coder",
 }
 
 
@@ -65,6 +72,7 @@ class ToolParserFactory:
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
         "deepseek_v4": DeepSeekV4Parser,
+        "deepseek_v41": DeepSeekV41Parser,
         "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,

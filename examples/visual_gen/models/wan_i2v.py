@@ -24,6 +24,7 @@ import argparse
 import os
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 _DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cat_piano.png")
 
@@ -62,9 +63,11 @@ def main():
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: I2V request construction ---
-    # Start from per-model defaults (steps, guidance, seed, etc.) and set the input image.
+    # Start from per-model defaults (steps, guidance, seed, etc.) and set the
+    # first-frame reference. Wan I2V also accepts a ``last_frame`` role, so the
+    # role must be given to disambiguate.
     params = visual_gen.default_params
-    params.image = args.image
+    params.image_reference = [MediaRef(content=args.image, format="path", role="first_frame")]
 
     output = visual_gen.generate(
         inputs="A cat presses the piano keys with its paws, soft notes filling the quiet room.",

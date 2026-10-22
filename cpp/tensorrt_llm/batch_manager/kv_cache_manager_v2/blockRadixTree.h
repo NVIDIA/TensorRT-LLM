@@ -32,6 +32,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -52,7 +53,7 @@ struct Block;
 struct ReuseScope
 {
     std::optional<LoraTaskIdType> loraId;
-    std::optional<std::uint64_t> salt;
+    std::optional<std::string> salt;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
@@ -68,7 +69,7 @@ struct ReuseScope
 // collision-resistant and >= 256-bit. The radix tree is a globally shared,
 // cross-request/cross-tenant cache index, prefix matching is decided purely by
 // digest equality with NO re-verification of the underlying tokens, and the
-// hashed input (tokens, the user-supplied cache_salt in ReuseScope, multimodal
+// hashed input (tokens, the salt string in ReuseScope, multimodal
 // content bytes) is attacker-influenceable. A hash collision therefore silently
 // reuses another request's KV blocks (cross-request corruption / data leak),
 // and tenant isolation via cache_salt relies entirely on this hash's collision
@@ -244,6 +245,8 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Previous node in the chain (RootBlock or Block). Null after detaching from the tree.
     // Raw non-owning pointer: while attached, the prev node's `next` map owns us via shared_ptr.
     NodeBase* prev{nullptr};
+    //! Non-owning scope access while attached; cleared together with prev on detachment.
+    RootBlock* root{nullptr};
 
     TypedVec<LifeCycleId, CommittedPage*> storage;
 
@@ -271,6 +274,12 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     LifeCycleId numLifeCycles() const noexcept override
     {
         return storage.size();
+    }
+
+    //! Latest digest token in this block's prefix, when requested by the event sink.
+    std::shared_ptr<Digest const> const& getLastTokenDigest() const noexcept
+    {
+        return mLastTokenDigest;
     }
 
     bool isFull() const noexcept
@@ -336,6 +345,9 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
 private:
     BlockOrdinal mOrdinal;
+    // Share an immutable value through descendants without retaining any ancestor block.
+    // Unlike prev, this context remains valid while the block is detached from the tree.
+    std::shared_ptr<Digest const> mLastTokenDigest;
 };
 
 // ---------------------------------------------------------------------------
@@ -373,14 +385,19 @@ public:
         // shortens it. Equal to numTokens when the model has no SSM life
         // cycle. Separates "attention prefix matched N tokens" from
         // "recurrent-snapshot pruning cut it to M".
-        int numTokensBeforeHybridPruning;
+        int numReusableTokensBeforeHybridPruning;
+        // Raw token-path walk depth, before any pruning. Locates where this
+        // request's content diverges from the tree, independent of page
+        // residency. Equal to numLookupTokens when there is no fork.
+        int numReusableTokensBeforePruning;
     };
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     // Takes a non-owning TokenSpan so a zero-copy int32 token buffer can be matched without
     // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
+    // backoff: tokens trimmed off the tail of the match (see KVCacheManagerConfig::reuseMatchBackoff).
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
-        bool enablePartialMatch = false) const;
+        bool enablePartialMatch = false, int backoff = 0) const;
 
     // Detach all cached blocks. ~Block() releases pages when the last owner drops a block.
     void clear();
@@ -409,7 +426,7 @@ public:
     }
 
     // Propose removal of an empty root block. Deferred to avoid destroying
-    // objects during destructor chains. Drained at safe points (addOrGetExisting, match).
+    // objects during destructor chains. Drained by addOrGetExisting() and clear() only.
     void proposeToEraseEmptyRoot(BlockKey const& key)
     {
         mPendingRootErases.push_back(key);
@@ -421,7 +438,7 @@ private:
         ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
-    // yields the attention-only prefix (used for numTokensBeforeHybridPruning).
+    // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
     std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
 
     // Erase any pending empty root blocks from mRoots.

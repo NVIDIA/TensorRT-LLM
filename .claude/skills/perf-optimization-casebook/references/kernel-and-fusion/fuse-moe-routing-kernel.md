@@ -18,7 +18,7 @@ log_markers:
   - "use the original pytorch implementation"   # is_fused=False fallback warning
 eligibility:
   - "model uses the noaux_tc router (sigmoid gating + per-expert correction bias, grouped top-k)"
-  - "fused-path bounds live in tensorrt_llm/_torch/modules/fused_moe/routing.py::Deepseekv3RoutingImpl.noaux_tc (the is_fused guard) — read them from YOUR checkout before judging eligibility"
+  - "fused-path bounds live in tensorrt_llm/_torch/moe/fused_moe/routing.py::Deepseekv3RoutingImpl.noaux_tc (the is_fused guard) — read them from YOUR checkout before judging eligibility"
   - "as of 84926bcb6f14, n_group > 1: requires top_k <= 8 and num_experts <= 256 and experts_per_group <= 32 and experts_per_group * topk_group <= 256"
   - "as of 84926bcb6f14, n_group == 1: requires num_experts <= 1024 and top_k <= 32"
 interactions:
@@ -91,7 +91,7 @@ measured: []
   group-top-k / expert-top-k / normalize math, within fp tolerance). Still a
   kernel rewrite, so **verify vs reference**; tie-breaking on equal scores can
   differ from the PyTorch path.
-- **Verify:** correctness — `pytest tests/unittest/_torch/thop/parallel/test_noaux_tc.py`
+- **Verify:** correctness — `pytest tests/unittest/_torch/kernels/parallel_hw_agnostic/test_noaux_tc.py`
   and `test_moe.py`, plus the C++ `routingDeepSeekTest`; compare
   `topk_values`/`topk_indices` to the PyTorch reference within tolerance,
   including tie cases. Perf — nsys before/after: routing kernel count, total
@@ -105,11 +105,11 @@ measured: []
   must stay in sync with the kernel's supported bounds — a mismatch errors
   instead of falling back.
 - **Prior art:** PRs #7761 (`[TRTLLM-8637]`), #13186 (widens fused-path
-  eligibility; `tensorrt_llm/_torch/modules/fused_moe/routing.py`
+  eligibility; `tensorrt_llm/_torch/moe/fused_moe/routing.py`
   `Deepseekv3RoutingImpl`);
   `cpp/tensorrt_llm/kernels/noAuxTcKernels.cu`, `moeTopKFuncs.cuh`,
   `cpp/tensorrt_llm/thop/noAuxTcOp.cpp`,
   `tensorrt_llm/_torch/models/modeling_deepseekv3.py`; analogous TRTLLM-Gen MoE
-  routing kernels under `kernels/trtllmGenKernels/blockScaleMoe/Routing*.cu`.
+  routing kernels under `kernels/moe/trtllmGen/routing/Routing*.cu`.
   Owning specialist: **kernel-cuda-specialist**. Related: `perf-host-analysis`
   (inter-kernel gap), `perf-nsight-systems` (launch count).

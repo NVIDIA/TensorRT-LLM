@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
-import os
 import pathlib
 import pickle
 import sys
@@ -19,7 +18,6 @@ from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_pixtral
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 mpi4py.MPI.pickle.__init__(
     cloudpickle.dumps,

@@ -11,27 +11,24 @@ Run unit tests:
 
 Run all:
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_transformer.py -v -s
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_COSMOS3=/path/to/Cosmos3-Nano \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_transformer.py -v -s
 """
 
 import gc
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     PRETRAINED_CONFIG_COMPAT_DEFAULTS,
     Cosmos3VFMTransformer,
+    Qwen3VLTextRotaryEmbedding,
     apply_pretrained_config_compat_defaults,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
@@ -57,24 +54,6 @@ def _cleanup_gpu():
         torch.cuda.empty_cache()
 
 
-def _llm_models_root() -> str:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch/trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
-
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 _NUM_TRAIN_TIMESTEPS = 1000.0
@@ -97,12 +76,11 @@ def _transformer_config_path(checkpoint_dir: str) -> str:
 
 
 def _require_checkpoint() -> str:
-    if not COSMOS3_NANO_PATH or not os.path.isdir(COSMOS3_NANO_PATH):
-        pytest.skip(f"Checkpoint not found: {COSMOS3_NANO_PATH}")
-    config_path = _transformer_config_path(COSMOS3_NANO_PATH)
+    checkpoint_dir = get_checkpoint("Cosmos3-Nano")
+    config_path = _transformer_config_path(checkpoint_dir)
     if not os.path.isfile(config_path):
-        pytest.skip(f"Transformer config not found: {config_path}")
-    return COSMOS3_NANO_PATH
+        pytest.fail(f"Transformer config not found: {config_path}")
+    return checkpoint_dir
 
 
 def _load_model_config(checkpoint_dir: str) -> DiffusionModelConfig:
@@ -402,6 +380,315 @@ class TestCosmos3Audio:
 
 
 @pytest.mark.integration
+class TestCosmos3Action:
+    """Action modality — Nano architecture, random weights, action_gen on."""
+
+    ACTION_DIM = 64
+    T_ACTION = 4
+    NUM_DOMAINS = 32
+
+    @pytest.fixture(autouse=True)
+    def _require_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    @pytest.fixture
+    def action_model_config(self):
+        checkpoint_dir = _require_checkpoint()
+        model_config = _load_model_config(checkpoint_dir)
+        cfg = model_config.pretrained_config
+        cfg.action_gen = True
+        cfg.action_dim = self.ACTION_DIM
+        cfg.num_embodiment_domains = self.NUM_DOMAINS
+        cfg.sound_gen = False
+        return model_config
+
+    @pytest.fixture
+    def cosmos3_model_config_noaction(self):
+        checkpoint_dir = _require_checkpoint()
+        model_config = _load_model_config(checkpoint_dir)
+        model_config.pretrained_config.action_gen = False
+        model_config.pretrained_config.sound_gen = False
+        return model_config
+
+    def test_action_model_structure(self, action_model_config):
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        assert model.action_gen is True
+        assert model.action_dim == self.ACTION_DIM
+        assert hasattr(model, "action_proj_in")
+        assert hasattr(model, "action_proj_out")
+        assert hasattr(model, "action_modality_embed")
+        assert model.action_modality_embed.shape == (model.hidden_size,)
+
+    def test_video_only_model_has_no_action_heads(self, cosmos3_model_config_noaction):
+        model = Cosmos3VFMTransformer(model_config=cosmos3_model_config_noaction)
+        assert model.action_gen is False
+        assert not hasattr(model, "action_proj_in")
+        assert not hasattr(model, "action_proj_out")
+        assert not hasattr(model, "action_modality_embed")
+
+    def test_pack_action_rejects_wrong_last_dim(self, action_model_config):
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim - 1)
+        with pytest.raises(ValueError, match="action latent dimension mismatch"):
+            model.pack_action(action_latents)
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        assert out.action is not None
+        _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+    @pytest.mark.high_cuda_memory
+    def test_domain_ids_validated_once_per_request(self, action_model_config):
+        """The range check reads a device tensor, so it is a blocking sync. It
+        belongs on the first step of a request, not on every denoise step."""
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+
+        calls = []
+        real_validate = model.action_proj_in.validate_domain_ids
+        model.action_proj_in.validate_domain_ids = lambda ids: (
+            calls.append(ids),
+            real_validate(ids),
+        )[1]
+
+        def run_step():
+            with torch.inference_mode():
+                model(
+                    hidden_states=hs,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    video_shape=video_shape,
+                    fps=24.0,
+                    action_latents=action_latents,
+                    action_domain_ids=domain_ids,
+                )
+
+        run_step()
+        run_step()
+        assert len(calls) == 1
+
+        model.reset_cache()
+        run_step()
+        assert len(calls) == 2
+
+    def test_graph_key_separates_requests_that_differ_only_in_scalars(self, action_model_config):
+        """TRT-LLM captures a family of graphs and dispatches by key. fps, the
+        action clock and the start offset change the rotary positions without
+        changing any tensor shape, so they must discriminate keys or two such
+        requests would replay the same graph."""
+        from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+            CUDAGraphRunner,
+            CUDAGraphRunnerConfig,
+        )
+
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        model.register_cuda_graph_extra_key_fns(runner)
+
+        base = dict(fps=24.0, action_fps=5.0, action_start_frame_offset=1)
+        key = runner.get_graph_key(**base)
+        for field, other in (
+            ("fps", 16.0),
+            ("action_fps", 10.0),
+            ("action_start_frame_offset", 0),
+        ):
+            assert runner.get_graph_key(**{**base, field: other}) != key, field
+
+        # A video-only request keys exactly as before: absent scalars drop out.
+        assert runner.get_graph_key(fps=None, action_fps=None) == runner.get_graph_key()
+
+    def test_graph_key_separates_step_precisions(self, action_model_config):
+        """The step precision swaps quantization methods at identical shapes, so
+        an FP8 step and a 16-bit step must not replay the same graph."""
+        from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+            CUDAGraphRunner,
+            CUDAGraphRunnerConfig,
+        )
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
+            StepPrecisionController,
+        )
+
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        model.register_cuda_graph_extra_key_fns(runner)
+        no_policy = runner.get_graph_key()
+
+        # Installed after the runner, as post_load_weights() does.
+        model.step_precision_controller = StepPrecisionController(first_steps=3, last_steps=3)
+        model.set_denoising_step(step_index=10, num_steps=50)
+        fp8 = runner.get_graph_key()
+        model.set_denoising_step(step_index=0, num_steps=50)
+        a16 = runner.get_graph_key()
+
+        assert fp8 != a16
+        assert no_policy not in (fp8, a16)
+
+    @pytest.mark.high_cuda_memory
+    def test_action_rope_table_built_once_per_request(self, action_model_config):
+        """Chunk size, prompt lengths, fps and the frame offset are fixed for a
+        request, so the rotary table is too. Rebuilding it per step costs a
+        device-to-host sync per batch element plus an H2D copy of the position
+        ids -- for identical numbers."""
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+
+        calls = []
+        real = model._compute_action_rope_freqs
+        model._compute_action_rope_freqs = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+
+        def run_step():
+            with torch.inference_mode():
+                model(
+                    hidden_states=hs,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    video_shape=video_shape,
+                    fps=24.0,
+                    action_latents=action_latents,
+                    action_domain_ids=domain_ids,
+                )
+
+        run_step()
+        run_step()
+        run_step()
+        assert len(calls) == 1
+
+        model.reset_cache()
+        run_step()
+        assert len(calls) == 2
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_domain_id_out_of_range_raises(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([self.NUM_DOMAINS], dtype=torch.long, device=DEVICE)
+        with (
+            torch.inference_mode(),
+            pytest.raises(ValueError, match=r"domain_id must be in \[0, \d+\)"),
+        ):
+            model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_without_action_latents_returns_none(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        assert out.action is None
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_noisy_mask(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel, t=2
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        noisy_mask = torch.ones(1, self.T_ACTION, 1, device=DEVICE, dtype=DTYPE)
+        noisy_mask[:, 0, :] = 0.0
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+                action_noisy_mask=noisy_mask,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_multiframe(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel, t=3
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+
+@pytest.mark.integration
 class TestCosmos3TransformerCheckpoint:
     """Load Cosmos3-Nano transformer weights and run a single forward step."""
 
@@ -439,7 +726,7 @@ class TestCosmos3TransformerCheckpoint:
             )
         _assert_finite_output(out.video, hs.shape)
 
-    @pytest.mark.parametrize("quant_algo", ["FP8"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_fp8_quantization(self, quant_algo: str):
         checkpoint_dir = _require_checkpoint()
         if not torch.cuda.is_available():
@@ -451,7 +738,7 @@ class TestCosmos3TransformerCheckpoint:
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=_SKIP_AUX)
         try:
-            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
             transformer = pipeline.transformer
             c = transformer.latent_channel_size
             hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
@@ -594,3 +881,80 @@ class TestI2V4StepConfigShape:
         assert not hasattr(model, "audio_modality_embed")
         assert model.base_fps == 16
         assert len(model.gen_layers) == 2
+
+
+class TestRotaryTablePrecision:
+    """The mRoPE angle table must stay fp32-accurate when fp32 GEMMs run in TF32.
+
+    NGC PyTorch images set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1. Positions above
+    2048 do not fit TF32's 10-bit mantissa, so a table built as a K=1 matmul is
+    off by radians for late tokens wherever cuBLAS picks a TF32 kernel for that
+    shape (Blackwell). The table is an outer product and must not go through a
+    GEMM. Checkpoint-free; Nano head_dim and rope axes."""
+
+    HEAD_DIM = 128
+    ROPE_AXES = [24, 20, 20]
+    # Text tokens (up to 4096) + margin + fps-scaled vision positions land well
+    # above 2048. cuBLAS picks a TF32 kernel for the K=1 GEMM only at some
+    # problem sizes, so sweep the sizes a Cosmos3 request actually produces.
+    SEQUENCE_LENGTHS = [4096, 6240, 8192, 10336, 16384]
+    # Text ids are int64; fps-modulated vision, audio and action ids are fp32.
+    POSITION_DTYPES = [torch.int64, torch.float32]
+
+    @pytest.fixture(autouse=True)
+    def _require_tf32_capable_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        # TF32 exists from Ampere on. Below that, allow_tf32=True changes
+        # nothing and the case would pass without covering the regression.
+        if torch.cuda.get_device_capability() < (8, 0):
+            pytest.skip("TF32-capable GPU (SM80+) required")
+
+    def _rotary(self) -> Qwen3VLTextRotaryEmbedding:
+        pretrained = SimpleNamespace(
+            rope_theta=1_000_000.0,
+            head_dim=self.HEAD_DIM,
+            max_position_embeddings=262_144,
+            rope_axes_dim=self.ROPE_AXES,
+            rope_scaling=None,
+        )
+        return Qwen3VLTextRotaryEmbedding(SimpleNamespace(pretrained_config=pretrained))
+
+    @staticmethod
+    def _reference_cos_sin(rotary: Qwen3VLTextRotaryEmbedding, position_ids: torch.Tensor):
+        """Same math as the module, in float64 and without any matmul."""
+        inv = rotary.inv_freq.double()[None, None, :, None]  # [1, 1, D/2, 1]
+        pos = position_ids.double()[:, :, None, :]  # [3, B, 1, N]
+        freqs = (inv * pos).transpose(2, 3)  # [3, B, N, D/2]
+        freqs = rotary.apply_interleaved_mrope(freqs.clone(), rotary.mrope_section)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
+
+    @pytest.mark.parametrize("allow_tf32", [False, True])
+    @pytest.mark.parametrize("pos_dtype", POSITION_DTYPES, ids=str)
+    @pytest.mark.parametrize("seq_len", SEQUENCE_LENGTHS)
+    def test_rotary_table_matches_fp64_under_tf32(
+        self, allow_tf32: bool, pos_dtype: torch.dtype, seq_len: int
+    ):
+        saved = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        try:
+            rotary = self._rotary().to(DEVICE)
+            ramp = torch.arange(seq_len, dtype=pos_dtype, device=DEVICE)
+            position_ids = ramp.expand(3, -1)[:, None, :]
+            probe = torch.empty(0, dtype=torch.float32, device=DEVICE)
+
+            cos, sin = rotary(probe, position_ids)
+            ref_cos, ref_sin = self._reference_cos_sin(rotary, position_ids)
+
+            # The returned dtype follows the probe, not the position ids.
+            assert cos.dtype == probe.dtype
+            assert sin.dtype == probe.dtype
+
+            # fp32 evaluates angles of ~4e4 rad with ~6e-8 relative precision, so
+            # a few 1e-3 absolute is the honest fp32 floor; TF32 breakage is O(1).
+            tol = 5e-3
+            assert (cos.double() - ref_cos).abs().max().item() < tol
+            assert (sin.double() - ref_sin).abs().max().item() < tol
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = saved

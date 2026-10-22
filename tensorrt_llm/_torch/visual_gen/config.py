@@ -35,6 +35,7 @@ from tensorrt_llm.visual_gen.args import (
     CacheConfig,
     CacheDiTConfig,
     CompilationConfig,
+    CpuOffloadConfig,
     CudaGraphConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
@@ -50,11 +51,17 @@ from tensorrt_llm.visual_gen.args import (
 
 def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     """
-    Discover components from diffusers pipeline's model_index.json.
+    Discover components from a Diffusers pipeline manifest.
+
+    Standard pipelines use ``model_index.json``. Experimental modular
+    pipelines use ``modular_model_index.json`` but retain the same component
+    subdirectory/config layout needed by TRT-LLM.
 
     Returns dict mapping component name to config.json path.
     """
     model_index_path = checkpoint_path / "model_index.json"
+    if not model_index_path.exists():
+        model_index_path = checkpoint_path / "modular_model_index.json"
     if not model_index_path.exists():
         return {}
 
@@ -73,7 +80,14 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
+    """Create state shared by attention layers in one model component.
+
+    The state outlives individual forwards and CUDA Graph captures. It owns the
+    shape-keyed TRTLLM metadata cache, whose metadata objects also carry the FMHA
+    plan caches, so one static block-sparse profile is planned once per component
+    and shape instead of once per layer. Each model component receives a distinct
+    state and must not execute concurrent forwards.
+    """
     return {"metadata_cache": {}}
 
 
@@ -109,6 +123,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
 
     # Unified parallelism mapping copied from the owning pipeline config.
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+    device: str = "cuda"
 
     dynamic_weight_quant: bool = False
 
@@ -119,7 +134,9 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
+    cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Per-component metadata cache shared by VisualGen TRTLLM attention layers.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -174,17 +191,26 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+    device: str = "cuda"
 
     dynamic_weight_quant: bool = False
 
     # Sub-configs from VisualGenArgs (merged during from_pretrained)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
+    # VAE quantization is component-scoped. None preserves checkpoint-driven
+    # selection, while QuantConfig(quant_algo=None) explicitly disables it.
+    vae_conv_quant_config: Optional[QuantConfig] = None
+    # VAE Conv-only ModelOpt overrides. None lets the checkpoint determine the mode.
+    vae_conv_dynamic_weight_quant: Optional[bool] = None
+    vae_conv_dynamic_activation_quant: Optional[bool] = None
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
+    cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Seed state copied into each model component before attention metadata is created.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -230,30 +256,60 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         self,
         component_name: str,
         model_pretrained_config: Any,
+        quant: tuple[QuantConfig, dict | None, bool, bool] | None = None,
     ) -> DiffusionModelConfig:
+        """Build a component config, falling back to pipeline quantization when unspecified."""
+        if quant is None:
+            quant = (
+                self.quant_config,
+                self.quant_config_dict,
+                self.dynamic_weight_quant,
+                self.force_dynamic_quantization,
+            )
+        quant_config, quant_config_dict, dynamic_weight_quant, force_dynamic_quantization = quant
         return DiffusionModelConfig(
             component_name=_model_config_value(component_name),
             pretrained_config=_model_config_value(model_pretrained_config),
             # Topology mappings carry distributed process-group handles.
             mapping=_model_config_value(self.mapping, deep_copy=False),
             skip_create_weights_in_init=_model_config_value(self.skip_create_weights_in_init),
-            force_dynamic_quantization=_model_config_value(self.force_dynamic_quantization),
+            force_dynamic_quantization=_model_config_value(force_dynamic_quantization),
             allreduce_strategy=_model_config_value(self.allreduce_strategy),
             extra_attrs=_model_config_value(self.extra_attrs),
             # Topology mappings carry distributed process-group handles.
             visual_gen_mapping=_model_config_value(self.visual_gen_mapping, deep_copy=False),
-            dynamic_weight_quant=_model_config_value(self.dynamic_weight_quant),
-            quant_config=_model_config_value(self.quant_config),
-            quant_config_dict=_model_config_value(self.quant_config_dict),
+            device=_model_config_value(self.device),
+            dynamic_weight_quant=_model_config_value(dynamic_weight_quant),
+            quant_config=_model_config_value(quant_config),
+            quant_config_dict=_model_config_value(quant_config_dict),
             compilation=_model_config_value(self.compilation),
             torch_compile=_model_config_value(self.torch_compile),
             cuda_graph=_model_config_value(self.cuda_graph),
+            cpu_offload_config=_model_config_value(self.cpu_offload_config),
             attention=_model_config_value(self.attention),
             attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
             cache=_model_config_value(self.cache),
             enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
         )
+
+    @classmethod
+    def _resolve_quant_config(
+        cls,
+        user_quant: dict | QuantConfig | None,
+        checkpoint_quant: dict | None,
+    ) -> tuple[QuantConfig, dict | None, bool, bool]:
+        """Prefer an explicit user algorithm over each component's checkpoint metadata.
+
+        User configs without a non-None quant_algo fall back to the checkpoint.
+        """
+        if isinstance(user_quant, dict) and user_quant.get("quant_algo") is not None:
+            return cls.load_diffusion_quant_config(user_quant)
+        if isinstance(user_quant, QuantConfig) and user_quant.quant_algo is not None:
+            return user_quant, None, False, False
+        if isinstance(checkpoint_quant, dict):
+            return cls.load_diffusion_quant_config(checkpoint_quant)
+        return QuantConfig(), None, False, False
 
     @staticmethod
     def load_diffusion_quant_config(
@@ -274,6 +330,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             algo_map = {
                 "FP8": QuantAlgo.FP8,
                 "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
+                "FP8_PER_CHANNEL_PER_TOKEN": QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                 "NVFP4": QuantAlgo.NVFP4,
                 "W4A16_AWQ": QuantAlgo.W4A16_AWQ,
                 "W4A8_AWQ": QuantAlgo.W4A8_AWQ,
@@ -297,6 +354,11 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 group_size = weights_config.get("group_size")
             break
 
+        # FP8_PER_CHANNEL_PER_TOKEN quantizes activations per-token at runtime;
+        # static activation quantization is not currently supported.
+        if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            dynamic_activation_quant = True
+
         # Set defaults based on quant_algo if group_size not specified
         if group_size is None:
             if quant_algo in (QuantAlgo.NVFP4,):
@@ -313,6 +375,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             # since input_scale is not calibrated
             if quant_algo == QuantAlgo.NVFP4 and dynamic_weight_quant:
                 dynamic_activation_quant = True
+            if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+                dynamic_activation_quant = True
 
         quant_config = QuantConfig(
             quant_algo=quant_algo,
@@ -324,6 +388,83 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         layer_quant_config = None
 
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
+
+    @staticmethod
+    def load_vae_conv_quant_config(
+        quant_config_dict: dict,
+        checkpoint_quant_config_dict: Optional[dict] = None,
+    ) -> Tuple[QuantConfig, Optional[bool], Optional[bool]]:
+        """Overlay VAE quantization on its checkpoint and parse dynamic modes.
+
+        A top-level ``dynamic`` is shorthand for setting both weight and
+        activation quantization. Alternatively, one ModelOpt config group may
+        set ``weights.dynamic`` and ``input_activations.dynamic`` independently.
+        Omitted values remain ``None`` so the VAE loader can resolve them from
+        checkpoint contents. A user dictionary without ``quant_algo`` inherits
+        the VAE checkpoint algorithm; an explicit ``QuantConfig`` is handled by
+        the caller and can disable checkpoint-driven quantization.
+        """
+        has_shorthand = "dynamic" in quant_config_dict
+        has_groups = "config_groups" in quant_config_dict
+        if has_shorthand and has_groups:
+            raise ValueError(
+                "vae_config.quant_conv_config cannot specify both top-level 'dynamic' and "
+                "'config_groups' dynamic settings"
+            )
+
+        dynamic_weight: Optional[bool] = None
+        dynamic_activation: Optional[bool] = None
+
+        if has_shorthand:
+            dynamic = quant_config_dict["dynamic"]
+            if type(dynamic) is not bool:
+                raise ValueError("vae_config.quant_conv_config 'dynamic' must be a boolean")
+            dynamic_weight = dynamic_activation = dynamic
+        elif has_groups:
+            config_groups = quant_config_dict["config_groups"]
+            if not isinstance(config_groups, dict) or len(config_groups) != 1:
+                raise ValueError(
+                    "vae_config.quant_conv_config supports exactly one ModelOpt config group"
+                )
+            group_name, group_config = next(iter(config_groups.items()))
+            if not isinstance(group_config, dict):
+                raise ValueError(
+                    f"vae_config.quant_conv_config group {group_name!r} must contain a dictionary"
+                )
+
+            def _dynamic_value(section_name: str) -> Optional[bool]:
+                section = group_config.get(section_name, {})
+                if not isinstance(section, dict):
+                    raise ValueError(
+                        f"vae_config.quant_conv_config group {group_name!r} section "
+                        f"{section_name!r} must contain a dictionary"
+                    )
+                if "dynamic" not in section:
+                    return None
+                value = section["dynamic"]
+                if type(value) is not bool:
+                    raise ValueError(
+                        f"vae_config.quant_conv_config {section_name}.dynamic must be a boolean"
+                    )
+                return value
+
+            dynamic_weight = _dynamic_value("weights")
+            dynamic_activation = _dynamic_value("input_activations")
+
+        effective_quant_config = dict(quant_config_dict)
+        if effective_quant_config.get("quant_algo") is None and isinstance(
+            checkpoint_quant_config_dict, dict
+        ):
+            effective_quant_config["quant_algo"] = checkpoint_quant_config_dict.get("quant_algo")
+        quant_config, _, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(
+            effective_quant_config
+        )
+        if (
+            dynamic_weight is not None or dynamic_activation is not None
+        ) and quant_config.quant_algo != QuantAlgo.NVFP4:
+            raise ValueError("VAE dynamic quantization settings require quant_algo='NVFP4'")
+
+        return quant_config, dynamic_weight, dynamic_activation
 
     @staticmethod
     def _convert_quantization_metadata(
@@ -439,7 +580,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         cls,
         checkpoint_dir: str,
         args: Optional["VisualGenArgs"] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> "DiffusionPipelineConfig":
         """
         Load config from pretrained checkpoint.
@@ -451,8 +592,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             )
 
         Supports two checkpoint formats:
-        * **Diffusers directory layout** -- ``model_index.json`` with
-          component sub-directories each containing ``config.json``.
+        * **Diffusers directory layout** -- ``model_index.json`` or
+          ``modular_model_index.json`` with component sub-directories each
+          containing ``config.json``.
         * **Single-safetensors** -- no ``model_index.json``; config embedded
           in the safetensors metadata header under a ``"config"`` key.  The
           transformer section is extracted as ``pretrained_config`` and the
@@ -462,8 +604,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         Args:
             checkpoint_dir: Path to checkpoint
             args: VisualGenArgs containing user config
-                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache,
-                   cache_backend, cache_dit)
+                - (compilation_config, torch_compile_config, cuda_graph_config,
+                   cpu_offload_config, pipeline_config, attention_config, parallel_config,
+                   cache_config)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
@@ -472,6 +615,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         compilation_cfg = args.compilation_config if args else CompilationConfig()
         torch_compile_cfg = args.torch_compile_config if args else TorchCompileConfig()
         cuda_graph_cfg = args.cuda_graph_config if args else CudaGraphConfig()
+        offload_cfg = args.cpu_offload_config if args else CpuOffloadConfig()
         attention_cfg = args.attention_config if args else AttentionConfig()
         parallel_cfg = args.parallel_config if args else ParallelConfig()
         cache_cfg = args.cache_config if args else None
@@ -484,21 +628,25 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # LTX-2 stage-2 paths (spatial_upsampler_path, distilled_lora_path)
-        # are surfaced to the LTX2 pipeline consumer via extra_attrs. The
-        # resolved pipeline_config kwarg comes from PipelineLoader after
-        # registry validation; when from_pretrained is called directly
-        # (mostly in unit tests), fall back to the raw VisualGenArgs dict.
+        # Preserve all registry-resolved model options, including False and None.
+        # Direct callers may supply the raw dictionary without a PipelineLoader.
         resolved_pipeline_config = kwargs.pop("pipeline_config", None)
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
-        for key in ("spatial_upsampler_path", "distilled_lora_path"):
-            value = resolved_pipeline_config.get(key)
-            if value:
-                extra_attrs[key] = value
+        extra_attrs.update(resolved_pipeline_config)
+
+        h3_workflow = resolved_pipeline_config.get("workflow")
+        if h3_workflow is not None:
+            if h3_workflow not in ("fl2va", "ref2va"):
+                raise ValueError("MiniMax-H3 workflow must be 'fl2va' or 'ref2va'.")
+            extra_attrs["workflow"] = h3_workflow
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
+        if h3_workflow == "ref2va":
+            if "transformer_ref" not in components:
+                raise ValueError("MiniMax-H3 ref2va requires the transformer_ref checkpoint.")
+            components[PipelineComponent.TRANSFORMER] = components.pop("transformer_ref")
         component_config_dicts: Dict[str, Dict[str, Any]] = {}
 
         if components:
@@ -523,6 +671,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 pretrained_config._name_or_path = str(checkpoint_path)
 
             model_index_path = checkpoint_path / "model_index.json"
+            if not model_index_path.exists():
+                model_index_path = checkpoint_path / "modular_model_index.json"
             if model_index_path.exists():
                 with open(model_index_path) as f:
                     model_index = json.load(f)
@@ -575,55 +725,91 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             else:
                 raise ValueError(
                     f"Config not found at {checkpoint_dir}. "
-                    "Expected model_index.json (diffusers) or "
+                    "Expected model_index.json or modular_model_index.json "
+                    "(Diffusers), or "
                     "safetensors with embedded config metadata."
                 )
 
-        # Resolve quant_config. A user dict containing ``quant_algo``
-        # is parsed via ``load_diffusion_quant_config``; a user dict
-        # without ``quant_algo`` (including ``{}``) falls through to the
-        # checkpoint's embedded ``quantization_config``.
         user_quant = args.quant_config if args else None
-        if isinstance(user_quant, dict) and user_quant.get("quant_algo") is not None:
-            quant_config, quant_config_dict, dynamic_weight_quant, dynamic_activation_quant = (
-                cls.load_diffusion_quant_config(user_quant)
-            )
-        elif isinstance(user_quant, QuantConfig) and user_quant.quant_algo is not None:
-            quant_config = user_quant
-            quant_config_dict = None
-            dynamic_weight_quant = False
-            dynamic_activation_quant = False
-        else:
-            quant_config = QuantConfig()
-            quant_config_dict = None
-            dynamic_weight_quant = False
-            dynamic_activation_quant = False
-            quant_dict = getattr(pretrained_config, "quantization_config", None)
-            if isinstance(quant_dict, dict):
-                quant_config, quant_config_dict, dynamic_weight_quant, dynamic_activation_quant = (
-                    cls.load_diffusion_quant_config(quant_dict)
+        primary_quant = cls._resolve_quant_config(
+            user_quant, getattr(pretrained_config, "quantization_config", None)
+        )
+        quant_config, quant_config_dict, dynamic_weight_quant, dynamic_activation_quant = (
+            primary_quant
+        )
+        transformer_quant_configs = {component.value: primary_quant}
+        if "transformer_2" in component_config_dicts:
+            if components:
+                # Diffusers stores each expert's quantization metadata in its own config.
+                transformer_quant_configs["transformer_2"] = cls._resolve_quant_config(
+                    user_quant, component_config_dicts["transformer_2"].get("quantization_config")
                 )
+            else:
+                # Single-safetensors components share the top-level quantization metadata.
+                transformer_quant_configs["transformer_2"] = primary_quant
 
-        if runtime_lora_cfg is not None and quant_config.quant_algo is not None:
-            raise ValueError(
-                "runtime_lora_config does not currently support VisualGen weight "
-                f"quantization ({quant_config.quant_algo}). Fuse the adapter into "
-                "a full-precision checkpoint first, or disable quantization."
-            )
+        transformer_quant_algos = [
+            config[0].quant_algo for config in transformer_quant_configs.values()
+        ]
+        if runtime_lora_cfg is not None:
+            targets = runtime_lora_cfg.target_components or list(transformer_quant_configs)
+            for name in targets:
+                resolved = transformer_quant_configs.get(name)
+                if resolved is not None and resolved[0].quant_algo is not None:
+                    raise ValueError(
+                        "runtime_lora_config does not currently support VisualGen weight "
+                        f"quantization ({name}: {resolved[0].quant_algo}). Fuse the adapter into "
+                        "a full-precision checkpoint first, or set "
+                        "runtime_lora_config.target_components to unquantized transformer components."
+                    )
+
+        # Keep VAE precision independent from the transformer. Reuse the
+        # established QuantConfig schema and ModelOpt ``ignore`` parser, but do
+        # not reuse the transformer instance: component routing by name pattern
+        # cannot represent BF16 transformer + FP4 VAE (or the reverse).
+        user_vae_quant = args.vae_config.quant_conv_config if args else None
+        vae_component_config = component_config_dicts.get(PipelineComponent.VAE.value, {})
+        checkpoint_vae_quant = vae_component_config.get("quantization_config")
+        if isinstance(user_vae_quant, dict):
+            (
+                vae_conv_quant_config,
+                vae_conv_dynamic_weight_quant,
+                vae_conv_dynamic_activation_quant,
+            ) = cls.load_vae_conv_quant_config(user_vae_quant, checkpoint_vae_quant)
+        elif isinstance(user_vae_quant, QuantConfig):
+            vae_conv_quant_config = user_vae_quant
+            vae_conv_dynamic_weight_quant = None
+            vae_conv_dynamic_activation_quant = None
+        else:
+            vae_conv_quant_config = None
+            vae_conv_dynamic_weight_quant = None
+            vae_conv_dynamic_activation_quant = None
 
         # Enable tunable FP4 quantize for visual gen: larger activation
         # tensors (full image/video latents) amortize the AutoTuner overhead.
-        if quant_config.quant_algo == QuantAlgo.NVFP4:
+        if QuantAlgo.NVFP4 in transformer_quant_algos:
             from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 
             NVFP4LinearMethod.use_tunable_quantize = True
 
+        if QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN in transformer_quant_algos:
+            from tensorrt_llm._torch.modules.linear import FP8RowwiseLinearMethod
+
+            FP8RowwiseLinearMethod.use_tunable_quantize = True
+
         attention_metadata_state = (
-            create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
+            create_attention_metadata_state()
+            if attention_cfg.backend in ("TRTLLM", "FLASHINFER")
+            else None
         )
+
+        device = kwargs.pop("device", "cuda")
 
         pipeline_config = cls(
             quant_config=quant_config,
+            vae_conv_quant_config=vae_conv_quant_config,
+            vae_conv_dynamic_weight_quant=vae_conv_dynamic_weight_quant,
+            vae_conv_dynamic_activation_quant=vae_conv_dynamic_activation_quant,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,
@@ -631,10 +817,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             compilation=compilation_cfg,
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
+            cpu_offload_config=offload_cfg,
             attention=attention_cfg,
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            device=device,
             runtime_lora=runtime_lora_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
             skip_create_weights_in_init=True,
@@ -654,6 +842,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             pipeline_config.model_configs[component_name] = pipeline_config._make_model_config(
                 component_name,
                 component_pretrained_config,
+                transformer_quant_configs.get(component_name),
             )
 
         if not pipeline_config.model_configs:

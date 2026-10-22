@@ -1,5 +1,18 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Pipeline registry for unified config flow.
 
 Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPipeline → BasePipeline
@@ -7,7 +20,7 @@ Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPi
 All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
-the pipeline class plus three pieces of per-family metadata:
+the pipeline class plus four pieces of per-family metadata:
 
   * ``hf_ids``  — canonical HuggingFace model IDs that dispatch to this
                   pipeline. Powers ``VisualGen.supported_models()`` and
@@ -16,7 +29,10 @@ the pipeline class plus three pieces of per-family metadata:
                   automatically without needing to appear here.
   * ``defaults`` — default per-family ``pipeline_config`` knobs
                    (schema-by-example for the strict-validated dict).
+  * ``download_patterns`` — optional HuggingFace allow-list for repositories
+                            that contain multiple checkpoint formats/variants.
   * ``doc``     — short human-readable description for discovery tooling.
+  * ``supports_nvfp4_vae`` — whether this family can execute an NVFP4 VAE.
 
 The dataclass and the registry itself are deliberately private — users go
 through ``VisualGenArgs(model=...)``, ``VisualGen.supported_models()``,
@@ -30,9 +46,10 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
     from .config import DiffusionPipelineConfig
@@ -44,7 +61,7 @@ class PipelineComponent(str, Enum):
 
     Inherits from ``str`` so values compare equal to plain strings,
     e.g. ``PipelineComponent.VAE == "vae"`` is ``True``. The loader reads
-    these from ``model_index.json``.
+    these from ``model_index.json`` or ``modular_model_index.json``.
     """
 
     TRANSFORMER = "transformer"
@@ -54,6 +71,9 @@ class PipelineComponent(str, Enum):
     TOKENIZER = "tokenizer"
     TOKENIZER_2 = "tokenizer_2"
     SCHEDULER = "scheduler"
+    AUDIO_SCHEDULER = "audio_scheduler"
+    AUDIO_VAE = "audio_vae"
+    PROCESSOR = "processor"
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
     SOUND_TOKENIZER = "sound_tokenizer"
@@ -68,10 +88,12 @@ class _PipelineEntry:
     pipeline_cls: Type["BasePipeline"]
     hf_ids: List[str] = field(default_factory=list)
     defaults: Dict[str, Any] = field(default_factory=dict)
+    download_patterns: List[str] = field(default_factory=list)
     doc: str = ""
+    supports_nvfp4_vae: bool = False
 
 
-# Keyed by Diffusers ``_class_name`` (from model_index.json). ~3-5 entries
+# Keyed by Diffusers ``_class_name`` (from either manifest format). ~3-5 entries
 # total — one per pipeline family, not one per checkpoint. Fine-tunes
 # auto-dispatch via their inherited ``_class_name``.
 PIPELINE_REGISTRY: Dict[str, _PipelineEntry] = {}
@@ -82,8 +104,10 @@ def register_pipeline(
     *,
     hf_ids: Optional[List[str]] = None,
     defaults: Optional[Dict[str, Any]] = None,
+    download_patterns: Optional[List[str]] = None,
     doc: str = "",
-):
+    supports_nvfp4_vae: bool = False,
+) -> Callable[[Type["BasePipeline"]], Type["BasePipeline"]]:
     """Register a pipeline class with optional per-family metadata.
 
     Usage:
@@ -95,6 +119,7 @@ def register_pipeline(
             "LTX2Pipeline",
             hf_ids=["Lightricks/LTX-Video"],
             defaults={"text_encoder_path": ""},
+            download_patterns=["model_index.json", "transformer/*"],
             doc="Lightricks LTX-Video family.",
         )
         class LTX2Pipeline(BasePipeline):
@@ -113,7 +138,9 @@ def register_pipeline(
             pipeline_cls=cls,
             hf_ids=list(hf_ids or []),
             defaults=dict(defaults or {}),
+            download_patterns=list(download_patterns or []),
             doc=doc,
+            supports_nvfp4_vae=supports_nvfp4_vae,
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
@@ -142,7 +169,9 @@ class AutoPipeline:
                 f"Checkpoint: {checkpoint_dir}"
             )
 
-        pipeline_class = PIPELINE_REGISTRY[class_name].pipeline_cls
+        entry = PIPELINE_REGISTRY[class_name]
+        AutoPipeline._validate_vae_quantization(config, class_name, entry)
+        pipeline_class = entry.pipeline_cls
 
         # Let the pipeline class upgrade itself to a specialised variant
         # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
@@ -154,17 +183,64 @@ class AutoPipeline:
         return pipeline_class(config)
 
     @staticmethod
+    def _validate_vae_quantization(
+        config: "DiffusionPipelineConfig",
+        class_name: str,
+        entry: _PipelineEntry,
+    ) -> None:
+        """Reject NVFP4 VAE execution on pipeline families without support."""
+        vae_model_config = config.model_configs.get(PipelineComponent.VAE.value)
+        checkpoint_quant_config = (
+            getattr(vae_model_config.pretrained_config, "quantization_config", None)
+            if vae_model_config is not None
+            else None
+        )
+        checkpoint_quant_algo = (
+            checkpoint_quant_config.get("quant_algo")
+            if isinstance(checkpoint_quant_config, dict)
+            else None
+        )
+
+        vae_conv_quant_config = config.vae_conv_quant_config
+        if vae_conv_quant_config is not None:
+            quant_algo = vae_conv_quant_config.quant_algo
+            if quant_algo not in (None, QuantAlgo.NVFP4):
+                raise ValueError(
+                    f"VAE quantization supports only NVFP4, got {quant_algo}. "
+                    "Use quant_config for transformer quantization."
+                )
+        else:
+            quant_algo = checkpoint_quant_algo
+
+        nvfp4_values = (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
+        if checkpoint_quant_algo is not None and checkpoint_quant_algo not in nvfp4_values:
+            raise ValueError(
+                f"VAE checkpoint quantization supports only NVFP4, got {checkpoint_quant_algo}."
+            )
+        if quant_algo not in nvfp4_values and checkpoint_quant_algo not in nvfp4_values:
+            return
+        if not entry.supports_nvfp4_vae:
+            raise ValueError(
+                f"NVFP4 VAE is not supported by {class_name}. "
+                "Remove vae_config.quant_conv_config or use a supported Wan pipeline."
+            )
+
+    @staticmethod
     def _detect_from_checkpoint(checkpoint_dir: str) -> str:
         """Detect pipeline ``_class_name`` from a checkpoint directory.
 
         Resolution order:
-        1. ``model_index.json`` (diffusers directory layout)
+        1. ``model_index.json`` or ``modular_model_index.json``
         2. Safetensors metadata (LTX-2 native single-file format)
         """
-        index_path = os.path.join(checkpoint_dir, "model_index.json")
+        index_paths = [
+            os.path.join(checkpoint_dir, "model_index.json"),
+            os.path.join(checkpoint_dir, "modular_model_index.json"),
+        ]
+        index_path = next((path for path in index_paths if os.path.exists(path)), None)
 
-        # 1. Diffusers format model_index.json
-        if os.path.exists(index_path):
+        # 1. Standard or modular Diffusers manifest.
+        if index_path is not None:
             with open(index_path) as f:
                 index = json.load(f)
 
@@ -203,7 +279,8 @@ class AutoPipeline:
 
         raise ValueError(
             f"Cannot detect pipeline type for {checkpoint_dir}\n"
-            f"Expected model_index.json with '_class_name' field at: {index_path}, "
+            "Expected model_index.json or modular_model_index.json with an "
+            "'_class_name' field, "
             f"or safetensors file(s) with embedded 'config' metadata."
         )
 

@@ -17,8 +17,8 @@ from unittest.mock import patch
 
 import pynvml
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 
 
 def setup_function() -> None:
@@ -31,7 +31,10 @@ def teardown_function() -> None:
     MnnvlMemory.support_nvlink.cache_clear()
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200 NVL")
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
+    return_value="NVIDIA H200 NVL",
+)
 def test_pcie_nvl_sku_detected_by_name(mock_get_device_name) -> None:
     with patch.object(MnnvlMemory, "_ensure_nvml_initialized") as mock_initialize:
         assert MnnvlMemory._is_pcie_nvl_sku(0)
@@ -39,15 +42,19 @@ def test_pcie_nvl_sku_detected_by_name(mock_get_device_name) -> None:
     mock_initialize.assert_not_called()
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
-@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
-@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount", return_value=8)
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+    "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
+    return_value="NVIDIA H200",
+)
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetCount", return_value=8)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
 )
 @patch.object(MnnvlMemory, "support_nvlink", return_value=True)
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetP2PStatus",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetP2PStatus",
     return_value=pynvml.NVML_P2P_STATUS_NOT_SUPPORTED,
 )
 def test_split_nvlink_topology_detected(
@@ -64,7 +71,7 @@ def test_split_nvlink_topology_detected(
         return pynvml.NVML_TOPOLOGY_NODE
 
     with patch(
-        "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetTopologyCommonAncestor",
         side_effect=common_ancestor,
     ):
         assert MnnvlMemory._is_pcie_nvl_sku(0)
@@ -73,19 +80,23 @@ def test_split_nvlink_topology_detected(
     mock_support_nvlink.assert_called_once_with(0, need_all_up=False)
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
-@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
-@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount", return_value=2)
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+    "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
+    return_value="NVIDIA H200",
+)
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetCount", return_value=2)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
 )
 @patch.object(MnnvlMemory, "support_nvlink", return_value=False)
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetP2PStatus",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetP2PStatus",
     return_value=pynvml.NVML_P2P_STATUS_NOT_SUPPORTED,
 )
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetTopologyCommonAncestor",
     return_value=pynvml.NVML_TOPOLOGY_SYSTEM,
 )
 def test_pcie_hopper_with_system_peers_is_not_split_nvlink(
@@ -103,20 +114,23 @@ def test_pcie_hopper_with_system_peers_is_not_split_nvlink(
     mock_common_ancestor.assert_called_once_with(0, 1)
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
-@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
-@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount", return_value=2)
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
+    return_value="NVIDIA H200",
+)
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetCount", return_value=2)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
     side_effect=lambda index: index,
 )
 @patch.object(MnnvlMemory, "support_nvlink")
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetP2PStatus",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetP2PStatus",
     return_value=pynvml.NVML_P2P_STATUS_OK,
 )
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetTopologyCommonAncestor",
     return_value=pynvml.NVML_TOPOLOGY_SYSTEM,
 )
 def test_dual_socket_hgx_with_system_peers_is_not_split_nvlink(
@@ -134,14 +148,18 @@ def test_dual_socket_hgx_with_system_peers_is_not_split_nvlink(
     mock_common_ancestor.assert_called_once_with(0, 1)
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
-@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
-@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount", return_value=8)
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+    "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
+    return_value="NVIDIA H200",
+)
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetCount", return_value=8)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
 )
 @patch(
-    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetTopologyCommonAncestor",
     return_value=pynvml.NVML_TOPOLOGY_NODE,
 )
 @patch.object(MnnvlMemory, "support_nvlink", return_value=True)
@@ -157,7 +175,10 @@ def test_nvswitch_topology_remains_supported(
     mock_support_nvlink.assert_not_called()
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA B200 NVL")
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
+    return_value="NVIDIA B200 NVL",
+)
 @patch.object(MnnvlMemory, "_ensure_nvml_initialized")
 def test_b200_does_not_use_hopper_topology_fallback(mock_initialize, mock_get_device_name) -> None:
     assert not MnnvlMemory._is_pcie_nvl_sku(0)
@@ -167,23 +188,26 @@ def test_b200_does_not_use_hopper_topology_fallback(mock_initialize, mock_get_de
 def test_topology_probe_initializes_nvml() -> None:
     with (
         patch(
-            "tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name",
+            "tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.get_device_name",
             return_value="NVIDIA H200",
         ),
         patch(
-            "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount",
+            "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetCount",
             side_effect=[pynvml.NVMLError_Uninitialized(), 1],
         ),
-        patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlInit") as mock_nvml_init,
-        patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", return_value=0),
+        patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlInit") as mock_nvml_init,
+        patch(
+            "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+            return_value=0,
+        ),
     ):
         assert not MnnvlMemory._is_pcie_nvl_sku(0)
 
     mock_nvml_init.assert_called_once_with()
 
 
-@patch("tensorrt_llm._mnnvl_utils.get_sm_version", return_value=90)
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.current_device", return_value=0)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.get_sm_version", return_value=90)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.current_device", return_value=0)
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=True)
 @patch.object(MnnvlMemory, "support_nvlink")
 def test_supports_mnnvl_rejects_split_topology(
@@ -193,8 +217,8 @@ def test_supports_mnnvl_rejects_split_topology(
     mock_support_nvlink.assert_not_called()
 
 
-@patch("tensorrt_llm._mnnvl_utils.get_sm_version", return_value=90)
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.current_device", return_value=0)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.get_sm_version", return_value=90)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.torch.cuda.current_device", return_value=0)
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=False)
 @patch.object(MnnvlMemory, "support_nvlink", return_value=True)
 def test_supports_mnnvl_accepts_full_fabric(
@@ -204,16 +228,107 @@ def test_supports_mnnvl_accepts_full_fabric(
     mock_support_nvlink.assert_called_once_with(0, True)
 
 
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
+)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.NVML_NVLINK_MAX_LINKS", 36)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability",
+    return_value=True,
+)
+def test_support_nvlink_ignores_indices_past_the_gpu_link_count(
+    mock_capability, mock_get_handle, mock_initialize
+) -> None:
+    """A GPU with fewer links than the probe bound still counts as fully up.
+
+    NVML answers the capability query for every index below
+    NVML_NVLINK_MAX_LINKS and only the state query rejects the surplus, so the
+    indices the GPU does not have must not enter the up/total ratio.
+    """
+    physical_links = 18
+
+    def link_state(handle, link_idx):
+        if link_idx >= physical_links:
+            raise pynvml.NVMLError_NotSupported()
+        return True
+
+    with patch(
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState",
+        side_effect=link_state,
+    ):
+        assert MnnvlMemory.support_nvlink(0, True)
+
+
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
+)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.NVML_NVLINK_MAX_LINKS", 36)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability",
+    return_value=True,
+)
+def test_support_nvlink_rejects_a_down_link_inside_the_gpu_range(
+    mock_capability, mock_get_handle, mock_initialize
+) -> None:
+    """A link the GPU does have but that reports down keeps the fabric unsupported."""
+    physical_links = 18
+
+    def link_state(handle, link_idx):
+        if link_idx >= physical_links:
+            raise pynvml.NVMLError_NotSupported()
+        return link_idx != 3
+
+    with patch(
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState",
+        side_effect=link_state,
+    ):
+        assert not MnnvlMemory.support_nvlink(0, True)
+
+
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
+)
+@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.NVML_NVLINK_MAX_LINKS", 36)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability",
+    return_value=True,
+)
+def test_support_nvlink_keeps_probing_after_a_rejected_index(
+    mock_capability, mock_get_handle, mock_initialize
+) -> None:
+    """A rejected index must not end the probe: a later down link still counts."""
+    rejected_link = 3
+    down_link = 7
+    physical_links = 18
+
+    def link_state(handle, link_idx):
+        if link_idx == rejected_link or link_idx >= physical_links:
+            raise pynvml.NVMLError_NotSupported()
+        return link_idx != down_link
+
+    with patch(
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState",
+        side_effect=link_state,
+    ):
+        assert not MnnvlMemory.support_nvlink(0, True)
+
+
+@patch(
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
     True,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.get_sm_version",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.get_sm_version",
     return_value=90,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
     return_value=0,
 )
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=True)
@@ -224,15 +339,15 @@ def test_deep_ep_low_latency_rejects_split_topology(
 
 
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
     True,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.get_sm_version",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.get_sm_version",
     return_value=100,
 )
 @patch(
-    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
+    "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
     return_value=0,
 )
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=False)

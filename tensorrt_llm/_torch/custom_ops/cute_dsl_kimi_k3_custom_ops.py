@@ -16,8 +16,7 @@
 
 The implementation source-integrates the production orchestration from the
 KDA ``chunk_kda_fwd`` benchmark. The default pipeline launches fused K123,
-Akk inverse, and persistent K4 kernels. Equal-length inputs may instead use
-the fused K1234 kernel.
+Akk inverse, and persistent K4 kernels.
 
 Supported:
   - Equal-length sequences (B ≥ 1, with the existing B=1 padding path)
@@ -25,16 +24,20 @@ Supported:
   - safe_gate mode (sigmoid + lower_bound) and softplus mode
   - dt_bias
   - use_gate_in_kernel=True with A_log
+  - optional in-kernel beta sigmoid
   - chunk_size=64
 
-The public ``trtllm::kda_prefill`` operator returns only the KDA output and
-final recurrent state. Intermediate matrices remain private runner workspace.
+The ``trtllm::kda_prefill`` operator updates selected recurrent-state pool rows
+in place. Intermediate matrices remain private runner workspace.
 """
 
+import os
 import weakref
-from typing import Optional, Tuple
+from typing import Any, Hashable, Optional, TypeVar
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -45,18 +48,15 @@ if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.akk_inverse import akk_inv_host as _akk_inv_host
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.fused_k123 import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.akk_inverse import akk_inv_host as _akk_inv_host
+    from ..attention.kernels.blackwell.kimi_k3_kda.fused_k123 import (
         make_host_function as _fused_make_host,
     )
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.fused_k1234 import (
-        make_host_fn as _fused_k1234_make_host,
-    )
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.k4_persistent import (
         BYTES_PER_TENSORMAP as _K4P_BTM,
     )
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import NUM_TENSORMAPS as _K4P_NTM
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.k4_persistent import NUM_TENSORMAPS as _K4P_NTM
+    from ..attention.kernels.blackwell.kimi_k3_kda.k4_persistent import (
         make_host_fn as _k4p_make_host,
     )
     from ..modules.fla.index import prepare_chunk_indices
@@ -69,6 +69,51 @@ def _ct(t, etype):
     r = from_dlpack(t, assumed_align=16)
     r.element_type = etype
     return r
+
+
+def _fits_32bit_stride(tensor: torch.Tensor) -> bool:
+    int32_max = 2**31 - 1
+    max_offset = int(tensor.storage_offset())
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        stride = abs(int(stride))
+        if stride > int32_max:
+            return False
+        if size:
+            max_offset += (int(size) - 1) * stride
+            if max_offset > int32_max:
+                return False
+    return True
+
+
+def _dynamic_dlpack_arg(tensor: torch.Tensor):
+    wrapper = from_dlpack(
+        tensor,
+        assumed_align=16,
+        use_32bit_stride=_fits_32bit_stride(tensor),
+    )
+    for dim, stride in enumerate(tensor.stride()):
+        if stride == 1:
+            return wrapper.mark_layout_dynamic(dim)
+    return wrapper
+
+
+def _layout_key(tensor: torch.Tensor):
+    return (
+        tensor.dtype,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        _fits_32bit_stride(tensor),
+    )
+
+
+def _dynamic_vector_layout_key(tensor: torch.Tensor):
+    """Key a 1D CuTe argument whose sole extent is runtime dynamic."""
+    assert tensor.ndim == 1
+    return (
+        tensor.dtype,
+        tuple(tensor.stride()),
+        _fits_32bit_stride(tensor),
+    )
 
 
 def _current_cu_stream(device):
@@ -122,13 +167,6 @@ _varlen_pure_cache = {}
 # single-seq cu_seqlens.
 _varlen_single_seqlen_cache = {}
 
-# id(tensor) -> cute_wrapper. The wrappers themselves are stateless views
-# over the tensor's storage, so they remain valid as long as the tensor's
-# data pointer / shape / strides don't change. Callers that reuse the same
-# tensor objects across iterations (typical benchmark pattern) hit the
-# cache; per-call fresh tensors (the executor runtime pattern) rebuild.
-_input_wrap_cache = {}
-
 
 def _prune_on_gc(cache, key, *keyobjs):
     """Drop ``cache[key]`` when any of ``keyobjs`` is garbage-collected.
@@ -145,24 +183,24 @@ def _prune_on_gc(cache, key, *keyobjs):
         weakref.finalize(o, cache.pop, key, None)
 
 
-def _ct_cached(t, etype):
-    """`_ct(t, etype)` with id(t)-based cache. Returns the same cute wrapper
-    for repeated calls with the same tensor object, avoiding per-call
-    `from_dlpack` overhead (~5-10us each).
+def _scratch_ct(cute_wrappers, name, t, etype):
+    """`_ct(t, etype)` for the ``_get_buffers`` scratch tensor ``t``, cached
+    under ``name`` in ``cute_wrappers``, the wrapper dict of the same
+    ``_buf_cache`` entry, so a launch skips its ``from_dlpack`` (~5-10us each).
 
-    ONLY use for tensors with process-long lifetime (module params, the
-    module-level scratch from ``_get_buffers``): the cached wrapper pins the
-    tensor's storage, so the weakref pruning never fires for the keyed
-    object and a per-call activation would be pinned forever (~100MB/call
-    leak in the executor runtime). Per-call tensors must use plain ``_ct``.
+    A CuTe wrapper keeps the tensor it wraps alive (its DLPack capsule holds a
+    reference), so a wrapper is cached only beside its tensor: evicting the
+    entry from ``_buf_cache`` releases the scratch and its wrappers together.
+    Per-call tensors are never cached; they are wrapped with plain ``_ct``.
+    Without an entry (``cute_wrappers`` is None) ``t`` is wrapped afresh.
     """
-    key = (id(t), etype)
-    w = _input_wrap_cache.get(key)
-    if w is None:
-        w = _ct(t, etype)
-        _input_wrap_cache[key] = w
-        _prune_on_gc(_input_wrap_cache, key, t)
-    return w
+    if cute_wrappers is None:
+        return _ct(t, etype)
+    key = ("scratch_ct", name, etype)
+    cached = cute_wrappers.get(key)
+    if cached is None or cached[0] is not t:
+        cached = cute_wrappers[key] = (t, _ct(t, etype))
+    return cached[1]
 
 
 # Cache for dt_bias `.float().contiguous().view(H, K)` + cute wrapper.
@@ -259,55 +297,90 @@ _akk_inv_cache = {}
 _k4p_cache = {}
 _k4p_tm_ws = {}
 
-# Side-stream cache for the initial-state copy overlapping K123.
-_side_streams = {}
+# ========== Shape-keyed scratch caches ==========
+# The scratch caches below are keyed by the packed prefill token count. In the
+# executor that is attn_metadata.num_ctx_tokens, which the scheduler does not
+# quantize, so almost every prefill iteration brings a new key. Every such
+# cache must therefore be LRU-bounded through _lru_put / _lru_touch.
 
 
-def _get_side_stream(dev):
-    idx = dev.index or 0
-    if idx not in _side_streams:
-        _side_streams[idx] = torch.cuda.Stream(device=dev)
-    return _side_streams[idx]
+_V = TypeVar("_V")
+
+
+def _lru_put(cache: dict, key: Hashable, value: _V, max_entries: int) -> _V:
+    """Insert ``value`` under ``key``, first evicting least-recently-used entries."""
+    while len(cache) >= max_entries:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
+
+
+def _lru_touch(cache: dict, key: Hashable) -> Any:
+    """Mark ``key`` most recently used and return its value."""
+    cache[key] = cache.pop(key)
+    return cache[key]
+
+
+_DEFAULT_SCRATCH_CACHE_ENTRIES = 2
+
+
+def _scratch_cache_max_entries() -> int:
+    """Entry cap of the shape-keyed scratch caches: TLLM_KDA_BUF_CACHE_ENTRIES, default 2.
+
+    A non-integer value falls back to the default with a warning instead of
+    failing the import of this module.
+    """
+    raw = os.environ.get("TLLM_KDA_BUF_CACHE_ENTRIES")
+    if raw is None:
+        return _DEFAULT_SCRATCH_CACHE_ENTRIES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid TLLM_KDA_BUF_CACHE_ENTRIES={raw!r}; "
+            f"using the default of {_DEFAULT_SCRATCH_CACHE_ENTRIES}."
+        )
+        return _DEFAULT_SCRATCH_CACHE_ENTRIES
 
 
 # Buffer cache: avoid re-allocating ~67us of intermediate tensors per call.
 # Also caches cute.Tensor wrappers (saves ~7us each call from from_dlpack).
-# LRU-bounded: entries are keyed by (B, T, ...) shapes, and the runtime
-# executor calls with a different token count per prefill batch — an
-# unbounded dict would pin ~T*150KB of scratch per distinct shape forever.
+#
+# One entry owns ~1.25 KiB per token per KDA head, i.e. ~1 GiB at H=96 and
+# T=8192. This scratch is allocated after the KV-cache pool has been sized, so
+# every resident entry is memory the KV-cache accounting never saw: keep the
+# cap small. A small cap costs almost nothing, because the reuse that matters
+# is within one forward: all KDA layers of an iteration share one T, so even a
+# single entry hits on every layer but the first. Cross-iteration hits are
+# incidental, since T usually changes from one iteration to the next.
+# Override with TLLM_KDA_BUF_CACHE_ENTRIES (minimum 1).
 _buf_cache = {}
-_BUF_CACHE_MAX_ENTRIES = 8
+_BUF_CACHE_MAX_ENTRIES = _scratch_cache_max_entries()
 
 # Padded-input scratch cache for the eqlen partial-chunk path. Keyed by
 # (B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T).
 # real_T is part of the key so the g sentinel tail [real_T:T_padded] = -1e3
-# is set once and reused across calls with the same shape. LRU-bounded like
-# _buf_cache: real_T varies per prefill batch, so an unbounded dict would pin
-# scratch for every distinct token count forever.
+# is set once and reused across calls with the same shape.
 _padded_input_cache = {}
-_PAD_CACHE_MAX_ENTRIES = 8
+_PADDED_INPUT_CACHE_MAX_ENTRIES = _BUF_CACHE_MAX_ENTRIES
 
 # Sentinel-padded g scratch for varlen single-seq Phase 2.1 path. Keyed by
 # (B, T_padded, H, K, dtype, device, real_T). The tail [real_T:T_padded] is
 # pre-set to -1e3 once at cache init; subsequent calls only overwrite the
-# valid prefix [0, real_T).
+# valid prefix [0, real_T). real_T is the request's true prompt length, so
+# the key space is as wide as the prompt-length distribution.
 _g_sentinel_cache = {}
+_G_SENTINEL_CACHE_MAX_ENTRIES = _BUF_CACHE_MAX_ENTRIES
 
 
 def _get_g_sentinel_buffer(B, T_padded, H, K, dtype_g, device, real_T):
     key = (B, T_padded, H, K, dtype_g, device.index if device.index is not None else 0, real_T)
-    e = _g_sentinel_cache.get(key)
-    if e is None:
-        e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
-        if real_T < T_padded:
-            e[:, real_T:] = -1000.0
-        while len(_g_sentinel_cache) >= _PAD_CACHE_MAX_ENTRIES:
-            _g_sentinel_cache.pop(next(iter(_g_sentinel_cache)))
-        _g_sentinel_cache[key] = e
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _g_sentinel_cache[key] = _g_sentinel_cache.pop(key)
-    return e
+    if key in _g_sentinel_cache:
+        return _lru_touch(_g_sentinel_cache, key)
+    e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
+    if real_T < T_padded:
+        e[:, real_T:] = -1000.0
+    return _lru_put(_g_sentinel_cache, key, e, _G_SENTINEL_CACHE_MAX_ENTRIES)
 
 
 def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T):
@@ -322,29 +395,23 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
         device.index if device.index is not None else 0,
         real_T,
     )
-    e = _padded_input_cache.get(key)
-    if e is None:
-        q_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        k_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        v_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        beta_pad = torch.zeros(B, T_padded, H, dtype=dtype_beta, device=device)
-        # g: zero in [0, real_T), sentinel -1e3 in [real_T, T_padded). Caller's
-        # data overwrites the prefix each call; the sentinel tail never moves.
-        g_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
-        if real_T < T_padded:
-            g_pad[:, real_T:] = -1000.0
-        e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
-        while len(_padded_input_cache) >= _PAD_CACHE_MAX_ENTRIES:
-            _padded_input_cache.pop(next(iter(_padded_input_cache)))
-        _padded_input_cache[key] = e
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _padded_input_cache[key] = _padded_input_cache.pop(key)
-    return e
+    if key in _padded_input_cache:
+        return _lru_touch(_padded_input_cache, key)
+    q_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    k_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    v_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    beta_pad = torch.zeros(B, T_padded, H, dtype=dtype_beta, device=device)
+    # g: zero in [0, real_T), sentinel -1e3 in [real_T, T_padded). Caller's
+    # data overwrites the prefix each call; the sentinel tail never moves.
+    g_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
+    if real_T < T_padded:
+        g_pad[:, real_T:] = -1000.0
+    e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
+    return _lru_put(_padded_input_cache, key, e, _PADDED_INPUT_CACHE_MAX_ENTRIES)
 
 
 def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=False):
-    """All beta fusion lives in akk_inv kernel epilogue (post-inv column-scale)."""
+    """Return cached intermediate tensors for the KDA prefill pipeline."""
     key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs, varlen)
     if key not in _buf_cache:
         bf16 = cutlass.BFloat16
@@ -371,15 +438,10 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         k_scaled = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)  # raw, no beta
         kg = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)
         q_scaled = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)
+        beta_activated = _with_slack(torch.empty, B, T_alloc, H, dtype=torch.bfloat16)
         gk_last_exp = torch.empty(B, NT, H, K_dim, device=dev, dtype=torch.float32)
         A_qk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
         A_kk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
-        O_flat = _with_slack(torch.empty, B, T_alloc, H, V_dim, dtype=dtype_k)
-        # K4 reads initial state from S_out (caller copies it in) and writes
-        # the final state back into the same buffer — no separate s_4d, no
-        # extra D2D memcpy at the end of the K4 launcher. Layout matches
-        # caller's [N_seqs, H, K, V] contig fp32 convention.
-        S_out = torch.empty(N_seqs, H, K_dim, V_dim, device=dev, dtype=torch.float32)
         cu_eqlen = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=dev)
         # co_eqlen is consumed only on the eqlen path (varlen K4 derives its
         # chunk offsets from cu_seqlens). Eqlen inputs are pre-padded to a
@@ -396,7 +458,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         KS_flat = k_scaled.reshape(T_total, H, K_dim)
         QS_flat = q_scaled.reshape(T_total, H, K_dim)
         KG_flat = kg.reshape(T_total, H, K_dim)
-        O_token = O_flat.reshape(T_total, H, V_dim)
         gk_flat = gk_last_exp.reshape(-1, H, K_dim)
 
         def _wrap(t, etype):
@@ -409,7 +470,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         ks_ct = _wrap(KS_flat, bf16)  # raw k_scaled (beta absorbed in akk_inv)
         qs_ct = _wrap(QS_flat, bf16)
         kg_ct = _wrap(KG_flat, bf16)
-        o_ct = _wrap(O_token, bf16)
         gk_ct = _wrap(gk_flat, fp32)
         cu_eqlen_ct = from_dlpack(cu_eqlen, assumed_align=4).mark_layout_dynamic()
         cu_eqlen_ct.element_type = cutlass.Int32
@@ -425,76 +485,66 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         akk_out_view = from_dlpack(A_kk, assumed_align=16).mark_layout_dynamic()
         akk_out_view.element_type = fp32
 
-        # K4 state wrapper points directly at S_out — K4 reads/writes in
-        # place. Only N_seqs (the outer compact mode) varies with the runtime
-        # context batch. Keep the inner H/K/V shape and strides static so the
-        # DSL can prove each (batch, head) state tile remains 16-byte aligned.
-        s_ct = from_dlpack(S_out, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0,
-            stride_order=(0, 1, 2, 3),
-        )
-        s_ct.element_type = fp32
-
-        # Side stream is process-long, safe to cache. The MAIN stream must
-        # NOT be cached here: the executor creates the buffers under one
-        # stream (warmup) and calls under another (execution_stream), so it
-        # is re-queried per call in _chunk_kda_fwd.
-        side_stream_cached = _get_side_stream(dev)
-
         cute_wrappers = dict(
             a_ct=a_ct,
             aqc_ct=aqc_ct,
             ks_ct=ks_ct,
             qs_ct=qs_ct,
             kg_ct=kg_ct,
-            o_ct=o_ct,
             gk_ct=gk_ct,
             cu_eqlen_ct=cu_eqlen_ct,
             co_eqlen_ct=co_eqlen_ct,
             akk_in_view=akk_in_view,
             akk_out_view=akk_out_view,
-            s_ct=s_ct,
-            side_stream=side_stream_cached,
             # Filled lazily on first launch — saves cache_key tuple build +
             # outer dict lookup on subsequent calls.
             _k123_fns={},
             _akk_inv_fn=None,
-            _k4_fn=None,
         )
 
-        while len(_buf_cache) >= _BUF_CACHE_MAX_ENTRIES:
-            _buf_cache.pop(next(iter(_buf_cache)))
-        _buf_cache[key] = (
-            k_scaled,
-            kg,
-            q_scaled,
-            gk_last_exp,
-            A_qk,
-            A_kk,
-            O_flat,
-            S_out,
-            cu_eqlen,
-            co_eqlen,
-            cute_wrappers,
+        return _lru_put(
+            _buf_cache,
+            key,
+            (
+                k_scaled,
+                kg,
+                q_scaled,
+                beta_activated,
+                gk_last_exp,
+                A_qk,
+                A_kk,
+                cu_eqlen,
+                co_eqlen,
+                cute_wrappers,
+            ),
+            _BUF_CACHE_MAX_ENTRIES,
         )
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _buf_cache[key] = _buf_cache.pop(key)
-    return _buf_cache[key]
+    return _lru_touch(_buf_cache, key)
+
+
+def _new_output(dev, dtype, B, T, H, V_dim, BT, varlen=False):
+    """The prefill's output ``o`` [B, T, H, V] and K4's wrapper of it, new for every call: ``o`` belongs to the
+    caller, so no later call may write it. On the varlen path the buffer has one chunk of slack past T, like the
+    scratch."""
+    T_alloc = T + BT if varlen else T
+    o = torch.empty(B, T_alloc, H, V_dim, device=dev, dtype=dtype)[:, :T]
+    o_ct = from_dlpack(o.reshape(B * T, H, V_dim), assumed_align=16).mark_layout_dynamic()
+    o_ct.element_type = cutlass.BFloat16
+    return o, o_ct
 
 
 def _launch_k4_persistent(
     cute_wrappers,
+    o_ct,
     v_beta,
-    S_in,
-    S_out,
+    state_pool,
+    state_indices,
     cu_seqlens,
     chunk_offsets,
     cu_eqlen_passed=False,
     num_sm=148,
     H=None,
     V_dim=None,
-    use_fast_sync=False,
 ):
     """Launch persistent K4 with cached CuTe wrappers.
 
@@ -505,7 +555,7 @@ def _launch_k4_persistent(
     runtime never emits zero-length sequences.
 
     No fast-launch (args-tuple) cache here: such a cache pins the per-call
-    v/initial-state tensors via their cute wrappers (the wrapper holds the
+    activation and state-pool tensors via their CuTe wrappers (the wrapper holds the
     storage, so the keyed object never dies and weakref pruning never
     fires) — a per-call GPU memory leak in the executor runtime. The
     per-call cost is re-wrapping a handful of tensors (~10us each).
@@ -515,17 +565,17 @@ def _launch_k4_persistent(
     dev = v_beta.device
     dev_idx = dev.index or 0
 
-    s_ct = cute_wrappers["s_ct"]
+    s_ct = _dynamic_dlpack_arg(state_pool)
     a_ct = cute_wrappers["a_ct"]
     b_ct = cute_wrappers["ks_ct"]  # raw k_scaled (beta absorbed in akk_inv)
     q_ct = cute_wrappers["qs_ct"]
     aqc_ct = cute_wrappers["aqc_ct"]
     kg_ct = cute_wrappers["kg_ct"]
-    o_ct = cute_wrappers["o_ct"]
     gk_ct = cute_wrappers["gk_ct"]
 
     # v is a per-call activation — wrap fresh every call (never cache; see
-    # _ct_cached docstring).
+    # _scratch_ct: only the _get_buffers scratch keeps cached wrappers, in its
+    # own _buf_cache entry).
     v_view = v_beta.reshape(-1, H, V_dim) if v_beta.dim() == 4 else v_beta
     v_ct = from_dlpack(v_view, assumed_align=16).mark_layout_dynamic()
     v_ct.element_type = bf16
@@ -535,6 +585,8 @@ def _launch_k4_persistent(
         co_ct = cute_wrappers["co_eqlen_ct"]
     else:
         cu_ct, co_ct = _get_k4_varlen_cu_co(cu_seqlens, chunk_offsets)
+
+    state_indices_ct = _dynamic_dlpack_arg(state_indices)
 
     # Allocate for the maximum persistent grid once. The scheduler applies
     # min(N_seqs * H, num_sm) at runtime, so pre-minimizing here would turn
@@ -555,41 +607,43 @@ def _launch_k4_persistent(
     # Launch on torch's CURRENT stream — see _current_cu_stream.
     stream = _current_cu_stream(dev)
 
-    k4_fn = cute_wrappers.get("_k4_fn")
+    # H and the state V/K dims MUST be in the key: s_ct bakes the inner
+    # [H, V, K] shape and all strides at compile time, so the compiled
+    # function is head-count- and layout-specific. N_seqs and the
+    # token/chunk counts remain runtime values.
+    cache_key = (
+        dev_idx,
+        num_sm,
+        H,
+        state_pool.shape[-1],
+        V_dim,
+        _layout_key(state_pool),
+        # The sole dimension of this vector is runtime dynamic. Excluding
+        # its extent lets warmup serve full and underfilled context batches.
+        _dynamic_vector_layout_key(state_indices),
+    )
+    k4_fn = _k4p_cache.get(cache_key)
     if k4_fn is None:
-        # H and the state K/V dims MUST be in the key: s_ct bakes the inner
-        # [H, K, V] shape and all strides at compile time
-        # (mark_compact_shape_dynamic(mode=0) in _get_buffers), so the
-        # compiled function is head-count-specific. Reusing an H=96-compiled
-        # kernel for a smaller H misaddresses every (seq, head) state tile
-        # (baked mode-0 stride H*K*V) — silently corrupting final_state and,
-        # through the recurrence, O. Observed as the small-H parity
-        # regression whenever another head count compiled first in the same
-        # process (isolated processes were clean). N_seqs and the token/chunk
-        # counts stay runtime — only layout-baked dims belong here.
-        cache_key = (dev_idx, num_sm, H, S_out.shape[-2], V_dim)
-        k4_fn = _k4p_cache.get(cache_key)
-        if k4_fn is None:
-            host_fn = _k4p_make_host(num_sm=num_sm)
-            k4_fn = cute.compile(
-                host_fn,
-                a_ct,
-                b_ct,
-                v_ct,
-                q_ct,
-                aqc_ct,
-                kg_ct,
-                o_ct,
-                gk_ct,
-                s_ct,
-                cu_ct,
-                co_ct,
-                tm_ct,
-                N_seqs,
-                stream,
-            )
-            _k4p_cache[cache_key] = k4_fn
-        cute_wrappers["_k4_fn"] = k4_fn
+        host_fn = _k4p_make_host(num_sm=num_sm)
+        k4_fn = cute.compile(
+            host_fn,
+            a_ct,
+            b_ct,
+            v_ct,
+            q_ct,
+            aqc_ct,
+            kg_ct,
+            o_ct,
+            gk_ct,
+            s_ct,
+            state_indices_ct,
+            cu_ct,
+            co_ct,
+            tm_ct,
+            N_seqs,
+            stream,
+        )
+        _k4p_cache[cache_key] = k4_fn
 
     args = (
         a_ct,
@@ -601,6 +655,7 @@ def _launch_k4_persistent(
         o_ct,
         gk_ct,
         s_ct,
+        state_indices_ct,
         cu_ct,
         co_ct,
         tm_ct,
@@ -616,6 +671,7 @@ def _launch_fused_k123_inv(
     g,
     A_log,
     beta,
+    beta_activated,
     scale,
     k_scaled,
     kg,
@@ -627,13 +683,16 @@ def _launch_fused_k123_inv(
     chunk_indices,
     is_varlen,
     NT,
+    valid_tokens,
     dt_bias=None,
     safe_gate=False,
     lower_bound=None,
+    use_beta_sigmoid_in_kernel=True,
     akk_in_view=None,
     akk_out_view=None,
     cute_wrappers=None,
     varlen_pure_override=False,
+    varlen_is_aligned=None,
 ):
     """Persistent K1+K2 (writes A_kk in I+L format with diag=1) chained with
     BF16 akk_inv (in-place inversion). Final A_kk_inv = (I+L)^-1."""
@@ -649,15 +708,17 @@ def _launch_fused_k123_inv(
     T_padded = T if is_varlen else None
     has_bias = dt_bias is not None
 
-    # Auto-detect VARLEN_PURE eligibility, cached by id(cu_seqlens).
-    # First call with a given cu_seqlens object pays one GPU->CPU sync; later
-    # calls with the same tensor object are a dict lookup (~100 ns).
+    # Prefer the host-derived alignment property supplied by the model runtime.
+    # Direct low-level callers that omit it retain the cached device inference
+    # fallback for backward compatibility.
     varlen_pure = False
     if is_varlen and cu_seqlens is not None:
         if varlen_pure_override:
             # Caller (Phase 2.1 single-seq path) sentinel-padded the data for
             # this call; the cached per-object verdict stays untouched.
             varlen_pure = True
+        elif varlen_is_aligned is not None:
+            varlen_pure = varlen_is_aligned
         else:
             _vp_key = id(cu_seqlens)
             if _vp_key not in _varlen_pure_cache:
@@ -693,25 +754,36 @@ def _launch_fused_k123_inv(
         varlen_pure,
         cu_ci_dtypes,
         eqlen_t_key,
+        use_beta_sigmoid_in_kernel,
+        beta.dtype,
     )
 
     # Inputs are guaranteed contiguous by upstream linear projections.
     # A_log is fp32 model param; .float() is no-op when dtype already matches.
-    # q/k/g/beta/cu/ci are per-call activations: plain _ct, never cached
-    # (see _ct_cached docstring). The _get_buffers scratch below is
-    # module-persistent, so caching its wrappers is safe and worthwhile.
+    # q/k/g/beta/cu/ci are per-call activations: plain _ct, never cached.
+    # The _get_buffers scratch below is wrapped once per _buf_cache entry, and
+    # its wrappers live in that entry's cute_wrappers (see _scratch_ct).
     q_ct = _ct(q, cutlass.BFloat16)
     k_ct = _ct(k, cutlass.BFloat16)
     g_ct = _ct(g, cutlass.BFloat16)
     alog_ct = _ct(A_log if A_log.dtype == torch.float32 else A_log.float(), cutlass.Float32)
-    beta_ct = _ct(beta, cutlass.BFloat16)
+    if beta.dtype == torch.float32:
+        beta_etype = cutlass.Float32
+    elif beta.dtype == torch.bfloat16:
+        beta_etype = cutlass.BFloat16
+    else:
+        raise ValueError(f"Kimi K3 KDA prefill beta must be float32 or bfloat16, got {beta.dtype}")
+    beta_ct = _ct(beta, beta_etype)
+    beta_activated_ct = _scratch_ct(
+        cute_wrappers, "beta_activated", beta_activated, cutlass.BFloat16
+    )
 
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
-    kg_ct = _ct_cached(kg, cutlass.BFloat16)
-    qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
-    gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
-    aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_inv, cutlass.BFloat16)
+    ks_ct = _scratch_ct(cute_wrappers, "k_scaled", k_scaled, cutlass.BFloat16)
+    kg_ct = _scratch_ct(cute_wrappers, "kg", kg, cutlass.BFloat16)
+    qs_ct = _scratch_ct(cute_wrappers, "q_scaled", q_scaled, cutlass.BFloat16)
+    gk_ct = _scratch_ct(cute_wrappers, "gk_last_exp", gk_last_exp, cutlass.Float32)
+    aqk_ct = _scratch_ct(cute_wrappers, "A_qk", A_qk, cutlass.BFloat16)
+    akk_ct = _scratch_ct(cute_wrappers, "A_kk", A_kk_inv, cutlass.BFloat16)
 
     if is_varlen:
         cu_ct = _ct(cu_seqlens, _cute_int_type(cu_seqlens.dtype))
@@ -734,6 +806,7 @@ def _launch_fused_k123_inv(
         g_ct,
         alog_ct,
         beta_ct,
+        beta_activated_ct,
         scale,
         ks_ct,
         kg_ct,
@@ -749,6 +822,7 @@ def _launch_fused_k123_inv(
         NT,
         B,
         B * (T_padded if is_varlen else NT * BT),
+        valid_tokens,
         stream,
     )
 
@@ -761,6 +835,7 @@ def _launch_fused_k123_inv(
             T_padded=T_padded,
             has_bias=has_bias,
             use_safe_gate=safe_gate,
+            use_beta_sigmoid=use_beta_sigmoid_in_kernel,
             varlen_pure=varlen_pure,
         )
         _fused_k123_cache[cache_key] = cute.compile(host_fn, *ct_args)
@@ -788,17 +863,28 @@ def _launch_fused_k123_inv(
         is_varlen_int = 0
         T_val = NT * BT
 
+    beta_for_akk = beta_activated if use_beta_sigmoid_in_kernel else beta
+    if beta_for_akk.dtype == torch.float32:
+        akk_beta_etype = cutlass.Float32
+    else:
+        akk_beta_etype = cutlass.BFloat16
+    akk_beta_ct = (
+        _scratch_ct(cute_wrappers, "beta_activated", beta_for_akk, akk_beta_etype)
+        if use_beta_sigmoid_in_kernel
+        else _ct(beta_for_akk, akk_beta_etype)
+    )
+
     # B/NT/T_val remain runtime args of akk_inv_host. Eqlen T is still part of
-    # the cache key because the raw mBeta wrapper bakes its batch stride.
+    # the cache key because the beta wrapper bakes its batch stride.
     # cu/ci dtype is a specializer for the same reason as in the K123 key above
     # (element type baked into the compiled reader).
-    akk_cache_key = (H, is_varlen, dev, cu_ci_dtypes, eqlen_t_key)
+    akk_cache_key = (H, is_varlen, dev, cu_ci_dtypes, eqlen_t_key, beta_for_akk.dtype)
     if akk_cache_key not in _akk_inv_cache:
         _akk_inv_cache[akk_cache_key] = cute.compile(
             _akk_inv_host,
             akk_in_view,
             akk_out_view,
-            beta_ct,
+            akk_beta_ct,
             B,
             NT,
             H,
@@ -809,88 +895,8 @@ def _launch_fused_k123_inv(
             stream,
         )
     akk_fn = _akk_inv_cache[akk_cache_key]
-    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct, akk_ci_ct, T_val, stream)
+    akk_args = (akk_in_view, akk_out_view, akk_beta_ct, B, NT, akk_cu_ct, akk_ci_ct, T_val, stream)
     akk_fn(*akk_args)
-
-
-# ========== Fused K1234 compilation cache ==========
-_fused_k1234_cache = {}
-_BT = 64
-
-
-def _launch_fused_k1234(
-    q,
-    k,
-    v,
-    g,
-    A_log,
-    beta,
-    scale,
-    initial_state,
-    output_final_state,
-    dt_bias=None,
-    safe_gate=False,
-    lower_bound=None,
-):
-    """Launch single fused K1+K2+K3+K4 SMEM-direct kernel (eqlen only)."""
-    B, T, H, K = q.shape
-    V_dim = v.shape[-1]
-    device = q.device
-    dev = device.index or 0
-    NC = T // _BT
-    has_bias = dt_bias is not None
-
-    # B only changes the outer extent and launch grid. T, H, and K change
-    # compiled tensor layouts, so they must select distinct artifacts.
-    cache_key = (dev, has_bias, safe_gate, T, H, K)
-
-    # Buffers
-    BH = B * H
-    N_seqs = B
-    S_fp32 = torch.empty(BH, K, V_dim, dtype=torch.float32, device=device)
-    if initial_state is None:
-        S_fp32.zero_()
-    else:
-        S_fp32.copy_(initial_state.reshape(BH, K, V_dim))
-    O_out = torch.empty(B, T, H, V_dim, dtype=q.dtype, device=device)
-    clocks = torch.empty(2, BH, dtype=torch.int64, device=device)
-
-    bf16 = cutlass.BFloat16
-    fp32 = cutlass.Float32
-    if has_bias:
-        bias_ct = _ct(dt_bias.float().contiguous().view(H, K), fp32)
-    else:
-        bias_ct = _ct(torch.empty(1, 1, dtype=torch.float32, device=device), fp32)
-    lb_val = float(lower_bound) if lower_bound is not None else 0.0
-
-    ct_args = (
-        _ct(q.contiguous(), bf16),
-        _ct(k.contiguous(), bf16),
-        _ct(g.contiguous(), bf16),
-        _ct(A_log.float().contiguous(), fp32),
-        _ct(beta.contiguous(), bf16),
-        float(scale),
-        _ct(v.contiguous(), bf16),
-        _ct(O_out, bf16),
-        _ct(S_fp32, fp32),
-        bias_ct,
-        lb_val,
-        _ct(clocks, cutlass.Int64),
-        NC,
-        H,
-        B,
-        # Launch on torch's CURRENT stream — see _current_cu_stream.
-        _current_cu_stream(device),
-    )
-
-    if cache_key not in _fused_k1234_cache:
-        host_fn = _fused_k1234_make_host(has_bias=has_bias, use_safe_gate=safe_gate)
-        _fused_k1234_cache[cache_key] = cute.compile(host_fn, *ct_args)
-    _fused_k1234_cache[cache_key](*ct_args)
-
-    S_out = S_fp32.reshape(N_seqs, H, K, V_dim)
-    final_state = S_out if output_final_state else None
-    return O_out, final_state
 
 
 def _chunk_kda_fwd(
@@ -899,66 +905,29 @@ def _chunk_kda_fwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
     safe_gate: bool = False,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = True,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
-    disable_recompute: bool = False,
-    return_intermediate_states: bool = False,
-    cp_context=None,
-    use_fused_k1234: bool = False,
-):
-    """KDA forward — optimized, FLA-compatible interface."""
+    varlen_is_aligned: bool | None = None,
+    single_sequence_length: int | None = None,
+) -> torch.Tensor:
+    """Run optimized KDA prefill against indexed recurrent-state rows."""
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
 
     is_varlen = cu_seqlens is not None
 
     if q.shape[1] == 0:
-        # Zero-token call: the runtime can emit a context batch whose token
-        # payload is empty (observed under the overlap scheduler + logprobs
-        # flows; the FLA fallback tolerates it). No tokens means no output
-        # rows and an unchanged recurrent state — return before any kernel
-        # or buffer setup (whose arange(step=T) would raise "step must be
-        # nonzero").
-        B, _, H, K = q.shape
-        V_dim = v.shape[-1]
-        n_seqs = B if cu_seqlens is None else cu_seqlens.shape[0] - 1
-        o = v.new_empty(B, 0, H, V_dim)
-        if not output_final_state:
-            final_state = None
-        elif initial_state is not None:
-            # clone: the caller index_copy_s final_state back into the state
-            # pool the initial state may alias.
-            final_state = initial_state.to(torch.float32).clone()
-        else:
-            final_state = torch.zeros(n_seqs, H, K, V_dim, dtype=torch.float32, device=q.device)
-        return (o, final_state, None, None, None, None, None, None, None, None, None, initial_state)
-
-    # ===== Fused K1234 path (eqlen only, single kernel launch) =====
-    if use_fused_k1234 and not is_varlen:
-        o, final_state = _launch_fused_k1234(
-            q,
-            k,
-            v,
-            g,
-            A_log,
-            beta,
-            scale,
-            initial_state,
-            output_final_state,
-            dt_bias=dt_bias,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
-        return (o, final_state, None, None, None, None, None, None, None, None, None, initial_state)
+        raise ValueError("Indexed KDA prefill does not support an empty token batch.")
 
     B, T, H, K = q.shape
     V_dim = v.shape[-1]
@@ -977,13 +946,17 @@ def _chunk_kda_fwd(
     # Varlen with non-aligned seq lengths is a separate problem (Phase 2):
     # multi-seq varlen can't be host-padded without repacking memory.
     real_T = T
-    needs_eqlen_pad = (not is_varlen) and (T % BT != 0)
+    CPB_BT = 4 * BT  # CHUNKS_PER_BLOCK * BT, the cgs_per_head divisibility unit
+    # The trigger is CPB_BT, not BT: the eqlen scheduler floors `cgs_per_head`
+    # and has no `chunk_idx < num_chunks` guard, so a BT-aligned T whose chunk
+    # count is not a multiple of CHUNKS_PER_BLOCK (T = 64, 128, 192, 320, ...)
+    # would silently drop its trailing chunks.
+    needs_eqlen_pad = (not is_varlen) and (T % CPB_BT != 0)
     if needs_eqlen_pad:
         if B != 1:
             raise NotImplementedError(
-                f"eqlen with B>1 and T % {BT} != 0 not supported (got B={B}, T={T})."
+                f"eqlen with B>1 and T % {CPB_BT} != 0 not supported (got B={B}, T={T})."
             )
-        CPB_BT = 4 * BT  # CHUNKS_PER_BLOCK * BT, the cgs_per_head divisibility unit
         T_padded = ((T + CPB_BT - 1) // CPB_BT) * CPB_BT
         # Pre-allocated padded scratch buffers (per (B,T_padded,H,K,dtype) cache
         # key). torch.cat would reallocate + copy the full 200MB q tensor every
@@ -1021,17 +994,27 @@ def _chunk_kda_fwd(
     # Multi-seq optimization needs per-seq dynamic tensormap (Phase 2.2).
     needs_varlen_single_pad = False
     if is_varlen and cu_seqlens is not None and cu_seqlens.shape[0] == 2 and B == 1:
-        _vl_key = id(cu_seqlens)
-        if _vl_key not in _varlen_pure_cache:
-            cu_cpu = cu_seqlens.cpu().tolist()
-            sl = cu_cpu[1] - cu_cpu[0]
-            _varlen_pure_cache[_vl_key] = sl % BT == 0
-            _varlen_single_seqlen_cache[_vl_key] = sl
-            _prune_on_gc(_varlen_pure_cache, _vl_key, cu_seqlens)
-            _prune_on_gc(_varlen_single_seqlen_cache, _vl_key, cu_seqlens)
-        if not _varlen_pure_cache[_vl_key]:
-            real_T = _varlen_single_seqlen_cache[_vl_key]
-            needs_varlen_single_pad = True
+        if single_sequence_length is not None:
+            single_sequence_is_aligned = single_sequence_length % BT == 0
+            if varlen_is_aligned is not None and varlen_is_aligned != single_sequence_is_aligned:
+                raise ValueError("varlen_is_aligned disagrees with single_sequence_length")
+            varlen_is_aligned = single_sequence_is_aligned
+            if not single_sequence_is_aligned:
+                real_T = single_sequence_length
+                needs_varlen_single_pad = True
+        else:
+            _vl_key = id(cu_seqlens)
+            if _vl_key not in _varlen_pure_cache:
+                cu_cpu = cu_seqlens.cpu().tolist()
+                sl = cu_cpu[1] - cu_cpu[0]
+                _varlen_pure_cache[_vl_key] = sl % BT == 0
+                _varlen_single_seqlen_cache[_vl_key] = sl
+                _prune_on_gc(_varlen_pure_cache, _vl_key, cu_seqlens)
+                _prune_on_gc(_varlen_single_seqlen_cache, _vl_key, cu_seqlens)
+            varlen_is_aligned = _varlen_pure_cache[_vl_key]
+            if not varlen_is_aligned:
+                real_T = _varlen_single_seqlen_cache[_vl_key]
+                needs_varlen_single_pad = True
     varlen_pure_override = False
     if needs_varlen_single_pad:
         # q/k/v/beta already zero-padded by caller (FLA convention). Re-build g
@@ -1067,16 +1050,7 @@ def _chunk_kda_fwd(
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
-        if NT < 4:
-            # The persistent K123 scheduler launches NT // 4 cooperative
-            # groups per head; fewer than 4 total chunks produces a
-            # zero-size grid (DSLCudaRuntimeError at launch). Callers must
-            # route such batches to the FLA path — see
-            # KDAKernelDispatch.prefill_chunk_kda.
-            raise ValueError(
-                f"kda_prefill requires >= 4 total varlen chunks (got {NT}); "
-                "route small varlen batches to the FLA fallback"
-            )
+        # The varlen scheduler supports any chunk count.
         N_seqs = len(cu_seqlens) - 1
     else:
         NT = T // BT
@@ -1087,35 +1061,15 @@ def _chunk_kda_fwd(
         k_scaled,
         kg,
         q_scaled,
+        beta_activated,
         gk_last_exp,
         A_qk,
         A_kk,
-        O_flat,
-        S_out,
         cu_eqlen,
         co_eqlen,
         cute_wrappers,
     ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT, varlen=is_varlen)
-
-    # ===== State copy on side stream, parallel with K123 =====
-    # K4 needs S_out populated with initial_state. By doing this copy on a
-    # side stream BEFORE K123 launches, the D2D memcpy overlaps with K123's
-    # compute. Especially big win for high-N_seqs varlen where state is huge
-    # (192MB for N=32, ~64us memcpy) — would otherwise serialize before K4.
-    if initial_state is None:
-        S_in = torch.zeros(N_seqs, H, K, V_dim, dtype=torch.float32, device=device)
-    else:
-        S_in = initial_state
-    # Current stream per call — never the buffer-creation-time stream (the
-    # executor creates buffers under warmup's stream and calls under
-    # execution_stream; syncing against a stale stream un-orders the copy).
-    main_stream = torch.cuda.current_stream(device)
-    side_stream = cute_wrappers["side_stream"]
-    needs_copy = S_in.data_ptr() != S_out.data_ptr()
-    if needs_copy:
-        side_stream.wait_stream(main_stream)
-        with torch.cuda.stream(side_stream):
-            S_out.copy_(S_in)
+    o, o_ct = _new_output(device, k.dtype, B, T, H, V_dim, BT, varlen=is_varlen)
 
     # Beta is fused entirely in akk_inv kernel epilogue (post-inv column-scale).
     # No host v*beta and no K1 k_scaled*beta any more.
@@ -1125,6 +1079,7 @@ def _chunk_kda_fwd(
         g,
         A_log,
         beta,
+        beta_activated,
         scale,
         k_scaled,
         kg,
@@ -1136,13 +1091,16 @@ def _chunk_kda_fwd(
         chunk_indices,
         is_varlen,
         NT,
+        real_T,
         dt_bias=dt_bias,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         akk_in_view=cute_wrappers["akk_in_view"],
         akk_out_view=cute_wrappers["akk_out_view"],
         cute_wrappers=cute_wrappers,
         varlen_pure_override=varlen_pure_override,
+        varlen_is_aligned=varlen_is_aligned,
     )
 
     # ===== K4: persistent kernel (eqlen + varlen via cu_seqlens) =====
@@ -1153,49 +1111,24 @@ def _chunk_kda_fwd(
         cu_for_k4 = cu_eqlen
         chunk_offsets_for_k4 = co_eqlen
 
-    # Wait for the side-stream state copy to finish before K4 reads S_out.
-    if needs_copy:
-        main_stream.wait_stream(side_stream)
-
     _launch_k4_persistent(
         cute_wrappers,
+        o_ct,
         v,
-        S_in,
-        S_out,
+        state_pool,
+        state_indices,
         cu_for_k4,
         chunk_offsets_for_k4,
         cu_eqlen_passed=(not is_varlen),
         H=H,
         V_dim=V_dim,
-        use_fast_sync=(not is_varlen),
     )
 
-    o = O_flat
-    A_qk_out = A_qk
-    A_kk_out = A_kk
     if needs_eqlen_pad:
         # Caller called with original T = real_T; their downstream code expects
-        # outputs at that shape. Slice the padded scratch tail back off.
+        # outputs at that shape. Slice the padded tail back off.
         o = o[:, :real_T]
-        A_qk_out = A_qk_out[:, :real_T]
-        A_kk_out = A_kk_out[:, :real_T]
-    # multiseq_info is always None here (Phase 2.2 disabled — see above)
-    final_state = S_out if output_final_state else None
-
-    return (
-        o,
-        final_state,
-        None,
-        A_qk_out,
-        A_kk_out,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        initial_state,
-    )
+    return o
 
 
 class KdaPrefillRunner:
@@ -1208,112 +1141,158 @@ class KdaPrefillRunner:
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
         scale: float,
-        initial_state: Optional[torch.Tensor],
-        output_final_state: bool,
         cu_seqlens: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
         safe_gate: bool = False,
         lower_bound: Optional[float] = None,
         use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
-        disable_recompute: bool = False,
-        return_intermediate_states: bool = False,
-        use_fused_k1234: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Run KDA prefill and return output plus final recurrent state."""
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Run KDA prefill and update selected recurrent-state rows."""
         if not IS_CUTLASS_DSL_AVAILABLE:
             raise RuntimeError("Kimi K3 KDA prefill requires NVIDIA CUTLASS DSL")
         if chunk_size != 64:
             raise ValueError(f"Kimi K3 KDA prefill requires chunk_size=64, got {chunk_size}")
-        # Zero-token calls take the early return in _chunk_kda_fwd and
-        # never touch A_log; the runtime emits such batches (overlap
-        # scheduler + logprobs flows), so only require A_log when there
-        # is work to do.
-        if A_log is None and q.shape[1] != 0:
+        if A_log is None:
             raise ValueError("Kimi K3 KDA prefill requires A_log")
 
-        result = _chunk_kda_fwd(
+        return _chunk_kda_fwd(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
+            state_pool=state_pool,
+            state_indices=state_indices,
             scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_size=chunk_size,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
             use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             A_log=A_log,
             dt_bias=dt_bias,
-            disable_recompute=disable_recompute,
-            return_intermediate_states=return_intermediate_states,
-            use_fused_k1234=use_fused_k1234,
+            varlen_is_aligned=varlen_is_aligned,
+            single_sequence_length=single_sequence_length,
         )
-        return result[0], result[1]
+
+
+def _validate_indexed_state_pool(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+) -> None:
+    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    H, K, V = q.shape[2], q.shape[3], v.shape[3]
+    if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
+        raise ValueError(
+            "Expected state_pool to be a rank-4 fp32 tensor with shape [slots, H, V, K]."
+        )
+    if state_pool.shape[1:] != (H, V, K):
+        raise ValueError(
+            f"Expected state_pool shape [slots, {H}, {V}, {K}], got {tuple(state_pool.shape)}."
+        )
+    expected_inner_strides = (V * K, K, 1)
+    if state_pool.stride()[1:] != expected_inner_strides:
+        raise ValueError(
+            "Indexed KDA prefill requires dense H/V/K inner dimensions; "
+            f"expected strides {expected_inner_strides}, got "
+            f"{state_pool.stride()[1:]}."
+        )
+    if state_pool.stride(0) < H * V * K or state_pool.stride(0) % 4 != 0:
+        raise ValueError(
+            "Indexed KDA prefill requires a non-overlapping, 16-byte-aligned slot stride."
+        )
+    if state_pool.data_ptr() % 16 != 0:
+        raise ValueError("Indexed KDA prefill requires a 16-byte-aligned state pool.")
+    if state_indices.ndim != 1 or state_indices.shape[0] != num_sequences:
+        raise ValueError(
+            f"Expected state_indices shape [{num_sequences}], got {tuple(state_indices.shape)}."
+        )
+    if state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("state_indices must have dtype int32 or int64.")
+    if not state_indices.is_contiguous():
+        raise ValueError("state_indices must be contiguous.")
+    if state_indices.data_ptr() % 16 != 0:
+        raise ValueError("Indexed KDA prefill requires 16-byte-aligned state_indices.")
+    for name, tensor in (
+        ("q", q),
+        ("v", v),
+        ("state_indices", state_indices),
+    ):
+        if tensor.device != state_pool.device:
+            raise ValueError(f"{name} and state_pool must be on the same device.")
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
 
-    @torch.library.custom_op("trtllm::kda_prefill", mutates_args=(), device_types="cuda")
+    @torch.library.custom_op(
+        "trtllm::kda_prefill",
+        mutates_args=("state_pool",),
+        device_types="cuda",
+    )
     def kda_prefill(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
         scale: float,
-        initial_state: Optional[torch.Tensor],
-        output_final_state: bool,
         cu_seqlens: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
         safe_gate: bool = False,
         lower_bound: Optional[float] = None,
         use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
-        disable_recompute: bool = False,
-        return_intermediate_states: bool = False,
-        use_fused_k1234: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run Kimi K3 KDA chunked prefill on Blackwell GPUs.
-
-        Returns ``(output, final_state)``. ``final_state`` is an empty
-        tensor when ``output_final_state`` is False —
-        ``torch.library.custom_op`` cannot infer a schema for
-        ``Optional[Tensor]`` returns.
-        """
-        output, final_state = KdaPrefillRunner.forward(
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Run KDA prefill directly against a V-first recurrent-state pool."""
+        _validate_indexed_state_pool(
+            q,
+            v,
+            state_pool,
+            state_indices,
+            cu_seqlens,
+        )
+        return KdaPrefillRunner.forward(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
+            state_pool=state_pool,
+            state_indices=state_indices,
             A_log=A_log,
             scale=scale,
             dt_bias=dt_bias,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_size=chunk_size,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
             use_gate_in_kernel=use_gate_in_kernel,
-            disable_recompute=disable_recompute,
-            return_intermediate_states=return_intermediate_states,
-            use_fused_k1234=use_fused_k1234,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            varlen_is_aligned=varlen_is_aligned,
+            single_sequence_length=single_sequence_length,
         )
-        if final_state is None:
-            final_state = q.new_empty(0, dtype=torch.float32)
-        return output, final_state
 
     @kda_prefill.register_fake
     def _(
@@ -1322,31 +1301,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
         scale: float,
-        initial_state: Optional[torch.Tensor],
-        output_final_state: bool,
         cu_seqlens: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
         safe_gate: bool = False,
         lower_bound: Optional[float] = None,
         use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
-        disable_recompute: bool = False,
-        return_intermediate_states: bool = False,
-        use_fused_k1234: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del k, g, beta, A_log, scale, dt_bias, initial_state
-        del chunk_indices, chunk_size, safe_gate, lower_bound
-        del use_gate_in_kernel, disable_recompute, return_intermediate_states
-        del use_fused_k1234
-        num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-        output = v.new_empty(v.shape)
-        if output_final_state:
-            final_state = q.new_empty(
-                (num_sequences, q.shape[2], q.shape[3], v.shape[3]), dtype=torch.float32
-            )
-        else:
-            final_state = q.new_empty(0, dtype=torch.float32)
-        return output, final_state
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
+    ) -> torch.Tensor:
+        del q, k, g, beta, state_pool, state_indices
+        del scale, cu_seqlens, chunk_indices, chunk_size, safe_gate
+        del lower_bound, use_gate_in_kernel, use_beta_sigmoid_in_kernel, A_log, dt_bias
+        del varlen_is_aligned, single_sequence_length
+        return v.new_empty(v.shape)

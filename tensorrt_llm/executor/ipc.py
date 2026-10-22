@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import hashlib
 import hmac
@@ -196,6 +210,21 @@ class ZeroMqQueue:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
+    def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
+        """Send an object without waiting for a writable peer.
+
+        Raises:
+            zmq.Again: If the socket cannot accept the message immediately.
+        """
+        self.setup_lazily()
+        self._check_thread_safety()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+                data = self._prepare_data(obj)
+                self._send_data(data, flags=zmq.NOBLOCK, routing_id=routing_id)
+            else:
+                self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+
     def put_noblock(self,
                     obj: Any,
                     *,
@@ -263,9 +292,23 @@ class ZeroMqQueue:
             logger.error(traceback.format_exc())
             raise e
 
-    def get(self) -> Any:
+    def get(self, timeout: Optional[float] = None) -> Any:
+        """Receive an object from the queue.
+
+        Args:
+            timeout: If ``None`` (default), block until a message arrives.
+                If a non-negative float, wait up to that many seconds and
+                raise ``queue.Empty`` if nothing arrives in time.
+        """
         self.setup_lazily()
         self._check_thread_safety()
+        if timeout is not None:
+            # ``zmq.Socket.poll`` takes timeout in milliseconds; convert
+            # from seconds. ``poll`` returns 0 when the timeout fires
+            # without any event on the socket.
+            if not self.socket.poll(timeout=int(timeout * 1000)):
+                from queue import Empty
+                raise Empty()
         return self._recv_data()
 
     def drain(self) -> list[Any]:
@@ -307,44 +350,50 @@ class ZeroMqQueue:
         # which can cause message drops
         deadline = asyncio.get_event_loop().time() + timeout
         while True:
-            try:
-                # Try non-blocking receive
-                if self.socket_type == zmq.ROUTER:
-                    identity, data = await self.socket.recv_multipart(
-                        flags=zmq.NOBLOCK)
-                    self._last_identity = identity
-                    obj = self._parse_data(data)
-                    if return_identity:
-                        return obj, identity
-                    else:
-                        return obj
-                else:
-                    if self.use_hmac_encryption:
-                        data = await self.socket.recv(flags=zmq.NOBLOCK)
-                        obj = self._parse_data(data)
-                    else:
-                        obj = await self.socket.recv_pyobj(flags=zmq.NOBLOCK)
-
-                    if return_identity:
-                        return obj, None
-                    else:
-                        return obj
-            except zmq.Again:
-                # No message available yet
-                remaining_ms = int(
-                    (deadline - asyncio.get_event_loop().time()) * 1000)
-                if remaining_ms <= 0:
-                    raise asyncio.TimeoutError()
-                # Use async poller to wait for data without busy-polling on a
-                # fixed interval, which avoids latency spikes from sleep(0.01)
-                async_poller = zmq.asyncio.Poller()
-                async_poller.register(self.socket, zmq.POLLIN)
+            if self.socket.get(zmq.EVENTS) & zmq.POLLIN:
                 try:
-                    events = await async_poller.poll(timeout=remaining_ms)
-                finally:
-                    async_poller.unregister(self.socket)
-                if not events:
-                    raise asyncio.TimeoutError()
+                    if self.socket_type == zmq.ROUTER:
+                        identity, data = await self.socket.recv_multipart(
+                            flags=zmq.NOBLOCK)
+                        self._last_identity = identity
+                        obj = self._parse_data(data)
+                        if return_identity:
+                            return obj, identity
+                        else:
+                            return obj
+                    else:
+                        if self.use_hmac_encryption:
+                            data = await self.socket.recv(flags=zmq.NOBLOCK)
+                            obj = self._parse_data(data)
+                        else:
+                            obj = await self.socket.recv_pyobj(flags=zmq.NOBLOCK
+                                                               )
+
+                        if return_identity:
+                            return obj, None
+                        else:
+                            return obj
+                except zmq.Again as exc:
+                    # Readiness can become stale. PyZMQ's failed receive Future
+                    # retains its exception; break the traceback cycle so it
+                    # cannot retain this frame and later payloads with GC off.
+                    exc.__traceback__ = None
+            # Keep the wait outside the exception handler so its traceback
+            # cannot remain active while this coroutine receives another item.
+            remaining_ms = int(
+                (deadline - asyncio.get_event_loop().time()) * 1000)
+            if remaining_ms <= 0:
+                raise asyncio.TimeoutError()
+            # Use async poller to wait for data without busy-polling on a
+            # fixed interval, which avoids latency spikes from sleep(0.01)
+            async_poller = zmq.asyncio.Poller()
+            async_poller.register(self.socket, zmq.POLLIN)
+            try:
+                events = await async_poller.poll(timeout=remaining_ms)
+            finally:
+                async_poller.unregister(self.socket)
+            if not events:
+                raise asyncio.TimeoutError()
 
     def close(self):
         if self.socket:

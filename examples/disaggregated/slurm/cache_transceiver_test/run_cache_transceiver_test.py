@@ -53,16 +53,20 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver,
 )
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
+    CacheTransceiverConfig,
+    KvPoolRebalanceConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -102,7 +106,7 @@ class KvCacheConfigV2:
     disk_cache_path: Optional[str] = None
     onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
@@ -115,6 +119,10 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
 
 
 class _Timeout(Exception):

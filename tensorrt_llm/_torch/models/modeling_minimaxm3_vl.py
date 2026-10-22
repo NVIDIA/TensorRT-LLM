@@ -1181,6 +1181,22 @@ class MiniMaxVLEncoderMLP(nn.Module):
         return self.fc2(x)
 
 
+class _MiniMaxVLCheckpointLayerNorm(nn.LayerNorm):
+    """LayerNorm whose checkpoint-backed affine tensors support meta init.
+
+    ``MetaInitMode`` redirects empty parameter allocations to ``meta`` but
+    rejects the ``fill_`` calls made by ``LayerNorm.reset_parameters``. Every
+    affine tensor in the M3 vision tower is loaded from the checkpoint, so its
+    reset can be skipped only while the parameter is meta. Normal CPU and CUDA
+    construction retain PyTorch's ones/zeros initialization.
+    """
+
+    def reset_parameters(self) -> None:
+        if self.weight is not None and self.weight.is_meta:
+            return
+        super().reset_parameters()
+
+
 class MiniMaxVLEncoderLayer(nn.Module):
     """Vision encoder layer: pre-norm self-attention + pre-norm MLP.
 
@@ -1192,9 +1208,13 @@ class MiniMaxVLEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = MiniMaxVLEncoderSelfAttention(config, dtype)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm1 = _MiniMaxVLCheckpointLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.mlp = MiniMaxVLEncoderMLP(config, dtype)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm2 = _MiniMaxVLCheckpointLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
 
     def forward(
         self,
@@ -1265,7 +1285,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         self.embeddings = MiniMaxVLPatchEmbedding(config, dtype)
         # NOTE: the typo "layrnorm" matches the published checkpoint key.
-        self.pre_layrnorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.pre_layrnorm = _MiniMaxVLCheckpointLayerNorm(
+            embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.encoder = MiniMaxVLEncoder(config, dtype)
 
         if config.position_embedding_type != "rope" or config.rope_mode != "3d":
@@ -1715,15 +1737,19 @@ class MiniMaxM3VLInputProcessor:
     ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
     """
 
+    supports_tokenization_cache = True
+
     def __init__(
         self,
         model_path: str,
         config: Any,
         tokenizer: Any = None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs: Any,
     ):
         from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+        from tensorrt_llm.logger import logger
 
         BaseMultimodalInputProcessor.__init__(
             self,
@@ -1748,6 +1774,15 @@ class MiniMaxM3VLInputProcessor:
             use_fast=self._use_fast,
             trust_remote_code=trust_remote_code,
         )
+        # The HF processor tokenizes with add_special_tokens=True and the cache with False,
+        # so their ids match only if the tokenizer adds no special tokens.
+        if enable_tokenization_cache and self._processor.tokenizer.num_special_tokens_to_add() != 0:
+            logger.warning(
+                "enable_tokenization_cache is ignored: the MiniMax-M3 tokenizer adds "
+                "special tokens, so cached ids would differ from the HF processor's."
+            )
+            enable_tokenization_cache = False
+        self._init_tokenization_cache(enable_tokenization_cache, self._processor.tokenizer)
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
             self._dtype = getattr(text_cfg, "torch_dtype", torch.bfloat16)
@@ -2028,6 +2063,9 @@ class MiniMaxM3VLInputProcessor:
                 templated_text = "\n".join(explicit)
         else:
             templated_text = text_prompt or ""
+            ids = self._encode_with_tokenization_cache(templated_text, sampling_params)
+            if ids is not None:
+                return ids, {"multimodal_data": {}}
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
         # in the BatchFeature output.

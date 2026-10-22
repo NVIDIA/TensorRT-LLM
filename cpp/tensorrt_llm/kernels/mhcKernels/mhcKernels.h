@@ -32,7 +32,8 @@ namespace kernels::mhc
 void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 const* residual, float const* hc_scale,
     float const* hc_base, float* post_mix, float* comb_mix, __nv_bfloat16* layer_input, int M, int K, int hidden_size,
     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat,
-    int num_splits, int block_size, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int num_splits, int block_size, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
+    float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
 
 void mhcGemmSqrsumFmaLaunch(__nv_bfloat16 const* x, float const* w_t, float* y, float* r, int M, int N, int K,
     int tile_n, int tile_m, cudaStream_t stream);
@@ -68,7 +69,8 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
+    float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
 
 // FMA-path fused hyper-connection boundary launcher.
 //
@@ -96,7 +98,8 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
+    float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (TF32 tcgen05 path).
 //
@@ -128,7 +131,7 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
     float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
-    cudaStream_t stream);
+    cudaStream_t stream, float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (FMA path).
 //
@@ -155,7 +158,7 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int tile_n, int num_k_splits, int tile_m, float rms_eps, float hc_pre_eps,
     float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight,
-    float norm_eps, cudaStream_t stream);
+    float norm_eps, cudaStream_t stream, float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
 
 } // namespace kernels::mhc
 

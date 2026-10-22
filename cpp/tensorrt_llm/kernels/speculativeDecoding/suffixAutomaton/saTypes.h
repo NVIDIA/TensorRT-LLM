@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,9 +32,6 @@ namespace kernels::speculative_decoding::suffix_automaton
 {
 
 using Token = NamedType<int32_t, struct TokenTag>;
-using BatchIndex = NamedType<int, struct BatchIndexTag>;
-using RequestID = NamedType<uint64_t, struct RequestIDTag>;
-using NumTokens = NamedType<int, struct NumTokensTag>;
 using NodeIndex = NamedType<int, struct NodeIndexTag>;
 using TextIndex = NamedType<int, struct TextIndexTag>;
 

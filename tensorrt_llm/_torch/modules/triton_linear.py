@@ -21,13 +21,14 @@ import torch
 from torch.nn.parameter import Parameter
 from triton_kernels.matmul import FlexCtx, PrecisionConfig, matmul
 from triton_kernels.numerics import InFlexData
+from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
 
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-from .fused_moe.fused_moe_triton import (swizzle_weight_and_scale,
-                                         update_weight_stride)
+from ..moe.fused_moe.fused_moe_triton import (swizzle_weight_and_scale,
+                                              update_weight_stride)
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
                      WeightsLoadingConfig, copy_weight, load_weight_shard,
                      load_weights_fused_gate_up_helper,
@@ -277,6 +278,7 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
         else:
             flex_ctx = FlexCtx()
         pc = PrecisionConfig(b_mx_scale=module.weight_scale,
+                             b_microblock_size=MXFP_BLOCK_SIZE.value,
                              flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)

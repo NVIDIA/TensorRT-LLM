@@ -331,11 +331,11 @@ def _make_handler_request(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         sampling_config=SimpleNamespace(
-            repetition_penalty=[1.2],
-            presence_penalty=[0.4],
-            frequency_penalty=[0.3],
-            temperature=[1.0],
-            prompt_ignore_length=[prompt_ignore_length],
+            repetition_penalty=1.2,
+            presence_penalty=0.4,
+            frequency_penalty=0.3,
+            temperature=1.0,
+            prompt_ignore_length=prompt_ignore_length,
             beam_width=beam_width,
             beam_width_array=None,
         ),

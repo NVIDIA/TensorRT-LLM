@@ -15,7 +15,6 @@
 import gc
 import importlib
 import os
-import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
@@ -27,14 +26,13 @@ import torch
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag)
-from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
+                                             control_action_decorator)
 
 from ... import TorchLlmArgs
-from ...bindings import executor as tllm
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
-from ...sampling_params import BatchedLogitsProcessor
 from ..base_worker import BaseWorker
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
@@ -74,9 +72,7 @@ class RayWorkerWrapper:
         self.gpu = int(ray.get_gpu_ids()[0])
         self.local_gpu = self.physical_to_local_id(self.gpu)
 
-        # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
-        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
-            tempfile.gettempdir(), f"deep_gemm_rank{rank}_gpu{self.gpu}")
+        _configure_deep_gemm_cache(rank, self.gpu)
 
         torch.cuda.set_device(self.local_gpu)
 
@@ -192,6 +188,18 @@ class RayWorkerWrapper:
         id_mapping = list(map(int, visible_devices.split(",")))
         return id_mapping.index(phys_id)
 
+    # Methods that a user-supplied WorkerExtension is explicitly allowed
+    # to override on the worker class. These are designated extension
+    # points: their BaseWorker implementations forward to the engine and
+    # the extension's override is expected to win for Ray deployments
+    # (e.g. RL workflows using torch.cuda.profiler directly). When one of
+    # these names collides, the extension's method is copied into the
+    # derived class dict so MRO resolves to it regardless of base order.
+    _EXTENSION_OVERRIDABLE_METHODS = frozenset({
+        "start_profile",
+        "stop_profile",
+    })
+
     @staticmethod
     def _inject_worker_extension(
             worker_class: Type[BaseWorker],
@@ -207,9 +215,27 @@ class RayWorkerWrapper:
                 f"Failed to load worker extension '{extension_cls_name}'"
             ) from e
 
+        # Derived-class overrides: for explicitly overridable method
+        # names (see _EXTENSION_OVERRIDABLE_METHODS), copy the extension
+        # method into the derived class dict so it wins over the base
+        # worker's implementation regardless of MRO order.
+        derived_attrs = {'__module__': worker_class.__module__}
+        overridable = RayWorkerWrapper._EXTENSION_OVERRIDABLE_METHODS
+
         # Check for conflicts
         for attr in dir(extension_cls):
             if attr.startswith("__"):
+                continue
+            if attr in overridable:
+                # Extension is allowed to override; copy its attribute
+                # directly so MRO resolves to the extension version.
+                ext_attr = extension_cls.__dict__.get(attr)
+                if ext_attr is None:
+                    # Inherited from a base of extension_cls; fall back
+                    # to getattr which still returns the extension-side
+                    # implementation.
+                    ext_attr = getattr(extension_cls, attr)
+                derived_attrs[attr] = ext_attr
                 continue
             if hasattr(worker_class, attr):
                 raise ValueError(
@@ -218,7 +244,7 @@ class RayWorkerWrapper:
 
         derived_name = f"{worker_class.__name__}With{extension_cls.__name__}"
         ExtendedWorker = type(derived_name, (worker_class, extension_cls),
-                              {'__module__': worker_class.__module__})
+                              derived_attrs)
         return ExtendedWorker
 
 
@@ -227,9 +253,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
     def __init__(
         self,
         device_id: int,
-        engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         hf_model_dir: Optional[Path] = None,
@@ -242,9 +265,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         from tensorrt_llm.logger import logger
 
         super().__init__(
-            engine=engine,
-            executor_config=executor_config,
-            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
@@ -261,6 +281,11 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise RuntimeError(
                 "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
         self.init_rpc_worker(self.global_rank, rpc_addr, hmac_key)
+        # Postprocess parallelism: spawn the local PostprocWorker pool on the
+        # response-producing rank. Outputs re-enter _response_queue via the
+        # collector thread, so the RPC stream needs no protocol change.
+        if self.global_rank == 0 and self.postproc_config.enabled:
+            self.init_postproc_workers()
         self.start_rpc_server()
 
     def setup_engine(self):
@@ -274,8 +299,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
-    @control_action_decorator
-    def sleep(self, sleep_tags: List[str]):
+    def sleep(self, sleep_tags: List[str]) -> None:
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
 
@@ -283,17 +307,35 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        tags = self._prepare_sleep_tags(tags)
+        if not tags:
+            return
+        self._validate_sleep_tags(tags)
+
+        logger.info(f"Sleep: {tags}")
+        self.engine.begin_sleep_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
-            logger.info(f"Sleep: {tags}")
-            torch.cuda.synchronize()
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Encountered an error in sleep: {e}")
-            raise e
+            with self.engine.control_action():
+                torch.cuda.synchronize()
+                mutation_started = True
+                self._invalidate_v1_prefix_cache_for_sleep(tags)
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_sleep_transition()
+            logger.exception("Encountered an error in sleep")
+            raise
+        try:
+            self.engine.complete_sleep_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
@@ -304,15 +346,30 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        tags = self._prepare_wakeup_tags(tags)
+        if not tags:
+            return
+
+        logger.info(f"Wakeup: {tags}")
+        self.engine.begin_wakeup_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
-            logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
+            mutation_started = True
             materialize_with_tag(*tags)
             torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in wakeup")
-            raise e
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_wakeup_transition()
+            logger.exception("Encountered an error in wakeup")
+            raise
+        try:
+            self.engine.complete_wakeup_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def start(self):
         pass
@@ -328,6 +385,9 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if hasattr(self, 'shutdown_event'):
             self.shutdown_event.set()
+
+        if getattr(self, '_postproc_pool', None) is not None:
+            self.shutdown_postproc_workers()
 
         if hasattr(self, 'rpc_server') and self.rpc_server is not None:
             logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")
@@ -345,7 +405,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             self.engine.shutdown()
             self.engine = None
 
-            assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
             if (self.llm_args.backend == "pytorch"
                     and hasattr(self, "checkpoint_loader")
                     and self.checkpoint_loader is not None):
@@ -357,19 +416,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         logger.debug(f"Worker {self.rank} shutdown done.")
 
-    def _get_comm_ranks_device_id(self):
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        comm_ranks = [None] * world_size
-        device_ids = [None] * world_size
-
-        torch.distributed.all_gather_object(comm_ranks, global_rank)
-        torch.distributed.all_gather_object(device_ids, self.device_id)
-
+    def _configure_device(self):
         configure_cpu_affinity(self.device_id)
-
-        return comm_ranks, device_ids
 
     def __enter__(self):
         return self

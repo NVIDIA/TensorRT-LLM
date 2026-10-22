@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Attention Data Parallelism (ADP) abstractions.
 
@@ -22,10 +37,12 @@ import math
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
-from dataclasses import MISSING, astuple, dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
+
+from ..llm_request import LlmRequestState
+from .rank_state import RankIterStatsPayload, RankState
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -47,101 +64,19 @@ def _num_input_tokens(request) -> int:
     return len(getattr(request, "input_token_ids", []))
 
 
-@dataclass
-class RankIterStatsPayload:
-    """Per-rank IterationStats payload piggybacked on the ADP allgather."""
-
-    has_iter_stats: int = 0
-    iter_stats_iter: int = -1
-    num_context_requests: int = 0
-    num_ctx_tokens: int = 0
-    num_ctx_kv_tokens: int = 0
-    num_gen_requests: int = 0
-    num_gen_kv_tokens: int = 0
-    num_paused_requests: int = 0
-    num_paused_kv_tokens: int = 0
-
-    def serialize(self) -> list[int]:
-        """Serialize to a flat list for allgather transport."""
-        return list(astuple(self))
-
-    @classmethod
-    def deserialize(cls, data: list[int]) -> RankIterStatsPayload:
-        """Deserialize a flat payload, filling omitted trailing defaults."""
-        values = list(data)
-        payload_fields = fields(cls)
-        if len(values) > len(payload_fields):
-            raise ValueError(
-                f"RankIterStatsPayload has {len(values)} fields, expected at most "
-                f"{len(payload_fields)}"
-            )
-        for field_info in payload_fields[len(values) :]:
-            if field_info.default is not MISSING:
-                values.append(field_info.default)
-            elif field_info.default_factory is not MISSING:
-                values.append(field_info.default_factory())
-            else:
-                raise ValueError(
-                    f"RankIterStatsPayload is missing required field {field_info.name}"
-                )
-        return cls(*values)
+def is_retiring_request(request) -> bool:
+    """True if ``request`` has produced its final token and is being torn down."""
+    return request.state == LlmRequestState.GENERATION_TO_COMPLETE
 
 
-@dataclass
-class RankState:
-    """Per-rank state information shared via allgather before request assignment.
+def build_active_requests_for_overlap(active_requests):
+    """Return ``active_requests`` without the requests that are already retiring."""
+    return [req for req in active_requests if not is_retiring_request(req)]
 
-    Each rank populates its local RankState, then all ranks exchange states
-    via allgather. The collected list[RankState] is the input to
-    ADPRouter.
-    """
 
-    rank: int
-    num_active_requests: int = 0
-    num_active_tokens: int = 0
-    iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
-
-    def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
-        if iter_stats_payload is None:
-            return
-        self.iter_stats = replace(iter_stats_payload)
-
-    def serialize(self) -> list[int]:
-        """Serialize to a flat list for allgather transport."""
-        return [
-            self.rank,
-            self.num_active_requests,
-            self.num_active_tokens,
-            *self.iter_stats.serialize(),
-        ]
-
-    @classmethod
-    def deserialize(cls, data: list[int]) -> RankState:
-        """Deserialize from a flat list received via allgather."""
-        values = list(data)
-        rank_state_prefix_field_count = 3
-        rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
-        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
-        if len(values) < 1:
-            raise ValueError("RankState payload is missing required field rank")
-        if len(values) > max_field_count:
-            raise ValueError(
-                f"RankState payload has {len(values)} fields, expected at most {max_field_count}"
-            )
-        rank_values = values[:rank_state_prefix_field_count]
-        for field_info in rank_state_fields[len(rank_values) :]:
-            if field_info.default is not MISSING:
-                rank_values.append(field_info.default)
-            elif field_info.default_factory is not MISSING:
-                rank_values.append(field_info.default_factory())
-            else:
-                raise ValueError(f"RankState payload is missing required field {field_info.name}")
-        return cls(
-            rank=rank_values[0],
-            num_active_requests=rank_values[1],
-            num_active_tokens=rank_values[2],
-            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
-        )
+def count_retiring_requests(active_requests) -> int:
+    """Count the retiring requests in ``active_requests``."""
+    return sum(1 for req in active_requests if is_retiring_request(req))
 
 
 class ADPRouter(ABC):
@@ -163,13 +98,15 @@ class ADPRouter(ABC):
 
     needs_prefix_matches: bool = False
 
-    def __init__(self, dist: Distributed):
+    def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
         self.dist = dist
+        self.exclude_retiring_requests = has_seq_slot_headroom
 
     @classmethod
     def create(
         cls,
         dist: "Distributed",
+        has_seq_slot_headroom: bool,
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
@@ -178,6 +115,8 @@ class ADPRouter(ABC):
 
         Args:
             dist: Distributed communicator.
+            has_seq_slot_headroom: Whether the executor's sequence-slot pool was
+                sized with the extra overlap headroom.
             kv_cache_manager: KV cache manager instance (may be None).
             attention_dp_config: AttentionDpConfig instance (may be None).
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
@@ -199,6 +138,7 @@ class ADPRouter(ABC):
             # KV-cache-aware path and takes precedence when both are enabled.
             return ConversationAwareADPRouter(
                 dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
@@ -212,6 +152,7 @@ class ADPRouter(ABC):
         ):
             return KVCacheAwareADPRouter(
                 dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
                 kv_cache_manager=kv_cache_manager,
                 load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
                 match_rate_threshold=attention_dp_config.kv_cache_routing_match_rate_threshold,
@@ -221,7 +162,7 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist)
+        return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
 
     @abstractmethod
     def create_rank_state(
@@ -245,6 +186,8 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        forward_work: tuple[int, int] | None = None,
+        include_kv_cache_load: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -255,10 +198,21 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            forward_work: Context and generation work eligible before this
+                iteration polls transfers, used by conditional attention DP.
         """
-        local_state = self.create_rank_state(active_requests, new_requests or [])
+        if self.exclude_retiring_requests:
+            active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
+            num_retiring_requests = len(active_requests) - len(active_requests_for_overlap)
+        else:
+            active_requests_for_overlap = active_requests
+            num_retiring_requests = 0
+        local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
+        local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
-        responses = self.dist.tp_allgather(local_state.serialize())
+        if forward_work is not None:
+            local_state.num_context_requests, local_state.num_generation_requests = forward_work
+        responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
         return [RankState.deserialize(data=resp) for resp in responses]
 
     @staticmethod
@@ -507,6 +461,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         self,
         dist: "Distributed",
         kv_cache_manager,
+        has_seq_slot_headroom: bool = False,
         load_balance_weight: float = 1.0,
         match_rate_threshold: float = 0.1,
         fair_share_multiplier: float = 2.0,
@@ -514,7 +469,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         async_transfer_manager=None,
         account_for_in_transfer: bool = False,
     ):
-        super().__init__(dist)
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
         self.match_rate_threshold = match_rate_threshold
@@ -798,9 +753,9 @@ class KVCacheAwareADPRouter(ADPRouter):
 
 class ConversationAwareADPRouter(ADPRouter):
     """Pins each conversation to a single attention-DP rank: the first request
-    of a conversation is placed by ``new_conv_placement`` (round-robin by
-    default, or least-queued), and every later request with the same
-    ``conversation_id`` returns to that rank, keeping the conversation's
+    of a conversation is placed by ``new_conv_placement`` (``round_robin`` by
+    default, ``least_queued``, or ``least_tokens``), and every later request with
+    the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
     back to the same ``new_conv_placement`` policy.
     """
@@ -812,16 +767,19 @@ class ConversationAwareADPRouter(ADPRouter):
     def __init__(
         self,
         dist: "Distributed",
+        has_seq_slot_headroom: bool = False,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
     ):
-        super().__init__(dist)
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
-            "least_queued" if new_conv_placement == "least_queued" else "round_robin"
+            new_conv_placement
+            if new_conv_placement in ("round_robin", "least_queued", "least_tokens")
+            else "round_robin"
         )
         self._round_robin_cursor = 0
 
@@ -842,9 +800,14 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
+        # Read routing affinity before ExecutorRequest is merged into LlmRequest.
         req = req_item.request
         if req is None:
             return None
+        scheduling_params = getattr(req, "py_scheduling_params", None)
+        affinity_id = getattr(scheduling_params, "subagent_affinity_id", None)
+        if affinity_id:
+            return affinity_id
         conversation_params = req.py_conversation_params
         if conversation_params is None:
             return None
@@ -922,6 +885,16 @@ class ConversationAwareADPRouter(ADPRouter):
             max_num_active_requests,
         )
 
+        # Only allgathered state and broadcast requests enter the estimate;
+        # local KV statistics would make ranks disagree on placement.
+        token_load: list[int] = []
+        if self._new_conv_placement == "least_tokens":
+            token_load = [0] * tp_size
+            for state in all_rank_states:
+                token_load[state.rank] = state.num_active_tokens + sum(
+                    _num_input_tokens(item.request) for item in all_ranks_new_requests[state.rank]
+                )
+
         # 2) Soft cap for spreading new conversations across ranks, clamped to
         #    per-rank slot capacity so no placement path can overfill a rank.
         #    Sticky returns gate on the hard cap and may still exceed this cap,
@@ -950,6 +923,20 @@ class ConversationAwareADPRouter(ADPRouter):
                     return r
             return _least_loaded(soft_cap)
 
+        def _least_active_tokens(soft_cap: int) -> int:
+            """Shared active prompt load plus this call's admissions."""
+            cands = [r for r in range(tp_size) if all_ranks_num_active_requests[r] < soft_cap]
+            rank = min(
+                cands or range(tp_size),
+                key=lambda r: (
+                    token_load[r],
+                    all_ranks_num_active_requests[r],
+                    (r - self._round_robin_cursor) % tp_size,
+                ),
+            )
+            self._round_robin_cursor = (rank + 1) % tp_size
+            return rank
+
         for req_item in remaining_unscheduled:
             conv_id = self._conversation_id(req_item)
             rank = None
@@ -969,10 +956,11 @@ class ConversationAwareADPRouter(ADPRouter):
 
             if rank is None:
                 # First turn of a new conversation, sticky-overflow, or no
-                # conversation_id -> spread under the soft cap: round-robin
-                # (count-uniform) or least-queued (steers away from ranks kept
-                # busy by heavy pinned conversations).
-                if self._new_conv_placement == "least_queued":
+                # conversation_id -> spread under the soft cap using the
+                # configured count- or token-based placement strategy.
+                if self._new_conv_placement == "least_tokens":
+                    rank = _least_active_tokens(expected_num_active_requests)
+                elif self._new_conv_placement == "least_queued":
                     rank = _least_loaded(expected_num_active_requests)
                 else:
                     rank = _next_rr(expected_num_active_requests)
@@ -982,11 +970,13 @@ class ConversationAwareADPRouter(ADPRouter):
 
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
+            if self._new_conv_placement == "least_tokens":
+                token_load[rank] += _num_input_tokens(req_item.request)
 
         # Sticky returns use the hard cap, so a rank may now exceed the pre-loop
         # soft `expected`. Re-bump so the returned value covers the actual
-        # per-rank max -- _pad_attention_dp_dummy_request asserts
-        # expected >= len(active_requests) on every rank.
+        # per-rank max -- _pad_attention_dp_dummy_request compares `expected`
+        # against each rank's routable active count.
         expected_num_active_requests = max(
             expected_num_active_requests, max(all_ranks_num_active_requests)
         )

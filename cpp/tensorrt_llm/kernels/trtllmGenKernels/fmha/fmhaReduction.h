@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ namespace kernels
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelParams const& params,
-    int32_t multiProcessorCount, cudaStream_t stream);
+    float softmaxPScale, int32_t multiProcessorCount, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -61,6 +61,10 @@ llm = LLM(model='/path/to/model',
 llm.generate("Hello, my name is")
 ```
 
+This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
+cache in its normal runtime type and use NVFP4 only while Pages reside in Host
+or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
+
 
 ### Offline Quantization with ModelOpt
 
@@ -124,16 +128,18 @@ The language component decides which quantization methods are supported by a giv
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
 | Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |     .     |     .     |     .      |     .      |
 | Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     Y     |     Y     |     Y      |     Y      |
+| Rubin(sm107)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |     .     |     Y     |     .      |     Y      |
 
 ```{note}
-FP8 block wise scaling GEMM kernels for sm100/103 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).
+FP8 block wise scaling GEMM kernels for sm100/103/107 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).
 ```
 
 
 ## Quick Links
 
+- [KV Cache Compression](kv-cache-compression.md)
 - [Pre-quantized Models by ModelOpt](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4)
 - [ModelOpt Support Matrix](https://nvidia.github.io/Model-Optimizer/guides/0_support_matrix.html)

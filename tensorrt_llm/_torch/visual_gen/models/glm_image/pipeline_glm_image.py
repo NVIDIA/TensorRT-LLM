@@ -36,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 
 from .transformer_glm_image import GlmImageTransformer2DModel
 
@@ -87,6 +88,15 @@ def retrieve_timesteps(
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
+        # Diffusers 0.40 recomputes timestep labels from shifted sigmas, changing
+        # GLM's transformer conditioning. Restore pre-0.40 labels for backward
+        # compatibility, not as a claim of better quality; keep shifted sigmas.
+        # TODO: On a Diffusers upgrade, check the upstream GLM resolution in
+        # https://github.com/huggingface/diffusers/issues/14461 and compare its
+        # timestep/sigma schedules. Before removing this override, rerun GLM
+        # scheduler parity and T2I/I2I quality tests against the aligned reference;
+        # update regression expectations and goldens only for an accepted change.
+        scheduler.timesteps = torch.as_tensor(timesteps, dtype=torch.float32, device=device)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif timesteps is not None and sigmas is None:
@@ -548,7 +558,7 @@ class GlmImagePipeline(BasePipeline):
             )
         generator = None
         if params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(params.seed)
+            generator = make_noise_generator(params.seed, self.device)
         return self.forward(
             prompt=req.prompt,
             height=params.height,
@@ -567,7 +577,7 @@ class GlmImagePipeline(BasePipeline):
                 height=height,
                 width=width,
                 num_inference_steps=steps,
-                generator=torch.Generator(device=self.device).manual_seed(42),
+                generator=make_noise_generator(42, self.device),
             )
 
     @torch.inference_mode()

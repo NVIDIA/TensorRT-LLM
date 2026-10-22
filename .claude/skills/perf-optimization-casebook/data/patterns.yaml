@@ -128,7 +128,7 @@ patterns:
     bottleneck: [launch, sync]
     signals: [small-batch-decode, many-small-kernels, draft-forward-exposed, expert-load-imbalance]
     families: [runtime-execution]
-    instances: [case-multi-stream-shared-routed-expert, case-overlap-mla-rope-uk-bgemm, case-overlap-online-eplb, case-two-model-mtp-eagle]
+    instances: [case-multi-stream-shared-routed-expert, case-overlap-mla-rope-uk-bgemm, case-overlap-online-eplb]
     notes: >
       The hard part is proving data-independence (disjoint output slices /
       disjoint step state); stream-switching only pays off under CUDA-graph

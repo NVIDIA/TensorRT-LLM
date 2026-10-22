@@ -8,7 +8,7 @@ from typing import Iterator, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import serialization
@@ -178,6 +178,13 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
+                # Encoder outputs are weight-derived. The control action is
+                # draining by default, so any live reference or reservation
+                # here is a lifecycle error rather than state that may be
+                # force-dropped. Invalidate before every partial reload; a
+                # multi-call update session must not expose outputs from an
+                # earlier weight bucket through the persistent cache.
+                self.engine.invalidate_multimodal_encoder_cache()
                 self.engine.model_engine.model_loader.reload(
                     self.engine.model_engine.model, weights, allow_partial_loading=True
                 )
@@ -193,6 +200,9 @@ class WorkerExtension:
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
                 self.engine.reset_prefix_cache()
+                # Finalization can post-process weights; drop outputs encoded
+                # since the last bucket reload.
+                self.engine.invalidate_multimodal_encoder_cache()
                 delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
                 torch.cuda.synchronize()

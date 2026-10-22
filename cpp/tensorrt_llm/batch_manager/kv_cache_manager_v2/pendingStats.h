@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -37,6 +38,9 @@ struct PendingAllocationSegment
     bool countAsGeneration;
     bool recordManagerStats;
     bool recordRequestStats;
+    // Allocated for content a KV connector loaded from an external store: booked as reused rather
+    // than missed.
+    bool countAsConnectorReused{false};
 };
 
 struct PendingStatsDelta
@@ -45,10 +49,11 @@ struct PendingStatsDelta
     KVCacheStatsDelta requestStats;
     KVCacheIterationStatsDelta iterationStats;
     std::optional<LifeCycleId> lifeCycle;
+    int64_t connectorReusedBlocks{0};
 
     [[nodiscard]] bool empty() const noexcept
     {
-        return globalStats.empty() && requestStats.empty() && iterationStats.empty();
+        return globalStats.empty() && requestStats.empty() && iterationStats.empty() && connectorReusedBlocks == 0;
     }
 };
 
@@ -58,7 +63,8 @@ public:
     [[nodiscard]] bool empty() const noexcept
     {
         return mRequestStats.empty() && mGlobalStats.empty() && mIterationStatsByLifeCycle.empty()
-            && mSsmSnapshotIterationStatsByLifeCycle.empty();
+            && mSsmSnapshotIterationStatsByLifeCycle.empty() && countsByLevelEmpty(mCachedTokensByLevel)
+            && mConnectorReusedBlocksByLifeCycle.empty() && mConnectorCachedTokens == 0;
     }
 
     void clear() noexcept
@@ -67,6 +73,10 @@ public:
         mGlobalStats.clear();
         mIterationStatsByLifeCycle.clear();
         mSsmSnapshotIterationStatsByLifeCycle.clear();
+        mReusedBlocksByLevelByLifeCycle.clear();
+        mConnectorReusedBlocksByLifeCycle.clear();
+        mCachedTokensByLevel.clear();
+        mConnectorCachedTokens = 0;
         mAllocationSegments.clear();
     }
 
@@ -88,8 +98,11 @@ public:
         return true;
     }
 
+    // `byLevel` splits the same full/partial counts across the cache levels the reused pages were
+    // resident on. It rides along with the scalar counters so both are committed or discarded
+    // together; reuse is never rolled back (only allocation ranges are), so add-only is enough.
     bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks,
-        bool recordManagerStats = true, bool recordRequestStats = true)
+        ReusedBlocksByLevel const& byLevel = {}, bool recordManagerStats = true, bool recordRequestStats = true)
     {
         int const reusedBlocks = fullReusedBlocks + partialReusedBlocks;
         if (reusedBlocks == 0 || (!recordManagerStats && !recordRequestStats))
@@ -105,6 +118,7 @@ public:
             delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
             delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
             delta.lifeCycle = lifeCycle;
+            mReusedBlocksByLevelByLifeCycle[lifeCycle].add(byLevel);
         }
         if (recordRequestStats)
         {
@@ -138,7 +152,10 @@ public:
         return true;
     }
 
-    bool subtractAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd)
+    //! Rebook the pending missed allocations in [blockBegin, blockEnd) as reused, for blocks whose
+    //! content a KV connector loads instead of the forward pass computing it. The blocks stay
+    //! counted as allocated. Allocations already committed are not pending and stay missed.
+    bool recordConnectorReuse(BlockOrdinal blockBegin, BlockOrdinal blockEnd)
     {
         if (blockBegin >= blockEnd || mAllocationSegments.empty())
         {
@@ -146,14 +163,58 @@ public:
         }
 
         bool changed = false;
+        std::vector<PendingAllocationSegment> segments;
+        segments.reserve(mAllocationSegments.size() + 2);
+        for (auto const& segment : mAllocationSegments)
+        {
+            BlockOrdinal const servedBegin = std::max(blockBegin, segment.blockBegin);
+            BlockOrdinal const servedEnd = std::min(blockEnd, segment.blockEnd);
+            if (servedBegin >= servedEnd || !segment.countAsMissed)
+            {
+                segments.push_back(segment);
+                continue;
+            }
+
+            changed = true;
+            subtract(allocationDelta(segment, servedBegin, servedEnd));
+            if (segment.blockBegin < servedBegin)
+            {
+                auto head = segment;
+                head.blockEnd = servedBegin;
+                segments.push_back(head);
+            }
+            auto served = segment;
+            served.blockBegin = servedBegin;
+            served.blockEnd = servedEnd;
+            served.countAsMissed = false;
+            served.countAsConnectorReused = true;
+            add(allocationDelta(served, servedBegin, servedEnd));
+            segments.push_back(served);
+            if (servedEnd < segment.blockEnd)
+            {
+                auto tail = segment;
+                tail.blockBegin = servedEnd;
+                segments.push_back(tail);
+            }
+        }
+        mAllocationSegments = std::move(segments);
+        return changed;
+    }
+
+    bool subtractAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd)
+    {
+        if (blockBegin >= blockEnd || mAllocationSegments.empty())
+        {
+            return false;
+        }
+
+        // Every segment is examined: once recordConnectorReuse() has split segments they are no
+        // longer ordered by position across life cycles. The list is cleared at each commit.
+        bool changed = false;
         int index = static_cast<int>(mAllocationSegments.size()) - 1;
         while (index >= 0)
         {
             auto& segment = mAllocationSegments[static_cast<size_t>(index)];
-            if (segment.blockEnd <= blockBegin)
-            {
-                break;
-            }
             BlockOrdinal const removedBegin = std::max(blockBegin, segment.blockBegin);
             BlockOrdinal const removedEnd = std::min(blockEnd, segment.blockEnd);
             if (removedBegin >= removedEnd)
@@ -198,30 +259,126 @@ public:
         return mSsmSnapshotIterationStatsByLifeCycle;
     }
 
+    ReusedBlocksByLevelByLifeCycle const& reusedBlocksByLevelByLifeCycle() const noexcept
+    {
+        return mReusedBlocksByLevelByLifeCycle;
+    }
+
+    ConnectorReusedBlocksByLifeCycle const& connectorReusedBlocksByLifeCycle() const noexcept
+    {
+        return mConnectorReusedBlocksByLifeCycle;
+    }
+
+    // Cached-token attribution for the sequence's reuse match, indexed by cache level.
+    //
+    // Unlike the reuse counters this is a manager-global quantity rather than a per-lifecycle one:
+    // a match spans every lifecycle at once (the final SSM checkpoint summarizes the whole
+    // recurrent prefix, so its tier applies to every matched token), leaving no single lifecycle to
+    // attribute it to. It still rides the pending-stats lifecycle so it is committed or discarded
+    // together with the counters it was derived from -- in particular, a dummy sequence's
+    // attribution is dropped by the same discardPendingStats() that drops its reuse counters.
+    bool recordCachedTokensByLevel(CountsByLevel const& counts)
+    {
+        if (countsByLevelEmpty(counts))
+        {
+            return false;
+        }
+        addCountsByLevel(mCachedTokensByLevel, counts);
+        return true;
+    }
+
+    void clearCachedTokensByLevel() noexcept
+    {
+        mCachedTokensByLevel.clear();
+    }
+
+    //! Limit a level's staged attribution without restoring counts already dropped or committed.
+    void limitCachedTokensByLevel(CacheLevel level, int64_t maxTokens)
+    {
+        // No attribution is staged when stats are disabled, discarded, or already committed.
+        if (mCachedTokensByLevel.empty())
+        {
+            return;
+        }
+        TLLM_CHECK_DEBUG(level < mCachedTokensByLevel.size());
+        if (level >= mCachedTokensByLevel.size())
+        {
+            return;
+        }
+        auto& count = mCachedTokensByLevel.at(level);
+        TLLM_CHECK_DEBUG(maxTokens >= 0);
+        count = std::min(count, std::max(int64_t{0}, maxTokens));
+    }
+
+    [[nodiscard]] CountsByLevel const& cachedTokensByLevel() const noexcept
+    {
+        return mCachedTokensByLevel;
+    }
+
+    // Prompt tokens a KV connector loaded from an external store, the cached tokens that sit on no
+    // cache level. Manager-global like the attribution above, for the same reason.
+    bool recordConnectorCachedTokens(int64_t numTokens)
+    {
+        TLLM_CHECK_DEBUG(numTokens >= 0);
+        if (numTokens <= 0)
+        {
+            return false;
+        }
+        mConnectorCachedTokens += numTokens;
+        return true;
+    }
+
+    [[nodiscard]] int64_t connectorCachedTokens() const noexcept
+    {
+        return mConnectorCachedTokens;
+    }
+
 private:
     static PendingStatsDelta allocationDelta(
         PendingAllocationSegment const& segment, BlockOrdinal blockBegin, BlockOrdinal blockEnd)
     {
         int64_t const numBlocks = static_cast<int64_t>(std::max(0, blockEnd - blockBegin)) * segment.beamWidth;
+        int64_t const missedBlocks = segment.countAsMissed ? numBlocks : 0;
+        int64_t const connectorReusedBlocks = segment.countAsConnectorReused ? numBlocks : 0;
         PendingStatsDelta delta;
         if (segment.recordManagerStats)
         {
             delta.globalStats.allocTotalBlocks = numBlocks;
             delta.globalStats.allocNewBlocks = numBlocks;
-            delta.globalStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.globalStats.reusedBlocks = connectorReusedBlocks;
+            delta.globalStats.missedBlocks = missedBlocks;
             delta.iterationStats.iterAllocTotalBlocks = numBlocks;
             delta.iterationStats.iterAllocNewBlocks = numBlocks;
-            delta.iterationStats.iterMissedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.iterationStats.iterReusedBlocks = connectorReusedBlocks;
+            delta.iterationStats.iterFullReusedBlocks = connectorReusedBlocks;
+            delta.iterationStats.iterMissedBlocks = missedBlocks;
             delta.iterationStats.iterGenAllocBlocks = segment.countAsGeneration ? numBlocks : 0;
             delta.lifeCycle = segment.lifeCycle;
+            delta.connectorReusedBlocks = connectorReusedBlocks;
         }
         if (segment.recordRequestStats)
         {
             delta.requestStats.allocTotalBlocks = numBlocks;
             delta.requestStats.allocNewBlocks = numBlocks;
-            delta.requestStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.requestStats.reusedBlocks = connectorReusedBlocks;
+            delta.requestStats.missedBlocks = missedBlocks;
         }
         return delta;
+    }
+
+    void addConnectorReusedBlocks(std::optional<LifeCycleId> lifeCycle, int64_t numBlocks)
+    {
+        if (numBlocks == 0)
+        {
+            return;
+        }
+        TLLM_CHECK_DEBUG(lifeCycle.has_value());
+        auto const it = mConnectorReusedBlocksByLifeCycle.try_emplace(*lifeCycle, 0).first;
+        it->second += numBlocks;
+        if (it->second == 0)
+        {
+            mConnectorReusedBlocksByLifeCycle.erase(it);
+        }
     }
 
     bool add(PendingStatsDelta const& delta)
@@ -237,6 +394,7 @@ private:
             TLLM_CHECK_DEBUG(delta.lifeCycle.has_value());
             mIterationStatsByLifeCycle[*delta.lifeCycle].add(delta.iterationStats);
         }
+        addConnectorReusedBlocks(delta.lifeCycle, delta.connectorReusedBlocks);
         return true;
     }
 
@@ -261,6 +419,7 @@ private:
                 }
             }
         }
+        addConnectorReusedBlocks(delta.lifeCycle, -delta.connectorReusedBlocks);
         return true;
     }
 
@@ -268,6 +427,10 @@ private:
     KVCacheStatsDelta mGlobalStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mReusedBlocksByLevelByLifeCycle;
+    ConnectorReusedBlocksByLifeCycle mConnectorReusedBlocksByLifeCycle;
+    CountsByLevel mCachedTokensByLevel;
+    int64_t mConnectorCachedTokens{0};
     std::vector<PendingAllocationSegment> mAllocationSegments;
 };
 

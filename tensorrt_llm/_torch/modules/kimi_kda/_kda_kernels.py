@@ -27,6 +27,8 @@ from types import ModuleType
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from . import _kda_decode
 
@@ -62,8 +64,459 @@ def get_kda_sm_version() -> int:
 
 
 def is_kda_optimized_supported() -> bool:
-    """The optimized prefill/decode kernels are Blackwell sm_100 only."""
-    return get_kda_sm_version() in (100, 103)
+    """The optimized prefill/decode kernels need Blackwell sm_100 or Rubin sm_107."""
+    return get_kda_sm_version() in (100, 103, 107)
+
+
+@triton.jit(do_not_specialize=["num_tokens", "feature_stride"])
+def _fused_kda_post_conv_kernel(
+    packed_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    num_tokens,
+    token_stride,
+    feature_stride,
+    l2_norm_eps,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
+):
+    """Normalize and transpose packed Q/K/V in one launch.
+
+    ``packed`` is ``[3 * NUM_HEADS * HEAD_DIM, num_tokens]`` with one unit
+    stride: along tokens (channel-major) or, with ``TOKEN_MAJOR``, along
+    features. ``token_stride`` stays specialized so Triton sees when
+    token-major rows start 16-byte aligned and vectorizes their loads.
+    ``feature_stride`` is the token count in channel-major mode, where
+    specializing it selects a slower layout.
+    """
+    token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    head_idx = tl.program_id(1)
+    dim_offsets = tl.arange(0, BLOCK_DIM)
+    token_mask = token_offsets < num_tokens
+    dim_mask = dim_offsets < HEAD_DIM
+    mask = token_mask[:, None] & dim_mask[None, :]
+
+    feature_offsets = head_idx * HEAD_DIM + dim_offsets
+    projection_size = NUM_HEADS * HEAD_DIM
+    if TOKEN_MAJOR:
+        outer_stride_i64 = token_stride.to(tl.int64)
+        source_offsets = token_offsets[:, None].to(tl.int64) * outer_stride_i64 + feature_offsets[
+            None, :
+        ].to(tl.int64)
+        section_stride = projection_size
+    else:
+        outer_stride_i64 = feature_stride.to(tl.int64)
+        source_offsets = feature_offsets[None, :].to(tl.int64) * outer_stride_i64 + token_offsets[
+            :, None
+        ].to(tl.int64)
+        section_stride = projection_size * outer_stride_i64
+    output_offsets = (
+        token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
+    )
+
+    q = tl.load(packed_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
+    q /= tl.sqrt(tl.sum(q * q, axis=1) + l2_norm_eps)[:, None]
+    tl.store(q_out_ptr + output_offsets, q, mask=mask)
+
+    k = tl.load(
+        packed_ptr + section_stride + source_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    k /= tl.sqrt(tl.sum(k * k, axis=1) + l2_norm_eps)[:, None]
+    tl.store(k_out_ptr + output_offsets, k, mask=mask)
+
+    v = tl.load(
+        packed_ptr + 2 * section_stride + source_offsets,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(v_out_ptr + output_offsets, v, mask=mask)
+
+
+def fused_kda_post_conv(
+    packed: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    l2_norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert packed convolution output to KDA Q/K/V.
+
+    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]`` and is either
+    channel-major (unit token stride) or a transposed view of token-major
+    rows (unit feature stride). The returned tensors are contiguous
+    ``[1, tokens, num_heads, head_dim]``; Q and K are L2-normalized along the
+    head dimension.
+    """
+    projection_size = num_heads * head_dim
+    if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
+        raise ValueError(
+            "Packed KDA post-conv expected shape "
+            f"[{3 * projection_size}, tokens], got {tuple(packed.shape)}"
+        )
+    num_tokens = packed.shape[1]
+    feature_stride, token_stride = packed.stride()
+    token_major = feature_stride == 1 and num_tokens > 1
+    if not token_major and token_stride != 1 and num_tokens > 1:
+        raise ValueError(
+            "Packed KDA post-conv requires a unit stride along tokens or features, "
+            f"got strides {packed.stride()}"
+        )
+
+    output_shape = (1, num_tokens, num_heads, head_dim)
+    q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
+    k_out = torch.empty_like(q_out)
+    v_out = torch.empty_like(q_out)
+    if num_tokens == 0:
+        return q_out, k_out, v_out
+
+    block_tokens = 16
+    block_dim = triton.next_power_of_2(head_dim)
+    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
+    _fused_kda_post_conv_kernel[grid](
+        packed,
+        q_out,
+        k_out,
+        v_out,
+        num_tokens,
+        token_stride,
+        feature_stride,
+        l2_norm_eps,
+        num_heads,
+        head_dim,
+        block_tokens,
+        block_dim,
+        token_major,
+        num_warps=8,
+        num_stages=3,
+    )
+    return q_out, k_out, v_out
+
+
+@triton.jit
+def _copy_kda_replay_conv_window_kernel(
+    conv_ptr,
+    q_cache_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    state_indices_ptr,
+    conv_stride_slot,
+    conv_stride_dim,
+    conv_stride_window,
+    cache_stride_slot,
+    cache_stride_dim,
+    cache_stride_window,
+    PROJECTION_SIZE: tl.constexpr,
+    COMMITTED: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    request = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < PROJECTION_SIZE * COMMITTED
+    dim = offsets // COMMITTED
+    window = offsets % COMMITTED
+    slot = tl.load(state_indices_ptr + request).to(tl.int64)
+
+    conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
+    cache_offset = slot * cache_stride_slot + dim * cache_stride_dim + window * cache_stride_window
+    section_offset = PROJECTION_SIZE * conv_stride_dim
+    tl.store(q_cache_ptr + cache_offset, tl.load(conv_ptr + conv_offset, mask=mask), mask=mask)
+    tl.store(
+        k_cache_ptr + cache_offset,
+        tl.load(conv_ptr + conv_offset + section_offset, mask=mask),
+        mask=mask,
+    )
+    tl.store(
+        v_cache_ptr + cache_offset,
+        tl.load(conv_ptr + conv_offset + 2 * section_offset, mask=mask),
+        mask=mask,
+    )
+
+
+def copy_kda_replay_conv_window(
+    conv_pool: torch.Tensor,
+    q_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+) -> None:
+    """Copy selected packed ``W - 1`` rows into KDA replay caches.
+
+    The live convolution pool is ``[slots, 3D, W - 1]``. Replay caches are
+    ``[slots, D, W - 1 + num_spec]`` with a dim-contiguous inner layout.
+    """
+    if conv_pool.ndim != 3 or conv_pool.shape[1] % 3:
+        raise ValueError(f"Expected packed rank-3 KDA convolution pool, got {conv_pool.shape}")
+    projection_size = conv_pool.shape[1] // 3
+    committed = conv_pool.shape[2]
+    caches = (q_cache, k_cache, v_cache)
+    expected_prefix = (conv_pool.shape[0], projection_size)
+    if any(cache.ndim != 3 or cache.shape[:2] != expected_prefix for cache in caches):
+        raise ValueError("KDA replay convolution caches do not match the live pool geometry")
+    if any(cache.shape[2] < committed for cache in caches):
+        raise ValueError("KDA replay convolution caches are shorter than the committed window")
+    if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
+        raise ValueError("KDA replay convolution caches must share one layout")
+    if state_indices.ndim != 1 or state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("KDA replay state indices must be a rank-1 int32 or int64 tensor")
+    if any(tensor.device != conv_pool.device for tensor in (*caches, state_indices)):
+        raise ValueError("KDA replay convolution tensors must be on one device")
+    if state_indices.numel() == 0:
+        return
+
+    block_size = 256
+    grid = (
+        state_indices.numel(),
+        triton.cdiv(projection_size * committed, block_size),
+    )
+    with torch.cuda.device(conv_pool.device.index):
+        _copy_kda_replay_conv_window_kernel[grid](
+            conv_pool,
+            q_cache,
+            k_cache,
+            v_cache,
+            state_indices,
+            conv_pool.stride(0),
+            conv_pool.stride(1),
+            conv_pool.stride(2),
+            q_cache.stride(0),
+            q_cache.stride(1),
+            q_cache.stride(2),
+            PROJECTION_SIZE=projection_size,
+            COMMITTED=committed,
+            BLOCK_SIZE=block_size,
+        )
+
+
+@triton.jit
+def _store_kda_replay_conv_window_kernel(
+    conv_ptr,
+    q_cache_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    state_indices_ptr,
+    num_accepted_ptr,
+    conv_stride_slot,
+    conv_stride_dim,
+    conv_stride_window,
+    cache_stride_slot,
+    cache_stride_dim,
+    cache_stride_window,
+    PROJECTION_SIZE: tl.constexpr,
+    COMMITTED: tl.constexpr,
+    NUM_SPEC: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    request = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < PROJECTION_SIZE * COMMITTED
+    dim = offsets // COMMITTED
+    window = offsets % COMMITTED
+    slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    # The window after the accepted drafts starts at their count, clamped
+    # like the verify kernels clamp it.
+    shift = tl.minimum(tl.maximum(tl.load(num_accepted_ptr + request), 0), NUM_SPEC)
+
+    conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
+    cache_offset = (
+        slot * cache_stride_slot + dim * cache_stride_dim + (window + shift) * cache_stride_window
+    )
+    section_offset = PROJECTION_SIZE * conv_stride_dim
+    tl.store(conv_ptr + conv_offset, tl.load(q_cache_ptr + cache_offset, mask=mask), mask=mask)
+    tl.store(
+        conv_ptr + conv_offset + section_offset,
+        tl.load(k_cache_ptr + cache_offset, mask=mask),
+        mask=mask,
+    )
+    tl.store(
+        conv_ptr + conv_offset + 2 * section_offset,
+        tl.load(v_cache_ptr + cache_offset, mask=mask),
+        mask=mask,
+    )
+
+
+def store_kda_replay_conv_window(
+    conv_pool: torch.Tensor,
+    q_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+) -> None:
+    """Store each selected slot's conv window after its accepted drafts in
+    the live convolution pool.
+
+    The replay caches hold the window before the golden token in columns
+    ``[0, W - 1)`` and the raw inputs of the round's drafts after it, so the
+    ``W - 1`` columns starting at the request's ``num_accepted_tokens`` entry
+    are the window the next verify would start from. They are raw
+    convolution inputs, so storing them in a bf16 pool is exact.
+    """
+    projection_size = conv_pool.shape[1] // 3
+    committed = conv_pool.shape[2]
+    caches = (q_cache, k_cache, v_cache)
+    if any(cache.shape[1] != projection_size or cache.shape[2] < committed for cache in caches):
+        raise ValueError("KDA replay convolution caches do not match the live pool geometry")
+    if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
+        raise ValueError("KDA replay convolution caches must share one layout")
+    if num_accepted_tokens.shape != state_indices.shape:
+        raise ValueError("Expected one accepted-draft count per state index")
+    if state_indices.numel() == 0:
+        return
+
+    block_size = 256
+    grid = (
+        state_indices.numel(),
+        triton.cdiv(projection_size * committed, block_size),
+    )
+    with torch.cuda.device(conv_pool.device.index):
+        _store_kda_replay_conv_window_kernel[grid](
+            conv_pool,
+            q_cache,
+            k_cache,
+            v_cache,
+            state_indices,
+            num_accepted_tokens,
+            conv_pool.stride(0),
+            conv_pool.stride(1),
+            conv_pool.stride(2),
+            q_cache.stride(0),
+            q_cache.stride(1),
+            q_cache.stride(2),
+            PROJECTION_SIZE=projection_size,
+            COMMITTED=committed,
+            NUM_SPEC=q_cache.shape[2] - committed,
+            BLOCK_SIZE=block_size,
+        )
+
+
+@triton.jit
+def _replay_kda_token_records_kernel(
+    state_ptr,
+    records_ptr,
+    state_indices_ptr,
+    num_accepted_ptr,
+    state_stride_slot,
+    records_stride_slot,
+    NUM_SPEC: tl.constexpr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    request = tl.program_id(0)
+    head = tl.program_id(1)
+    rows = tl.program_id(2) * BLOCK_V + tl.arange(0, BLOCK_V)
+    keys = tl.arange(0, K)
+    slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    accepted = tl.minimum(tl.maximum(tl.load(num_accepted_ptr + request), 0), NUM_SPEC)
+    state_ptrs = (
+        state_ptr + slot * state_stride_slot + (head * V + rows[:, None]) * K + keys[None, :]
+    )
+    state = tl.load(state_ptrs)
+    records = records_ptr + slot * records_stride_slot
+    for t in range(0, accepted):
+        vn = tl.load(records + (t * H + head) * V + rows)
+        beta_k = tl.load(records + NUM_SPEC * H * V + (t * H + head) * K + keys)
+        decay = tl.load(records + NUM_SPEC * H * (V + K) + (t * H + head) * K + keys)
+        state = tl.fma(decay[None, :], state, vn[:, None] * beta_k[None, :])
+    tl.store(state_ptrs, state)
+
+
+def replay_kda_token_records(
+    recurrent_state: torch.Tensor,
+    state_tok: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+) -> None:
+    """Replay each selected slot's accepted drafts onto its pool state from
+    the per-draft records the Kimi K3 verify kernels keep in the slot's
+    per-token state region.
+
+    A slot's region of ``state_tok`` (``[slots, num_spec, H, V, K]`` fp32)
+    starts with the records of the last round's drafts: the row innovations
+    ``vn`` ``[num_spec][H][V]``, then ``beta * k`` and the decay
+    ``[num_spec][H][K]``. Draft ``t`` updates the state as the kernels do,
+    ``S = fma(decay, S, vn (beta * k))``, so the result is bit-identical to the
+    state their next verify starts from.
+    """
+    num_spec, num_heads, v_dim, k_dim = state_tok.shape[1:]
+    if state_indices.numel() == 0:
+        return
+    block_v = 32
+    grid = (state_indices.numel(), num_heads, v_dim // block_v)
+    with torch.cuda.device(recurrent_state.device.index):
+        _replay_kda_token_records_kernel[grid](
+            recurrent_state,
+            state_tok,
+            state_indices,
+            num_accepted_tokens,
+            recurrent_state.stride(0),
+            state_tok.stride(0),
+            NUM_SPEC=num_spec,
+            H=num_heads,
+            V=v_dim,
+            K=k_dim,
+            BLOCK_V=block_v,
+        )
+
+
+def commit_kda_pending_drafts(
+    recurrent_state: torch.Tensor,
+    conv_pool: torch.Tensor,
+    conv_q: torch.Tensor,
+    conv_k: torch.Tensor,
+    conv_v: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_tok: Optional[torch.Tensor] = None,
+) -> None:
+    """Commit one layer's pending accepted drafts into its live pools.
+
+    ``num_accepted_tokens[n]`` is the number of drafts of slot
+    ``state_indices[n]`` the last verify accepted, which the next verify
+    would take up first. Afterwards ``recurrent_state`` and ``conv_pool``
+    hold the state and the conv window that verify would start from (the
+    window bit for bit), and the caller clears the slot's count:
+
+    * with per-token states (``state_tok``), the drafts are replayed from the
+      per-draft records the Kimi K3 verify kernels keep there
+      (``replay_kda_token_records``);
+    * otherwise they are replayed from the replay caches (``k_cache`` /
+      ``g_cache`` / ``v_cache`` / ``beta_cache``) by the fused verify kernel's
+      own replay steps (``kda_mtp_commit_pending_drafts``). The tensor-core
+      verify computes a chunk in one pass, so this commit rounds the state
+      differently from a verify that replays the drafts itself.
+    """
+    num_spec = conv_q.shape[2] - conv_pool.shape[2]
+    if state_tok is not None:
+        replay_kda_token_records(recurrent_state, state_tok, state_indices, num_accepted_tokens)
+    else:
+        _load_mtp_module().kda_mtp_commit_pending_drafts(
+            recurrent_state,
+            conv_q,
+            conv_k,
+            conv_v,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            state_indices,
+            num_accepted_tokens,
+            num_spec,
+            conv_width=conv_pool.shape[2] + 1,
+        )
+    store_kda_replay_conv_window(
+        conv_pool, conv_q, conv_k, conv_v, state_indices, num_accepted_tokens
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +599,37 @@ def is_kda_mtp_verify_available() -> bool:
     return is_kda_optimized_supported() and is_intree_mtp_available()
 
 
+def kda_mtp_max_num_spec() -> int:
+    """Largest draft count the fused multi-token verify kernel supports."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+        MAX_NUM_SPEC,
+    )
+
+    return MAX_NUM_SPEC
+
+
+def kda_mtp_replay_num_spec(num_spec: int) -> Optional[int]:
+    """Draft count to size the KDA replay caches for, or ``None``.
+
+    ``None`` keeps the legacy intermediate verification buffers, so the
+    module runs the sequential FLA verify: either the fused kernel cannot
+    run here, or ``num_spec`` exceeds what it supports.
+    """
+    if not is_kda_mtp_verify_available():
+        return None
+    max_num_spec = kda_mtp_max_num_spec()
+    if num_spec > max_num_spec:
+        from tensorrt_llm.logger import logger
+
+        logger.warning_once(
+            f"KDA fused multi-token verify supports at most {max_num_spec} draft "
+            f"tokens, got {num_spec}; using the sequential FLA verify.",
+            key="kda_mtp_num_spec_fallback",
+        )
+        return None
+    return num_spec
+
+
 # ---------------------------------------------------------------------------
 # Dispatch API used by the KimiKDALinearAttention module.
 # ---------------------------------------------------------------------------
@@ -205,10 +689,15 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def mtp_verify(self, **kwargs) -> torch.Tensor:
+    def mtp_verify(
+        self, *, mxfp8_output: bool = False, **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
-        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
+        Thin passthrough to ``trtllm::kda_mtp_decode``, or with
+        ``mxfp8_output`` to ``trtllm::kda_mtp_decode_fp8``, which always
+        fuses the output norm and returns the E4M3 core and its R128c4
+        scales (see
         ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
@@ -219,8 +708,60 @@ class KDAKernelDispatch:
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        _load_mtp_module()  # registers trtllm::kda_mtp_decode
+        _load_mtp_module()  # registers both the BF16 and the MXFP8-output ops
+        if mxfp8_output:
+            if not kwargs.pop("fuse_output_norm", True):
+                raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
+
+    def can_use_indexed_prefill(
+        self,
+        *,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_sequences: int,
+        num_tokens: int,
+    ) -> bool:
+        """Return whether prefill can update this V-first pool directly."""
+        if self.prefill_kernel_path != "optimized" or num_tokens == 0:
+            return False
+        if cu_seqlens is not None:
+            if cu_seqlens.shape[0] - 1 != num_sequences:
+                return False
+        if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
+            return False
+        _, H, V, K = state_pool.shape
+        if state_pool.stride()[1:] != (V * K, K, 1):
+            return False
+        if state_pool.stride(0) < H * V * K or state_pool.stride(0) % 4:
+            return False
+        if state_pool.data_ptr() % 16:
+            return False
+        if (
+            state_indices.ndim != 1
+            or state_indices.shape[0] != num_sequences
+            or state_indices.dtype not in (torch.int32, torch.int64)
+            or not state_indices.is_contiguous()
+        ):
+            return False
+        if state_indices.data_ptr() % 16:
+            return False
+        if (
+            has_initial_states.ndim != 1
+            or has_initial_states.shape[0] != num_sequences
+            or has_initial_states.dtype != torch.bool
+            or not has_initial_states.is_contiguous()
+        ):
+            return False
+        if (
+            state_pool.device != state_indices.device
+            or state_pool.device != has_initial_states.device
+        ):
+            return False
+        return True
 
     def prefill_chunk_kda(
         self,
@@ -237,53 +778,46 @@ class KDAKernelDispatch:
         safe_gate: bool,
         lower_bound: Optional[float],
         cu_seqlens: Optional[torch.Tensor],
+        chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
+        state_pool: Optional[torch.Tensor] = None,
+        state_indices: Optional[torch.Tensor] = None,
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
-        On the optimized path this replays the preprocessing that FLA's
-        ``ChunkKDAFunction.forward`` performs when the caller enables
-        ``use_qk_l2norm_in_kernel``, ``use_beta_sigmoid_in_kernel``,
-        ``use_gate_in_kernel``, and ``state_v_first``; then dispatches to
-        the in-tree ``trtllm::kda_prefill`` CuTe DSL op.
+        Q and K must be L2-normalized by the caller. On the optimized path,
+        beta sigmoid runs inside the in-tree CuTe DSL op.
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
 
-        State layout contract (both paths): ``initial_state`` is consumed
-        and ``final_state`` returned in the V-first ``[N, H, V, K]`` layout —
-        the layout of the executor's ssm pool and of the fused decode
-        kernel. The in-tree prefill op natively uses the FLA-default K-first
-        ``[N, H, K, V]`` layout, so the optimized path transposes at both
-        boundaries (K == V == 128 for Kimi K3, so shapes alone cannot catch
-        a mix-up — the transpose is semantic).
-        """
-        use_optimized = self.prefill_kernel_path == "optimized"
-        chunk_indices = None
-        if use_optimized and cu_seqlens is not None:
-            from fla.ops.utils.index import prepare_chunk_indices
+        The optimized kernel always reads and writes indexed V-first
+        ``[slots, H, V, K]`` state-pool rows. Callers provide the executor
+        pool and reset fresh rows before entering the kernel. The FLA fallback
+        retains the batch-dense ``initial_state``/``final_state`` contract.
 
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            # The persistent K123 scheduler needs at least 4 total chunks
-            # (cgs_per_head = NT // 4 cooperative groups per head). The
-            # eqlen path guarantees this by padding to a 256-token multiple
-            # inside the op; varlen has no such pad, so small varlen
-            # batches (short-prompt contexts, NT < 4) launch with a
-            # zero-size grid -> DSLCudaRuntimeError. Route them to the FLA
-            # reference path (negligible perf impact at these sizes). The
-            # check must happen HERE, before the l2norm/beta-sigmoid
-            # pre-transforms below: the FLA path applies both in-kernel.
-            if chunk_indices.shape[0] < 4:
-                use_optimized = False
+        ``chunk_indices``, ``varlen_is_aligned``, and
+        ``single_sequence_length`` are prepared once from Kimi K3 runtime
+        metadata. They keep the optimized path from reading ``cu_seqlens``
+        back from the GPU in every KDA layer.
+        """
+        use_indexed_state = state_pool is not None
+        if use_indexed_state and (initial_state is not None or state_indices is None):
+            raise ValueError(
+                "Indexed KDA prefill requires state_indices and does not accept initial_state."
+            )
+        use_optimized = self.prefill_kernel_path == "optimized" and use_indexed_state
+
+        if use_indexed_state and not use_optimized:
+            raise RuntimeError(
+                "Indexed KDA prefill requires the optimized prefill path; "
+                "use the FLA state path for this batch."
+            )
 
         if use_optimized:
             import torch.nn.functional as F
-            from fla.modules.l2norm import l2norm_fwd
-            from fla.ops.common.gate import fused_beta_sigmoid
-
-            q, _ = l2norm_fwd(q)
-            k, _ = l2norm_fwd(k)
-            beta = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
 
             real_T = q.shape[1]
             if cu_seqlens is not None:
@@ -305,38 +839,30 @@ class KDAKernelDispatch:
             dt_bias_kernel = dt_bias.detach() if dt_bias is not None else None
 
             _load_prefill_module()  # registers trtllm::kda_prefill
-
-            if initial_state is not None:
-                # Pool V-first [N, H, V, K] -> op K-first [N, H, K, V].
-                initial_state = initial_state.transpose(-1, -2).contiguous()
-
-            out, final_state = torch.ops.trtllm.kda_prefill(
+            out = torch.ops.trtllm.kda_prefill(
                 q=q,
                 k=k,
                 v=v,
                 g=g,
                 beta=beta,
+                state_pool=state_pool,
+                state_indices=state_indices,
                 scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
                 chunk_size=chunk_size,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
                 use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
+                varlen_is_aligned=varlen_is_aligned,
+                single_sequence_length=single_sequence_length,
             )
             if out.shape[1] != real_T:
                 out = out[:, :real_T]
-            if final_state is not None and final_state.numel() > 0:
-                # Op K-first [N, H, K, V] -> pool V-first [N, H, V, K].
-                # .contiguous() also detaches the result from the op's
-                # shared per-shape S_out scratch, which the next same-shape
-                # call overwrites.
-                final_state = final_state.transpose(-1, -2).contiguous()
-            return out, final_state
+            return out, None
 
         from fla.ops.kda import chunk_kda
 
@@ -351,7 +877,7 @@ class KDAKernelDispatch:
             scale=scale,
             initial_state=initial_state,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=False,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
             safe_gate=safe_gate,

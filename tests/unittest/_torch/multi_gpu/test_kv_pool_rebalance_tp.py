@@ -14,7 +14,7 @@
 # limitations under the License.
 """Multi-rank TP tests for the KVCacheManagerV2 rebalance trigger.
 
-``tests/unittest/_torch/executor/test_kv_pool_rebalance.py`` covers the same
+``tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py`` covers the same
 logic against a mocked ``dist``; these tests run it across real MPI ranks with
 a real ``MPIDist``, which is the only way to show the collective actually
 agrees (and that ranks reach it in lockstep rather than deadlocking).
@@ -100,6 +100,7 @@ def _make_executor(
     exe.enable_attention_dp = enable_attention_dp
     exe.enable_kv_pool_rebalance = True
     exe.kv_cache_transceiver = None
+    exe.kv_connector_manager = None
     exe.is_warmup = False
     exe.is_shutdown = False
     exe.drafter = None

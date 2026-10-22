@@ -674,6 +674,20 @@ inline __device__ T cuda_clamp(T val, T minVal, T maxVal)
 }
 
 #ifdef ENABLE_FP8
+// nvcc's front end (cudafe++/EDG) mis-resolves float2(val) and float4(val) in C++20 mode: it skips
+// the explicit conversion operator of __nv_fp8x2_e4m3 / __nv_fp8x4_e4m3 and falls back to
+// parenthesized aggregate initialization, a branch the standard only reaches when no constructor is
+// viable. Spell the operator out so the call does not depend on that overload resolution.
+__device__ inline float2 fp8x2_to_float2(__nv_fp8x2_e4m3 val)
+{
+    return val.operator float2();
+}
+
+__device__ inline float4 fp8x4_to_float4(__nv_fp8x4_e4m3 val)
+{
+    return val.operator float4();
+}
+
 template <>
 __device__ inline float2 cuda_cast<float2, __nv_fp8x2_e4m3>(__nv_fp8x2_e4m3 val)
 {

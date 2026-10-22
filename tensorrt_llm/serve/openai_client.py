@@ -18,14 +18,31 @@ import json
 import os
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tuple, Type
+from contextlib import aclosing
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
 import aiohttp
+import msgspec
+from pydantic import BaseModel
 
+from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
+    build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
 from tensorrt_llm.serve.openai_protocol import (
@@ -41,6 +58,7 @@ from tensorrt_llm.serve.perf_metrics import (
     RETURN_METRICS_HEADER,
     SSE_METRICS_EVENT,
     ClientMetricsCollector,
+    adjusted_clock_from_headers,
     build_metrics_record_from_headers,
 )
 from tensorrt_llm.serve.responses_utils import (
@@ -52,21 +70,22 @@ from tensorrt_llm.serve.router import Router
 
 # yapf: enable
 
-# msgspec msgpack is an opt-in transport for the orchestrator->worker request
-# body (alternative to the JSON path). Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1;
-# the orchestrator encodes the forwarded body as msgpack and flags it with the
-# X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
-# routes it through Request.json()). Fails loudly at import if msgspec is missing.
-_MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
-if _MSGSPEC_ENABLED:
-    try:
-        import msgspec
-    except ImportError as exc:
-        raise ImportError(
-            "TRTLLM_SERVE_ENABLE_MSGSPEC=1 requires the msgspec package "
-            "(listed in requirements.txt)."
-        ) from exc
-    _msgpack_encoder = msgspec.msgpack.Encoder()
+# The forwarded orchestrator->worker request body is encoded as msgspec
+# msgpack and flagged with the X-TRTLLM-Msgpack header.
+_msgpack_encoder = msgspec.msgpack.Encoder()
+MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+
+
+# post_json's request and response are ordinary pydantic models, but not the
+# UCompletion* union: it carries auxiliary payloads such as count-tokens. The
+# protocol names the one method actually called, and the TypeVar ties the
+# returned object to the type the caller asked for, so a mismatch is a type
+# error rather than an Any that silently propagates.
+class _SerializableRequest(Protocol):
+    def model_dump(self, *, mode: str = ..., exclude_unset: bool = ...) -> dict: ...
+
+
+_ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
 
 def _metrics_phase(role: ServerRole) -> str:
@@ -118,6 +137,22 @@ class OpenAIClient(ABC):
         """Return the list of ready servers and the list of unready servers."""
         ...
 
+    @abstractmethod
+    async def post_json(
+        self,
+        endpoint: str,
+        request: _SerializableRequest,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        """Post a non-streaming auxiliary request to a selected worker.
+
+        Unlike _send_request this carries no disaggregation state and does not
+        touch the router's in-flight accounting: it is for side endpoints such
+        as token counting, which need a worker's tokenizer but no KV transfer.
+        """
+        ...
+
     async def shutdown(self) -> None: ...
 
     @abstractmethod
@@ -147,6 +182,7 @@ class OpenAIHttpClient(OpenAIClient):
         disagg_id_generator: Optional[Callable[[], Awaitable[int]]] = None,
         request_perf_metrics: bool = False,
         internal_disagg_auth_key: Optional[str] = None,
+        bounded_replay_on_generation: bool = False,
     ):
         self._router = router
         self._role = role
@@ -162,18 +198,56 @@ class OpenAIHttpClient(OpenAIClient):
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
             max_field_size=_PERF_METRICS_HEADER_BUDGET_BYTES,
         )
-        self._max_retries = max_retries
+        self._no_retry = os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        self._max_retries = 0 if self._no_retry else max_retries
+        if self._no_retry:
+            logger.info(
+                "Disaggregated HTTP retry is DISABLED by "
+                f"TRTLLM_DISAGG_NO_RETRY=1 for role={role.name}"
+            )
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self._bounded_replay_on_generation = bounded_replay_on_generation
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
-        if self._role != ServerRole.GENERATION:
-            return {}
-        if not request_requires_internal_disagg_auth(request):
-            return {}
-        return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
+        headers = build_subagent_affinity_headers(
+            self._internal_disagg_auth_key, request, self._role
+        )
+        if self._role == ServerRole.GENERATION and request_requires_internal_disagg_auth(request):
+            headers.update(
+                build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
+            )
+        return headers
+
+    async def post_json(
+        self,
+        endpoint: str,
+        request: _SerializableRequest,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        server_url = server if server.startswith("http") else f"http://{server}"
+        url = f"{server_url.rstrip('/')}/{endpoint}"
+        # A count-tokens body carries the whole conversation, so it is as large
+        # as a chat body and encoding it costs the orchestrator's event loop the
+        # same way -- hence the same msgpack transport as _send_request. The
+        # worker decodes it because _MsgspecRoute is the app's route_class, so
+        # it covers every route rather than just the completion ones.
+        body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+        headers = dict(MSGPACK_HEADERS)
+        async with self._session.post(url, data=body, headers=headers) as response:
+            if response.status >= 400:
+                error_body = await response.text()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {error_body[:2048]}",
+                    headers=response.headers,
+                )
+            return response_type(**await response.json())
 
     async def _send_request(
         self,
@@ -189,21 +263,40 @@ class OpenAIHttpClient(OpenAIClient):
                 server, _ = await self._router.get_next_server(request)
             else:
                 server, _ = await self._router.get_next_server(request, req_id=req_id)
+        # A retry below re-issues disagg_request_id, but the router keyed this
+        # request's reservation by the id it was routed with. Pin that id here so
+        # every later renew/finish still addresses the original reservation --
+        # otherwise the coordinator never sees a release for it and the placement
+        # load only drains when the expiration task fires. Only the context role
+        # needs this: the coordinator keys generation requests by ctx_request_id,
+        # which the retry loop never rewrites.
+        if (
+            req_id is None
+            and self._role == ServerRole.CONTEXT
+            and self._disagg_id_generator is not None
+        ):
+            pinned_dp = request.disaggregated_params
+            if pinned_dp is not None:
+                req_id = pinned_dp.disagg_request_id
         url = f"http://{server}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
+        self._metrics_collector.total_requests.inc()
+        if request.stream:
+            resp_generator = self._stream_with_cleanup(server, url, request, hooks, req_id)
+            # Enter its cleanup scope before returning: aclose() on an unstarted
+            # async generator would otherwise leave the router reservation live.
+            await resp_generator.__anext__()
+            return resp_generator
+        success = False
         try:
-            self._metrics_collector.total_requests.inc()
-            resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
-            if request.stream:
-                # return the response generator, the request is not done yet
-                return resp_generator
-            else:
-                # consume the generator to get the response and return it directly when it's not streaming
-                response = None
-                async for resp_json in resp_generator:
+            response = None
+            async with aclosing(
+                self._post_with_retry(server, url, request, hooks, req_id)
+            ) as response_generator:
+                async for resp_json in response_generator:
                     response = response_type(**resp_json)
                     if hooks:
                         if self._role == ServerRole.CONTEXT:
@@ -211,12 +304,37 @@ class OpenAIHttpClient(OpenAIClient):
                         else:
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
-                return response
-        except Exception:
-            self._metrics_collector.error_requests.inc()
-            # finish the request upon error
-            await self._finish_request(request, success=False, req_id=req_id)
-            raise
+            success = True
+            return response
+        finally:
+            if not success:
+                self._metrics_collector.error_requests.inc()
+            await self._finish_request(request, success=success, req_id=req_id)
+
+    async def _stream_with_cleanup(
+        self,
+        server: str,
+        url: str,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
+    ) -> AsyncGenerator[Any, None]:
+        success = False
+        try:
+            # Consumed by _send_request, before the caller sees this generator.
+            yield None
+            async with aclosing(
+                self._post_with_retry(server, url, request, hooks, req_id)
+            ) as response_generator:
+                async for chunk in response_generator:
+                    yield chunk
+            success = True
+        finally:
+            # Own the logical request, including errors before response headers
+            # and cancellation. Individual HTTP attempts must not release it.
+            if not success:
+                self._metrics_collector.error_requests.inc()
+            await self._finish_request(request, success=success, req_id=req_id)
 
     async def _post_with_retry(
         self,
@@ -227,13 +345,41 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
+        disagg_params = request.disaggregated_params
+        is_remote_tail_handoff = disagg_params is not None and (
+            (
+                self._role == ServerRole.GENERATION
+                and disagg_params.request_type == "generation_only"
+                and disagg_params.remote_tail_start is not None
+            )
+            or (
+                self._bounded_replay_on_generation
+                and disagg_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+                and (
+                    (
+                        self._role == ServerRole.CONTEXT
+                        and disagg_params.request_type == "context_only"
+                    )
+                    or (
+                        self._role == ServerRole.GENERATION
+                        and disagg_params.request_type == "generation_only"
+                    )
+                )
+            )
+        )
+        # Remote-tail retries cannot safely replay or cancel the paired transfer.
+        # Generation-first dispatch precedes the context response carrying the
+        # tail boundary, so identify that handoff from the deployment config.
+        max_retries = 0 if is_remote_tail_handoff else self._max_retries
         # Loop range must cover the transient-TCP extended budget (up to 5)
         # so the conditional raise inside the except block can actually decide
         # to keep retrying.  Non-transient errors still raise on the first
         # attempt that reaches self._max_retries.
-        _TRANSIENT_TCP_BUDGET = 5
-        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_remote_tail_handoff else 5
+        loop_max = max(max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
+            if attempt > 0:
+                await self._router.renew_request(request, req_id=req_id)
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -242,17 +388,10 @@ class OpenAIHttpClient(OpenAIClient):
                     if hooks:
                         hooks.on_disagg_request_id(dp.disagg_request_id)
             # Serialize once on the orchestrator's single event-loop thread.
-            if _MSGSPEC_ENABLED:
-                # msgspec msgpack: encode the request dict to msgpack bytes. Keep
-                # Content-Type application/json so FastAPI still routes the body
-                # through Request.json() (it only does that for json/+json content
-                # subtypes); the X-TRTLLM-Msgpack header tells the worker's
-                # Request.json() to decode with msgspec instead of stdlib json.
-                body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
-                headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
-            else:
-                body = request.model_dump_json(exclude_unset=True)
-                headers = {"Content-Type": "application/json"}
+            # Content-Type stays application/json so FastAPI still routes the
+            # body through Request.json(); the header picks the decoder.
+            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
@@ -264,6 +403,12 @@ class OpenAIHttpClient(OpenAIClient):
                     data=body,
                     headers=headers,
                 ) as http_response:
+                    response_clock = AdjustedSteadyClock()
+                    if self._request_perf_metrics:
+                        destination_time = get_steady_clock_now_in_seconds()
+                        response_clock = adjusted_clock_from_headers(
+                            http_response.headers, start_time, destination_time
+                        )
                     content_type = http_response.headers.get("Content-Type", "")
                     if self._request_perf_metrics:
                         role = _metrics_phase(self._role)
@@ -279,6 +424,7 @@ class OpenAIHttpClient(OpenAIClient):
                             http_response.headers,
                             role,
                             request_id=request_id,
+                            adjusted_clock=response_clock,
                         )
                         if hooks and response_metrics:
                             hooks.on_perf_metrics(
@@ -293,12 +439,20 @@ class OpenAIHttpClient(OpenAIClient):
                     if is_stream:
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
-                        async for line in self._response_generator(
-                            request, http_response, start_time, server, hooks, req_id
-                        ):
-                            lines_yielded += 1
-                            yield line
-                        # don't finish the request here since the response generator is not done yet
+                        async with aclosing(
+                            self._response_generator(
+                                request,
+                                http_response,
+                                start_time,
+                                server,
+                                hooks,
+                                req_id,
+                                response_clock,
+                            )
+                        ) as response_generator:
+                            async for line in response_generator:
+                                lines_yielded += 1
+                                yield line
                     else:
                         if http_response.status >= 400:
                             error_body = await http_response.text()
@@ -312,8 +466,6 @@ class OpenAIHttpClient(OpenAIClient):
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
-                        # finish the request after the successful response
-                        await self._finish_request(request, req_id=req_id)
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
                         )
@@ -334,9 +486,9 @@ class OpenAIHttpClient(OpenAIClient):
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
                 )
-                effective_max = self._max_retries
+                effective_max = max_retries
                 if is_transient_tcp:
-                    effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
+                    effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)
                 if attempt >= effective_max:
                     logger.error(
                         f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
@@ -348,6 +500,7 @@ class OpenAIHttpClient(OpenAIClient):
                     f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
                     traceback.format_exc(),
                 )
+                await self._router.renew_request(request, req_id=req_id)
                 await asyncio.sleep(self._retry_interval_sec)
                 self._metrics_collector.retry_requests.inc()
             except Exception as e:
@@ -364,12 +517,12 @@ class OpenAIHttpClient(OpenAIClient):
         server: str,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        response_clock: Optional[AdjustedSteadyClock] = None,
     ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
-        success = True
         try:
             last_token_time = start_time
             chunk_count = 0
@@ -425,7 +578,9 @@ class OpenAIHttpClient(OpenAIClient):
                     try:
                         headers = json.loads(data)
                         metrics = build_metrics_record_from_headers(
-                            headers, _metrics_phase(self._role)
+                            headers,
+                            _metrics_phase(self._role),
+                            adjusted_clock=response_clock,
                         )
                     except (TypeError, ValueError) as error:
                         logger.warning("Ignoring malformed perf metrics event: %s", error)
@@ -441,16 +596,7 @@ class OpenAIHttpClient(OpenAIClient):
         except aiohttp.ClientError as e:
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
-            self._metrics_collector.error_requests.inc()
-            success = False
             raise
-        except Exception:
-            self._metrics_collector.error_requests.inc()
-            success = False
-            raise
-        finally:
-            # finish the request after streaming response is done or error is raised
-            await self._finish_request(request, success=success, req_id=req_id)
 
     async def _finish_request(
         self,

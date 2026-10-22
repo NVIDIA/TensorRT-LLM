@@ -8,7 +8,7 @@ TensorRT LLM uses a [multi-stage Dockerfile](https://github.com/NVIDIA/TensorRT-
 |-------|---------|-----------|
 | **`devel`** | Development environment with all build dependencies pre-installed. No TensorRT LLM source or wheel included. Mount your source checkout and build inside. | [`devel`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel) |
 | **`wheel`** | Intermediate build stage. Extends `devel`, copies the source tree, and compiles the TensorRT LLM wheel. Not published as a standalone image. | -- |
-| **`release`** | Runtime image. Extends `devel`, installs the pre-built wheel from the `wheel` stage. Ready to use with no further compilation. | [`release`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) |
+| **`release`** | Runtime image. Extends `devel`, installs the pre-built wheel from the `wheel` stage, including the OpenEngine gRPC runtime. Ready to use with no further compilation. | [`release`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) |
 
 ## Pre-built Images on NGC
 
