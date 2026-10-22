@@ -1047,6 +1047,13 @@ class PyExecutor:
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
         self.pp_multi_stream_sample = os.environ.get(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
+        # Debug: compare each aggregated helix CP rank's schedule every
+        # iteration; see _check_helix_schedule_consistency.
+        check_requested = os.environ.get("TLLM_HELIX_AGG_CHECK_SCHEDULE",
+                                         "0") == "1"
+        self._check_helix_schedule = (check_requested
+                                      and self.dist.mapping.has_cp_helix()
+                                      and self.kv_cache_transceiver is None)
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches
@@ -4843,6 +4850,8 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
+        if getattr(self, "_check_helix_schedule", False):
+            self._check_helix_schedule_consistency(scheduled_batch)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
@@ -10554,6 +10563,47 @@ class PyExecutor:
                 and not req.is_finished)
             if should_recompute:
                 self._pause_recompute_request(req)
+
+    def _check_helix_schedule_consistency(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Raise unless every aggregated helix CP rank scheduled the same batch.
+
+        Each rank runs its own scheduler, so the ranks agree only while every
+        decision reads rank-invariant inputs; a divergence would otherwise show
+        up as a hang or corrupt KV in the next CP collective. Every rank raises
+        together, since each compares the same gathered summaries.
+
+        Only the non-PP executor loops run it: with pipeline parallelism the
+        first rank schedules and broadcasts the result. Set
+        TLLM_HELIX_AGG_CHECK_SCHEDULE on every rank, since a rank without it
+        skips the gather and the others wait on it.
+        """
+        summary = (
+            tuple((r.py_request_id, r.context_current_position,
+                   r.context_chunk_size, r.prompt_len, r.total_input_len_cp)
+                  for r in scheduled_batch.context_requests),
+            tuple((r.py_request_id, r.py_helix_decode_group_index)
+                  for r in scheduled_batch.generation_requests),
+            tuple(r.py_request_id for r in scheduled_batch.paused_requests),
+            tuple(r.py_request_id
+                  for r in scheduled_batch.recompute_paused_requests),
+        )
+        summaries = self.dist.cp_allgather(summary)
+        # Context requests must carry the full prompt: a per-rank slice would
+        # under-size the global ledger.
+        sliced = [
+            request_id
+            for request_id, _, _, prompt_len, total_len in summaries[0][0]
+            if prompt_len != total_len
+        ]
+        if sliced or any(s != summaries[0] for s in summaries[1:]):
+            per_rank = "\n".join(
+                f"  cp_rank {cp_rank} (ctx, gen, paused, recompute_paused): {s}"
+                for cp_rank, s in enumerate(summaries))
+            raise RuntimeError(
+                "Aggregated helix CP ranks disagree on the schedule"
+                f" (context requests without the full prompt: {sliced}):\n"
+                f"{per_rank}")
 
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.

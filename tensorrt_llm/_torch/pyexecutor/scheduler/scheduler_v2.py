@@ -630,7 +630,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if other.py_request_id in demoted_ids:
                         protected.add(other.py_request_id)
             return self._try_preempt_for_pages(
-                requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
+                requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids, req
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -1697,20 +1697,27 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if not success:
             if self.has_cp_helix:
-                # No-evict stance: every validated helix run used
-                # GUARANTEED_NO_EVICT semantics; eviction stays off under
-                # helix until a KV-pressure e2e validates it.
-                raise RuntimeError(
-                    f"[V2Scheduler] KV allocation failed for helix request "
-                    f"{req.py_request_id}; eviction is disabled under helix "
-                    f"CP pending end-to-end validation. Increase "
-                    f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
-                    f"or max_tokens (GLOBAL tokens across CP ranks, not "
-                    f"per-rank), or reduce concurrency."
+                if not self.enable_recompute_pause:
+                    # A disaggregated helix generation server cannot replay a
+                    # prefill, and suspending to a lower tier is not validated
+                    # under helix, so fail instead of stalling.
+                    raise RuntimeError(
+                        f"[V2Scheduler] KV allocation failed for helix request "
+                        f"{req.py_request_id}; a disaggregated helix generation "
+                        f"server cannot preempt a request, since it cannot "
+                        f"replay the prefill. Increase "
+                        f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
+                        f"or max_tokens (GLOBAL tokens across CP ranks, not "
+                        f"per-rank), or reduce concurrency."
+                    )
+                # Aggregated helix has a single hot GPU pool (no host, disk
+                # or GPU cold level), so a suspended request's pages have
+                # nowhere to go and recompute-pause is the only way to make
+                # room.
+            else:
+                req_it_end, success = self._try_evict_for_gen(
+                    req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
                 )
-            req_it_end, success = self._try_evict_for_gen(
-                req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
-            )
 
         if not success:
             req_it_end, success = self._try_recompute_pause_for_gen(
@@ -1730,10 +1737,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
-        # that frees no pages.
-        if self.kv_cache_manager.is_request_active(
-            req.py_request_id
-        ) and not self._has_pending_connector_load(req):
+        # that frees no pages. Under aggregated helix's single hot GPU pool
+        # suspending frees nothing either, and an active request stays
+        # eligible for preemption on behalf of a context request.
+        if (
+            not self.has_cp_helix
+            and self.kv_cache_manager.is_request_active(req.py_request_id)
+            and not self._has_pending_connector_load(req)
+        ):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
@@ -1804,6 +1815,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         inflight_request_ids: set[int],
         recompute_paused: RequestList,
         preempted_ids: set[int],
+        requester: LlmRequest,
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
 
@@ -1829,7 +1841,13 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Newest first, so the requests closest to completing keep their
         # pages and the pool drains instead of thrashing.
-        for i in range(len(requests_list) - 1, -1, -1):
+        stop = -1
+        if self.has_cp_helix:
+            # Only requests behind the requester, as the generation ladder
+            # does: an older victim would retake the pages on the next pass
+            # and preempt the requester in turn.
+            stop = next(i for i, r in enumerate(requests_list) if r is requester)
+        for i in range(len(requests_list) - 1, stop, -1):
             victim = requests_list[i]
             if victim.py_request_id in protected_ids:
                 continue
@@ -1968,10 +1986,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             return
 
-        # A connector rejects every tier below GPU at bring-up
-        # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering host_cache_size
-        # there is advice the user cannot act on.
-        if getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+        # Aggregated helix (`KVCacheManagerV2.__init__`) and a connector
+        # (`PyExecutor._reject_non_gpu_cache_tiers`) reject every tier below GPU
+        # at bring-up, so offering host_cache_size there is advice the user
+        # cannot act on.
+        if self.has_cp_helix and self.enable_recompute_pause:
+            remedy = (
+                "Aggregated helix runs a single hot GPU pool, so no secondary "
+                "tier can be configured. Increase "
+                "kv_cache_config.max_gpu_total_bytes (rank-local bytes), "
+                "max_tokens (GLOBAL tokens across CP ranks) or "
+                "free_gpu_memory_fraction, or lower max_batch_size."
+            )
+        elif getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
             remedy = (
                 "A KV connector is attached, which requires a GPU-only cache, "
                 "so no secondary tier can be configured. Increase "
