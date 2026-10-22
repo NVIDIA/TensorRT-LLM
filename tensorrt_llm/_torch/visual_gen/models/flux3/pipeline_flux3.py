@@ -533,6 +533,7 @@ class Flux3Pipeline(BasePipeline):
                 **inputs,
                 **prepared,
                 **target_kwargs,
+                timestep=timestep,
                 pag_single_layers=pag_single_layers,
                 pag_strength=pag_strength,
                 pag_samples=pag_samples,

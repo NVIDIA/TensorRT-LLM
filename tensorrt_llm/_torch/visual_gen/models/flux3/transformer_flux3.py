@@ -490,6 +490,7 @@ class Flux3Attention(Attention):
         need_v: bool = False,
         quantized: Fp8RowwiseQuantizedTensor | NVFP4Activation | None = None,
         sample_bounds: Bounds | None = None,
+        timestep: Tensor | None = None,
     ):
         """QKV -> QK-norm -> RoPE -> attention, returning the pre-out-projection
         result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). Fused path
@@ -507,7 +508,7 @@ class Flux3Attention(Attention):
                 self.apply_packed_qk_norm_rope(qkv, fc, fs)
                 qkv = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             q, k, v = qkv
-            attn = self._attend(q, k, v, sample_bounds)
+            attn = self._attend(q, k, v, sample_bounds, timestep)
             if need_v:
                 v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
                 return attn, v  # [B, H, S, D] for apply_flux3_pag
@@ -530,14 +531,21 @@ class Flux3Attention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q = apply_rotary_emb(q, cos, sin).to(v.dtype)
         k = apply_rotary_emb(k, cos, sin).to(v.dtype)
-        attn = self._attend(q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds)
+        attn = self._attend(q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep)
         if need_v:
             return attn, v.transpose(1, 2)  # v as [B, H, S, D] for apply_flux3_pag
         return attn
 
-    def _attend(self, q: Tensor, k: Tensor, v: Tensor, sample_bounds: Bounds | None) -> Tensor:
+    def _attend(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        sample_bounds: Bounds | None,
+        timestep: Tensor | None = None,
+    ) -> Tensor:
         if sample_bounds is None:
-            return self._attn_impl(q, k, v)
+            return self._attn_impl(q, k, v, timestep=timestep)
         if q.shape[0] == 1 and len(sample_bounds) > 1:
             length = sample_bounds[0][1]
             if (
@@ -550,7 +558,8 @@ class Flux3Attention(Attention):
             ):
                 # Equal packed segments are independent batch rows for every backend.
                 return self._attn_impl(
-                    *(x.view(len(sample_bounds), length, x.shape[-1]) for x in (q, k, v))
+                    *(x.view(len(sample_bounds), length, x.shape[-1]) for x in (q, k, v)),
+                    timestep=timestep,
                 ).reshape_as(q)
         output = torch.zeros_like(q)
         for start, end in sample_bounds:
@@ -563,7 +572,9 @@ class Flux3Attention(Attention):
                         k_sample.contiguous(),
                         v_sample.contiguous(),
                     )
-                output[:, start:end] = self._attn_impl(q_sample, k_sample, v_sample)
+                output[:, start:end] = self._attn_impl(
+                    q_sample, k_sample, v_sample, timestep=timestep
+                )
         return output
 
 
@@ -708,6 +719,7 @@ class Flux3ModeBlock(nn.Module):
         freqs: Tuple[Tensor, Tensor],
         mod: Tuple[Tensor, Tensor, Tensor],
         sample_bounds: Bounds | None = None,
+        timestep: Tensor | None = None,
     ) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
         x_mod = self._pertoken_adaln.apply(
@@ -717,7 +729,7 @@ class Flux3ModeBlock(nn.Module):
         mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
         quantized = _flux3_shared_fp8_input(self.attn, mlp_in, x_mod)
         attn = self.attn.attn_pre_out(
-            x_mod, freqs, quantized=quantized, sample_bounds=sample_bounds
+            x_mod, freqs, quantized=quantized, sample_bounds=sample_bounds, timestep=timestep
         )
 
         if self._fuse_proj_out:
@@ -842,6 +854,7 @@ class Flux3SingleStreamBlock(nn.Module):
         pag_strength: float = 0.0,
         sample_bounds: Bounds | None = None,
         pag_samples: tuple[int, ...] = (0,),
+        timestep: Tensor | None = None,
     ) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
         residual = combined
@@ -852,7 +865,12 @@ class Flux3SingleStreamBlock(nn.Module):
         mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
         quantized = _flux3_shared_fp8_input(self.attn, mlp_in, combined)
         attn, v = self.attn.attn_pre_out(
-            combined, freqs, need_v=True, quantized=quantized, sample_bounds=sample_bounds
+            combined,
+            freqs,
+            need_v=True,
+            quantized=quantized,
+            sample_bounds=sample_bounds,
+            timestep=timestep,
         )
         attn = apply_flux3_pag(attn, v, pag_strength, sample_bounds, pag_samples)
 
@@ -1272,6 +1290,7 @@ class Flux3Model(BaseDiffusionModel):
         *,
         layout: Layout | None = None,
         timesteps_ref: Tensor | None = None,
+        timestep: Tensor | None = None,
         pag_single_layers: list[int] | None = None,
         pag_strength: float = 1.0,
         pag_samples: tuple[int, ...] = (0,),
@@ -1310,7 +1329,11 @@ class Flux3Model(BaseDiffusionModel):
             state["tokens"] = self._early_adaln_runtime[name].prepare(state["tokens"], *mod[:2])
             for block in blocks:
                 state["tokens"] = block(
-                    state["tokens"], freqs, mod, sample_bounds=bounds(local_lengths[name])
+                    state["tokens"],
+                    freqs,
+                    mod,
+                    sample_bounds=bounds(local_lengths[name]),
+                    timestep=timestep,
                 )
             streams[name] = state
 
@@ -1335,6 +1358,7 @@ class Flux3Model(BaseDiffusionModel):
                 else 0.0,
                 sample_bounds=sample_bounds,
                 pag_samples=pag_samples,
+                timestep=timestep,
             )
         outputs = {}
         for name in self.final_layer:
