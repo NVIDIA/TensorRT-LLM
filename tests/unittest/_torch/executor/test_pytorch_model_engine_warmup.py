@@ -795,6 +795,133 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     assert runner._graphs.force_lora_graph_for_capture is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prefetch,coverage,cache_path,once",
+    [
+        ("1", None, None, True),
+        ("1", "1", None, False),
+        (None, None, None, False),
+        ("1", None, "autotuner.json", False),
+    ],
+    ids=["prefetch", "prefetch_jit_coverage", "prefetch_off", "prefetch_tactic_file"],
+)
+def test_flashinfer_mxfp8_graph_tuning_runs_once_per_shape(
+    prefetch: str | None,
+    coverage: str | None,
+    cache_path: str | None,
+    once: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With JIT prefetch on, the warmup-only pass tunes the FlashInfer MXFP8
+    decode-graph backends around the first forward of each (batch size, draft
+    length) shape only; a repeat (the advanced-sampling variant, the final
+    executor's second warmup) runs outside tuning mode, like the capture pass.
+    A forward that raises leaves its shape untuned. TLLM_WARMUP_JIT_COVERAGE=1,
+    which prefetch off implies, tunes every warmup-only forward, and so does a
+    TLLM_AUTOTUNER_CACHE_PATH, whose reload in the next pass replaces the
+    in-memory tactics."""
+    for name, value in (
+        ("TLLM_JIT_AHEAD", prefetch),
+        ("TLLM_WARMUP_JIT_COVERAGE", coverage),
+        ("TLLM_AUTOTUNER_CACHE_PATH", cache_path),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    runner = object.__new__(DecoderCudaGraphs)
+    runner._flashinfer_mxfp8_tuned_graph_shapes = set()
+    runner._tuning_flashinfer_mxfp8_graphs = False
+    tuned = []
+
+    @contextlib.contextmanager
+    def fake_autotune() -> Iterator[None]:
+        tuned.append("enter")
+        yield
+
+    def forward(shape):
+        with runner._flashinfer_mxfp8_graph_tuning(*shape):
+            pass
+
+    with patch("tensorrt_llm._torch.modules.linear.flashinfer_mxfp8_autotune", fake_autotune):
+        # Capture pass (not warmup-only): never tunes.
+        forward((32, 3))
+        assert tuned == []
+
+        # Warmup-only pass, greedy then advanced sampling over the same shapes.
+        runner._tuning_flashinfer_mxfp8_graphs = True
+        for _variant in ("greedy", "advanced sampling"):
+            for shape in ((32, 3), (1, 3)):
+                forward(shape)
+        assert len(tuned) == (2 if once else 4)
+        assert runner._flashinfer_mxfp8_tuned_graph_shapes == {(32, 3), (1, 3)}
+
+        # A failed forward does not mark its shape tuned.
+        with pytest.raises(RuntimeError, match="forward failed"):
+            with runner._flashinfer_mxfp8_graph_tuning(8, 3):
+                raise RuntimeError("forward failed")
+        assert (8, 3) not in runner._flashinfer_mxfp8_tuned_graph_shapes
+        tuned.clear()
+
+        # The final executor's warmup-only pass reuses the tuned shapes.
+        forward((32, 3))
+        forward((8, 3))
+        assert len(tuned) == (1 if once else 2)
+        assert (8, 3) in runner._flashinfer_mxfp8_tuned_graph_shapes
+
+
+@pytest.mark.cpu_only
+def test_cuda_graph_warmup_scopes_flashinfer_mxfp8_tuning_to_warmup_only_pass() -> None:
+    """run_cuda_graph_warmup arms the per-shape FlashInfer MXFP8 tuning only
+    for the warmup-only pass of an engine with FlashInfer MXFP8 layers, and
+    disarms it afterwards, including when the capture raises."""
+    method = object.__new__(MXFP8LinearMethod)
+    method.backend = "auto"
+    method._flashinfer_mxfp8 = object()
+    runner = object.__new__(DecoderCudaGraphs)
+    runner.model = SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)])
+    runner._config = SimpleNamespace(
+        enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED
+    )
+    runner._lora = SimpleNamespace(cuda_graph_manager=None)
+    runner.cuda_graph_runner = SimpleNamespace(enabled=True, is_warmup_only=True)
+    runner._metrics = {}
+    runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    runner._flashinfer_mxfp8_tuned_graph_shapes = set()
+    runner._tuning_flashinfer_mxfp8_graphs = False
+    resource_manager = ResourceManager({})
+    armed = []
+
+    def capture(_resources):
+        armed.append(runner._tuning_flashinfer_mxfp8_graphs)
+
+    with (
+        patch.object(runner, "_capture_generation_cuda_graphs", side_effect=capture) as gen,
+        patch.object(runner, "_capture_additional_cuda_graphs"),
+    ):
+        runner.run_cuda_graph_warmup(resource_manager)
+        runner.cuda_graph_runner.is_warmup_only = False
+        with patch.object(runner, "_capture_prefill_cuda_graphs"):
+            runner.run_cuda_graph_warmup(resource_manager)
+        assert armed == [True, False]
+        assert runner._tuning_flashinfer_mxfp8_graphs is False
+
+        runner.cuda_graph_runner.is_warmup_only = True
+        gen.side_effect = RuntimeError("capture failed")
+        with pytest.raises(RuntimeError, match="capture failed"):
+            runner.run_cuda_graph_warmup(resource_manager)
+        assert runner._tuning_flashinfer_mxfp8_graphs is False
+
+        # Without FlashInfer MXFP8 layers the warmup-only pass does not tune.
+        gen.side_effect = capture
+        method._flashinfer_mxfp8 = None
+        armed.clear()
+        runner.run_cuda_graph_warmup(resource_manager)
+        assert armed == [False]
+
+
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
 def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     engine, resource_manager = _build_engine_and_resource_manager()
@@ -1047,6 +1174,115 @@ class TestWarmupCleanup(unittest.TestCase):
             model_engine.warmup(resource_manager)
 
         model_engine._runner.warmup.assert_called_once_with(resource_manager)
+
+    @pytest.mark.cpu_only
+    def test_jit_prefetch_deep_gemm_starts_after_prewarms_before_forwards(self) -> None:
+        """With JIT prefetch on, the DeepGEMM helpers start once the pre-JIT
+        prewarms (sampling module, Engram, CSA2 sparse indexer) are done and
+        before the first warmup forward; with it off they never start. The
+        engine's hook is unset again after warmup."""
+        runner = object.__new__(DecoderRunner)
+        warmup = runner._warmup = object.__new__(DecoderWarmup)
+        warmup._warmup_timer = _WarmupTimer(rank=0)
+        warmup._metrics = {}
+        warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        warmup.before_warmup_forwards_callable = None
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine._metrics = warmup._metrics
+        model_engine.moe_load_balancer = None
+        model_engine.is_warmup = False
+        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._runner = runner
+        model_engine.model = torch.nn.Module()
+        model_engine.llm_args = SimpleNamespace(sparse_attention_config=None)
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = Mock()
+        events = []
+
+        def record(name):
+            return lambda *args, **kwargs: events.append(name)
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup.warmup_sampling_module",
+                side_effect=record("sampling"),
+            ),
+            patch(
+                "tensorrt_llm._torch.jit_prefetch.start_flashinfer_build",
+                return_value=False,
+            ),
+            patch.object(warmup, "_tunes_flashinfer_mxfp8", return_value=False),
+            patch.object(warmup, "_prewarm_engram_kernels", side_effect=record("engram")),
+            patch.object(warmup, "_prewarm_csa2_sparse_indexer", side_effect=record("csa2")),
+            patch.object(
+                warmup, "_prewarm_minimax_m3_msa_indexer", side_effect=record("msa_indexer")
+            ),
+            patch.object(warmup, "_warmup_scheduled_forwards", side_effect=record("forwards")),
+            patch.object(
+                model_engine, "_start_deep_gemm_prefetch", side_effect=record("dg_helpers")
+            ),
+            patch.object(model_engine, "_init_jit_prefetch", side_effect=record("init_prefetch")),
+            patch(
+                "tensorrt_llm._torch.modules.mamba.jit_prefetch_decode.start_recording",
+                side_effect=record("record"),
+            ),
+            patch(
+                "tensorrt_llm._torch.modules.mamba.jit_prefetch_decode.stop_recording",
+                side_effect=record("stop_record"),
+            ),
+        ):
+            for prefetch in (True, False):
+                with self.subTest(prefetch=prefetch):
+                    events.clear()
+                    env = {"TLLM_JIT_AHEAD": "1"} if prefetch else {}
+                    with patch.dict(os.environ, env, clear=False):
+                        os.environ.pop("TLLM_JIT_PREFETCH", None)
+                        if not prefetch:
+                            os.environ.pop("TLLM_JIT_AHEAD", None)
+                        model_engine._warmup_impl(resource_manager)
+                    phases = ["sampling", "engram", "csa2", "msa_indexer", "forwards"]
+                    if prefetch:
+                        phases = ["record", *phases[:4], "dg_helpers", "forwards", "stop_record"]
+                    self.assertEqual(events, [*phases, "init_prefetch"])
+                    self.assertIsNone(runner.before_warmup_forwards_callable)
+
+    @pytest.mark.cpu_only
+    def test_jit_prefetch_deep_gemm_priority_token_counts(self) -> None:
+        """The DeepGEMM FP8 Linear provider builds first every token count
+        warmup and graph capture launch: each CUDA graph batch size, times the
+        tokens per decode step; before those, on every rank, those of the
+        warmup forwards ahead of graph capture: the attention warmup's (one
+        generation request, one context token, and both together) and
+        max_num_tokens, the general warmup's and the autotuner's pure-context
+        shape."""
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.model = torch.nn.Module()
+        model_engine.max_num_tokens = 9216
+        model_engine.original_max_total_draft_tokens = 5
+        model_engine.max_total_draft_tokens = 5
+        model_engine._cuda_graph_batch_sizes = [1, 2, 4]
+        model_engine.attn_runtime_features = SimpleNamespace(
+            chunked_prefill=False, cache_reuse=False, chunk_size=0,
+            chunked_prefill_buffer_batch_size=1,
+        )  # fmt: skip
+        captured = {}
+
+        def provider(model, max_num_tokens, priority_ms, first_ms):
+            captured.update(
+                max_num_tokens=max_num_tokens,
+                priority_ms=sorted(priority_ms),
+                first_ms=sorted(first_ms),
+            )
+            return Mock()
+
+        with (
+            patch("tensorrt_llm._torch.jit_prefetch_deep_gemm.FP8LinearDeepGemmProvider", provider),
+            patch("tensorrt_llm._torch.jit_prefetch_deep_gemm.DeepGemmMoEProvider"),
+        ):
+            model_engine._deep_gemm_providers()
+        self.assertEqual(captured["max_num_tokens"], 9216)
+        self.assertEqual(captured["priority_ms"], [1, 2, 4, 6, 12, 24])
+        self.assertEqual(captured["first_ms"], [1, 6, 7, 9216])
 
     @pytest.mark.cpu_only
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
@@ -2012,3 +2248,194 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "role,prefetch,coverage,grid",
+    [
+        (None, "1", None, True),
+        ("generation", "1", None, True),
+        ("context", "1", None, False),
+        ("context", None, None, True),
+        ("context", "1", "1", True),
+        ("context", None, "0", False),
+    ],
+)
+def test_attention_warmup_skips_gen_fmha_grid_on_context_workers(
+    monkeypatch: pytest.MonkeyPatch, role, prefetch, coverage, grid
+) -> None:
+    """With the JIT-coverage passes off (JIT prefetch on, or
+    TLLM_WARMUP_JIT_COVERAGE=0), a disaggregated context worker runs warmup's
+    attention forward without the TRTLLM-Gen generation FMHA's NVRTC grid;
+    every other role, and a context worker with the passes on, keeps it."""
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    for name, value in (
+        ("TRTLLM_DISAGG_ROLE", role),
+        ("TLLM_JIT_AHEAD", prefetch),
+        ("TLLM_WARMUP_JIT_COVERAGE", coverage),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    warmup = object.__new__(DecoderWarmup)
+    warmup._config = SimpleNamespace(
+        attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
+        max_total_draft_tokens=0,
+        is_spec_decode=False,
+        spec_config=None,
+    )
+    warmup._inputs = SimpleNamespace(guided_decoder=None)
+    warmup._warmup_timer = _WarmupTimer(rank=0)
+    warmup._dummy_requests = SimpleNamespace(
+        create_warmup_request=lambda *a, **k: object(),
+        release_batch_context=lambda *a, **k: contextlib.nullcontext(object()),
+    )
+    warmup._agreement = SimpleNamespace(should_run_warmup_batch=lambda *a, **k: True)
+    warmup._graphs = SimpleNamespace(no_cuda_graph=contextlib.nullcontext)
+    seen = []
+    warmup._forward_warmup = lambda *a, trtllm_gen_jit_warmup=False, **k: seen.append(
+        trtllm_gen_jit_warmup
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    # A Mamba-hybrid model (Kimi K3) runs only the generation request here.
+    warmup._run_attention_warmup(Mock(), can_run_general_warmup=False)
+    assert seen == [grid]
+
+
+@pytest.mark.cpu_only
+def test_disagg_server_forwards_its_role_to_the_executor_ranks(monkeypatch: pytest.MonkeyPatch):
+    """The disaggregated server passes its role to the executor's MPI ranks
+    through env_overrides (they do not inherit the server's environment),
+    keeping any override the config already sets."""
+    from tensorrt_llm.commands import serve
+
+    launched = {}
+    cfg = SimpleNamespace(
+        server_configs=[SimpleNamespace(type="ctx", hostname="h", port=1)],
+        allow_request_chat_template=False,
+        internal_request_auth_key=None,
+    )
+    monkeypatch.setenv("TLLM_DISAGG_INSTANCE_IDX", "0")
+    monkeypatch.setattr(serve, "parse_disagg_config_file", lambda path: cfg)
+    monkeypatch.setattr(serve, "launch_server", lambda **kw: launched.update(kw))
+    monkeypatch.setattr(serve, "mpi_rank", lambda: 0, raising=False)
+    serve._launch_disaggregated_server("cfg.yaml", {"env_overrides": {"A": "1"}})
+    assert launched["llm_args"]["env_overrides"] == {"A": "1", "TRTLLM_DISAGG_ROLE": "context"}
+    assert os.environ["TRTLLM_DISAGG_ROLE"] == "context"
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+
+
+@pytest.mark.cpu_only
+def test_load_time_deep_gemm_limits_lead_with_the_warmup_token_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The DeepGEMM limits the model loader starts the helpers from: every
+    CUDA graph token count, and before those the token counts of warmup's
+    first forwards (one generation request, one context token, both
+    together, a max_num_tokens context batch), with the draft length the
+    arguments give. Prefetch off, or limits unknown before the model is
+    loaded, leave the start to warmup."""
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.attn_runtime_features = AttentionRuntimeFeatures()
+    engine.original_max_total_draft_tokens = 6
+    engine.batch_size = 2
+    engine.max_num_tokens = 14
+    engine.llm_args = SimpleNamespace(cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
+    monkeypatch.delenv("TLLM_JIT_AHEAD", raising=False)
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    assert engine._load_time_deep_gemm_limits() is None
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
+    # Graph batch sizes above max_batch_size are dropped, as the engine does.
+    assert engine._load_time_deep_gemm_limits() == {
+        "max_num_tokens": 14,
+        "priority_ms": [1, 2, 7, 14],
+        "first_ms": (7, 1, 8, 14),
+    }
+    engine.max_num_tokens = None
+    assert engine._load_time_deep_gemm_limits() is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pending", [True, False])
+def test_warmup_joins_the_sampling_build_the_model_loader_started(
+    monkeypatch: pytest.MonkeyPatch, pending: bool
+) -> None:
+    """A sampling-module helper the model loader started while the weights
+    loaded is joined before CUDA graph capture: warmup neither builds the
+    module in place nor starts a second helper. Without one, warmup starts
+    its own helper, as before."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    warmup = object.__new__(DecoderWarmup)
+    warmup._warmup_timer = _WarmupTimer(rank=0)
+    warmup._metrics = {}
+    warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    warmup.before_warmup_forwards_callable = None
+    resource_manager = Mock()
+    events = []
+    monkeypatch.setattr(jp, "flashinfer_build_pending", lambda name: pending)
+    monkeypatch.setattr(jp, "start_flashinfer_build", lambda *a: events.append("start") or True)
+    monkeypatch.setattr(jp, "start_mxfp8_tune_builds", lambda *a: False)
+    monkeypatch.setattr(jp, "cancel_flashinfer_build", lambda: events.append("cancel"))
+    monkeypatch.setattr(
+        decoder_warmup_module, "warmup_sampling_module", lambda: events.append("in_place")
+    )
+    for name in (
+        "_tunes_flashinfer_mxfp8",
+        "_prewarm_engram_kernels",
+        "_prewarm_csa2_sparse_indexer",
+        "_prewarm_minimax_m3_msa_indexer",
+    ):
+        monkeypatch.setattr(warmup, name, lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(
+        warmup,
+        "_warmup_scheduled_forwards",
+        lambda rm, kv, sampling_in_helper: events.append(f"forwards(helper={sampling_in_helper})"),
+        raising=False,
+    )
+    warmup._warmup_scheduled(resource_manager, Mock())
+    assert events == (
+        ["forwards(helper=True)", "cancel"]
+        if pending
+        else ["start", "forwards(helper=True)", "cancel"]
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("per_iter", [True, False])
+def test_plan_jit_prefetch_binds_the_executor_and_plans_only_with_plan_per_iter(
+    per_iter: bool,
+) -> None:
+    """The engine's per-batch hook binds the executor thread for every
+    scheduled batch, so the JIT stats and the waits on helper compiles see its
+    launches; it plans the batch (DeepGEMM, CuTe DSL, Triton providers) only
+    with TLLM_JIT_PLAN_PER_ITER on. Warmup batches are never planned."""
+    prefetcher = Mock(plan_per_iter=per_iter)
+    engine = object.__new__(PyTorchModelEngine)
+    engine._jit_prefetcher = prefetcher
+    engine._is_warmup = False
+    engine._runner = object()  # not a DecoderRunner: no CUDA graph runner, every batch eager
+    ctx = SimpleNamespace(context_chunk_size=5, context_current_position=0,
+                          py_num_compressed_tokens=0)  # fmt: skip
+    scheduled = SimpleNamespace(context_requests=[ctx], generation_requests=[])
+
+    engine._plan_jit_prefetch(scheduled, Mock())
+
+    prefetcher.bind_executor_thread.assert_called_once_with()
+    planned = [prefetcher.plan_deep_gemm, prefetcher.plan_cute_dsl, prefetcher.plan]
+    assert [m.called for m in planned] == [per_iter] * 3
+    if per_iter:
+        prefetcher.plan_deep_gemm.assert_called_once_with(5)
+        prefetcher.plan_cute_dsl.assert_called_once_with([5])
+
+    prefetcher.reset_mock()
+    engine._is_warmup = True
+    engine._plan_jit_prefetch(scheduled, Mock())
+    assert not prefetcher.bind_executor_thread.called and not prefetcher.plan.called

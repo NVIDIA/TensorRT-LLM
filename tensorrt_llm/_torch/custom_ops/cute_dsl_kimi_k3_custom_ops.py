@@ -160,6 +160,17 @@ def _cute_int_type(dtype):
 
 # ========== Fused K1+K2+K3 compilation cache ==========
 _fused_k123_cache = {}
+
+# Set by JitPrefetcher: (cache_key) -> compiled function exported by a CPU-only
+# helper, or None to compile here as usual.
+k123_loader = None
+
+
+def _jit_prefetch_load_k123(cache_key):
+    loader = k123_loader
+    return loader(cache_key) if loader is not None else None
+
+
 # id(cu_seqlens) -> bool. Skips per-call GPU->CPU sync on subsequent calls
 # when the same cu_seqlens tensor is reused (typical training/inference loop).
 _varlen_pure_cache = {}
@@ -296,6 +307,16 @@ _akk_inv_cache = {}
 # ========== K4 persistent (varlen via cu_seqlens) compilation cache ==========
 _k4p_cache = {}
 _k4p_tm_ws = {}
+
+# Set by JitPrefetcher: (cache_key) -> compiled K4 exported by a CPU-only
+# helper, or None to compile here as usual.
+k4_loader = None
+
+
+def _jit_prefetch_load_k4(cache_key):
+    loader = k4_loader
+    return loader(cache_key) if loader is not None else None
+
 
 # ========== Shape-keyed scratch caches ==========
 # The scratch caches below are keyed by the packed prefill token count. In the
@@ -624,25 +645,27 @@ def _launch_k4_persistent(
     )
     k4_fn = _k4p_cache.get(cache_key)
     if k4_fn is None:
-        host_fn = _k4p_make_host(num_sm=num_sm)
-        k4_fn = cute.compile(
-            host_fn,
-            a_ct,
-            b_ct,
-            v_ct,
-            q_ct,
-            aqc_ct,
-            kg_ct,
-            o_ct,
-            gk_ct,
-            s_ct,
-            state_indices_ct,
-            cu_ct,
-            co_ct,
-            tm_ct,
-            N_seqs,
-            stream,
-        )
+        k4_fn = _jit_prefetch_load_k4(cache_key)
+        if k4_fn is None:
+            host_fn = _k4p_make_host(num_sm=num_sm)
+            k4_fn = cute.compile(
+                host_fn,
+                a_ct,
+                b_ct,
+                v_ct,
+                q_ct,
+                aqc_ct,
+                kg_ct,
+                o_ct,
+                gk_ct,
+                s_ct,
+                state_indices_ct,
+                cu_ct,
+                co_ct,
+                tm_ct,
+                N_seqs,
+                stream,
+            )
         _k4p_cache[cache_key] = k4_fn
 
     args = (
@@ -838,7 +861,10 @@ def _launch_fused_k123_inv(
             use_beta_sigmoid=use_beta_sigmoid_in_kernel,
             varlen_pure=varlen_pure,
         )
-        _fused_k123_cache[cache_key] = cute.compile(host_fn, *ct_args)
+        loaded = _jit_prefetch_load_k123(cache_key)
+        _fused_k123_cache[cache_key] = (
+            loaded if loaded is not None else cute.compile(host_fn, *ct_args)
+        )
     k123_fn = _fused_k123_cache[cache_key]
     k123_fn(*ct_args)
 

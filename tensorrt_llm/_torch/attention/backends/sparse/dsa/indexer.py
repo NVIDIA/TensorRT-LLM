@@ -88,6 +88,29 @@ except ImportError:
 
 _DG_SCHEDULE_BLOCK_KV = 64
 
+# Compiled-in parameters of every DeepGEMM indexer-logits call this process has
+# made, read by the JIT prefetcher (jit_prefetch_deep_gemm.DsaIndexerProvider)
+# to compile the variants a later batch will need (the other next_n).
+DG_INDEXER_VARIANTS: set = set()
+
+
+def _record_mqa_variant(num_heads, head_dim, is_fp4, clean_logits, weights_dtype) -> None:
+    """Record the compiled-in values of one DeepGEMM MQA-logits call (the
+    kernel's head count, after any FP4 padding) for JIT prefetch."""
+    DG_INDEXER_VARIANTS.add(
+        (
+            "mqa",
+            int(num_heads),
+            int(head_dim),
+            bool(is_fp4),
+            bool(is_fp4),
+            False,
+            bool(clean_logits),
+            "float32",
+            str(weights_dtype).replace("torch.", ""),
+        )
+    )
+
 
 def use_cute_dsl_paged_mqa_logits(requested: bool) -> bool:
     """Whether the CuTe DSL paged MQA logits kernel runs instead of DeepGEMM.
@@ -1728,6 +1751,7 @@ class Indexer(nn.Module):
                 q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
                 q_scale_2d = F.pad(q_scale_2d, (0, padded_heads - heads))
                 weights = F.pad(weights, (0, padded_heads - heads))
+            _record_mqa_variant(padded_heads, self.head_dim, True, clean_logits, weights.dtype)
             return fp8_fp4_mqa_logits(
                 (q_fp8, q_scale_2d),
                 (k_fp4_bytes, k_scale_int32),
@@ -1736,6 +1760,7 @@ class Indexer(nn.Module):
                 cu_seqlen_ke,
                 clean_logits=clean_logits,
             )
+        _record_mqa_variant(q_fp8.shape[1], self.head_dim, False, clean_logits, weights.dtype)
         return fp8_mqa_logits(
             q_fp8,
             (k_fp8, k_scale.reshape(-1)),
@@ -1757,6 +1782,20 @@ class Indexer(nn.Module):
         q_scale: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
+        DG_INDEXER_VARIANTS.add(
+            (
+                "paged",
+                q_decode.shape[1],
+                self.n_heads,
+                self.head_dim,
+                k_cache.shape[1],
+                self.use_fp4,
+                self.use_fp4,
+                False,
+                "float32",
+                str(weights_decode.dtype).replace("torch.", ""),
+            )
+        )
         if self.use_fp4:
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale),

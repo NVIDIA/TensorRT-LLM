@@ -539,3 +539,61 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     # The remaining shape is never attempted: recovering locally would leave
     # peers waiting in a forward this rank has abandoned.
     engine._dummy_requests.create_warmup_request.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "env,covered,forwards,forced",
+    [
+        # Tuned ahead: only the multi-sequence pass, no forced initial states,
+        # with prefetch or without it.
+        ({"TLLM_JIT_AHEAD": "1"}, True, 1, 0),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, True, 1, 0),
+        ({"TLLM_JIT_AHEAD": "1", "TLLM_WARMUP_JIT_COVERAGE": "1"}, True, 1, 0),
+        # Prefetch without tune ahead: only the forced-initial-states pass.
+        ({"TLLM_JIT_AHEAD": "1"}, False, 1, 1),
+        ({"TLLM_JIT_AHEAD": "1", "TLLM_JIT_TUNE_AHEAD": "0"}, True, 1, 1),
+        # Both passes.
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, False, 2, 1),
+        (
+            {"TLLM_JIT_AHEAD": "1", "TLLM_JIT_TUNE_AHEAD": "0", "TLLM_WARMUP_JIT_COVERAGE": "1"},
+            True,
+            2,
+            1,
+        ),
+        ({}, True, 2, 1),
+    ],
+)
+def test_mamba_warmup_passes_with_prefetch_tune_ahead(
+    env, covered, forwards, forced, monkeypatch
+) -> None:
+    """With JIT prefetch tuning ahead, and every recurrent layer covered by it,
+    the Mamba warmup skips its forced-initial-states pass; otherwise the
+    passes are those of prefetch without tune ahead, or of no prefetch."""
+    for var in (
+        "TLLM_JIT_AHEAD",
+        "TLLM_JIT_PREFETCH",
+        "TLLM_JIT_TUNE_AHEAD",
+        "TLLM_WARMUP_JIT_COVERAGE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    engine, resource_manager = _mamba_engine()
+    engine._dummy_requests.create_warmup_request = mock.Mock(return_value=object())
+    engine._forward_warmup = mock.Mock()
+    engine._mamba_prefill_tuned_ahead = mock.Mock(return_value=covered)
+
+    with (
+        _no_cuda_side_effects(),
+        mock.patch.object(warmup_module, "MambaHybridCacheManager", _StandInMambaCacheManager),
+        mock.patch.object(
+            warmup_module.Mamba2Metadata,
+            "force_initial_states_for_warmup",
+            side_effect=contextlib.nullcontext,
+        ) as force_initial_states,
+        mock.patch.object(warmup_module, "clear_memory_buffers"),
+    ):
+        engine._run_mamba_hybrid_warmup(resource_manager)
+
+    assert engine._forward_warmup.call_count == forwards
+    assert force_initial_states.call_count == forced

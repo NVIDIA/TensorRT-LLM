@@ -211,6 +211,13 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: per-call device multiply.
         self._native_bmm1_scale: float | None = None
 
+    @staticmethod
+    def native_decode_geometry(num_query_heads: int, head_dim: int) -> bool:
+        """Whether small generation batches of a layer with this TP-local query
+        geometry run the native TRTLLM-GEN decode kernel on this device (for a
+        BF16 latent cache)."""
+        return (num_query_heads, head_dim) == (16, 512) and get_sm_version() in (100, 103)
+
     @classmethod
     def support_fused_rope(cls) -> bool:
         # Fully NoPE: there is no rotary embedding anywhere on this path.
@@ -637,10 +644,14 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         native_supported = (
             q.is_cuda
             and q.dtype == torch.bfloat16
-            and (native_fp8 or (kv_rows.dtype == torch.bfloat16 and num_query_heads == 16))
-            and head_dim == 512
+            and (
+                (native_fp8 and head_dim == 512 and get_sm_version() in (100, 103))
+                or (
+                    kv_rows.dtype == torch.bfloat16
+                    and self.native_decode_geometry(num_query_heads, head_dim)
+                )
+            )
             and num_cache_rows % 32 == 0
-            and get_sm_version() in (100, 103)
         )
         if native_supported:
             # Reserve shared scratch and per-layer counters during prefill/profiling.

@@ -48,6 +48,7 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
+from .. import jit_prefetch_deep_gemm
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_2in_kernel, silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
@@ -2152,6 +2153,20 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
+@lru_cache(maxsize=1)
+def _deep_gemm_jit_tuning_needed() -> bool:
+    """Whether the single-tactic DeepGemm swap-AB ops go through the autotuner.
+
+    Their only tactic needs no tuning; the tuning pass (over
+    ``deep_gemm_jit_warmup_buckets``) exists to compile the DeepGemm layouts
+    during warmup. When JIT prefetch compiles those layouts in CPU-only
+    helpers instead, the ops call their single tactic directly.
+    """
+    from ..jit_prefetch import warmup_jit_coverage_enabled
+    from ..jit_prefetch_deep_gemm import supported
+    return warmup_jit_coverage_enabled() or not supported()
+
+
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2201,12 +2216,23 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
+        # Time only the DeepGEMM call: an allocator stall in the quantize or
+        # the output allocation above must not read as a compile.
+        observed = jit_prefetch_deep_gemm.launch_observer is not None
+        if observed:
+            t0 = jit_prefetch_deep_gemm.note_launch(input.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1))
         deep_gemm.fp8_gemm_nt(
             (a, a_sf),
             (weight, weight_scale),
             output,
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
+        if observed:
+            jit_prefetch_deep_gemm.note_launch_done(input.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1), t0)
         return output
 
 
@@ -2265,12 +2291,21 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             device=activation.device,
             dtype=self.output_dtype,
         )
+        observed = jit_prefetch_deep_gemm.launch_observer is not None
+        if observed:
+            t0 = jit_prefetch_deep_gemm.note_launch(activation.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1))
         deep_gemm.fp8_gemm_nt(
             (activation, activation_scale),
             (weight, weight_scale),
             output,
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
+        if observed:
+            jit_prefetch_deep_gemm.note_launch_done(activation.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1), t0)
         return output
 
 
@@ -2285,12 +2320,15 @@ def fp8_prequantized_swap_ab_gemm(
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
     runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
-    _, best_tactic = AutoTuner.get().choose_one(
-        "trtllm::fp8_prequantized_swap_ab_gemm",
-        [runner],
-        Fp8PrequantizedSwapABGemmRunner.tuning_config,
-        [activation, activation_scale, weight, weight_scale],
-    )
+    if _deep_gemm_jit_tuning_needed():
+        _, best_tactic = AutoTuner.get().choose_one(
+            "trtllm::fp8_prequantized_swap_ab_gemm",
+            [runner],
+            Fp8PrequantizedSwapABGemmRunner.tuning_config,
+            [activation, activation_scale, weight, weight_scale],
+        )
+    else:
+        best_tactic = 0
     return runner(
         inputs=[activation, activation_scale, weight, weight_scale],
         tactic=best_tactic,
@@ -2338,12 +2376,15 @@ def fp8_swap_ab_gemm(
         disable_ue8m0_cast,
         quant_tactic=quant_tactic,
     )
-    _, best_tactic = tuner.choose_one(
-        "trtllm::fp8_swap_ab_gemm",
-        [gemm_runner],
-        fp8SwapABGemmRunner.tuning_config,
-        [input, weight, weight_scale],
-    )
+    if _deep_gemm_jit_tuning_needed():
+        _, best_tactic = tuner.choose_one(
+            "trtllm::fp8_swap_ab_gemm",
+            [gemm_runner],
+            fp8SwapABGemmRunner.tuning_config,
+            [input, weight, weight_scale],
+        )
+    else:
+        best_tactic = 0
     return gemm_runner(
         inputs=[input, weight, weight_scale],
         tactic=best_tactic,

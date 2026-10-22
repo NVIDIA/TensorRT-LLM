@@ -229,6 +229,10 @@ class DecoderWarmup:
     shapes, pre-populates the memory pool and captures the CUDA graphs.
     """
 
+    # Called once the pre-JIT prewarms are done, before the first warmup
+    # forward (the engine starts JIT compile-ahead helpers there).
+    before_warmup_forwards_callable: Callable[[], None] | None = None
+
     def __init__(
         self,
         *,
@@ -276,6 +280,84 @@ class DecoderWarmup:
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
         return self._inputs.guided_decoder
+
+    def _tunes_flashinfer_mxfp8(self) -> bool:
+        """Whether ``_run_autotuner_warmup`` will run its FlashInfer MXFP8 pass.
+
+        That pass builds FlashInfer's CUTLASS MXFP8 GEMM module the first time
+        it tunes ``mm_mxfp8``. This mirrors the pass's selection without
+        changing any layer's backend, so JIT compile ahead can start that
+        build at the beginning of warmup; the autotuner warmup still decides.
+        """
+        return self.flashinfer_mxfp8_pass_selected(
+            self.model,
+            self.mapping,
+            enable_autotuner=self._config.enable_autotuner,
+            context_warmups_supported=self._context_warmups_supported,
+            cuda_graphs=self._graphs.enabled,
+            compile_all_batches=(
+                self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
+            ),
+        )
+
+    @staticmethod
+    def flashinfer_mxfp8_pass_selected(
+        model: torch.nn.Module,
+        mapping: Mapping,
+        *,
+        enable_autotuner: bool,
+        context_warmups_supported: bool,
+        cuda_graphs: bool,
+        compile_all_batches: bool,
+    ) -> bool:
+        """Whether a runner's warmup, on ``model``, runs the autotuner
+        warmup's FlashInfer MXFP8 pass: ``_tunes_flashinfer_mxfp8`` with the
+        engine's settings as arguments, so JIT compile ahead can also decide
+        it once the model is constructed (``jit_prefetch.start_model_builds``).
+
+        ``context_warmups_supported`` is the runner class's own flag,
+        ``cuda_graphs`` whether the decode CUDA graph runner is enabled and
+        ``compile_all_batches`` whether ``torch.compile`` runs the decode
+        batches as well as the prefill ones.
+        """
+        from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+
+        # The autotuner warmup runs only with the autotuner on, for a runner
+        # with context warmups; context parallelism other than Helix skips
+        # warmup altogether.
+        if (
+            not enable_autotuner
+            or not context_warmups_supported
+            or (mapping.cp_size > 1 and not mapping.has_cp_helix())
+        ):
+            return False
+        methods = [
+            quant_method
+            for module in model.modules()
+            if isinstance(
+                (quant_method := getattr(module, "quant_method", None)), MXFP8LinearMethod
+            )
+        ]
+        # FlashInfer MXFP8 runs on the CUTLASS-layout operands through the
+        # trtllm::flashinfer_mm_mxfp8 op (MXFP8LinearMethod._load_flashinfer).
+        if not any(method.use_cutlass for method in methods):
+            return False
+        if getattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", None) is None:
+            return False
+        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return any(
+                method.backend == "flashinfer"
+                or (method.backend == "auto" and not compile_all_batches)
+                for method in methods
+            )
+        return (
+            cuda_graphs
+            and not compile_all_batches
+            and any(
+                getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
+                for module in model.modules()
+            )
+        )
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
@@ -344,17 +426,71 @@ class DecoderWarmup:
         # CUDA graph capture pass exercises the non-greedy sampler, so with
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
-        with self._warmup_timer.phase(
-            "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
-        ):
-            warmup_sampling_module()
-            self._prewarm_engram_kernels(kv_cache_manager)
-            self._prewarm_csa2_sparse_indexer(kv_cache_manager)
-            self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
+        from tensorrt_llm._torch.jit_prefetch import (
+            cancel_flashinfer_build,
+            flashinfer_build_pending,
+            prefetch_enabled,
+            start_flashinfer_build,
+            start_mxfp8_tune_builds,
+        )
 
-        if kv_cache_manager is None:
-            logger.info("Skipping warm up as no KV Cache manager allocated.")
-            return
+        # With JIT compile ahead on, a CPU-only helper builds the sampling
+        # module (started by the model loader while the weights loaded, or
+        # here) while the eager warmup forwards below run on the GPU; it is
+        # joined (and the module loaded) before CUDA graph capture, the first
+        # phase that can launch the sampling kernels, together with any helper
+        # the model loader started on a module of the model's layers. Another
+        # builds the FlashInfer modules the autotuner warmup's FlashInfer MXFP8
+        # pass needs, if it runs and the model loader has not started them
+        # already; the pass waits on their file locks.
+        sampling_in_helper = kv_cache_manager is not None and (
+            flashinfer_build_pending("sampling") or start_flashinfer_build()
+        )
+        if kv_cache_manager is not None and prefetch_enabled():
+            start_mxfp8_tune_builds(self._tunes_flashinfer_mxfp8())
+        try:
+            with self._warmup_timer.phase(
+                "sampling_module_prewarm",
+                metrics=self._metrics,
+                metric_name="sampling_warmup_seconds",
+            ):
+                if not sampling_in_helper:
+                    warmup_sampling_module()
+                self._prewarm_engram_kernels(kv_cache_manager)
+                self._prewarm_csa2_sparse_indexer(kv_cache_manager)
+                self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
+
+            if kv_cache_manager is None:
+                logger.info("Skipping warm up as no KV Cache manager allocated.")
+                return None
+            if self.before_warmup_forwards_callable is not None:
+                self.before_warmup_forwards_callable()
+            return self._warmup_scheduled_forwards(
+                resource_manager, kv_cache_manager, sampling_in_helper
+            )
+        finally:
+            # No-op once joined. Warmup raised before the join, or the engine
+            # has no KV cache to warm up (a helper the model loader started
+            # is then not joined): stop the helpers rather than wait for
+            # them; their modules are built in place on first use.
+            cancel_flashinfer_build()
+
+    def _join_sampling_module_build(self) -> None:
+        """Wait for the helpers building FlashInfer modules (the sampling
+        module, a module of the model's layers), then load the sampling module."""
+        from tensorrt_llm._torch.jit_prefetch import wait_flashinfer_build
+
+        with self._warmup_timer.phase(
+            "sampling_module_join", metrics=self._metrics, metric_name="sampling_warmup_seconds"
+        ):
+            wait_flashinfer_build()
+            warmup_sampling_module()
+
+    def _warmup_scheduled_forwards(
+        self, resource_manager: ResourceManager, kv_cache_manager, sampling_in_helper: bool
+    ) -> EagerWorkspaceReclaimer | None:
+        """The warmup phases that run forwards, after the pre-JIT prewarms."""
+        from tensorrt_llm._torch.jit_prefetch import flashinfer_builds_pending
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
@@ -366,7 +502,9 @@ class DecoderWarmup:
                 logger.info(
                     f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
                 )
-                return
+                if sampling_in_helper or flashinfer_builds_pending():
+                    self._join_sampling_module_build()
+                return None
 
         # Create AutoTuner singleton in eager context before any compiled forward.
         # Otherwise the first get() can happen inside torch.compile tracing and
@@ -460,6 +598,8 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        if sampling_in_helper or flashinfer_builds_pending():
+            self._join_sampling_module_build()
         with self._warmup_timer.phase("cuda_graph_capture"):
             self._graphs.warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -593,6 +733,14 @@ class DecoderWarmup:
         except ImportError:
             return
         if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+            return
+        from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
+        from tensorrt_llm._torch.jit_prefetch import warmup_jit_coverage_enabled
+
+        if not warmup_jit_coverage_enabled() and jdg.supports_indexer():
+            # JIT compile ahead builds this kernel's variants (one per next_n
+            # on SM100, where it has no batch-size template parameter) in
+            # CPU-only helpers; see jit_prefetch_deep_gemm.DsaIndexerProvider.
             return
         try:
             from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -890,6 +1038,23 @@ class DecoderWarmup:
                 "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
             )
 
+        # A disaggregated context worker never decodes a real request (its
+        # only generation steps are attention-DP padding dummies), so the
+        # TRTLLM-Gen generation FMHA's NVRTC grid over every batch size x KV
+        # length (tens of seconds per rank) is a JIT-coverage pass it can
+        # drop with the others. The forward still runs, on the kernels of its
+        # own shape.
+        from tensorrt_llm._torch.jit_prefetch import (
+            disagg_context_only,
+            warmup_jit_coverage_enabled,
+        )
+
+        gen_fmha_grid = not disagg_context_only() or warmup_jit_coverage_enabled()
+        if not gen_fmha_grid:
+            logger.info(
+                "Context-only worker: skipping the TRTLLM-Gen generation FMHA JIT grid in warmup"
+            )
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._dummy_requests.create_warmup_request(
                 resource_manager, num_tokens=num_tokens, num_gen_requests=num_gen_requests
@@ -921,7 +1086,7 @@ class DecoderWarmup:
                         resource_manager,
                         enable_spec_decode=self._config.is_spec_decode,
                         runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                        trtllm_gen_jit_warmup=True,
+                        trtllm_gen_jit_warmup=gen_fmha_grid,
                     )
                     torch.cuda.synchronize()
 
@@ -1195,6 +1360,27 @@ class DecoderWarmup:
         if ran_native_forward:
             self._completed_autotuner_warmup_num_tokens = curr_max_num_tokens
 
+    def _mamba_prefill_tuned_ahead(self) -> bool:
+        """True if JIT tune ahead covers the autotune keys of the Mamba
+        warmup's forced-initial-states pass on this rank: every recurrent
+        layer the rank holds is a Mamba2 mixer running the Triton SSD kernels
+        (Nemotron-H), whose variants ``MambaSSDProvider`` compiles and tunes,
+        or it holds none. GDN and KDA layers read the same initial-state
+        metadata and are autotuned on keys no provider tunes ahead."""
+        from tensorrt_llm._torch.modules.mamba.jit_prefetch import MambaSSDProvider
+        from tensorrt_llm._torch.modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
+
+        try:
+            shapes = MambaSSDProvider(self.model).shapes
+            linear_attn = bool(LinearAttnProvider(self.model))
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(
+                "Mamba hybrid warmup kept: cannot tell whether JIT tune ahead covers "
+                f"it. {type(e).__name__}: {e}"
+            )
+            return False
+        return all(s.triton_ssd for s in shapes) and not linear_attn
+
     def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager) -> None:
         """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
 
@@ -1222,6 +1408,11 @@ class DecoderWarmup:
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
+        With JIT tune ahead on (``TLLM_JIT_TUNE_AHEAD``), the autotune
+        benchmark of (2)'s keys runs at the end of warmup instead, so (2) is
+        skipped and (1) runs. Otherwise, with JIT compile ahead on, its helpers
+        compile (1)'s variants, so only (2) runs, to autotune on the GPU.
+
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
@@ -1231,6 +1422,18 @@ class DecoderWarmup:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
             return
+        from tensorrt_llm._torch.jit_prefetch import tune_ahead_enabled, warmup_jit_coverage_enabled
+
+        jit_coverage = warmup_jit_coverage_enabled()
+        # With tune ahead on, the autotune benchmark of the HAS_INITSTATES
+        # keys runs on the GPU at the end of warmup
+        # (MambaSSDProvider.tune_batches), so the forced-initial-states pass
+        # below has nothing left to do. A pipeline stage holds only its own
+        # layers, so ranks can disagree; the gate itself only reads the
+        # environment, so every rank enters this agreement or none does.
+        tuned_ahead = tune_ahead_enabled() and self._agreement.agree_flag(
+            self._mamba_prefill_tuned_ahead()
+        )
 
         token_num_upper_bound = min(
             self._config.max_num_tokens,
@@ -1273,7 +1476,7 @@ class DecoderWarmup:
         # Resolved the same way the runtime does, so warmup can't prime the
         # alignment variant of a class the runtime never instantiates.
         metadata_cls = resolve_mamba_metadata_cls(self.model)
-        chunk_alignment = metadata_cls.prefill_chunk_alignment
+        chunk_alignment = metadata_cls.prefill_chunk_alignment if jit_coverage else None
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates,
         #  chunk_aligned)
@@ -1281,6 +1484,21 @@ class DecoderWarmup:
             (capped_num_tokens, 0, False, False, False),
             (capped_num_tokens, 0, False, True, True),
         ]
+        if tuned_ahead:
+            # Only the multi-sequence pass runs, compile ahead or not: it is
+            # the first multi-request context forward of the warmup, which
+            # loads the attention backend's kernels for such batches
+            # (_run_attention_warmup runs no context shape on Mamba hybrid
+            # models). Its SSD autotune keys are those of a batch without
+            # cached prefixes, tuned by the autotuner pass's forward, else
+            # here, as without tune ahead.
+            mamba_warmup_shapes = mamba_warmup_shapes[:1]
+        elif not jit_coverage:
+            # JIT compile ahead compiles the multi-sequence variants the first
+            # pass exists for. The HAS_INITSTATES pass stays: its kernels are
+            # autotuned on new keys (initial states, chunk indices), and that
+            # benchmark has to run on the GPU.
+            mamba_warmup_shapes = mamba_warmup_shapes[1:]
 
         autotuner_enabled = self._config.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)

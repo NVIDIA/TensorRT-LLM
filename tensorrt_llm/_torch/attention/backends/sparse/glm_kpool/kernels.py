@@ -86,6 +86,38 @@ def gather_fp8_kv_rows(
 
 _FP32_MIN = torch.finfo(torch.float32).min
 
+# The batch-independent part of every kpool_score / kpool_update /
+# kpool_expand launch seen so far, one entry per distinct launch class (phase,
+# layer layout): ``{kernel: {fields_key: fields}}``. Filled by the warmup
+# forwards; ``jit_prefetch.GlmKpoolProvider`` plans every batch-dependent
+# variant of each entry.
+KPOOL_LAUNCH_TEMPLATE: dict = {}
+
+
+def _record_template(name: str, **fields) -> None:
+    key = tuple(sorted(fields.items()))
+    entries = KPOOL_LAUNCH_TEMPLATE.setdefault(name, {})
+    if key not in entries:
+        entries[key] = fields
+
+
+def _aligned(t: torch.Tensor) -> bool:
+    return (t.storage_offset() * t.element_size()) % 16 == 0
+
+
+def _layout(t: torch.Tensor) -> tuple:
+    """Shape, strides, 16-byte alignment and dtype of a batch-independent
+    tensor (a pool or a parameter)."""
+    return (tuple(t.shape), tuple(t.stride()), _aligned(t), t.dtype)
+
+
+def _row_input(t: torch.Tensor) -> tuple:
+    """dtype of a 1-D per-row input, and whether it is a slice of a longer
+    buffer: such a slice starts at a batch-dependent element (e.g. the
+    generation rows' ``kv_lens[num_contexts:]``), so its 16-byte alignment
+    can change from batch to batch."""
+    return (t.dtype, t.numel() < t.untyped_storage().nbytes() // t.element_size())
+
 
 @triton.jit
 def _kpool_update_kernel(
@@ -181,6 +213,18 @@ def kpool_update(
     n = positions.shape[0]
     if n == 0:
         return
+    if not positions.is_meta:
+        _record_template(
+            "update",
+            index_pool=_layout(index_pool),
+            block_tables=(block_tables.stride(0), _aligned(block_tables), block_tables.dtype),
+            positions=_row_input(positions),
+            request_ids=None if request_ids is None else _row_input(request_ids),
+            ape=_layout(ape),
+            tokens_per_block=tokens_per_block,
+            head_dim=head_dim,
+            kpool=kpool,
+        )
     _kpool_update_kernel[(n,)](
         index_pool,
         block_tables,
@@ -469,6 +513,25 @@ def kpool_score(
     if precision == "bf16" and not bf16_dot:
         precision = "tf32"
     bp = 64
+    if not q.is_meta:
+        _record_template(
+            "score",
+            num_heads=num_heads,
+            q=(q.dtype, _aligned(q)),
+            weights=(weights.stride(0), weights.stride(1), _aligned(weights), weights.dtype),
+            index_pool=_layout(index_pool),
+            block_tables=(block_tables.stride(0), _aligned(block_tables), block_tables.dtype),
+            kv_lens=_row_input(kv_lens),
+            request_ids=None if request_ids is None else _row_input(request_ids),
+            tokens_per_block=tokens_per_block,
+            num_pools_max=num_pools_max,
+            head_dim=head_dim,
+            kpool=kpool,
+            q_scale=q_scale,
+            w_scale=w_scale,
+            precision=precision,
+            rows_per_program=rows,
+        )
     score_blocks = triton.cdiv(num_pools_max, bp)
     if max_kv_len is not None:
         score_blocks = min(score_blocks, triton.cdiv(max(0, int(max_kv_len)) // kpool, bp))
@@ -609,6 +672,19 @@ def kpool_expand(
     out = torch.empty(n, out_width, dtype=torch.int32, device=selected.device)
     if n == 0:
         return out
+    if not selected.is_meta:
+        _record_template(
+            "expand",
+            selected=(select_k, selected.stride(0), _aligned(selected), selected.dtype),
+            kv_lens=_row_input(kv_lens),
+            block_tables=(block_tables.stride(0), _aligned(block_tables), block_tables.dtype),
+            request_ids=None if request_ids is None else _row_input(request_ids),
+            tokens_per_block=tokens_per_block,
+            base_row=base_row,
+            rows_per_slot=rows_per_slot,
+            kpool=kpool,
+            out_width=out_width,
+        )
     _kpool_expand_kernel[(n,)](
         selected,
         kv_lens,

@@ -430,6 +430,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
             if layer_idx in kv_cache_manager.layer_offsets
         }
+        # The compiled forward takes these views as graph inputs. Their page
+        # count is the pool's, which differs between the KV-cache estimation
+        # pass and the final executor, so it stays symbolic: a static one would
+        # recompile the whole decoder when the final pool replaces the
+        # estimation one. Only an opaque custom op reads the views.
+        for views in self.msa_layer_cache_tensors.values():
+            for view in views:
+                if view is not None:
+                    torch._dynamo.maybe_mark_dynamic(view, 0)
         capture_graph = self.is_cuda_graph
         buffers = self.cuda_graph_buffers
         max_num_sequences = int(self.max_num_sequences)

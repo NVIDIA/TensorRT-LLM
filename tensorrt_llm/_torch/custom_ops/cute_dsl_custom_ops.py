@@ -602,6 +602,14 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
                 num_non_exiting_tiles, global_sf, *others)
 
 
+# Set by the JIT prefetcher (jit_prefetch_cute_dsl.install_fp8_gemm_loader):
+# (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_active_clusters) ->
+# the TVM-FFI FP8 blockwise GEMM a CPU-only helper exported, or None to
+# compile it here as usual. CuteDSLFp8BlackwellRunner and
+# CuteDSLFp8BlackwellBmmRunner compile the same kernel.
+fp8_gemm_loader = None
+
+
 def get_dense_gemm_approximate_cta_nums(
         M: int, N: int, tile_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int]) -> int:
@@ -5132,25 +5140,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    1,  # batch
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_cute_tensor,
-                    max_active_clusters=max_active_clusters,
-                    stream=stream,
-                    options="--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
-                )
+                # A TVM-FFI kernel is shape-generic: the tactic and the
+                # cluster occupancy alone select it, so a CPU-only JIT
+                # prefetch helper may have exported it already.
+                loader = fp8_gemm_loader
+                compiled_gemm = (loader(use_2cta_instrs, mma_tiler_mn,
+                                        cluster_shape_mn, max_active_clusters)
+                                 if self.use_tvm_ffi and loader is not None else
+                                 None)
+                if compiled_gemm is None:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        1,  # batch
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
@@ -5452,25 +5469,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    batch_size,
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_cute_tensor,
-                    max_active_clusters=max_active_clusters,
-                    stream=stream,
-                    options="--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
-                )
+                # The same TVM-FFI kernel as CuteDSLFp8BlackwellRunner's: the
+                # batch is a runtime scalar like every extent, so a CPU-only
+                # JIT prefetch helper's export of the tactic serves both.
+                loader = fp8_gemm_loader
+                compiled_gemm = (loader(use_2cta_instrs, mma_tiler_mn,
+                                        cluster_shape_mn, max_active_clusters)
+                                 if self.use_tvm_ffi and loader is not None else
+                                 None)
+                if compiled_gemm is None:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]

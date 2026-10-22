@@ -184,6 +184,10 @@ class DecoderCudaGraphs:
     and ``_capture_additional_cuda_graphs``.
     """
 
+    # Whether the current warmup-only pass tunes the FlashInfer MXFP8
+    # decode-graph backends (armed by run_cuda_graph_warmup).
+    _tuning_flashinfer_mxfp8_graphs = False
+
     def __init__(
         self,
         *,
@@ -224,6 +228,10 @@ class DecoderCudaGraphs:
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
+        # Generation CUDA graph shapes (batch size, draft length) whose
+        # warmup-only forward ran under the FlashInfer MXFP8 decode-graph
+        # tuning (see run_cuda_graph_warmup).
+        self._flashinfer_mxfp8_tuned_graph_shapes: set[tuple[int, int]] = set()
 
     @property
     def force_lora_graph_for_capture(self) -> bool | None:
@@ -646,7 +654,6 @@ class DecoderCudaGraphs:
                 if not context_only:
                     from tensorrt_llm._torch.modules.linear import (
                         MXFP8LinearMethod,
-                        flashinfer_mxfp8_autotune,
                         flashinfer_mxfp8_decode_graph_capture,
                     )
 
@@ -662,18 +669,58 @@ class DecoderCudaGraphs:
                         )
                         and quant_method.needs_flashinfer_autotune
                     ]
-                    flashinfer_autotune_context = (
-                        flashinfer_mxfp8_autotune()
-                        if is_warmup_only and flashinfer_methods
-                        else contextlib.nullcontext()
+                    # Each warmup-only forward enters the tuning in
+                    # _flashinfer_mxfp8_graph_tuning.
+                    self._tuning_flashinfer_mxfp8_graphs = is_warmup_only and bool(
+                        flashinfer_methods
                     )
-                    with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
-                        self._capture_generation_cuda_graphs(resource_manager)
+                    try:
+                        with flashinfer_mxfp8_decode_graph_capture():
+                            self._capture_generation_cuda_graphs(resource_manager)
+                    finally:
+                        self._tuning_flashinfer_mxfp8_graphs = False
                     self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
         if not is_warmup_only:
             self._capture_prefill_cuda_graphs(resource_manager)
+
+    @contextlib.contextmanager
+    def _flashinfer_mxfp8_graph_tuning(self, batch_size: int, draft_len: int) -> Iterator[None]:
+        """Tune the FlashInfer MXFP8 decode-graph backends around one
+        warmup-only forward of a generation CUDA graph shape.
+
+        In the warmup-only pass, MXFP8 layers tune their per-bucket quantize
+        and GEMM backends (``mxfp8_quantize_gemm_autotuned``), and FlashInfer's
+        autotuner runs in tuning mode for every GEMM. A tuning-mode lookup of
+        a cached tactic still rebuilds every tuning profile of the op, seconds
+        per forward on a model with hundreds of MXFP8 GEMMs. A shape's tactics
+        depend only on its GEMM shapes, which follow from the batch size and
+        draft length, and stay in the process-wide autotuner caches. So with
+        JIT compile ahead on (``warmup_jit_coverage_enabled`` false) a shape is
+        tuned once per runner: a repeat (the advanced-sampling and LoRA
+        variants, the final executor's warmup) runs outside tuning mode and
+        looks the same tactics up, as the capture pass does.
+        ``TLLM_WARMUP_JIT_COVERAGE=1``, the default without compile ahead,
+        tunes every warmup-only forward. So does ``TLLM_AUTOTUNER_CACHE_PATH``:
+        the autotuner warmup of the next pass reloads that file, which
+        replaces the in-memory tactics with the file's.
+        """
+        from tensorrt_llm._torch.jit_prefetch import warmup_jit_coverage_enabled
+
+        shape = (batch_size, draft_len)
+        if not self._tuning_flashinfer_mxfp8_graphs or (
+            shape in self._flashinfer_mxfp8_tuned_graph_shapes
+            and not warmup_jit_coverage_enabled()
+            and os.environ.get("TLLM_AUTOTUNER_CACHE_PATH") is None
+        ):
+            yield
+            return
+        from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_autotune
+
+        with flashinfer_mxfp8_autotune():
+            yield
+        self._flashinfer_mxfp8_tuned_graph_shapes.add(shape)
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
@@ -777,12 +824,13 @@ class DecoderCudaGraphs:
                                 enable_spec_decode=enable_spec_decode,
                                 runtime_draft_len=draft_len,
                             )
-                            self._forward_warmup(
-                                batch,
-                                resource_manager,
-                                enable_spec_decode=enable_spec_decode,
-                                runtime_draft_len=draft_len,
-                            )
+                            with self._flashinfer_mxfp8_graph_tuning(bs, draft_len):
+                                self._forward_warmup(
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=enable_spec_decode,
+                                    runtime_draft_len=draft_len,
+                                )
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
