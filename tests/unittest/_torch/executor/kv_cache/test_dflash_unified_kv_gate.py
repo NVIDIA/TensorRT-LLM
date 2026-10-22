@@ -61,7 +61,6 @@ def _creator(*, is_disagg, target, draft, tp_size=1, draft_windows=None):
         _allow_separate_draft_kv_cache=True,
         draft_len_schedule=None,
     )
-    creator._draft_model_engine = None
     creator._draft_config = draft
     creator._mapping = SimpleNamespace(
         pp_size=1,
