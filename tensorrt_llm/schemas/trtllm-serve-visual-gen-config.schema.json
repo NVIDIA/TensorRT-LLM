@@ -980,7 +980,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -1104,6 +1104,6 @@
       "status": "prototype"
     }
   },
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --visual_gen_args",
+  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --visual_gen_args",
   "type": "object"
 }
