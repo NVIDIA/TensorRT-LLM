@@ -1250,6 +1250,157 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert "location" in all_params
         assert "SF" in all_params
 
+    def test_no_parameter_call_has_empty_json_arguments(self, parser):
+        """Test non-streaming calls without parameters serialize as an object."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        text = ("<tool_call>\n"
+                "<function=run_tests>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [no_parameter_tool])
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "run_tests"
+        assert result.calls[0].parameters == "{}"
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_streaming_no_parameter_call_has_empty_json_arguments(self):
+        """Test token-by-token streaming emits one valid empty object."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        parser = self.make_parser()
+        text = ("<tool_call>\n"
+                "<function=run_tests>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        argument_deltas = []
+        for token in text:
+            result = parser.parse_streaming_increment(token,
+                                                      [no_parameter_tool])
+            argument_deltas.extend(call.parameters for call in result.calls
+                                   if call.parameters)
+
+        arguments = "".join(argument_deltas)
+        assert arguments == "{}"
+        assert json.loads(arguments) == {}
+
+    def test_streaming_partial_tool_call_prefix_preserves_normal_text(self):
+        """Test partial tool-call prefixes do not lose surrounding text."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        parser = self.make_parser()
+
+        result = parser.parse_streaming_increment("Hello <tool_cal",
+                                                  [no_parameter_tool])
+        assert result.normal_text == "Hello "
+        assert not result.calls
+
+        result = parser.parse_streaming_increment(
+            "l><function=run_tests></function></tool_call>",
+            [no_parameter_tool])
+        assert result.normal_text == ""
+        assert len(result.calls) == 2
+        assert result.calls[0].name == "run_tests"
+        assert result.calls[0].parameters == ""
+        assert result.calls[1].parameters == "{}"
+
+    def test_streaming_parameter_and_parallel_calls_keep_valid_arguments(
+            self, sample_tools):
+        """Test parameterized and parallel calls retain valid JSON arguments."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        parser = self.make_parser()
+        text = ("<tool_call>\n"
+                "<function=get_weather>\n"
+                "<parameter=location>NYC</parameter>\n"
+                "</function>\n"
+                "</tool_call>\n"
+                "<tool_call>\n"
+                "<function=run_tests>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        arguments_by_tool = {}
+        for token in text:
+            result = parser.parse_streaming_increment(
+                token, sample_tools + [no_parameter_tool])
+            for call in result.calls:
+                if call.parameters:
+                    arguments_by_tool.setdefault(call.tool_index,
+                                                 []).append(call.parameters)
+
+        assert json.loads("".join(arguments_by_tool[0])) == {"location": "NYC"}
+        assert json.loads("".join(arguments_by_tool[1])) == {}
+
+    def test_streaming_parameterless_call_before_parameterized_call(
+            self, sample_tools):
+        """Test adjacent calls in one increment keep arguments isolated."""
+        no_parameter_tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="run_tests",
+                description="Run the tests",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+        parser = self.make_parser()
+        text = ("<tool_call><function=run_tests></function></tool_call>"
+                "<tool_call><function=get_weather>"
+                "<parameter=location>NYC</parameter></function></tool_call>")
+
+        result = parser.parse_streaming_increment(
+            text, sample_tools + [no_parameter_tool])
+        arguments_by_tool = {}
+        for call in result.calls:
+            if call.parameters:
+                arguments_by_tool.setdefault(call.tool_index,
+                                             []).append(call.parameters)
+
+        assert json.loads("".join(arguments_by_tool[0])) == {}
+        assert json.loads("".join(arguments_by_tool[1])) == {"location": "NYC"}
+
     def test_parse_streaming_increment_end_token_handling(
             self, sample_tools, parser):
         """Test streaming parser handles end token correctly."""
