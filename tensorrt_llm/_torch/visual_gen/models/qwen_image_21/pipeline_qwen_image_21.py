@@ -19,11 +19,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import (
-    ExtraParamSchema,
-    RefSlotSpec,
-    RoleSpec,
-)
+from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
@@ -202,7 +198,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
         return pack_latents(latents, batch_size, num_channels_latents, height, width)
 
     @staticmethod
-    def _unpack_latents(latents: torch.Tensor, height: int, width: int, vae_scale_factor: int) -> torch.Tensor:
+    def _unpack_latents(
+        latents: torch.Tensor, height: int, width: int, vae_scale_factor: int
+    ) -> torch.Tensor:
         return unpack_latents(latents, height, width, vae_scale_factor)
 
     def _init_transformer(self) -> None:
@@ -245,8 +243,12 @@ class QwenImage21Pipeline(QwenImagePipeline):
             logger.info("Loading Qwen3-VL processor for Qwen-Image 2.1...")
             self.processor = Qwen3VLProcessor.from_pretrained(checkpoint_dir, subfolder="processor")
             self.tokenizer = self.processor.tokenizer
-            sys_message = [{"role": "system", "content": [{"type": "text", "text": self.sys_prompt}]}]
-            sys_tokens = self.processor.apply_chat_template(sys_message, tokenize=True, return_dict=False)
+            sys_message = [
+                {"role": "system", "content": [{"type": "text", "text": self.sys_prompt}]}
+            ]
+            sys_tokens = self.processor.apply_chat_template(
+                sys_message, tokenize=True, return_dict=False
+            )
             self._drop_idx = len(sys_tokens[0])
             self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
 
@@ -274,8 +276,10 @@ class QwenImage21Pipeline(QwenImagePipeline):
                 self.vae.enable_tiling()
 
         if PipelineComponent.SCHEDULER not in skip_components:
-            logger.info("Loading native Qwen-Image 2.1 FlowMatch scheduler...")
-            self.scheduler = self.scheduler_class.from_pretrained(checkpoint_dir, subfolder="scheduler")
+            logger.info("Loading Diffusers FlowMatch scheduler with Qwen-Image 2.1 defaults...")
+            self.scheduler = self.scheduler_class.from_pretrained(
+                checkpoint_dir, subfolder="scheduler"
+            )
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None:
@@ -326,7 +330,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
             "image_vae": "diffusers.AutoencoderKLQwenImage21 fallback",
         }
 
-    def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    def _extract_masked_hidden(
+        self, hidden_states: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, ...]:
         bool_mask = mask.bool()
         valid_lengths = bool_mask.sum(dim=1)
         selected = hidden_states[bool_mask]
@@ -369,7 +375,12 @@ class QwenImage21Pipeline(QwenImagePipeline):
                         img = white
                     condition_pil_list.append(img)
 
-        processor_kwargs = {"text": prompts, "padding": True, "padding_side": "left", "return_tensors": "pt"}
+        processor_kwargs = {
+            "text": prompts,
+            "padding": True,
+            "padding_side": "left",
+            "return_tensors": "pt",
+        }
         if not is_t2i:
             processor_kwargs["images"] = condition_pil_list
         model_inputs = self.processor(**processor_kwargs).to(device)
@@ -380,7 +391,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
             "output_hidden_states": True,
         }
         if not is_t2i and hasattr(model_inputs, "pixel_values"):
-            forward_kwargs.update(pixel_values=model_inputs.pixel_values, image_grid_thw=model_inputs.image_grid_thw)
+            forward_kwargs.update(
+                pixel_values=model_inputs.pixel_values, image_grid_thw=model_inputs.image_grid_thw
+            )
         if hasattr(model_inputs, "mm_token_type_ids"):
             forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
 
@@ -392,7 +405,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
             handle.remove()
         hidden_states = outputs.hidden_states[-1]
 
-        split_hidden_states = list(self._extract_masked_hidden(hidden_states, model_inputs.attention_mask))
+        split_hidden_states = list(
+            self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+        )
         split_hidden_states = [e[self._drop_idx :] for e in split_hidden_states]
         image_pad_mask = [
             (sample_ids[sample_mask.bool()] == self._img_token_id)
@@ -400,15 +415,22 @@ class QwenImage21Pipeline(QwenImagePipeline):
         ]
         image_pad_mask = [e[self._drop_idx :] for e in image_pad_mask]
 
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+        attn_mask_list = [
+            torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states
+        ]
         max_seq_len = max(e.size(0) for e in split_hidden_states)
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            [
+                torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))])
+                for u in split_hidden_states
+            ]
         )
         encoder_attention_mask = torch.stack(
             [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
         )
-        image_pad_mask = torch.stack([torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in image_pad_mask])
+        image_pad_mask = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in image_pad_mask]
+        )
         return prompt_embeds, encoder_attention_mask, image_pad_mask
 
     def _encode_prompt(
@@ -419,11 +441,19 @@ class QwenImage21Pipeline(QwenImagePipeline):
         image: list | None = None,
         num_images_per_prompt: int = 1,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(prompt, image=image, device=device)
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(
+            prompt, image=image, device=device
+        )
         batch_size, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1).view(batch_size * num_images_per_prompt, seq_len, -1)
-        prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt).view(batch_size * num_images_per_prompt, seq_len)
-        image_pad_mask = image_pad_mask.repeat(1, num_images_per_prompt).view(batch_size * num_images_per_prompt, seq_len)
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1).view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
+        prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt).view(
+            batch_size * num_images_per_prompt, seq_len
+        )
+        image_pad_mask = image_pad_mask.repeat(1, num_images_per_prompt).view(
+            batch_size * num_images_per_prompt, seq_len
+        )
         if prompt_embeds_mask is not None and prompt_embeds_mask.all():
             prompt_embeds_mask = None
         prompt_embeds = prompt_embeds[:, :max_sequence_length].to(dtype=self.dtype, device=device)
@@ -458,8 +488,16 @@ class QwenImage21Pipeline(QwenImagePipeline):
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents = latents.to(self.vae.dtype)
         z_dim = self.vae.config.z_dim
-        latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = torch.tensor(self.vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(self.vae.config.latents_std)
+            .view(1, z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False)[0]
         if image.shape[1] >= 3:
@@ -533,7 +571,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
                 elif isinstance(img, np.ndarray):
                     pil_img = PILImage.fromarray(img)
                 else:
-                    raise ValueError(f"image accepts bytes, PIL image, numpy array, or list thereof, got {type(img).__name__}")
+                    raise ValueError(
+                        f"image accepts bytes, PIL image, numpy array, or list thereof, got {type(img).__name__}"
+                    )
                 condition_images.append(pil_img)
             calculated_width, calculated_height, _ = calculate_dimensions(
                 output_resolution * output_resolution,
@@ -543,7 +583,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
             width = width or calculated_width
 
         if height is None or width is None:
-            raise ValueError("height and width must be set for text-to-image requests without references.")
+            raise ValueError(
+                "height and width must be set for text-to-image requests without references."
+            )
         multiple_of = self.vae_scale_factor * 2
         width = int(width) // multiple_of * multiple_of
         height = int(height) // multiple_of * multiple_of
@@ -552,7 +594,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
         prompt_embeds, prompt_embeds_mask, image_pad_mask = self._encode_prompt(
             prompt, device, max_sequence_length, image=condition_images
         )
-        num_channels_latents = int(getattr(self.transformer.config, "in_channels", self.latent_channels))
+        num_channels_latents = int(
+            getattr(self.transformer.config, "in_channels", self.latent_channels)
+        )
         latents, input_images_latents = self._prepare_latents(
             batch_size,
             num_channels_latents,
@@ -567,10 +611,16 @@ class QwenImage21Pipeline(QwenImagePipeline):
         else:
             latent_model_token_count = latents.shape[1]
         del latent_model_token_count
-        img_shapes = [[(1, height // self.vae_scale_factor, width // self.vae_scale_factor)]] * batch_size
+        img_shapes = [
+            [(1, height // self.vae_scale_factor, width // self.vae_scale_factor)]
+        ] * batch_size
         img_mask = append_target_slots(image_pad_mask.bool(), latents.shape[1])
 
-        sigmas_np = sigmas if sigmas is not None else np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        sigmas_np = (
+            sigmas
+            if sigmas is not None
+            else np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        )
         mu = calculate_shift(
             latents.shape[1],
             self.scheduler.config.get("base_image_seq_len", 256),
@@ -584,16 +634,26 @@ class QwenImage21Pipeline(QwenImagePipeline):
 
         timer.mark_denoise_start()
         kv_cache = None
-        cache_enabled = bool(use_kv_cache) and hasattr(self.transformer, "transformer_blocks") and getattr(
-            self.transformer.config, "causal_condition", True
+        cache_enabled = (
+            bool(use_kv_cache)
+            and hasattr(self.transformer, "transformer_blocks")
+            and getattr(self.transformer.config, "causal_condition", True)
         )
         if cache_enabled:
             kv_cache = QwenImage21KVCache(len(self.transformer.transformer_blocks))
-        logger.info("Denoising Qwen-Image 2.1 (%d steps, kv_cache=%s)...", len(timesteps), cache_enabled)
+        logger.info(
+            "Denoising Qwen-Image 2.1 (%d steps, kv_cache=%s)...", len(timesteps), cache_enabled
+        )
         for i, t in self._profile_denoise_steps(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            kv_cache_mode = "extract" if cache_enabled and i == 0 else ("cached" if cache_enabled else None)
-            latent_model_input = latents if input_images_latents is None else torch.cat([input_images_latents, latents], dim=1)
+            kv_cache_mode = (
+                "extract" if cache_enabled and i == 0 else ("cached" if cache_enabled else None)
+            )
+            latent_model_input = (
+                latents
+                if input_images_latents is None
+                else torch.cat([input_images_latents, latents], dim=1)
+            )
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep / 1000,

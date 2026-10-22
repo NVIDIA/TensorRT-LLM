@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen-Image-2.1 VisualGen model package.
 
-The package intentionally exposes TRTLLM-owned classes plus small stateless
-runtime helpers.  Exact Diffusers reuse is limited to the declared image-VAE
-fallback inside the pipeline runtime and is recorded in the enablement run's
-``design/external_component_reuse.yaml``.
+The pipeline and transformer integrate with TRTLLM while reusing Diffusers'
+image VAE, FlowMatch Euler scheduler, timestep embedding, and regular RMSNorm.
 """
 
 from importlib import import_module

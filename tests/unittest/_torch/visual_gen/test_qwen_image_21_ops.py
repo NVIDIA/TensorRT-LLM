@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the TensorRT-LLM project
 
+import json
 import math
 
 import numpy as np
+import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.models.embeddings import TimestepEmbedding
 
 from tensorrt_llm._torch.visual_gen.models.qwen_image_21 import (
     QwenImage21FlowMatchEulerScheduler,
@@ -18,6 +22,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image_21 import (
 from tensorrt_llm._torch.visual_gen.models.qwen_image_21.transformer_qwen_image_21 import (
     QwenImage21Attention,
     QwenImage21RMSNorm,
+    QwenImage21TimestepProjEmbeddings,
     QwenImage21ZeroCenterRMSNorm,
 )
 
@@ -52,7 +57,7 @@ def test_qwen_image_21_appends_one_mask_slot_per_2x2_latent_group():
     assert out[0].tolist() == [True, False, True, True, True, True, True]
 
 
-def test_qwen_image_21_native_flowmatch_scheduler_matches_reference_equations():
+def test_qwen_image_21_flowmatch_scheduler_matches_reference_equations():
     scheduler = QwenImage21FlowMatchEulerScheduler(
         base_image_seq_len=256,
         base_shift=0.5,
@@ -82,6 +87,49 @@ def test_qwen_image_21_native_flowmatch_scheduler_matches_reference_equations():
     dt = scheduler.sigmas[1] - scheduler.sigmas[0]
     expected_step = (sample.float() + dt * model_output.float()).half()
     assert torch.equal(out, expected_step)
+
+
+@pytest.mark.parametrize("filename", ["scheduler_config.json", "config.json"])
+def test_qwen_image_21_scheduler_loads_local_config(tmp_path, filename):
+    config_dir = tmp_path / "scheduler"
+    config_dir.mkdir()
+    (config_dir / filename).write_text(json.dumps({"shift_terminal": 0.05, "max_shift": 1.1}))
+    scheduler = QwenImage21FlowMatchEulerScheduler.from_pretrained(str(tmp_path))
+    assert isinstance(scheduler, FlowMatchEulerDiscreteScheduler)
+    assert scheduler.config.shift_terminal == 0.05
+    assert scheduler.config.max_shift == 1.1
+    assert scheduler.config.use_dynamic_shifting is True
+    assert scheduler.config.max_image_seq_len == 8192
+
+
+@pytest.mark.parametrize("sample_dtype", [torch.float32, torch.bfloat16])
+def test_qwen_image_21_scheduler_matches_diffusers_across_steps(sample_dtype):
+    scheduler = QwenImage21FlowMatchEulerScheduler()
+    reference = FlowMatchEulerDiscreteScheduler.from_config(scheduler.config)
+    for instance in (scheduler, reference):
+        instance.set_timesteps(sigmas=[1.0, 0.75, 0.5, 0.25], mu=0.7, device="cpu")
+        instance.set_begin_index(0)
+    sample = torch.tensor([[1.1, -2.3]], dtype=sample_dtype)
+    expected = sample.clone()
+    model_output = torch.tensor([[0.27, -0.53]], dtype=torch.bfloat16)
+    for t, reference_t in zip(scheduler.timesteps, reference.timesteps):
+        sample = scheduler.step(model_output, t, sample, return_dict=False)[0].to(sample_dtype)
+        expected = reference.step(model_output, reference_t, expected, return_dict=False)[0].to(
+            sample_dtype
+        )
+        torch.testing.assert_close(sample, expected, rtol=0, atol=0)
+
+
+def test_qwen_image_21_timestep_embedding_preserves_checkpoint_layout():
+    embedding = QwenImage21TimestepProjEmbeddings(16).timestep_embedder
+    assert isinstance(embedding, TimestepEmbedding)
+    assert set(embedding.state_dict()) == {"linear_1.weight", "linear_2.weight"}
+    x = torch.linspace(-1, 1, 256).unsqueeze(0)
+    expected = torch.nn.functional.linear(x, embedding.linear_1.weight)
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.silu(expected), embedding.linear_2.weight
+    )
+    torch.testing.assert_close(embedding(x), expected)
 
 
 def test_qwen_image_21_attention_qk_norm_uses_regular_rmsnorm():
