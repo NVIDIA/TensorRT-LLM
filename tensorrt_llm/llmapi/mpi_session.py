@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
@@ -1072,45 +1072,91 @@ class RemoteMpiCommSessionServer():
                 "green")
             mpi_barrier()
 
+    # How often the wait for a previous task's worker futures services the
+    # control socket.
+    PENDING_POLL_SECONDS = 0.1
+
+    # Reply to a shutdown request, so the stop client knows it was received.
+    SHUTDOWN_ACK = "shutdown-ack"
+
+    def _receive(self) -> Optional[RemoteTask]:
+        """Read one message from the control socket.
+
+        A shutdown request (None) is acknowledged as soon as it is read: the
+        stop client resends on a new connection whenever an attempt goes
+        unacknowledged, and the server only accepts the new connection when
+        it next reads the socket, so a reply sent later would go to a client
+        that has already closed.
+        """
+        message = self.queue.get()
+        if message is None:
+            # Best-effort: a client that has already given up does not need it.
+            self.queue.put_noblock(self.SHUTDOWN_ACK, retry=2)
+        return message
+
+    def _wait_for_pending_futures(self, pending_futures: list) -> list:
+        """Wait for a previous task's worker futures, servicing the socket.
+
+        The control socket is a PAIR socket, which talks to one peer at a time
+        and takes a new client only after a zmq call on it has processed the
+        previous client's disconnect. The wait polls the socket every
+        ``PENDING_POLL_SECONDS``, so a client that connects after the task's
+        client has exited, such as the stop client (``stop_server_main``),
+        is accepted and its messages are read while the workers are still
+        running.
+
+        Returns:
+            Messages received during the wait, in arrival order, for the caller
+            to handle after the futures are done.
+        """
+        logger_debug(
+            f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
+            "grey")
+        n_failed = 0
+        first_exc = None
+        received = []
+        not_done = set(pending_futures)
+        while not_done:
+            done, not_done = futures_wait(not_done,
+                                          timeout=self.PENDING_POLL_SECONDS)
+            for future in done:
+                try:
+                    future.result()
+                except Exception as e:
+                    n_failed += 1
+                    if first_exc is None:
+                        first_exc = e
+                    print_colored(
+                        f"RemoteMpiCommSessionServer: MPI worker future "
+                        f"failed: {type(e).__name__}: {e}\n", "red")
+            if n_failed == len(pending_futures):
+                # All workers failed, no point waiting further.
+                break
+            while self.queue.poll(0):
+                received.append(self._receive())
+        if n_failed:
+            logger.error(f"RemoteMpiCommSessionServer: {n_failed}/"
+                         f"{len(pending_futures)} MPI worker(s) failed. "
+                         f"First error: {first_exc}")
+        logger_debug(
+            "RemoteMpiCommSessionServer all pending futures completed\n",
+            "grey")
+        return received
+
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
         pending_futures = []
+        received: List[Optional[RemoteTask]] = []
         while True:
             # Wait for any pending futures from previous tasks to complete
             # This ensures all ranks are ready before accepting the next task
             if pending_futures:
-                logger_debug(
-                    f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
-                    "grey")
-                n_failed = 0
-                first_exc = None
-                # Use as_completed so that failures are logged as soon as
-                # they occur rather than blocking behind a stuck future.
-                for future in as_completed(pending_futures):
-                    try:
-                        future.result()  # Wait for completion
-                    except Exception as e:
-                        n_failed += 1
-                        if first_exc is None:
-                            first_exc = e
-                        print_colored(
-                            f"RemoteMpiCommSessionServer: MPI worker future "
-                            f"failed: {type(e).__name__}: {e}\n", "red")
-                        if n_failed == len(pending_futures):
-                            # All workers failed — no point waiting further.
-                            break
-                if n_failed:
-                    logger.error(
-                        f"RemoteMpiCommSessionServer: {n_failed}/"
-                        f"{len(pending_futures)} MPI worker(s) failed. "
-                        f"First error: {first_exc}")
+                received.extend(self._wait_for_pending_futures(pending_futures))
                 pending_futures.clear()
-                logger_debug(
-                    "RemoteMpiCommSessionServer all pending futures completed\n",
-                    "grey")
 
-            message: Optional[RemoteTask] = self.queue.get()
+            message: Optional[RemoteTask] = (received.pop(0)
+                                             if received else self._receive())
             if message is None:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",

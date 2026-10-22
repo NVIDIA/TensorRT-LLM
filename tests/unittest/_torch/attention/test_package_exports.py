@@ -190,15 +190,27 @@ def test_attribute_error_inside_submodule_surfaces_as_import_error(pkg, monkeypa
 
 
 def test_package_root_import_is_lazy():
-    """Importing the package root adds nothing beyond the package module itself."""
+    """Importing the package root adds nothing beyond the package module itself.
+
+    ``tensorrt_llm._torch`` may load the package root already, because the custom
+    ops import their kernels from ``kernels/`` beneath it. Nothing else under the
+    package may be loaded at that point.
+    """
+    kernels = f"{PKG}.kernels"
     _run_fresh(f"""
         import sys
         import tensorrt_llm._torch
         before = set(sys.modules)
-        assert {PKG!r} not in before, "tensorrt_llm._torch already imports the package root"
         import {PKG}
         added = set(sys.modules) - before
         assert added <= {{{PKG!r}}}, sorted(added)
+        loaded = sorted(
+            m for m in sys.modules
+            if m.startswith({PKG + "."!r})
+            and m != {kernels!r}
+            and not m.startswith({kernels + "."!r})
+        )
+        assert not loaded, loaded
     """)
 
 

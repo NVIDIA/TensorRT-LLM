@@ -12,6 +12,15 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_resolution
+  - unittest/_torch/moe/test_moe_impl.py::test_b12x_lora_rejection_is_build_independent
+  - unittest/_torch/moe/test_moe_impl.py::test_b12x_cutlass_prefill_routing
+  - unittest/_torch/moe/test_moe_impl.py::test_b12x_cutlass_build_mode_resolution
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_dynamic_scale_resolution
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_validation
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_selection
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_probe
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_fingerprint
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -49,6 +58,8 @@ l0_cpu:
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   - unittest/_torch/executor
+  - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
+  - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation
@@ -89,6 +100,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -101,8 +113,9 @@ l0_cpu:
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_route_capture.py
+  - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_utils.py
-  - unittest/_torch/thop/parallel_hw_agnostic
+  - unittest/_torch/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py
@@ -181,6 +194,10 @@ l0_cpu:
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  - unittest/llmapi/apps/test_render_callers.py
+  - unittest/llmapi/apps/test_render_core.py
+  - unittest/llmapi/apps/test_render_http.py
+  - unittest/llmapi/apps/test_render_standalone.py
   # test_request_metrics.py as a whole is not registered on any list, so only the
   # two cases added with the KV-transfer fix are selected here. Registering the
   # file would also enable a dozen pre-existing cases that have never run in CI,
@@ -192,6 +209,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
+  - unittest/llmapi/apps/test_serve_lazy_import.py
   - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py

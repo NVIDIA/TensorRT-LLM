@@ -41,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -994,6 +995,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         py_request_id=7,
         lora_task_id=3,
         cache_salt="11",
+        kv_cache_retention_config=None,
         is_dummy=False,
         return_perf_metrics=False,
         prompt_len=8,
@@ -1009,6 +1011,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     manager.is_estimating_kv_cache = False
     manager._has_cp_helix = False
     manager.kv_cache_map = {} if fresh_cache else {request.py_request_id: kv_cache}
+    manager._on_allocation_stream = set()
     manager._stream = SimpleNamespace(cuda_stream=Mock())
     manager._context_reuse_tokens = Mock(return_value=[10, 11, 12])
     manager._create_kv_cache = Mock(return_value=kv_cache)
@@ -1550,6 +1553,7 @@ class _ContextRequest:
     use_conversation_params: bool = True
     lora_task_id: int | None = None
     cache_salt: str | None = None
+    kv_cache_retention_config: KvCacheRetentionConfig | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
@@ -1560,6 +1564,7 @@ class _ContextRequest:
     context_current_position: int = 0
     py_served_prefix_end: int = 0
     py_num_connector_matched_tokens: int = 0
+    py_connector_allocation_reported: bool = False
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None
@@ -1763,6 +1768,59 @@ def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:
     finally:
         if dummy is not None:
             manager.free_resources(dummy[0])
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "global_prompt,local_prompt,rank,range_end,expected",
+    [(256, 128, 0, 128, [35, 80]), (64, 0, 1, 128, [10]), (130, 66, 0, 65, [35, 80])],
+)
+def test_helix_retention_uses_rank_local_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    global_prompt: int,
+    local_prompt: int,
+    rank: int,
+    range_end: int,
+    expected: list[int],
+) -> None:
+    # Only cross-process coordination is replaced; allocation and policy run in native V2 on GPU.
+    dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
+    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=512,
+        max_batch_size=1,
+        max_num_tokens=256,
+        mapping=Mapping(
+            world_size=2, cp_size=2, tp_size=1, rank=rank, cp_config={"cp_type": "HELIX"}
+        ),
+        dtype=DataType.HALF,
+    )
+    request = _ContextRequest(
+        1, list(range(local_prompt)), local_prompt, "retention", use_conversation_params=False
+    )
+    request.total_input_len_cp = global_prompt
+    request.kv_cache_retention_config = KvCacheRetentionConfig(
+        [KvCacheRetentionConfig.TokenRangeRetentionConfig(64, range_end, 80)],
+        decode_retention_priority=10,
+    )
+    try:
+        assert isinstance(manager.impl, KVCacheManager)
+        assert manager.impl.init_config.tokens_per_block == 128
+        assert manager.prepare_context_cache(request) is not None
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.resize(global_prompt)
+        group = manager.impl.get_layer_group_id(0)
+        assert cache.get_page_priorities(group) == expected
+        assert cache.resize((len(expected) + 1) * 128)
+        assert cache.get_page_priorities(group) == expected + [10]
+    finally:
+        manager.free_resources(request)
         manager.shutdown()
 
 
@@ -2399,9 +2457,18 @@ def test_live_storage_stats_use_the_manager_api() -> None:
         core.shutdown()
 
 
-def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() -> None:
+@pytest.mark.parametrize(
+    "kv_connector_manager, expected_connector_cached_tokens",
+    [(None, None), (SimpleNamespace(capacity_only=False), 9)],
+    ids=["no_connector", "serving_connector"],
+)
+def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
+    kv_connector_manager, expected_connector_cached_tokens
+) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.enable_stats = True
+    manager.is_draft = False
+    manager.kv_connector_manager = kv_connector_manager
     snapshot_delta = SimpleNamespace(
         iter_snapshot_lookups=2,
         iter_snapshot_hits=1,
@@ -2418,7 +2485,9 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
         get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
         get_and_reset_iteration_cached_tokens_by_level=lambda: [5, 2, 1],
+        get_and_reset_iteration_connector_cached_tokens=lambda: 9,
         get_and_reset_iteration_reused_blocks_by_level=lambda: {},
+        get_and_reset_iteration_connector_reused_blocks=lambda: {},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
@@ -2438,6 +2507,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
     assert stats.disk_prefetch_blocks == 7
     assert stats.cached_tokens_by_level == [5, 2, 1]
+    assert stats.connector_cached_tokens == expected_connector_cached_tokens
 
 
 def _make_admission_manager(
@@ -2460,8 +2530,12 @@ def _make_admission_manager(
     manager.is_estimating_kv_cache = is_estimating_kv_cache
     manager._spec_recompute_tail = 0
     manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
+    manager._allocation_stream = None
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager._resume_and_restore = lambda _req_id, _kv_cache: True
     kv_cache = SimpleNamespace(
+        is_active=False,
         num_committed_tokens=7,
         enable_swa_scratch_reuse=True,
         drop_cached_token_attribution=Mock(),

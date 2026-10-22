@@ -60,7 +60,7 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner
+from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
 
 
 def _cache_device(meta) -> torch.device:
@@ -194,6 +194,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # never captured. Built once per step in prepare() and reused by every
     # layer.
     _msa_prefill_proxy_plan: Optional[tuple] = None
+    _msa_prefill_proxy_kv_indices: Optional[torch.Tensor] = None
     _msa_prefill_gqa_plan: Optional[tuple] = None
     _msa_prefill_dense_plan: Optional[tuple] = None
     # Per-token valid-block count for the prefill-side indexer proxy. It is
@@ -280,6 +281,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def msa_prefill_proxy_plan(self) -> Optional[tuple]:
         """Prebuilt indexer proxy plan for this step's fmha_sm100 rows."""
         return self._msa_prefill_proxy_plan
+
+    @property
+    def msa_prefill_proxy_kv_indices(self) -> Optional[torch.Tensor]:
+        """Flattened page table msa_prefill_proxy_plan reads; see segmented_proxy_plan."""
+        kv_indices = self._msa_prefill_proxy_kv_indices
+        return self.msa_kv_indices if kv_indices is None else kv_indices
 
     @property
     def msa_prefill_gqa_plan(self) -> Optional[tuple]:
@@ -904,6 +911,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         per-step tensors.
         """
         self._msa_prefill_proxy_plan = None
+        self._msa_prefill_proxy_kv_indices = None
         self._msa_prefill_gqa_plan = None
         self._msa_prefill_dense_plan = None
         self._msa_prefill_n_valid_blocks = None
@@ -970,12 +978,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
-        self._msa_prefill_proxy_plan = plan_for(
-            self._msa_proxy_plan_rows(),
-            num_qo_heads=num_index_heads,
-            num_kv_heads=1,
-            output_maxscore=True,
+        # Its rows are a batch prefix, so their pages prefix msa_kv_indices.
+        proxy_rows = self._msa_proxy_plan_rows()
+        segmented = proxy_rows is not None and segmented_proxy_plan(
+            fmha_sm100,
+            qo_lens_cpu[: proxy_rows[1]],
+            qo_offset_cpu[: proxy_rows[1]],
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            kv_indices=self.msa_kv_indices,
         )
+        if segmented:
+            self._msa_prefill_proxy_plan, self._msa_prefill_proxy_kv_indices = segmented
+        else:
+            self._msa_prefill_proxy_plan = plan_for(
+                proxy_rows,
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
+                output_maxscore=True,
+            )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
         # NVFP4 sparse layers run the MSA CSR kernel, which takes no plan.
@@ -1527,7 +1548,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             idx_q_view,
             idx_k_cache,
             idx_sm_scale=idx_sm_scale,
-            kv_indices=metadata.msa_kv_indices,
+            kv_indices=metadata.msa_prefill_proxy_kv_indices,
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,
