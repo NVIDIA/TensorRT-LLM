@@ -378,10 +378,11 @@ class KimiKDALinearAttention(nn.Module):
         2. Kernel-layout constants that ``_decode_via_optimized`` used to
            rebuild with ~6 device kernels per layer per decode step:
            transposed conv weights (bf16 ``[W, D]``) and fp32 copies of
-           ``A_log`` / ``dt_bias`` / ``o_norm.weight``.
+           ``A_log`` / ``dt_bias`` / ``o_norm.weight``; only built when the
+           optimized decode kernel is in use.
+
+        The fused projections serve every decode and verify path.
         """
-        if self._dispatch.decode_kernel_path != "optimized":
-            return
         if self.q_proj.weight.device.type != "cuda":
             return
         with torch.no_grad():
@@ -411,7 +412,8 @@ class KimiKDALinearAttention(nn.Module):
                 self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
                 self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
             self._bfa_proj_weight = self._merge_projection_weights(bfa_modules, pad_rows_to=8)
-            self._build_decode_kernel_constants()
+            if self._dispatch.decode_kernel_path == "optimized":
+                self._build_decode_kernel_constants()
 
     @staticmethod
     def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:
