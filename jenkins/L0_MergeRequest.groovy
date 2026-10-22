@@ -837,7 +837,8 @@ def launchReleaseCheck(pipeline, globalVars)
                 echo "Could not determine changed files, falling back to all files"
             }
         }
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
+        // This pod lacks a TensorRT-LLM build; CPU schema tests check schema freshness.
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && SKIP=trtllm-serve-schemas-check python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
 
         // Step 4: Run license check
         withEnv(['GONOSUMDB=*.nvidia.com']) {
