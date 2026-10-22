@@ -122,54 +122,94 @@ complete encoder input must fit in the iteration token budget.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
-Entries in this matrix require a request with at least one listed non-language modality; language-only test evidence is
-not used to mark a feature as supported here.
+Multimodal support depends on both the encoder and its integration with the language model.
+The tables below separate these capabilities. A registered architecture or a shared mixin alone
+does not establish validated support for every image, video, or audio workflow.
 
-| Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
-| ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | -------------- | --------------------- | ------------------------- | --------- |
-| `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
-| `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | N/A            | Yes                   | No                        | L + I     |
-| `Gemma4ForConditionalGeneration`     | Yes                | Yes        | Yes             | Yes           | No             | Yes                   | No                        | L + I + V + A [^9] |
-| `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Untested        | Yes           | No             | Yes                   | No                        | L + I + A |
-| `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes            | Yes                   | No                        | L + I     |
-| `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I + V |
-| `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I     |
-| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I     |
-| `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested       | Untested              | No                        | L + I + V |
-| `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I     |
-| `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | N/A            | Yes                   | Yes                       | L + I + V + A [^10] |
-| `Phi4MMForCausalLM`                  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + A |
-| `Qwen2VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
-| `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Yes                   | Untested                  | L + I     |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Yes                   | Untested                  | L + I + V |
-| `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I + V |
-| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
-| `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
-| `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | L + I     |
+## LLM Integration with Multimodal Inputs
 
-Note:
-- L: Language
-- I: Image
-- V: Video
-- A: Audio
+Entries in this table require a request with at least one listed non-language modality;
+language-only test evidence is not used to mark a feature as supported here.
+The [language-model feature matrix](#model-feature-support-matrix-key-models) lists shared
+features such as overlap scheduling, sampling, and logits processing. Its text-only results
+do not imply multimodal compatibility.
+
+| Model Architecture | Modality | LLM CUDA Graph | Chunked Prefill | LLM KV Cache Reuse | E/PD Serving |
+| --- | --- | --- | --- | --- | --- |
+| `Exaone4_5_ForConditionalGeneration` | L + I + V | Yes | Yes | Yes | No |
+| `Gemma3ForConditionalGeneration` | L + I | Yes | N/A | N/A | No |
+| `Gemma4ForConditionalGeneration` | L + I + V + A [^9] | Yes | Yes | No | No |
+| `Gemma4UnifiedForConditionalGeneration` | L + I + A | Yes | Untested | No | No |
+| `HCXVisionForCausalLM` | L + I | Yes | No | Yes | No |
+| `LlavaLlamaModel (VILA)` | L + I + V | Yes | No | No | No |
+| `LlavaNextForConditionalGeneration` | L + I | Yes | Yes | Yes | Yes |
+| `Llama4ForConditionalGeneration` | L + I | Yes | No | No | No |
+| `MiniCPMV4_6ForConditionalGeneration` [^14] | L + I + V | Untested | Untested | Untested | No |
+| `Mistral3ForConditionalGeneration` | L + I | Yes | Yes | Yes | No |
+| `NemotronH_Nano_VL_V2` | L + I + V + A [^10] | Yes | Yes | N/A | Yes |
+| `Phi4MMForCausalLM` | L + I + A | Yes | Yes | Yes | No |
+| `Qwen2VLForConditionalGeneration` | L + I + V | Yes | Yes | Yes | No |
+| `Qwen2_5_VLForConditionalGeneration` | L + I + V | Yes | Yes | Yes | Yes |
+| `Qwen3VLForConditionalGeneration` | L + I + V | Yes | Yes | Yes | Yes |
+| `Qwen3VLMoeForConditionalGeneration` | L + I + V | Yes | Yes | Yes | Yes |
+| `Step3p7ForConditionalGeneration` | L + I | Yes | Untested | Untested | Untested |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | L + I + V | Yes | Untested | No | Untested |
+| `Cosmos3ForConditionalGeneration` [^13] | L + I + V | Yes | Yes | Yes | Untested |
+| `Qwen3_5ForConditionalGeneration` | L + I + V | Yes | Untested | No | Yes |
+| `Qwen3_5MoeForConditionalGeneration` | L + I + V | Yes | Untested | No | Yes |
+| `Qwen4ExpForConditionalGeneration` | L + I | Untested | Untested | Untested | No |
+
+- **Modality:** L = language, I = image, V = video, A = audio.
+- **LLM CUDA graph** covers the language-model execution path. Encoder capture/replay is listed separately below.
+- **LLM KV cache reuse** means sharing cached prefixes across requests with multimodal input. `No` or `Untested`
+  does not mean the decoder lacks a KV cache. Text-only requests can have a different reuse status.
+- **Chunked prefill** covers prompts containing the listed non-language inputs.
+- **E/PD serving** is the multimodal encoder/prefill/decode handoff path; it is distinct from text-only P/D serving.
 
 ## Multimodal Encoder Optimizations
 
-The following optimizations are available to models that implement
-`MultimodalModelMixin`.
+Encoder item scheduling, embedding caching, CUDA graphs, and side-stream prefetch are independent capabilities.
+`Declared` means the model exposes the corresponding capability hook, but validated coverage for the listed
+multimodal inputs is not established by this table. `Untested` means coverage has not been established;
+it does not assert that the implementation is absent. `No` means the shared integration is not implemented.
+`Yes` entries remain subject to the configuration limits below.
 
-| Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
-| ------------------ | ------------------------------ | --------------------------- |
-| `Gemma4ForConditionalGeneration` | Yes | Yes |
-| `Gemma4UnifiedForConditionalGeneration` | Yes | Yes |
-| `Mistral3ForConditionalGeneration` | Yes | Yes |
-| `Qwen3VLForConditionalGeneration` | Yes | Yes |
-| `Qwen3VLMoeForConditionalGeneration` | Yes | Yes |
-| `Qwen3_5ForConditionalGeneration` | Yes | Yes |
-| `Qwen3_5MoeForConditionalGeneration` | Yes | Yes |
+The **encoder attention** column describes the current implementation/default selection, not all supported backend
+combinations. **LLM setting** means the encoder reads `attn_backend`; **HF config** means attention is selected by the
+Hugging Face encoder configuration. Native and HF encoder paths can have different backend restrictions.
+
+| Model Architecture | Encoder Attention | Item Scheduling | Encoder Embedding Cache | Encoder CUDA Graph | Side-Stream Prefetch |
+| --- | --- | --- | --- | --- | --- |
+| `Exaone4_5_ForConditionalGeneration` | `TRTLLM` | Declared | No | No | Untested |
+| `Gemma3ForConditionalGeneration` | `TRTLLM` | No | No | No | No |
+| `Gemma4ForConditionalGeneration` | Vision: `TRTLLM`; audio: custom | No | Yes | No | Yes |
+| `Gemma4UnifiedForConditionalGeneration` | N/A (encoder-free) | No | Yes | N/A | Yes |
+| `HCXVisionForCausalLM` | LLM setting | No | No | No | No |
+| `LlavaLlamaModel (VILA)` | HF config | No | No | No | No |
+| `LlavaNextForConditionalGeneration` | LLM setting | No | No | No | No |
+| `Llama4ForConditionalGeneration` | HF config | No | No | No | No |
+| `MiniCPMV4_6ForConditionalGeneration` [^14] | LLM setting; window SDPA | No | No | No | No |
+| `Mistral3ForConditionalGeneration` | `TRTLLM` | Declared | Yes | No | Yes |
+| `NemotronH_Nano_VL_V2` | Vision: `FLASHINFER`; audio: SDPA | No | No | Yes (vision) | Untested |
+| `Phi4MMForCausalLM` | HF config | No | No | No | No |
+| `Qwen2VLForConditionalGeneration` | HF `flash_attention_2` | Declared | No | No | Untested |
+| `Qwen2_5_VLForConditionalGeneration` | `TRTLLM` | Declared | No | No | Untested |
+| `Qwen3VLForConditionalGeneration` | LLM setting | Declared | Yes | No | Yes |
+| `Qwen3VLMoeForConditionalGeneration` | LLM setting | Declared | Yes | No | Yes |
+| `Step3p7ForConditionalGeneration` | LLM setting | No | No | No | No |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | SDPA | No | No | No | No |
+| `Cosmos3ForConditionalGeneration` [^13] | LLM setting | Declared | Declared | No | Untested |
+| `Qwen3_5ForConditionalGeneration` | LLM setting | Declared | Yes | No | Yes |
+| `Qwen3_5MoeForConditionalGeneration` | LLM setting | Declared | Yes | No | Yes |
+| `Qwen4ExpForConditionalGeneration` | LLM setting | Declared | Declared | No | Untested |
+
+- **Item scheduling** is the `supports_mm_encoder_item_scheduling` model contract. It selects encoder items
+  within the per-iteration item/token budgets and requires matching processor item metadata.
+- **Encoder embedding cache** is cross-request reuse of encoder outputs. It is separate from item scheduling
+  and from LLM KV cache reuse. The `supports_encoder_cache` capability also requires a positive reuse capacity.
+- **Encoder CUDA graph** requires model-specific capture/replay integration. Inheriting `MultimodalEncoderMixin`
+  only connects attention-metadata setup to the runtime encoder budget; it does not enable graph capture.
+  The Nemotron entry covers the RADIO vision tower, including video frames, and does not cover its audio encoder.
 
 - **Multimodal encoder side stream** prefetches encoder work for pending requests on a separate
   CUDA stream, allowing it to overlap with work on the main stream. Set
