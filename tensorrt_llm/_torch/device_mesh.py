@@ -69,6 +69,7 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     tp_mesh = None
 
     _MESH_DIM_CACHE_PREFIX = '_mesh_dim_cache_'
+    _memoize_mesh_dims = True
 
     # Group membership is fixed once the device mesh is built (build_mesh is
     # build-once and c10d ProcessGroups are immutable), so each mesh dim is
@@ -83,8 +84,9 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
         resolved = (pg, pg.rank(), self._get_group_ranks(pg), group_name)
         # Before torch.distributed is initialized (single-process runs) the
         # group is a placeholder stub -- don't memoize it.
-        if DeviceMeshTopologyImpl.device_mesh is not None or dist.is_initialized(
-        ):
+        if self._memoize_mesh_dims and (
+                DeviceMeshTopologyImpl.device_mesh is not None
+                or dist.is_initialized()):
             setattr(self, f'{self._MESH_DIM_CACHE_PREFIX}{name}', resolved)
         return resolved
 
