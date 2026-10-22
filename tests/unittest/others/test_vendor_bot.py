@@ -344,6 +344,23 @@ def test_match_multiple_upstream_prs_without_manual_map(source: Path) -> None:
     assert all(item["method"] == "same-commit" for item in evidence.values())
 
 
+def test_merge_diagnostic_explains_attribution_and_latest_dev_rebase(source: Path) -> None:
+    base = _commit(source, "base\n")
+    canonical = _commit(source, "canonical\n", "canonical.py")
+    _git(source, "checkout", "-q", "-b", "temporary", base)
+    _commit(source, "change\n")
+    _git(source, "merge", "--no-ff", "-m", "merge canonical", canonical)
+    reviewed = _git(source, "rev-parse", "HEAD")
+    with pytest.raises(m.Diagnostic) as failure:
+        m.match(source, canonical, reviewed, {})
+    issue = failure.value
+    assert reviewed in issue.problem and "2 parents" in issue.problem
+    assert "commit-by-commit upstream attribution" in issue.problem
+    assert "latest canonical dev branch" in issue.action
+    assert "cherry-pick" in issue.action and "Do not rewrite canonical history" in issue.action
+    assert "update and verify" in issue.action and "cannot remove a merge commit" in issue.action
+
+
 def test_match_rebased_patch(source: Path) -> None:
     base = _commit(source, "VALUE = 0\n")
     downstream = _commit(source, "VALUE = 1\n")
@@ -1191,7 +1208,8 @@ def test_posted_marker_feedback_is_specific_and_recovers_without_cache(
         monitor.gh.pr["body"] = valid
         monkeypatch.setattr(m, "resolve", lambda *args: ({reviewed.commit: 123}, {}))
         restarted.inspect(7)
-    assert len(monitor.gh.comments) == 1
+    assert len(monitor.gh.comments) == 2
+    assert monitor.gh.comments[0]["body"] == body
     assert monitor.gh.reviews[0]["state"] == "DISMISSED"
     assert not any(payload.get("event") == "APPROVE" for _, _, payload in monitor.gh.writes)
 
@@ -1241,9 +1259,9 @@ def test_valid_feedback_is_rechecked_when_only_dev_tip_changes(
     monitor.inspect(7)
     assert monitor.gh.pr == original_pr
     assert monitor.store.get("observation:7")["state"] == "blocked"
-    assert len(monitor.gh.comments) == 1
-    assert "latest canonical branch tip" in monitor.gh.comments[0]["body"]
-    assert monitor.gh.canonical_tip in monitor.gh.comments[0]["body"]
+    assert len(monitor.gh.comments) == 2
+    assert "latest canonical branch tip" in monitor.gh.comments[-1]["body"]
+    assert monitor.gh.canonical_tip in monitor.gh.comments[-1]["body"]
     assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
 
 
@@ -1270,10 +1288,10 @@ def test_upstream_main_reconciles_obsolete_review_without_sqlite(
         monkeypatch.setattr(restarted, "_inputs", lambda pr: (previous, reviewed))
         restarted.inspect(7)
         assert store.get("observation:7")["state"] == "metadata_valid"
-        assert len(monitor.gh.comments) == len(monitor.gh.reviews) == 1
+        assert len(monitor.gh.comments) == 2 and len(monitor.gh.reviews) == 1
         assert monitor.gh.reviews[0]["state"] == "DISMISSED"
-        assert "Upstream-main source ancestry is valid" in monitor.gh.comments[0]["body"]
-        assert reviewed.commit in monitor.gh.comments[0]["body"]
+        assert "Upstream-main source ancestry is valid" in monitor.gh.comments[-1]["body"]
+        assert reviewed.commit in monitor.gh.comments[-1]["body"]
         writes = copy.deepcopy(monitor.gh.writes)
         restarted.inspect(7)
         assert monitor.gh.writes == writes
@@ -1286,9 +1304,31 @@ def test_upstream_main_reconciles_obsolete_review_without_sqlite(
         )
         restarted.inspect(7)
         assert store.get("observation:7")["state"] == "blocked"
-        assert len(monitor.gh.comments) == 1
-        assert "not reachable" in monitor.gh.comments[0]["body"]
+        assert len(monitor.gh.comments) == 3
+        assert "not reachable" in monitor.gh.comments[-1]["body"]
         assert monitor.gh.reviews[-1]["state"] == "CHANGES_REQUESTED"
+
+
+def test_upstream_diagnostic_does_not_blame_author_for_incomplete_checks(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/org/library.git", "pull/42/head")
+    monkeypatch.setattr(monitor, "_inputs", lambda pr: (previous, reviewed))
+    monkeypatch.setattr(
+        monitor.gh, "compare", lambda repo, base, head: {"merge_base_commit": {"sha": base}}
+    )
+    api = monitor.gh.api
+
+    def unavailable(endpoint, **kwargs):
+        if endpoint == "repos/org/library/git/ref/heads/main":
+            raise RuntimeError("Upstream API unavailable")
+        return api(endpoint, **kwargs)
+
+    monkeypatch.setattr(monitor.gh, "api", unavailable)
+    monitor.poll()
+    assert not monitor.gh.writes
+    assert monitor.store.get("health")["counts"]["errors"] == 1
 
 
 def test_upstream_exception_does_not_waive_other_vendors_metadata(
@@ -1447,8 +1487,9 @@ def test_same_commit_reference_reconciles_stale_feedback_then_clears_after_fix(
         previous, url="https://github.com/author/library.git", branch="temporary"
     )
     monitor.inspect(7)
-    assert len(gh.comments) == len(gh.reviews) == 1
-    assert all("adds no new vendor commit" in item["body"] for item in (*gh.comments, *gh.reviews))
+    assert len(gh.comments) == 2 and len(gh.reviews) == 1
+    assert "adds no new vendor commit" in gh.comments[-1]["body"]
+    assert "#issuecomment-2" in gh.reviews[0]["body"]
     assert "fast-forward" not in gh.reviews[0]["body"]
     assert gh.reviews[0]["state"] == "CHANGES_REQUESTED"
     assert any(
@@ -1460,9 +1501,9 @@ def test_same_commit_reference_reconciles_stale_feedback_then_clears_after_fix(
             b.Monitor(monitor.args, gh, store).inspect(7)
             assert store.get("observation:7")["state"] == "ignored"
             assert store.get("problem:7") is None
-    assert len(gh.comments) == len(gh.reviews) == 1
-    assert "does not require vendor promotion" in gh.comments[0]["body"]
-    assert "metadata and source attribution are valid" not in gh.comments[0]["body"]
+    assert len(gh.comments) == 3 and len(gh.reviews) == 1
+    assert "does not require vendor promotion" in gh.comments[-1]["body"]
+    assert "metadata and source attribution are valid" not in gh.comments[-1]["body"]
     assert gh.reviews[0]["state"] == "DISMISSED"
     assert not any(payload.get("event") == "APPROVE" for _, _, payload in gh.writes)
     writes = copy.deepcopy(gh.writes)
@@ -1488,11 +1529,11 @@ def test_ignored_pr_cleans_remote_feedback_without_sqlite(
     if remaining == "neither":
         assert not monitor.gh.writes
     else:
-        assert len(monitor.gh.comments) == 1
-        assert "no longer applies" in monitor.gh.comments[0]["body"]
-        assert "not** a code-review approval" in monitor.gh.comments[0]["body"]
+        assert len(monitor.gh.comments) == (1 if remaining == "review" else 2)
+        assert "no longer applies" in monitor.gh.comments[-1]["body"]
+        assert "not** a code-review approval" in monitor.gh.comments[-1]["body"]
         assert all(review["state"] == "DISMISSED" for review in monitor.gh.reviews)
-        assert len(monitor.gh.writes) == (2 if remaining in ("review", "both") else 1)
+        assert len(monitor.gh.writes) == (3 if remaining in ("review", "both") else 1)
 
 
 @pytest.mark.parametrize("existing", ["manual", "other-actor", "other-vendor"])
@@ -1698,6 +1739,7 @@ def test_source_history_diagnostic_has_canonical_pin_and_regeneration_steps(
         canonical in issue.action and "operator/library" in issue.action and "dev" in issue.action
     )
     assert "temporary" in issue.action and "scripts/vendor/manage.py" in issue.action
+    assert "latest tip without merge commits" in issue.action
     assert "vendored snapshot" in issue.action and "push" in issue.action
     assert not issue.example
 
@@ -1916,6 +1958,38 @@ def test_monitor_posts_similarity_and_deduplicates_feedback(
     assert monitor.gh.writes == writes
 
 
+def test_feedback_review_links_to_current_result(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue("Missing block"))
+    comment, review = gh.comments[0], gh.reviews[0]
+    link = f"https://github.com/org/consumer/pull/7#issuecomment-{comment['id']}"
+    assert f"[Latest vendor validation and step-by-step fix]({link})" in review["body"]
+    assert "Vendor validation:" in comment["body"]
+    assert f"/pull/7/commits/{gh.pr['head']['sha']}" in comment["body"]
+    original = comment["body"]
+    gh.pr["head"]["sha"] = "d" * 40
+    monitor._feedback(gh.pr, _issue("Pin needs rebase"))
+    assert len(gh.comments) == 2 and len(gh.reviews) == 1
+    assert "#issuecomment-2" in review["body"]
+    assert "Pin needs rebase" in gh.comments[-1]["body"]
+    assert "d" * 40 in gh.comments[-1]["body"]
+    assert link in gh.comments[-1]["body"] and "Supersedes" in gh.comments[-1]["body"]
+    assert comment["body"] == original
+
+
+def test_feedback_repairs_review_link_when_comment_is_recreated(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue("Missing block"))
+    # A human comment keeps the fake API's next ID distinct from the deleted ID.
+    gh.comments[0] = {"id": 80, "body": "Human comment", "user": {"login": "author"}}
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, gh, store)
+        restarted._feedback(gh.pr, _issue("Missing block"))
+    assert len(gh.comments) == 2 and len(gh.reviews) == 1
+    assert f"#issuecomment-{gh.comments[1]['id']}" in gh.reviews[0]["body"]
+    assert "#issuecomment-1)" not in gh.reviews[0]["body"]
+
+
 def test_feedback_deduplicates_with_empty_sqlite(monitor: b.Monitor) -> None:
     monitor._feedback(monitor.gh.pr, _issue("Missing block"))
     writes = copy.deepcopy(monitor.gh.writes)
@@ -1924,8 +1998,260 @@ def test_feedback_deduplicates_with_empty_sqlite(monitor: b.Monitor) -> None:
         restarted._feedback(monitor.gh.pr, _issue("Missing block"))
         assert monitor.gh.writes == writes
         restarted._feedback(monitor.gh.pr, None)
-    assert len(monitor.gh.comments) == len(monitor.gh.reviews) == 1
+    assert len(monitor.gh.comments) == 2 and len(monitor.gh.reviews) == 1
     assert monitor.gh.reviews[0]["state"] == "DISMISSED"
+
+
+def test_feedback_appends_changed_fixes_and_repeated_result_transitions(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    for index, action in enumerate(("Fix A", "Fix B", "Fix A"), start=1):
+        issue = m.Diagnostic("Same problem", action)
+        previous = copy.deepcopy(gh.comments)
+        with contextlib.closing(b.Store(":memory:")) as store:
+            restarted = b.Monitor(monitor.args, gh, store)
+            restarted._feedback(gh.pr, issue)
+            writes = copy.deepcopy(gh.writes)
+            restarted._feedback(gh.pr, issue)
+            assert gh.writes == writes
+        assert len(gh.comments) == index and gh.comments[:-1] == previous
+        assert f"**Fix:** {action}" in gh.comments[-1]["body"]
+        assert "@author" in gh.comments[-1]["body"]
+        assert f"#issuecomment-{index}" in gh.reviews[0]["body"]
+        if index > 1:
+            assert f"#issuecomment-{index - 1}" in gh.comments[-1]["body"]
+    assert not any(method == "PATCH" for _, method, _ in gh.writes)
+
+
+@pytest.mark.parametrize("change", ["commit", "branch", "url"])
+def test_feedback_notifies_source_changes_with_unchanged_result(
+    monitor: b.Monitor, change: str
+) -> None:
+    gh = monitor.gh
+    source = _vendor("b" * 40, "https://github.com/author/library.git", "temporary")
+    monitor._feedback(gh.pr, None, source=source)
+    updated = dataclasses.replace(
+        source,
+        **{
+            change: {
+                "commit": "c" * 40,
+                "branch": "temporary2",
+                "url": "https://github.com/other/library.git",
+            }[change]
+        },
+    )
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, gh, store)
+        restarted._feedback(gh.pr, None, source=updated)
+        writes = copy.deepcopy(gh.writes)
+        restarted._feedback(gh.pr, None, source=updated)
+        assert gh.writes == writes
+    assert len(gh.comments) == 2
+    assert updated.commit in gh.comments[-1]["body"]
+    assert "@author" in gh.comments[-1]["body"]
+
+
+def test_feedback_unrelated_pr_updates_do_not_notify(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue())
+    before = copy.deepcopy(gh.comments)
+    writes = copy.deepcopy(gh.writes)
+    gh.pr["head"]["sha"] = "c" * 40
+    gh.pr["body"] = "Updated prose unrelated to the validation result"
+    monitor._feedback(gh.pr, _issue())
+    assert gh.comments == before and gh.writes == writes
+
+
+def test_upstream_valid_feedback_suppresses_observed_tip_only_changes(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    proof = {
+        "promoted": "b" * 40,
+        "checked_canonical_tip": "b" * 40,
+        "upstream_observed_main": "b" * 40,
+    }
+    monitor._feedback(gh.pr, None, upstream_proof=proof)
+    writes = copy.deepcopy(gh.writes)
+    proof.update(checked_canonical_tip="a" * 40, upstream_observed_main="c" * 40)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(monitor.args, gh, store)._feedback(gh.pr, None, upstream_proof=proof)
+    assert gh.writes == writes
+    proof["promoted"] = "c" * 40
+    monitor._feedback(gh.pr, None, upstream_proof=proof)
+    assert len(gh.comments) == 2
+
+
+def test_upstream_invalid_feedback_suppresses_tip_churn_but_not_check_changes(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gh = monitor.gh
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/org/library.git", "pull/42/head")
+    upstream_tip, reachable = "b" * 40, True
+    original = gh.api
+
+    def api(endpoint, **kwargs):
+        if endpoint == "repos/org/library/git/ref/heads/main":
+            return {"object": {"sha": upstream_tip}}
+        return original(endpoint, **kwargs)
+
+    def compare(repo, base, head):
+        result = (
+            previous.commit
+            if base == reviewed.commit and head == upstream_tip and not reachable
+            else base
+        )
+        return {"merge_base_commit": {"sha": result}}
+
+    monkeypatch.setattr(gh, "api", api)
+    monkeypatch.setattr(gh, "compare", compare)
+
+    def check() -> None:
+        with pytest.raises(p.Diagnostic) as failure:
+            p._check_source(gh, previous, reviewed)
+        monitor._feedback(gh.pr, failure.value, source=reviewed)
+
+    check()
+    writes = copy.deepcopy(gh.writes)
+    gh.canonical_tip, upstream_tip = "c" * 40, "d" * 40
+    check()
+    assert gh.writes == writes
+    reachable = False
+    check()
+    assert len(gh.comments) == 2
+    assert "not reachable" in gh.comments[-1]["body"]
+
+
+def test_temporary_fork_same_ancestry_failure_does_not_repeat_for_new_dev_tip(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gh = monitor.gh
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "temporary")
+    monkeypatch.setattr(
+        gh, "compare", lambda *args: {"merge_base_commit": {"sha": previous.commit}}
+    )
+    for tip in ("c" * 40, "d" * 40):
+        gh.canonical_tip = tip
+        with pytest.raises(p.Diagnostic) as failure:
+            p._check_canonical_tip(gh, previous, reviewed)
+        monitor._feedback(gh.pr, failure.value, source=reviewed)
+    assert len(gh.comments) == 1 and len(gh.writes) == 2
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["post-response", "review-update", "dismissal-response", "dismissal-response-no-comment"],
+)
+def test_feedback_recovers_after_partial_publication_without_sqlite(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue("Initial problem"))
+    problem = None if stage.startswith("dismissal-response") else _issue("Changed problem")
+    no_promotion = stage == "dismissal-response-no-comment"
+    if no_promotion:
+        gh.comments.clear()
+    original = gh.api
+
+    def fail(endpoint, **kwargs):
+        if stage == "review-update" and endpoint.endswith("/reviews/1"):
+            raise RuntimeError("Injected review failure")
+        result = original(endpoint, **kwargs)
+        if (
+            stage == "post-response"
+            and endpoint.endswith("/comments")
+            and kwargs.get("method") == "POST"
+        ) or (stage.startswith("dismissal-response") and endpoint.endswith("/dismissals")):
+            raise RuntimeError("Injected lost response")
+        return result
+
+    monkeypatch.setattr(gh, "api", fail)
+    with pytest.raises(RuntimeError, match="Injected"):
+        monitor._feedback(gh.pr, problem, no_promotion=no_promotion)
+    monkeypatch.setattr(gh, "api", original)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, gh, store)
+        restarted._feedback(gh.pr, problem, no_promotion=no_promotion)
+        writes = copy.deepcopy(gh.writes)
+        restarted._feedback(gh.pr, problem, no_promotion=no_promotion)
+        assert gh.writes == writes
+    assert len(gh.comments) == (1 if no_promotion else 2) and len(gh.reviews) == 1
+    assert f"#issuecomment-{gh.comments[-1]['id']}" in gh.reviews[0]["body"]
+    assert gh.reviews[0]["state"] == ("DISMISSED" if problem is None else "CHANGES_REQUESTED")
+
+
+def test_feedback_uses_newest_owned_comment_not_listing_or_edit_order(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue("First"))
+    monitor._feedback(gh.pr, _issue("Second"))
+    gh.comments[0]["updated_at"] = "2099-01-01T00:00:00Z"
+    gh.comments.reverse()
+    gh.comments.append({"id": 99, "body": gh.comments[0]["body"], "user": {"login": "author"}})
+    writes = copy.deepcopy(gh.writes)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(monitor.args, gh, store)._feedback(gh.pr, _issue("Second"))
+    assert gh.writes == writes
+    assert "#issuecomment-2" in gh.reviews[0]["body"]
+
+
+def test_feedback_supersedes_legacy_comment_once(monitor: b.Monitor) -> None:
+    gh = monitor.gh
+    legacy = {
+        "id": 1,
+        "body": f"{monitor.marker}\nOld diagnostic",
+        "user": {"login": monitor.actor},
+    }
+    gh.comments.append(copy.deepcopy(legacy))
+    monitor._feedback(gh.pr, _issue())
+    assert gh.comments[0] == legacy and len(gh.comments) == 2
+    assert "Supersedes" in gh.comments[-1]["body"] and "#issuecomment-1" in gh.comments[-1]["body"]
+    writes = copy.deepcopy(gh.writes)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(monitor.args, gh, store)._feedback(gh.pr, _issue())
+    assert gh.writes == writes
+
+
+def test_feedback_finds_latest_result_on_later_comment_page(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue("First"))
+    monitor._feedback(gh.pr, _issue("Second"))
+    first, latest = copy.deepcopy(gh.comments)
+    latest["id"] = 101
+    gh.comments = (
+        [first]
+        + [
+            {"id": number, "body": "Unrelated discussion", "user": {"login": "author"}}
+            for number in range(2, 101)
+        ]
+        + [latest]
+    )
+    gh.comments.extend(
+        [
+            latest | {"id": 102, "user": {"login": "author"}},
+            latest
+            | {
+                "id": 103,
+                "body": latest["body"].replace(monitor.marker, "<!-- vendor-bot:other -->"),
+            },
+        ]
+    )
+    original, pages = gh.api, []
+
+    def paged(endpoint, **kwargs):
+        if "/issues/7/comments?" in endpoint:
+            page = int(parse_qs(endpoint.split("?", 1)[1])["page"][0])
+            pages.append(page)
+            return copy.deepcopy(gh.comments[(page - 1) * 100 : page * 100])
+        return original(endpoint, **kwargs)
+
+    monkeypatch.setattr(gh, "api", paged)
+    before = copy.deepcopy(gh.comments)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(monitor.args, gh, store)._feedback(gh.pr, _issue("Second"))
+    assert pages == [1, 2]
+    assert gh.comments == before
+    assert "#issuecomment-101" in gh.reviews[0]["body"]
 
 
 def _vendor(commit: str, url: str, branch: str):
@@ -2053,14 +2379,14 @@ def test_forbidden_dismissal_informs_author_without_approving(
 
     monkeypatch.setattr(monitor.gh, "api", forbidden)
     monitor._feedback(monitor.gh.pr, None, no_promotion=no_promotion)
-    assert "lacks dismissal permission" in monitor.gh.comments[0]["body"]
+    assert "lacks dismissal permission" in monitor.gh.comments[-1]["body"]
     assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
     writes = len(monitor.gh.writes)
     monitor._feedback(monitor.gh.pr, None, no_promotion=no_promotion)
     assert len(monitor.gh.writes) == writes
     monkeypatch.setattr(monitor.gh, "api", original)
     monitor._feedback(monitor.gh.pr, None, no_promotion=no_promotion)
-    assert "lacks dismissal permission" not in monitor.gh.comments[0]["body"]
+    assert "lacks dismissal permission" not in monitor.gh.comments[-1]["body"]
     assert monitor.gh.reviews[0]["state"] == "DISMISSED"
 
 

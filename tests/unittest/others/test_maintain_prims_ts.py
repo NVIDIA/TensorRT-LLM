@@ -942,6 +942,36 @@ def test_upstream_main_exception_is_narrow(world: World, failure: str) -> None:
     assert not any(call[0] == "push" for call in world.git_calls)
 
 
+def test_upstream_source_reports_all_failed_checks(world: World) -> None:
+    _pin_upstream(world, branch="pull/5434/head")
+    world.upstream = world.previous
+    _git(world.source, "switch", "-q", "--detach", world.previous)
+    tip = _advance_canonical(world)
+    with pytest.raises(m.Diagnostic) as failure:
+        m._make_plan(world.args(upstream_pr=[]), world)
+    text = str(failure.value)
+    assert text.count("- FAIL") == 3
+    assert "- PASS" not in text
+    assert "pull/5434/head" in text and "configured branch" in text
+    assert "latest canonical branch tip" in text and tip in text
+    assert "not reachable" in text and world.upstream in text
+    assert f"/compare/{world.reviewed}...{tip}" in text
+    assert f"/compare/{world.reviewed}...{world.upstream}" in text
+    assert "Temporary fork branch" in text and "rebase" in text
+    assert "Changing only the branch field" in text
+    assert "vendor-promotion block" in text and "vendor-sources.md" in text
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+
+def test_upstream_source_wrong_branch_does_not_invent_ancestry_failures(world: World) -> None:
+    _pin_upstream(world, branch="pull/<script>/head")
+    with pytest.raises(m.Diagnostic) as failure:
+        m._make_plan(world.args(upstream_pr=[]), world)
+    text = str(failure.value)
+    assert text.count("- FAIL") == 1 and text.count("- PASS") == 2
+    assert "<script>" not in text and "&lt;script&gt;" in text
+
+
 @pytest.mark.parametrize("movement", ["dev", "upstream"])
 def test_upstream_main_rechecks_refs_before_publication(
     world: World, monkeypatch: pytest.MonkeyPatch, movement: str
@@ -1011,11 +1041,14 @@ def test_upstream_main_rechecks_dev_before_valid_feedback(
     pr.update(merged=False, state="open", user={"login": "maintainer"})
     world.overrides[endpoint] = pr
     api = world.api
+    advanced = False
 
     def advance(endpoint, **kwargs):
+        nonlocal advanced
         result = api(endpoint, **kwargs)
-        if endpoint == f"repos/{_UPSTREAM}/git/ref/heads/main":
+        if endpoint == f"repos/{_UPSTREAM}/git/ref/heads/main" and not advanced:
             _advance_canonical(world)
+            advanced = True
         return result
 
     monkeypatch.setattr(world, "api", advance)

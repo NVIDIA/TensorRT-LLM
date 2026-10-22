@@ -464,7 +464,7 @@ local consumer checkout; no code or hooks from source forks are executed.
 
 ## Feedback and review safety
 
-With `--publish`, recognized author-actionable problems produce an updatable
+With `--publish`, recognized author-actionable problems produce a new
 comment containing the specific problem, its location, and a **Fix** section.
 Examples are included only when relevant, using the configured vendor and
 upstream repository. Missing metadata gets a complete copyable marked block;
@@ -473,6 +473,23 @@ nested resolution example. Existing entries for other vendors must be preserved.
 Edit the **PR description**, not a comment, when correcting metadata. The bot
 rechecks automatically on later polls; no manual recheck comment is required.
 
+Each comment is headed **Vendor validation**, mentions the PR author, identifies
+the checked PR revision and source pin when available, and links to the previous
+result it supersedes. The bot posts a new comment when the source URL/branch/pin,
+problem, fix instructions, or validation status changes. Earlier comments remain
+unchanged snapshots; the bot's marked reviews link to the newest result with
+**Latest vendor validation and step-by-step fix**.
+
+Unchanged polls do not post again. Moving observed dev/upstream tips alone or
+unrelated consumer commits do not notify unless they change the validation
+result. The bot still revalidates against live tips on each poll. Deduplication
+compares a versioned fingerprint in the newest bot-owned GitHub comment, not
+SQLite or every historical result: A → B → A posts three results. This also
+recovers after a lost POST response or a restart without SQLite. Legacy comments
+without a fingerprint are preserved and superseded once by the new format.
+Only comments/reviews from the configured account with the vendor marker count;
+manual feedback and other accounts/vendors are not modified.
+
 | Problem | What the bot tells the author to fix |
 |---------|-------------------------------------|
 | Missing markers | Names exactly which of `<!-- vendor-promotion:start -->` and `<!-- vendor-promotion:end -->` is missing, and where to insert it. |
@@ -480,7 +497,8 @@ rechecks automatically on later polls; no manual recheck comment is required.
 | Malformed YAML or schema | Reports YAML line/column or the affected field path and the expected structure, without copying raw parser excerpts. YAML line 1 is the first line inside the fence. |
 | Invalid upstream PR or resolution | Identifies the list entry, duplicated PR, source SHA, missing reason, or unlisted PR, and gives the correction. |
 | Unresolved attribution | Shows candidate PRs and similarity scores where applicable; explains how to correct the PR list/source pin or supply a targeted author assertion. |
-| Source-history or lock-selection problem | Explains the rebase or lock-file change and vendor regeneration needed. Rebase guidance identifies the canonical pin. Metadata edits alone cannot fix these failures. |
+| Source-history or lock-selection problem | Explains the rebase or lock-file change and vendor regeneration needed. Rebase guidance targets the latest canonical dev tip, not just the older consumer lock pin. Merge diagnostics explain the linear-history requirement for temporary-fork attribution. Metadata edits alone cannot fix these failures. |
+| Upstream source fails the exception | Reports the configured-branch, latest-dev ancestry, and upstream-reachability checks together, with observed SHAs and comparison links. Gives both the temporary-fork recovery path and the requirements for using upstream directly; renaming the lock branch alone cannot repair ancestry. |
 | Same-commit temporary reference | If the PR redirects the source URL/branch but pins the current canonical commit, asks the author to restore the canonical URL/branch from its target base. Keep the commit, other lock fields, vendored files, and patch unchanged; no upstream-PR metadata is needed. |
 
 `unpaired_reason` is appropriate only when there genuinely is no paired upstream
@@ -500,10 +518,10 @@ configured refresh targets are not treated as unnecessary temporary redirects.
 
 After correction it dismisses only its own marked metadata reviews, when
 authorized. If an open PR no longer needs promotion, it also reconciles existing
-comments/reviews from GitHub, without requiring SQLite history. It updates the
-comment to explain that the previous request no longer applies, rather than
+comments/reviews from GitHub, without requiring SQLite history. It posts a new
+result to explain that the previous request no longer applies, rather than
 claiming metadata validation succeeded. It posts no feedback on an ignored PR
-unless it already has a bot comment or an unresolved bot review to reconcile.
+unless it already has a bot comment or a marked bot review to reconcile.
 If dismissal is forbidden, an authorized human must dismiss the
 review; the bot reports the failure rather than approving the code. If the
 authenticated account already has a manual approval/objection, the bot uses
