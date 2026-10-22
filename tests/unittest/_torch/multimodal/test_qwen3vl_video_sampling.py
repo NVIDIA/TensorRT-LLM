@@ -159,6 +159,88 @@ def test_full_video_retains_hf_default(adapter, processor):
     assert torch.equal(result["input_ids"], reference["input_ids"])
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("processor_fps,count", [(2, 60), (30, 768)])
+def test_dropped_frame_above_cap_samples_with_source_mapping(
+    adapter, processor, nested, processor_fps, count
+) -> None:
+    """A failed retrieve must not let the default path bypass HF's frame cap."""
+    processor.video_processor.fps = processor_fps
+    indices = [i for i in range(900) if i != 450]
+    video = _video(indices, fps=30, total=900)
+    prefix = _video(list(range(450)), fps=30, total=900)
+    presampled = _video(np.linspace(0, 899, 32).astype(int).tolist(), fps=30, total=900)
+    original = copy.deepcopy(video.metadata)
+    result = _run(
+        adapter, processor, [video, prefix, presampled], **({"videos_kwargs": {}} if nested else {})
+    )
+    selected = np.linspace(0, 898, count).round().astype(int)
+    expected = [indices[i] for i in selected]
+    metadata = result["video_metadata"][0]
+    assert result["video_grid_thw"][:, 0].tolist() == [
+        count // 2,
+        (30 if processor_fps == 2 else 450) // 2,
+        16,
+    ]
+    assert list(metadata.frames_indices) == expected
+    assert metadata.fps == 30
+    assert metadata.total_num_frames == 900
+    assert metadata.duration == 30
+    assert processor._calculate_timestamps(metadata.frames_indices, metadata.fps) == pytest.approx(
+        [(expected[i] + expected[i + 1]) / 60 for i in range(0, count, 2)]
+    )
+    # Recover the first video's pixels; they encode decoded positions, not source indices.
+    n_patches = int(result["video_grid_thw"][0].prod().item())
+    patches = result["pixel_values_videos"][:n_patches].reshape(count // 2, -1, 3, 2, 16, 16)
+    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == selected.tolist()
+    assert list(result["video_metadata"][2].frames_indices) == presampled.metadata["frames_indices"]
+    assert video.metadata == original
+    assert adapter.get_num_tokens_per_video(
+        video=video.frames, video_metadata=video.metadata
+    ) == adapter.get_num_tokens_per_video(
+        video=video.frames, video_grid_thw=result["video_grid_thw"][0]
+    )
+
+
+@pytest.mark.parametrize("n_decoded", [768, 769])
+def test_presampled_default_frame_cap_boundary(adapter, processor, n_decoded) -> None:
+    """Preserve IO samples through the cap and use HF defaults above it."""
+    video = _video(np.linspace(0, 2399, n_decoded).astype(int).tolist(), total=2400)
+    result = _run(adapter, processor, [video])
+    expected_count = n_decoded if n_decoded == 768 else 200
+    assert result["video_grid_thw"][0, 0].item() == expected_count // 2
+    selected = np.linspace(0, n_decoded - 1, expected_count).round().astype(int)
+    assert list(result["video_metadata"][0].frames_indices) == [
+        video.metadata["frames_indices"][i] for i in selected
+    ]
+
+
+@pytest.mark.parametrize(
+    "kwargs,processor_disabled,count",
+    [
+        ({"do_sample_frames": False}, False, 899),
+        ({}, True, 899),
+        ({"num_frames": 899}, False, 899),
+        ({"num_frames": 0}, False, 899),
+        ({"fps": 0}, False, 899),
+        ({"num_frames": 8, "fps": 2}, False, 8),
+    ],
+)
+def test_above_cap_respects_explicit_sampling_controls(
+    adapter, processor, kwargs, processor_disabled, count
+) -> None:
+    """The default cap guard must not override caller targets or disabled sampling."""
+    processor.video_processor.do_sample_frames = not processor_disabled
+    video = _video([i for i in range(900) if i != 450], fps=30, total=900)
+    result = _run(adapter, processor, [video], **kwargs)
+    assert result["video_grid_thw"][0, 0].item() == (count + 1) // 2
+    selected = np.linspace(0, 898, count).round().astype(int)
+    expected = [video.metadata["frames_indices"][i] for i in selected]
+    if count % 2:
+        expected.append(expected[-1])  # HF pads the final temporal patch.
+    assert list(result["video_metadata"][0].frames_indices) == expected
+
+
 def test_metadata_without_source_indices_uses_decoded_offsets(adapter, processor):
     video = _video(list(range(48)), total=48)
     del video.metadata["frames_indices"]
