@@ -135,7 +135,7 @@ class AttentionNormGate(OpWrapper):
     launch (``TRIGGERS``); it changes nothing the kernel computes.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Certified bit for bit against the built-in `_attention_norm_gate_kernel`

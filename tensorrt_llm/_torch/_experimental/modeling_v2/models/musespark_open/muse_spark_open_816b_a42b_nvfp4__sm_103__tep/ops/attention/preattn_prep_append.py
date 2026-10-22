@@ -46,6 +46,8 @@ from .preattn_prep import HEAD_DIM, _inverse_rms, _load8, _normalize, _split_pro
 LOG2E = 1.4426950408889634
 #: Query rows a decode step may carry: one accepted token and up to 7 drafts.
 MAX_ROWS = 8
+#: Sequences one call may carry (``requests``): a decode step of two to four requests.
+MAX_REQUESTS = 4
 
 
 @triton.jit
@@ -97,6 +99,8 @@ def _preattn_prep_append_kernel(
     LAUNCH_WITH_PDL: tl.constexpr,
     TRIGGER_AT_ENTRY: tl.constexpr = False,
     TEST_DELAY_NS: tl.constexpr = 0,
+    REQS: tl.constexpr = 1,
+    BT_STRIDE_REQ: tl.constexpr = 0,
 ):
     D: tl.constexpr = 64
     PAGE: tl.constexpr = NUM_KV_HEADS * P * D
@@ -127,7 +131,15 @@ def _preattn_prep_append_kernel(
 
     # The step's cache slot of this row: the step's rows are the last ``rows``
     # positions of the sequence (seq_lens[0] counts them).
-    position = tl.load(seq_len_ptr) - tl.num_programs(0) + tl.program_id(0)
+    if REQS > 1:
+        # Several sequences of equal row count, one after another: this row's
+        # sequence, its length and its row of the block table.
+        per_req = tl.num_programs(0) // REQS
+        req = tl.program_id(0) // per_req
+        position = tl.load(seq_len_ptr + req) - per_req + tl.program_id(0) % per_req
+        bt_ptr = bt_ptr + req * BT_STRIDE_REQ
+    else:
+        position = tl.load(seq_len_ptr) - tl.num_programs(0) + tl.program_id(0)
     slot = (kv_head * P + position % P) * D
 
     # The pass-through half first, so its load is in flight during the norm:
@@ -247,9 +259,17 @@ class PreattnPrepAppend(OpWrapper):
     sequence's K and V page ids, the layer's pool view, the two FP8 KV scales,
     the FMHA's host bmm1 scale and the output scale (1.0 for a BF16 output).
     Call site: the target's 16 full-attention layers on decode steps of one
-    sequence and at most 8 rows (fast path full_attention_prep_append), whose
-    trtllm-gen generation preprocess launch the target then skips; a caller
-    may launch it with trigger_at_entry to release its dependents at entry. Grid (rows, H + G), one warp per program.
+    sequence and at most 8 rows (fast path full_attention_prep_append), and at tep4 on
+    decode steps of two to four sequences of equal row count (fast path
+    wide_full_attention), whose trtllm-gen generation preprocess launch the target then
+    skips; a caller may launch it with trigger_at_entry to release its dependents at
+    entry. Grid (rows, H + G), one warp per program.
+
+    Several sequences (``block_tables`` ``[R, 2, pages]``, ``R = 2..4``): row ``t`` of
+    the projection belongs to sequence ``r = t // (rows / R)`` at position
+    ``seq_lens[r] - rows / R + t % (rows / R)``, through that sequence's table row; the
+    query buffer, the fused operand and the gate keep the projection's row order. The
+    one-sequence call launches the kernel without this axis.
 
     Bit-identical, gated by its own tests: qkv_out and gate_out against
     preattn_prep and the built-in prep; the cache bytes, the E4M3 query bytes
@@ -259,13 +279,13 @@ class PreattnPrepAppend(OpWrapper):
     output on both paths, eager and in a captured graph.
 
     Loud preconditions (ValueError before any launch): BF16 projection with
-    unit last stride and width 2 * (H + G) * 64, 1..8 rows, FP8 E4M3 pool
-    [pages, G, P, 64] with P a power of two, int32 [2, pages] block table with
-    unit last stride, int32 seq_lens, fp32 scales, a query buffer of at least
-    M * H * 64 bytes.
+    unit last stride and width 2 * (H + G) * 64, 1..8 rows per sequence, FP8 E4M3
+    pool [pages, G, P, 64] with P a power of two, int32 [2, pages] or
+    [R <= 4, 2, pages] block table with unit last stride, int32 seq_lens of at
+    least R, fp32 scales, a query buffer of at least M * H * 64 bytes.
 
-    Not certified: RoPE layers (the full-attention layers are NoPE), more
-    than one sequence per call, head width other than 64, NVFP4 or BF16 caches.
+    Not certified: RoPE layers (the full-attention layers are NoPE), sequences of
+    different row counts in one call, head width other than 64, NVFP4 or BF16 caches.
     """
 
     def __call__(
@@ -291,21 +311,25 @@ class PreattnPrepAppend(OpWrapper):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows, width = qkv.shape
         page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
+        requests = block_tables.shape[0] if block_tables.dim() == 3 else 1
         if (
             qkv.dtype != torch.bfloat16
             or qkv.stride(-1) != 1
             or width != 2 * (num_q_heads + num_kv_heads) * HEAD_DIM
-            or not 1 <= rows <= MAX_ROWS
+            or not 1 <= requests <= MAX_REQUESTS
+            or rows % requests != 0
+            or not 1 <= rows // requests <= MAX_ROWS
             or kv_pool.dtype != torch.float8_e4m3fn
             or kv_pool.dim() != 4
             or tuple(kv_pool.shape[1:]) != (num_kv_heads, page, HEAD_DIM)
             or not kv_pool.is_contiguous()
             or page & (page - 1) != 0
             or block_tables.dtype != torch.int32
-            or block_tables.dim() != 2
-            or block_tables.shape[0] != 2
+            or block_tables.dim() not in (2, 3)
+            or block_tables.shape[-2] != 2
             or block_tables.stride(-1) != 1
             or seq_lens.dtype != torch.int32
+            or seq_lens.numel() < requests
             or kv_scale_orig_quant.dtype != torch.float32
             or kv_scale_quant_orig.dtype != torch.float32
             or bmm1_scale.dtype != torch.float32
@@ -316,9 +340,11 @@ class PreattnPrepAppend(OpWrapper):
             or q_fp8.numel() * q_fp8.element_size() < rows * num_q_heads * HEAD_DIM
         ):
             raise ValueError(
-                "preattn_prep_append takes a BF16 [1..8, 2 (H + G) 64] projection, an FP8 E4M3 "
-                "pool [pages, G, P, 64] (P a power of two), an int32 [2, pages] block table, "
-                "int32 seq_lens, fp32 scales and a contiguous query buffer of M H 64 bytes; got "
+                "preattn_prep_append takes a BF16 [R x 1..8, 2 (H + G) 64] projection, an FP8 "
+                "E4M3 pool [pages, G, P, 64] (P a power of two), an int32 [2, pages] or "
+                "[R, 2, pages] block table (R <= 4 sequences of equal row count), int32 "
+                "seq_lens of at least R, fp32 scales and a contiguous query buffer of M H 64 "
+                "bytes; got "
                 f"qkv {qkv.dtype} {tuple(qkv.shape)} strides {qkv.stride()}, H={num_q_heads} "
                 f"G={num_kv_heads}, pool {kv_pool.dtype} {tuple(kv_pool.shape)}, table "
                 f"{block_tables.dtype} {tuple(block_tables.shape)}, seq_lens {seq_lens.dtype}, "
@@ -337,7 +363,7 @@ class PreattnPrepAppend(OpWrapper):
             q_fp8.view(torch.uint8).view(torch.float8_e4m3fn),
             kv_pool,
             block_tables,
-            block_tables.stride(0),
+            block_tables.stride(-2),
             seq_lens,
             kv_scale_orig_quant,
             kv_scale_quant_orig,
@@ -359,6 +385,8 @@ class PreattnPrepAppend(OpWrapper):
             launch_pdl=enable_pdl,
             # Passed only when set: the default launch is the kernel without the switch.
             **({"TRIGGER_AT_ENTRY": True} if enable_pdl and trigger_at_entry else {}),
+            # Likewise the multi-sequence build: one sequence launches the kernel without it.
+            **({"REQS": requests, "BT_STRIDE_REQ": block_tables.stride(0)} if requests > 1 else {}),
         )
         return qkv_out, gate_out
 
@@ -414,14 +442,18 @@ class PreattnPrepAppend(OpWrapper):
         q8 = q_fp8.view(torch.uint8).reshape(-1)
         q8[: rows * num_q_heads * HEAD_DIM] = e4m3(q).reshape(-1)
         pool_bytes = kv_pool.view(torch.uint8)
-        length = int(seq_lens[0])
-        positions = torch.arange(length - rows, length, device=qkv.device)
-        k_pages = block_tables[0, positions // page].long()
-        v_pages = block_tables[1, positions // page].long()
-        slots = positions % page
-        for g in range(num_kv_heads):
-            pool_bytes[k_pages, g, slots] = e4m3(k[:, g])
-            pool_bytes[v_pages, g, slots] = e4m3(v[:, g])
+        tables = block_tables if block_tables.dim() == 3 else block_tables[None]
+        per_req = rows // tables.shape[0]
+        for r in range(tables.shape[0]):
+            length = int(seq_lens[r])
+            positions = torch.arange(length - per_req, length, device=qkv.device)
+            k_pages = tables[r, 0, positions // page].long()
+            v_pages = tables[r, 1, positions // page].long()
+            slots = positions % page
+            own = slice(r * per_req, (r + 1) * per_req)
+            for g in range(num_kv_heads):
+                pool_bytes[k_pages, g, slots] = e4m3(k[own, g])
+                pool_bytes[v_pages, g, slots] = e4m3(v[own, g])
         u = kv_scale_quant_orig.float()[0]
         bmm1 = u * u * torch.tensor(bmm1_host_scale, dtype=torch.float32, device=u.device)
         bmm1_scale[0] = bmm1
@@ -457,23 +489,25 @@ class PreattnPrepAppend(OpWrapper):
         positions; a block table shorter than the context reads page ids past
         its end; a page id outside the pool writes outside it.
         """
-        rows = qkv.shape[0]
-        length = int(seq_lens[0])
+        tables = block_tables if block_tables.dim() == 3 else block_tables[None]
+        rows = qkv.shape[0] // tables.shape[0]
         page = kv_pool.shape[2]
-        if length < rows:
-            raise ValueError(f"seq_lens[0] = {length} is shorter than the step's {rows} rows")
-        last = (length - 1) // page
-        if block_tables.shape[1] <= last:
-            raise ValueError(
-                f"a [2, {block_tables.shape[1]}] block table cannot address {length} keys "
-                f"of {page}-token pages"
-            )
-        used = block_tables[:, (length - rows) // page : last + 1]
-        if int(used.min()) < 0 or int(used.max()) >= kv_pool.shape[0]:
-            raise ValueError(
-                f"page ids [{int(used.min())}, {int(used.max())}] outside the "
-                f"{kv_pool.shape[0]}-page pool"
-            )
+        for r in range(tables.shape[0]):
+            length = int(seq_lens[r])
+            if length < rows:
+                raise ValueError(f"seq_lens[{r}] = {length} is shorter than the step's {rows} rows")
+            last = (length - 1) // page
+            if tables.shape[2] <= last:
+                raise ValueError(
+                    f"a [2, {tables.shape[2]}] block table cannot address {length} keys "
+                    f"of {page}-token pages"
+                )
+            used = tables[r, :, (length - rows) // page : last + 1]
+            if int(used.min()) < 0 or int(used.max()) >= kv_pool.shape[0]:
+                raise ValueError(
+                    f"page ids [{int(used.min())}, {int(used.max())}] outside the "
+                    f"{kv_pool.shape[0]}-page pool"
+                )
 
 
 preattn_prep_append = PreattnPrepAppend()

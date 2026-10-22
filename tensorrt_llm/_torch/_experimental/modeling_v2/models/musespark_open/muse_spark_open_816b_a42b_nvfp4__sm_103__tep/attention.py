@@ -483,9 +483,12 @@ class MuseSparkOpenTepDecodeAttention(MuseSparkOpenAttention):
         attention_sinks: Optional[torch.Tensor],
         relative_attention_bias: Optional[torch.Tensor],
         has_lora: bool,
+        requests: int = 1,
     ) -> Optional[str]:
         """Why this call cannot run ``paged_decode_attention``, or ``None``.
 
+        ``requests`` > 1 asks instead whether it is ``requests`` generation sequences of at
+        most ``_DECODE_MAX_ROWS`` rows each (the multi-request ``swa_block``).
         Host-side reads only: under a CUDA graph each is a per-capture constant.
         """
         attn = self.attn
@@ -514,8 +517,13 @@ class MuseSparkOpenTepDecodeAttention(MuseSparkOpenAttention):
             (getattr(md, "kv_cache_block_offsets", None) is None, "no paged KV cache"),
             (getattr(md, "is_cross", False), "cross attention"),
             (getattr(md, "beam_width", 1) != 1, "beam search"),
-            (md.num_seqs != 1 or md.num_generations != 1, "not one generation sequence"),
-            (not 1 <= rows <= _DECODE_MAX_ROWS, f"{rows} rows"),
+            (
+                md.num_seqs != requests or md.num_generations != requests,
+                "not one generation sequence"
+                if requests == 1
+                else f"not {requests} generation sequences",
+            ),
+            (not 1 <= rows <= _DECODE_MAX_ROWS * requests, f"{rows} rows"),
             (
                 getattr(md, "is_spec_decoding_enabled", False)
                 or getattr(md, "is_spec_dec_tree", False)

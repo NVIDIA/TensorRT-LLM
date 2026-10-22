@@ -41,8 +41,10 @@ on any mismatch it runs the real call -- which rewrites the very bytes the prep
 wrote from the same operand -- and logs why once.
 
 Which steps: ``DecodeTarget`` decode steps (the call carries the
-``preattn_prep`` op) with no context rows, ``2 <= B <= 128`` sequences of one
-width ``Q <= 8`` and at most ``preattn_prep``'s 1024 rows. A step of one
+``preattn_prep`` op) with no context rows, ``min_seqs <= B <= 128`` sequences
+(``install``; 2 unless the composition folds the append of smaller multi-request
+steps in its own paths) of one width ``Q <= 8`` and at most ``preattn_prep``'s
+1024 rows. A step of one
 sequence -- the 8-row decode step of a single request -- returns to the class behind this mixin
 before anything else is read, so the one-sequence fast paths
 (``full_attention_prep_append``, ``full_attention_split_kv``,
@@ -123,14 +125,18 @@ def _window_left(cyclic: int, max_past: int) -> int:
     return cyclic - 1 if 0 < cyclic < max_past else -1
 
 
-def takes_step(attn_metadata) -> bool:
-    """Whether a step is one this path may fold: no context rows, 2..128 sequences, no beams.
+#: Fewest sequences of a step the fold takes by default (``install``'s ``min_seqs``).
+MIN_SEQS = 2
+
+
+def takes_step(attn_metadata, min_seqs: int = MIN_SEQS) -> bool:
+    """Whether a step is one this path may fold: no context rows, ``min_seqs``..128 sequences, no beams.
 
     Host-side reads only (per-capture constants under a CUDA graph).
     """
     return (
         getattr(attn_metadata, "num_contexts", 1) == 0
-        and 2 <= getattr(attn_metadata, "num_seqs", 0) <= MAX_SEQS
+        and min_seqs <= getattr(attn_metadata, "num_seqs", 0) <= MAX_SEQS
         and getattr(attn_metadata, "num_generations", 0) == getattr(attn_metadata, "num_seqs", -1)
         and getattr(attn_metadata, "beam_width", 1) == 1
     )
@@ -398,17 +404,20 @@ class MultiRequestPrepAppendAttention:
     ``multi_request_prep_append`` in place of the ``preattn_prep`` prep and lets the
     built-in attention's generation preprocess stand down for it (``eliding``);
     any other call is exactly the class behind it. Adds two plain attributes set
-    for the duration of one forward, and one set by ``install``: the model's
-    ``MultiRequestCensus``.
+    for the duration of one forward, and two set by ``install``: the model's
+    ``MultiRequestCensus`` and the fewest sequences of a step it folds.
     """
 
     _mr_append_metadata: Optional[object]
     _mr_append_folded: Optional[MultiRequestFoldedPreprocess]
     _mr_append_census: Optional[MultiRequestCensus] = None
+    _mr_append_min_seqs: int = MIN_SEQS
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._mr_append_census
-        takes = kwargs.get("preattn_prep") is not None and takes_step(attn_metadata)
+        takes = kwargs.get("preattn_prep") is not None and takes_step(
+            attn_metadata, self._mr_append_min_seqs
+        )
         if census is not None and self.layer_idx == census.layers[0]:
             census.begin(int(getattr(attn_metadata, "num_seqs", 0)) if takes else 0)
         # Only a forward the first layer opened as a multi-request decode step is counted.
@@ -621,11 +630,13 @@ def _folded_class(base: type) -> type:
     return type(f"{base.__name__}MultiRequestAppend", (MultiRequestPrepAppendAttention, base), {})
 
 
-def install(model: torch.nn.Module) -> int:
+def install(model: torch.nn.Module, min_seqs: int = MIN_SEQS) -> int:
     """Re-class every layer's attention with ``MultiRequestPrepAppendAttention`` in front.
 
     Run after every other attention re-class: the mixin goes in front of whatever
-    class each layer carries by then, and acts only on multi-request decode steps.
+    class each layer carries by then, and acts only on decode steps of ``min_seqs``
+    or more sequences (a composition whose own paths fold the append of smaller
+    multi-request steps passes the first count they leave to this one).
     Every layer is checked before any is re-classed. Idempotent: a model whose
     layers all carry the mixin is left alone. Returns the number of layers
     re-classed.
@@ -667,15 +678,21 @@ def install(model: torch.nn.Module) -> int:
             "[musespark_open] multi_request_prep_append cannot fold the decode preprocess: "
             + " | ".join(refused)
         )
+    if not 2 <= min_seqs <= MAX_SEQS:
+        raise ValueError(
+            f"[musespark_open] multi_request_prep_append folds steps of 2..{MAX_SEQS} sequences, "
+            f"not from {min_seqs}"
+        )
     census = MultiRequestCensus(tuple(attention.layer_idx for attention in attentions))
     for attention in attentions:
         attention.__class__ = _folded_class(type(attention))
         attention._mr_append_metadata = None
         attention._mr_append_folded = None
         attention._mr_append_census = census
+        attention._mr_append_min_seqs = min_seqs
     logger.info(
         f"[musespark_open] multi_request_prep_append: the K/V append, E4M3 query and FMHA scales "
-        f"of {len(attentions)} layers run in the decode prep on steps of 2..{MAX_SEQS} sequences "
+        f"of {len(attentions)} layers run in the decode prep on steps of {min_seqs}..{MAX_SEQS} sequences "
         f"of up to {MAX_ROWS_PER_SEQ} rows each; their trtllm-gen generation preprocess launch "
         "(decoder-info + append) is skipped"
     )

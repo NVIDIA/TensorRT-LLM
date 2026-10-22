@@ -83,7 +83,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ... import attention as _target_attention
 from ...attention_forward import PREPROCESS_ARGS, eliding, preprocess_reachable
 from ...dispatch import LAUNCH_PDL
-from ...ops.attention.preattn_prep_append import MAX_ROWS, preattn_prep_append
+from ...ops.attention.preattn_prep_append import MAX_REQUESTS, MAX_ROWS, preattn_prep_append
 
 #: ``PositionEmbeddingType.learned_absolute``: what a layer without RoPE passes; the
 #: append kernel then applies no rotation.
@@ -98,12 +98,17 @@ def _ptr(t: Optional[torch.Tensor]) -> Optional[int]:
 
 @functools.lru_cache(maxsize=64)
 def generation_layout(
-    dtype: torch.dtype, rows: int, num_heads: int, num_kv_heads: int, rotary_dim: int
+    dtype: torch.dtype,
+    rows: int,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    batch: int = 1,
 ) -> dict:
-    """The C++ generation workspace layout of one sequence of ``rows`` query rows."""
+    """The C++ generation workspace layout of ``batch`` sequences of ``rows`` query rows in all."""
     return dict(
         thop.get_trtllm_gen_generation_workspace_layout(
-            dtype, 1, rows, num_heads, 64, rotary_dim, num_kv_heads
+            dtype, batch, rows, num_heads, 64, rotary_dim, num_kv_heads
         )
     )
 
@@ -141,6 +146,8 @@ class FoldedPreprocess:
     quant_mode: int
     bmm1_host: float
     rotary_dim: int
+    #: The step's sequences (``wide_full_attention``: 2..4 of ``rows / requests`` rows each).
+    requests: int = 1
     consumed: bool = field(default=False)
     #: Why a preprocess call in this layer's window ran the real op, if one did.
     fallback: Optional[str] = field(default=None)
@@ -166,6 +173,7 @@ class FoldedPreprocess:
                     int(a["num_heads"]),
                     int(a["num_kv_heads"]),
                     int(a["rotary_embedding_dim"]),
+                    *((int(a["batch_beam"]),) if self.requests > 1 else ()),
                 )
                 != self.layout,
                 "another workspace layout",
@@ -195,10 +203,14 @@ class FoldedPreprocess:
             (int(a["kv_cache_quant_mode"]) != self.quant_mode, "another KV cache mode"),
             (not mode.has_fp8_kv_cache() or mode.has_fp4_kv_cache(), "not an FP8 KV cache"),
             (
-                int(a["num_tokens"]) != self.rows or int(a["input_seq_length"]) != self.rows,
+                int(a["num_tokens"]) != self.rows
+                or int(a["input_seq_length"]) != self.rows // self.requests,
                 "other rows",
             ),
-            (int(a["batch_beam"]) != 1, "not one sequence"),
+            (
+                int(a["batch_beam"]) != self.requests,
+                "not one sequence" if self.requests == 1 else "other sequences",
+            ),
             (int(a["position_embedding_type"]) != _NO_ROTARY, "a rotary layer"),
             (int(a["rotary_embedding_scale_type"]) != _NO_ROTARY_SCALING, "rotary scaling"),
             (float(a["bmm1_scale"]) != self.bmm1_host, "another softmax scale"),
@@ -403,6 +415,9 @@ class FullAppendAttention:
     _prep_append_metadata: Optional[object]
     _prep_append_folded: Optional[FoldedPreprocess]
     _prep_append_census: Optional[FoldCensus] = None
+    #: ``wide_full_attention`` (``install_multi``): fold decode steps of 2..``MAX_REQUESTS``
+    #: generation sequences of equal row count too.
+    _prep_append_multi: bool = False
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._prep_append_census
@@ -467,6 +482,28 @@ class FullAppendAttention:
             )
         return result
 
+    def _prep_append_requests(self, md) -> int:
+        """The sequences of this step the fold takes in one call: 1, or under
+        ``_prep_append_multi`` the 2..``MAX_REQUESTS`` generation sequences of a step whose host
+        ``seq_lens`` are all ``rows / sequences`` (at most ``MAX_ROWS``). Host-side reads only."""
+        if not self._prep_append_multi:
+            return 1
+        n = md.num_seqs
+        rows = md.num_tokens
+        seq_lens = getattr(md, "seq_lens", None)
+        if (
+            not 2 <= n <= MAX_REQUESTS
+            or md.num_generations != n
+            or rows % n
+            or rows // n > MAX_ROWS
+            or seq_lens is None
+            or seq_lens.is_cuda
+            or seq_lens.numel() < n
+            or bool((seq_lens[:n] != rows // n).any())
+        ):
+            return 1
+        return n
+
     def _prep_append_fmha_lib(self):
         """The flashinfer trtllm-gen FMHA library of this layer's FMHA manager, or None."""
         return _target_attention.trtllm_gen_fmha(self.attn)
@@ -475,8 +512,9 @@ class FullAppendAttention:
         """Why this call cannot run the folded prep, or ``None``. Host-side reads only."""
         attn = self.attn
         mode = QuantMode(int(getattr(attn, "quant_mode", 0)))
+        requests = self._prep_append_requests(md)
         checks = (
-            (not 1 <= qkv.shape[0] <= MAX_ROWS, f"{qkv.shape[0]} rows"),
+            (not 1 <= qkv.shape[0] // requests <= MAX_ROWS, f"{qkv.shape[0]} rows"),
             (not getattr(self, "skip_rope", False), "a RoPE layer"),
             (getattr(attn, "position_embedding_type", None) != _NO_ROTARY, "a rotary append"),
             (not mode.has_fp8_kv_cache() or mode.has_fp4_kv_cache(), "the KV cache is not FP8"),
@@ -484,7 +522,10 @@ class FullAppendAttention:
             (getattr(md, "kv_cache_block_offsets", None) is None, "no paged KV cache"),
             (getattr(md, "is_cross", False), "cross attention"),
             (getattr(md, "beam_width", 1) != 1, _BEAM_SEARCH),
-            (md.num_seqs != 1 or md.num_generations != 1, _NOT_ONE_SEQUENCE),
+            (
+                md.num_seqs != requests or md.num_generations != requests,
+                _NOT_ONE_SEQUENCE,
+            ),
             (md.num_tokens != qkv.shape[0], "rows other than the step's tokens"),
             (getattr(md, "effective_workspace", None) is None, "no attention workspace"),
             (self._prep_append_fmha_lib() is None, "no trtllm-gen FMHA library"),
@@ -512,7 +553,12 @@ class FullAppendAttention:
             fp8_context_fmha=True,
         )
         layout = generation_layout(
-            qkv.dtype, rows, self.num_heads, self.num_key_value_heads, attn.rope_params.dim
+            qkv.dtype,
+            rows,
+            self.num_heads,
+            self.num_key_value_heads,
+            attn.rope_params.dim,
+            *((requests,) if requests > 1 else ()),
         )
         if workspace.numel() * workspace.element_size() < max(required, layout["total_size"]):
             return "a workspace the attention grows first"
@@ -523,6 +569,7 @@ class FullAppendAttention:
     ) -> Tuple[torch.Tensor, torch.Tensor, FoldedPreprocess]:
         attn = self.attn
         rows = qkv.shape[0]
+        requests = self._prep_append_requests(md)
         layer_idx = attn.get_local_layer_idx(md)
         total_num_blocks = self._prep_append_fmha_lib()._get_total_num_blocks(md)
         kv_pool, block_tables, _ = thop.build_trtllm_gen_kv_cache_metadata(
@@ -537,12 +584,17 @@ class FullAppendAttention:
             total_num_blocks,
             attn.quant_mode,
             0,
-            1,
+            requests,
             qkv.dtype,
         )
         workspace = md.effective_workspace
         layout = generation_layout(
-            qkv.dtype, rows, self.num_heads, self.num_key_value_heads, attn.rope_params.dim
+            qkv.dtype,
+            rows,
+            self.num_heads,
+            self.num_key_value_heads,
+            attn.rope_params.dim,
+            *((requests,) if requests > 1 else ()),
         )
         q_buf = _workspace_view(workspace, layout["q_buf_offset"], layout["q_buf_size"], qkv.dtype)
         bmm1 = _workspace_view(
@@ -561,7 +613,7 @@ class FullAppendAttention:
             self.scale_query_by,
             self._qkv_layout_inverse is not None,
             kv_pool,
-            block_tables[0],
+            block_tables[0] if requests == 1 else block_tables[:requests],
             seq_lens,
             attn.kv_scale_orig_quant,
             attn.kv_scale_quant_orig,
@@ -591,6 +643,7 @@ class FullAppendAttention:
             quant_mode=int(attn.quant_mode),
             bmm1_host=bmm1_host,
             rotary_dim=attn.rope_params.dim,
+            requests=requests,
         )
         return qkv_out, gate, folded
 
@@ -653,6 +706,31 @@ def install(model: torch.nn.Module) -> int:
         f"[musespark_open] full_attention_prep_append: the KV append and FP8 query of {len(full)} "
         "full-attention layers run in the preattn_prep prep on decode steps of one sequence and at most "
         f"{MAX_ROWS} rows; their trtllm-gen generation preprocess launch is skipped"
+    )
+    return len(full)
+
+
+def install_multi(model: torch.nn.Module) -> int:
+    """``wide_full_attention``: the fold also takes decode steps of 2..``MAX_REQUESTS`` sequences.
+
+    Run after ``install``. Sets ``_prep_append_multi`` on every full-attention layer; returns
+    how many.
+
+    Raises:
+        ValueError: if a full-attention layer does not carry the fold (``install``).
+    """
+    full = [layer.self_attn for layer in model.layers if not layer.self_attn.is_sliding]
+    refused = [a.layer_idx for a in full if not isinstance(a, FullAppendAttention)]
+    if refused:
+        raise ValueError(
+            "[musespark_open] wide_full_attention extends full_attention_prep_append, which "
+            f"full-attention layers {refused} do not carry"
+        )
+    for attention in full:
+        attention._prep_append_multi = True
+    logger.info(
+        f"[musespark_open] wide_full_attention: the folded prep of {len(full)} full-attention "
+        f"layers also takes decode steps of 2..{MAX_REQUESTS} sequences of up to {MAX_ROWS} rows"
     )
     return len(full)
 

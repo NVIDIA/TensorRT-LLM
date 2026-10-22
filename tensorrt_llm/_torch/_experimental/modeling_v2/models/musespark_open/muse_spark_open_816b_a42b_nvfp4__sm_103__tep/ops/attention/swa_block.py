@@ -166,12 +166,27 @@ def _swa_split_kernel(
     QKV_PERMUTED: tl.constexpr,
     APPLY_ROPE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    REQS: tl.constexpr = 1,
 ):
     G: tl.constexpr = HQ // HKV
     PAGE: tl.constexpr = HKV * P * D
     split = tl.program_id(0)
     h = tl.program_id(1)
     row_group = tl.program_id(2)
+    if REQS > 1:
+        # Several sequences of M rows each, request-major in the operand: program
+        # (split, h, req * RG + row_group) is the one-sequence program of request
+        # ``req`` on its own rows, length, block-table row, positions and partials.
+        RG: tl.constexpr = (M * G + R - 1) // R
+        req = row_group // RG
+        row_group = row_group % RG
+        qkv_ptr += req * M * qkv_stride
+        bt_ptr += req * 2 * bt_stride_kv  # [requests, 2, pages], K then V rows
+        seq_len_ptr += req
+        if APPLY_ROPE:
+            positions_ptr += req * M
+        part_o_ptr += req * num_splits * HKV * M * G * D
+        part_ml_ptr += req * num_splits * HKV * M * G * 2
     d = tl.arange(0, D)
 
     # Column offsets of this program's heads in the operand: the prep output
@@ -401,10 +416,19 @@ def _swa_combine_kernel(
     BLOCK_S: tl.constexpr,
     FUSED_GATE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    REQS: tl.constexpr = 1,
 ):
     G: tl.constexpr = HQ // HKV
     row = tl.program_id(0)  # token * G + query head within the KV group
     h = tl.program_id(1)
+    if REQS > 1:
+        # Request ``program_id(2)``'s partials, output rows and gate rows.
+        req = tl.program_id(2)
+        part_o_ptr += req * num_splits * HKV * M * G * D
+        part_ml_ptr += req * num_splits * HKV * M * G * 2
+        out_ptr += req * M * out_stride
+        if FUSED_GATE:
+            gate_ptr += req * M * gate_token_stride
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
         if FUSED_GATE:
@@ -771,3 +795,323 @@ class SwaBlockAttention(OpWrapper):
 
 
 swa_block_attention = SwaBlockAttention()
+
+
+#: Sequences one multi-request call takes: a TP4 decode step of up to four requests.
+MULTI_MAX_REQUESTS = 4
+
+
+class SwaBlockMultiAttention(OpWrapper):
+    """``swa_block_attention`` of a decode step of several sequences, in the same two launches.
+
+    ``qkv`` holds ``B = seq_lens.numel()`` sequences of ``M = rows / B`` rows each,
+    request-major (rows ``b M .. b M + M - 1`` are sequence ``b``'s, at positions
+    ``seq_lens[b] - M .. seq_lens[b] - 1``); ``block_tables`` is ``[B, 2, pages]`` (each
+    sequence's K and V page ids, the TRT-LLM table's layout); ``position_ids`` and ``gate``
+    are per row in the same order. Row block ``b`` of the result, and every cache byte the
+    call writes for sequence ``b``, is what ``swa_block_attention`` computes for that
+    sequence alone, bit for bit: each program is a one-sequence program of the same kernel
+    on its sequence's rows, length, page ids, positions and partials (the kernels' ``REQS``
+    axis; ``REQS = 1`` is the one-sequence build, unchanged).
+
+    Fusion boundary, PDL and pre-wait loads: as ``swa_block_attention``.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    note = """
+    Metadata consumed: seq_lens[0..B), each sequence's K and V page ids, the
+    positions (with fused_prep and RoPE), all on the device and read before
+    griddepcontrol.wait; the layer's pool view; the FP8 KV scale. Call site:
+    the target's sliding-window attention layers on TP4 decode steps of 2..4
+    sequences of equal row count (each request's spec-decoding verify), under
+    the wide_swa_block fast path. Grids: split (num_splits, G, B*ceil(M*8/32)),
+    combine (M*8, G, B).
+
+    Gated by its own tests, bit for bit against swa_block_attention of each
+    sequence alone (cache bytes and output), eagerly and through CUDA-graph
+    replays at changing contexts.
+
+    Loud preconditions (ValueError): those of swa_block_attention per sequence;
+    2..4 sequences, rows a multiple of their number, at most 8 rows each; an
+    int32 [B, 2, pages] block table whose sequence stride is two rows;
+    contiguous seq_lens and positions.
+
+    Not certified: sequences of different row counts, more than 4 sequences.
+    """
+
+    def __call__(
+        self,
+        qkv: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+        window: int,
+        num_splits: int,
+        q_fp8: bool = False,
+        fused_prep: bool = False,
+        cos_sin: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        prep_eps: float = 0.0,
+        q_scale: float = 1.0,
+        qkv_permuted: bool = False,
+        gate: Optional[torch.Tensor] = None,
+        gate_eps: float = 0.0,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        total = qkv.shape[0]
+        reqs = seq_lens.numel()
+        rows = total // reqs if reqs else 0
+        page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
+        width = (2 if fused_prep else 1) * (num_q_heads + num_kv_heads) * HEAD_DIM
+        if not fused_prep:
+            width += num_kv_heads * HEAD_DIM
+        if (
+            not 2 <= reqs <= MULTI_MAX_REQUESTS
+            or rows * reqs != total
+            or not 1 <= rows <= MAX_ROWS
+            or qkv.dtype != torch.bfloat16
+            or qkv.dim() != 2
+            or qkv.stride(-1) != 1
+            or qkv.shape[1] != width
+            or num_q_heads != Q_PER_KV * num_kv_heads
+            or kv_pool.dtype != torch.float8_e4m3fn
+            or kv_pool.dim() != 4
+            or tuple(kv_pool.shape[1:]) != (num_kv_heads, page, HEAD_DIM)
+            or not kv_pool.is_contiguous()
+            or page & (page - 1) != 0
+            or block_tables.dtype != torch.int32
+            or block_tables.dim() != 3
+            or tuple(block_tables.shape[:2]) != (reqs, 2)
+            or block_tables.stride(-1) != 1
+            or block_tables.stride(0) != 2 * block_tables.stride(1)
+            or seq_lens.dtype != torch.int32
+            or not seq_lens.is_contiguous()
+            or kv_scale_orig_quant.dtype != torch.float32
+            or window <= 0
+            or num_splits < max_blocks(window, rows)
+        ):
+            raise ValueError(
+                f"swa_block_multi takes 2..{MULTI_MAX_REQUESTS} sequences of 1..{MAX_ROWS} rows "
+                "each, request-major BF16 qkv [B * M, "
+                + ("2 (H + G) * 64" if fused_prep else "(H + 2G) * 64")
+                + "] with H = 8 G, an FP8 E4M3 pool [pages, G, P, 64] (P a power of two), an int32 "
+                "[B, 2, pages] block table of sequence stride two rows, contiguous int32 seq_lens "
+                "[B], an fp32 scale, a sliding window and at least one split per key block; got "
+                f"qkv {qkv.dtype} {tuple(qkv.shape)}, {reqs} sequences, H={num_q_heads} "
+                f"G={num_kv_heads}, pool {kv_pool.dtype} {tuple(kv_pool.shape)}, table "
+                f"{block_tables.dtype} {tuple(block_tables.shape)} strides "
+                f"{tuple(block_tables.stride())}, seq_lens {seq_lens.dtype}, scale "
+                f"{kv_scale_orig_quant.dtype}, window {window}, splits {num_splits}"
+            )
+        rope = fused_prep and cos_sin is not None
+        positions = None
+        if rope:
+            positions = position_ids.reshape(-1)
+            if (
+                positions.numel() != total
+                or not positions.is_contiguous()
+                or cos_sin.dtype != torch.float32
+                or cos_sin.dim() != 3
+                or tuple(cos_sin.shape[1:]) != (2, HEAD_DIM // 2)
+                or not cos_sin.is_contiguous()
+            ):
+                raise ValueError(
+                    f"swa_block_multi RoPE needs one contiguous position per row and a contiguous "
+                    f"fp32 [max_positions, 2, {HEAD_DIM // 2}] table, got {positions.numel()} "
+                    f"positions for {total} rows and a {cos_sin.dtype} {tuple(cos_sin.shape)} table"
+                )
+        if gate is not None and (
+            gate.dtype != torch.bfloat16
+            or gate.ndim not in (2, 3)
+            or gate.stride(-1) != 1
+            or gate.shape[0] != total
+            or gate.numel() != total * num_q_heads * HEAD_DIM
+            or (gate.ndim == 3 and gate.shape[-1] != HEAD_DIM)
+        ):
+            raise ValueError(
+                f"swa_block_multi's gate must be BF16 [rows, H * {HEAD_DIM}] or "
+                f"[rows, H, {HEAD_DIM}] with unit last stride, got {gate.dtype} {tuple(gate.shape)}"
+            )
+        out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
+        group_rows = rows * Q_PER_KV
+        part_o = torch.empty(
+            (reqs * num_splits * num_kv_heads * group_rows, HEAD_DIM),
+            dtype=torch.float32,
+            device=qkv.device,
+        )
+        part_ml = torch.empty(
+            (reqs * num_splits * num_kv_heads * group_rows, 2),
+            dtype=torch.float32,
+            device=qkv.device,
+        )
+        _swa_split_kernel[
+            (num_splits, num_kv_heads, reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM))
+        ](
+            qkv,
+            qkv.stride(0),
+            kv_pool,
+            block_tables,
+            block_tables.stride(1),
+            seq_lens,
+            kv_scale_orig_quant,
+            cos_sin if rope else kv_scale_orig_quant,
+            positions if rope else seq_lens,
+            prep_eps,
+            q_scale,
+            part_o,
+            part_ml,
+            math.log2(math.e) / math.sqrt(HEAD_DIM),
+            num_splits,
+            M=rows,
+            HQ=num_q_heads,
+            HKV=num_kv_heads,
+            D=HEAD_DIM,
+            P=page,
+            WINDOW=window,
+            BLOCK=BLOCK_N,
+            R=ROWS_PER_PROGRAM,
+            Q_FP8=q_fp8,
+            FUSED_PREP=fused_prep,
+            QKV_PERMUTED=qkv_permuted,
+            APPLY_ROPE=rope,
+            LAUNCH_WITH_PDL=enable_pdl,
+            REQS=reqs,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+            launch_pdl=enable_pdl,
+        )
+        _swa_combine_kernel[(group_rows, num_kv_heads, reqs)](
+            part_o,
+            part_ml,
+            out,
+            out.stride(0),
+            out if gate is None else gate,
+            0 if gate is None else gate.stride(0),
+            0 if gate is None else gate_head_stride(gate),
+            gate_eps,
+            num_splits,
+            M=rows,
+            HQ=num_q_heads,
+            HKV=num_kv_heads,
+            D=HEAD_DIM,
+            BLOCK_S=triton.next_power_of_2(num_splits),
+            FUSED_GATE=gate is not None,
+            LAUNCH_WITH_PDL=enable_pdl,
+            REQS=reqs,
+            num_warps=4,
+            launch_pdl=enable_pdl,
+        )
+        return out
+
+    def reference(
+        self,
+        qkv: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+        window: int,
+        num_splits: int,
+        q_fp8: bool = False,
+        fused_prep: bool = False,
+        cos_sin: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        prep_eps: float = 0.0,
+        q_scale: float = 1.0,
+        qkv_permuted: bool = False,
+        gate: Optional[torch.Tensor] = None,
+        gate_eps: float = 0.0,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """``swa_block_attention.reference`` of each sequence alone, rows concatenated."""
+        reqs = seq_lens.numel()
+        rows = qkv.shape[0] // reqs
+        positions = position_ids.reshape(-1) if position_ids is not None else None
+        outs = []
+        for b in range(reqs):
+            sl = slice(b * rows, (b + 1) * rows)
+            outs.append(
+                swa_block_attention.reference(
+                    qkv[sl],
+                    kv_pool,
+                    block_tables[b],
+                    seq_lens[b : b + 1],
+                    kv_scale_orig_quant,
+                    num_q_heads,
+                    num_kv_heads,
+                    window,
+                    num_splits,
+                    q_fp8,
+                    fused_prep,
+                    cos_sin,
+                    positions[sl] if positions is not None else None,
+                    prep_eps,
+                    q_scale,
+                    qkv_permuted,
+                    gate[sl] if gate is not None else None,
+                    gate_eps,
+                )
+            )
+        return torch.cat(outs)
+
+    def is_valid(
+        self,
+        qkv: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+        window: int,
+        num_splits: int,
+        q_fp8: bool = False,
+        fused_prep: bool = False,
+        cos_sin: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        prep_eps: float = 0.0,
+        q_scale: float = 1.0,
+        qkv_permuted: bool = False,
+        gate: Optional[torch.Tensor] = None,
+        gate_eps: float = 0.0,
+        enable_pdl: bool = False,
+    ) -> None:
+        """``swa_block_attention.is_valid`` of each sequence, and no page written by two of them."""
+        reqs = seq_lens.numel()
+        rows = qkv.shape[0] // reqs
+        positions = position_ids.reshape(-1) if position_ids is not None else None
+        page = kv_pool.shape[2]
+        written = set()
+        for b in range(reqs):
+            sl = slice(b * rows, (b + 1) * rows)
+            swa_block_attention.is_valid(
+                qkv[sl],
+                kv_pool,
+                block_tables[b],
+                seq_lens[b : b + 1],
+                kv_scale_orig_quant,
+                num_q_heads,
+                num_kv_heads,
+                window,
+                num_splits,
+                q_fp8,
+                fused_prep,
+                cos_sin,
+                positions[sl] if positions is not None else None,
+            )
+            length = int(seq_lens[b])
+            first, last = (length - rows) // page, (length - 1) // page
+            for kv in range(2):
+                pages = set(block_tables[b, kv, first : last + 1].tolist())
+                if pages & written:
+                    raise ValueError(f"sequence {b} writes a page another sequence writes")
+                written |= pages
+
+
+swa_block_multi_attention = SwaBlockMultiAttention()

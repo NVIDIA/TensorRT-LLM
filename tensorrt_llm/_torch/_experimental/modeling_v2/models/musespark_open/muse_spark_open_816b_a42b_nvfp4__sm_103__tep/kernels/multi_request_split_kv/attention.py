@@ -25,7 +25,9 @@ Which steps: ``num_contexts == 0`` and at least two sequences, read on the host 
 metadata (per-capture constants under a CUDA graph). A step of one sequence -- the 8-row
 decode graph of a single request -- returns to the class behind this mixin before anything else
 is read, so its kernels and what the 8-row fast paths do are unchanged. Prefill and mixed steps are never
-intercepted.
+intercepted. ``install``'s ``min_requests`` raises the floor where another path owns the smallest
+multi-request steps (``wide_full_attention`` takes 2..4 sequences on sm107 TEP4): steps below it
+are the class behind this mixin.
 
 Any call that is not the plain case -- positional arguments, other keywords, sinks, a scaled
 cache, another layout, a query length above 8 or ragged query lengths, scales that are neither
@@ -100,14 +102,15 @@ def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
-def takes_step(attn_metadata) -> bool:
-    """Whether a step is one this path intercepts: no context rows and two or more sequences.
+def takes_step(attn_metadata, min_requests: int = 2) -> bool:
+    """Whether a step is one this path intercepts: no context rows and at least
+    ``min_requests`` (at least two) sequences.
 
     Host-side reads only.
     """
     return (
         getattr(attn_metadata, "num_contexts", 1) == 0
-        and getattr(attn_metadata, "num_seqs", 0) >= 2
+        and getattr(attn_metadata, "num_seqs", 0) >= max(2, min_requests)
         and getattr(attn_metadata, "beam_width", 1) == 1
     )
 
@@ -318,6 +321,7 @@ class MultiRequestSplitKvAttention:
 
     _mr_window: int = 0
     _mr_kv_heads: int = 4
+    _mr_min_requests: int = 2
     _mr_census: Optional[MultiRequestCensus] = None
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
@@ -330,7 +334,7 @@ class MultiRequestSplitKvAttention:
         return result
 
     def _attn_impl(self, q, k, v, attn_metadata, *args, **kwargs):
-        if not takes_step(attn_metadata):
+        if not takes_step(attn_metadata, self._mr_min_requests):
             return super()._attn_impl(q, k, v, attn_metadata, *args, **kwargs)
         call = MultiRequestCall(kv_heads=self._mr_kv_heads, window=self._mr_window)
         with intercepting(call):
@@ -350,9 +354,10 @@ def _mr_class(base: type) -> type:
     return type(f"{base.__name__}MR", (MultiRequestSplitKvAttention, base), {})
 
 
-def install(model: torch.nn.Module, sliding: bool) -> int:
+def install(model: torch.nn.Module, sliding: bool, min_requests: int = 2) -> int:
     """Re-class the full-attention layers' attention (and, with ``sliding``, the sliding-window
-    layers') in front of whatever class they carry, and compile the kernel build their decode
+    layers') in front of whatever class they carry, so that their decode steps of at least
+    ``min_requests`` (at least two) sequences take this path, and compile the kernel build their decode
     calls launch: an E4M3 query with fp32 device scales, which the generation preprocess makes
     with the FP8 KV cache unless the call is ``generation_only`` (which this target's layers
     never pass). The BF16-query build is not compiled here; a call that needs it runs the
@@ -438,9 +443,11 @@ def install(model: torch.nn.Module, sliding: bool) -> int:
         attention._mr_window = WINDOW if attention.is_sliding else 0
         attention._mr_kv_heads = kv_heads
         attention._mr_census = census
+        attention._mr_min_requests = max(2, min_requests)
     full = sum(1 for attention in chosen if not attention.is_sliding)
     logger.info(
-        f"[musespark_open] multi_request_split_kv: on decode steps of two or more sequences the "
+        f"[musespark_open] multi_request_split_kv: on decode steps of {max(2, min_requests)} or "
+        f"more sequences the "
         f"decode FMHA of {full} full-attention and {len(chosen) - full} sliding-window layers "
         f"runs multi_request_split_kv ({kv_heads} KV heads per rank, builds "
         f"pdl={sorted(pdl)} window={sorted(windows)} q=E4M3 + device scales)"

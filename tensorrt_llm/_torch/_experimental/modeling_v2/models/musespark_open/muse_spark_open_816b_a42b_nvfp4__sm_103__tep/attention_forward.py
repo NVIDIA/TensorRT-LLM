@@ -170,15 +170,30 @@ class _FlashinferStandIn:
         return getattr(self._real, name)
 
 
+def _one_launch(*args, **kwargs) -> None:
+    """``_decode_launch_groups`` while intercepting: the decode FMHA is one call."""
+    return None
+
+
 @contextlib.contextmanager
 def intercepting(call: SplitKvCall) -> Iterator[None]:
-    """Have ``run_generation``'s decode FMHA call go through ``call`` for the duration."""
+    """Have ``run_generation``'s decode FMHA call go through ``call`` for the duration.
+
+    The call is one launch over the whole batch: the opt-in grouped decode launches
+    (``TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH``) are off for the duration, since ``call``
+    takes exactly one decode FMHA call and would run the built-in FMHA on the others.
+    """
     real = _fi_gen.flashinfer
+    real_groups = getattr(_fi_gen, "_decode_launch_groups", None)
     _fi_gen.flashinfer = _FlashinferStandIn(real, call)
+    if real_groups is not None:
+        _fi_gen._decode_launch_groups = _one_launch
     try:
         yield
     finally:
         _fi_gen.flashinfer = real
+        if real_groups is not None:
+            _fi_gen._decode_launch_groups = real_groups
 
 
 def decode_reachable() -> Optional[str]:
