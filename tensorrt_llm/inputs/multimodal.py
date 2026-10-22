@@ -1035,9 +1035,11 @@ def find_mm_token_lengths(
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
                 video_metadata = None
+                video_is_sampled = None
                 video_audio = None
                 if isinstance(item, VideoData):
                     video_metadata = item.metadata
+                    video_is_sampled = item.is_sampled
                     video_audio = item.audio
                     item = item.frames
                 if isinstance(item, np.ndarray):
@@ -1047,6 +1049,8 @@ def find_mm_token_lengths(
                         "Video must be decoded frames represented as a list "
                         f"or stacked numpy array, got {type(item).__name__}")
                 call_kwargs = {"video": item}
+                if video_is_sampled is not None:
+                    call_kwargs["video_is_sampled"] = video_is_sampled
                 if video_metadata is not None:
                     # Used by per-model overrides that need to account for
                     # per-video metadata such as sampled frame positions.
