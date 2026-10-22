@@ -261,8 +261,9 @@ def _rowtile_plan_kernel(
     request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
     lone_rows, lone_count, rows,
     bits_stride_row, block_table_stride_request, block_table_stride_page, slots_stride_group,
-    ROWS_PER_TILE: tl.constexpr, NUM_REQUESTS: tl.constexpr, ROWS_POW2: tl.constexpr,
-    BLOCK_N: tl.constexpr, SHARED_TILE_COST: tl.constexpr, NUM_CACHE_PAGES: tl.constexpr,
+    NUM_REQUESTS, NUM_CACHE_PAGES,
+    ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr,
+    BLOCK_N: tl.constexpr, SHARED_TILE_COST: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, PLAN_WORDS: tl.constexpr,
 ):  # fmt: skip
     """Per group of rows of one request: list the union of its rows' resident
@@ -355,10 +356,11 @@ def _rowtile_lone_kernel(
     selected_stride_row: tl.constexpr, selected_stride_token: tl.constexpr,
     output_stride_row: tl.constexpr, output_stride_head: tl.constexpr,
     output_stride_dim: tl.constexpr,
-    NUM_CACHE_PAGES: tl.constexpr, NUM_REQUESTS: tl.constexpr, PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_CACHE_PAGES, NUM_REQUESTS, LONE_PROGRAMS,
+    PAGE_TABLE_WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, ROWS_PER_TILE: tl.constexpr,
     ROWS_POW2: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr, LONE_PROGRAMS: tl.constexpr, USE_PDL: tl.constexpr,
+    HEAD_DIM: tl.constexpr, USE_PDL: tl.constexpr,
     LONE_STAGES: tl.constexpr,
 ):  # fmt: skip
     """Rows of groups the row-tile pass does not serve: each its own columns, gathered."""
@@ -391,7 +393,7 @@ def _rowtile_lone_row(
     block_table_stride_request, block_table_stride_page,
     selected_stride_row, selected_stride_token,
     output_stride_row, output_stride_head, output_stride_dim,
-    NUM_CACHE_PAGES: tl.constexpr, NUM_REQUESTS: tl.constexpr, PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_CACHE_PAGES, NUM_REQUESTS, PAGE_TABLE_WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, LONE_STAGES: tl.constexpr,
 ):  # fmt: skip
