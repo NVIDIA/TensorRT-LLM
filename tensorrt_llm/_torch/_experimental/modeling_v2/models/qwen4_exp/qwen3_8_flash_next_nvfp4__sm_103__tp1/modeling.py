@@ -158,6 +158,7 @@ from .ops.attention.qsa_paged_sparse_gqa_decode import MAX_ROWS as _SPARSE_DECOD
 from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_decode
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
+from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import qsa_paged_sparse_gqa_nvfp4_decode
 from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
 from .ops.attention.qsa_rollback_planes import plane_table as _plane_table
 from .ops.attention.qsa_rollback_planes import qsa_rollback_gather, qsa_rollback_restore
@@ -2479,10 +2480,13 @@ def _sparse_gqa(
     tokens_per_block,
     query_positions,
     compress_ratio,
+    output_gate=None,
 ):
     """Sparse GQA over the layer's paged pool (dequantizing an NVFP4 one). The prefill pair
-    `query_positions` / `compress_ratio` is a bound on a context row's scan, or None, None."""
+    `query_positions` / `compress_ratio` is a bound on a context row's scan, or None, None.
+    `output_gate` (NVFP4 pool, no prefill pair only) returns the gated output."""
     if kv.k_scale is None:
+        assert output_gate is None, "the output gate is fused on the NVFP4 decode-row path only"
         return qsa_paged_sparse_gqa(
             q=q,
             k_cache=kv.k,
@@ -2495,6 +2499,24 @@ def _sparse_gqa(
             query_positions=query_positions,
             compress_ratio=compress_ratio,
         )
+    if query_positions is None:
+        # Rows without the prefill pair (decode, draft, a mixed step's generation rows): the
+        # CuTe split-K + merge, with the output gate fused when the caller hands it over.
+        return qsa_paged_sparse_gqa_nvfp4_decode(
+            q,
+            kv.k,
+            kv.v,
+            kv.k_scale,
+            kv.v_scale,
+            core.kv_scale_quant_orig,
+            block_table,
+            selected_tokens,
+            request_indices,
+            tokens_per_block,
+            core.softmax_scale,
+            output_gate=output_gate,
+        )
+    assert output_gate is None, "the output gate is fused on the decode-row path only"
     return qsa_paged_sparse_gqa_nvfp4(
         q=q,
         k_cache=kv.k,
@@ -4938,6 +4960,7 @@ class DecodeTarget:
                     token_topk=core.token_topk,
                 )
             if kv.k_scale is not None:
+                # The output gate rides the CuTe kernel's store (one split) or merge.
                 attn = _sparse_gqa(
                     core,
                     kv,
@@ -4949,7 +4972,9 @@ class DecodeTarget:
                     # The prefill pair bounds a context row's scan; none here.
                     query_positions=None,
                     compress_ratio=None,
+                    output_gate=gate,
                 )
+                gated = True
             else:
                 # The output gate rides the split-K merge whenever the launch has
                 # one (more than one split); otherwise it is its own kernel below.
@@ -5787,7 +5812,9 @@ class DecodeTarget:
                     tokens_per_block=tokens_per_block,
                     query_positions=None,
                     compress_ratio=None,
+                    output_gate=gate,
                 )
+                gated = True
             else:
                 gated = qsa_paged_sparse_gqa.fuses_output_gate(q_dst, kv.k, selected, gate)
                 attn = qsa_paged_sparse_gqa(
