@@ -2428,6 +2428,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_kv_pool_rebalance=False,
     cold_tier_offload_min_priority=None,
     host_cache_size=None,
+    kv_cache_overrides=None,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2458,6 +2459,7 @@ def _build_v2_hybrid_with_mamba_layer(
         enable_kv_pool_rebalance=enable_kv_pool_rebalance,
         cold_tier_offload_min_priority=cold_tier_offload_min_priority,
         host_cache_size=host_cache_size,
+        **(kv_cache_overrides or {}),
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -2600,6 +2602,39 @@ def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) 
 
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[ssm_pool_id, :, 1]) == 0
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[attention_pool_id, :, 1]) > 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_appends_retained_group():
+    """The retained-token twin of the attention layer sits behind the SSM and attention layers."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_dtype="mixed_nvfp4_float16",
+        kv_cache_overrides=dict(first_n=32, last_n=32),
+    )
+    try:
+        # Layer 0 is recurrent state, layer 1 the attention layer, layer 2 its twin.
+        assert mgr.high_layers == {1: 2}
+        assert not mgr._is_local_mamba_layer(2)
+        assert mgr.get_buffers(0) is None
+        low = mgr.get_buffers(1, mixed_precision_pool="low")
+        high = mgr.get_buffers(1, mixed_precision_pool="high")
+        assert low.dtype == torch.uint8
+        assert high.dtype == torch.float16
+        assert high.shape[1:] == (2, 32, 4, 64)
+        mgr.add_dummy_requests([123], token_nums=[128], is_gen=False)
+        low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 1)
+        assert len(low_pages[0]) == len(high_pages[0]) == 4
+        assert min(low_pages[0]) >= 0
+        # The leading (sink) and trailing (window) pages are always retained.
+        assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
     finally:
         mgr.shutdown()
 

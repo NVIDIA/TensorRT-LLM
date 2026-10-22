@@ -1276,6 +1276,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
+    # Declared by each manager class that can host the retained-token layer
+    # group next to its own pools; it is read from the class itself, so a
+    # subclass does not inherit it.
+    _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -3184,11 +3188,10 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
-        # Managers with their own pools (hybrid, sparse) are not wired up yet.
-        if type(self) is not KVCacheManagerV2:
+        if not type(self).__dict__.get("_supports_mixed_precision_kv", False):
             raise NotImplementedError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is only supported by the "
-                f"standard KV cache manager, not {type(self).__name__}"
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is not supported by "
+                f"{type(self).__name__}"
             )
         self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
