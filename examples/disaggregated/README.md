@@ -263,13 +263,6 @@ generation requests with this key, and generation workers reject request-supplie
 disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
 the internal handoff does not carry a valid signature.
 
-First-party launchers generate one deployment-scoped key and store it in the
-private worker and proxy configurations they create, so no key input is required
-for those workflows. Workers started later through service discovery reuse the
-generated context or generation configuration. Custom orchestration should
-provision the same `internal_request_auth_key` in every process belonging to the
-deployment.
-
 
 #### Sending requests to the disaggregated server
 
@@ -547,8 +540,7 @@ the active context/generation servers is below the corresponding threshold.
 
 Note that the disaggregated server and all the context/generation servers should have the same `disagg_cluster` configuration values, or the disaggregated server may not be able to keep alive or detect inactivity the other servers properly. If `disagg_cluster` section is specified, 
 the disaggregated server and all context/generation worker configs should also set the
-same `internal_request_auth_key` value. The service-discovery launcher below creates
-and distributes that value automatically.
+same `internal_request_auth_key` value.
 
 Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/service_discovery_example/).
 

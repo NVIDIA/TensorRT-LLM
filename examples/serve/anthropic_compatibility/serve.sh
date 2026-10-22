@@ -124,8 +124,6 @@ if [[ "${MODE}" == "agg" ]]; then
     SERVER_URL="http://${HOSTNAME_FQDN}:${PORT}"
 else
     INTERNAL_REQUEST_AUTH_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-    original_umask=$(umask)
-    umask 077
     cat > "${RUN_DIR}/worker.yaml" <<EOF
 internal_request_auth_key: "${INTERNAL_REQUEST_AUTH_KEY}"
 EOF
@@ -147,7 +145,6 @@ generation_servers:
   num_instances: 1
   urls: ["127.0.0.1:${GEN_PORT}"]
 EOF
-    umask "${original_umask}"
     log "starting disaggregated server on port ${PORT}"
     trtllm-serve disaggregated -c "${RUN_DIR}/disagg.yaml" \
         > "${RUN_DIR}/disagg.log" 2>&1 &

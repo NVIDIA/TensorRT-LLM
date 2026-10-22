@@ -12,8 +12,6 @@ disagg_port="8000"
 ctx_port="8001"
 gen_port="8002"
 internal_request_auth_key="${internal_request_auth_key:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
-original_umask=$(umask)
-umask 077
 
 # use the first node as the disaggregated server node
 disagg_server_node=$(head -n 1 <(scontrol show hostnames $SLURM_JOB_NODELIST))
@@ -58,8 +56,6 @@ cache_transceiver_config:
   transceiver_runtime: CPP
   max_tokens_in_buffer: 2048
 EOL
-
-umask "${original_umask}"
 
 # Launch a proxy without any context/generation servers.
 srun --container-image=${container_image} \

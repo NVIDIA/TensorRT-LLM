@@ -46,7 +46,6 @@ from submit import (
     resolve_internal_request_auth_key,
     save_env_file,
     save_worker_config,
-    write_private_yaml,
 )
 
 
@@ -105,7 +104,9 @@ def generate_mpi_worker_config(
         "generation_servers": gen_section,
     }
 
-    write_private_yaml(output_path, config)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
 def submit_dwdp_job(config, log_dir, dry_run):
@@ -300,7 +301,8 @@ def submit_dwdp_job(config, log_dir, dry_run):
 
     server_config = convert_allocations_to_server_config(allocations)
     server_config["internal_request_auth_key"] = internal_request_auth_key
-    write_private_yaml(os.path.join(log_dir, "server_config_base.yaml"), server_config)
+    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
+        yaml.dump(server_config, f)
     disagg_server_hostname = server_config["hostname"]
     disagg_server_port = server_config["port"]
 
