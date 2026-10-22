@@ -561,11 +561,10 @@ def _normalize_qwen35_quant_config_dict(
 
     Split linear-attn in_proj projections (in_proj_qkv/in_proj_z or fully
     split q/k/v/z) are fused into a single ``in_proj_qkvz`` Linear at runtime.
-    When the checkpoint quantizes every one of them per-tensor FP8, a single
-    FP8 entry is synthesized under the fused module name so the Linear is
-    built FP8; the weight mapper then requantizes the split weights onto one
-    shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
-    sets get no fused entry, and the mapper dequantizes them to bf16 instead.
+    When all of them share one FP8 scheme, a single entry is synthesized under
+    the fused module name. Per-tensor FP8 weights are requantized onto a shared
+    scale (_requantize_linear_attn_fp8_qkvz); per-channel scales are packed with
+    the rows. Other sets get no fused entry; per-tensor FP8 ones load as bf16.
 
     The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
     _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103 for 16-element
@@ -620,7 +619,11 @@ def _normalize_qwen35_quant_config_dict(
         # model.layers.{offset+N} key, so a fused entry would build an FP8
         # module whose weights load as bf16.
         in_proj_match = re.search(r"^(.+\.linear_attn)\.in_proj_(qkv|q|k|v|z)$", name)
-        if in_proj_match and not from_mtp and cfg.quant_algo == QuantAlgo.FP8:
+        if (
+            in_proj_match
+            and not from_mtp
+            and cfg.quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        ):
             in_proj_fp8.setdefault(in_proj_match.group(1), {})[in_proj_match.group(2)] = cfg
             continue
         if name.endswith(".mlp.experts"):
@@ -654,10 +657,11 @@ def _normalize_qwen35_quant_config_dict(
                 name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
         normalized[name] = cfg
 
-    # Synthesize one FP8 entry per fused in_proj_qkvz whose split projections
-    # are all FP8; the weight mapper requantizes them onto a shared scale.
+    # One fused in_proj_qkvz entry per complete split set with a single FP8 scheme.
     for prefix, projs in in_proj_fp8.items():
-        if set(projs) in ({"qkv", "z"}, {"q", "k", "v", "z"}):
+        if set(projs) in ({"qkv", "z"}, {"q", "k", "v", "z"}) and (
+            len({cfg.quant_algo for cfg in projs.values()}) == 1
+        ):
             normalized[f"{prefix}.in_proj_qkvz"] = next(iter(projs.values()))
 
     qcd.clear()
