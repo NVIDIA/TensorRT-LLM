@@ -25,6 +25,7 @@ version is documented in the deployment guide.
 """
 
 import copy
+import dataclasses
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -676,7 +677,17 @@ class Glm5NextVisionModelBase(nn.Module):
         vlm_base_model: Optional[type[nn.Module]] = None,
     ) -> None:
         super().__init__()
+        encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": model_config.attn_backend},
+            supported_backends=Glm5NextVLM.get_supported_encoder_attention_backends(model_config),
+        )
         self.model_config = model_config
+        if encoder_backends["vision"] != model_config.attn_backend:
+            self.model_config = dataclasses.replace(
+                model_config, attn_backend=encoder_backends["vision"]
+            )
+            self.model_config.extra_attrs = model_config.extra_attrs
+            self.model_config._frozen = model_config._frozen
         self.model_dtype = _text_dtype(model_config)
         # The tower is excluded from checkpoint quantization (BF16 in
         # ``modules_to_not_convert``); scrub the quant config so no Linear
@@ -1049,6 +1060,17 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
 
     _supports_flash_attn = True
     _supports_sdpa = True
+
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config", None) is None:
+            return {}
+        return {"vision": frozenset({"TRTLLM"})}
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         # Transformers 5.x PreTrainedModel.__init__ probes MoE expert

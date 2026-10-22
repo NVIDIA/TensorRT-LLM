@@ -667,6 +667,15 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         )
 
         # Construct the vision encoder.
+        defaults = {"vision": "FLASHINFER"}
+        if getattr(config, "sound_config", None) is not None:
+            defaults["audio"] = "SDPA"
+        encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+            defaults=defaults,
+            supported_backends=NemotronHMultimodalModel.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         vision_model_config = copy.deepcopy(model_config)
         vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
         mm_config = model_config.multimodal_config
@@ -674,6 +683,7 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         self.vision_model = RADIOVisionModel(
             vision_model_config,
             disable_quantization=True,
+            vision_attn_backend=encoder_backends["vision"],
             encoder_cuda_graph_config=encoder_cuda_graph_config,
         )
 
@@ -2865,6 +2875,21 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     _supports_flash_attn = True
+
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        config = model_config.pretrained_config
+        backends = {}
+        if getattr(config, "vision_config", None) is not None:
+            backends["vision"] = frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})
+        if getattr(config, "sound_config", None) is not None:
+            backends["audio"] = frozenset({"SDPA"})
+        return backends
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config

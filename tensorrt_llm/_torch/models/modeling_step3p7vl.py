@@ -725,11 +725,17 @@ class Step3p7VisionTower(nn.Module):
         # checkpoints). Build a dedicated single-rank, quant-disabled
         # ModelConfig for the TRT-LLM ``Attention``/``Linear`` submodules so
         # they neither shard nor quantize, while still honouring the parent's
-        # attention backend selection.
+        # default unless an encoder backend is explicitly selected.
+        backends = model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": model_config.attn_backend},
+            supported_backends=Step3p7VLForConditionalGeneration.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         vision_model_config = ModelConfig(
             pretrained_config=vision_config,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
-            attn_backend=getattr(model_config, "attn_backend", "TRTLLM"),
+            attn_backend=backends["vision"],
             skip_create_weights_in_init=False,
         )
         self.vision_model = Step3p7VisionEncoder(
@@ -1216,6 +1222,17 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     multimodal payload this class is a thin passthrough so plain text
     benchmarks continue to use the original Step3p7 text path.
     """
+
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config", None) is None:
+            return {}
+        return {"vision": frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__()

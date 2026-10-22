@@ -603,6 +603,21 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
     supports_encoder_cache = True
 
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        config = model_config.pretrained_config
+        backends = {}
+        if getattr(config, "vision_config", None) is not None:
+            backends["vision"] = frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})
+        if getattr(config, "audio_config", None) is not None:
+            backends["audio"] = frozenset({"VANILLA"})
+        return backends
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
@@ -897,7 +912,20 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        attn_backend = model_config.attn_backend if name == "text_config" else "TRTLLM"
+        attn_backend = model_config.attn_backend
+        if name != "text_config":
+            defaults = {}
+            if model_config.pretrained_config.vision_config is not None:
+                defaults["vision"] = "TRTLLM"
+            if model_config.pretrained_config.audio_config is not None:
+                defaults["audio"] = "VANILLA"
+            encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+                defaults=defaults,
+                supported_backends=Gemma4MultimodalModelBase.get_supported_encoder_attention_backends(
+                    model_config
+                ),
+            )
+            attn_backend = encoder_backends[name.removesuffix("_config")]
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,

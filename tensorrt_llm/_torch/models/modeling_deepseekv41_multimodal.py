@@ -41,7 +41,24 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
     Attention, Engram, and DSpark remain in the text model.
     """
 
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config", None) is None:
+            return {}
+        return {"vision": frozenset({"SDPA"})}
+
     def __init__(self, model_config: ModelConfig) -> None:
+        model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": "SDPA"},
+            supported_backends=DeepseekV41ForConditionalGeneration.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         config = model_config.pretrained_config
         super().__init__(config)
         self.model_config = model_config
