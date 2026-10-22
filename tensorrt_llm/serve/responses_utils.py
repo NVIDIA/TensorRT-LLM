@@ -59,8 +59,7 @@ from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.utils import (async_apply_chat_template,
-                                       resolve_hf_chat_template)
+from tensorrt_llm.inputs.utils import resolve_hf_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -89,6 +88,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 UCompletionRequest,
                                                 UCompletionResponse,
                                                 to_disaggregated_params)
+from tensorrt_llm.serve.render import (RenderResources, legacy_render_enabled,
+                                       render_conversation)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
@@ -890,6 +891,7 @@ def _render_developer_as_system(
     tokenizer: Optional[TokenizerBase],
     processor: Optional[AutoProcessor],
     tools: Optional[list[dict[str, Any]]],
+    chat_template: Optional[str] = None,
 ) -> list[ChatCompletionMessageParam]:
     """Render ``developer`` messages as ``system`` where the template lacks them.
 
@@ -904,7 +906,7 @@ def _render_developer_as_system(
     template = resolve_hf_chat_template(getattr(tokenizer, "tokenizer",
                                                 tokenizer),
                                         processor,
-                                        chat_template=None,
+                                        chat_template=chat_template,
                                         tools=tools)
     if not isinstance(template, str) or _template_renders(
             template, "developer"):
@@ -1391,6 +1393,7 @@ async def _create_input_tokens(
     model_config: PretrainedConfig,
     processor: AutoProcessor,
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
+    chat_template: Optional[str] = None,
 ) -> PromptInputs:
     """Create the model input for a Responses request.
 
@@ -1412,12 +1415,22 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
+    # Same pipeline as the chat route: the server template and the model
+    # extension's tool serialization apply here too.
+    render_resources = RenderResources.from_parts(
+        tokenizer=tokenizer,
+        model_type=resolve_top_level_model_type(model_config),
+        hf_config=model_config,
+        processor=processor,
+        default_chat_template=chat_template)
+    if legacy_render_enabled():
+        render_resources = render_resources.legacy_view()
     tools_dict = [
-        tool.model_dump()
+        render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
     messages = _render_developer_as_system(messages, tokenizer, processor,
-                                           tools_dict)
+                                           tools_dict, chat_template)
     conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
         messages, model_config, multimodal_server_config)
     has_media = any(message.get("media") for message in conversation)
@@ -1436,29 +1449,28 @@ async def _create_input_tokens(
     # which expects the thinking-mode framing - leaves it in the visible text.
     chat_template_kwargs = reasoning_chat_template_kwargs(request)
 
-    prompt_task = async_apply_chat_template(
-        model_type=resolve_top_level_model_type(model_config),
-        tokenizer=tokenizer,
-        processor=processor,
+    render_task = render_conversation(
+        render_resources,
         conversation=conversation,
+        mm_placeholder_counts=mm_placeholder_counts,
         add_generation_prompt=True,
         tools=tools_dict,
-        mm_placeholder_counts=mm_placeholder_counts,
         chat_template_kwargs=chat_template_kwargs or None,
-        enable_tokenize=not has_media,
         injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
             request),
+        # Media is rendered to text for the model's input processor to expand.
+        tokenize=not has_media,
     )
-    prompt, (mm_data,
-             mm_embeddings) = await asyncio.gather(prompt_task, mm_coroutines)
+    rendered, (mm_data,
+               mm_embeddings) = await asyncio.gather(render_task, mm_coroutines)
     if not has_media:
-        return prompt
+        return rendered.token_ids
 
     if mm_data and mm_embeddings:
         raise ValueError(
             "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the "
             "same time is not supported.")
-    inputs = prompt_inputs(prompt)
+    inputs = prompt_inputs(rendered.text)
     if mm_data:
         inputs["multi_modal_data"] = mm_data
         if mm_item_order:
@@ -1500,6 +1512,7 @@ async def request_preprocess(
     processor: Optional[AutoProcessor] = None,
     reasoning_parser: Optional[str] = None,
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
+    chat_template: Optional[str] = None,
 ) -> tuple[PromptInputs, SamplingParams]:
 
     sampling_params = request.to_sampling_params(
@@ -1550,6 +1563,7 @@ async def request_preprocess(
             model_config=model_config,
             processor=processor,
             multimodal_server_config=multimodal_server_config,
+            chat_template=chat_template,
         )
 
     if ENABLE_RESPONSES_DEBUG_MSG:  # decoding is not free; skip it otherwise

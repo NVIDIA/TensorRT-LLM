@@ -206,11 +206,14 @@ async def _preprocess(monkeypatch, store_flag):
 
         return list(messages), mm(), {}, None
 
-    async def fake_template(**kwargs):
-        return [1, 2, 3]
+    async def fake_render(resources, **kwargs):
+        return SimpleNamespace(token_ids=[1, 2, 3], text=None)
 
+    resources = SimpleNamespace(extension=SimpleNamespace(serialize_tool=lambda tool: tool))
     monkeypatch.setattr(ru, "parse_chat_messages_coroutines", fake_parse)
-    monkeypatch.setattr(ru, "async_apply_chat_template", fake_template)
+    monkeypatch.setattr(ru, "RenderResources", SimpleNamespace(from_parts=lambda **kw: resources))
+    monkeypatch.setattr(ru, "legacy_render_enabled", lambda: False)
+    monkeypatch.setattr(ru, "render_conversation", fake_render)
     monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "llama")
     monkeypatch.setattr(ru, "add_thinking_budget_logits_processor", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -261,6 +264,7 @@ def _server_up_to_preprocess(monkeypatch):
     server.model_config = None
     server.processor = None
     server.multimodal_server_config = None
+    server.chat_template = None
     server.tool_parser = None
     server.metrics_collector = None
     server.generator = SimpleNamespace(

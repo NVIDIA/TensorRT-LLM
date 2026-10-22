@@ -340,6 +340,7 @@ def test_a_context_worker_with_postprocessing_workers_returns_the_prompt(monkeyp
     server.model_config = None
     server.processor = None
     server.multimodal_server_config = None
+    server.chat_template = None
     server.tool_parser = None
     server.metrics_collector = None
     server.conversation_store = None

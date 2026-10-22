@@ -985,7 +985,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self._server_state[server].set_hash_algo(worker_algo)
 
     @staticmethod
-    def _content_affinity_key(request: OpenAIRequest) -> Optional[int]:
+    def _content_affinity_key(
+            request: OpenAIRequest,
+            token_ids: Optional[List[int]] = None) -> Optional[int]:
+        """Conversation key from the first messages and the first prompt tokens.
+
+        ``token_ids`` are the router's own ids, for a request it did not write them
+        back into: the key must not depend on whether the ids were forwarded.
+        """
         messages = getattr(request, "messages", None)
         if not messages:
             return None
@@ -994,7 +1001,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             content = (message.get("content") if isinstance(message, dict) else
                        getattr(message, "content", ""))
             parts.append(str(content))
-        token_ids = getattr(request, "prompt_token_ids", None)
+        token_ids = getattr(request, "prompt_token_ids", None) or token_ids
         if token_ids:
             parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
         digest = blake3("".join(parts).encode("utf-8"),
@@ -1035,9 +1042,13 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self._tokenize_and_compute_block_hashes_by_algo(
                 request, algos, cache_salt)
         return {
-            "block_hashes_by_algo": block_hashes_by_algo,
-            "conv_key": self._content_affinity_key(request),
-            "num_tokens": sum(len(token_list) for token_list in token_lists),
+            "block_hashes_by_algo":
+            block_hashes_by_algo,
+            "conv_key":
+            self._content_affinity_key(
+                request, token_lists[0] if len(token_lists) == 1 else None),
+            "num_tokens":
+            sum(len(token_list) for token_list in token_lists),
         }
 
     async def _route(self, key, exclude_server=None, request=None, req_id=None):
