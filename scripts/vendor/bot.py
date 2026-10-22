@@ -450,6 +450,7 @@ class Monitor:
         problem: Diagnostic | None,
         *,
         attribution: dict[str, dict] | None = None,
+        upstream_proof: dict | None = None,
         no_promotion: bool = False,
     ) -> None:
         number = pr["number"]
@@ -461,6 +462,18 @@ class Monitor:
             else "Vendor promotion metadata and source attribution are valid. "
             "This is **not** a code-review approval. Promotion still requires the source PR to merge."
         )
+        if upstream_proof is not None and problem is None:
+            message = (
+                "Upstream-main source ancestry is valid: pinned commit "
+                f"`{upstream_proof['promoted']}` contains canonical "
+                f"dev tip `{upstream_proof['checked_canonical_tip']}` and is reachable from "
+                f"the configured upstream branch at `{upstream_proof['upstream_observed_main']}`. "
+                f"No vendor-promotion metadata or upstream PR list is required for "
+                f"{field(self.gh.vendor_name)} in this mode. Promotion will fast-forward dev to "
+                "the exact reviewed pin, not the moving upstream tip, and restore the canonical "
+                "lock URL/branch. This is **not** a code-review approval. Normal review and CI "
+                "still apply; promotion requires the source PR to merge and ancestry to remain valid."
+            )
         if no_promotion:
             message = (
                 f"This PR does not require vendor promotion for {field(self.gh.vendor_name)} "
@@ -813,24 +826,28 @@ class Monitor:
             if current.to_mapping() != reviewed.to_mapping():
                 self._transition(number, "ignored", "historical pin is no longer pending promotion")
                 return
-            promote._check_current(self.gh, plan)
         try:
             self.progress.operation("validating_metadata", number)
-            promote._check_source_repo(self.gh, promote._repo_name(reviewed.url))
-            promote._check_canonical_tip(self.gh, previous, reviewed)
-            entry = metadata.parse(pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo)
+            if pr.get("merged"):
+                promote._check_current(self.gh, plan)
+            upstream_proof = promote._check_source(self.gh, previous, reviewed)
+            entry, evidence = None, None
             cache = self.args.workdir / "sources.git"
-            # Until provenance is committed, decisions follow current remote
-            # inputs, not whichever upstream heads a previous process cached.
-            _, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
+            if upstream_proof is None:
+                entry = metadata.parse(
+                    pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo
+                )
+                # Until provenance is committed, decisions follow current remote
+                # inputs, not whichever upstream heads a previous process cached.
+                _, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
             # Attribution may take long enough for another consumer's promotion
             # to advance the shared canonical branch. Do not report stale inputs as valid.
-            promote._check_canonical_tip(self.gh, previous, reviewed)
+            upstream_proof = promote._check_source(self.gh, previous, reviewed)
         except Diagnostic as error:
             self._feedback(pr, error)
             return
         self.progress.operation("reconciling_feedback", number)
-        self._feedback(pr, None, attribution=evidence)
+        self._feedback(pr, None, attribution=evidence, upstream_proof=upstream_proof)
         if not pr.get("merged"):
             return
         # Re-read mutable description/head before any promotion. Immutable lock
@@ -841,19 +858,20 @@ class Monitor:
                 number, "deferred", "source head or description changed; retry next poll"
             )
             return
-        arguments.upstream_pr = [str(item) for item in entry["upstream_prs"]]
-        arguments.unpaired_reason = entry["unpaired_reason"]
-        arguments.source_repo = cache if cache.exists() else None
+        if entry is not None:
+            arguments.upstream_pr = [str(item) for item in entry["upstream_prs"]]
+            arguments.unpaired_reason = entry["unpaired_reason"]
+            arguments.source_repo = cache if cache.exists() else None
         self.progress.operation("planning_promotion", number)
         plan = promote._make_plan(
             arguments,
             self.gh,
-            auto_match=bool(entry["upstream_prs"]),
-            resolutions=entry["resolutions"],
+            auto_match=entry is not None and bool(entry["upstream_prs"]),
+            resolutions=entry["resolutions"] if entry is not None else None,
         )
         # Attribution evidence is versioned with the durable promotion record.
         # Reuse the original published record on retries rather than replacing it.
-        if plan.completed_pr is None:
+        if plan.completed_pr is None and entry is not None:
             plan.record["contributor_metadata"] = {
                 "source_head": pr["head"]["sha"],
                 "metadata_digest": metadata.fingerprint(entry),

@@ -22,9 +22,11 @@ default lock. For an isolated test or another consumer repository, place
 For a code-changing PR, start with the
 [PrimTS contributor walkthrough](#contributor-workflow-primts-example).
 It covers editing the vendored code, exporting to a temporary branch in your
-fork, and pinning that branch in TensorRT-LLM. Do not point a normal PrimTS
-source-update PR at FlashInfer upstream `main`, even if your fix has merged
-there; canonical-branch promotion and upstream refresh are maintainer workflows.
+fork, and pinning that branch in TensorRT-LLM. An already-upstream update may
+instead use the [upstream-main fast-forward exception](#using-an-upstream-main-pin).
+An upstream PR merging alone is insufficient: the chosen pin must contain the
+latest canonical dev tip by Git ancestry. Canonical-branch promotion and divergent
+upstream refresh remain maintainer workflows.
 
 ## Lock contract
 
@@ -337,10 +339,10 @@ git -C "$PRIMTS_REPO" push "$PRIMTS_FORK_URL" "HEAD:refs/heads/$PRIMTS_TMP_BRANC
 PRIMTS_NEW_SHA=$(git -C "$PRIMTS_REPO" rev-parse HEAD)
 ```
 
-Do not push directly to the canonical dev branch or use upstream `main` as the
-source of this consumer update. Open the related FlashInfer PR separately;
-if it needs a different base/history for upstream review, use a separate branch
-without changing the consumer pin to upstream `main`.
+Do not push directly to the canonical dev branch. Open the related FlashInfer PR
+separately; if it needs different history for upstream review, use a separate
+branch. Keep the consumer pin on your temporary branch unless it independently
+satisfies the [upstream-main exception](#using-an-upstream-main-pin).
 
 ### 5. Pin the pushed commit and verify
 
@@ -399,7 +401,50 @@ Leave the lock on your temporary fork branch through review and merge. Do not
 delete or rewrite that branch before promotion completes. The maintainer or
 bot then fast-forwards the canonical dev branch and creates a separate
 **lock-only** PR restoring its URL/branch without changing the reviewed SHA or
-vendored code. Do not pin back to upstream after the paired FlashInfer PR merges.
+vendored code. A paired FlashInfer PR merging does not by itself permit switching
+the consumer pin to upstream; the exception below requires exact ancestry.
+
+### Using an upstream-main pin
+
+When all intended changes are already on the configured upstream branch, the
+consumer lock may use that upstream repository/branch directly if:
+
+```text
+previous canonical pin <= latest canonical dev tip <= chosen upstream pin <= upstream main tip
+```
+
+`<=` means Git ancestor-or-equal, not equivalent patches under different SHAs.
+Check both live tips against the **exact SHA** you intend to pin, for example
+using the source repository and dev variables from the walkthrough:
+
+```bash
+PRIMTS_UPSTREAM_URL=https://github.com/flashinfer-ai/flashinfer.git
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_UPSTREAM_URL" main
+PRIMTS_UPSTREAM_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+PRIMTS_NEW_SHA=$PRIMTS_UPSTREAM_TIP  # Or an older reviewed commit on main.
+git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_DEV_TIP" "$PRIMTS_NEW_SHA"
+git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_NEW_SHA" "$PRIMTS_UPSTREAM_TIP"
+```
+
+Both checks must succeed. Bring the selected destination files and compatibility
+patch into alignment with that exact revision, retaining necessary downstream
+adaptations, then use `manage.py pin` as in step 5 with `--url
+"$PRIMTS_UPSTREAM_URL" --branch main --commit "$PRIMTS_NEW_SHA"`. `pin` verifies
+materialization; it does not import a newer source tree. Commit the source/lock
+update together and run normal review and CI.
+
+No upstream PR list, `unpaired_reason`, or vendor-promotion entry is needed for
+this qualifying vendor. Other changed vendors still need their own metadata.
+Upstream merge commits are allowed. The bot checks live ancestry again before
+feedback and promotion; a later dev advance may require a newer pin. If dev and
+upstream diverge, use a temporary fork based on dev or ask for a maintainer
+refresh rather than forcing the canonical branch or bypassing metadata checks.
+
+Promotion still restores the canonical fork/branch and fast-forwards it only to
+the reviewed SHA. It saves versioned ancestry proof instead of individual PR
+mappings. See the [toolkit exception and provenance contract](../scripts/vendor/README.md#upstream-main-fast-forward-exception).
 
 ### If the dev branch advances
 

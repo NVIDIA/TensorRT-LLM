@@ -666,17 +666,7 @@ def resolve(
     cache: Path,
 ) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Fetch only Git data into a private bare cache and resolve declared PRs."""
-    if previous.source != reviewed.source or set(previous.include) != set(reviewed.include):
-        changed = (["source"] if previous.source != reviewed.source else []) + (
-            ["include"] if set(previous.include) != set(reviewed.include) else []
-        )
-        raise Diagnostic(
-            "Automatic attribution requires unchanged lock source/include selection. "
-            "Changed fields: " + ", ".join(f"`{name}`" for name in changed) + ".",
-            "Separate the selection change into a different PR. In this source-update PR, "
-            "restore the canonical `source`/`include` selection in "
-            "`3rdparty/vendor_sources.lock.yaml` and regenerate the vendor snapshot.",
-        )
+    promote._check_selection(previous, reviewed)
     cache.mkdir(parents=True, exist_ok=True)
     if not (cache / "HEAD").exists():
         promote._git(cache, "init", "--bare", "--quiet")
