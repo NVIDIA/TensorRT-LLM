@@ -94,7 +94,9 @@ If you want to use the latest main branch, you can build from source: [https://n
 
 Use these configurations as starting points for 4x B200 with FP8 weights and a BF16 KV cache. Tune the batch size and token budget for your workload.
 
-For single-request latency, setting `TRTLLM_LOW_M_GEMM_BACKEND=auto` before launching the server routes BF16 projections with at most 32 rows to autotuned low-M GEMM kernels. With MTP on 4x B200 it lowered inter-token latency by about 2% at concurrency 1 and left concurrency 8 unchanged, but tuning those kernels adds about two minutes to server startup.
+For low-concurrency serving of long prompts, run the routed experts tensor-parallel with `--ep_size 1` instead of `--ep_size 4`. With prompts of more than 10K tokens, short outputs, MTP (`max_draft_len: 3`) and an FP8 KV cache on 4x B200, EP1 raised per-user output speed by about 6% at concurrency 1 and output throughput by about 12% at concurrency 8, because it avoids the expert-parallel load imbalance in the MoE all-reduce. This applies to the tensor-parallel configurations; keep `--ep_size 4` with attention data parallelism, which targets high concurrency, where expert-parallel load evens out. The throughput chart in [Performance](#performance) was measured with EP4.
+
+Setting `TRTLLM_LOW_M_GEMM_BACKEND=auto` before launching the server routes BF16 projections with at most 32 rows to autotuned low-M GEMM kernels. For this checkpoint it is not recommended: in the workload above it raised per-user output speed at concurrency 1 by only about 1%, while adding about 30 ms to time to first token, lowering concurrency-8 throughput by about 5%, and adding several minutes of kernel tuning to server startup.
 
 #### B200 FP8 Config
 
