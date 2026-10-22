@@ -350,11 +350,12 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self.enable_overlap_headroom,
         )
-        # In case that some tests use stub models and override `_load_model`.
+        # AutoModelForCausalLM sets extra_attrs; a model passed in through
+        # `model=`, such as a test stub, may not have it.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        # Router Replay (R3) capturer owned by this engine (None when disabled or
-        # for draft engines). Registered in the model extra attrs so the MoE
+        # Router Replay (R3) capturer owned by this engine (None when disabled).
+        # Registered in the model extra attrs so the MoE
         # routing hook reaches this engine's capturer during its forward, the
         # same way ``moe_layers`` is looked up -- no process-wide state.
         self.route_capture = RouteCapture.create(
