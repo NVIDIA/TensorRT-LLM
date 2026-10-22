@@ -6271,10 +6271,10 @@ def _run_mla_decode_body(
     page_batch = ctm.Int32(0)
     valid_k_for_l = ctm.Int32(0)
     q_batch = bidz
-    # Packed rows: grid.z enumerates (split, request) tasks, request fastest.
-    # Rows of this M tile are [query token, head] pairs of one request; the
-    # split owns KV tiles [split_tile_begin, split_tile_begin + split_tiles)
-    # and every bound below is relative to split_base_k.
+    # Packed rows: grid.z is the request when num_splits == 1, else a slot of the plan's
+    # tables, in grid order (packed_plan_kernel). Rows of this M tile are [query token,
+    # head] pairs of one request; the split owns KV tiles [split_tile_begin,
+    # split_tile_begin + split_tiles) and every bound below is relative to split_base_k.
     split_tile_begin = ctm.Int32(0)
     split_base_k = ctm.Int32(0)
     first_valid_k = ctm.Int32(0)
@@ -6282,6 +6282,8 @@ def _run_mla_decode_body(
     packed_request_valid_k = ctm.Int32(0)
     packed_single_task = ctm.Boolean(False)
     c_batch_idx = bidz
+    # Partials and row stats go to begins[request] + split, where the reduction reads them.
+    store_task_idx = bidz
     if cutlass.const_expr(packed_query_heads > 0):
         # Balanced plan (one task per request when num_splits == 1, else the
         # plan kernel's tables): the request and KV split this task owns.
@@ -6296,6 +6298,8 @@ def _run_mla_decode_body(
             task_request = ctm.Int32(mPlan_i[plan_tables + bidz])
             task_split = ctm.Int32(mPlan_i[plan_tables + task_capacity + bidz])
             task_count = ctm.Int32(mPlan_i[plan_tables + task_capacity + task_capacity + bidz])
+            store_task_idx = ctm.Int32(mPlan_i[ctm.Int32(2) + task_request]) + task_split
+        store_task_idx = cute.arch.make_warp_uniform(store_task_idx)
         tiles_per_split = cute.arch.make_warp_uniform(tiles_per_split)
         page_batch = cute.arch.make_warp_uniform(task_request)
         split_idx = cute.arch.make_warp_uniform(task_split)
@@ -7453,7 +7457,7 @@ def _run_mla_decode_body(
                         tidx,
                         bidx,
                         bidy,
-                        bidz,
+                        store_task_idx,
                         m,
                         n,
                         final_row_max=final_row_max,
@@ -7479,7 +7483,7 @@ def _run_mla_decode_body(
                         tidx,
                         bidx,
                         bidy,
-                        bidz,
+                        store_task_idx,
                         m,
                         n,
                         final_row_max=final_row_max,
@@ -7504,7 +7508,7 @@ def _run_mla_decode_body(
                     tidx,
                     bidx,
                     bidy,
-                    bidz,
+                    store_task_idx,
                     m,
                     n,
                     final_row_max=final_row_max,
