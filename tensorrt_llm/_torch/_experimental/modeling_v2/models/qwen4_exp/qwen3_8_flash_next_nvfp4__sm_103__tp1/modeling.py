@@ -105,6 +105,7 @@ device-driven because row indices are produced on device inside a captured decod
 forward, which cannot express a host readback.
 """
 
+import functools
 import math
 import os
 import re
@@ -224,6 +225,7 @@ from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
 from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gated_delta_rule_update
+from .ops.ssm.gdn_cached_replay_cute import gdn_cached_replay_cute
 from .ops.ssm.gdn_decode_gated_norm_pdl import MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS
 from .ops.ssm.gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl
 from .ops.ssm.gdn_decode_rows_gated_norm import gdn_decode_rows, gdn_decode_rows_gated_norm
@@ -722,6 +724,7 @@ class _Replay(NamedTuple):
     history: int
     width: int  # verify rows per generation request
     all_layer_commit: bool  # the manager commits partitioned steps over every layer
+    cute: bool  # bf16 pool: the CuTe replay, committing wrapping rows in-kernel
 
 
 class _Bound(NamedTuple):
@@ -1994,6 +1997,14 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # generation requests, and the forward hands the kernel the work items under that
         # same condition.
         all_layer = bool(getattr(cm, "use_gdn_cached_replay_all_layer_commit", False))
+        # A bf16 pool replays on the CuTe kernel, which commits every wrapping row in-kernel at
+        # any batch size (the checkpoint read once and written once): the manager's all-layer
+        # commit would advance those checkpoints a second time, so it is switched off for this
+        # manager, and with it the work items the metadata builds for it.
+        cute = ssm0.dtype == torch.bfloat16
+        if cute and all_layer:
+            cm._use_gdn_cached_replay_all_layer_commit = False
+            all_layer = False
         if all_layer:
             missing = [n for n in ("replay_work_items", "replay_n_writes") if not hasattr(mm, n)]
             assert not missing, (
@@ -2001,7 +2012,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 f"{missing}; the partitioned verify call needs both"
             )
         return _Replay(
-            old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width, all_layer
+            old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width, all_layer, cute
         )
 
     def _bind_draft_cache_manager(self, md) -> None:
@@ -2762,7 +2773,9 @@ def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
 
     `replay` is `(work_items, n_writes, partitioned)`; the work items are given exactly
     when the manager runs its all-layer commit after the step (without that commit every
-    history wrap goes uncommitted, with it a wrap committed here is committed twice).
+    history wrap goes uncommitted, with it a wrap committed here is committed twice). A bf16
+    pool runs the CuTe kernel (`gdn_cached_replay_cute`), which commits every wrap here: the
+    manager's all-layer commit is off for it (`_bind_replay`), so no work items reach it.
     `mq_out` is the conv's fresh, contiguous output, so the kernel reads q/k/v from it
     directly (`packed_qkv`) and never from the views. The conv before it does not signal
     dependents, so the kernel launches without PDL."""
@@ -2770,7 +2783,12 @@ def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
     state = core._bound.replay
     old_x, old_B, old_dt, old_dA = state.old[i]
     qv, kv, vv = torch.split(mq_out, [core.key_dim, core.key_dim, core.value_dim], 1)
-    out = fused_recurrent_gated_delta_rule_cached_replay_update(
+    entry = (
+        functools.partial(gdn_cached_replay_cute, in_kernel_commit=True)
+        if state.cute
+        else fused_recurrent_gated_delta_rule_cached_replay_update
+    )
+    out = entry(
         q=torch.reshape(qv, [n, p, core.num_k_heads, core.head_k_dim]),
         k=torch.reshape(kv, [n, p, core.num_k_heads, core.head_k_dim]),
         v=torch.reshape(vv, [n, p, core.num_v_heads, core.head_v_dim]),
