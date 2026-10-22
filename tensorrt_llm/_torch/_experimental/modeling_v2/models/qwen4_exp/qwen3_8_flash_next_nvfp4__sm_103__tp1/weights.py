@@ -44,6 +44,7 @@ plain row-major FP8 128x128: `[up ; gate]` concat, bf16
 both ways: every key is consumed or in the non-load set.
 """
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -141,6 +142,26 @@ _CUDA_HOST_REGISTER_PORTABLE = 0x01
 _CUDA_HOST_REGISTER_MAPPED = 0x02
 
 
+def _local_cpus(device) -> set | None:
+    """The CPUs sysfs lists as local to `device`'s PCI function and this process may run on,
+    or None when that is unknown."""
+    try:
+        props = torch.cuda.get_device_properties(device)
+        path = (
+            f"/sys/bus/pci/devices/{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+            f"{props.pci_device_id:02x}.0/local_cpulist"
+        )
+        with open(path) as fh:
+            text = fh.read().strip()
+    except (OSError, AttributeError, RuntimeError):
+        return None
+    cpus = set()
+    for part in filter(None, text.split(",")):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return (cpus & os.sched_getaffinity(0)) or None
+
+
 class _RegisteredHostBuffer:
     """A pageable CPU allocation registered (pinned and mapped) for the device, and
     unregistered before its storage is released: at this size glibc serves the
@@ -151,14 +172,27 @@ class _RegisteredHostBuffer:
     GB300 the device's random row gathers from its pages run an order of magnitude
     slower than from registered pageable memory."""
 
-    def __init__(self, nbytes: int) -> None:
-        self._storage = torch.empty(nbytes, dtype=torch.uint8)
-        self.pointer = self._storage.data_ptr()
-        CUASSERT(
-            cudart.cudaHostRegister(
-                self.pointer, nbytes, _CUDA_HOST_REGISTER_PORTABLE | _CUDA_HOST_REGISTER_MAPPED
+    def __init__(self, nbytes: int, device=None) -> None:
+        # The registration faults the pages in on this thread, so under the default local
+        # allocation policy they land on the NUMA node of the CPU it runs on. Pinned to the
+        # CPUs local to `device` meanwhile, the table sits next to the GPU that gathers from
+        # it: on GB300, random row gathers from the other socket's memory run ~1.7x slower,
+        # and with a process per GPU half of them would otherwise land there.
+        local = _local_cpus(device) if device is not None else None
+        previous = os.sched_getaffinity(0) if local else None
+        if local:
+            os.sched_setaffinity(0, local)
+        try:
+            self._storage = torch.empty(nbytes, dtype=torch.uint8)
+            self.pointer = self._storage.data_ptr()
+            CUASSERT(
+                cudart.cudaHostRegister(
+                    self.pointer, nbytes, _CUDA_HOST_REGISTER_PORTABLE | _CUDA_HOST_REGISTER_MAPPED
+                )
             )
-        )
+        finally:
+            if previous:
+                os.sched_setaffinity(0, previous)
         # Bound now: at interpreter shutdown the module may already be torn down.
         self._unregister = cudart.cudaHostUnregister
 
@@ -184,7 +218,7 @@ def _host_resident_empty(
     )
     assert device.type == "cuda", f"host offload needs a cuda device to map into; got {device}"
 
-    host = _RegisteredHostBuffer(rows * cols)
+    host = _RegisteredHostBuffer(rows * cols, device)
     (device_pointer,) = CUASSERT(cudart.cudaHostGetDevicePointer(host.pointer, 0))
 
     # No public torch API builds a tensor over a pointer the caching allocator
