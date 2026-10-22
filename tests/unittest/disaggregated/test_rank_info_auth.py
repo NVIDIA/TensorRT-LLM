@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import time
 from collections import OrderedDict
 from unittest.mock import Mock, call, patch
 
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    _RANK_INFO_CHALLENGE_TTL_S,
     MessageType,
     RankInfoAuthenticationError,
     RankInfoServer,
@@ -48,7 +50,10 @@ def test_rank_info_server_challenges_unauthenticated_request():
 def test_rank_info_server_accepts_once_with_valid_tag():
     server = _make_server()
     nonce = b"n" * 32
-    server._rank_info_auth_challenges[b"client"] = nonce
+    server._rank_info_auth_challenges[b"client"] = (
+        nonce,
+        time.monotonic() + _RANK_INFO_CHALLENGE_TTL_S,
+    )
     request = [
         MessageType.REQUEST_INSTANCE_INFO,
         nonce,
@@ -66,7 +71,10 @@ def test_rank_info_server_accepts_once_with_valid_tag():
 def test_rank_info_server_rejects_wrong_key_and_consumes_challenge():
     server = _make_server()
     nonce = b"n" * 32
-    server._rank_info_auth_challenges[b"client"] = nonce
+    server._rank_info_auth_challenges[b"client"] = (
+        nonce,
+        time.monotonic() + _RANK_INFO_CHALLENGE_TTL_S,
+    )
     request = [
         MessageType.REQUEST_INSTANCE_INFO,
         nonce,
@@ -139,3 +147,88 @@ def test_authentication_failure_fails_only_affected_task(ownership):
     assert isinstance(task.fail.call_args.args[0], RankInfoAuthenticationError)
     if ownership:
         session.cancel_unpublished_task.assert_called_once_with(task)
+
+
+def test_full_cache_preserves_live_challenges():
+    server = _make_server()
+    with patch(f"{_TRANSFER_MODULE}._RANK_INFO_CHALLENGE_CACHE_SIZE", 1):
+        server._handle_rank_info_request(b"client", [MessageType.REQUEST_INSTANCE_INFO])
+        pending = server._rank_info_auth_challenges[b"client"]
+        server._messenger.reset_mock()
+        server._handle_rank_info_request(b"other", [MessageType.REQUEST_INSTANCE_INFO])
+        server._messenger.send.assert_called_once_with([b"other", MessageType.AUTHENTICATION_ERROR])
+        # A retry by the original client reuses the nonce without refreshing its expiry.
+        server._handle_rank_info_request(b"client", [MessageType.REQUEST_INSTANCE_INFO])
+        assert list(server._rank_info_auth_challenges.items()) == [(b"client", pending)]
+        nonce = pending[0]
+        server._handle_rank_info_request(
+            b"client",
+            [
+                MessageType.REQUEST_INSTANCE_INFO,
+                nonce,
+                _rank_info_auth_tag(_AUTH_KEY, _ENDPOINT, nonce),
+            ],
+        )
+    server._messenger.send.assert_called_with([b"client", b"rank-info"])
+
+
+@pytest.mark.parametrize("request_new_first", [False, True])
+def test_expired_challenge_cannot_authenticate_and_frees_capacity(request_new_first):
+    server = _make_server()
+    with (
+        patch(f"{_TRANSFER_MODULE}._RANK_INFO_CHALLENGE_CACHE_SIZE", 1),
+        patch(f"{_TRANSFER_MODULE}.time.monotonic", return_value=0) as clock,
+    ):
+        server._handle_rank_info_request(b"old", [MessageType.REQUEST_INSTANCE_INFO])
+        nonce = server._rank_info_auth_challenges[b"old"][0]
+        clock.return_value = _RANK_INFO_CHALLENGE_TTL_S
+        if request_new_first:
+            server._handle_rank_info_request(b"new", [MessageType.REQUEST_INSTANCE_INFO])
+            assert list(server._rank_info_auth_challenges) == [b"new"]
+        server._handle_rank_info_request(
+            b"old",
+            [
+                MessageType.REQUEST_INSTANCE_INFO,
+                nonce,
+                _rank_info_auth_tag(_AUTH_KEY, _ENDPOINT, nonce),
+            ],
+        )
+    server._rank_info.to_bytes.assert_not_called()
+    server._messenger.send.assert_called_with([b"old", MessageType.AUTHENTICATION_ERROR])
+    if not request_new_first:
+        server._handle_rank_info_request(b"new", [MessageType.REQUEST_INSTANCE_INFO])
+        assert list(server._rank_info_auth_challenges) == [b"new"]
+
+
+@pytest.mark.parametrize("extra_frames", [[b"nonce"], [b"nonce", b"tag", b"extra"]])
+def test_malformed_followup_consumes_challenge(extra_frames):
+    server = _make_server()
+    server._handle_rank_info_request(b"client", [MessageType.REQUEST_INSTANCE_INFO])
+    nonce = server._rank_info_auth_challenges[b"client"][0]
+    server._handle_rank_info_request(b"client", [MessageType.REQUEST_INSTANCE_INFO, *extra_frames])
+    assert b"client" not in server._rank_info_auth_challenges
+    server._handle_rank_info_request(
+        b"client",
+        [
+            MessageType.REQUEST_INSTANCE_INFO,
+            nonce,
+            _rank_info_auth_tag(_AUTH_KEY, _ENDPOINT, nonce),
+        ],
+    )
+    server._rank_info.to_bytes.assert_not_called()
+    server._messenger.send.assert_called_with([b"client", MessageType.AUTHENTICATION_ERROR])
+
+
+def test_receiver_reports_full_cache_as_busy_not_version_mismatch():
+    receiver = Receiver.__new__(Receiver)
+    receiver._incompatible_peers = {}
+    receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
+    receiver._should_register_peer = Mock(return_value=True)
+    messenger = Mock()
+    messenger.receive.return_value = [MessageType.AUTHENTICATION_ERROR]
+    with patch(f"{_TRANSFER_MODULE}.ZMQMessenger", return_value=messenger):
+        with pytest.raises(RankInfoAuthenticationError, match="server is busy; retry"):
+            receiver._get_sender_info(Mock())
+    messenger.send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
+    messenger.stop.assert_called_once()
+    assert not receiver._incompatible_peers

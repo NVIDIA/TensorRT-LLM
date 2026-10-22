@@ -53,6 +53,12 @@ resolution. Local checkpoint paths and diagnostic source labels are excluded.
 Architecture declarations, manager settings, and dtype inputs also participate
 in the shared plan fingerprint.
 
+The first context instance generates a fresh RankInfo authentication key during
+setup and publishes it through an owner-only rendezvous file; every instance
+leader reads that key and broadcasts it to its MPI ranks before creating the
+transceiver. No user-provided key is needed. The CI gate clears rendezvous files
+before launching each precheck; manual runs must use a fresh shared work directory.
+
 ## Enabling / disabling
 
 **On by default** for every disaggregated perf-sanity test. To opt out:
