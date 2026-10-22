@@ -509,11 +509,14 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        before_replay: Callable[[], None] | None = None,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
         Without a key, record the model body while a breakable prefill graph
         captures, run through one when it covers the tokens, otherwise eagerly.
+        ``before_replay`` runs right before the replay of an already captured
+        graph, after the draft-cache metadata refresh.
         """
         with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
             if self.captures_model_body(key):
@@ -531,6 +534,7 @@ class DecoderCudaGraphs:
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
                 position_id_offsets=position_id_offsets,
+                before_replay=before_replay,
             )
 
     def _run(
@@ -546,6 +550,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        before_replay: Callable[[], None] | None = None,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
@@ -596,6 +601,8 @@ class DecoderCudaGraphs:
                     attn_metadata, draft_kv_cache_manager
                 )
                 try:
+                    if before_replay is not None:
+                        before_replay()
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.replay(
                             key, inputs, position_id_offsets=position_id_offsets

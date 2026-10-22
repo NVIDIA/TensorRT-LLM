@@ -129,6 +129,11 @@ def test_targets_do_not_share_files():
     Targets are allowed to import the catalog and nothing else of each
     other's. A shared helper between two targets is the first step back to
     the abstraction this package exists to avoid.
+
+    One declared exception: a target may import its own family's ``shared``
+    package (``models/<family>/shared/``), the code two or more targets of one
+    family call that cannot be a catalog entry (README, "Op ownership"). It is
+    never another target's directory.
     """
     for arch in _ARCHS:
         for target_dir, name in _routed_targets(arch):
@@ -138,6 +143,8 @@ def test_targets_do_not_share_files():
                     dots, tail = match.group(1), match.group(2)
                     if len(dots) == 1:
                         continue  # sibling within the target
+                    if len(dots) == 2 and tail.split(".")[0] == "shared":
+                        continue  # the family's shared package
                     assert tail.startswith("catalog"), (
                         f"{name}: {source_file.name} reaches outside its own "
                         f"directory for {tail!r}; targets may import the "

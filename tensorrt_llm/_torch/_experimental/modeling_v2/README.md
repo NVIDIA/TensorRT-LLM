@@ -111,8 +111,21 @@ models/<family>/
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
+  shared/           code two or more targets of the family call that is not an entry
 catalog/<category>/ entries more than one target calls
 ```
+
+GLM-5.2's target, `glm_moe_dsa/glm_5_2_nvfp4__sm_103__default`, is a default target (see
+"Default and specialized targets") for GLM-5.2 NVFP4 low-latency decode. It admits tp8, tep
+at four or eight ranks, and dep at the cells its routing module lists, and picks the fast
+paths of the layout when it is built; the fast paths were designed and tuned for tp8, and
+tep and dep run the subset that applies to them. The fast paths are under
+`glm_moe_dsa/shared/kernels/`, the routed-MoE ones under the target's own `kernels/`, with
+their C++ kernels and ops in `cpp/tensorrt_llm/kernels/glmMoeDsa` and
+`cpp/tensorrt_llm/thop/glmMoeDsa`; `shared/dispatch.py` selects them and lists the knobs.
+With tensor-parallel attention the layers run the composition of `shared/layers.py`. The
+target is gated end to end by `tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py`
+(GSM8K under `require` at tp8, tep4 and dep8).
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain
@@ -381,6 +394,14 @@ names beside the code that reads it, only adds something to forget to update.
 An entry only one target calls lives under that target's `ops/`; one that two
 or more call lives in `catalog/`. A later target that needs an owned entry
 promotes it by moving the file and its test to the shared tree -- the test is
-the certification record, so nothing else has to travel with it. The five
+the certification record, so nothing else has to travel with it.
+
+Code that two or more targets of one family call and that cannot be an entry --
+it holds state across calls (collective workspaces, compiled kernels, a plan the
+kernels read) or registers torch ops when imported, so one copy per process is
+required -- lives in that family's `models/<family>/shared/`, moved there with its
+tests the same way. A target may import its own family's `shared` package and
+the catalog, nothing else (`test_modeling_v2_claims.py`); `shared` imports no
+target. The five
 other out-of-tree targets and the agent definitions are not migrated in this
 batch.

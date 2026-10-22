@@ -22,6 +22,7 @@ from tensorrt_llm.mapping import Mapping
 from .interface import ScheduledInputs
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import StepInputStager
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 
 
@@ -137,11 +138,13 @@ def pad_input_tokens(
     enable_attention_dp: bool,
     prefill_cuda_graph_backend: PrefillCudaGraphBackend,
     prefill_cuda_graph_num_tokens: list[int],
+    step_input_stager: "StepInputStager | None" = None,
 ) -> int:
     """Pad the batch to the token count its prefill graph or attention-DP peers need.
 
     Zeroes the padded rows of ``input_ids`` and ``position_ids``, whose last
     dimension is the token one, and returns the token count the model runs on.
+    With ``step_input_stager`` the zeroing is staged on it.
     """
     padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = get_padding_params(
         num_tokens,
@@ -158,6 +161,11 @@ def pad_input_tokens(
         attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
     if attn_metadata.padded_num_tokens is None:
         return num_tokens
+    if step_input_stager is not None:
+        # Staged write; see the window banner in DecoderRunner._forward_decoder.
+        step_input_stager.zero(input_ids[num_tokens:padded_num_tokens])
+        step_input_stager.zero(position_ids[..., num_tokens:padded_num_tokens])
+        return padded_num_tokens
     input_ids[num_tokens:padded_num_tokens].fill_(0)
     position_ids[..., num_tokens:padded_num_tokens].fill_(0)
     return padded_num_tokens
