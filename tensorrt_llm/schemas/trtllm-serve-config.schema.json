@@ -4119,7 +4119,17 @@
     },
     "MoePerLayerDynamicLoadBalancerConfig": {
       "additionalProperties": false,
-      "description": "Configure per-layer dynamic EPLB with Halo-Q scheduling.",
+      "description": "Configure per-layer dynamic EPLB with HALO-Q or HALO-R scheduling.",
+      "if": {
+        "properties": {
+          "planner": {
+            "const": "halo_r"
+          }
+        },
+        "required": [
+          "planner"
+        ]
+      },
       "properties": {
         "auxiliary_sms": {
           "default": 4,
@@ -4155,11 +4165,35 @@
           "status": "prototype",
           "title": "Num Slots",
           "type": "integer"
+        },
+        "planner": {
+          "default": "halo_q",
+          "description": "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the ranks with the most spare load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler on `auxiliary_sms` CTAs (at least 2) and its relay copy on 16, supports up to 4 helper slots per rank and requires `helper_slot_mode: shared_banks`.",
+          "enum": [
+            "halo_q",
+            "halo_r"
+          ],
+          "status": "prototype",
+          "title": "Planner",
+          "type": "string"
         }
       },
       "required": [
         "num_slots"
       ],
+      "then": {
+        "properties": {
+          "auxiliary_sms": {
+            "minimum": 2
+          },
+          "helper_slot_mode": {
+            "const": "shared_banks"
+          }
+        },
+        "required": [
+          "helper_slot_mode"
+        ]
+      },
       "title": "MoePerLayerDynamicLoadBalancerConfig",
       "type": "object"
     },
