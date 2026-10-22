@@ -30,7 +30,7 @@ from pathlib import Path
 
 import click
 
-from cbts.blocks import YAMLIndex, block_matches_stage, parse_stages_from_groovy
+from cbts.blocks import YAMLIndex, block_matches_stage, parse_stages
 from cbts.coverage.selection.touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -45,7 +45,7 @@ from cbts.coverage.selection.touch_db import (
 # jenkins/scripts/cbts/cbts/command/coverage/selection/audit.py -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[7]
 _DEFAULT_TEST_DB = _REPO_ROOT / "tests/integration/test_lists/test-db"
-_DEFAULT_GROOVY = _REPO_ROOT / "jenkins/L0_Test.groovy"
+_DEFAULT_STAGE_CONFIG = _REPO_ROOT / "jenkins/scripts/test_stage_configs.json"
 
 
 def _fmt_pct(n: int, d: int) -> str:
@@ -63,21 +63,25 @@ def _fmt_pct(n: int, d: int) -> str:
     default=str(_DEFAULT_TEST_DB),
     help="test-db dir to diff against the DB (HEAD coverage gap); '' to skip",
 )
-@click.option("--groovy", default=str(_DEFAULT_GROOVY), help="Groovy file to parse stage defs from")
+@click.option(
+    "--stage-config",
+    default=str(_DEFAULT_STAGE_CONFIG),
+    help="Stage config JSON to read stage defs from",
+)
 @click.option("--list-not-in-db", is_flag=True, help="print every gap case (default: first 15)")
-def main(db, list_untrusted, min_funcs, test_db, groovy, list_not_in_db):
+def main(db, list_untrusted, min_funcs, test_db, stage_config, list_not_in_db):
     """Audit a CBTS touch DB (`cbts_touchmap.sqlite`) — format, scale, and coverage completeness."""
-    args = _Args(db, list_untrusted, min_funcs, test_db, groovy, list_not_in_db)
+    args = _Args(db, list_untrusted, min_funcs, test_db, stage_config, list_not_in_db)
     _run(args)
 
 
 class _Args:
-    def __init__(self, db, list_untrusted, min_funcs, test_db, groovy, list_not_in_db):
+    def __init__(self, db, list_untrusted, min_funcs, test_db, stage_config, list_not_in_db):
         self.db = db
         self.list_untrusted = list_untrusted
         self.min_funcs = min_funcs
         self.test_db = test_db
-        self.groovy = groovy
+        self.stage_config = stage_config
         self.list_not_in_db = list_not_in_db
 
 
@@ -175,9 +179,9 @@ def _run(args: _Args) -> int:
             print(f"  [{footprint[t]:>5} funcs] {t}\n      -> {reason(t)}")
 
     # -- HEAD coverage gap: cases on an instrumented stage with no DB row --
-    if args.test_db and Path(args.test_db).is_dir() and Path(args.groovy).is_file():
+    if args.test_db and Path(args.test_db).is_dir() and Path(args.stage_config).is_file():
         yaml_index = YAMLIndex.load(Path(args.test_db))
-        all_stages = parse_stages_from_groovy(Path(args.groovy), include_post_merge=True)
+        all_stages = parse_stages(Path(args.stage_config), include_post_merge=True)
         bare_known = {split_stage(t)[1] for t in known}
         per_stage: dict[str, set[str]] = {}
         for name in sorted(set(all_stages) & set(stages)):

@@ -19,7 +19,7 @@ Modes:
       Print the union of rules' `needs_diff_for` patterns, one per line.
   python3 -m cbts.command main INPUT_JSON
       INPUT_JSON: {changed_files: [...], diffs: {path: diff}, post_merge: bool}.
-      Stages are parsed from jenkins/L0_Test.groovy; YAMLs from
+      Stages are parsed from jenkins/scripts/test_stage_configs.json; YAMLs from
       tests/integration/test_lists/test-db/. Decision JSON goes to stdout
       with keys: scope, affected_stages, reasons, test_db_dir_override,
       affected_stage_test_counts, affected_stage_split_counts.
@@ -44,7 +44,7 @@ from cbts.blocks import (
     compute_stage_split_counts,
     compute_stage_test_counts,
     load_durations,
-    parse_stages_from_groovy,
+    parse_stages,
     write_filtered_test_db,
 )
 from cbts.coverage.tier import (
@@ -414,10 +414,10 @@ def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     "(default: <repo-root>/tests/integration/test_lists/test-db).",
 )
 @click.option(
-    "--groovy-file",
+    "--stage-config-file",
     default=None,
-    help="Override path to the Jenkins test Groovy file "
-    "(default: <repo-root>/jenkins/L0_Test.groovy).",
+    help="Override path to the L0 test stage config JSON "
+    "(default: <repo-root>/jenkins/scripts/test_stage_configs.json).",
 )
 @click.option(
     "--coverage-db",
@@ -445,7 +445,7 @@ def main(
     list_needed_diffs,
     repo_root,
     test_db,
-    groovy_file,
+    stage_config_file,
     coverage_db,
     coverage_db_meta,
     no_data_policy,
@@ -456,7 +456,7 @@ def main(
         list_needed_diffs=list_needed_diffs,
         repo_root=repo_root,
         test_db=test_db,
-        groovy_file=groovy_file,
+        stage_config_file=stage_config_file,
         coverage_db=coverage_db,
         coverage_db_meta=coverage_db_meta,
         no_data_policy=no_data_policy,
@@ -470,7 +470,7 @@ class _Args:
     list_needed_diffs: bool
     repo_root: str
     test_db: Optional[str]
-    groovy_file: Optional[str]
+    stage_config_file: Optional[str]
     coverage_db: Optional[str]
     coverage_db_meta: Optional[str]
     no_data_policy: str
@@ -501,21 +501,23 @@ def _run(args: _Args) -> int:
     test_db_dir = (
         Path(args.test_db) if args.test_db else repo_root / "tests/integration/test_lists/test-db"
     )
-    groovy_path = (
-        Path(args.groovy_file) if args.groovy_file else repo_root / "jenkins/L0_Test.groovy"
+    config_path = (
+        Path(args.stage_config_file)
+        if args.stage_config_file
+        else repo_root / "jenkins/scripts/test_stage_configs.json"
     )
 
     if not test_db_dir.is_dir():
         print(f"error: test-db directory not found: {test_db_dir}", file=sys.stderr)
         return 2
-    if not groovy_path.is_file():
-        print(f"error: Jenkins groovy file not found: {groovy_path}", file=sys.stderr)
+    if not config_path.is_file():
+        print(f"error: stage config file not found: {config_path}", file=sys.stderr)
         return 2
 
     yaml_index = YAMLIndex.load(test_db_dir)
     # Include post-merge stages; the trigger-mode filter below selects the
     # subset matching the user's flag.
-    stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
+    stages = parse_stages(config_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path, repo_root)
     rules = build_rules(yaml_index, stages, repo_root)
     selector = Selector(stages)

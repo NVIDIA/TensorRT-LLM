@@ -55,10 +55,13 @@ class Block:
     tests: list[str]
 
 
-# Strip trailing ` SKIP ...` / ` TIMEOUT ...` annotations from a test id.
-# YAML entries can carry `TIMEOUT (n)`, waives.txt entries can carry both;
-# the lookup must hit either form so we normalize on both sides.
-_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
+# Strip trailing ` SKIP ...` / ` TIMEOUT ...` / ` ISOLATION` annotations from a
+# test id. YAML entries can carry `TIMEOUT (n)` and/or `ISOLATION` (see
+# jenkins/scripts/cbts/README.md), waives.txt entries can carry SKIP/TIMEOUT;
+# the lookup must hit either form so we normalize on both sides. `ISOLATION`
+# has no trailing argument of its own, but `\b.*$` still swallows anything
+# after it (e.g. a later `-k "..."`), matching how SKIP/TIMEOUT are handled.
+_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT|ISOLATION)\b.*$")
 
 # Strip leading `full:<gpu>/` platform prefix used in waives.txt.
 _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
@@ -67,9 +70,10 @@ _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
 def normalize_test_id(test_id: str) -> str:
     """Canonical form for cross-referencing test-db YAML and waives.txt.
 
-    Strips trailing `SKIP`/`TIMEOUT` annotations, trailing `# comment`, and
-    leading `full:<gpu>/` prefix. `YAMLIndex` indexes both the raw and the
-    normalized form; `rules.waives_rule` looks up by this normalization.
+    Strips trailing `SKIP`/`TIMEOUT`/`ISOLATION` annotations, trailing
+    `# comment`, and leading `full:<gpu>/` prefix. `YAMLIndex` indexes both
+    the raw and the normalized form; `rules.waives_rule` looks up by this
+    normalization.
     """
     s = test_id.strip()
     s = _TEST_ID_SUFFIX_RE.sub("", s).strip()
@@ -177,7 +181,8 @@ def _normalize_target_path(target: str) -> str:
 def _entry_target(entry: str) -> str:
     """Canonical "target" key for indexing/lookup.
 
-    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m), and `[params]` suffix.
+    Strips SKIP/TIMEOUT/ISOLATION/full:gpu, pytest options (-k/-m), and
+    `[params]` suffix.
 
     `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
     `file.py -k "kw"`                          → `file.py`
@@ -398,41 +403,8 @@ def _range_in(val_str: str | None, gte, lte) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Stage config parsing from jenkins/L0_Test.groovy
+# Stage config parsing from jenkins/scripts/test_stage_configs.json
 # ---------------------------------------------------------------------------
-
-# Matches a single entry like:
-#   "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
-#   "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-#   "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 3, 1, 1, true],
-# Same shape as scripts/test_to_stage_mapping.py::_STAGE_RE, extended to
-# capture split_id / total_splits / gpu_count and tolerate any number of
-# trailing positional args (e.g. SLURM configs append a boolean flag).
-_STAGE_ENTRY_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\['
-    r'\s*"(?P<platform>[^"]+)"\s*,'
-    r'\s*"(?P<yml>[^"]+)"'
-    r"(?:\s*,\s*(?P<split_id>\d+))?"
-    r"(?:\s*,\s*(?P<total_splits>\d+))?"
-    r"(?:\s*,\s*(?P<gpu_count>\d+))?"
-    r"(?:\s*,[^\]]*)?"  # tolerate trailing positional args before `]`
-    r"\s*\]"
-)
-
-# Detects assignments opening a map literal, e.g. `x86TestConfigs = [`.
-# Used to track which cpu_arch bucket the stage entries below belong to.
-_MAP_OPEN_RE = re.compile(r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[\s*$")
-
-
-def _classify_map_var(var_name: str) -> Optional[str]:
-    """Map a Groovy variable name to cpu_arch bucket, or None if unknown."""
-    v = var_name.lower()
-    if "sbsa" in v or "aarch64" in v:
-        return "sbsa"
-    if "x86" in v:
-        return "x86"
-    return None
-
 
 # Stages CBTS always runs, whatever the decision.
 ALWAYS_RUN_STAGE_PREFIX = "CPU-"
@@ -499,51 +471,34 @@ def derive_mako_from_stage(stage_name: str) -> dict[str, str]:
     return mako
 
 
-def parse_stages_from_groovy(
-    groovy_path: Path, include_post_merge: bool = False
-) -> dict[str, Stage]:
-    """Parse `jenkins/L0_Test.groovy` and return {stage_name -> Stage}.
+def parse_stages(config_path: Path, include_post_merge: bool = False) -> dict[str, Stage]:
+    """Expand `jenkins/scripts/test_stage_configs.json` into {stage_name -> Stage}.
 
-    - cpu_arch is determined by which map literal (x86TestConfigs,
-      SBSATestConfigs, ...) the entry lives in; falls back to stage-name
-      heuristic if the map var is unfamiliar.
+    Mirrors `buildStageConfigsFromSpecs` in jenkins/L0_Test.groovy: each
+    family spec yields shards `<name>-1 .. <name>-<splits>` using the spec's
+    static `splits` (runtime duration-based resizing is not applied here).
+
+    - cpu_arch comes from the spec's `arch` ("x86" or "SBSA").
     - mako is derived via `derive_mako_from_stage` (pure stage-name logic).
     - Post-Merge stages are excluded by default (CBTS runs in pre-merge CI).
     """
     stages: dict[str, Stage] = {}
-    current_arch: Optional[str] = None
-
-    for line in groovy_path.read_text().splitlines():
-        # Skip commented-out lines: disabled stage configs must not be parsed.
-        if line.lstrip().startswith("//"):
+    for spec in json.loads(config_path.read_text())["configs"]:
+        name = spec["name"]
+        if not include_post_merge and "Post-Merge" in name:
             continue
-        open_match = _MAP_OPEN_RE.search(line.rstrip())
-        if open_match:
-            # Reset on every map opening — including unfamiliar ones — so a
-            # later map between classified sections can't inherit a stale
-            # arch. Unknown maps fall back to the stage-name heuristic below.
-            current_arch = _classify_map_var(open_match.group("var"))
-
-        m = _STAGE_ENTRY_RE.search(line)
-        if not m:
-            continue
-        stage_name = m.group("stage")
-        if not include_post_merge and "Post-Merge" in stage_name:
-            continue
-
-        # Fallback heuristic if we haven't seen an obvious map-var yet.
-        arch = current_arch
-        if arch is None:
-            arch = "sbsa" if ("GH200" in stage_name or "SBSA" in stage_name) else "x86"
-
-        stages[stage_name] = Stage(
-            name=stage_name,
-            yaml_stem=m.group("yml"),
-            cpu_arch=arch,
-            split_id=int(m.group("split_id") or 1),
-            total_splits=int(m.group("total_splits") or 1),
-            mako=derive_mako_from_stage(stage_name),
-        )
+        splits = int(spec["splits"])
+        arch = "sbsa" if str(spec["arch"]).lower() == "sbsa" else "x86"
+        for k in range(1, splits + 1):
+            stage_name = f"{name}-{k}"
+            stages[stage_name] = Stage(
+                name=stage_name,
+                yaml_stem=spec["testDB"],
+                cpu_arch=arch,
+                split_id=k,
+                total_splits=splits,
+                mako=derive_mako_from_stage(stage_name),
+            )
     return stages
 
 
