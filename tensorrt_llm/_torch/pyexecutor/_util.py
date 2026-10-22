@@ -28,10 +28,11 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    BeamSearchCudaGraphConfig, CacheTransceiverConfig, CapacitySchedulerPolicy,
+    EagleDecodingConfig, KVEventsConfig, KvCacheCompressionConfig,
+    KvCacheConfig, MTPDecodingConfig, MultimodalEncoderSchedulingPolicy,
+    PeftCacheConfig, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -78,6 +79,7 @@ from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
+from .sampler.beam_search_graph import BeamSearchGraphProfile
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
@@ -4534,6 +4536,7 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
     max_num_sequences: int,
+    beam_search_cuda_graph_config: BeamSearchCudaGraphConfig | None = None,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
     # be sized identically to the executor's slot pool.
@@ -4542,7 +4545,26 @@ def create_torch_sampler_args(
     max_total_draft_tokens = (0 if speculative_config is None else
                               speculative_config.tokens_per_gen_step - 1)
 
+    config = beam_search_cuda_graph_config
+    profiles = ()
+    if config is not None:
+        batches = config.resolve_batch_sizes(max_num_sequences)
+        profiles = tuple(
+            BeamSearchGraphProfile(
+                beam_widths=tuple(capture.beam_width_array[min(
+                    index,
+                    len(capture.beam_width_array) -
+                    1)] for index in range(capture.max_capture_tokens)),
+                max_beam_width=max(capture.beam_width_array),
+                batch_sizes=batches,
+                early_stopping=capture.early_stopping,
+            ) for capture in config.capture_configs)
     return TorchSampler.Args(
+        beam_search_graph_profiles=profiles,
+        beam_search_graph_max_graphs=192
+        if config is None else config.max_graphs,
+        beam_search_graph_max_static_input_bytes=512 * 1024 *
+        1024 if config is None else config.max_static_input_bytes,
         max_seq_len=max_seq_len,
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
@@ -4575,7 +4597,16 @@ def instantiate_sampler(
         llm_args,
         max_num_sequences=max_num_sequences)
 
+    beam_graph_config = llm_args.beam_search_cuda_graph_config
+    if beam_graph_config is not None:
+        batch_sizes = beam_graph_config.resolve_batch_sizes(max_batch_size)
+        beam_graph_config = beam_graph_config.model_copy(
+            update={
+                "batch_sizes": list(batch_sizes),
+                "max_batch_size": max(batch_sizes),
+            })
     sampler_args = create_torch_sampler_args(
+        beam_search_cuda_graph_config=beam_graph_config,
         max_seq_len=engine.max_seq_len,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,

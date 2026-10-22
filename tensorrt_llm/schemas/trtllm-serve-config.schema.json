@@ -340,6 +340,104 @@
       "title": "AutoDecodingConfig",
       "type": "object"
     },
+    "BeamSearchCudaGraphCaptureConfig": {
+      "additionalProperties": false,
+      "description": "Beam schedule and generation steps to prepare at executor startup.",
+      "properties": {
+        "beam_width_array": {
+          "description": "Non-decreasing output beam widths for successive generated tokens. Steps beyond the array repeat its last width, as in SamplingParams.beam_width_array. A single width describes fixed-width beam search.",
+          "items": {
+            "exclusiveMinimum": 0,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "title": "Beam Width Array",
+          "type": "array"
+        },
+        "early_stopping": {
+          "default": 1,
+          "description": "Beam early-stopping mode to prepare: 0 (false), 1 (true), or 2 (never). Other request modes execute eagerly unless separately prepared.",
+          "enum": [
+            0,
+            1,
+            2
+          ],
+          "title": "Early Stopping",
+          "type": "integer"
+        },
+        "max_capture_tokens": {
+          "description": "Number of generated-token steps to prepare. This does not limit request max_tokens; uncovered steps execute eagerly.",
+          "exclusiveMinimum": 0,
+          "title": "Max Capture Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "beam_width_array",
+        "max_capture_tokens"
+      ],
+      "title": "BeamSearchCudaGraphCaptureConfig",
+      "type": "object"
+    },
+    "BeamSearchCudaGraphConfig": {
+      "additionalProperties": false,
+      "description": "Opt-in startup capture ranges for single-GPU synchronous beam sampling.",
+      "properties": {
+        "batch_sizes": {
+          "anyOf": [
+            {
+              "items": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Exact request-group sizes to prepare, excluding beam rows. No padding is applied. If omitted, sizes are generated from max_batch_size using the decode CUDA graph policy with padding disabled.",
+          "title": "Batch Sizes"
+        },
+        "capture_configs": {
+          "description": "Beam schedules to prepare in declaration order, sharing the batch sizes and resource limits below. Uncovered shapes and parameters execute eagerly; requests never trigger capture.",
+          "items": {
+            "$ref": "#/$defs/BeamSearchCudaGraphCaptureConfig"
+          },
+          "minItems": 1,
+          "title": "Capture Configs",
+          "type": "array"
+        },
+        "max_batch_size": {
+          "default": 0,
+          "description": "Maximum request-group size to prepare. When batch_sizes is given, 0 infers its maximum; an explicit value must equal that maximum. If both are omitted, the capture limit is min(128, the executor max_batch_size). This does not limit the service batch capacity.",
+          "minimum": 0,
+          "title": "Max Batch Size",
+          "type": "integer"
+        },
+        "max_graphs": {
+          "default": 192,
+          "description": "Maximum number of prepared sampling graphs. Capture configurations are prepared in declaration order until this limit is reached.",
+          "exclusiveMinimum": 0,
+          "title": "Max Graphs",
+          "type": "integer"
+        },
+        "max_static_input_bytes": {
+          "default": 536870912,
+          "description": "Maximum bytes of persistent logits staging buffers per sampler. This excludes graph scratch, sampler state, temporary warmup tensors, and the 1 MiB radix workspace.",
+          "exclusiveMinimum": 0,
+          "title": "Max Static Input Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capture_configs"
+      ],
+      "title": "BeamSearchCudaGraphConfig",
+      "type": "object"
+    },
     "BlockReuseConfig": {
       "additionalProperties": false,
       "description": "Configuration for KV cache block reuse policies.",
@@ -6386,6 +6484,19 @@
     "batched_logits_processor": {
       "description": "Live objects require the Python LLM API.",
       "type": "null"
+    },
+    "beam_search_cuda_graph_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BeamSearchCudaGraphConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opt-in startup CUDA graphs for beam sampling. Disabled when omitted. Supports a single GPU and synchronous TorchSampler; uncovered requests execute eagerly. Independent of model-forward cuda_graph_config.",
+      "status": "prototype"
     },
     "bounded_replay_on_generation": {
       "default": false,

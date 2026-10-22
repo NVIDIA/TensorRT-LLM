@@ -121,6 +121,7 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
+from .sampler.beam_search_graph import BeamSearchGraphCaptureOwner
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -454,6 +455,7 @@ class PyExecutor:
                 "kv_pool_rebalance_check_interval must be positive, got "
                 f"{kv_pool_rebalance_check_interval}")
         super(PyExecutor, self).__init__()
+        self._beam_graph_capture_owner = BeamSearchGraphCaptureOwner()
         self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -1585,9 +1587,27 @@ class PyExecutor:
                 ". "
                 "Remove sleep_config to keep the current configuration.")
 
+    def _warmup_sampler_cuda_graphs(self) -> None:
+        """Prepare sampler graphs only before the final decoder worker starts."""
+        if (not self.sampler.needs_cuda_graph_warmup or self.is_warmup
+                or self.worker_started or self.dist.world_size != 1
+                or self.is_encoder_decoder
+                or self.draft_model_engine is not None
+                or self.kv_cache_transceiver is not None
+                or self.kv_connector_manager is not None):
+            return
+        with self._beam_graph_capture_owner.allow_capture() as allowed:
+            if allowed:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.execution_stream):
+                    self.sampler.prepare_cuda_graphs(
+                        vocab_size=self.model_engine.model.vocab_size_padded)
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
+
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                self._warmup_sampler_cuda_graphs()
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -2011,6 +2031,7 @@ class PyExecutor:
             self.encoder_launch_executor = None
 
         self.worker_started = False
+        self.sampler.release_cuda_graphs()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -2052,6 +2073,7 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        self._beam_graph_capture_owner.close()
 
     def can_enqueue_requests(self) -> bool:
         """

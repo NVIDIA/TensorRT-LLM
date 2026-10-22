@@ -31,7 +31,7 @@ final once the winning path is known, so they are accumulated in
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Callable, NamedTuple, Optional, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, TypeAlias, cast
 
 import torch
 
@@ -45,6 +45,9 @@ from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
 from .sampler_common import _get_beam_width_out, _request_get_sampling_params, int_tensor
 from .sampler_features import _SideStreamCopier
+
+if TYPE_CHECKING:
+    from .beam_search_graph import BeamSearchGraphProfile, BeamSearchGraphRunner
 
 BEAM_SEARCH_PAD_TOKEN = -1
 
@@ -100,7 +103,9 @@ class BeamSearchEarlyStop(IntEnum):
         return cls.NEVER
 
 
-def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _beam_topk(
+    values: torch.Tensor, k: int, workspace: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Sorted top-k over the last dim of a 2D tensor, dispatched on row width.
 
     flashinfer's radix-select kernel is O(n) and much faster than torch.topk on
@@ -115,7 +120,7 @@ def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor
     equal values may differ, which torch.topk leaves unspecified anyway.
     """
     if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000:
-        return radix_topk_op(values, k)
+        return radix_topk_op(values, k, workspace)
     return torch.topk(values, k=k, dim=-1, sorted=True)
 
 
@@ -432,6 +437,7 @@ def beam_candidate_topk(
     cand_gen_lengths: Optional[torch.Tensor] = None,
     diversity_rate: "torch.Tensor | float | None" = None,
     source_beam_indices: Optional[torch.Tensor] = None,
+    topk_workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Two-stage top-k over beam-expansion candidates with per-source-beam
     ranking adjustments, ranked by::
@@ -482,7 +488,7 @@ def beam_candidate_topk(
     # Stage 1: raw per-beam top-k (the per-beam adjustments are constant
     # along the vocab axis, so raw ordering == adjusted ordering).
     per_beam_vals, per_beam_tokens = _beam_topk(
-        logprobs.view(batch_size * beam_width_in, vocab_size), stage1_k
+        logprobs.view(batch_size * beam_width_in, vocab_size), stage1_k, topk_workspace
     )
     per_beam_vals = per_beam_vals.view(batch_size, beam_width_in, stage1_k)
     per_beam_tokens = per_beam_tokens.view(batch_size, beam_width_in, stage1_k)
@@ -513,7 +519,7 @@ def beam_candidate_topk(
         # token), so the power is always well-defined.
         penalty_factor = cand_gen_lengths.to(logprobs.dtype).pow(exponent)
         keys = keys / penalty_factor.unsqueeze(-1)
-    _, selected = _beam_topk(keys.view(batch_size, -1), beam_width_out)
+    _, selected = _beam_topk(keys.view(batch_size, -1), beam_width_out, topk_workspace)
     sorted_logprobs = per_beam_vals.view(batch_size, -1).gather(1, selected)
     predecessor_beams = (selected // stage1_k).to(torch.int32)
     tokens = per_beam_tokens.view(batch_size, -1).gather(1, selected).to(torch.int32)
@@ -798,6 +804,7 @@ def beam_search_sampling_batch_cba(
     length_penalty: "torch.Tensor | float | None" = None,
     diversity_rate: "torch.Tensor | float | None" = None,
     return_probs: bool = True,
+    topk_workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Beam-search step with a candidate-beams array (CBA). Every
     early_stopping mode runs here; the mode only selects the done verdict:
@@ -899,6 +906,7 @@ def beam_search_sampling_batch_cba(
         beam_width_out=num_beams + max(num_beams, beam_width_in),
         diversity_rate=diversity_rate,
         source_beam_indices=args.beam_idx_arange,
+        topk_workspace=topk_workspace,
     )
 
     # Length penalty normalized to a per-request exponent tensor (0 == off),
@@ -1134,13 +1142,18 @@ class BeamSearchStep:
         )
 
     def sample(
-        self, logits: torch.Tensor, *, metadata: BeamSearchMetadata
+        self,
+        logits: torch.Tensor,
+        *,
+        metadata: BeamSearchMetadata,
+        graph_runner: "BeamSearchGraphRunner | None" = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sample the group's logits rows, ``row_stride`` per request."""
         # Temperature is applied before the op slices the padding rows off, so
         # it must cover every row the forward laid out.
         temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
-        return beam_search_sampling_batch_cba(
+        sample = beam_search_sampling_batch_cba if graph_runner is None else graph_runner.sample
+        return sample(
             logits / temperature,
             beam_width_in=self._beam_width_in,
             beam_width_out=self._beam_width_out,
@@ -1450,8 +1463,15 @@ class BeamSearchHandler:
         has_multi_token_stop_words: Callable[[LlmRequest], bool],
         copy_to_host: Callable[[torch.Tensor], torch.Tensor],
         make_side_stream_copier: Callable[[], AbstractContextManager[_SideStreamCopier]],
+        graph_profiles: tuple["BeamSearchGraphProfile", ...] = (),
+        graph_max_graphs: int = 192,
+        graph_max_static_input_bytes: int = 512 * 1024 * 1024,
     ):
         self._store = store
+        self._graph_profiles = graph_profiles
+        self._graph_max_graphs = graph_max_graphs
+        self._graph_max_static_input_bytes = graph_max_static_input_bytes
+        self._graph_runner: BeamSearchGraphRunner | None = None
         self._max_seq_len = max_seq_len
         self._use_speculative_d2h = use_speculative_d2h
         # Bound methods of the owning sampler: the D2H copies must share its
@@ -1466,6 +1486,57 @@ class BeamSearchHandler:
         # Stop-word length check lives with finish-reason handling, which also
         # uses it outside beam search; injected rather than duplicated here.
         self._has_multi_token_stop_words = has_multi_token_stop_words
+
+    @property
+    def needs_cuda_graph_warmup(self) -> bool:
+        return bool(self._graph_profiles) and self._store is not None and self._graph_runner is None
+
+    def sample(
+        self, step: BeamSearchStep, logits: torch.Tensor, *, metadata: BeamSearchMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sample with this handler's prepared graphs, or use the eager CBA path."""
+        return step.sample(logits, metadata=metadata, graph_runner=self._graph_runner)
+
+    def prepare_cuda_graphs(
+        self,
+        *,
+        vocab_size: int,
+        new_log_probs: torch.Tensor,
+        end_ids_cuda: torch.Tensor,
+        past_tokens_cuda: torch.Tensor,
+    ) -> None:
+        """Prepare configured steps before any executor worker starts.
+
+        The executor owns the process-quiescent startup phase. Tensor arguments
+        are the persistent log-prob and finish-handler buffers used at runtime.
+        """
+        if not self._graph_profiles or self._store is None or self._graph_runner is not None:
+            return
+        from .beam_search_graph import BeamSearchGraphRunner
+
+        runner = BeamSearchGraphRunner(
+            max_graphs=self._graph_max_graphs,
+            max_static_input_bytes=self._graph_max_static_input_bytes,
+        )
+        try:
+            runner.prepare(
+                self._store,
+                self._graph_profiles,
+                vocab_size=vocab_size,
+                new_log_probs=new_log_probs,
+                end_ids=end_ids_cuda,
+                past_tokens=past_tokens_cuda,
+            )
+        except (RuntimeError, ValueError):
+            runner.clear()
+            raise
+        self._graph_runner = runner
+
+    def release_cuda_graphs(self) -> None:
+        """Release sampling graphs after the executor worker has stopped."""
+        if self._graph_runner is not None:
+            self._graph_runner.clear()
+            self._graph_runner = None
 
     def build_metadata(
         self,
