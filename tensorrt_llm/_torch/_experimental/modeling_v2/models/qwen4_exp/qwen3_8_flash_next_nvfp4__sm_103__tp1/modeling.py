@@ -161,6 +161,8 @@ from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_deco
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import qsa_paged_sparse_gqa_nvfp4_decode
+from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import qsa_paged_sparse_gqa_nvfp4_verify
+from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import takes_grouped as _verify_takes_grouped
 from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
 from .ops.attention.qsa_rollback_planes import plane_table as _plane_table
 from .ops.attention.qsa_rollback_planes import qsa_rollback_gather, qsa_rollback_restore
@@ -2629,10 +2631,13 @@ def _sparse_gqa(
     query_positions,
     compress_ratio,
     output_gate=None,
+    rows_per_request=1,
 ):
     """Sparse GQA over the layer's paged pool (dequantizing an NVFP4 one). The prefill pair
     `query_positions` / `compress_ratio` is a bound on a context row's scan, or None, None.
-    `output_gate` (NVFP4 pool, no prefill pair only) returns the gated output."""
+    `output_gate` (NVFP4 pool, no prefill pair only) returns the gated output.
+    `rows_per_request` (NVFP4 pool, no prefill pair only): the rows come that many consecutive
+    rows a request, a verify step's generation rows; 1 for any other batch."""
     if kv.k_scale is None:
         assert output_gate is None, "the output gate is fused on the NVFP4 decode-row path only"
         return qsa_paged_sparse_gqa(
@@ -2650,6 +2655,25 @@ def _sparse_gqa(
     if query_positions is None:
         # Rows without the prefill pair (decode, draft, a mixed step's generation rows): the
         # CuTe split-K + merge, with the output gate fused when the caller hands it over.
+        if rows_per_request > 1:
+            # A verify step's rows, `rows_per_request` a request: the request-grouped entry
+            # loads each selected K/V token once for a group of a request's rows (from eight
+            # groups up; below that it is the per-row kernel).
+            return qsa_paged_sparse_gqa_nvfp4_verify(
+                q,
+                kv.k,
+                kv.v,
+                kv.k_scale,
+                kv.v_scale,
+                core.kv_scale_quant_orig,
+                block_table,
+                selected_tokens,
+                request_indices,
+                tokens_per_block,
+                core.softmax_scale,
+                rows_per_request,
+                output_gate=output_gate,
+            )
         return qsa_paged_sparse_gqa_nvfp4_decode(
             q,
             kv.k,
@@ -2781,13 +2805,26 @@ def _nvfp4_context_plan(core, md, req_idx, block_table, tpb: int) -> tuple:
 
 
 def _sparse_gqa_nvfp4_context(
-    core, kv, plan, q, block_table, selected, req_idx, logical, tpb: int, num_ctx: int, out
+    core,
+    kv,
+    plan,
+    q,
+    block_table,
+    selected,
+    req_idx,
+    logical,
+    tpb: int,
+    num_ctx: int,
+    out,
+    rows_per_request: int = 1,
 ) -> torch.Tensor:
     """Sparse GQA of a step with context rows over an NVFP4 pool, into `out` `[rows,
     q_width]`. With a plan (`_nvfp4_context_plan`) the first `num_ctx` rows, the context
     rows, take the row-tile pass over the plan's scratch, filled here from this layer's
     pool; the other rows, and every row without a plan, go split-K over the pool itself
-    (with the prefill pair the entry would take its per-row prefill kernel)."""
+    (with the prefill pair the entry would take its per-row prefill kernel). The generation
+    rows after the context rows come `rows_per_request` a request: more than one (a verify
+    step's) takes the request-grouped entry for them on their own."""
     rows = q.shape[0]
     head = 0
     if plan is not None:
@@ -2820,6 +2857,28 @@ def _sparse_gqa_nvfp4_context(
         )
         out[:num_ctx].copy_(torch.reshape(context, [num_ctx, core.q_width]))
         head = num_ctx
+    elif (
+        rows_per_request > 1
+        and 0 < num_ctx < rows
+        and _verify_takes_grouped(
+            q[num_ctx:], kv.k, block_table, selected[num_ctx:], tpb, rows_per_request
+        )
+    ):
+        # Without a plan the context rows would share the generation rows' split-K launch;
+        # when those are enough for the request-grouped kernel the context rows go on their own.
+        context = _sparse_gqa(
+            core,
+            kv,
+            q=q[:num_ctx],
+            block_table=block_table,
+            selected_tokens=selected[:num_ctx],
+            request_indices=req_idx[:num_ctx],
+            tokens_per_block=tpb,
+            query_positions=None,
+            compress_ratio=None,
+        )
+        out[:num_ctx].copy_(torch.reshape(context, [num_ctx, core.q_width]))
+        head = num_ctx
     if head < rows:
         rest = _sparse_gqa(
             core,
@@ -2831,6 +2890,8 @@ def _sparse_gqa_nvfp4_context(
             tokens_per_block=tpb,
             query_positions=None,
             compress_ratio=None,
+            # the generation rows alone, or every row of the step
+            rows_per_request=rows_per_request if head == num_ctx else 1,
         )
         out[head:rows].copy_(torch.reshape(rest, [rows - head, core.q_width]))
     return out
@@ -3419,6 +3480,7 @@ class PrefillTarget:
                     tokens_per_block,
                     num_ctx,
                     attn_out[:num_tokens],
+                    rows_per_request=step.attn["predicted_tokens_per_seq"],
                 )
             elif num_tokens >= _ROWTILE_MIN_ROWS and kv.k.dtype == q_dst.dtype:
                 # A context launch of thousands of rows over a bf16 pool takes the row-tile
@@ -5218,7 +5280,8 @@ class DecodeTarget:
                     token_topk=core.token_topk,
                 )
             if kv.k_scale is not None:
-                # The output gate rides the CuTe kernel's store (one split) or merge.
+                # The output gate rides the CuTe kernel's store (one split) or merge. A verify
+                # step's rows come `predicted_tokens_per_seq` a request.
                 attn = _sparse_gqa(
                     core,
                     kv,
@@ -5231,6 +5294,7 @@ class DecodeTarget:
                     query_positions=None,
                     compress_ratio=None,
                     output_gate=gate,
+                    rows_per_request=step["predicted_tokens_per_seq"],
                 )
                 gated = True
             else:
