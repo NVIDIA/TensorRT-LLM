@@ -7,6 +7,9 @@
 * The step-input stager writes per-layer and shared attention-op page tables exactly as the
   manager's own copy does, and the life cycles' SHARED-path tables over their readable
   columns, each from a snapshot of the host rows taken when it records.
+* The block decode's window kernels, called as ``windowed_block_decode`` calls them on the
+  drafter's real per-layer views with the one worker-decoded page table, read and append
+  at the pages the manager allocated to every draft layer (grouped and per-layer tables).
 """
 
 from collections import Counter
@@ -34,11 +37,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, PageIndexMode
 
 PAGE = 16
 WINDOW = 4 * PAGE
@@ -243,5 +247,121 @@ def test_the_staged_tables_are_a_snapshot_of_the_host_table(monkeypatch, layout:
         torch.cuda.synchronize()
         host.copy_(saved)
         assert torch.equal(staged, expected)
+    finally:
+        manager.shutdown()
+
+
+def _manager_pages(manager, layer_id: int, view: torch.Tensor) -> torch.Tensor:
+    """``[requests, blocks]`` indices into ``view`` of each request's K/V pages, -1 where BAD.
+
+    From the host table and the layer's page-index converters and pool origins only, so
+    independent of the attention-op tables and of the worker's decode.
+    """
+    local = manager.layer_offsets[layer_id]
+    pool_id = manager.impl.get_layer_group_id(local)
+    rows = manager.index_mapper.get_copy_index(_request_ids(), 0, 1, False).tolist()
+    host = manager.host_kv_cache_block_offsets
+    page_bytes = view.stride(0) * view.element_size()
+    pages = torch.full((len(rows), host.shape[3]), -1, dtype=torch.int64)
+    for role, lane in ((Role.KEY, 0), (Role.VALUE, 1)):
+        converter = manager.impl.get_page_index_converter(local, role)
+        origin = manager.impl.get_mem_pool_base_address(local, role, PageIndexMode.PER_LAYER)
+        stride = manager.impl.get_page_stride(local, role)
+        for b, row in enumerate(rows):
+            for j, base in enumerate(host[pool_id, row, 0].tolist()):
+                if base == BAD_PAGE_INDEX:
+                    continue
+                address = origin + (base * converter.scale + converter.layer_offset) * stride
+                if lane == 0:
+                    page, rest = divmod(address - view.data_ptr(), page_bytes)
+                    assert rest == 0
+                    pages[b, j] = page
+                assert view[pages[b, j], lane].data_ptr() == address
+    return pages
+
+
+@_needs_cuda
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("layout", ("grouped", "per-layer"))
+def test_the_window_kernel_reads_the_unified_tables(monkeypatch, layout: str, wide: bool):
+    """One page table for every draft layer, as ``windowed_block_decode`` passes it."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.spec import (  # noqa: E501
+        dflash_window_attention,
+        dflash_window_attention_wide,
+    )
+
+    op = (
+        dflash_window_attention_wide.dflash_window_attention_wide
+        if wide
+        else dflash_window_attention.dflash_window_attention
+    )
+    manager = _make_manager(monkeypatch, layout)
+    try:
+        num_seqs = len(REQUESTS)
+        worker = object.__new__(DFlashWorker)
+        worker._ctx_unified_cache = True
+        pool = worker._managed_ctx_pool(manager, NUM_DRAFT, NKV, HEAD_DIM, torch.bfloat16, 2)
+        assert pool is not None
+        assert worker._init_ctx_block_tables(
+            manager, pool, num_seqs, NUM_DRAFT, NKV, HEAD_DIM, PAGE
+        )
+        assert worker._refresh_ctx_block_tables(
+            SimpleNamespace(kv_cache_block_offsets=_native_tables(manager)), num_seqs
+        )
+        table = worker._ctx_block_tables[:num_seqs]
+        ctx = torch.tensor([history for _, _, history, _ in REQUESTS], device="cuda")
+        seqlens = (ctx + BLOCK).int()
+        rows = torch.arange(num_seqs, dtype=torch.int32, device="cuda")
+        window = (WINDOW - PAGE - 1, WINDOW - PAGE - 1)
+        cols = torch.arange(int(seqlens.max()), device="cuda")
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        for layer_idx, layer_id in enumerate(worker._ctx_layer_ids):
+            view = pool[layer_idx]
+            view.copy_(torch.randn(view.shape, device="cuda", generator=gen).bfloat16())
+            pages = _manager_pages(manager, layer_id, view).cuda()
+            valid = pages >= 0
+            # The worker's decode names this layer's pages wherever the manager has one.
+            assert torch.equal(table.long()[valid], pages[valid])
+            col_pages = pages[:, cols // PAGE]
+            read = (cols >= (ctx - window[0]).clamp(min=0).unsqueeze(1)) & (
+                cols < seqlens.unsqueeze(1)
+            )
+            assert (col_pages[read] >= 0).all(), "the window reads a page the manager retired"
+            # The block decode's call: each plane of the layer's view as a pool of rows.
+            k_cache, v_cache = view[:, 0].transpose(1, 2), view[:, 1].transpose(1, 2)
+            arenas = [
+                plane[col_pages.clamp(min=0), cols % PAGE] * read[..., None, None]
+                for plane in (k_cache, v_cache)
+            ]
+            q = (
+                2 * torch.randn(num_seqs, BLOCK, HQ, HEAD_DIM, device="cuda", generator=gen)
+            ).bfloat16()
+            k_new, v_new = (
+                torch.randn(
+                    num_seqs * BLOCK, NKV, HEAD_DIM, device="cuda", generator=gen
+                ).bfloat16()
+                for _ in range(2)
+            )
+            want = op(q, *arenas, seqlens, rows, window, None, False, k_new, v_new)
+            got = op(
+                q,
+                k_cache,
+                v_cache,
+                seqlens,
+                rows,
+                window,
+                None,
+                False,
+                k_new,
+                v_new,
+                page_table=table,
+            )
+            assert torch.equal(got, want), (got.float() - want.float()).abs().max().item()
+            # The block's K/V landed in the manager's pages for its columns.
+            block = ctx.unsqueeze(1) + torch.arange(BLOCK, device="cuda")
+            block_pages = pages.gather(1, block // PAGE)
+            for plane, new in ((k_cache, k_new), (v_cache, v_new)):
+                landed = plane[block_pages, block % PAGE]
+                assert torch.equal(landed, new.view(num_seqs, BLOCK, NKV, HEAD_DIM))
     finally:
         manager.shutdown()
