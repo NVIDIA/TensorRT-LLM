@@ -36,8 +36,9 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.bounce as bounce_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     IntactMapper,
     ReplicatedMapper,
