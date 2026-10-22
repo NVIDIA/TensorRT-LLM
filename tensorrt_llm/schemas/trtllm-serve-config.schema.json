@@ -5083,17 +5083,6 @@
           "default": null,
           "description": "The sequence length threshold separating dense and QSA attention. When omitted, it is resolved to token_topk after checkpoint geometry is loaded; an explicit value below token_topk is raised to token_topk because it cannot reduce attention work.",
           "title": "Seq Len Threshold"
-        },
-        "sparse_core_backend": {
-          "default": "auto",
-          "description": "Kernel for the QSA sparse core attention and indexer scorer. 'auto' runs the PrimTS (CUTLASS task-scheduling) kernels on SM100/SM103/SM107 and keeps Triton for small decode batches, 'triton' always uses the Triton kernels, 'prims_ts' always uses PrimTS and raises when the device does not support it.",
-          "enum": [
-            "auto",
-            "triton",
-            "prims_ts"
-          ],
-          "title": "Sparse Core Backend",
-          "type": "string"
         }
       },
       "title": "QSASparseAttentionConfig",
