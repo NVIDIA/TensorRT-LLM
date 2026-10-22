@@ -36,19 +36,21 @@ endif()
 
 if(DYNAMIC_EPLB_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL
                           13.1)
-  list(APPEND DYNAMIC_EPLB_SOURCES moeRebalanceTma.cu)
+  list(APPEND DYNAMIC_EPLB_SOURCES moeRebalanceTma.cu moeRebalanceHaloR.cu
+       moeRebalanceRelay.cu)
 else()
   list(APPEND DYNAMIC_EPLB_SOURCES moeRebalancePlaceholder.cpp)
-  list(APPEND DYNAMIC_EPLB_DEFINITIONS TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_TMA)
+  list(APPEND DYNAMIC_EPLB_DEFINITIONS TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_TMA
+       TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_HALO_R)
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
     message(
       STATUS
-        "Per-layer dynamic EPLB TMA disabled: CUDA 13.1 or newer is required (found ${CMAKE_CUDA_COMPILER_VERSION})"
+        "Per-layer dynamic EPLB TMA and HALO-R disabled: CUDA 13.1 or newer is required (found ${CMAKE_CUDA_COMPILER_VERSION})"
     )
   else()
     message(
       STATUS
-        "Per-layer dynamic EPLB TMA disabled: none of SM100, SM103, or SM107 was requested"
+        "Per-layer dynamic EPLB TMA and HALO-R disabled: none of SM100, SM103, or SM107 was requested"
     )
   endif()
 endif()
