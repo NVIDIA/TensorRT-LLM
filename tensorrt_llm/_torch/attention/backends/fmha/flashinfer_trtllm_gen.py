@@ -39,6 +39,7 @@ Example:
 """
 
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -49,6 +50,7 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_en
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
+from tensorrt_llm._torch import q35_env
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -63,6 +65,15 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .q35_cp import q35_cp_decode_ll
+from .q35_fused_decode import (
+    q35_fused_decode,
+    q35_fused_decode_fold,
+    q35_fused_decode_fold_supported,
+    q35_fused_decode_supported,
+    q35_fused_workspace_floats,
+)
+from .q35_segmented import q35_segmented_decode, q35_segmented_supported
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
@@ -218,6 +229,82 @@ if IS_FLASHINFER_AVAILABLE:
 
 
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
+
+# Qwen3.5 decode paths of run_generation (generation-only, one KV head per rank, FP8 KV, uniform q_len), in order of
+# precedence: CP-lite (q35_cp.py, KV head replicated over attn.q35_cp_group), fused decode (q35_fused_decode.py),
+# segmented (q35_segmented.py). Thresholds tuned for Qwen3.5-397B on SM 10.3.
+_Q35_ATTN_CP_MIN_BATCH = 2
+_Q35_ATTN_CP_MAX_BATCH = 64
+_Q35_ATTN_FUSED_MAX_BATCH = 4
+_Q35_ATTN_SEGMENTS = 16
+# At b4 the trtllm-gen kernel is already bandwidth-bound and segmenting loses ~3 us per call.
+_Q35_ATTN_SEG_MAX_BATCH = 2
+# Counter slots for segmented / CP-lite calls: >= max(b * segments * folded heads, #SMs).
+_Q35_COUNTER_SLOTS = 64 * 128
+
+
+def _q35_cp_segments(num_requests: int, q_len: int) -> int:
+    """Local segments per CP rank of a CP-lite call."""
+    return 2 if (num_requests <= 2 or q_len == 1) else 1
+
+
+@dataclass
+class Q35FoldInputs:
+    """Raw inputs of the qk-norm / RoPE / gate / KV-append prologue of a folded call (see q35_fold_inputs)."""
+
+    # Raw QKV projection [num_tokens, (2 * Hq + 2 * Hkv) * D] bf16 ((q, gate) per head, K, V).
+    qkv: torch.Tensor
+    q_weight: torch.Tensor
+    k_weight: torch.Tensor
+    cos_sin: torch.Tensor
+    positions: torch.Tensor  # [T] or [3, T] (interleaved mrope), contiguous
+    eps: float
+    rotary_dim: int
+    mrope_section: Optional[tuple]
+
+
+@dataclass
+class Q35KvAppendPlan:
+    """Paged FP8 destination of a generation-only call whose FP8 query / K / V the attention module writes.
+
+    The module fills q_fp8 / scales and hands the plan over through ``attn.q35_kv_appended``.
+    """
+
+    layer_idx: int
+    num_tokens: int
+    num_requests: int
+    q_len: int
+    kv_pool: torch.Tensor  # FP8 [blocks, num_kv_heads, tokens_per_block, head_dim]
+    block_tables: torch.Tensor  # int32 [num_requests, 2 (K, V), max_pages]
+    seq_lens: torch.Tensor  # int32, KV length including the new tokens
+    kv_scale_orig_quant: torch.Tensor
+    kv_scale_quant_orig: torch.Tensor
+    host_bmm1_scale: float
+    q_fp8: Optional[torch.Tensor] = None  # [num_tokens, num_heads, head_dim]
+    # float32 [8]: bmm1, bmm1 * log2e at [0:2]; bmm2 at [4] (both views 16-byte aligned)
+    scales: Optional[torch.Tensor] = None
+    # Set when the module skipped the prologue kernel; run_generation then runs the folded kernel or the prologue.
+    fold: Optional[Q35FoldInputs] = None
+
+
+# Shared by every attention layer (the calls are serialized on the decode stream): device -> (workspace, counters).
+_Q35_FUSED_BUFFERS: dict = {}
+
+
+def _q35_fused_buffers(device: torch.device, sm_count: int, capturing: bool):
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    bufs = _Q35_FUSED_BUFFERS.get(key)
+    if bufs is None:
+        if capturing:
+            raise RuntimeError(
+                "The Q35 fused-decode workspace must be allocated before CUDA graph capture."
+            )
+        ws = torch.zeros(q35_fused_workspace_floats(sm_count), dtype=torch.float32, device=device)
+        # grid-barrier epoch counters: row b serves batch b; zero once, never reset (the kernel keeps them consistent)
+        cnt = torch.zeros(_Q35_ATTN_FUSED_MAX_BATCH + 1, 8, dtype=torch.int64, device=device)
+        bufs = (ws, cnt)
+        _Q35_FUSED_BUFFERS[key] = bufs
+    return bufs
 
 
 def _get_multi_ctas_kv_counter_size(
@@ -390,6 +477,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+        # Qwen3.5 segmented / CP-lite calls need max(b * segments * heads, SMs) counters, more than the regular
+        # buffer holds. Zero once; the kernel resets its counters at the end of every launch.
+        self._q35_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
     def is_environment_available(cls) -> bool:
@@ -862,6 +952,18 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 device=q.device,
             )
 
+        if q35_env.fast_paths_enabled():
+            capturing = metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing()
+            if self._q35_counter_buffer is None or self._q35_counter_buffer.device != q.device:
+                if capturing:
+                    raise RuntimeError(
+                        "The Q35 segmented-attention counter buffer must be allocated before capture."
+                    )
+                self._q35_counter_buffer = torch.zeros(
+                    _Q35_COUNTER_SLOTS, dtype=torch.int32, device=q.device
+                )
+            _q35_fused_buffers(q.device, self._multi_processor_count, capturing)
+
         num_tokens = q.size(0)
         attention_input_type = forward_args.attention_input_type
         is_gen_only = attention_input_type == AttentionInputType.generation_only
@@ -1103,14 +1205,33 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if attention_input is None:
             raise RuntimeError("trtllm-gen generation requires QKV or query input.")
         attn = params.attn
-        meta = params.meta
         fwd = params.fwd
-        rope_params = attn.rope_params
         bmm1_scale_static = get_bmm1_scale(attn)
         attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.batch_size
+        # The attention module may already have written this call's FP8 query / K / V (q35_kv_append_plan).
+        preprocessed = None
+        q35_plan = getattr(attn, "q35_kv_appended", None)
+        if q35_plan is not None:
+            attn.q35_kv_appended = None
+            if q35_plan.fold is not None:
+                if self._q35_fold_generation(params, q35_plan, fp8_context_fmha):
+                    return
+                attention_input = self._q35_fold_fallback(params, q35_plan)
+            preprocessed = self._q35_appended_preprocess(
+                params, q35_plan, batch_beam, attention_chunk_size, fp8_context_fmha
+            )
+        if preprocessed is None:
+            preprocessed = self._run_generation_preprocess(
+                params,
+                attention_input,
+                batch_beam,
+                bmm1_scale_static,
+                attention_chunk_size,
+                fp8_context_fmha,
+            )
         (
             q_processed,
             kv_pool,
@@ -1124,7 +1245,86 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             max_kv_len,
             window_left,
             is_multi_token_gen,
-        ) = thop.trtllm_gen_generation_preprocess(
+        ) = preprocessed
+
+        q_len_per_req = None if is_multi_token_gen else params.input_seq_length
+        decode_max_q_len = max_q_len if is_multi_token_gen else None
+        decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
+
+        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
+        if has_fp4_kv and kv_scale_pool is None:
+            raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
+        if has_fp4_kv or fp8_context_fmha:
+            q_processed = (
+                q_processed.view(torch.uint8)
+                .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
+                .view(torch.float8_e4m3fn)
+                .view(params.num_tokens, attn.num_heads, attn.head_dim)
+            )
+        gen_bmm1_scale = (
+            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+        )
+        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
+
+        if q35_env.fast_paths_enabled() and self._q35_run_generation(
+            params,
+            q_processed,
+            kv_pool,
+            block_tables,
+            kv_scale_pool,
+            max_kv_len,
+            window_left,
+            is_multi_token_gen,
+            has_fp4_kv,
+            gen_bmm1_scale,
+            gen_bmm2_scale,
+            fmha_workspace,
+        ):
+            return
+
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_seq_len=max_kv_len,
+            bmm1_scale=gen_bmm1_scale,
+            bmm2_scale=gen_bmm2_scale,
+            window_left=window_left,
+            out=params.output,
+            sinks=fwd.attention_sinks,
+            kv_layout=self._layout,
+            enable_pdl=self._enable_pdl,
+            backend="trtllm-gen",
+            q_len_per_req=q_len_per_req,
+            max_q_len=decode_max_q_len,
+            cum_seq_lens_q=decode_cu_seqlens,
+            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            bmm1_scale_log2=(
+                _get_bmm1_scale_log2(gen_bmm1_scale)
+                if isinstance(gen_bmm1_scale, torch.Tensor)
+                else None
+            ),
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+        )
+
+    def _run_generation_preprocess(
+        self,
+        params: FmhaParams,
+        attention_input: torch.Tensor,
+        batch_beam: int,
+        bmm1_scale_static: float,
+        attention_chunk_size: int,
+        fp8_context_fmha: bool,
+    ) -> tuple:
+        """C++ generation preprocess: query, K / V append into the paged cache, FMHA scales and cache views."""
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        rope_params = attn.rope_params
+        return thop.trtllm_gen_generation_preprocess(
             attention_input,  # qkv_input (also accepts Q-only input for cached KV)
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
@@ -1170,52 +1370,407 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.is_cross,  # is_cross
         )
 
-        q_len_per_req = None if is_multi_token_gen else params.input_seq_length
-        decode_max_q_len = max_q_len if is_multi_token_gen else None
-        decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
-
-        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
-        if has_fp4_kv and kv_scale_pool is None:
-            raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or fp8_context_fmha:
-            q_processed = (
-                q_processed.view(torch.uint8)
-                .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
-                .view(torch.float8_e4m3fn)
-                .view(params.num_tokens, attn.num_heads, attn.head_dim)
+    def _q35_run_generation(
+        self,
+        params: FmhaParams,
+        q_processed: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_scale_pool: Optional[torch.Tensor],
+        max_kv_len: int,
+        window_left: int,
+        is_multi_token_gen: bool,
+        has_fp4_kv: bool,
+        gen_bmm1_scale,
+        gen_bmm2_scale,
+        fmha_workspace: torch.Tensor,
+    ) -> bool:
+        """Run a generation call on a Qwen3.5 decode path; False when none applies."""
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        if not (
+            not is_multi_token_gen
+            and not has_fp4_kv
+            and meta.beam_width == 1
+            and not params.is_cross
+            and q_processed.dim() == 3
+            and q_processed.is_contiguous()
+            # These trtllm-gen launches take an FP8 query with an FP8 KV cache.
+            and (q_processed.dtype == torch.float8_e4m3fn or q_processed.dtype == kv_pool.dtype)
+            and self._q35_counter_buffer is not None
+        ):
+            return False
+        num_requests = params.num_requests
+        # Pure-generation calls only: the gate the attention module offers covers every token of the forward.
+        gate = getattr(attn, "q35_pending_gate", None)
+        if gate is not None:
+            gate = (
+                gate[: params.num_tokens]
+                if meta.num_contexts == 0 and gate.shape[0] >= params.num_tokens
+                else None
             )
-        gen_bmm1_scale = (
-            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+        generation_only = (
+            meta.num_contexts == 0
+            and kv_scale_pool is None
+            and window_left < 0
+            and fwd.attention_sinks is None
         )
-        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=max_kv_len,
-            bmm1_scale=gen_bmm1_scale,
-            bmm2_scale=gen_bmm2_scale,
-            window_left=window_left,
-            out=params.output,
-            sinks=fwd.attention_sinks,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            backend="trtllm-gen",
-            q_len_per_req=q_len_per_req,
-            max_q_len=decode_max_q_len,
-            cum_seq_lens_q=decode_cu_seqlens,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            bmm1_scale_log2=(
+        cp_group = getattr(attn, "q35_cp_group", None)
+        if (
+            generation_only
+            and cp_group is not None
+            and attn.num_kv_heads == 1
+            and _Q35_ATTN_CP_MIN_BATCH <= num_requests <= _Q35_ATTN_CP_MAX_BATCH
+        ):
+            exchange = self._q35_cp_exchange(attn, len(cp_group))
+            # The q all-gather and the partials of one call must fit the exchange's per-pair payload.
+            if (
+                exchange is not None
+                and params.num_tokens * attn.num_heads * (attn.head_dim * 2 + 4)
+                <= exchange.max_words * 4
+            ):
+                self._q35_cp_generation(
+                    params,
+                    exchange,
+                    q_processed,
+                    kv_pool,
+                    block_tables,
+                    max_kv_len,
+                    gen_bmm1_scale,
+                    gen_bmm2_scale,
+                    fmha_workspace,
+                    gate,
+                )
+                return True
+
+        if (
+            generation_only
+            and num_requests <= _Q35_ATTN_FUSED_MAX_BATCH
+            and kv_pool.dim() == 4
+            and kv_pool.is_contiguous()
+            and q35_fused_decode_supported(
+                attn.num_heads,
+                attn.num_kv_heads,
+                attn.head_dim,
+                params.input_seq_length,
+                num_requests,
+                window_left,
+                False,
+                params.tokens_per_block,
+                q_processed.dtype,
+                params.output.dtype,
+                kv_pool.dtype,
+                self._multi_processor_count,
+            )
+        ):
+            ws, cnt = _q35_fused_buffers(q_processed.device, self._multi_processor_count, False)
+            q35_fused_decode(
+                q_processed,
+                kv_pool,
+                block_tables,
+                params.sequence_lengths,
+                params.input_seq_length,
+                gen_bmm1_scale,
+                gen_bmm2_scale,
+                params.output,
+                ws,
+                cnt,
+                self._multi_processor_count,
+                self._enable_pdl,
+                gate=gate,
+            )
+            if gate is not None:
+                attn.q35_gate_applied = True
+            return True
+
+        if num_requests <= _Q35_ATTN_SEG_MAX_BATCH and q35_segmented_supported(
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            params.input_seq_length,
+            num_requests,
+            _Q35_ATTN_SEGMENTS,
+            window_left,
+            fwd.attention_sinks is not None,
+            params.tokens_per_block,
+            q_processed.dtype,
+            params.output.dtype,
+        ):
+            q35_segmented_decode(
+                flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode,
+                q_processed,
+                kv_pool,
+                block_tables,
+                params.sequence_lengths,
+                max_kv_len,
+                params.input_seq_length,
+                attn.num_kv_heads,
+                _Q35_ATTN_SEGMENTS,
+                gen_bmm1_scale,
                 _get_bmm1_scale_log2(gen_bmm1_scale)
                 if isinstance(gen_bmm1_scale, torch.Tensor)
-                else None
-            ),
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+                else gen_bmm1_scale,
+                gen_bmm2_scale,
+                fmha_workspace,
+                self._q35_counter_buffer,
+                params.output,
+                flashinfer.decode.get_device_sm_count(q_processed.device),
+                kv_scale_pool,
+                self._enable_pdl,
+                gate=gate,
+            )
+            if gate is not None:
+                attn.q35_gate_applied = True
+            return True
+        return False
+
+    def _q35_fold_cp_applies(self, attn: "TrtllmAttention", num_requests: int) -> bool:
+        """Whether CP-lite may take a generation call of num_requests (it has precedence over the fused path)."""
+        group = getattr(attn, "q35_cp_group", None)
+        return (
+            group is not None
+            and attn.num_kv_heads == 1
+            and _Q35_ATTN_CP_MIN_BATCH <= num_requests <= _Q35_ATTN_CP_MAX_BATCH
         )
+
+    def _q35_fold_generation(
+        self, params: FmhaParams, plan: Q35KvAppendPlan, fp8_context_fmha: bool
+    ) -> bool:
+        """Run the folded fused decode when the call meets the conditions of the fused branch of _q35_run_generation
+        and of _q35_appended_preprocess; False otherwise."""
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        f = plan.fold
+        if not (
+            getattr(attn, "q35_pending_gate", None) is not None
+            and fp8_context_fmha
+            and meta.num_contexts == 0
+            and meta.beam_width == 1
+            and not params.is_cross
+            and params.seq_offset == 0
+            and params.spec_decoding_generation_lengths is None
+            and params.num_requests <= _Q35_ATTN_FUSED_MAX_BATCH
+            and not self._q35_fold_cp_applies(attn, params.num_requests)
+            and plan.layer_idx == attn.local_layer_idx
+            and plan.num_tokens == params.num_tokens
+            and plan.num_requests == params.num_requests
+            and plan.q_len == params.input_seq_length
+            and fwd.out_scale is None
+            and fwd.attention_sinks is None
+            and fwd.kv_scale_orig_quant is plan.kv_scale_orig_quant
+            and fwd.kv_scale_quant_orig is plan.kv_scale_quant_orig
+            and params.sequence_lengths is not None
+            and params.sequence_lengths.data_ptr() == plan.seq_lens.data_ptr()
+            and params.output is not None
+            and params.output.dtype == torch.bfloat16
+            and not QuantMode(attn.quant_mode).has_fp4_kv_cache()
+            and self._multi_processor_count is not None
+        ):
+            return False
+        window_left = self._compute_window_left(
+            params.cyclic_attention_window_size,
+            params.max_past_kv_length,
+            get_attention_chunk_size(attn),
+        )
+        if window_left >= 0 or not q35_fused_decode_supported(
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            params.input_seq_length,
+            params.num_requests,
+            window_left,
+            False,
+            params.tokens_per_block,
+            torch.float8_e4m3fn,
+            params.output.dtype,
+            plan.kv_pool.dtype,
+            self._multi_processor_count,
+        ):
+            return False
+        ws, cnt = _q35_fused_buffers(params.output.device, self._multi_processor_count, False)
+        q35_fused_decode_fold(
+            f.qkv[: params.num_tokens],
+            f.q_weight,
+            f.k_weight,
+            f.cos_sin,
+            f.positions,
+            f.eps,
+            f.rotary_dim,
+            f.mrope_section,
+            plan.kv_pool,
+            plan.block_tables,
+            params.sequence_lengths,
+            params.input_seq_length,
+            plan.kv_scale_orig_quant,
+            plan.kv_scale_quant_orig,
+            plan.host_bmm1_scale,
+            params.output,
+            ws,
+            cnt,
+            self._multi_processor_count,
+            self._enable_pdl,
+        )
+        attn.q35_gate_applied = True
+        return True
+
+    @staticmethod
+    def _q35_fold_fallback(params: FmhaParams, plan: Q35KvAppendPlan) -> torch.Tensor:
+        """Run the prologue kernel the module skipped for a folded call that misses the fused path.
+
+        Returns the packed QKV of this call; the contiguous gate replaces attn.q35_pending_gate.
+        """
+        from ...kernels.fused_qk_norm_rope_gate import q35_fused_qkv_rope_gate_append
+
+        attn = params.attn
+        f = plan.fold
+        plan.fold = None
+        qkv_out, gate_out, plan.q_fp8, plan.scales = q35_fused_qkv_rope_gate_append(
+            f.qkv,
+            f.q_weight,
+            f.k_weight,
+            f.cos_sin,
+            f.positions,
+            f.eps,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            f.rotary_dim,
+            f.mrope_section,
+            plan,
+        )
+        params.qkv_input = qkv_out[: params.num_tokens]
+        if getattr(attn, "q35_pending_gate", None) is not None:
+            attn.q35_pending_gate = gate_out
+        return params.qkv_input
+
+    def _q35_appended_preprocess(
+        self,
+        params: FmhaParams,
+        plan: Q35KvAppendPlan,
+        batch_beam: int,
+        attention_chunk_size: int,
+        fp8_context_fmha: bool,
+    ) -> Optional[tuple]:
+        """trtllm_gen_generation_preprocess outputs for a call whose FP8 query / K / V the module wrote.
+
+        None when the call does not match the plan; the C++ path then rewrites the same bytes from the bf16 QKV.
+        """
+        attn = params.attn
+        fwd = params.fwd
+        if not (
+            fp8_context_fmha
+            and plan.q_fp8 is not None
+            and plan.scales is not None
+            and plan.layer_idx == attn.local_layer_idx
+            and plan.num_tokens == params.num_tokens
+            and plan.num_requests == batch_beam
+            and plan.q_len == params.input_seq_length
+            and params.seq_offset == 0
+            and not params.is_cross
+            and params.spec_decoding_generation_lengths is None
+            and fwd.out_scale is None
+            and fwd.kv_scale_orig_quant is plan.kv_scale_orig_quant
+            and fwd.kv_scale_quant_orig is plan.kv_scale_quant_orig
+            and params.sequence_lengths is not None
+            and params.sequence_lengths.data_ptr() == plan.seq_lens.data_ptr()
+            and params.qkv_input is not None
+            and params.qkv_input.dtype == torch.bfloat16
+        ):
+            return None
+        layout = _get_generation_workspace_layout(
+            params.qkv_input.dtype,
+            batch_beam,
+            params.num_tokens,
+            attn.num_heads,
+            attn.head_dim,
+            attn.num_kv_heads,
+            attn.rope_params.dim,
+        )
+        offset = int(layout["trtllm_gen_workspace_offset"])
+        size = int(layout["trtllm_gen_workspace_size"])
+        workspace = params.workspace.view(-1).view(torch.uint8)
+        if size <= 0 or offset + size > workspace.numel():
+            return None
+        window_left = self._compute_window_left(
+            params.cyclic_attention_window_size,
+            params.max_past_kv_length,
+            attention_chunk_size,
+        )
+        return (
+            plan.q_fp8,
+            plan.kv_pool,
+            plan.block_tables,
+            None,
+            plan.scales.narrow(0, 0, 2),
+            plan.scales.narrow(0, 4, 1),
+            workspace.narrow(0, offset, size),
+            None,
+            params.input_seq_length,
+            params.max_past_kv_length,
+            window_left,
+            False,
+        )
+
+    @staticmethod
+    def _q35_cp_exchange(attn: "TrtllmAttention", cp: int):
+        """The LL exchange of this rank's CP-lite group, or None (CP-lite is then skipped).
+
+        Created lazily on the first eager call; a graph captured before it exists keeps the other paths.
+        """
+        mapping = getattr(attn, "q35_cp_mapping", None)
+        if mapping is None:
+            return None
+        from tensorrt_llm._torch.distributed.ll_exchange import get_tp_group_exchange
+
+        exchange = get_tp_group_exchange(mapping, group_size=cp)
+        if exchange is not None and not (
+            exchange.group_size == cp and exchange.grank == attn.q35_cp_rank
+        ):
+            raise RuntimeError("TPGroupExchange group does not match the CP-lite KV group.")
+        return exchange
+
+    def _q35_cp_generation(
+        self,
+        params: FmhaParams,
+        exchange,
+        q_processed: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_kv_len: int,
+        bmm1_scale,
+        bmm2_scale,
+        fmha_workspace: torch.Tensor,
+        gate: Optional[torch.Tensor],
+    ) -> None:
+        """CP-lite generation attention (fmha/q35_cp.py) for the rows of this rank's own heads."""
+        rows, hq, d = q_processed.shape
+        q35_cp_decode_ll(
+            exchange,
+            flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode,
+            q_processed,
+            kv_pool,
+            block_tables,
+            params.sequence_lengths,
+            max_kv_len,
+            params.input_seq_length,
+            _q35_cp_segments(params.num_requests, params.input_seq_length),
+            bmm1_scale,
+            _get_bmm1_scale_log2(bmm1_scale)
+            if isinstance(bmm1_scale, torch.Tensor)
+            else bmm1_scale,
+            bmm2_scale,
+            fmha_workspace,
+            self._q35_counter_buffer,
+            flashinfer.decode.get_device_sm_count(q_processed.device),
+            self._enable_pdl,
+            params.output.view(rows, hq, d),
+            gate=gate,
+        )
+        if gate is not None:
+            params.attn.q35_gate_applied = True
 
     def run_mla_generation(
         self,
@@ -1318,3 +1873,193 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
+
+
+def _q35_trtllm_gen_lib(attn: "TrtllmAttention") -> Optional[FlashInferTrtllmGenFmha]:
+    """The FlashInferTrtllmGenFmha instance that serves this layer's non-MLA generation calls, or None.
+
+    Only context-only libraries (PhasedFmha without its own run_generation) may precede it in selection order.
+    """
+    manager = getattr(attn, "_fmha_manager", None)
+    for lib in getattr(manager, "fmha_libs", ()):
+        if isinstance(lib, FlashInferTrtllmGenFmha):
+            return lib
+        if not (
+            isinstance(lib, PhasedFmha) and type(lib).run_generation is PhasedFmha.run_generation
+        ):
+            return None
+    return None
+
+
+def q35_kv_append_plan(
+    attn: "TrtllmAttention",
+    metadata: "TrtllmAttentionMetadata",
+    num_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> Optional[Q35KvAppendPlan]:
+    """Destination for the module-side FP8 q / K / V write of a generation-only step, or None (stock path).
+
+    Mirrors the conditions under which the C++ generation preprocess (applyBiasRopeUpdateKVCacheV2) writes FP8 K / V
+    and an FP8 query with a uniform q_len; run_generation re-checks the call before skipping its preprocess.
+    """
+    if num_tokens <= 0:
+        return None
+    lib = _q35_trtllm_gen_lib(attn)
+    if lib is None or FlashInferTrtllmGenFmha._missing_fused_nanobind_ops():
+        return None
+    if (
+        attn.is_mla_enable
+        or attn.sparse_params is not None
+        or attn.num_heads != num_heads
+        or attn.num_kv_heads != num_kv_heads
+        or attn.head_dim != head_dim
+        or head_dim % 16 != 0
+    ):
+        return None
+    quant_mode = QuantMode(attn.quant_mode)
+    if not quant_mode.has_fp8_kv_cache() or quant_mode.has_fp4_kv_cache():
+        return None
+    if (
+        metadata.kv_cache_block_offsets is None
+        or metadata.host_kv_cache_pool_pointers is None
+        or metadata.host_kv_cache_pool_mapping is None
+        or metadata.kv_cache_manager is None
+    ):
+        return None
+    num_seqs = metadata.num_generations
+    if (
+        metadata.num_contexts != 0
+        or num_seqs <= 0
+        or metadata.beam_width != 1
+        or metadata.is_cross
+        or num_tokens % num_seqs != 0
+    ):
+        return None
+    if metadata.is_spec_decoding_enabled and attn.predicted_tokens_per_seq > 1:
+        return None
+    seq_lens = metadata.kv_lens_cuda_runtime
+    if seq_lens is None or seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
+        return None
+    kv_scale_orig_quant = attn.kv_scale_orig_quant
+    kv_scale_quant_orig = attn.kv_scale_quant_orig
+    if not (
+        isinstance(kv_scale_orig_quant, torch.Tensor)
+        and isinstance(kv_scale_quant_orig, torch.Tensor)
+        and kv_scale_orig_quant.dtype == torch.float32
+        and kv_scale_quant_orig.dtype == torch.float32
+    ):
+        return None
+    tokens_per_block = metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
+    if tokens_per_block <= 0 or tokens_per_block & (tokens_per_block - 1):
+        return None
+    layer_idx = attn.get_local_layer_idx(metadata)
+    kv_pool, block_tables, kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
+        metadata.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
+        metadata.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
+        metadata.kv_cache_block_offsets,  # kv_cache_block_offsets
+        layer_idx,  # layer_idx
+        num_kv_heads,  # num_kv_heads
+        tokens_per_block,  # tokens_per_block
+        head_dim,  # head_dim
+        lib.kv_factor,  # kv_factor
+        lib._get_total_num_blocks(metadata),  # total_num_blocks
+        attn.quant_mode,  # kv_cache_quant_mode
+        0,  # batch_start
+        num_seqs,  # batch_size
+        torch.bfloat16,  # dtype
+    )
+    if (
+        kv_scale_pool is not None
+        or kv_pool.dtype != torch.float8_e4m3fn
+        or block_tables.dtype != torch.int32
+    ):
+        return None
+    return Q35KvAppendPlan(
+        layer_idx=layer_idx,
+        num_tokens=num_tokens,
+        num_requests=num_seqs,
+        q_len=num_tokens // num_seqs,
+        kv_pool=kv_pool,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        kv_scale_orig_quant=kv_scale_orig_quant,
+        kv_scale_quant_orig=kv_scale_quant_orig,
+        host_bmm1_scale=get_bmm1_scale(attn),
+    )
+
+
+def q35_fold_inputs(
+    attn: "TrtllmAttention",
+    plan: Q35KvAppendPlan,
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    rotary_dim: int,
+    mrope_section: Optional[tuple],
+) -> Optional[Q35FoldInputs]:
+    """Fold inputs when a call with KV-append ``plan`` will take the fused decode path, else None.
+
+    The module then skips its prologue kernel; run_generation runs it itself if the call goes elsewhere after all.
+    """
+    lib = _q35_trtllm_gen_lib(attn)
+    if lib is None:
+        return None
+    if lib._multi_processor_count is None:
+        lib._multi_processor_count = lib._get_multi_processor_count(qkv.device)
+    if (
+        plan.num_requests > _Q35_ATTN_FUSED_MAX_BATCH
+        or lib._q35_fold_cp_applies(attn, plan.num_requests)
+        or plan.num_tokens != qkv.shape[0]
+        or plan.num_tokens != plan.num_requests * plan.q_len
+    ):
+        return None
+    if mrope_section is not None and positions.numel() != 3 * qkv.shape[0]:
+        return None
+    if not q35_fused_decode_supported(
+        attn.num_heads,
+        attn.num_kv_heads,
+        attn.head_dim,
+        plan.q_len,
+        plan.num_requests,
+        -1,
+        False,
+        plan.kv_pool.shape[2],
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        plan.kv_pool.dtype,
+        lib._multi_processor_count,
+    ) or not q35_fused_decode_fold_supported(
+        attn.num_heads,
+        attn.num_kv_heads,
+        attn.head_dim,
+        rotary_dim,
+        plan.q_len,
+        qkv,
+        positions,
+        cos_sin,
+    ):
+        return None
+    if not (
+        q_weight.dtype == torch.bfloat16
+        and k_weight.dtype == torch.bfloat16
+        and q_weight.is_contiguous()
+        and k_weight.is_contiguous()
+        and q_weight.numel() == attn.head_dim
+        and k_weight.numel() == attn.head_dim
+    ):
+        return None
+    return Q35FoldInputs(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos_sin=cos_sin,
+        positions=positions,
+        eps=float(eps),
+        rotary_dim=rotary_dim,
+        mrope_section=tuple(mrope_section) if mrope_section is not None else None,
+    )
