@@ -123,16 +123,23 @@ if [[ "${MODE}" == "agg" ]]; then
     start_server server "${PORT}" || exit 1
     SERVER_URL="http://${HOSTNAME_FQDN}:${PORT}"
 else
+    INTERNAL_REQUEST_AUTH_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+    original_umask=$(umask)
+    umask 077
+    cat > "${RUN_DIR}/worker.yaml" <<EOF
+internal_request_auth_key: "${INTERNAL_REQUEST_AUTH_KEY}"
+EOF
     # Both workers hold a full copy of the weights, so a single-GPU box cannot
     # run this mode; CUDA_VISIBLE_DEVICES splits them across two devices.
-    CUDA_VISIBLE_DEVICES="${CTX_GPU:-0}" start_server ctx "${CTX_PORT}" || exit 1
-    CUDA_VISIBLE_DEVICES="${GEN_GPU:-1}" start_server gen "${GEN_PORT}" || exit 1
+    CUDA_VISIBLE_DEVICES="${CTX_GPU:-0}" start_server ctx "${CTX_PORT}" --config "${RUN_DIR}/worker.yaml" || exit 1
+    CUDA_VISIBLE_DEVICES="${GEN_GPU:-1}" start_server gen "${GEN_PORT}" --config "${RUN_DIR}/worker.yaml" || exit 1
 
     cat > "${RUN_DIR}/disagg.yaml" <<EOF
 hostname: 0.0.0.0
 port: ${PORT}
 model: ${MODEL}
 backend: "pytorch"
+internal_request_auth_key: "${INTERNAL_REQUEST_AUTH_KEY}"
 context_servers:
   num_instances: 1
   urls: ["127.0.0.1:${CTX_PORT}"]
@@ -140,6 +147,7 @@ generation_servers:
   num_instances: 1
   urls: ["127.0.0.1:${GEN_PORT}"]
 EOF
+    umask "${original_umask}"
     log "starting disaggregated server on port ${PORT}"
     trtllm-serve disaggregated -c "${RUN_DIR}/disagg.yaml" \
         > "${RUN_DIR}/disagg.log" 2>&1 &

@@ -263,11 +263,12 @@ generation requests with this key, and generation workers reject request-supplie
 disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
 the internal handoff does not carry a valid signature.
 
-The executable first-party Ray, Slurm, service-discovery, and benchmark launchers
-generate a fresh key for each launch and inject it into all generated worker and
-proxy configurations; no key input is required for those workflows. Explicit key
-configuration remains available for custom orchestration that starts the processes
-independently.
+First-party launchers generate one deployment-scoped key and store it in the
+private worker and proxy configurations they create, so no key input is required
+for those workflows. Workers started later through service discovery reuse the
+generated context or generation configuration. Custom orchestration should
+provision the same `internal_request_auth_key` in every process belonging to the
+deployment.
 
 
 #### Sending requests to the disaggregated server

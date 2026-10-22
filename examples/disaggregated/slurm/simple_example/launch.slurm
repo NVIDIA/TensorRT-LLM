@@ -10,16 +10,37 @@ work_path=""
 ctx_port=8001
 gen_port=8002
 
-internal_request_auth_key=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 auth_config_dir=$(mktemp -d "${work_path}/.trtllm-disagg.XXXXXX")
 original_umask=$(umask)
 umask 077
-for config_name in ctx gen disagg; do
-    {
-        printf 'internal_request_auth_key: "%s"\n' "${internal_request_auth_key}"
-        cat "${work_path}/${config_name}_config.yaml"
-    } >"${auth_config_dir}/${config_name}_config.yaml"
-done
+python3 - "${work_path}" "${auth_config_dir}" <<'PY'
+import secrets
+import sys
+from pathlib import Path
+
+import yaml
+
+source_dir, output_dir = map(Path, sys.argv[1:])
+names = ("ctx_config.yaml", "gen_config.yaml", "disagg_config.yaml")
+configs = {}
+configured_keys = set()
+for name in names:
+    config = yaml.safe_load((source_dir / name).read_text()) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"{name} must contain a YAML mapping")
+    configs[name] = config
+    key = config.get("internal_request_auth_key")
+    if key is not None:
+        if not isinstance(key, str) or not key:
+            raise ValueError("internal_request_auth_key must be a non-empty string")
+        configured_keys.add(key)
+if len(configured_keys) > 1:
+    raise ValueError("internal_request_auth_key must match across configurations")
+key = next(iter(configured_keys), None) or secrets.token_hex(32)
+for name, config in configs.items():
+    config["internal_request_auth_key"] = key
+    (output_dir / name).write_text(yaml.safe_dump(config, sort_keys=False))
+PY
 umask "${original_umask}"
 trap 'rm -rf "${auth_config_dir}"' EXIT
 
