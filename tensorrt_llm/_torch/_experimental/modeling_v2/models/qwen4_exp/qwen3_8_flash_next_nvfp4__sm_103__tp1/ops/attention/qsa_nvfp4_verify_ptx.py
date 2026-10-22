@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inline-PTX pieces of `qsa_paged_sparse_gqa_nvfp4_verify`'s kernel beyond the ones the
 per-row kernel (`qsa_paged_sparse_gqa_nvfp4_decode`) already has: the union scan's bit
-operations, vector global stores, the tcgen05 thread-sync fences, and tcgen05.mma issue with
+operations, vector global loads and stores, the tcgen05 thread-sync fences, and tcgen05.mma issue with
 precomputed descriptors.
 
 `gemm_ts` issues every K step of a GEMM whose A operand sits in tensor memory from one
@@ -86,6 +86,37 @@ def stg4f(gaddr, a, b, c, d, *, loc=None, ip=None):
         + [_ir(v, cutlass.Float32, loc, ip) for v in (a, b, c, d)],
         "{ st.global.v4.f32 [$1], {$2, $3, $4, $5}; mov.u32 $0, 0; }",
         "=r,l,f,f,f,f",
+        loc,
+        ip,
+        side=True,
+    )
+
+
+@dsl_user_op
+def ldg2(gaddr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_ir(gaddr, cutlass.Int64, loc, ip)],
+        "ld.global.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,l",
+        loc,
+        ip,
+        side=True,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(2)]
+
+
+@dsl_user_op
+def stg2(gaddr, a, b, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [
+            _ir(gaddr, cutlass.Int64, loc, ip),
+            _ir(a, cutlass.Int32, loc, ip),
+            _ir(b, cutlass.Int32, loc, ip),
+        ],
+        "{ st.global.v2.b32 [$1], {$2, $3}; mov.u32 $0, 0; }",
+        "=r,l,r,r",
         loc,
         ip,
         side=True,

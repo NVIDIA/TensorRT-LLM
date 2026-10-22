@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """QSA sparse GQA over an NVFP4 paged K/V pool for MTP verify rows, request-grouped: CuTe DSL
-(tcgen05) split-K, then `qsa_paged_sparse_gqa_nvfp4_decode`'s merge.
+(tcgen05) split-K, then a row merge of the split partials.
 
 Tier 5 (CuTe DSL written for this target). A verify step's rows come `T`
 (`rows_per_request`) consecutive rows a request, and the rows of one request select mostly
@@ -70,9 +70,11 @@ from .qsa_nvfp4_verify_ptx import (
     ctz,
     gemm_ts,
     groups8,
+    ldg2,
     popc,
     red_or_shared,
     spread4,
+    stg2,
     stg4,
     stg4f,
     tcgen05_fence_after,
@@ -92,8 +94,8 @@ from .qsa_paged_sparse_gqa_nvfp4_decode import (
     _ldg4,
     _lds1,
     _lds4,
-    _MergeKernel,
     _ptr,
+    _round_bf16,
     _scale2s,
     _stg1,
     _sts1,
@@ -195,6 +197,25 @@ def _layout(rpr: int, group: int, width: int, bt_width: int, tpb: int, splits: i
 def _sigmoid_fast(x):
     """1 / (1 + 2^(-x log2 e)) on ex2.approx and rcp.approx (relative error ~1e-6)."""
     return cute.arch.rcp_approx(1.0 + cute.math.exp2(-x * LOG2E, fastmath=True))
+
+
+def _tree_fmax(vals):
+    """Max of a short list, pairwise (traced as Python)."""
+    while len(vals) > 1:
+        vals = [
+            cute.arch.fmax(vals[j], vals[j + 1]) if j + 1 < len(vals) else vals[j]
+            for j in range(0, len(vals), 2)
+        ]
+    return vals[0]
+
+
+def _tree_sum(vals):
+    """Sum of a short list, pairwise (traced as Python)."""
+    while len(vals) > 1:
+        vals = [
+            vals[j] + vals[j + 1] if j + 1 < len(vals) else vals[j] for j in range(0, len(vals), 2)
+        ]
+    return vals[0]
 
 
 def _phase(g, n):
@@ -1414,6 +1435,130 @@ class _VerifyKernel:
                         )
 
 
+#: Threads of a merge CTA (16 bytes, four values, a thread at a time).
+MERGE_THREADS = 256
+#: Merge CTAs a row, each a contiguous share of the row's heads x head_dim values (measured on
+#: GB300: 8 is faster than 1-4 at 64-128 rows, 16 no faster).
+MERGE_PARTS = 8
+
+
+class _RowMergeKernel:
+    """The split partials of a row range merged as the decode op's merge kernel does
+    (log2-sum-exp weights, fp32), the gate applied to the bf16-rounded result: `parts` CTAs a
+    row, every load of a thread issued before the first use."""
+
+    def __init__(self, *, heads, splits, gated, pdl, parts):
+        self.heads, self.splits, self.gated, self.pdl = heads, splits, gated, pdl
+        self.parts = parts
+
+    @cute.jit
+    def __call__(
+        self,
+        gate_t: cute.Tensor,
+        part_ptr: cute.Pointer,
+        lse_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        rows: cutlass.Int32,
+        gate_stride: cutlass.Int32,
+        stream,
+    ):
+        self.kernel(
+            part_ptr.toint(),
+            lse_ptr.toint(),
+            out_ptr.toint(),
+            gate_t.iterator.toint(),
+            rows,
+            gate_stride,
+        ).launch(
+            grid=[rows * self.parts, 1, 1],
+            block=[MERGE_THREADS, 1, 1],
+            stream=stream,
+            use_pdl=self.pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        part_base: cutlass.Int64,
+        lse_base: cutlass.Int64,
+        out_base: cutlass.Int64,
+        gate_base: cutlass.Int64,
+        rows: cutlass.Int32,
+        gate_stride: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        heads: cutlass.Constexpr = self.heads
+        sp: cutlass.Constexpr = self.splits
+        parts: cutlass.Constexpr = self.parts
+        n_all: cutlass.Constexpr = heads * HEAD_DIM // 4
+        n_c: cutlass.Constexpr = -(-n_all // parts)
+        per: cutlass.Constexpr = -(-n_c // MERGE_THREADS)
+        neg_inf = -Float32.inf
+        row = bidx // parts
+        c0 = (bidx % parts) * n_c
+        r64 = cutlass.Int64(row)
+        cs = [
+            cutlass.min(c0 + cutlass.min(tidx + MERGE_THREADS * j, n_c - 1), n_all - 1)
+            for j in range(per)
+        ]
+        gws = []
+        if const_expr(self.gated):
+            # the gate is an input of the attention call, ready before the split kernel ran
+            gws = [ldg2(gate_base + (r64 * gate_stride + 4 * c) * 2) for c in cs]
+        if const_expr(self.pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+            cute.arch.griddepcontrol_wait()
+        lss = []
+        pss = []
+        for j in cutlass.range_constexpr(per):
+            head = cs[j] // (HEAD_DIM // 4)
+            lss.append(
+                [
+                    _bits_f32(
+                        _ldg1(lse_base + ((cutlass.Int64(s_) * rows + r64) * heads + head) * 4)
+                    )
+                    for s_ in range(sp)
+                ]
+            )
+            pss.append(
+                [
+                    _ldg4(
+                        part_base
+                        + ((cutlass.Int64(s_) * rows + r64) * (heads * HEAD_DIM) + 4 * cs[j]) * 4
+                    )
+                    for s_ in range(sp)
+                ]
+            )
+        for j in cutlass.range_constexpr(per):
+            ls = lss[j]
+            mx = _tree_fmax(ls)
+            ws = [
+                Float32(cutlass.select_(mx > neg_inf, cute.math.exp2(lv - mx), Float32(0.0)))
+                for lv in ls
+            ]
+            den = _tree_sum(ws)
+            res = []
+            for e in cutlass.range_constexpr(4):
+                acc = _tree_sum([ws[s_] * _bits_f32(pss[j][s_][e]) for s_ in range(sp)])
+                merged = Float32(0.0)
+                if den > Float32(0.0):
+                    merged = acc / den
+                if const_expr(self.gated):
+                    if const_expr(e % 2 == 0):
+                        gx = _bf2_lo(gws[j][e // 2])
+                    else:
+                        gx = _bf2_hi(gws[j][e // 2])
+                    merged = _round_bf16(merged) * _sigmoid_fast(gx)
+                res.append(merged)
+            if (tidx + MERGE_THREADS * j < n_c) & (c0 + tidx + MERGE_THREADS * j < n_all):
+                stg2(
+                    out_base + (r64 * (heads * HEAD_DIM) + 4 * cs[j]) * 2,
+                    _bf2_pack(res[0], res[1]),
+                    _bf2_pack(res[2], res[3]),
+                )
+
+
 # ---------------------------------------------------------------------------------------
 # launch
 # ---------------------------------------------------------------------------------------
@@ -1638,16 +1783,18 @@ def nvfp4_sparse_gqa_verify_grouped(
     )
     if merged <= 0:
         return out
-    mkey = ("merge", num_q_heads, n_splits, gated, use_pdl)
+    mkey = ("rowmerge", num_q_heads, n_splits, gated, use_pdl, MERGE_PARTS)
     mfn = _COMPILED.get(mkey)
     if mfn is None:
         mfn = cute.compile(
-            _MergeKernel(heads=num_q_heads, splits=n_splits, gated=gated, pdl=use_pdl),
+            _RowMergeKernel(
+                heads=num_q_heads, splits=n_splits, gated=gated, pdl=use_pdl, parts=MERGE_PARTS
+            ),
             from_dlpack(gate_t, assumed_align=16).mark_layout_dynamic(leading_dim=gate_t.dim() - 1),
             _ptr(part, cutlass.Float32),
             _ptr(lse, cutlass.Float32, 4),
-            _ptr(out, cutlass.BFloat16),
-            cutlass.Int32(rows),
+            _ptr(out, cutlass.BFloat16, 8),
+            cutlass.Int32(merged),
             cutlass.Int32(gate_stride),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--opt-level 2 --enable-tvm-ffi",
@@ -1759,6 +1906,11 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
             spec=_verify(tuple((3000 + 211 * i, 4) for i in range(8)), overlap=None),
         ),
         Cell(
+            why="MTP3 verify at 128 rows (32 requests x 4, the mid-concurrency step): two "
+            "splits a unit, merged by the row merge with the gate",
+            spec=_verify(tuple((2100 + (53 * i) % 1900, 4) for i in range(32)), gated=True),
+        ),
+        Cell(
             why="MTP3 verify at 1024 rows (256 requests x 4): one CTA a unit with the gate fused "
             "into its store, the last wave's units split two ways and merged",
             spec=_verify(tuple((2100 + (37 * i) % 1900, 4) for i in range(256)), gated=True),
@@ -1802,14 +1954,14 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
     (T <= 6; a block table of at most 612 pages of 32 tokens at T = 4, 892 at T = 3, 1364 at
     T = 2); the per-row kernel otherwise. Launch (`plan_launch`): within one wave of
     (group, KV head) units every unit takes the same splits, filling the GPU once (one CTA an
-    SM), followed by the decode op's merge; past one wave the units of the full waves take one
+    SM), followed by the row merge; past one wave the units of the full waves take one
     CTA each (bf16 output, the gate fused) and the units of the partial last wave two to four,
     only their rows merged.
 
     GB300, one layer, cold L2, T = 4, the decode step's call (output gate on) on MTP3 verify
     selections dumped from a served run (a request's rows' union 1.4-1.7x a row's selection,
-    about 8.4K tokens of context, the server's pool geometry): 64 rows 31.2 us, 128 rows 50.4,
-    256 rows 75.3, 512 rows 137, 1024 rows 232 -- against 39.5 / 69.5 / 135 / 237 / 461 us for
+    about 8.4K tokens of context, the server's pool geometry): 64 rows 29.7 us, 128 rows 46.1,
+    256 rows 75.3, 512 rows 137, 1024 rows 233 -- against 39.5 / 69.4 / 135 / 237 / 461 us for
     the per-row kernel. Below 32 rows the call is the per-row kernel's.
 
     Numerics: dequantized K/V values are exact in f16; scores on f16 MMAs with fp32
