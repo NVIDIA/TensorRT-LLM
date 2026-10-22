@@ -116,6 +116,8 @@ class ReasoningParserFactory:
                     parser, parser has not opted in, or neither marker is at
                     the tail). Callers must treat this as "ask elsewhere"
                     (e.g. the relayed disagg value), not as thinking-off.
+            A prompt with neither marker returns the parser's
+            `unmarked_prompt_thinking`, which is None unless the parser sets it.
         """
         entry = cls._parsers.get(reasoning_parser.lower())
         if entry is None:
@@ -129,7 +131,7 @@ class ReasoningParserFactory:
             return False
         if tail.endswith(parser_cls.reasoning_start):
             return True
-        return None
+        return parser_cls.unmarked_prompt_thinking
 
     @classmethod
     def keys(cls) -> KeysView[str]:
@@ -162,6 +164,8 @@ class BaseReasoningParser(ABC):
     resolves_thinking_from_prompt: ClassVar[bool] = False
     reasoning_start: ClassVar[str]
     reasoning_end: ClassVar[str]
+    # Mode of a prompt ending with neither marker; None leaves it unresolved.
+    unmarked_prompt_thinking: ClassVar[Optional[bool]] = None
 
     def __init__(self,
                  *,
@@ -542,35 +546,36 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     tag; with thinking disabled it prefills ``</mm:think>``, so the output is
     all content; in adaptive mode (the template default) it prefills nothing
     and the model emits ``<mm:think>`` or the bare sentinel first. The parser
-    therefore takes its mode from an explicit ``thinking_mode`` or from the
-    mode the server resolved off the rendered prompt (relayed as
-    ``enable_thinking``), and otherwise starts outside reasoning. Both
-    tags are delimiters and never appear in the result; text before an
-    opening tag is content; an opening tag without a closing tag is
-    reasoning cut off by the token limit. ``parse`` and ``parse_delta``
-    agree on every input for every chunking.
+    takes its mode from the one the server resolved off the rendered prompt
+    (relayed as ``enable_thinking``), falls back to ``thinking_mode`` when
+    nothing was rendered, and otherwise starts outside reasoning. Both tags
+    are delimiters and never appear in the result; text before an opening tag
+    is content; an opening tag without a closing tag is reasoning cut off by
+    the token limit. ``parse`` and ``parse_delta`` agree for every chunking.
     """
 
     resolves_thinking_from_prompt = True
     reasoning_start = "<mm:think>"
     reasoning_end = "</mm:think>"
+    # Adaptive mode prefills neither tag, so output starts outside reasoning.
+    unmarked_prompt_thinking = False
 
     def __init__(self,
                  *,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         kwargs = chat_template_kwargs or {}
-        # The template's own knob is `thinking_mode`; only "enabled" prefills
-        # the opening tag. Without it, trust the mode the server resolved
-        # from the rendered prompt, relayed as `enable_thinking` (a caller
-        # cannot pass that key: the template never reads it, so the
-        # unused-kwargs guard rejects it). A bare `thinking` is what the
-        # Responses path injects for `reasoning.effort`; this template does
-        # not act on it, so neither does the parser.
+        # The server overwrites `enable_thinking` with the mode resolved from
+        # the rendered prompt, so it wins over `thinking_mode`, which decides
+        # only when nothing was rendered. The Responses path's bare `thinking`
+        # is ignored because the template never reads it.
+        resolved = kwargs.get("enable_thinking")
         thinking_mode = kwargs.get("thinking_mode")
-        if thinking_mode is not None:
+        if resolved is not None:
+            prefilled_open = resolved is True
+        elif thinking_mode is not None:
             prefilled_open = thinking_mode == "enabled"
         else:
-            prefilled_open = kwargs.get("enable_thinking") is True
+            prefilled_open = False
         super().__init__(reasoning_at_start=prefilled_open,
                          chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<mm:think>"

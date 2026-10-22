@@ -548,8 +548,7 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 @pytest.mark.parametrize("parser", [
     "deepseek-r1", "deepseek_v4", "deepseek_v41", "qwen3", "qwen3_5",
-    "minimax_m2", "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2",
-    "kimi_k25"
+    "minimax_m2", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
@@ -1464,6 +1463,15 @@ def _m3_parser(kwargs: dict | None):
         ({
             "thinking": True
         }, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The mode resolved from the rendered prompt wins over `thinking_mode`.
+        ({
+            "thinking_mode": "enabled",
+            "enable_thinking": False
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking_mode": "disabled",
+            "enable_thinking": True
+        }, f"a{M3_END}b", "b", "a"),
     ])
 def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
                                      content: str,
@@ -1471,6 +1479,19 @@ def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
     result = _m3_parser(kwargs).parse(text)
     assert result.content == content
     assert result.reasoning_content == reasoning_content
+
+
+@pytest.mark.parametrize(("tail", "expected"), [
+    (M3_START, True),
+    (M3_END, False),
+    ("", False),
+    (f"{M3_START}a{M3_END}b\n<assistant>", False),
+])
+def test_minimax_m3_resolves_unmarked_prompt_as_not_thinking(
+        tail: str, expected: bool) -> None:
+    """Adaptive mode prefills nothing, so a bare header resolves to off."""
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        "minimax_m3", f"<user>hi</user>\n<assistant>{tail}") is expected
 
 
 def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:

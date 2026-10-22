@@ -764,8 +764,11 @@ class TestPreparationContext:
     def test_a_prompt_that_closes_thinking_is_recorded_as_off(self) -> None:
         assert self._context(self.PREFILLED_CLOSED)["resolved_thinking"]["poolside_v1"] is False
 
-    def test_a_prompt_that_prefills_nothing_records_nothing(self, tokenizer) -> None:
-        assert render_chat(chat_request(), resources(tokenizer)).context["resolved_thinking"] == {}
+    def test_a_prompt_that_prefills_nothing_records_minimax_m3_as_off(self, tokenizer) -> None:
+        # MiniMax-M3's adaptive mode prefills nothing, so only that parser resolves the prompt.
+        context = render_chat(chat_request(), resources(tokenizer)).context
+
+        assert context["resolved_thinking"] == {"minimax_m3": False}
 
     def test_no_generation_prompt_records_nothing(self) -> None:
         res = resources(make_tokenizer(chat_template=self.PREFILLED_OPEN))
