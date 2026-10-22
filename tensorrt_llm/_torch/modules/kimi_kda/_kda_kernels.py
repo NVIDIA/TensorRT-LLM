@@ -701,6 +701,7 @@ class KDAKernelDispatch:
         cu_seqlens: Optional[torch.Tensor],
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
+        cu_seqlens_cpu: Optional[torch.Tensor] = None,
         state_pool: Optional[torch.Tensor] = None,
         state_indices: Optional[torch.Tensor] = None,
         varlen_is_aligned: Optional[bool] = None,
@@ -714,6 +715,8 @@ class KDAKernelDispatch:
 
         FlashInfer updates indexed BF16/FP32 V-first state directly; FLA uses
         dense FP32 initial/final states. Both normalize Q/K internally.
+        ``cu_seqlens_cpu``, the host copy of ``cu_seqlens``, keeps FLA from
+        reading the sequence lengths back from the GPU in every KDA layer.
 
         ``sm_reserve`` SMs are left out of the optimized kernels' persistent
         grids for a kernel that runs concurrently with prefill.
@@ -765,6 +768,7 @@ class KDAKernelDispatch:
             lower_bound=lower_bound,
             state_v_first=True,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
     def decode_kda(self, **kwargs) -> torch.Tensor:
