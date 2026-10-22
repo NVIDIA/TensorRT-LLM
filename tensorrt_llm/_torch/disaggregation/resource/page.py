@@ -201,7 +201,12 @@ class PoolView:
         bytes_per_head: INDEXED views whose head count is not derivable from
             ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
             bytes_per_head`` is the per-rank head count. Attention K/V leaves
-            it ``None`` and uses ``kv_heads_per_rank`` instead.
+            it ``None``; its head count is ``num_kv_heads``.
+        num_kv_heads: Attention K/V views only. Per-rank KV-head count shared
+            by every layer of the view, so views of one rank (e.g. target and
+            draft layers) may shard or replicate heads differently. ``None``
+            in tables from older builders and for views without KV heads;
+            consumers then fall back to ``AttentionInfo.kv_heads_per_rank``.
     """
 
     pool_idx: int
@@ -211,6 +216,7 @@ class PoolView:
     bytes_per_layer: Optional[int] = None
     section_bytes: Optional[List[int]] = None
     bytes_per_head: Optional[int] = None
+    num_kv_heads: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -227,6 +233,7 @@ class PoolView:
             "bytes_per_head": (
                 int(self.bytes_per_head) if self.bytes_per_head is not None else None
             ),
+            "num_kv_heads": int(self.num_kv_heads) if self.num_kv_heads is not None else None,
         }
 
     @staticmethod
@@ -252,6 +259,9 @@ class PoolView:
             ),
             bytes_per_head=(
                 int(data["bytes_per_head"]) if data.get("bytes_per_head") is not None else None
+            ),
+            num_kv_heads=(
+                int(data["num_kv_heads"]) if data.get("num_kv_heads") is not None else None
             ),
         )
 
