@@ -31,6 +31,8 @@ Python and C++ codebase with a PyTorch execution path.
   reject missing or stale snapshots. The `trtllm-serve-schemas-check` pre-commit hook
   runs this check for package Python, schema, generator, and dependency changes using the
   active Python environment; it requires a TensorRT-LLM build matching the checkout.
+  The lightweight GitHub Actions pre-commit job skips this hook because it has no
+  TensorRT-LLM build; schema freshness is also covered by the CPU schema tests above.
   Wheels and HTML docs publish these same files.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
