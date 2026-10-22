@@ -366,10 +366,11 @@ class AttentionMetadata:
             MixedPrecisionKVStaging
 
         view = self.mixed_precision_staging
-        if view is None or not self.is_cuda_graph:
-            # The eager metadata and every CUDA graph copy share the process
-            # buffer pool, so the staging copy is allocated once per rank and
-            # the KV budget profiling run already accounts for it.
+        if view is None or view.manager is not self.kv_cache_manager:
+            # Built once per metadata object (eager or CUDA graph copy); the
+            # reserved buffer-pool block is shared, so the staging copy is
+            # allocated and zeroed once per rank and the KV budget profiling
+            # run already accounts for it.
             buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
                        is not None else get_memory_buffers())
             view = MixedPrecisionKVStaging(self.kv_cache_manager,

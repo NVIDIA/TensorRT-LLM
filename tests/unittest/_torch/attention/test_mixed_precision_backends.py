@@ -789,6 +789,11 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
         again = make_metadata().mixed_precision_staging
         assert again.get_buffers(0).data_ptr() == staging.data_ptr()
         assert len(get_memory_buffers().buffers["mixed_kv_staging"]) == len(blocks)
+        # Eager steps refresh the existing staging copy instead of rebuilding it.
+        metadata = make_metadata()
+        view = metadata.mixed_precision_staging
+        metadata.prepare()
+        assert metadata.mixed_precision_staging is view
         # The KV quota is not reduced for staging.
         assert manager.kv_cache_manager_py_config.cache_tiers[0].quota > 0
     finally:
