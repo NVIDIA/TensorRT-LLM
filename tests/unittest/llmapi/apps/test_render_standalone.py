@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+import ctypes
+import glob
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
 import socket
@@ -25,9 +30,12 @@ import textwrap
 import time
 import urllib.error
 import urllib.request
+import warnings
+from pathlib import Path
 
 import pytest
 
+import tensorrt_llm
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.serve.render import RenderResources, fingerprints_match, render_chat
 from tensorrt_llm.serve.render.__main__ import build_parser
@@ -175,6 +183,45 @@ class TestCommandLine:
 
 class TestCpuOnlyStartup:
     """The renderer builds with no GPU, no weights and no server or executor object."""
+
+    def test_the_launcher_loads_the_cuda_stub_only_when_the_driver_is_missing(
+        self, monkeypatch
+    ) -> None:
+        path = Path(tensorrt_llm.__file__).parent / "serve" / "render" / "trtllm-render"
+        loader = importlib.machinery.SourceFileLoader("trtllm_render_launcher", str(path))
+        launcher = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader(loader.name, loader)
+        )
+        loader.exec_module(launcher)
+
+        state = {"driver": True, "stubs": ["/cuda/lib64/stubs/libcuda.so"]}
+        loaded = []
+
+        def cdll(name, mode=0):
+            loaded.append((name, mode))
+            if name == "libcuda.so.1" and not state["driver"]:
+                raise OSError(name)
+
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        monkeypatch.setattr(glob, "glob", lambda pattern: list(state["stubs"]))
+        monkeypatch.delenv("CUDA_HOME", raising=False)
+        stderr = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", stderr)
+
+        with warnings.catch_warnings():
+            launcher._load_cuda_stub_if_needed()
+            assert loaded == [("libcuda.so.1", 0)]
+            assert stderr.getvalue() == ""
+
+            loaded.clear()
+            state["driver"] = False
+            launcher._load_cuda_stub_if_needed()
+            assert loaded[-1] == ("/cuda/lib64/stubs/libcuda.so", ctypes.RTLD_GLOBAL)
+            assert "CPU-only" in stderr.getvalue()
+
+            state["stubs"] = []
+            with pytest.raises(SystemExit, match="libcuda.so.1 not found"):
+                launcher._load_cuda_stub_if_needed()
 
     def test_building_the_app_initializes_no_cuda_and_imports_no_server(self, checkpoint) -> None:
         code = textwrap.dedent(
