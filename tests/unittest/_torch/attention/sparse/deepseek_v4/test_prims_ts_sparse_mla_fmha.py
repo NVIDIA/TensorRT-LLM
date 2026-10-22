@@ -676,3 +676,76 @@ def test_forward_sparse_mla_unified_fused_epilogue(monkeypatch, batch_name, kv_c
     got, got_sc = _dequant_fused(*results["prims"])
     assert got.shape == ref.shape
     _assert_fused_close(got, got_sc, ref, ref_sc, channels, device)
+
+
+def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
+    """The first eager forward of a static profile plans one representative row count
+    per distinct kernel compile signature, largest first, on the eager metadata only;
+    the same profile is not warmed again in the process and a second extra capacity
+    (another layer group) warms its own variants."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
+    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
+
+    planned = []
+
+    class _FakeWrapper:
+        def __init__(self, workspace_buffer=None):
+            pass
+
+        def plan(self, device, rows, heads, **kwargs):
+            planned.append((rows, kwargs["max_extra_topk"]))
+
+    class _FakeKernel:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def compile_signature(self):
+            return (self.rows // 8,)  # one variant per 8 row counts
+
+    def fake_resolve(device, rows, heads, **kwargs):
+        return (None, None, SimpleNamespace(kernel=_FakeKernel(rows)), None, 1024, None, None)
+
+    monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
+    monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+
+    class _Attn:
+        num_heads = 16
+        sparse_attention_config = SimpleNamespace(
+            window_size=128, enable_kv_cache_offload=False, enable_heuristic_topk=False
+        )
+
+    attn = _Attn()
+    lib = PrimsTSSparseMlaFmha(attn)
+    profile = dict(
+        device=torch.device("cuda"), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
+    )
+    eager = SimpleNamespace(
+        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=False
+    )
+    lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
+    assert planned == [(20, 512), (15, 512), (7, 512)]  # one per signature, largest first
+    lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
+    assert len(planned) == 3  # same profile: already warmed in this process
+    graph = SimpleNamespace(
+        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=True
+    )
+    lib._warm_kernel_variants(metadata=graph, extra=32, **profile)
+    assert len(planned) == 3  # CUDA graph metadata never warms
+    lib._warm_kernel_variants(metadata=eager, extra=32, **profile)
+    assert planned[3:] == [(20, 32), (15, 32), (7, 32)]  # another layer group warms its own
+    assert lib._get_plan(metadata=eager, rows=15, extra=512, **profile) is not None
+    assert len(planned) == 6  # the warmed plan is reused
+
+
+def test_index_contract_is_validated_once_per_process(monkeypatch) -> None:
+    """One validated eager launch per contract (producers + pools); the same contract never
+    re-validates, because that synchronizes the host inside the context ramp."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
+
+    monkeypatch.setattr(mod, "_VALIDATED_CONTRACTS", set())
+    key = ("cuda:0", 128, 512, 4, False, "torch.bfloat16", 1, 4096, 2, 4096)
+    assert PrimsTSSparseMlaFmha._claim_contract_validation(key) is True
+    assert PrimsTSSparseMlaFmha._claim_contract_validation(key) is False
+    other_pools = key[:6] + (3, 4096, 4, 4096)
+    assert PrimsTSSparseMlaFmha._claim_contract_validation(other_pools) is True

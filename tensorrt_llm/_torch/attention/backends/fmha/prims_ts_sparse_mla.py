@@ -46,6 +46,7 @@ signoff-qualified upstream, so it keeps the fallback for now.
 from __future__ import annotations
 
 import math
+import time
 import weakref
 from dataclasses import dataclass
 from importlib import import_module
@@ -84,6 +85,12 @@ _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 # Same compiler-target gate as fmha/prims_ts.py: the kernels share one CuTe DSL
 # task-scheduling stack, so a toolchain the dense libraries refuse is refused here too.
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
+# Process-level state shared by every library instance and metadata object:
+# the static profiles whose kernel variants were warmed (compiled kernels are
+# cached per process by the vendored wrapper, so one warm-up per profile is
+# enough), and the index contracts that were validated with one eager launch.
+_WARMED_PROFILES: set = set()
+_VALIDATED_CONTRACTS: set = set()
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _FUSED_OUTPUT_BLOCK = 128
@@ -120,7 +127,6 @@ class _SparsePlan:
     """One planned wrapper for a static profile; every launch input comes from the metadata."""
 
     wrapper: "BatchSparseMLADecodePagedTSWrapper"
-    validated: bool = False
 
 
 class PrimsTSSparseMlaFmha(Fmha):
@@ -132,11 +138,18 @@ class PrimsTSSparseMlaFmha(Fmha):
     # like the block-sparse and FlashInfer wrappers: every layer that runs with
     # one metadata object plans each static profile once, and layers sharing a
     # metadata object execute serially. All plans of a metadata object share
-    # one kernel workspace (under WORKSPACE_CACHE_KEY), grown to the largest
-    # profile, so the eager metadata does not accumulate one workspace per
-    # distinct generation row count.
+    # one kernel workspace (under WORKSPACE_CACHE_KEY) that is grown to the
+    # largest profile planned so far (a plan keeps the buffer it was planned
+    # with alive until the metadata object is dropped); warming plans the
+    # largest row count first so the metadata that warms allocates it once.
     PLAN_CACHE_KEY = "prims_ts_sparse_mla"
     WORKSPACE_CACHE_KEY = "prims_ts_sparse_mla.workspace"
+    # Generation row counts scanned when warming a profile's kernel variants:
+    # every count up to WARM_ROW_SCAN (the split-KV schedule changes often
+    # at small counts), then a geometric tail up to the metadata's token
+    # budget. One plan is created per distinct kernel compile signature.
+    WARM_ROW_SCAN = 128
+    WARM_ROW_TAIL = (192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
@@ -454,42 +467,13 @@ class PrimsTSSparseMlaFmha(Fmha):
         plan = cache.get(key)
         if plan is not None:
             return plan
+        t_plan = time.perf_counter()
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "PrimTS sparse MLA plans must be created during eager warmup, not under "
                 f"CUDA graph capture (rows={rows}, extra={extra}, dtype={q_dtype})."
             )
-        # DeepSeek-V4's producers emit valid prefixes: the window slots are
-        # the first min(pos + 1, window) rows, the compressed slots the first
-        # `topk_lens - window` rows (ratio 128 by construction, ratio 4 from
-        # the indexer's top-k), with -1 only in the tail. Promising that lets
-        # the kernel bound its work by the live lengths instead of scanning
-        # every capacity tile for holes. KV-cache offload breaks the promise
-        # (non-resident pages are masked to -1 in place), and the opt-in
-        # heuristic (GVR) top-k engines pad from their own candidate count,
-        # so both keep the generic hole-checking path. The first eager run of
-        # every plan validates the promise (run(validate=True)); the fields
-        # are read directly so a renamed config cannot silently fail open.
-        sparse_cfg = attn.sparse_attention_config
-        holes_possible = bool(sparse_cfg.enable_kv_cache_offload) or bool(
-            sparse_cfg.enable_heuristic_topk
-        )
-        plan_kwargs = dict(
-            max_topk=window,
-            max_extra_topk=extra,
-            max_seq_len_q=1,
-            q_data_type=q_dtype,
-            kv_layout="NHD",
-            has_sinks=has_sinks,
-            return_lse=False,
-            assume_valid_prefix=not holes_possible,
-        )
-        if fused_groups:
-            plan_kwargs.update(
-                output_quant_block_size=_FUSED_OUTPUT_BLOCK,
-                out_scale_format="fp32",
-                num_output_groups=fused_groups,
-            )
+        plan_kwargs, _ = self._plan_kwargs(extra, q_dtype, has_sinks, fused_groups)
         # One workspace per metadata object, shared by every plan and grown to
         # the largest profile: plans run serially, and a plan's scratch is only
         # live during its own launch. The size comes from the same resolver the
@@ -506,7 +490,147 @@ class PrimsTSSparseMlaFmha(Fmha):
         wrapper.plan(device, rows, heads, **plan_kwargs)
         plan = _SparsePlan(wrapper=wrapper)
         cache[key] = plan
+        logger.debug(
+            f"PrimTS sparse MLA plan rows={rows} extra={extra} sinks={has_sinks} "
+            f"fused={fused_groups}: {(time.perf_counter() - t_plan) * 1e3:.1f} ms "
+            f"({len(cache)} plans on this metadata)"
+        )
         return plan
+
+    def _holes_possible(self) -> bool:
+        """Whether -1 can appear inside a live index prefix with this layer's config
+        (KV-cache offload masks non-resident pages in place; the heuristic GVR top-k
+        pads from its own candidate count); read directly so a renamed field cannot
+        silently fail open."""
+        sparse_cfg = self.attn.sparse_attention_config
+        return bool(sparse_cfg.enable_kv_cache_offload) or bool(sparse_cfg.enable_heuristic_topk)
+
+    def _plan_kwargs(
+        self, extra: int, q_dtype: torch.dtype, has_sinks: bool, fused_groups: Optional[int]
+    ) -> tuple[dict, bool]:
+        """Return the wrapper plan() kwargs for a static profile and whether -1 holes
+        can appear inside a live index prefix.
+
+        DeepSeek-V4's producers emit valid prefixes: the window slots are the
+        first min(pos + 1, window) rows, the compressed slots the first
+        `topk_lens - window` rows (ratio 128 by construction, ratio 4 from the
+        indexer's top-k), with -1 only in the tail. Promising that lets the
+        kernel derive its masks from the live lengths instead of loading and
+        checking every index. KV-cache offload breaks the promise (non-resident
+        pages are masked to -1 in place), and the opt-in heuristic (GVR) top-k
+        engines pad from their own candidate count, so both keep the generic
+        hole-checking path. The fields are read directly so a renamed config
+        cannot silently fail open.
+        """
+        holes_possible = self._holes_possible()
+        plan_kwargs = dict(
+            max_topk=int(self.attn.sparse_attention_config.window_size),
+            max_extra_topk=extra,
+            max_seq_len_q=1,
+            q_data_type=q_dtype,
+            kv_layout="NHD",
+            has_sinks=has_sinks,
+            return_lse=False,
+            assume_valid_prefix=not holes_possible,
+        )
+        if fused_groups:
+            plan_kwargs.update(
+                output_quant_block_size=_FUSED_OUTPUT_BLOCK,
+                out_scale_format="fp32",
+                num_output_groups=fused_groups,
+            )
+        return plan_kwargs, holes_possible
+
+    def _warm_kernel_variants(
+        self,
+        *,
+        metadata: "TrtllmAttentionMetadata",
+        device: torch.device,
+        extra: int,
+        q_dtype: torch.dtype,
+        has_sinks: bool,
+        fused_groups: Optional[int],
+    ) -> None:
+        """Load every kernel variant of a static profile during eager warmup.
+
+        A batch's context ramp brings a new generation row count almost every
+        step, and mixed (context + generation) steps run eager. Planning a new
+        row count is cheap (~1 ms), but the first plan of each kernel variant
+        (the split-KV schedule changes with the row count and the extra
+        capacity) loads it from the persistent compile cache (~0.25 s), which
+        stalls the host while the GPU runs prefill. Compiled kernels are cached
+        per process by the wrapper, so this runs once per process and profile,
+        on the eager metadata only (CUDA graph metadata objects replay one row
+        count each and never need it), and never under capture. It scans the
+        row counts a step can carry, keeps one representative per distinct
+        compile signature, and plans them largest first so the shared
+        workspace is allocated once at its final size.
+        """
+        if torch.cuda.is_current_stream_capturing() or getattr(metadata, "is_cuda_graph", False):
+            return
+        attn = self.attn
+        heads = int(attn.num_heads)
+        profile_key = (
+            str(device),
+            heads,
+            extra,
+            q_dtype,
+            has_sinks,
+            fused_groups,
+            int(attn.sparse_attention_config.window_size),
+        )
+        if profile_key in _WARMED_PROFILES:
+            return
+        _WARMED_PROFILES.add(profile_key)
+        from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+        plan_kwargs, _ = self._plan_kwargs(extra, q_dtype, has_sinks, fused_groups)
+        # Generation rows per step: one per request, plus its draft tokens with
+        # speculative decoding, within the step's token budget.
+        requests = int(getattr(metadata, "max_num_requests", 0) or 0)
+        draft = int(getattr(metadata, "max_total_draft_tokens", 0) or 0)
+        tokens = int(getattr(metadata, "max_num_tokens", 0) or 0)
+        max_rows = requests * (1 + draft)
+        if tokens:
+            max_rows = min(max_rows, tokens) if max_rows else tokens
+        candidates = [r for r in range(1, min(max_rows, self.WARM_ROW_SCAN) + 1)]
+        candidates += [r for r in self.WARM_ROW_TAIL if self.WARM_ROW_SCAN < r <= max_rows]
+        t_warm = time.perf_counter()
+        representative: dict = {}
+        for rows in candidates:
+            spec = mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[2]
+            signature = mla_decode._mla_kernel_compile_signature(spec.kernel)
+            representative[signature] = rows  # the largest row count of each variant
+        for rows in sorted(representative.values(), reverse=True):
+            self._get_plan(
+                metadata=metadata,
+                device=device,
+                rows=rows,
+                extra=extra,
+                q_dtype=q_dtype,
+                has_sinks=has_sinks,
+                fused_groups=fused_groups,
+            )
+        logger.debug(
+            f"PrimTS sparse MLA warmed {len(representative)} kernel variants for extra={extra} "
+            f"(rows scanned up to {max_rows}): {(time.perf_counter() - t_warm) * 1e3:.0f} ms"
+        )
+
+    @staticmethod
+    def _claim_contract_validation(contract_key: tuple) -> bool:
+        """Return True exactly once per process for an index contract (never under capture).
+
+        The contract (valid prefixes, indices inside the pools) is a property
+        of the index producers and the pools they address, so one validated
+        eager launch per process and contract is enough; validating every
+        plan's first launch re-synchronized the host with a GPU that was busy
+        with prefill on the context-ramp steps that created new plans.
+        """
+        if torch.cuda.is_current_stream_capturing() or contract_key in _VALIDATED_CONTRACTS:
+            return False
+        _VALIDATED_CONTRACTS.add(contract_key)
+        logger.debug(f"PrimTS sparse MLA validating the index contract {contract_key}")
+        return True
 
     # ------------------------------------------------------------------ forward
     def forward(
@@ -560,15 +684,16 @@ class PrimsTSSparseMlaFmha(Fmha):
         output_scale = kv_scale
 
         sinks = self._sinks(forward_args)
-        plan = self._get_plan(
+        profile = dict(
             metadata=metadata,
             device=q.device,
-            rows=rows,
             extra=extra,
             q_dtype=query.dtype,
             has_sinks=sinks is not None,
             fused_groups=groups,
         )
+        self._warm_kernel_variants(**profile)
+        plan = self._get_plan(rows=rows, **profile)
 
         # Storage-row indices straight from sparse_attn_predict: the window
         # slots address the SWA pool and the compressed slots address the
@@ -600,10 +725,24 @@ class PrimsTSSparseMlaFmha(Fmha):
         else:
             run_kwargs["out"] = output.view(rows, 1, heads, _LATENT_DIM)
 
-        # Validate the index contract once per plan (the first layer that uses
-        # it) while still eager; graph replay must keep validation off because
-        # it synchronizes.
-        validate = not plan.validated and not torch.cuda.is_current_stream_capturing()
+        # One validated eager launch per process and contract; the key names
+        # the producers (window, extra capacity, compress ratio, hole policy)
+        # and the pools they address, so the KV-cache estimation executor's
+        # temporary pools and the serving pools are validated separately.
+        validate = self._claim_contract_validation(
+            (
+                str(q.device),
+                window,
+                extra,
+                ratio,
+                self._holes_possible(),
+                str(query.dtype),
+                swa_pool.data_ptr(),
+                int(swa_pool.shape[0]),
+                extra_pool.data_ptr() if extra_pool is not None else 0,
+                int(extra_pool.shape[0]) if extra_pool is not None else 0,
+            )
+        )
         plan.wrapper.run(
             query,
             swa_pool,
@@ -616,7 +755,6 @@ class PrimsTSSparseMlaFmha(Fmha):
             validate=validate,
             **run_kwargs,
         )
-        plan.validated = True
 
 
 __all__ = ["PrimsTSSparseMlaFmha", "get_prims_ts_toolchain_unsupported_reason"]
