@@ -1233,6 +1233,11 @@ class MiniMaxM3Attention(Attention):
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():
             return
+        if FlashInferTrtllmGenFmha.serves_only_extra_page_sizes():
+            # SM107 admits the library only for the KV manager's extra page sizes
+            # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
+            # there, as before SM107 was admitted.
+            return
         # Q/K norm and partial RoPE run in the model before backend dispatch.
         native_attn = TrtllmAttention(
             self.layer_idx,

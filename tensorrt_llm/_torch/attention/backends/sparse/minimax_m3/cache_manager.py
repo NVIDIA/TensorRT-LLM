@@ -559,7 +559,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for layer_idx in (*self._dense_native_layer_ids, *self._shared_draft_layer_ids)
             if layer_idx in self.layer_offsets
         ]
-        if self.is_draft or not native_layers:
+        if self.is_draft:
+            # A separate draft manager holds only draft layers, which all run
+            # native attention and use their own pool tables; it needs the P128
+            # opt-in but no virtual pools. (MiniMax-M3 Eagle3 shares the target
+            # manager today; this keeps a separate one on the trtllm-gen route.)
+            if self.tokens_per_block == 128 and self.dtype != DataType.NVFP4:
+                self.trtllm_gen_extra_tokens_per_block = frozenset({128})
+            return
+        if not native_layers:
             return
         if self.enable_swa_scratch_reuse:
             raise NotImplementedError(
@@ -571,7 +579,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return
         # Native layers run at the target's 128-token pages. trtllm-gen has P128
         # kernels for their dense-GQA shapes but not for every shape, so opt in
-        # here rather than in the global allowlist.
+        # here rather than in the global allowlist. On SM107 this opt-in is the
+        # only route for these layers: FallbackFmha has no P128 paged-context kernels.
         if self.tokens_per_block == 128:
             self.trtllm_gen_extra_tokens_per_block = frozenset({128})
         if self._use_per_layer_page_tables:

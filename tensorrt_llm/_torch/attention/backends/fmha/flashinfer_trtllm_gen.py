@@ -369,6 +369,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
+    # SMs on which this library serves only a KV cache manager's extra page
+    # sizes (``trtllm_gen_extra_tokens_per_block``); every other request there
+    # stays on the fallback FMHA.
+    EXTRA_PAGE_SIZES_ONLY_SMS = frozenset({107})
     # FlashInfer narrows key_cache.size(0) to int before constructing its TMA descriptor.
     MAX_NUM_PAGES_IN_MEM_POOL = (1 << 31) - 1
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
@@ -415,6 +419,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         return True
+
+    @classmethod
+    def serves_only_extra_page_sizes(cls) -> bool:
+        """Whether this device uses the library only for a KV cache manager's extra page sizes."""
+        return get_sm_version() in cls.EXTRA_PAGE_SIZES_ONLY_SMS
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -801,7 +810,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         # On SM107 this library serves only the extra page sizes, which the
         # fallback thop FMHA has no paged-context kernels for. Every other SM107
         # request stays on the fallback.
-        if get_sm_version() == 107 and tokens_per_block not in extra_tokens_per_block:
+        if self.serves_only_extra_page_sizes() and tokens_per_block not in extra_tokens_per_block:
             return False, (
                 f"tokens_per_block ({tokens_per_block}) on SM107, which uses this library "
                 "only for the KV cache manager's extra page sizes."

@@ -254,7 +254,7 @@ public:
         }
     }
 
-    bool shouldUseNvrtc(FmhaOptions const& options) const
+    static bool shouldUseNvrtc(FmhaOptions const& options)
     {
 #ifdef TLLM_RUBIN_FEATURES
         // Spcompress kernels must use precompiled cubins.
@@ -263,20 +263,7 @@ public:
             return false;
         }
 #endif // TLLM_RUBIN_FEATURES
-       // The cubin table has no dense paged-KV kernels for 128-token pages, and the page size is
-       // part of the kernel hash. On SM107, generate those BF16/E4M3 context and KeepsMmaAb
-       // generation kernels for the actual cache layout instead.
-        constexpr int kPageSize128 = 128;
-        if (mSM == kSM_107
-            && (isContextKernel(options.mFmhaKernelType) || isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType))
-            && !options.mIsMlaGen && !isTokenSparse(options.mSparseType) && isPagedKv(options.mQkvLayout)
-            && options.mNumTokensPerPage == kPageSize128 && options.mDtypeQ == options.mDtypeKv
-            && (options.mDtypeQ == tg::Dtype::Bfloat16 || options.mDtypeQ == tg::Dtype::E4m3)
-            && options.mDtypeOut == tg::Dtype::Bfloat16)
-        {
-            return true;
-        }
-        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+       // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
             return true;

@@ -301,6 +301,45 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch, dtype, swa_scra
     assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected_extra_pages)
 
 
+@pytest.mark.parametrize(
+    "dtype,tokens_per_block,expected",
+    [
+        (DataType.FP8, 128, {128}),
+        (DataType.BF16, 128, {128}),
+        (DataType.FP8, 32, set()),
+        (DataType.NVFP4, 128, set()),
+    ],
+)
+def test_separate_draft_manager_opts_into_p128(monkeypatch, dtype, tokens_per_block, expected):
+    """A separate (is_draft) manager holds only native draft layers: at 128-token pages
+    it lists 128 as a trtllm-gen extra page size (the only P128 route on SM107) and
+    builds no virtual pools."""
+    pointers = torch.tensor([[0x6000_0000, 0]])
+    mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+
+    def fake_base_prepare(self, index_mapper_capacity):
+        self._use_per_layer_page_tables = False
+        self.kv_cache_pool_pointers = pointers.clone()
+        self.kv_cache_pool_mapping = mapping.clone()
+        self.num_attention_op_pools = 1
+
+    monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", fake_base_prepare)
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = dtype
+    manager._shared_draft_layer_ids = []
+    manager.layer_offsets = {0: 0}
+    manager.is_draft = True
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = tokens_per_block
+
+    manager._prepare_page_table_tensor(8)
+
+    assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected)
+    assert manager._draft_op_pools == ()
+    assert torch.equal(manager.kv_cache_pool_pointers, pointers)
+    assert manager.num_attention_op_pools == (0 if dtype == DataType.NVFP4 else 1)
+
+
 def test_update_resources_refuses_tree_relocation(monkeypatch):
     """Linear acceptance rewinds through the base; tree acceptance is refused."""
     calls = []
