@@ -501,6 +501,13 @@ def _create_py_executor(
         llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
 
+    # Per-worker override for a YAML shared across roles, e.g. a disagg CTX worker:
+    # the overlap scheduler adds about one iteration of host time to TTFT.
+    if (os.environ.get("TRTLLM_DISABLE_OVERLAP_SCHEDULER", "0") == "1"
+            and not llm_args.disable_overlap_scheduler):
+        logger.info("TRTLLM_DISABLE_OVERLAP_SCHEDULER=1: overlap scheduler off")
+        llm_args.disable_overlap_scheduler = True
+
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
