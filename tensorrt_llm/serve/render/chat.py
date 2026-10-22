@@ -92,7 +92,7 @@ def prepare_chat_request(request: "ChatCompletionRequest", res: RenderResources)
     ensure_request_chat_template_allowed(request, res.allow_request_chat_template)
     extension = res.extension
     extension.apply_chat_extensions(request)
-    if request.tool_choice == "required" and not extension.allows_required_tool_choice():
+    if request.tool_choice == "required" and extension.required_tool_choice_mode() is None:
         # Schema-accepting "required" everywhere but enforcing it only for models
         # whose extension allows it would silently degrade to "auto" elsewhere;
         # reject loudly for models that cannot honor it. Still a ValueError for the
