@@ -374,6 +374,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
 
+    @staticmethod
+    def _gen_idle_poll_skip_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether an idle generation worker may skip its receive-status collectives.
+
+        Requires a synchronized status poll in which every rank owns every
+        request (no attention DP, one PP stage, no context parallelism), so
+        every rank requests the same receives in the same iteration.
+        """
+        return (
+            gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and getattr(mapping, "cp_size", 1) == 1
+        )
+
     def _fail_unproven_transfer(self, event: QuiescenceFatalEvent) -> None:
         """Fail-stop while the watchdog retains this transceiver's resource roots.
 
@@ -405,6 +420,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
         self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
+        # Idle receive-status skip: _gen_idle_agreed is set from the gathered
+        # outcome of a status round in which no rank held a receive session,
+        # and cleared by every receive request; while it is set no rank holds
+        # a session and the status poll skips its collectives on all ranks.
+        self._gen_idle_poll_skip = self._gen_idle_poll_skip_applies(m, self._gen_need_sync)
+        self._gen_idle_agreed = False
         pp_allgather: Callable = getattr(self._dist, "pp_allgather")
         self._gen_allgather: Callable = (
             pp_allgather if m.enable_attention_dp else self._dist.allgather
@@ -713,16 +734,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         need_sync: bool,
         locally_quiesced=None,
         locally_verified=None,
+        local_session_count: Optional[int] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
         # agreement from every rank.
         # Batch the id lists into one allgather to cut the per-step collective count.
+        # With local_session_count, the payload also carries each rank's
+        # receive-session count and the result ends with whether every rank
+        # reported zero sessions.
         local_outcome = [list(cancelled), list(failed), list(completed)]
         if locally_quiesced is not None:
             local_outcome.append(list(locally_quiesced))
         if locally_verified is not None:
             local_outcome.append(list(locally_verified))
+        if local_session_count is not None:
+            local_outcome.append([local_session_count])
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -753,8 +780,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # the same tokens, so a request counts as write-verified only
             # when EVERY rank verified its local shard.
             all_verified = [p[idx] for p in packed]
+            idx += 1
             global_verified = self._intersection(all_verified, n)
             result.append({rid for rid in to_process if rid in global_verified})
+        if local_session_count is not None:
+            result.append(all(p[idx][0] == 0 for p in packed))
         return tuple(result)
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
@@ -765,18 +795,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable, verified = (
-            self._consensus_outcome(
-                to_process,
-                cancelled,
-                failed,
-                completed,
-                self._gen_allgather,
-                self._gen_need_sync,
-                locally_retirable,
-                locally_verified,
-            )
+        # Read through getattr: unit tests assemble transceivers without __init__.
+        idle_skip = getattr(self, "_gen_idle_poll_skip", False)
+        outcome = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            locally_retirable,
+            locally_verified,
+            local_session_count=len(self._recv_sessions) if idle_skip else None,
         )
+        new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
+        if idle_skip:
+            # Every rank derives this from the same gathered payload.
+            self._gen_idle_agreed = outcome[5]
         retirable = set(globally_retirable)
         return (
             [rid for rid in new_cancelled if rid in retirable],
@@ -1110,6 +1145,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest) -> None:
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         if not self._validate_bridge_req(req, synchronous=True):
             return
         rid = get_unique_rid(req)
@@ -1191,6 +1229,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req: The generation request whose KV cache blocks to receive
                 into.
         """
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         if not self._validate_bridge_req(req):
             return
         self._ever_had_recv_session = True
@@ -1320,6 +1361,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return GenTransferStatus([], [], [])
+        if getattr(self, "_gen_idle_agreed", False):
+            # The last status round gathered zero receive sessions from every
+            # rank and no rank has requested a receive since (that clears the
+            # flag on every rank in the same iteration), so this round's
+            # consensus would be empty everywhere.
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
