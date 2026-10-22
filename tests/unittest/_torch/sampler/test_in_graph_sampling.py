@@ -68,7 +68,6 @@ class _Request:
     py_stop_words_list: Any = None
     py_bad_words: Any = None
     py_no_repeat_ngram_size: Any = None
-    py_is_draft: bool = False
     py_logits_post_processors: Any = None
     py_guided_decoding_params: Any = None
     py_embedding_bias: Any = None
@@ -147,8 +146,6 @@ class TestTierSelection:
             # Consume the logits after the forward returns.
             pytest.param(dict(py_guided_decoding_params=object()), id="guided_decoding"),
             pytest.param(dict(py_logits_post_processors=[object()]), id="logits_processor"),
-            # Shares this sampler but registers no hooks.
-            pytest.param(dict(py_is_draft=True), id="draft"),
             # Needs outputs the in-graph path does not produce.
             pytest.param(dict(py_return_log_probs=True), id="logprobs"),
         ],

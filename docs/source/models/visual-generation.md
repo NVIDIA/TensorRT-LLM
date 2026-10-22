@@ -291,7 +291,7 @@ args = VisualGenArgs(
 
 The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
 
-By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA cannot target a transformer component with weight quantization enabled, and startup fusion does not support per-request adapter switching.
 
 ### Quantized Attention
 
