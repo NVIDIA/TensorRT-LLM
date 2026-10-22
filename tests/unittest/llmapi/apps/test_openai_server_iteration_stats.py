@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import threading
 from collections import deque
 from types import SimpleNamespace
 
@@ -23,11 +24,23 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 
 class _FakeGenerator:
     def __init__(
-        self, stat_batches: list[list[dict]], iter_stats_max_iterations: int | None = None
+        self,
+        stat_batches: list[list[dict]],
+        iter_stats_max_iterations: int | None = None,
+        enable_iter_perf_stats: bool = True,
     ):
-        self.args = SimpleNamespace(iter_stats_max_iterations=iter_stats_max_iterations)
+        self.args = SimpleNamespace(
+            iter_stats_max_iterations=iter_stats_max_iterations,
+            enable_iter_perf_stats=enable_iter_perf_stats,
+        )
         self._stat_batches = deque(stat_batches)
         self.stats_timeouts = []
+        self.fetch_threads = []
+
+    def get_stats(self, timeout: float | None) -> list[dict]:
+        self.stats_timeouts.append(timeout)
+        self.fetch_threads.append(threading.get_ident())
+        return list(self._stat_batches.popleft()) if self._stat_batches else []
 
     def get_stats_async(self, timeout: float | None):
         self.stats_timeouts.append(timeout)
@@ -54,9 +67,12 @@ def _make_server(
     with_stats_buffer: bool = True,
     is_visual_gen: bool = False,
     iter_stats_max_iterations: int | None = None,
+    enable_iter_perf_stats: bool = True,
 ) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
-    server.generator = _FakeGenerator(stat_batches, iter_stats_max_iterations)
+    server.generator = _FakeGenerator(
+        stat_batches, iter_stats_max_iterations, enable_iter_perf_stats
+    )
     server.metrics_collector = _FakeMetricsCollector()
     server._is_visual_gen = is_visual_gen
     max_buffer_size = OpenAIServer._iteration_stats_buffer_maxlen(
@@ -107,6 +123,18 @@ async def test_metrics_endpoint_reads_queue_without_background_buffer():
     assert _response_content(response) == stats
     assert server.generator.stats_timeouts == [2]
     assert server.metrics_collector.logged_stats == []
+    # The blocking fetch runs off the event-loop thread.
+    assert server.generator.fetch_threads != [threading.get_ident()]
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_skips_fetch_with_iteration_stats_disabled():
+    server = _make_server([[{"iter": 5}]], with_stats_buffer=False, enable_iter_perf_stats=False)
+
+    response = await server.get_iteration_stats()
+
+    assert _response_content(response) == []
+    assert server.generator.stats_timeouts == []
 
 
 @pytest.mark.asyncio

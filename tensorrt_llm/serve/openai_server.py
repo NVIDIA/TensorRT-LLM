@@ -1767,9 +1767,13 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=stats)
 
         # Legacy path: no background collector -> read the queue directly.
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
+        # With iteration stats disabled nothing is ever produced, and the fetch
+        # below is a synchronous RPC with the multi-process executor that would
+        # hold this frontend's event loop for its whole 2 s timeout on every poll.
+        if not getattr(self.generator.args, "enable_iter_perf_stats", True):
+            return JSONResponse(content=[])
+        # Keep the blocking fetch off the event-loop thread.
+        stats = await asyncio.to_thread(self.generator.get_stats, 2)
         return JSONResponse(content=stats)
 
     async def get_energy_metrics(self) -> JSONResponse:
@@ -1898,9 +1902,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch is a synchronous RPC with the multi-process executor
+                # (it polls for up to the timeout), so it runs off the event loop.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
+                    for llm_stat in await asyncio.to_thread(
+                            self.generator.get_stats, 0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
                         # Tee into the /metrics snapshot buffer so the HTTP
                         # handler can serve without competing for the engine
