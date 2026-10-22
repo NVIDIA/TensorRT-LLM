@@ -222,6 +222,42 @@ def test_worker_abort_settles_waiting_request_without_model_batch(
     executor.resource_manager.free_resources.assert_called_once_with(cancelled)
 
 
+def test_worker_abort_settles_context_waiting_from_previous_pass(executor: PyExecutor) -> None:
+    """Cancel an earlier peer wait once without reviving it on late readiness."""
+    cancelled, healthy = _request(1, context=True), _request(2, context=True)
+    for request in (cancelled, healthy):
+        request.state = LlmRequestState.CONTEXT_INIT
+    executor.active_requests = [cancelled, healthy]
+    transceiver = executor.kv_cache_transceiver
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    peer_ready = Mock(return_value=False)
+    transceiver._transfer_worker = SimpleNamespace(has_all_peer_req_infos_for_send=peer_ready)
+    executor.disagg.prepare_context_schedulable([cancelled, healthy])
+    assert transceiver._wait_reqs == {1: cancelled, 2: healthy}
+    assert cancelled.state == healthy.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+
+    _abort(executor, cancelled, repeats=2)
+    assert executor._cancel_waiting_disagg_requests([]) == []
+
+    assert executor.active_requests == [healthy]
+    assert transceiver._wait_reqs == {2: healthy}
+    assert executor.canceled_req_ids == []
+    assert not healthy.is_finished
+    executor.resource_manager.free_resources.assert_not_called()
+    _assert_released_once(executor, cancelled)
+
+    peer_ready.reset_mock()
+    peer_ready.return_value = True
+    executor.disagg.prepare_context_schedulable([])
+
+    peer_ready.assert_called_once_with(2)
+    assert transceiver._wait_reqs == {}
+    assert healthy.state == LlmRequestState.CONTEXT_INIT
+    assert executor.active_requests == [healthy]
+    _assert_released_once(executor, cancelled)
+
+
 def test_cancellation_beats_late_transfer_readiness(executor: PyExecutor) -> None:
     """Late receive completion cannot schedule an already cancelled request."""
     request = _request(1)
