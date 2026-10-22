@@ -58,6 +58,15 @@ CL = KH * 4  # cluster size
 RPO = M // CL
 #: Item iterations a thread whose activation loads issue together (all of them at <= 16 rows).
 GROUP_IT = 10
+#: Rows from which the finalize fold is split over a K half's 4 CTAs (each forms a quarter of
+#: the half's rows and pushes it to all four); below it each CTA folds its whole K half itself
+#: in its items (4x the gathers, no exchange: 1.4-1.7 us a layer faster at 2 and 3 rows behind
+#: the runner, 1.7-2.3 us slower from 4, in the chained [MoE + site + MoE site] bench).
+FOLD_SPLIT_ROWS = 4
+#: Fold vectors a thread whose gathers issue together, split (all of them at <= 16 rows) and not
+#: (ten 16-byte gathers a vector: register budget).
+GROUP_FOLD = 3
+GROUP_FOLD_ITEMS = 2
 #: Rows of First2's A stage allocated at least: its shared-memory footprint (~90 KB at 2..8
 #: rows, ~118 KB at 16) leaves room beside it for the mix kernel's CTAs of the same site.
 A_MIN_ROWS = 8
@@ -123,11 +132,42 @@ def _mbar_wait0(mbar, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _st_async_v4(addr, a, b, c, d, mbar, *, loc=None, ip=None):
+    """16 bytes into a cluster CTA's shared memory, completing on that CTA's mbarrier."""
+    _asm(
+        T.i32(),
+        [cutlass.Int32(addr)] + [cutlass.Int32(v) for v in (a, b, c, d)] + [cutlass.Int32(mbar)],
+        "{ st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [$1], {$2, $3, $4, $5}, "
+        "[$6]; mov.u32 $0, 0; }",
+        "=r,r,r,r,r,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _bf16x2(lo, hi, *, loc=None, ip=None):
+    """Two fp32 values rounded (RN) into one bf16x2 word, `lo` low (exact for bf16 values)."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Float32(hi), cutlass.Float32(lo)],
+            "cvt.rn.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
 class _First2:
-    def __init__(self, *, hidden, rank, n_cols, rows, inject, combine, pdl):
+    def __init__(self, *, hidden, rank, n_cols, rows, inject, combine, pdl, topk=0):
         assert hidden == KH * KHW and n_cols <= NC * NCH and rows <= M
+        assert topk == 0 or combine, "the finalize fold needs the combine"
         self.hidden, self.rank, self.n_cols, self.rows = hidden, rank, n_cols, rows
-        self.inject, self.combine, self.pdl = inject, combine, pdl
+        self.inject, self.combine, self.pdl, self.topk = inject, combine, pdl, topk
         self.ld = KHW + PAD
         self.rld = NC + 2  # pushed slot: NC partials + the sum of squares (+pad)
 
@@ -140,6 +180,10 @@ class _First2:
         b += r(self.rows * (KHW // VEC) * 4)
         b += r(CL * RPO * self.rld * 4) + r(M * 4)
         b += r(KHW * 2)  # the norm-weight slice
+        if self.topk:
+            b += 2 * r(self.rows * self.topk * 4)  # the fold's slot rows and weights
+        if self.topk and self.rows >= FOLD_SPLIT_ROWS:
+            b += r(self.rows * KHW * 2) + 128  # the block rows of the K half, and an mbarrier
         return b + 256 + 128
 
     @cute.jit
@@ -150,6 +194,8 @@ class _First2:
         mInj,
         mShared,
         mGate,
+        mTopW,
+        mTopRows,
         mNorm,
         mW,
         mHcOut,
@@ -170,6 +216,8 @@ class _First2:
             mInj,
             mShared,
             mGate,
+            mTopW,
+            mTopRows,
             mNorm,
             mW,
             mHcOut,
@@ -197,6 +245,8 @@ class _First2:
         mInj,
         mShared,
         mGate,
+        mTopW,
+        mTopRows,
         mNorm,
         mW,
         mHcOut,
@@ -251,13 +301,35 @@ class _First2:
         sNw = smem.allocate_tensor(
             cutlass.BFloat16, cute.make_layout((1, KHW), stride=(KHW, 1)), byte_alignment=128
         )
-        sBar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), byte_alignment=8)
+        topk: cutlass.Constexpr = self.topk
+        split: cutlass.Constexpr = topk > 0 and rows >= FOLD_SPLIT_ROWS
+        if const_expr(topk > 0):
+            sTopR = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout((rows * topk,), stride=(1,)), byte_alignment=128
+            )
+            sTopW = smem.allocate_tensor(
+                cutlass.Float32, cute.make_layout((rows * topk,), stride=(1,)), byte_alignment=128
+            )
+        sBar = smem.allocate_tensor(
+            cutlass.Int64, cute.make_layout((2 if split else 1,)), byte_alignment=8
+        )
         rbar = cutlass.Int32(sBar.iterator.toint())
+        bbar = rbar + 8
+        if const_expr(split):
+            # The K half's block rows (finalize + combine), a quarter formed by each of the 4
+            # stream CTAs of this K half and pushed (st.async) into all four.
+            sBlk = smem.allocate_tensor(
+                cutlass.BFloat16, cute.make_layout((rows, KHW), stride=(KHW, 1)), byte_alignment=128
+            )
+            blk_a = cutlass.Int32(sBlk.iterator.toint())
+            sblk_vec = cute.logical_divide(sBlk, (None, VEC))
         # This CTA receives rows [me * RPO, me * RPO + RPO) of the cluster's partials from all CL
         # CTAs, by st.async on `rbar` (no cluster barrier, no fence, after the pushes).
         rows_me = cutlass.max(cutlass.min(cutlass.Int32(RPO), rows - me * RPO), cutlass.Int32(0))
         if tidx == 0:
             _mbar_init_tx(rbar, rows_me * (CL * (NC + 1) * 4))
+            if const_expr(split):
+                _mbar_init_tx(bbar, rows * KHW * 2)
         cute.arch.cluster_arrive()
 
         # 1. Before the wait: the norm weight's slice (its own cp.async group, waited on right
@@ -296,36 +368,148 @@ class _First2:
         sa_vec = cute.logical_divide(sA, (None, VEC))
         items: cutlass.Constexpr = rows * nvec
         n_it: cutlass.Constexpr = -(-items // THREADS)
+        if const_expr(split):
+            # With the split fold, every load that does not need the slot map issues with it: the
+            # items' hc rows and injection weights (one group: <= 10 items a thread at <= 16
+            # rows), and the fold quarter's shared-expert rows and gate logits. The gathers
+            # are then the fold's one added L2 round trip.
+            assert n_it <= GROUP_IT
+            fvq: cutlass.Constexpr = KHW // 4 // VEC
+            f_items: cutlass.Constexpr = rows * fvq
+            n_f: cutlass.Constexpr = -(-f_items // THREADS)
+            assert n_f <= GROUP_FOLD
+            fcol0 = (kh * KHW + s * (KHW // 4)) // VEC
+            xg0 = cute.make_rmem_tensor(
+                cute.make_layout((n_it, VEC), stride=(VEC, 1)), cutlass.BFloat16
+            )
+            ig0 = cute.make_rmem_tensor(cute.make_layout((n_it,), stride=(1,)), cutlass.Float32)
+            for k in cutlass.range_constexpr(n_it):
+                c = cutlass.min(tidx + k * THREADS, cutlass.Int32(items - 1))
+                r = c // nvec
+                p = c % nvec
+                cute.autovec_copy(hc_vec[r, (None, col0 + p)], xg0[k, None])
+                ig0[k] = mInj[r, s].to(cutlass.Float32)
+            shq = cute.make_rmem_tensor(
+                cute.make_layout((n_f, VEC), stride=(VEC, 1)), cutlass.BFloat16
+            )
+            zq = cute.make_rmem_tensor(cute.make_layout((n_f,), stride=(1,)), cutlass.Float32)
+            for k in cutlass.range_constexpr(n_f):
+                c = cutlass.min(tidx + k * THREADS, cutlass.Int32(f_items - 1))
+                cute.autovec_copy(sh_vec[c // fvq, (None, fcol0 + c % fvq)], shq[k, None])
+                zq[k] = mGate[c // fvq].to(cutlass.Float32)
+        if const_expr(topk > 0):
+            # The rows' expanded->permuted slot map and routing weights (the gathers below
+            # depend on it).
+            for i in cutlass.range_constexpr(-(-(rows * topk) // THREADS)):
+                cs = tidx + i * THREADS
+                if cs < rows * topk:
+                    sTopR[cs] = mTopRows[cs // topk, cs % topk]
+                    sTopW[cs] = mTopW[cs // topk, cs % topk].to(cutlass.Float32)
         cute.arch.cp_async_wait_group(1)  # the norm slice (the weights may still be landing)
         cute.arch.sync_threads()
+        if const_expr(split):
+            # The finalize and the combine of this CTA's quarter of its K half (40 vectors a
+            # row): the runner's fp32 FMAs in slot order from zero (a -1 slot skipped, a -1 slot
+            # reads row 0, unused), rounded once; then fma(sigmoid(gate), shared, routed) rounded
+            # once; pushed to the K half's 4 CTAs.
+            cute.arch.cluster_wait()  # every peer has started (its mbarriers initialized)
+            for f0 in cutlass.range_constexpr(0, n_f, GROUP_FOLD):
+                f_n: cutlass.Constexpr = min(GROUP_FOLD, n_f - f0)
+                fgq = cute.make_rmem_tensor(
+                    cute.make_layout((f_n, topk, VEC), stride=(topk * VEC, VEC, 1)),
+                    cutlass.BFloat16,
+                )
+                for k in cutlass.range_constexpr(f_n):
+                    c = cutlass.min(tidx + (f0 + k) * THREADS, cutlass.Int32(f_items - 1))
+                    r = c // fvq
+                    q = c % fvq
+                    for j in cutlass.range_constexpr(topk):
+                        cute.autovec_copy(
+                            b_vec[
+                                cutlass.max(sTopR[r * topk + j], cutlass.Int32(0)),
+                                (None, fcol0 + q),
+                            ],
+                            fgq[k, j, None],
+                        )
+                for k in cutlass.range_constexpr(f_n):
+                    c = tidx + (f0 + k) * THREADS
+                    if c < f_items:
+                        r = c // fvq
+                        q = c % fvq
+                        sg = 1.0 / (1.0 + cute.math.exp(-zq[f0 + k]))
+                        bq = [cutlass.Float32(0.0)] * VEC
+                        for v in cutlass.range_constexpr(VEC):
+                            acc = cutlass.Float32(0.0)
+                            for j in cutlass.range_constexpr(topk):
+                                if sTopR[r * topk + j] >= 0:
+                                    acc = cute.math.fma(
+                                        fgq[k, j, v].to(cutlass.Float32), sTopW[r * topk + j], acc
+                                    )
+                            bv = acc.to(cutlass.BFloat16).to(cutlass.Float32)
+                            bq[v] = (
+                                cute.math.fma(sg, shq[f0 + k, v].to(cutlass.Float32), bv)
+                                .to(cutlass.BFloat16)
+                                .to(cutlass.Float32)
+                            )
+                        words = [_bf16x2(bq[2 * w], bq[2 * w + 1]) for w in range(4)]
+                        dst = blk_a + (r * KHW + s * (KHW // 4) + q * VEC) * 2
+                        for sp in cutlass.range_constexpr(4):
+                            peer = kh + KH * sp
+                            _st_async_v4(_mapa(dst, peer), *words, _mapa(bbar, peer))
         nwr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
         outr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
         yr = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), cutlass.BFloat16)
-        for g0 in cutlass.range_constexpr(0, n_it, GROUP_IT):
-            g_n: cutlass.Constexpr = min(GROUP_IT, n_it - g0)
-            xg = cute.make_rmem_tensor(
-                cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
-            )
+        group: cutlass.Constexpr = GROUP_FOLD_ITEMS if topk > 0 and not split else GROUP_IT
+        for g0 in cutlass.range_constexpr(0, n_it, group):
+            g_n: cutlass.Constexpr = min(group, n_it - g0)
+            if const_expr(split):
+                xg = xg0
+            else:
+                xg = cute.make_rmem_tensor(
+                    cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
+                )
             bg = cute.make_rmem_tensor(
                 cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
             )
             shg = cute.make_rmem_tensor(
                 cute.make_layout((g_n, VEC), stride=(VEC, 1)), cutlass.BFloat16
             )
-            ig = cute.make_rmem_tensor(cute.make_layout((g_n,), stride=(1,)), cutlass.Float32)
+            if const_expr(split):
+                ig = ig0
+            else:
+                ig = cute.make_rmem_tensor(cute.make_layout((g_n,), stride=(1,)), cutlass.Float32)
             zg = cute.make_rmem_tensor(cute.make_layout((g_n,), stride=(1,)), cutlass.Float32)
-            for k in cutlass.range_constexpr(g_n):
+            if const_expr(topk > 0 and not split):
+                fg = cute.make_rmem_tensor(
+                    cute.make_layout((g_n, topk, VEC), stride=(topk * VEC, VEC, 1)),
+                    cutlass.BFloat16,
+                )
+            for k in cutlass.range_constexpr(0 if split else g_n):
                 # Past the last item a thread reads the last item's operands (unused).
                 c = cutlass.min(tidx + (g0 + k) * THREADS, cutlass.Int32(items - 1))
                 r = c // nvec
                 p = c % nvec
                 cute.autovec_copy(hc_vec[r, (None, col0 + p)], xg[k, None])
                 if const_expr(self.inject):
-                    cute.autovec_copy(b_vec[r, (None, k0 // VEC + p)], bg[k, None])
+                    if const_expr(topk > 0):
+                        # The finalize's slot rows of the permuted FC2 output (a -1 slot reads
+                        # row 0, unused).
+                        for j in cutlass.range_constexpr(topk):
+                            cute.autovec_copy(
+                                b_vec[
+                                    cutlass.max(sTopR[r * topk + j], cutlass.Int32(0)),
+                                    (None, k0 // VEC + p),
+                                ],
+                                fg[k, j, None],
+                            )
+                    else:
+                        cute.autovec_copy(b_vec[r, (None, k0 // VEC + p)], bg[k, None])
                     ig[k] = mInj[r, s].to(cutlass.Float32)
                     if const_expr(self.combine):
                         cute.autovec_copy(sh_vec[r, (None, k0 // VEC + p)], shg[k, None])
                         zg[k] = mGate[r].to(cutlass.Float32)
+            if const_expr(split and g0 == 0):
+                _mbar_wait0(bbar)  # the K half's block rows have landed
             for k in cutlass.range_constexpr(g_n):
                 c = tidx + (g0 + k) * THREADS
                 if c < items:
@@ -335,11 +519,26 @@ class _First2:
                     ssum = cutlass.Float32(0.0)
                     if const_expr(self.inject):
                         g = ig[k]
-                        if const_expr(self.combine):
+                        if const_expr(split):
+                            cute.autovec_copy(sblk_vec[r, (None, p)], bg[k, None])
+                        if const_expr(self.combine and not split):
                             sg = 1.0 / (1.0 + cute.math.exp(-zg[k]))
                         for v in cutlass.range_constexpr(VEC):
-                            bv = bg[k, v].to(cutlass.Float32)
-                            if const_expr(self.combine):
+                            if const_expr(topk > 0 and not split):
+                                # The runner's finalize: fp32 FMAs in slot order from zero, a
+                                # -1 slot skipped, one rounding.
+                                acc = cutlass.Float32(0.0)
+                                for j in cutlass.range_constexpr(topk):
+                                    if sTopR[r * topk + j] >= 0:
+                                        acc = cute.math.fma(
+                                            fg[k, j, v].to(cutlass.Float32),
+                                            sTopW[r * topk + j],
+                                            acc,
+                                        )
+                                bv = acc.to(cutlass.BFloat16).to(cutlass.Float32)
+                            else:
+                                bv = bg[k, v].to(cutlass.Float32)
+                            if const_expr(self.combine and not split):
                                 bv = (
                                     cute.math.fma(sg, shg[k, v].to(cutlass.Float32), bv)
                                     .to(cutlass.BFloat16)
@@ -433,7 +632,8 @@ class _First2:
         cute.arch.sync_threads()
 
         # 4. Push rows (2o, 2o+1) (and their sums of squares) to cluster rank o, slot `me`.
-        cute.arch.cluster_wait()
+        if const_expr(not split):
+            cute.arch.cluster_wait()
         red_addr = cutlass.Int32(sRed.iterator.toint())
         per: cutlass.Constexpr = RPO * (NC + 1)
         for it in cutlass.range_constexpr(-(-(CL * per) // THREADS)):
@@ -491,15 +691,36 @@ def _dl(t: torch.Tensor, align: int = 16):
 
 @functools.lru_cache(maxsize=None)
 def _compiled_first(
-    hidden, hc_count, rank, n_cols, n_wrows, rows, inject, combine, pdl, hc_stride, block_stride
+    hidden,
+    hc_count,
+    rank,
+    n_cols,
+    n_wrows,
+    rows,
+    inject,
+    combine,
+    pdl,
+    hc_stride,
+    block_stride,
+    topk=0,
+    n_perm=0,
 ):
     kern = _First2(
-        hidden=hidden, rank=rank, n_cols=n_cols, rows=rows, inject=inject, combine=combine, pdl=pdl
+        hidden=hidden,
+        rank=rank,
+        n_cols=n_cols,
+        rows=rows,
+        inject=inject,
+        combine=combine,
+        pdl=pdl,
+        topk=topk,
     )
     dev, bf = "cuda", torch.bfloat16
     width = hidden * hc_count
     hc = torch.empty(rows, hc_stride, dtype=bf, device=dev)[:, :width]
-    block = torch.empty(rows, block_stride, dtype=bf, device=dev)[:, :hidden]
+    block = torch.empty(n_perm if topk else rows, block_stride, dtype=bf, device=dev)[:, :hidden]
+    topw = torch.empty(rows, max(topk, 1), dtype=bf, device=dev)
+    toprows = torch.empty(rows, max(topk, 1), dtype=torch.int32, device=dev)
     inj = torch.empty(rows, hc_count, dtype=bf, device=dev)
     shared = torch.empty(rows, hidden, dtype=bf, device=dev)
     gate = torch.empty(rows, dtype=bf, device=dev)
@@ -517,6 +738,8 @@ def _compiled_first(
         _dl(inj, 2),
         _dl(shared),
         _dl(gate, 2),
+        _dl(topw, 2),
+        _dl(toprows, 4),
         _dl(norm),
         _dl(w),
         _dl(hc_out),
@@ -539,10 +762,14 @@ def first_rows(
     eps,
     shared=None,
     gate_logits=None,
+    topk_weights=None,
+    topk_rows=None,
     rank=320,
 ):
     """Returns `(hc_out, low [R, rank] bf16, inject_out [R, C] bf16 or None, rstd [R, C] fp32)`;
-    `n_cols` = rank + C with the injection, rank without (the stack-final mixer)."""
+    `n_cols` = rank + C with the injection, rank without (the stack-final mixer). With
+    `topk_weights` / `topk_rows` (the runner left unfinalized), `block_out` is its permuted FC2
+    output `[P, H]` and the routed rows are its finalize, formed here."""
     rows, width = hyper_input.shape
     hidden = width // hc_count
     dev = hyper_input.device
@@ -559,6 +786,7 @@ def first_rows(
     pdl = get_env_enable_pdl()
     weight = first.t()
     assert weight.shape[0] >= NC * NCH
+    top_k = topk_rows.shape[1] if topk_rows is not None else 0
     fn = _compiled_first(
         hidden,
         hc_count,
@@ -571,11 +799,15 @@ def first_rows(
         bool(pdl),
         hyper_input.stride(0),
         block_out.stride(0) if has_inject else hidden,
+        top_k,
+        block_out.shape[0] if top_k else 0,
     )
     blk = block_out if has_inject else hyper_input.new_empty(rows, hidden)
     inj = inject if has_inject else hyper_input.new_empty(rows, hc_count)
     sh = shared if has_shared else hyper_input.new_empty(rows, hidden)
     gate = gate_logits.reshape(rows) if has_shared else hyper_input.new_empty(rows)
+    topw = topk_weights if top_k else hyper_input.new_empty(rows, 1)
+    toprows = topk_rows if top_k else torch.empty(rows, 1, dtype=torch.int32, device=dev)
     stream = cuda_drv.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     fn(
         _dl(hyper_input),
@@ -583,6 +815,8 @@ def first_rows(
         _dl(inj, 2),
         _dl(sh),
         _dl(gate, 2),
+        _dl(topw, 2),
+        _dl(toprows, 4),
         _dl(norm_weight.reshape(1, -1)),
         _dl(weight),
         _dl(hc_out),
@@ -888,10 +1122,12 @@ def _reference_first(
     eps,
     shared=None,
     gate_logits=None,
+    topk_weights=None,
+    topk_rows=None,
 ):
-    """float64: the injection (and combine) rounded once as the 1-row kernel does, the grouped RMS,
-    the first projection over `normed`, `low = silu(z)` and `2 sigmoid(z)` (z = logits / C) each
-    rounded once, rstd in fp32."""
+    """float64: the finalize (with `topk_rows`), the combine and the injection each rounded once
+    as the 1-row kernel does, the grouped RMS, the first projection over `normed`, `low =
+    silu(z)` and `2 sigmoid(z)` (z = logits / C) each rounded once, rstd in fp32."""
     dt = hyper_input.dtype
     rows, width = hyper_input.shape
     hidden = width // hc_count
@@ -899,6 +1135,11 @@ def _reference_first(
     if block_out is None:
         hc_out = hyper_input
     else:
+        if topk_rows is not None:
+            valid = (topk_rows >= 0).unsqueeze(-1)
+            gathered = block_out.double()[topk_rows.clamp(min=0).long()]
+            w = topk_weights.double().unsqueeze(-1)
+            block_out = torch.where(valid, gathered * w, 0.0).sum(1).to(block_out.dtype)
         blk = block_out.double()
         if shared is not None:
             sg = torch.sigmoid(gate_logits.double().reshape(rows, 1))
@@ -925,9 +1166,14 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
     operands on tensor cores (`y = bf16(x * (1 + w))` against the bf16 weight) with fp32
     accumulation, inside 1-2 bf16 ulp of the float64 composition.
 
-    Fusion boundary: the combine, injection, grouped RMS statistics, first projection and
-    activations. The routed experts' finalize is the runner's (the forward does not fold it at
-    these row counts).
+    With `topk_weights` / `topk_rows` as well (the MoE runner left unfinalized), `block_out` is
+    its permuted FC2 output `[P, H]` and the routed row is the runner's finalize, formed here:
+    `routed[t, i] = sum_k topk_weights[t, k] * block_out[topk_rows[t, k], i]` as fp32 FMAs in
+    slot order from zero (a -1 slot skipped), rounded once -- bitwise what the runner's finalize
+    stores (as `qwen4_exp_hc_decode_first_cute`'s fold). The fold needs the combine.
+
+    Fusion boundary: the routed experts' finalize (optional), the combine, injection, grouped
+    RMS statistics, first projection and activations.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -935,6 +1181,10 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
         Cell(
             why="site after a MoE block: combine + injection, 2 rows",
             spec=dict(rows=2, site="combine"),
+        ),
+        Cell(
+            why="site after a MoE block, runner finalize folded in, 4 rows (MTP3 verify)",
+            spec=dict(rows=4, site="fold"),
         ),
         Cell(why="MoE site: injection, 8 rows", spec=dict(rows=8, site="inject")),
         Cell(
@@ -944,9 +1194,12 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
     )
     note = """
     Metadata consumed: none. Call sites: `DecodeTarget._hc_site` / `_hc_moe_site` at 2..16 rows
-    (decode batches, MTP verify and draft-extend rows), followed by `qwen4_exp_hc_decode_rows_mix`.
-    Grid (2 K halves, 4 streams, 14 N chunks of 24 columns), cluster (2, 4, 1), 8 warps; weights
-    staged before the PDL wait. One compile per row count and variant.
+    (decode batches, MTP verify and draft-extend rows), followed by `qwen4_exp_hc_decode_rows_mix`;
+    after a TRTLLM-backend MoE block (`DecodeTarget._moe_block` on the permuted runner) with the
+    fold. Grid (2 K halves, 4 streams, 14 N chunks of 24 columns), cluster (2, 4, 1), 8 warps;
+    weights staged before the PDL wait. With the fold from 4 rows each of a K half's 4 CTAs
+    forms a quarter of the half's routed + shared rows and pushes it to all four (DSMEM); at 2
+    and 3 rows each CTA folds its K half in its items. One compile per row count and variant.
     """
 
     def __call__(
@@ -961,6 +1214,8 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
         eps,
         shared=None,
         gate_logits=None,
+        topk_weights=None,
+        topk_rows=None,
     ):
         return first_rows(
             hyper_input,
@@ -973,6 +1228,8 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
             eps,
             shared,
             gate_logits,
+            topk_weights,
+            topk_rows,
         )
 
     def reference(
@@ -987,6 +1244,8 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
         eps,
         shared=None,
         gate_logits=None,
+        topk_weights=None,
+        topk_rows=None,
     ):
         return _reference_first(
             hyper_input,
@@ -999,6 +1258,8 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
             eps,
             shared,
             gate_logits,
+            topk_weights,
+            topk_rows,
         )
 
     def is_valid(
@@ -1013,6 +1274,8 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
         eps,
         shared=None,
         gate_logits=None,
+        topk_weights=None,
+        topk_rows=None,
     ) -> None:
         rows, width = hyper_input.shape
         assert 1 <= rows <= MAX_ROWS, f"1..{MAX_ROWS} rows"
@@ -1023,6 +1286,14 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
         )
         assert (block_out is None) == (inject is None)
         assert (shared is None) == (gate_logits is None)
+        assert (topk_weights is None) == (topk_rows is None), "topk_weights and topk_rows together"
+        if topk_rows is not None:
+            assert shared is not None, "the finalize fold needs the combine"
+            assert topk_rows.dtype == torch.int32 and topk_rows.shape[0] == rows
+            assert topk_rows.is_contiguous() and topk_weights.is_contiguous()
+            assert topk_weights.shape == topk_rows.shape and topk_weights.dtype == torch.bfloat16
+            assert block_out.dim() == 2 and block_out.shape[1] == width // hc_count
+            assert block_out.stride(1) == 1, "permuted rows [P, hidden]"
 
 
 class Qwen4ExpHcDecodeRowsMix(OpWrapper):

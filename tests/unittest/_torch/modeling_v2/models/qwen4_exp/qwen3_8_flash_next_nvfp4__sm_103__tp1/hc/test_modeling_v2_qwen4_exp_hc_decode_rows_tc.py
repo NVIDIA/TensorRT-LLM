@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: the 2..16-row hyper-connection site (`qwen4_exp_hc_decode_rows_first` +
 `qwen4_exp_hc_decode_rows_mix`) against the 1-row GEMV kernels applied row by row, over the
-three site kinds the forward sends (after a MoE block: combine + injection; MoE site: injection
-+ NVFP4; norm-only). `hc_out` must be bitwise; `mixed` within 1e-2 of the reference's largest
-magnitude (1-2 bf16 ulp: the projections take bf16 operands on tensor cores); the injection
-weights within one bf16 ulp; the NVFP4 codes may differ where `mixed` does."""
+site kinds the forward sends (after a MoE block: combine + injection, with or without the
+runner's finalize folded in; MoE site: injection + NVFP4; norm-only); and the folded site
+bitwise against the runner's finalize (`fp4_block_scale_moe_renorm_permuted.finalize`, the
+runner's arithmetic) followed by the unfolded site. `hc_out` must be bitwise; `mixed` within
+1e-2 of the reference's largest magnitude (1-2 bf16 ulp: the projections take bf16 operands on
+tensor cores); the injection weights within one bf16 ulp; the NVFP4 codes may differ where
+`mixed` does."""
 
 import importlib
 
@@ -20,6 +23,9 @@ first1 = importlib.import_module(
     P + "qwen4_exp_hc_decode_first_cute"
 ).qwen4_exp_hc_decode_first_cute
 mix1 = importlib.import_module(P + "qwen4_exp_hc_decode_mix_fp4_cute")
+finalize = importlib.import_module(
+    P.replace(".ops.hc.", ".ops.moe.") + "fp4_block_scale_moe_renorm_permuted"
+).finalize
 
 assert torch.cuda.is_available(), "the multi-row hyper-connection site requires a CUDA device"
 
@@ -27,6 +33,7 @@ DEV = "cuda"
 HIDDEN, C, RANK = 2560, 4, 320
 WIDTH = HIDDEN * C
 EPS = 1e-6
+TOPK = 10
 
 
 def _operands(rows, seed):
@@ -43,13 +50,28 @@ def _operands(rows, seed):
         gate=rnd(rows, 1),
         inject=(torch.rand(rows, C, generator=g, device=DEV) * 2).to(bf),
         gscale=torch.tensor([448.0 * 6 / 4.0], device=DEV),
+        # The unfinalized runner's permuted FC2 rows (37 rows no slot maps), slot map
+        # (the last 3 slots of the odd rows -1) and routing weights.
+        perm=rnd(rows * TOPK + 37, HIDDEN, scale=0.5),
+        topk_rows=_slot_map(rows, g),
+        topk_w=torch.softmax(torch.randn(rows, TOPK, generator=g, device=DEV), -1).to(bf),
     )
+
+
+def _slot_map(rows, g):
+    order = torch.randperm(rows * TOPK + 37, generator=g, device=DEV)[: rows * TOPK]
+    m = order.reshape(rows, TOPK).to(torch.int32)
+    m[1::2, -3:] = -1
+    return m.contiguous()
 
 
 def _site(o, site, rows_path: bool):
     """The site through either path: `(hc_out, mixed, inject_out, xq)`."""
     blk, inj = (None, None) if site == "norm" else (o["block"], o["inject"])
-    kw = dict(shared=o["shared"], gate_logits=o["gate"]) if site == "combine" else {}
+    kw = dict(shared=o["shared"], gate_logits=o["gate"]) if site in ("combine", "fold") else {}
+    if site == "fold":
+        blk = o["perm"]
+        kw.update(topk_weights=o["topk_w"], topk_rows=o["topk_rows"])
     n_cols = RANK if site == "norm" else RANK + C
     gs = o["gscale"] if site == "inject" else None
     if rows_path:
@@ -63,7 +85,7 @@ def _site(o, site, rows_path: bool):
         one = lambda t: None if t is None else t[r : r + 1]  # noqa: E731
         h, part, ss = first1(
             one(o["hc"]),
-            one(blk),
+            blk if site == "fold" else one(blk),
             one(inj),
             o["norm"],
             o["first"],
@@ -108,6 +130,31 @@ def test_first_cells(cell) -> None:
 @pytest.mark.parametrize("cell", mix_op.CELLS, ids=[c.why[:44] for c in mix_op.CELLS])
 def test_mix_cells(cell) -> None:
     _check(cell)
+
+
+@pytest.mark.parametrize("rows", [2, 3, 4, 16])
+@pytest.mark.parametrize("n_cols", [RANK + C, RANK])
+def test_fold_bitwise_vs_runner_finalize(rows, n_cols) -> None:
+    """Every output of the folded site equals the unfolded site fed the runner's finalize."""
+    o = _operands(rows, 300 + rows)
+    kw = dict(shared=o["shared"], gate_logits=o["gate"])
+    got = first_op(
+        o["hc"],
+        o["perm"],
+        o["inject"],
+        o["norm"],
+        o["first"],
+        C,
+        n_cols,
+        EPS,
+        topk_weights=o["topk_w"],
+        topk_rows=o["topk_rows"],
+        **kw,
+    )
+    routed = finalize(o["perm"], o["topk_w"], o["topk_rows"])
+    want = first_op(o["hc"], routed, o["inject"], o["norm"], o["first"], C, n_cols, EPS, **kw)
+    for a, b in zip(got, want):
+        assert (a is None and b is None) or torch.equal(a, b)
 
 
 def test_replay_matches_eager() -> None:

@@ -59,6 +59,11 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
             spec=_ckpt(1),
         ),
         Cell(
+            why="4 rows (MTP3 verify; 2..16-row batches): finalize folded into "
+            "qwen4_exp_hc_decode_rows_first",
+            spec=_ckpt(4),
+        ),
+        Cell(
             why="128 rows: the con=128 decode batch; the cluster routing kernel",
             spec=_ckpt(128),
         ),
@@ -83,7 +88,7 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
     not a multiple of 256).
 
     Hard limits
-      T            certified at 1, 64 and 128 (decode); the decode forward folds at
+      T            certified at 1, 4, 64 and 128 (decode); the decode forward folds at
                    every site that takes the combine
       num_experts  512, top_k 10
     """

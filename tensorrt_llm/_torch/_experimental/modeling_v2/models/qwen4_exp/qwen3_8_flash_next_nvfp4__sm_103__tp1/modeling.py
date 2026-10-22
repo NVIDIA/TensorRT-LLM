@@ -4820,12 +4820,12 @@ class DecodeTarget:
         `(gate_logits, shared, topk_weights, topk_rows)` `_moe_block` left
         uncombined: the site's first kernel forms the block output itself. With
         the top-k pair `block_out` is the runner's permuted FC2 rows and that
-        kernel (on either route) also forms their finalize. A site handed
+        kernel (on every route) also forms their finalize. A site handed
         `normed` has no pending block, so it never carries `moe`."""
         core = self.core
         gate_logits, shared, topk_w, topk_rows = moe if moe is not None else (None,) * 4
-        if _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX and topk_rows is None:
-            # Two tensor-core launches; the forward leaves the runner's finalize unfolded here.
+        if _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
+            # Two tensor-core launches; with the top-k pair the first also forms the finalize.
             n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
             hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
                 hc,
@@ -4838,6 +4838,8 @@ class DecodeTarget:
                 core.eps,
                 shared,
                 gate_logits,
+                topk_w,
+                topk_rows,
             )
             mixed, _, _ = qwen4_exp_hc_decode_rows_mix(low, rstd, up, hc, norm, core.hc_count)
             return hc, mixed, inject
@@ -4931,7 +4933,8 @@ class DecodeTarget:
         per-capture constant) the runner also skips its finalize: `routed` is then
         its permuted FC2 rows and `topk_weights` / `topk_rows` its routing weights
         and index map, which that site's first kernel
-        (`qwen4_exp_hc_decode_first_cute` or `qwen4_exp_hc_inject_norm`) gathers;
+        (`qwen4_exp_hc_decode_first_cute`, `qwen4_exp_hc_decode_rows_first` or
+        `qwen4_exp_hc_inject_norm`) gathers;
         without it both are None and `routed` is the finalized `[T, H]` rows.
 
         The shared expert and its per-token gate logit run on the core's side
@@ -5753,13 +5756,7 @@ class DecodeTarget:
             )
             # The trtllm-gen runner's finalize folds into the next site's first kernel
             # when that site takes the combine (every one but the PLE layer's).
-            # Not at 2.._HC_DECODE_ROWS_MAX rows either: those sites run on the tensor-core pair,
-            # which reads finalized rows.
-            fold = (
-                core.trunk_moe_backend == "TRTLLM"
-                and i + 1 != core.ple_layer
-                and not _HC_DECODE_GEMV_MAX_ROWS < num_tokens <= _HC_DECODE_ROWS_MAX
-            )
+            fold = core.trunk_moe_backend == "TRTLLM" and i + 1 != core.ple_layer
             block_out, moe = self._moe_block(mixed, xq, xsf, L, routed_out, gemm, fold=fold)
         # The stack-final mixer with no injection weight: it returns the mix
         # alone, and that mix *is* this checkpoint's final norm.
