@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Pinned provenance of this reproduction entry. Field reference: examples/perf_reproductions/README.md.
+entry_id: inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg
+status: branch  # branch | partial | mainline | superseded
+benchmark:
+  name: InferenceX
+  config_key: qwen3.5-fp4-gb300-dynamo-trt-agentic-disagg
+  scenario: agentic-coding
+model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+hardware: GB300 NVL72
+code:
+  repo: https://github.com/NVIDIA/TensorRT-LLM
+  commit: '4d09932ca7240f6fbb4d0dea811691446cc8cf92'
+  branch: feat/1.3.0rc24-iter-perf-stats-interval
+  tag: null
+image:
+  name: nvcr.io/nvidia/tensorrt-llm/release:1.3.0a0.dev202610210406
+  tensorrt_llm_version: 1.3.0a0.dev202610210406
+  digest: sha256:16b3237826b7969a3a736ceae930f7d63fe44f3c44c8e6c59a9d4b01dd66c199
+  platform_digests:
+    linux/amd64: sha256:c4f931e9e1ce244f17eb9c618d5af6592ead64cfb86225f59407f3df944b9d01
+    linux/arm64: sha256:b3d679d67e7c51145f2a8a084bbb8ec976fb9e22f3b9d83358b1a99edf85234c
+dependencies:
+  ai-dynamo: 1.6.0.dev20261010
+  ai-dynamo-runtime: 1.6.0.dev20261010
+external:
+  submission: https://github.com/SemiAnalysisAI/InferenceX/pull/4356
+  recipe_repo: https://github.com/longlee0622/InferenceX
+  recipe_commit: bb54127914f6c7c039a5a89c5fd8590441e4fc90
+  recipe: inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/qwen3.5/trtllm/gb300-fp4/agentx/disagg-variants.yaml
+verify:
+  # One log line per worker rank from tensorrt_llm/_torch/q35_env.py; {count} is the number of switches applied.
+  log_patterns:
+    decode: 'TRTLLM_Q35_PROFILE=gen \(attention DP: (True|False)\): 89 TRTLLM_Q35_\* switches set'
+    prefill_tep: 'TRTLLM_Q35_PROFILE=ctx \(attention DP: False\): 10 TRTLLM_Q35_\* switches set'
+    prefill_dep: 'TRTLLM_Q35_PROFILE=ctx \(attention DP: True\): 0 TRTLLM_Q35_\* switches set'
+upstream:
+  - feature: TRTLLM_Q35_PROFILE role profiles and @register re-read of TRTLLM_Q35_* switches (q35_env)
+    status: branch-only
+  - feature: Fused MoE front (router GEMM, top-k, routing tables, NVFP4 quant), dynamic expert assignment, low-M FP8 GEMMs
+    status: branch-only
+  - feature: Fused split-KV FP8 decode attention, context-parallel partial decode attention, segmented split-KV decode
+    status: branch-only
+  - feature: Fused GEMM + all-reduce + RMSNorm and low-latency all-reduce / exchange kernels (MNNVL)
+    status: branch-only
+  - feature: Fused GDN core and conv-replay kernels; in-forward and branch-point Mamba state snapshots
+    status: branch-only
+  - feature: MTP context draft CUDA graphs, steady-state decode preparation, fused accept, vocabulary-sharded sampling
+    status: branch-only
+  - feature: Breakable prefill CUDA graphs
+    status: equivalent-on-main
+    note: main selects it with prefill_cuda_graph_backend (#16609); this entry uses the branch's TRTLLM_PREFILL_BCG
+  - feature: Sampled iteration perf stats (iter_perf_stats_interval)
+    status: mainline
+    note: '#19717'
+  - feature: Shortest-first context scheduling and disaggregated generation first-step streaming
+    status: branch-only
