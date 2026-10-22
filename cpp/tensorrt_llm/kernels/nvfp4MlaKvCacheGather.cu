@@ -560,6 +560,191 @@ __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp
     }
 }
 
+__device__ __forceinline__ uint32_t ownerWorklistHash(uint32_t value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    return value ^ (value >> 16);
+}
+
+__global__ void publishOwnerWorklist(int32_t const* globalIndices, int32_t const* queryReqIndices,
+    int32_t* compactIndices, unsigned long long* ownerTable, int32_t* ownerPairs, int32_t* ownerCount,
+    int32_t numPairs, int32_t topK, int32_t topKShift, int32_t numRequests, int32_t tableSlots, int64_t numPoolTokens)
+{
+    int64_t const pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    bool winner = false;
+    if (pair < numPairs)
+    {
+        int32_t const physical = globalIndices[pair];
+        int32_t const pair32 = static_cast<int32_t>(pair);
+        int32_t const row = topKShift >= 0 ? pair32 >> topKShift : pair32 / topK;
+        int32_t const request = queryReqIndices[row];
+        compactIndices[pair] = -1;
+        if (physical >= 0 && static_cast<int64_t>(physical) < numPoolTokens)
+        {
+            // A full table or unexpected request ID may lose deduplication, never a valid value.
+            compactIndices[pair] = static_cast<int32_t>(pair);
+            winner = true;
+            if (request >= 0 && request < numRequests)
+            {
+                auto* table = ownerTable + static_cast<int64_t>(request) * tableSlots;
+                uint32_t slot = ownerWorklistHash(static_cast<uint32_t>(physical)) & (tableSlots - 1);
+                unsigned long long const entry = (static_cast<unsigned long long>(static_cast<uint32_t>(physical)) << 32)
+                    | static_cast<uint32_t>(pair);
+                for (int32_t probe = 0; probe < tableSlots; ++probe, slot = (slot + 1) & (tableSlots - 1))
+                {
+                    unsigned long long const old = atomicCAS(table + slot, ~0ULL, entry);
+                    if (old == ~0ULL || static_cast<uint32_t>(old >> 32) == static_cast<uint32_t>(physical))
+                    {
+                        int32_t const owner = old == ~0ULL ? static_cast<int32_t>(pair)
+                                                          : static_cast<int32_t>(static_cast<uint32_t>(old));
+                        compactIndices[pair] = owner;
+                        winner = owner == pair;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Invalid IDs and partial blocks still participate in every collective.
+    int32_t const lane = threadIdx.x % kWarpSize;
+    int32_t const warp = threadIdx.x / kWarpSize;
+    unsigned int const mask = __ballot_sync(0xFFFFFFFFU, winner);
+    int32_t const rank = __popc(mask & ((1U << lane) - 1));
+    __shared__ int32_t counts[kWarpsPerBlock], offsets[kWarpsPerBlock], base;
+    if (lane == 0)
+    {
+        counts[warp] = __popc(mask);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        int32_t total = 0;
+        for (int32_t i = 0; i < kWarpsPerBlock; ++i)
+        {
+            offsets[i] = total;
+            total += counts[i];
+        }
+        base = total != 0 ? atomicAdd(ownerCount, total) : 0;
+    }
+    __syncthreads();
+    if (winner)
+    {
+        ownerPairs[base + offsets[warp] + rank] = static_cast<int32_t>(pair);
+    }
+}
+
+__device__ __forceinline__ int32_t fetchOwnerGlobalIndex(int32_t const* globalIndices, int32_t* compactIndices,
+    int32_t const* ownerPairs, int64_t workItem, int64_t numPairs, int64_t numPoolTokens, int32_t lane)
+{
+    int32_t globalIdx = -1;
+    if (lane == 0)
+    {
+        int32_t const pair = ownerPairs[workItem];
+        if (pair >= 0 && static_cast<int64_t>(pair) < numPairs)
+        {
+            globalIdx = globalIndices[pair];
+            bool const valid = globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens;
+            compactIndices[pair] = valid ? pair : -1;
+            globalIdx = valid ? globalIdx : -1;
+        }
+    }
+    return __shfl_sync(0xFFFFFFFFU, globalIdx, 0);
+}
+
+__global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaOwnerWorklistGatherKernel(
+    uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool,
+    int32_t const* __restrict__ globalIndices, __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
+    float const* __restrict__ globalDequantScale, int64_t numPairs, int64_t numPoolTokens,
+    int32_t const* __restrict__ ownerPairs, int32_t const* __restrict__ ownerCount)
+{
+    int32_t const selectedOwners = *ownerCount;
+    if (selectedOwners < 0 || static_cast<int64_t>(selectedOwners) > numPairs)
+    {
+        return;
+    }
+    constexpr int32_t kResidualDim = kMlaResidualDim;
+    constexpr bool kCompactLayout = false;
+    constexpr int32_t kPackedHeadDim = kMlaPackedHeadDim + kResidualDim / 2;
+    constexpr int32_t kScalesPerToken = kMlaScalesPerToken + kResidualDim / 16;
+    constexpr int32_t kStagingRowBytes
+        = (kPackedHeadDim + kScalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes;
+    int32_t const warp = threadIdx.x / kWarpSize;
+    int32_t const lane = threadIdx.x % kWarpSize;
+    float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
+    __shared__ __align__(16) uint8_t staging[kMlaStagingBuffers][kWarpsPerBlock][kStagingRowBytes];
+    int64_t pair = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    int64_t const pairStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+    if (pair >= selectedOwners)
+    {
+        return;
+    }
+
+    int32_t globalIdx = fetchOwnerGlobalIndex(globalIndices, compactIndices, ownerPairs, pair, numPairs, numPoolTokens, lane);
+    int32_t stage = 0;
+    prefetchMlaRowForResidual<kResidualDim>(staging[stage][warp], dataPool, scalePool, globalIdx, lane, kCompactLayout);
+    int64_t nextPair = pair + pairStride;
+    bool hasNext = nextPair < selectedOwners;
+    int32_t nextGlobalIdx = -1;
+    if (hasNext)
+    {
+        nextGlobalIdx = fetchOwnerGlobalIndex(globalIndices, compactIndices, ownerPairs, nextPair, numPairs, numPoolTokens, lane);
+        prefetchMlaRowForResidual<kResidualDim>(
+            staging[1][warp], dataPool, scalePool, nextGlobalIdx, lane, kCompactLayout);
+    }
+    while (true)
+    {
+        if (hasNext)
+        {
+            waitAsyncCopiesKeepOne();
+        }
+        else
+        {
+            waitAsyncCopies();
+        }
+        __syncwarp();
+
+        int64_t const followingPair = nextPair + pairStride;
+        bool const hasFollowing = hasNext && followingPair < selectedOwners;
+        int32_t followingGlobalIdx = -1;
+        if (hasFollowing)
+        {
+            followingGlobalIdx
+                = fetchOwnerGlobalIndex(globalIndices, compactIndices, ownerPairs, followingPair, numPairs, numPoolTokens, lane);
+            int32_t const prefetchStage = stage == 0 ? 2 : stage - 1;
+            prefetchMlaRowForResidual<kResidualDim>(
+                staging[prefetchStage][warp], dataPool, scalePool, followingGlobalIdx, lane, kCompactLayout);
+        }
+
+        if (globalIdx >= 0)
+        {
+            auto const* stagedScales = reinterpret_cast<__nv_fp8_e4m3 const*>(staging[stage][warp] + kPackedHeadDim);
+            if (dequantScale == 1.F)
+            {
+                dequantizeRow<true>(staging[stage][warp], stagedScales, output, 0, ownerPairs[pair],
+                    kMlaHeadDim, kResidualDim, 1.F, lane);
+            }
+            else
+            {
+                dequantizeRow<false>(staging[stage][warp], stagedScales, output, 0, ownerPairs[pair],
+                    kMlaHeadDim, kResidualDim, dequantScale, lane);
+            }
+        }
+        if (!hasNext)
+        {
+            break;
+        }
+        pair = nextPair;
+        globalIdx = nextGlobalIdx;
+        nextPair = followingPair;
+        nextGlobalIdx = followingGlobalIdx;
+        hasNext = hasFollowing;
+        stage = stage == kMlaStagingBuffers - 1 ? 0 : stage + 1;
+    }
+}
+
 __global__ void nvFp4MlaKvCacheGatherGenericKernel(uint8_t const* __restrict__ dataPool,
     __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* __restrict__ globalIndices,
     __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
@@ -982,6 +1167,52 @@ void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_
         cuKvLengths, selectedFlags, selectedOffsets, globalIndices, numPairs, topK, numRequests, maxKvTokens,
         numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeNvFp4MlaKvCacheGatherWorklistReuse(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* globalIndices, __nv_fp8_e4m3* output, int32_t* compactIndices, int32_t const* ownerPairs,
+    int32_t const* ownerCount, float const* globalDequantScale, int32_t numRows, int32_t topK, int64_t numPoolTokens,
+    cudaStream_t stream)
+{
+    int64_t const numPairs = static_cast<int64_t>(numRows) * topK;
+    TLLM_CHECK(numRows > 0 && topK > 0 && numPairs <= std::numeric_limits<int32_t>::max() && numPoolTokens > 0);
+    int32_t const workBlocks = static_cast<int32_t>((numPairs + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    int32_t const blocks = std::min(workBlocks, tensorrt_llm::common::getMultiProcessorCount() * kGenerationBlocksPerSm);
+    nvFp4MlaOwnerWorklistGatherKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, globalIndices,
+        output, compactIndices, globalDequantScale, numPairs, numPoolTokens, ownerPairs, ownerCount);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeNvFp4MlaKvCacheGatherWorklist(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* globalIndices, int32_t const* queryReqIndices, __nv_fp8_e4m3* output, int32_t* compactIndices,
+    int64_t* ownerTable, int32_t* ownerPairs, int32_t* ownerCount, float const* globalDequantScale,
+    int32_t numRows, int32_t topK, int32_t numRequests, int32_t tableSlots, int64_t numPoolTokens, cudaStream_t stream)
+{
+    int64_t const numPairs = static_cast<int64_t>(numRows) * topK;
+    TLLM_CHECK(numRows > 0 && topK > 0 && numPairs <= std::numeric_limits<int32_t>::max() && numRequests > 0
+        && numPoolTokens > 0 && tableSlots > 0 && (tableSlots & (tableSlots - 1)) == 0);
+    TLLM_CHECK(static_cast<size_t>(numRequests)
+        <= std::numeric_limits<size_t>::max() / sizeof(int64_t) / static_cast<size_t>(tableSlots));
+    // Keep the common power-of-two top-K path division-free.
+    int32_t topKShift = -1;
+    if ((topK & (topK - 1)) == 0)
+    {
+        topKShift = 0;
+        for (int32_t value = topK; value > 1; value >>= 1)
+        {
+            ++topKShift;
+        }
+    }
+    TLLM_CUDA_CHECK(cudaMemsetAsync(
+        ownerTable, 0xFF, static_cast<size_t>(numRequests) * tableSlots * sizeof(int64_t), stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(ownerCount, 0, sizeof(int32_t), stream));
+    int32_t const blocks = static_cast<int32_t>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock);
+    publishOwnerWorklist<<<blocks, kThreadsPerBlock, 0, stream>>>(globalIndices, queryReqIndices, compactIndices,
+        reinterpret_cast<unsigned long long*>(ownerTable), ownerPairs, ownerCount,
+        static_cast<int32_t>(numPairs), topK, topKShift, numRequests, tableSlots, numPoolTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+    invokeNvFp4MlaKvCacheGatherWorklistReuse(dataPool, scalePool, globalIndices, output, compactIndices,
+        ownerPairs, ownerCount, globalDequantScale, numRows, topK, numPoolTokens, stream);
 }
 
 size_t getNvFp4MlaContextKvCacheGatherWorkspaceSize(int32_t totalKvTokens, cudaStream_t stream)

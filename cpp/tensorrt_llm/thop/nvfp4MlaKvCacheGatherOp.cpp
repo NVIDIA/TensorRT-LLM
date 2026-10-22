@@ -17,6 +17,9 @@
 #include "tensorrt_llm/kernels/nvfp4MlaKvCacheGather.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
+#include <ATen/MemoryOverlap.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <initializer_list>
 #include <limits>
 
 namespace th = torch;
@@ -267,12 +270,139 @@ void nvFp4MlaContextKvCacheGatherDirect(th::Tensor const& dataPool, th::Tensor c
         static_cast<int32_t>(residualDim), numPoolTokens, stream);
 }
 
+namespace
+{
+
+struct NvFp4WorklistPools
+{
+    uint8_t const* data;
+    __nv_fp8_e4m3 const* scales;
+};
+
+NvFp4WorklistPools validateNvFp4Worklist(th::Tensor const& hostPoolPointers, th::Tensor const& hostPoolMapping,
+    th::Tensor const& globalIndices, th::Tensor const& output, th::Tensor const& compactIndices,
+    th::Tensor const& ownerPairs, th::Tensor const& ownerCount, th::Tensor const& globalDequantScale,
+    int64_t layerIdx, int64_t numPoolTokens)
+{
+    TORCH_CHECK(hostPoolPointers.device().is_cpu() && hostPoolPointers.scalar_type() == th::kInt64
+            && hostPoolPointers.is_contiguous() && hostPoolPointers.dim() == 3
+            && hostPoolPointers.size(1) == 2 && hostPoolPointers.size(2) == 2,
+        "host_pool_pointers must be contiguous CPU int64 [num_pools, 2, 2]");
+    TORCH_CHECK(hostPoolMapping.device().is_cpu() && hostPoolMapping.scalar_type() == th::kInt32
+            && hostPoolMapping.is_contiguous() && hostPoolMapping.dim() == 2 && hostPoolMapping.size(1) == 2,
+        "host_pool_mapping must be contiguous CPU int32 [num_layers, 2]");
+    TORCH_CHECK(layerIdx >= 0 && layerIdx < hostPoolMapping.size(0), "layer_idx is out of range");
+    TORCH_CHECK(globalIndices.is_cuda() && globalIndices.scalar_type() == th::kInt32
+            && globalIndices.is_contiguous() && globalIndices.dim() == 2 && globalIndices.size(0) > 0
+            && globalIndices.size(1) > 0 && globalIndices.numel() <= std::numeric_limits<int32_t>::max(),
+        "worklist global_indices must be nonempty contiguous CUDA int32 [rows, top_k] with int32 pair count");
+    auto const device = globalIndices.device();
+    TORCH_CHECK(output.device() == device && compactIndices.device() == device && ownerPairs.device() == device
+            && ownerCount.device() == device && globalDequantScale.device() == device,
+        "worklist tensors must share the global_indices CUDA device");
+    TORCH_CHECK(output.scalar_type() == th::kFloat8_e4m3fn && output.is_contiguous() && output.dim() == 3
+            && output.size(0) == globalIndices.size(0) && output.size(1) == globalIndices.size(1)
+            && output.size(2) == 576,
+        "worklist output must be contiguous float8_e4m3fn [rows, top_k, 576]");
+    TORCH_CHECK(compactIndices.scalar_type() == th::kInt32 && compactIndices.is_contiguous()
+            && compactIndices.sizes() == globalIndices.sizes(),
+        "compact_indices must be contiguous int32 with the active global_indices shape");
+    TORCH_CHECK(ownerPairs.scalar_type() == th::kInt32 && ownerPairs.is_contiguous() && ownerPairs.dim() == 1
+            && ownerPairs.numel() >= globalIndices.numel(),
+        "owner_pairs must be contiguous int32 with capacity for every active pair");
+    TORCH_CHECK(ownerCount.scalar_type() == th::kInt32 && ownerCount.is_contiguous() && ownerCount.numel() == 1,
+        "owner_count must contain exactly one contiguous int32 value");
+    TORCH_CHECK(globalDequantScale.scalar_type() == th::kFloat32 && globalDequantScale.is_contiguous()
+            && globalDequantScale.numel() == 1,
+        "global_dequant_scale must contain exactly one contiguous float32 value");
+    TORCH_CHECK(numPoolTokens > 0 && numPoolTokens <= std::numeric_limits<int32_t>::max(),
+        "num_pool_tokens must be a positive int32 value");
+
+    int32_t const poolIdx = hostPoolMapping.data_ptr<int32_t>()[layerIdx * 2];
+    TORCH_CHECK(poolIdx >= 0 && poolIdx < hostPoolPointers.size(0), "mapped pool index is out of range");
+    auto const* pointers = hostPoolPointers.data_ptr<int64_t>() + static_cast<int64_t>(poolIdx) * 4;
+    int64_t const data = pointers[0];
+    int64_t const scales = pointers[1];
+    TORCH_CHECK(data != 0 && scales != 0 && data % 16 == 0 && scales % 8 == 0,
+        "NVFP4 worklist requires aligned non-null data and scale pools");
+    TORCH_CHECK(data != scales && scales != data + 320, "NVFP4 worklist requires separate data and scale pools");
+    return {reinterpret_cast<uint8_t const*>(data), reinterpret_cast<__nv_fp8_e4m3 const*>(scales)};
+}
+
+void checkWorklistDisjoint(std::initializer_list<th::Tensor const*> tensors)
+{
+    for (auto first = tensors.begin(); first != tensors.end(); ++first)
+    {
+        for (auto second = first + 1; second != tensors.end(); ++second)
+        {
+            at::assert_no_overlap(**first, **second);
+        }
+    }
+}
+
+} // namespace
+
+void nvFp4MlaKvCacheGatherWorklist(th::Tensor const& hostPoolPointers, th::Tensor const& hostPoolMapping,
+    th::Tensor const& globalIndices, th::Tensor const& queryReqIndices, th::Tensor& output,
+    th::Tensor& compactIndices, th::Tensor& ownerTable, th::Tensor& ownerPairs, th::Tensor& ownerCount,
+    th::Tensor const& globalDequantScale, int64_t layerIdx, int64_t numRequests, int64_t numPoolTokens)
+{
+    auto const pools = validateNvFp4Worklist(hostPoolPointers, hostPoolMapping, globalIndices, output,
+        compactIndices, ownerPairs, ownerCount, globalDequantScale, layerIdx, numPoolTokens);
+    TORCH_CHECK(numRequests > 0 && numRequests <= std::numeric_limits<int32_t>::max(),
+        "worklist num_requests must be a positive int32 value");
+    TORCH_CHECK(queryReqIndices.device() == globalIndices.device() && queryReqIndices.scalar_type() == th::kInt32
+            && queryReqIndices.is_contiguous() && queryReqIndices.dim() == 1
+            && queryReqIndices.size(0) == globalIndices.size(0),
+        "query_req_indices must be contiguous int32 with one request ID per active row");
+    TORCH_CHECK(ownerTable.device() == globalIndices.device() && ownerTable.scalar_type() == th::kInt64
+            && ownerTable.is_contiguous() && ownerTable.dim() == 2 && ownerTable.size(0) >= numRequests
+            && ownerTable.size(1) > 0 && ownerTable.size(1) <= std::numeric_limits<int32_t>::max()
+            && (ownerTable.size(1) & (ownerTable.size(1) - 1)) == 0,
+        "owner_table must be contiguous int64 [capacity >= num_requests, power-of-two int32 slots]");
+    checkWorklistDisjoint({&globalIndices, &queryReqIndices, &output, &compactIndices, &ownerTable,
+        &ownerPairs, &ownerCount, &globalDequantScale});
+    c10::cuda::CUDAGuard const deviceGuard(globalIndices.device());
+    auto stream = at::cuda::getCurrentCUDAStream(globalIndices.get_device()).stream();
+    tk::invokeNvFp4MlaKvCacheGatherWorklist(pools.data, pools.scales, globalIndices.data_ptr<int32_t>(),
+        queryReqIndices.data_ptr<int32_t>(), reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+        compactIndices.data_ptr<int32_t>(), ownerTable.data_ptr<int64_t>(), ownerPairs.data_ptr<int32_t>(),
+        ownerCount.data_ptr<int32_t>(), globalDequantScale.data_ptr<float>(),
+        static_cast<int32_t>(globalIndices.size(0)), static_cast<int32_t>(globalIndices.size(1)),
+        static_cast<int32_t>(numRequests), static_cast<int32_t>(ownerTable.size(1)), numPoolTokens, stream);
+}
+
+void nvFp4MlaKvCacheGatherWorklistReuse(th::Tensor const& hostPoolPointers, th::Tensor const& hostPoolMapping,
+    th::Tensor const& globalIndices, th::Tensor& output, th::Tensor& compactIndices,
+    th::Tensor const& ownerPairs, th::Tensor const& ownerCount, th::Tensor const& globalDequantScale,
+    int64_t layerIdx, int64_t numPoolTokens)
+{
+    auto const pools = validateNvFp4Worklist(hostPoolPointers, hostPoolMapping, globalIndices, output,
+        compactIndices, ownerPairs, ownerCount, globalDequantScale, layerIdx, numPoolTokens);
+    checkWorklistDisjoint({&globalIndices, &output, &compactIndices, &ownerPairs, &ownerCount, &globalDequantScale});
+    c10::cuda::CUDAGuard const deviceGuard(globalIndices.device());
+    auto stream = at::cuda::getCurrentCUDAStream(globalIndices.get_device()).stream();
+    tk::invokeNvFp4MlaKvCacheGatherWorklistReuse(pools.data, pools.scales, globalIndices.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()), compactIndices.data_ptr<int32_t>(),
+        ownerPairs.data_ptr<int32_t>(), ownerCount.data_ptr<int32_t>(), globalDequantScale.data_ptr<float>(),
+        static_cast<int32_t>(globalIndices.size(0)), static_cast<int32_t>(globalIndices.size(1)), numPoolTokens, stream);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def(
+        "nvfp4_mla_kv_cache_gather_worklist(Tensor host_pool_pointers, Tensor host_pool_mapping, "
+        "Tensor global_indices, Tensor query_req_indices, Tensor(a!) output, Tensor(b!) compact_indices, "
+        "Tensor(c!) owner_table, Tensor(d!) owner_pairs, Tensor(e!) owner_count, Tensor global_dequant_scale, "
+        "int layer_idx, int num_requests, int num_pool_tokens) -> ()");
+    m.def(
+        "nvfp4_mla_kv_cache_gather_worklist_reuse(Tensor host_pool_pointers, Tensor host_pool_mapping, "
+        "Tensor global_indices, Tensor(a!) output, Tensor(b!) compact_indices, Tensor owner_pairs, "
+        "Tensor owner_count, Tensor global_dequant_scale, int layer_idx, int num_pool_tokens) -> ()");
     m.def(
         "nvfp4_mla_kv_cache_gather(Tensor host_pool_pointers, Tensor host_pool_mapping, Tensor global_indices, "
         "Tensor(a!) output, Tensor(b!) compact_indices, Tensor global_dequant_scale, int layer_idx, "
@@ -295,6 +425,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("nvfp4_mla_kv_cache_gather_worklist", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGatherWorklist);
+    m.impl("nvfp4_mla_kv_cache_gather_worklist_reuse", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGatherWorklistReuse);
     m.impl("nvfp4_mla_kv_cache_gather", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGather);
     m.impl("nvfp4_mla_kv_cache_gather_direct", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGatherDirect);
     m.impl("nvfp4_mla_context_kv_cache_gather_direct", &tensorrt_llm::torch_ext::nvFp4MlaContextKvCacheGatherDirect);
