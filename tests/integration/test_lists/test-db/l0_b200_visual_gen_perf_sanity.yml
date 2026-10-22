@@ -23,3 +23,4 @@ l0_b200_visual_gen_perf_sanity:
   - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_2stage_bf16_i2v_cfg2_ulysses4_compile_on] TIMEOUT (180)
   - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_2stage_bf16_t2v_cfg2_ulysses4_compile_on] TIMEOUT (180)
   - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_nvfp4_i2v_cfg2_ulysses4_compile_on] TIMEOUT (120)
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-qwen_image_21_blackwell-qwen_image_21_bf16_vanilla_cfg1] TIMEOUT (180)
