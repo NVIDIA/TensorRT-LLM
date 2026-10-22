@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from tensorrt_llm._torch.visual_gen.token_order import (
     TokenReorder,
     morton3d_permutation,
+    require_native_token_order,
     resolve_token_order,
 )
 from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig
@@ -47,6 +48,13 @@ def test_resolve_token_order_reads_config_or_defaults():
     assert resolve_token_order(None) == "native"
     assert resolve_token_order(SolAttentionConfig(tau=2.0)) == "native"
     assert resolve_token_order(SolAttentionConfig(tau=2.0, token_order="morton")) == "morton"
+
+
+def test_require_native_token_order_rejects_morton_for_other_models():
+    require_native_token_order(None, "FLUX")
+    require_native_token_order(SolAttentionConfig(tau=2.0), "FLUX")
+    with pytest.raises(ValueError, match="FLUX"):
+        require_native_token_order(SolAttentionConfig(tau=2.0, token_order="morton"), "FLUX")
 
 
 @pytest.mark.parametrize("grid", [(1, 32, 32), (4, 8, 8), (21, 30, 52), (3, 5, 7)])
@@ -89,3 +97,14 @@ def test_token_reorder_native_is_identity_and_morton_restores():
     y = morton.permute(x)
     assert not torch.equal(y, x)
     assert torch.equal(morton.restore(y), x)
+
+
+def test_token_reorder_keeps_indices_of_every_prepared_grid():
+    """A captured CUDA graph replays the index pointers it saw; switching grids must not free them."""
+    morton = TokenReorder("morton")
+    morton.prepare((4, 8, 8), torch.device("cpu"))
+    first = morton._perm
+    morton.prepare((2, 8, 8), torch.device("cpu"))
+    assert morton._perm is not first
+    morton.prepare((4, 8, 8), torch.device("cpu"))
+    assert morton._perm is first

@@ -46,6 +46,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.token_order import require_native_token_order
 from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
@@ -143,6 +144,7 @@ class Flux2Pipeline(BasePipeline):
                 "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
                 "sparse_attention_config for FLUX.2."
             )
+        require_native_token_order(_sa_cfg, "FLUX.2")
 
         super().__init__(pipeline_config)
 
