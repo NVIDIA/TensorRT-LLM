@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
+import os
 from typing import Any
 
 import torch
@@ -955,10 +956,27 @@ def run_fp4_mla_attention_decode(
             cutedsl_kernel.run_trtllm_fp4_mla_decode_page_native_from_raw
         )
 
+        # Keep general cases on the original path. This specialization uses
+        # the prepacked-V mufu16 core and linear six-query MTP only.
+        fold_queries = (
+            num_heads == 6
+            and query_len_per_seq == 6
+            and num_gen_seqs == 1
+            and helix_kv_bounds is None
+            and softmax_stats_tensor is None
+            and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
+            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+            and getattr(metadata, "_fp4_mla_fold_q", True)
+            and os.environ.get("TRTLLM_FP4_MLA_FOLD_Q", "1") != "0"
+        )
+        if fold_queries:
+            from .fp4_mla_splitkv import select_split_count
+
+            fold_queries = select_split_count(max_pages * metadata.page_size) > 1
         physical_heads = 128
         kernel_q = q_fp4
         kernel_q_sf = q_sf
-        if num_heads < physical_heads:
+        if num_heads < physical_heads and not fold_queries:
             kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
                 metadata,
                 num_queries,
@@ -1064,6 +1082,43 @@ def run_fp4_mla_attention_decode(
                     "full-pool base and page offset."
                 )
 
+        from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
+
+        if fold_queries:
+            from .fp4_mla_foldq import run_fp4_mla_foldq
+
+            run_fp4_mla_foldq(
+                cutedsl_kernel,
+                metadata,
+                q_fp4,
+                q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                output,
+                splits=select_split_count(max_pages * metadata.page_size),
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                q_global_scale=q_global_scale,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+            )
+            return
+
+        # Helix also needs per-query bounds and softmax stats from the native path.
+        splits = (
+            select_split_count(max_pages * metadata.page_size)
+            if helix_kv_bounds is None and softmax_stats_tensor is None
+            else 1
+        )
+        direct_split_output = splits > 1 and getattr(
+            metadata, "_fp4_mla_splitkv_direct_output", True
+        )
         kernel_output = output
         kernel_softmax_stats = None
         if softmax_stats_tensor is not None:
@@ -1074,40 +1129,64 @@ def run_fp4_mla_attention_decode(
                 dtype=torch.float32,
                 device=output.device,
             )
-        if num_heads < physical_heads:
+        if num_heads < physical_heads and not direct_split_output:
             kernel_output = _ensure_workspace_tensor(
                 metadata,
                 "_fp4_mla_cutedsl_output_buf",
-                (num_queries, physical_heads, kv_lora_rank),
+                (q_batch_capacity, physical_heads, kv_lora_rank),
                 dtype=output.dtype,
                 device=output.device,
-            )
+            )[:num_queries]
 
-        run_trtllm_fp4_mla_decode_page_native_from_raw(
-            kernel_q,
-            kernel_q_sf,
-            kv_cache,
-            sf_cache,
-            core_v_packed,
-            core_v_sf,
-            global_scale,
-            src_page_ids,
-            metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-            kv_lens,
-            kernel_output,
-            max_kv_len=max_pages * metadata.page_size,
-            sm_scale=float(sm_scale),
-            num_heads=physical_heads,
-            q_global_scale=q_global_scale,
-            page_size=metadata.page_size,
-            query_len_per_seq=query_len_per_seq,
-            v_page_offset=v_page_offset,
-            q_batch_capacity=q_batch_capacity,
-            partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
-            softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
-            softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
-            helix_kv_bounds=helix_kv_bounds,
-        )
+        if splits > 1:
+            run_fp4_mla_splitkv(
+                _fp4_mla_cutedsl_kernel_module(),
+                metadata,
+                kernel_q,
+                kernel_q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                kernel_output,
+                splits=splits,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                q_global_scale=q_global_scale,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+                q_batch_capacity=q_batch_capacity,
+            )
+        else:
+            run_trtllm_fp4_mla_decode_page_native_from_raw(
+                kernel_q,
+                kernel_q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                kernel_output,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                num_heads=physical_heads,
+                q_global_scale=q_global_scale,
+                page_size=metadata.page_size,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+                q_batch_capacity=q_batch_capacity,
+                partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+                softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+                softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+                helix_kv_bounds=helix_kv_bounds,
+            )
         if kernel_output is not output:
             output.copy_(kernel_output[:, :num_heads])
         if kernel_softmax_stats is not None:

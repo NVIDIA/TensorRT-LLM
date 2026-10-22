@@ -29,6 +29,7 @@ nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode
 nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 CUDA_GRID_Z_MAX = 65535
+SUPPORTS_FOLDED_QUERIES = True
 INT32_MAX = (1 << 31) - 1
 
 
@@ -1011,6 +1012,8 @@ def fused_fp4_mla_decode_ctm(
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
     write_softmax_stats: ctm.Constexpr = False,
+    store_split: ctm.Constexpr = False,
+    folded_query_heads: ctm.Constexpr = 0,
 ) -> None:
     n, k = problem_size
     m = runtime_m
@@ -1343,6 +1346,8 @@ def fused_fp4_mla_decode_ctm(
         use_consecutive_page_pair,
         use_ksf_gather4,
         write_softmax_stats,
+        store_split,
+        folded_query_heads,
     ).launch(
         grid=(
             cute.ceil_div(c_tensor.shape[0], SMEM_P4_CTA_GROUP_M) * CLUSTER_SHAPE_MNK[0],
@@ -4548,8 +4553,11 @@ def _store_final_o_from_tmem(
     output_normalizer: ctm.Float32,
     write_softmax_stats: ctm.Constexpr = False,
     producer_warp_base: ctm.Constexpr = 0,
+    store_split: ctm.Constexpr = False,
 ) -> None:
     gC_arr = ctm.make_array_view(mC_mnl)
+    gAccum_arr = ctm.make_array_view(mAccum_mnl)
+    vsize: ctm.Constexpr = 16
     tmem_raw_addr = tmem_holding_buf.load()
     base_col_id = tmem_raw_addr & ctm.Int32(65535)
     base_row_id = tmem_raw_addr >> ctm.Int32(16)
@@ -4565,6 +4573,11 @@ def _store_final_o_from_tmem(
         + cta_rank * ctm.Int32(SMEM_P4_BMM1_M)
         + local_row
     )
+    if cutlass.const_expr(store_split):
+        # Both column bands have the same row state; export each row once.
+        if col_band == ctm.Int32(0):
+            mRowMax_ml[row, bidz] = final_row_max
+            mRowSum_ml[row, bidz] = final_row_sum
     batch_offset = bidz * m * n
     if cutlass.const_expr(write_softmax_stats):
         if col_band == ctm.Int32(0) and bidy == ctm.Int32(0):
@@ -4592,17 +4605,28 @@ def _store_final_o_from_tmem(
         tmem = ctm.inttoptr(tmem_addr, 6, ctm.Float32)
         c_rmem = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, tmem, num=subtile_cols)
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-        output_linear_idx = row * n + col_base + batch_offset
-        output_vec_f32 = c_rmem[0:subtile_cols]
-        output_vec = (output_vec_f32 * output_normalizer).to(mC_mnl.element_type)
-        # The decode output is consumed after this kernel and has no in-kernel
-        # reuse.  Avoid allocating its streaming write in L1; on GR100 this
-        # preserves the 256-bit vector store while lowering it to
-        # STG.E.NA.ENL2.256.
-        gC_arr.subview(output_linear_idx).data_ptr().nvvm_store_ext(
-            output_vec,
-            evict=prims.EvictPriority.NOALLOCATE,
-        )
+        for vec_idx in ctm.range_constexpr(subtile_cols // vsize):
+            linear_idx = row * n + col_base + vec_idx * vsize + batch_offset
+            vec_f32 = c_rmem[vec_idx * vsize : vec_idx * vsize + vsize]
+            if cutlass.const_expr(store_split):
+                gAccum_arr.store(
+                    vec_f32 * final_stat_scale,
+                    idx=linear_idx,
+                    vector_size=vsize,
+                    alignment=32,
+                )
+        if cutlass.const_expr(not store_split):
+            output_linear_idx = row * n + col_base + batch_offset
+            output_vec_f32 = c_rmem[0:subtile_cols]
+            output_vec = (output_vec_f32 * output_normalizer).to(mC_mnl.element_type)
+            # The decode output is consumed after this kernel and has no in-kernel
+            # reuse.  Avoid allocating its streaming write in L1; on GR100 this
+            # preserves the 256-bit vector store while lowering it to
+            # STG.E.NA.ENL2.256.
+            gC_arr.subview(output_linear_idx).data_ptr().nvvm_store_ext(
+                output_vec,
+                evict=prims.EvictPriority.NOALLOCATE,
+            )
 
 
 @cute.jit
@@ -5553,6 +5577,7 @@ def _runtime_t336_producer_tile_v23(
     tail_needs_mask: ctm.Boolean,
     is_final_tile: ctm.Constexpr,
     use_mixed_imlp: ctm.Constexpr,
+    causal_mask_possible: ctm.Constexpr = False,
 ) -> tuple:
     """Run one producer tile with a scalar-only runtime final-tail dispatch."""
     bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
@@ -5588,7 +5613,7 @@ def _runtime_t336_producer_tile_v23(
     lane_rebase = ctm.Boolean(False)
     anchor_delta_log2 = ctm.Float32(0.0)
     row_sum = ctm.Float32(0.0)
-    if cutlass.const_expr(is_final_tile):
+    if cutlass.const_expr(is_final_tile or causal_mask_possible):
         if tail_needs_mask:
             (
                 next_running_row_max,
@@ -5858,6 +5883,8 @@ def _run_mla_decode_body(
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
     write_softmax_stats: ctm.Constexpr = False,
+    store_split: ctm.Constexpr = False,
+    folded_query_heads: ctm.Constexpr = 0,
 ) -> None:
     pv_psf_rescale = ctm.Float32(FP4_MLA_P_GLOBAL_SCALE) * pv_output_scale
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -5868,7 +5895,9 @@ def _run_mla_decode_body(
     page_batch = ctm.Int32(0)
     valid_k_for_l = ctm.Int32(0)
     page_batch = cute.arch.make_warp_uniform(bidz // ctm.Int32(query_len_per_seq))
-    if cutlass.const_expr(use_helix_kv_bounds):
+    if cutlass.const_expr(folded_query_heads > 0):
+        valid_k_for_l = mValidK_l[page_batch]
+    elif cutlass.const_expr(use_helix_kv_bounds):
         valid_k_for_l = mHelixKvBounds_l[bidz]
     else:
         query_offset = bidz - page_batch * ctm.Int32(query_len_per_seq)
@@ -5877,6 +5906,9 @@ def _run_mla_decode_body(
             ctm.Int32(0),
         )
     valid_k_for_l = cute.arch.make_warp_uniform(valid_k_for_l)
+    folded_first_valid_k = ctm.Int32(0)
+    if cutlass.const_expr(folded_query_heads > 0):
+        folded_first_valid_k = cute.arch.make_warp_uniform(mHelixKvBounds_l[bidz])
     csr_page_begin = ctm.Int32(0)
     csr_page_count = ctm.Int32(0)
     csr_page_begin = cute.arch.make_warp_uniform(ctm.Int32(mPageIndptr_s[page_batch]))
@@ -6678,6 +6710,19 @@ def _run_mla_decode_body(
                     qsf_done_peer_mbar = _mapa_shared_cluster(qsf_owner_done_mbar, ctm.Int32(0))
                     _mbarrier_arrive_release_cta_shared_cluster(qsf_done_peer_mbar)
         stream_li_total = kv_tiles
+        producer_valid_k = valid_k_for_l
+        if cutlass.const_expr(folded_query_heads > 0):
+            # Both producer column bands own the same score row. Each CTA owns
+            # 64 head rows; packed rows are [logical query, logical head].
+            producer_row = (
+                cta_rank * ctm.Int32(SMEM_P4_BMM1_M)
+                + (warp_idx & ctm.Int32(1)) * ctm.Int32(32)
+                + (tidx & ctm.Int32(31))
+            )
+            logical_query = producer_row // ctm.Int32(folded_query_heads)
+            producer_valid_k = ctm.min(
+                valid_k_for_l, ctm.max(folded_first_valid_k + logical_query, ctm.Int32(0))
+            )
         running_row_max = ctm.Float32(-ctm.Float32.inf)
         running_row_anchor = ctm.Float32(-ctm.Float32.inf)
         p4_tmem_raw_addr = tmem_holding_buf.load()
@@ -6704,6 +6749,13 @@ def _run_mla_decode_body(
         stream_li_idx = ctm.Int32(0)
         stream_li_remaining = stream_li_total
         while stream_li_remaining > ctm.Int32(1):
+            producer_needs_mask = ctm.Boolean(False)
+            if cutlass.const_expr(folded_query_heads > 0):
+                # The MTP window may straddle a 256-token tile boundary, so
+                # the penultimate tile can also need per-row causal masking.
+                producer_needs_mask = folded_first_valid_k < (
+                    (stream_li_idx + ctm.Int32(1)) * ctm.Int32(KV_TILE)
+                )
             running_row_max, running_row_anchor, carried_dq1024, carried_old_scale = (
                 _runtime_t336_producer_tile_v23(
                     sAtomicRunningRowMax,
@@ -6725,7 +6777,7 @@ def _run_mla_decode_body(
                     tidx,
                     p4_tmem_base_col_id,
                     p4_tmem_base_row_id,
-                    valid_k_for_l,
+                    producer_valid_k,
                     softmax_scale_log2,
                     pv_psf_rescale,
                     running_row_max,
@@ -6734,15 +6786,18 @@ def _run_mla_decode_body(
                     carried_old_scale,
                     stream_li_idx,
                     stream_li_idx > ctm.Int32(0),
-                    ctm.Boolean(False),
+                    producer_needs_mask,
                     False,
                     use_mixed_imlp,
+                    folded_query_heads > 0,
                 )
             )
             stream_li_idx = stream_li_idx + ctm.Int32(1)
             stream_li_remaining = stream_li_remaining - ctm.Int32(1)
         final_tile_k_end = (stream_li_idx + ctm.Int32(1)) * ctm.Int32(KV_TILE)
         tail_needs_mask = valid_k_for_l < final_tile_k_end
+        if cutlass.const_expr(folded_query_heads > 0):
+            tail_needs_mask = folded_first_valid_k < final_tile_k_end
         running_row_max, running_row_anchor, carried_dq1024, carried_old_scale = (
             _runtime_t336_producer_tile_v23(
                 sAtomicRunningRowMax,
@@ -6764,7 +6819,7 @@ def _run_mla_decode_body(
                 tidx,
                 p4_tmem_base_col_id,
                 p4_tmem_base_row_id,
-                valid_k_for_l,
+                producer_valid_k,
                 softmax_scale_log2,
                 pv_psf_rescale,
                 running_row_max,
@@ -6835,6 +6890,16 @@ def _run_mla_decode_body(
                     final_stat_scale = ctm.Float32(1.0)
                     final_row_max = ctm.Float32(-ctm.Float32.inf)
                     final_row_sum = ctm.Float32(0.0)
+            if cutlass.const_expr(store_split):
+                # Convert the lazy-anchor numerator and denominator to the
+                # true row maximum expected by the shared reduction kernel.
+                # Empty splits avoid evaluating -inf - -inf.
+                if final_anchor_row_sum != ctm.Float32(0.0):
+                    final_stat_scale = cute.exp2(
+                        (running_row_anchor - running_row_max) * softmax_scale_log2,
+                        fastmath=True,
+                    )
+                    final_row_sum = final_anchor_row_sum * final_stat_scale
             output_normalizer = ctm.Float32(0.0)
             if valid_k_for_l != ctm.Int32(0) and final_anchor_row_sum != ctm.Float32(0.0):
                 output_normalizer = cute.arch.rcp_approx(final_anchor_row_sum) * pv_output_scale
@@ -6867,6 +6932,7 @@ def _run_mla_decode_body(
                 final_stat_scale=final_stat_scale,
                 output_normalizer=output_normalizer,
                 write_softmax_stats=write_softmax_stats,
+                store_split=store_split,
                 producer_warp_base=SMEM_P4_CORRECTION_WARP_ID_BEGIN,
             )
             prims.barrier(barrier_id=O_STORE_BAR_ID, number_of_threads=O_STORE_BAR_THREADS)
@@ -6919,6 +6985,8 @@ def kernel(
     use_consecutive_page_pair: ctm.Constexpr,
     use_ksf_gather4: ctm.Constexpr,
     write_softmax_stats: ctm.Constexpr,
+    store_split: ctm.Constexpr = False,
+    folded_query_heads: ctm.Constexpr = 0,
 ) -> None:
     _run_mla_decode_body(
         mPageTable_pl,
@@ -6958,6 +7026,8 @@ def kernel(
         use_consecutive_page_pair,
         use_ksf_gather4,
         write_softmax_stats,
+        store_split,
+        folded_query_heads,
     )
 
 
@@ -7212,6 +7282,8 @@ def _compile_fused(
     use_consecutive_page_pair: bool = False,
     write_softmax_stats: bool = False,
     use_helix_kv_bounds: bool = False,
+    store_split: bool = False,
+    folded_query_heads: int = 0,
 ) -> Callable:
     if type(kv) is not int:
         raise TypeError(f"runtime-KV compile K must be an int, got {type(kv).__name__}")
@@ -7240,6 +7312,8 @@ def _compile_fused(
         use_ksf_gather4,
         write_softmax_stats,
         use_helix_kv_bounds,
+        store_split,
+        folded_query_heads,
     )
     cached = _FUSED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
@@ -7288,6 +7362,8 @@ def _compile_fused(
         use_consecutive_page_pair=use_consecutive_page_pair,
         use_ksf_gather4=use_ksf_gather4,
         write_softmax_stats=write_softmax_stats,
+        store_split=store_split,
+        folded_query_heads=folded_query_heads,
         options="--opt-level 2 --ptxas-options '--uumn'",
     )
     _FUSED_COMPILE_CACHE[cache_key] = compiled
@@ -7322,6 +7398,8 @@ def run_trtllm_fp4_mla_decode_page_native(
     softmax_row_max: torch.Tensor | None = None,
     softmax_row_sum: torch.Tensor | None = None,
     helix_kv_bounds: torch.Tensor | None = None,
+    split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    folded_query_heads: int = 0,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -7336,6 +7414,14 @@ def run_trtllm_fp4_mla_decode_page_native(
         raise ValueError(
             f"page-native decode requires page_size={TRTLLM_PAGE_SIZE}, got {page_size}"
         )
+    # In folded mode the bounds tensor carries the first logical query's
+    # unclamped endpoint relative to this split. The normal Helix ABI is unchanged.
+    if folded_query_heads not in (0, 6):
+        raise ValueError("folded queries currently require six logical heads")
+    if folded_query_heads and (
+        query_len_per_seq != 1 or helix_kv_bounds is None or split_kv_buffers is None
+    ):
+        raise ValueError("folded queries require split output and per-task causal bounds")
     physical_k = _select_runtime_kv_profile(max_kv_len)
     for name, value in (
         ("assume_valid_k_prefix_tiles", assume_valid_k_prefix_tiles),
@@ -7601,6 +7687,25 @@ def run_trtllm_fp4_mla_decode_page_native(
         raise TypeError("q_global_scale must be a scalar FP32 CUDA tensor")
     if kv_global_scale.dtype != torch.float32 or kv_global_scale.numel() != 1:
         raise TypeError("kv_global_scale must be a scalar FP32 CUDA tensor")
+    if split_kv_buffers is not None:
+        if write_softmax_stats:
+            raise ValueError("split-KV buffers and softmax stats outputs are mutually exclusive")
+        expected_shapes = (
+            (l_batch, physical_m, TRTLLM_V_HEAD_DIM),
+            (l_batch, physical_m),
+            (l_batch, physical_m),
+        )
+        if len(split_kv_buffers) != 3:
+            raise ValueError("split_kv_buffers requires numerator, maxima, and sums")
+        for tensor, shape in zip(split_kv_buffers, expected_shapes):
+            if (
+                tensor.shape != shape
+                or tensor.dtype != torch.float32
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(f"split-KV buffer must be contiguous FP32 {shape} on {device}")
+            _validate_tensor_pointer_alignment("split-KV buffer", tensor, alignment_bytes=32)
     stream = _current_cu_stream()
     device_index = torch.cuda.current_device()
     context_result, current_context = cuda.cuCtxGetCurrent()
@@ -7623,6 +7728,11 @@ def run_trtllm_fp4_mla_decode_page_native(
         helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else valid_k_data_ptr
     )
     c_data_ptr = output.data_ptr()
+    split_o_data_ptr, split_max_data_ptr, split_sum_data_ptr = (
+        tuple(tensor.data_ptr() for tensor in split_kv_buffers)
+        if split_kv_buffers is not None
+        else (scratch_ptr, row_max_data_ptr, row_sum_data_ptr)
+    )
     page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
     q_global_scale_data_ptr = q_global_scale.data_ptr()
     kv_global_scale_data_ptr = kv_global_scale.data_ptr()
@@ -7642,9 +7752,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         valid_k_data_ptr,
         helix_kv_bounds_data_ptr,
         c_data_ptr,
-        scratch_ptr,
-        row_max_data_ptr,
-        row_sum_data_ptr,
+        split_o_data_ptr,
+        split_max_data_ptr,
+        split_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -7664,6 +7774,8 @@ def run_trtllm_fp4_mla_decode_page_native(
         use_consecutive_page_pair=use_consecutive_page_pair,
         write_softmax_stats=write_softmax_stats,
         use_helix_kv_bounds=helix_kv_bounds is not None,
+        store_split=split_kv_buffers is not None,
+        folded_query_heads=folded_query_heads,
     )
     supports_prepared = _class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
@@ -7683,8 +7795,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         valid_k_data_ptr,
         helix_kv_bounds_data_ptr,
         c_data_ptr,
-        row_max_data_ptr,
-        row_sum_data_ptr,
+        split_o_data_ptr,
+        split_max_data_ptr,
+        split_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -7719,9 +7832,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         valid_k_data_ptr,
         helix_kv_bounds_data_ptr,
         c_data_ptr,
-        scratch_ptr,
-        row_max_data_ptr,
-        row_sum_data_ptr,
+        split_o_data_ptr,
+        split_max_data_ptr,
+        split_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -7803,6 +7916,8 @@ def run_trtllm_fp4_mla_decode_page_native_from_raw(
     softmax_row_max: torch.Tensor | None = None,
     softmax_row_sum: torch.Tensor | None = None,
     helix_kv_bounds: torch.Tensor | None = None,
+    split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    folded_query_heads: int = 0,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -7857,4 +7972,6 @@ def run_trtllm_fp4_mla_decode_page_native_from_raw(
         softmax_row_max=softmax_row_max,
         softmax_row_sum=softmax_row_sum,
         helix_kv_bounds=helix_kv_bounds,
+        split_kv_buffers=split_kv_buffers,
+        folded_query_heads=folded_query_heads,
     )
