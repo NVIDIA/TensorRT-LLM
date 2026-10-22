@@ -197,6 +197,11 @@ def _fill_stall_timeout_sec() -> float:
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1: also stream the first GEN step of a
+# generation-only request (see _handle_responses); otherwise its first streamed
+# content waits for decoding iteration stream_interval.
+DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME = "TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP"
+
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
 # max_input_len truncation.
@@ -562,6 +567,8 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.disagg_gen_emit_first_step = os.environ.get(
+            DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME, "0") == "1"
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
@@ -9353,6 +9360,9 @@ class PyExecutor:
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}
+        # Read through getattr: this pass also runs on the minimal executors
+        # unit tests assemble.
+        emit_first_gen_step = getattr(self, "disagg_gen_emit_first_step", False)
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -9430,9 +9440,17 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
+            # A generation-only request under the overlap scheduler skipped its
+            # iteration-1 response above (the CTX returned the first token), so
+            # with stream_interval N its first streamed content would wait for
+            # decoding iteration N; TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1 streams
+            # its first GEN step as well.
+            first_gen_emit = (
+                emit_first_gen_step and request.is_generation_only_request
+                and not getattr(request, "py_gen_first_emitted", False))
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or request.py_decoding_iter % self.stream_interval
-                           == 0)
+                           or first_gen_emit or
+                           request.py_decoding_iter % self.stream_interval == 0)
             # The early-emit prototype issues the (non-terminal) iter-1
             # response from `_emit_first_token_responses`; suppress it here.
             if (not emit_first_iter and request.py_decoding_iter == 1
@@ -9445,6 +9463,8 @@ class PyExecutor:
                         [request], gpu_times_cache=gpu_times_cache)
                 response = request.create_response()
                 if response:
+                    if first_gen_emit:
+                        request.py_gen_first_emitted = True
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     self._maybe_attach_ctx_usage(request, response)
