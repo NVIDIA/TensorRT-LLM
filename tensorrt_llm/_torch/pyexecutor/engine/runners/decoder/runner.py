@@ -640,25 +640,28 @@ class DecoderRunner(ScheduledModelRunner):
             stager = None
             stager_source = self.runtime_hooks.step_input_stager
             if stager_source is not None:
+                # Only the replay of an already captured graph closes the window
+                # (before_replay); an eager step, an initial capture or a warmup
+                # would run the model before the staged writes are issued, so
+                # those steps always prepare natively.
                 graph_replay = (
                     can_run_graph
                     and not self.cuda_graph_runner.needs_capture(key)
                     and not self.cuda_graph_runner.is_warmup_only
                 )
-                stager = stager_source.begin_if_eligible(
-                    self._inputs,
-                    execution_requests,
-                    attn_metadata,
-                    spec_metadata,
-                    new_tensors_device,
-                    graph_replay=graph_replay,
-                    static_inputs=(
-                        self.cuda_graph_runner.shared_static_tensors if graph_replay else None
-                    ),
-                    is_dummy=is_dummy,
-                    enable_spec_decode=enable_spec_decode,
-                    promoted=bool(execution_promoted_context_ids),
-                )
+                if graph_replay:
+                    stager = stager_source.begin_if_eligible(
+                        self._inputs,
+                        execution_requests,
+                        attn_metadata,
+                        spec_metadata,
+                        new_tensors_device,
+                        graph_replay=graph_replay,
+                        static_inputs=self.cuda_graph_runner.shared_static_tensors,
+                        is_dummy=is_dummy,
+                        enable_spec_decode=enable_spec_decode,
+                        promoted=bool(execution_promoted_context_ids),
+                    )
             try:
                 # The window spans the scope: the scope is a no-op whenever
                 # speculative decoding is on, which every stager requires.
