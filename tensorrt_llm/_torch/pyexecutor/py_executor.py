@@ -5005,30 +5005,31 @@ class PyExecutor:
         return need
 
     def _consume_previous_batch_for_rebalance(self) -> None:
-        """Drain ``previous_batch`` so its _KVCache instances are quiescent.
+        """Drain in-flight batch work before KV pool rebalance.
 
-        No-op when ``previous_batch is None`` -- i.e., always a no-op in
-        the non-overlap loop, since that loop never sets previous_batch.
-        In the overlap loop this fires when the rebalance hook catches a
-        pending in-flight iteration; we consume it inline so suspend can
-        safely run.
-
-        Mirrors the inline sequence in ``_executor_loop_overlap`` that
-        handles ``previous_batch``.  Unlike the inline code we are not
-        guarded by ``should_process_previous_batch``: the rebalance gate
-        already excludes the multi-rank-divergence cases that flag exists
-        to handle.
+        In overlap mode, ADP ranks must participate in the transfer-response,
+        batch-response, and KV-event collectives even without a local batch.
+        Other modes remain a no-op when there is no previous batch.
         """
-        if self.previous_batch is None:
+        previous_batch = self.previous_batch
+        if previous_batch is None and (not self.enable_attention_dp
+                                       or self.disable_overlap_scheduler):
             return
-        self._update_requests(self.previous_batch.sample_state)
-        self._send_kv_async(
-            self.previous_batch.scheduled_requests.all_requests())
+        if previous_batch is not None:
+            self._update_requests(previous_batch.sample_state)
+            self._send_kv_async(
+                previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()
-        self._process_previous_batch()
-        self.perf_manager.compute_batch_gpu_times(
-            self.previous_batch.scheduled_requests.all_requests())
-        self.previous_batch = None
+        if previous_batch is not None:
+            self._process_previous_batch()
+        else:
+            self._enqueue_responses([])
+        if self.enable_kv_cache_events:
+            self._add_kv_cache_events()
+        if previous_batch is not None:
+            self.perf_manager.compute_batch_gpu_times(
+                previous_batch.scheduled_requests.all_requests())
+            self.previous_batch = None
 
     def _maybe_rebalance_kv_pools(self) -> None:
         """Rebalance KV pool ratios when the V2 auto-tuner asks for it.
@@ -5532,6 +5533,12 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # KV-cache event flushing performs an attention-DP allgather.
+                # Keep it outside the rank-divergent previous-batch branch so
+                # every rank enters the collective in the same order.
+                if self.enable_kv_cache_events:
+                    self._add_kv_cache_events()
+
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to
                 # the _enqueue_responses([]) call in the else branch.
@@ -5679,8 +5686,6 @@ class PyExecutor:
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
-        if self.enable_kv_cache_events:
-            self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
