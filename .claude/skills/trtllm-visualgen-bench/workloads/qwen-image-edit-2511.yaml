@@ -1,0 +1,23 @@
+# Qwen/Qwen-Image-Edit-2511  ·  QwenImageEditPlusPipeline  ·  image edit
+#
+# /v1/images/edits is the only image route with a field for an input image, which this
+# pipeline requires; /v1/images/generations 422s.
+# width/height are what the reference resolves to: the pipeline fits its aspect to
+# _VAE_IMAGE_SIZE = 1024*1024. Pinned so the shape is in the file, and so
+# `serve_check.py --warmup-from` can read it. Set both or neither; a new reference
+# needs them recomputed.
+backend: openai-image-edits
+
+common_params:
+  width: 1024
+  height: 1024
+  num_inference_steps: 50
+  guidance_scale: 4.0
+  max_sequence_length: 512
+  seed: 42
+
+requests:
+  - prompt: Transform the scene into sunset with orange and pink sky reflections on the lake while preserving the mountain, tree, and lake layout.
+    image_reference:
+      content: ../media/landscape.png
+      format: path

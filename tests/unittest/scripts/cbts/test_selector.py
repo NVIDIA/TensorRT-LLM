@@ -18,15 +18,18 @@
 from __future__ import annotations
 
 import difflib
+import json
 from pathlib import Path
 
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.command.main import Selector, _load_pr_inputs
 from cbts.coverage.selection.selector import CoverageSelector
 from cbts.coverage.tier import apply_coverage_tier
 from cbts.rules.base import PRInputs
+from cbts.rules.docs import CPU_TEST_YAML_STEM, DOCS_STAGE, DocsRule
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -604,3 +607,74 @@ def test_ordinary_no_data_function_change_keeps_file_fallback() -> None:
     assert result.ok
     assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
     assert result.caller_bounded_funcs == []
+
+
+@pytest.mark.parametrize("method_change", (False, True))
+def test_class_docstring_and_code_changes_preserve_coverage_decision(
+    tmp_path: Path, method_change: bool
+) -> None:
+    path = "tensorrt_llm/example.py"
+    before = (
+        'class Example:\n    "old docs"\n    VALUE = 1\n    def caller(self):\n        return 1\n'
+    )
+    source = (
+        'class Example:\n    "new docs"\n'
+        f"    VALUE = {1 if method_change else 2}\n"
+        f"    def caller(self):\n        return {2 if method_change else 1}\n"
+    )
+    source_path = tmp_path / path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source)
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps({"changed_files": [path], "diffs": {path: diff}}))
+    pr = _load_pr_inputs(input_path, tmp_path)
+    yaml_index = YAMLIndex()
+    yaml_index.blocks = [
+        Block(
+            yaml_stem=CPU_TEST_YAML_STEM,
+            block_index=0,
+            condition={},
+            tests=["unittest/api_stability"],
+        ),
+        Block(
+            yaml_stem="l0_a10",
+            block_index=0,
+            condition={},
+            tests=["test_caller", "test_unrelated"],
+        ),
+    ]
+    stages = {
+        name: Stage(
+            name=name,
+            yaml_stem=stem,
+            cpu_arch="x86_64",
+            split_id=1,
+            total_splits=1,
+        )
+        for name, stem in (
+            ("CPU-Generic-x86-1", CPU_TEST_YAML_STEM),
+            ("A10-PyTorch-1", "l0_a10"),
+        )
+    }
+    selector = Selector(stages)
+    result = selector.run(pr, [DocsRule(yaml_index, stages)])
+    db = _FakeDB()
+    db.rows["Example"] = {"A10-PyTorch-1/test_unrelated"}
+    db.rows["Example.caller"] = {"A10-PyTorch-1/test_caller"}
+
+    tier, note = apply_coverage_tier(
+        pr, selector.pairs, selector.handled, stages, yaml_index, tmp_path, db
+    )
+
+    assert result.scope is None
+    assert pr.docstring_files == {path}
+    assert not pr.docstring_only_files
+    assert not selector.handled
+    if method_change:
+        assert tier is not None, note
+        assert tier.removed == {("l0_a10", 0): {"test_unrelated"}}
+        assert tier.affected_stages == set(stages) | {DOCS_STAGE}
+    else:
+        assert tier is None
+        assert "class/signature import change" in note

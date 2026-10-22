@@ -542,6 +542,26 @@ def _dsr1():
     return _DSR1
 
 
+# The last R1 layer built at a moe_tp slice of the expert intermediate. One
+# slot rather than one per width: a 256-expert layer is several GB of codes.
+_DSR1_SLICE: dict = {}
+
+
+def _dsr1_at(inter: int):
+    """The R1 layer at an expert intermediate of `inter`.
+
+    A moe_tp rank's slice is a layer of its own: the target cuts the up/gate
+    rows and down columns before the kernel layout, so the kernel sees an
+    ordinary layer of that width (the deepseek default shard test pins the
+    cut-then-layout order)."""
+    if inter == 2048:
+        return _dsr1()
+    if inter not in _DSR1_SLICE:
+        _DSR1_SLICE.clear()
+        _DSR1_SLICE[inter] = _build(256, 7168, inter, seed=256 + inter)
+    return _DSR1_SLICE[inter]
+
+
 # The token column certified at the R1 geometry. 8192 is trtllm's default
 # `max_num_tokens`; a dep4 target gathers four ranks' tokens before the expert
 # call, so its own T reaches 4 * 8192 and it must chunk down into calls this
@@ -2294,8 +2314,18 @@ def test_strided_inputs_are_silently_wrong():
     print("  test_strided_inputs_are_silently_wrong OK")
 
 
-# The shared layer each cell's (num_experts, hidden, intermediate) names.
+# The shared layer each cell's (num_experts, hidden, intermediate) names. An
+# R1 cell at a moe_tp slice of the intermediate takes `_dsr1_at` instead.
 _GEOMETRIES = {(256, 7168, 2048): _dsr1, (512, 2560, 640): _many_experts}
+
+
+def _cell_layer(spec: dict):
+    """The shared layer and reference a cell's geometry names."""
+    key = (spec["num_experts"], spec["hidden"], spec["intermediate"])
+    if key in _GEOMETRIES:
+        return _GEOMETRIES[key]()
+    assert key[:2] == (256, 7168), f"no shared layer for cell geometry {key}"
+    return _dsr1_at(key[2])
 
 
 @pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
@@ -2313,7 +2343,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     """
     certifying(moe)
     spec = cell.spec
-    args, ref = _GEOMETRIES[(spec["num_experts"], spec["hidden"], spec["intermediate"])]()
+    args, ref = _cell_layer(spec)
     off, n = spec["local_expert_offset"], spec["local_num_experts"]
     num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
     gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
