@@ -7089,29 +7089,28 @@ def _fp8_rowwise(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class _Fp8VerifyHead:
-    """The target's `lm_head` under the dense FP8 mode: decode rows (up to `fp8_gemv`'s) on the
-    packed block-scaled copy, other calls on the bf16 head."""
+    """The target's `lm_head` under the dense FP8 mode: `_Fp8DraftHead` over the same copies --
+    decode rows up to `fp8_gemv`'s on the packed block-scaled copy, more rows (a large verify
+    step) on the per-row-scaled copy through cuBLASLt with per-token activation scales."""
 
-    def __init__(self, lm_head, packed) -> None:
-        self.lm_head, self.packed = lm_head, packed
+    def __init__(self, rowwise: tuple, packed) -> None:
+        self.head = _Fp8DraftHead(*rowwise, packed)
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] <= _FP8_GEMV_HEAD_ROWS and _gemv_ready(hidden_states):
-            return fp8_gemv_op(hidden_states, self.packed)
-        return self.lm_head(hidden_states)
+        return self.head(hidden_states)
 
 
 class _WideningLogitsProcessor(LogitsProcessor):
     """The shell's logits processor (its row gather, its fp32 logits) over `_WidenedHead`;
     with `fp8_head` set (the dense FP8 mode) the target's own head runs `_Fp8VerifyHead`."""
 
-    fp8_head = None
+    fp8_head = None  # (rowwise copy, packed copy) under the dense FP8 mode
 
     def forward(
         self, hidden_states, lm_head, attn_metadata, return_context_logits: bool = False
     ) -> torch.Tensor:
         if self.fp8_head is not None and not isinstance(lm_head, _Fp8DraftHead):
-            lm_head = _Fp8VerifyHead(lm_head, self.fp8_head)
+            lm_head = _Fp8VerifyHead(*self.fp8_head)
         return super().forward(
             hidden_states, _WidenedHead(lm_head), attn_metadata, return_context_logits
         )
@@ -7568,11 +7567,14 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         super().post_load_weights()
         self.model.post_load_weights()
         draft_fp8 = self.model.mtp_enabled and _mtp_draft_head_mode() == "fp8"
+        rowwise = (
+            _fp8_rowwise(self.lm_head.weight.data) if draft_fp8 or _dense_fp8_enabled() else None
+        )
         if draft_fp8:
-            self.model._mtp_head_fp8 = _fp8_rowwise(self.lm_head.weight.data)
+            self.model._mtp_head_fp8 = rowwise
         # One packed block-scaled copy serves the draft head's decode rows and, under the dense
         # FP8 mode, the target's own head's.
         if draft_fp8 or _dense_fp8_enabled():
             self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
         if _dense_fp8_enabled():
-            self.logits_processor.fp8_head = self.model._lm_head_g
+            self.logits_processor.fp8_head = (rowwise, self.model._lm_head_g)
