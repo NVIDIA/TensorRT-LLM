@@ -26,6 +26,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import (
     _quantize_mxfp8_v,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 # Quantization dtype -> quant_attention_config accepted by AttentionConfig.
@@ -51,8 +52,8 @@ MIN_COSINE = {None: 0.9999, "fp8": 0.995, "mxfp8": 0.995}
 def _require_cudnn(quant_dtype: str | None) -> None:
     if not torch.cuda.is_available():
         pytest.skip("cuDNN attention backend requires CUDA.")
-    if quant_dtype is not None and torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("cuDNN FP8/MXFP8 SDPA requires a Blackwell-class GPU (sm100+).")
+    if quant_dtype is not None and get_sm_version() not in (100, 103, 107):
+        pytest.skip("cuDNN FP8/MXFP8 SDPA requires SM100/SM103/SM107.")
 
 
 def _make_qkv(batch, num_heads, num_kv_heads, seq_q, seq_kv, head_dim, device):

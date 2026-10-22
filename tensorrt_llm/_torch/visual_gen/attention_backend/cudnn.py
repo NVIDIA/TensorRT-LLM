@@ -300,8 +300,11 @@ class CuDNNAttention(AttentionBackend):
     def check_hardware_compatibility(
         cls, device: torch.device, quant_dtype: str | None = None
     ) -> None:
-        if get_sm_version() not in (100, 103) and quant_dtype is not None:
-            raise RuntimeError("cuDNN quantized attention requires NVIDIA Blackwell-class GPU.")
+        if get_sm_version() not in (100, 103, 107) and quant_dtype is not None:
+            raise RuntimeError(
+                "cuDNN quantized attention requires SM100, SM103 or SM107; "
+                f"got SM{get_sm_version()}."
+            )
 
     @classmethod
     def check_library_feature(cls, quant_dtype: str | None = None) -> None:
