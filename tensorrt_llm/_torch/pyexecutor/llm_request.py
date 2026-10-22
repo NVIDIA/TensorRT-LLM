@@ -1631,7 +1631,12 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    else:
+        # Owned int32 ndarray: the LlmRequest ctor memcpys it, where
+        # `input_token_ids` would build O(ISL) PyLongs to be cast back one by one.
+        input_tokens = executor_request.input_token_ids_i32
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     # Kept in its native list[list[int]] form, like py_bad_words. The
