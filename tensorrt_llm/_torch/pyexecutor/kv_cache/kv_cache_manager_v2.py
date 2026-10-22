@@ -3345,8 +3345,19 @@ class KVCacheManagerV2(BaseResourceManager):
         return tuple([row[:count].tolist() for row, count in zip(role, counts)] for role in out)
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
-        """Return the configured typical sequence length, if any."""
-        return kv_cache_config.avg_seq_len
+        """Return the typical sequence length that sizes the pools when no ratio is given."""
+        if kv_cache_config.avg_seq_len is not None or self.low_precision_dtype is None:
+            return kv_cache_config.avg_seq_len
+        # Without a typical step the backend sizes the pools for one 2048-token
+        # request, which hands the retained-token group a share it never uses.
+        typical_seq_len = max(1, self.max_seq_len // 2)
+        logger.warning_once(
+            "kv_cache_config.avg_seq_len is not set; sizing the mixed-precision KV pools for "
+            f"max_seq_len / 2 = {typical_seq_len} tokens. Set avg_seq_len to the workload's "
+            "typical sequence length for an accurate split.",
+            key="mixed_precision_avg_seq_len",
+        )
+        return typical_seq_len
 
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int

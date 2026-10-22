@@ -212,6 +212,17 @@ def test_automatic_pool_sizing_covers_retained_group(make_manager, estimating):
     assert high_pages < low_pages
 
 
+def test_automatic_pool_sizing_defaults_to_half_max_seq_len(make_manager):
+    """Without avg_seq_len the pools are sized as for max_seq_len / 2, not the backend's 2048-token request."""
+    options = dict(pool_ratio=None, max_tokens=1 << 20, max_gpu_total_bytes=1 << 30)
+    implicit = make_manager(config=mixed_config(**options), max_batch_size=64)
+    explicit = make_manager(config=mixed_config(avg_seq_len=512, **options), max_batch_size=64)
+    typical = implicit.kv_cache_manager_py_config.typical_step
+    assert typical is not None
+    assert {desc.capacity for desc in typical.kv_caches[1:]} == {512}
+    assert pool_pages(implicit) == pool_pages(explicit)
+
+
 @pytest.mark.parametrize("policy,reused_tokens", [("per_request", 128), ("all_reusable", 512)])
 def test_native_common_reuse_and_window_retention(make_manager, policy, reused_tokens):
     manager = make_manager(config=mixed_config(block_reuse_config={"policy": policy}))
