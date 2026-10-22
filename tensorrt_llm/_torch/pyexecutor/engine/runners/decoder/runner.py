@@ -836,6 +836,7 @@ class DecoderRunner(ScheduledModelRunner):
             warmup_sampling_module()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
+            self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
@@ -5464,6 +5465,44 @@ class DecoderRunner(ScheduledModelRunner):
             self.dist.tp_allgather(1)
         if compiled:
             logger.info("CSA2 sparse indexer prewarm complete")
+
+    def _prewarm_minimax_m3_msa_indexer(
+        self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> None:
+        """Compile the MSA indexer's KV-split proxy variants, which no warmup forward plans."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+            MiniMaxM3KVCacheManagerV2,
+        )
+
+        if not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+            return
+        sparse_config = self.sparse_attention_config
+        if (
+            not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig)
+            or sparse_config.implementation != "msa"
+        ):
+            return
+
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
+            prewarm_split_proxy_variants,
+        )
+
+        params = sparse_config.to_sparse_metadata_params(
+            pretrained_config=self.model.model_config.pretrained_config
+        )
+        index_dtype = (
+            torch.float8_e4m3fn if kv_cache_manager.indexer_kv_dtype == "fp8" else torch.bfloat16
+        )
+        with torch.inference_mode():
+            prewarm_split_proxy_variants(
+                index_dtype,
+                params.sharded_index_head_count(self.mapping),
+                kv_cache_manager.tokens_per_block,
+            )
+        torch.cuda.synchronize()
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
+        logger.info("MiniMax-M3 MSA indexer prewarm complete")
 
     def _cuda_graph_metadata_prepare_scope(
         self,
