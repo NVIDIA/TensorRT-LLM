@@ -818,7 +818,7 @@ class Sender(SenderBase):
         # it silently leaves the peer's receive unresolved for good. Under attention DP the
         # entries of non-assigned DP ranks are expected and must stay silent, since a FAILED
         # from them would fail a receive the assigned ranks are still writing.
-        answer_peers = getattr(self._registrar.self_rank_info, "dp_size", 1) == 1
+        answer_peers = self._registrar.self_rank_info.dp_size == 1
         swept: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
