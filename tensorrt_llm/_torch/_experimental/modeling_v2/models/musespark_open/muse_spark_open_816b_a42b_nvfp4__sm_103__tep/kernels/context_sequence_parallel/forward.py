@@ -47,10 +47,10 @@ rows. So the path takes:
   up to the next captured bucket, so with buckets ``..., 768, 1024, ...`` every step of
   769 rows or more replays a sequence-parallel graph, generation rows beside the
   context rows included;
-* an eager step of at least ``EAGER_MIN_ROWS`` rows, where the GPU work saved exceeds
-  the host time added.
+* an eager step of at least the device's eager threshold (``EAGER_MIN_ROWS_BY_SM``,
+  ``EAGER_MIN_ROWS`` on sm103), where the GPU work saved exceeds the host time added.
 
-Eager steps below ``EAGER_MIN_ROWS`` (including the breakable graph's eager warmups of
+Eager steps below that threshold (including the breakable graph's eager warmups of
 its buckets, and every step when no prefill graph is configured), and every decode step,
 run what they ran before.
 
@@ -89,8 +89,14 @@ MIN_ROWS = 1024
 #: bound by its host launches up to about this many rows sequence-parallel (the
 #: collectives add their own host launches to it), so between the graph's largest bucket
 #: and this the replicated forward is faster; above it the sequence-parallel GPU time is
-#: the shorter.
+#: the shorter. Measured on sm103 with its Grace host.
 EAGER_MIN_ROWS = 4608
+
+#: ``EAGER_MIN_ROWS`` per SM version (``dispatch.sm_of``). On sm107 with its Vera host the
+#: eager sequence-parallel forward is already the faster one at 3584 rows, the smallest
+#: eager step above the default prefill graph buckets (3072 rows), so every eager step of
+#: the largest bucket's rows or more takes the path there. Any other SM takes sm103's.
+EAGER_MIN_ROWS_BY_SM = {103: EAGER_MIN_ROWS, 107: 3072}
 
 #: The ranks the rows are split over: one tray's TP4 group, experts parallel over it.
 TP_SIZE = 4
@@ -133,8 +139,11 @@ def refusal(model: MuseSparkOpenModel) -> Optional[str]:
     return None
 
 
-def install(model: MuseSparkOpenModel) -> "ContextSequenceParallel":
+def install(model: MuseSparkOpenModel, sm: Optional[int] = None) -> "ContextSequenceParallel":
     """The path's forward for ``model``, with every layer's MoE re-classed (``moe.install``).
+
+    ``sm`` is the SM version the model's composition was built for; it picks the eager
+    threshold (``EAGER_MIN_ROWS_BY_SM``).
 
     The MNNVL all-reduce workspaces are grown on the first prefill step
     (``ContextSequenceParallel.reserve``).
@@ -145,7 +154,7 @@ def install(model: MuseSparkOpenModel) -> "ContextSequenceParallel":
     """
     from . import moe as _moe
 
-    path = ContextSequenceParallel(model)
+    path = ContextSequenceParallel(model, sm)
     _moe.install(model, min_rows=MIN_ROWS)
     return path
 
@@ -213,12 +222,14 @@ class ContextSequenceParallel:
             the TP group reads the same facts, so every rank raises alike).
     """
 
-    def __init__(self, model: MuseSparkOpenModel) -> None:
+    def __init__(self, model: MuseSparkOpenModel, sm: Optional[int] = None) -> None:
         reason = refusal(model)
         if reason is not None:
             raise ValueError(f"[musespark_open] context_sequence_parallel: {reason}")
         self.mapping = model._sp_mapping
         self.reserved = False
+        #: The fewest rows of an eager step that runs sequence-parallel on this SM.
+        self.eager_min_rows = EAGER_MIN_ROWS_BY_SM.get(sm, EAGER_MIN_ROWS)
 
     def reserve(self, model: MuseSparkOpenModel) -> None:
         """Grow ``model``'s MNNVL all-reduce workspaces once, on the first prefill step.
@@ -247,7 +258,7 @@ class ContextSequenceParallel:
         spec_metadata = kwargs.get("spec_metadata")
         return (
             rows >= MIN_ROWS
-            and (rows >= EAGER_MIN_ROWS or is_in_breakable_cuda_graph())
+            and (rows >= self.eager_min_rows or is_in_breakable_cuda_graph())
             and attn_metadata.num_contexts > 0
             and not torch.compiler.is_compiling()
             and kwargs.get("lora_params") is None
