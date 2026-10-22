@@ -852,6 +852,20 @@ set wrong has a test that catches it:
   set, and the copy keeps a per-layer table of the expert each helper slot
   holds so that it skips experts a whole team already holds. Any other writer
   of those helper rows would invalidate the table.
+- `planner: halo_r` swaps HALO-Q and the TMA copy for the HALO-R scheduler
+  (`moeRebalanceHaloR.cu`, planner in `moeRebalanceHaloRPlanner.h`) and the
+  unicast relay copy (`moeRebalanceRelay.cu`), driven by
+  `per_layer_dynamic_eplb/halo_r_planner.py`. HALO-R reuses the count exchange,
+  ordinal and route passes of `moeRebalanceHaloQKernel.cuh` and the plan
+  field layout, and requires `helper_slot_mode=shared_banks`. HALO-R keeps
+  READY generations on the device (the relay publishes the scheduler epoch;
+  the next scheduler launch drains and zeroes the READY row before its count
+  exchange) and hands the MegaMoE gate the constant generation 1. Each layer
+  call forks the copy stream from the current stream and joins it back in
+  `finish`, so breakable prefill graphs capture the whole call; the
+  `validate_per_layer_dynamic_eplb_cuda_graph` validator admits that
+  combination only. Its device waits use a fixed wall-clock bound
+  (`HALO_R_SPIN_BUDGET_NS`) instead of `SchedulerSpinBound`.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
