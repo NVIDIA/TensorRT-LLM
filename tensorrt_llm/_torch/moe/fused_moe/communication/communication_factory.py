@@ -27,6 +27,7 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
 from ..nccl_ep_utils import (
@@ -96,6 +97,7 @@ class CommunicationFactory:
         hidden_size: Optional[int] = None,
         communication_method: Optional[str] = None,
         allow_alltoall: bool = True,
+        quant_config: Optional[QuantConfig] = None,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -124,6 +126,11 @@ class CommunicationFactory:
             communication_method: Optional model-selected communication method.
                 ``TRTLLM_FORCE_COMM_METHOD`` takes precedence when set.
             allow_alltoall: Whether the backend supports all-to-all dispatch.
+            quant_config: Quantization config of the MoE layer this strategy serves.
+                Quantization-aware strategies dispatch the activations the layer's
+                backend produces, so a layer whose quantization differs from the
+                model-wide config (e.g. an MTP layer excluded from quantization)
+                must pass its own. Falls back to model_config.quant_config.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -151,7 +158,8 @@ class CommunicationFactory:
         if hidden_size is None:
             hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype
-        quant_config = model_config.quant_config
+        if quant_config is None:
+            quant_config = model_config.quant_config
         max_num_tokens = model_config.max_num_tokens
         moe_max_num_tokens = model_config.moe_max_num_tokens
         use_cuda_graph = model_config.use_cuda_graph
@@ -198,6 +206,7 @@ class CommunicationFactory:
                 alltoall_result_do_sum,
                 use_flashinfer,
                 hidden_size=hidden_size,
+                quant_config=quant_config,
             )
             logger.info(
                 f"Selected communication strategy: {strategy.__class__.__name__} "
@@ -353,6 +362,7 @@ class CommunicationFactory:
         alltoall_result_do_sum: bool,
         use_flashinfer: bool,
         hidden_size: Optional[int] = None,
+        quant_config: Optional[QuantConfig] = None,
     ) -> Communication:
         """
         Create a specific method (for debugging/testing)
@@ -366,7 +376,8 @@ class CommunicationFactory:
         if hidden_size is None:
             hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype
-        quant_config = model_config.quant_config
+        if quant_config is None:
+            quant_config = model_config.quant_config
         max_num_tokens = model_config.max_num_tokens
         moe_max_num_tokens = model_config.moe_max_num_tokens
         use_cuda_graph = model_config.use_cuda_graph
