@@ -15,6 +15,7 @@ import torch
 from PIL import Image
 
 from tensorrt_llm.media.encoding import (
+    _x264_preset,
     image_to_bytes,
     resolve_video_format,
     save_image,
@@ -174,6 +175,27 @@ def test_resolve_video_format_unknown_string_raises():
 def test_resolve_video_format_path_without_suffix_raises():
     with pytest.raises(ValueError, match="without suffix"):
         resolve_video_format(Path("noext"))
+
+
+# ---------------------------------------------------------------------------
+# _x264_preset (TRTLLM_VIDEO_ENCODING_X264_PRESET)
+# ---------------------------------------------------------------------------
+
+
+def test_x264_preset_default(monkeypatch):
+    monkeypatch.delenv("TRTLLM_VIDEO_ENCODING_X264_PRESET", raising=False)
+    assert _x264_preset() == "medium"
+
+
+def test_x264_preset_normalized(monkeypatch):
+    monkeypatch.setenv("TRTLLM_VIDEO_ENCODING_X264_PRESET", " UltraFast ")
+    assert _x264_preset() == "ultrafast"
+
+
+def test_x264_preset_invalid_raises(monkeypatch):
+    monkeypatch.setenv("TRTLLM_VIDEO_ENCODING_X264_PRESET", "bogus")
+    with pytest.raises(ValueError, match="libx264 preset"):
+        _x264_preset()
 
 
 # ---------------------------------------------------------------------------
