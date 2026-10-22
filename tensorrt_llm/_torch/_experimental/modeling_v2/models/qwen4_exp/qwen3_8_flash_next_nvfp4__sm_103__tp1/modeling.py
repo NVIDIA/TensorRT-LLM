@@ -190,10 +190,16 @@ from .ops.hc.qwen4_exp_hc_decode_rows_tc import (
     qwen4_exp_hc_decode_rows_mix,
 )
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
+from .ops.hc.qwen4_exp_hc_first_rescale_tc import qwen4_exp_hc_first_rescale_tc
 from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
+from .ops.hc.qwen4_exp_hc_inject_rstd import qwen4_exp_hc_inject_rstd
 from .ops.hc.qwen4_exp_hc_lowrank_act import qwen4_exp_hc_lowrank_act
 from .ops.hc.qwen4_exp_hc_up_gate_mean import qwen4_exp_hc_up_gate_mean
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4 import qwen4_exp_hc_up_gate_mean_fp4
+from .ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (
+    qwen4_exp_hc_up_gate_mean_rstd,
+    qwen4_exp_hc_up_gate_mean_rstd_fp4,
+)
 from .ops.hc.qwen4_exp_post_inject import qwen4_exp_post_inject
 from .ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
@@ -649,6 +655,16 @@ _HC_DECODE_GEMV_MAX_ROWS = 1  # capacity: fixed: dispatch threshold, not a buffe
 _HC_TC_FIRST_MAX_ROWS = (
     128  # capacity: fixed: dispatch threshold (one MMA tile), not a buffer bound
 )
+
+#: Prefill steps of at least this many rows run each trunk hyper-connection site on the
+#: un-normalized residual: `qwen4_exp_hc_inject_rstd` stores `hc_out` and a `[T, C]` rstd
+#: instead of the `[T, C*H]` normed stream, and the mixer
+#: (`qwen4_exp_hc_first_rescale_tc` + `qwen4_exp_hc_up_gate_mean_rstd(_fp4)`) forms
+#: `normed` on chip. Smaller steps keep `qwen4_exp_hc_inject_norm` and the stored-normed
+#: mixer. GB300 micro-bench, us a site (stored normed vs rstd): 2048 rows 57.0 vs 56.7,
+#: 3072 rows 82.4 vs 76.1, 4096 rows 104.0 vs 90.8, 8192 rows 186.2 vs 164.9, 16384 rows
+#: 360.1 vs 293.7.
+_HC_RSTD_MIN_ROWS = 3072  # capacity: fixed: a dispatch threshold, not a buffer size
 
 #: FP8 block-scale block edge, on both weight-scale axes and the activation row.
 _FP8_BLOCK = _weights.FP8_BLOCK
@@ -2260,6 +2276,10 @@ class _LayerWeights(NamedTuple):
     out_g: object | None = None
     sh_gu_g: object | None = None
     sh_dn_g: object | None = None
+    # `1 + ahc_norm` / `1 + mhc_norm` in fp32, the rstd mixers' operand
+    # (`qwen4_exp_hc_up_gate_mean_rstd`); set by `PrefillTarget` only.
+    ahc_norm_w1: torch.Tensor | None = None
+    mhc_norm_w1: torch.Tensor | None = None
 
 
 def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
@@ -2392,6 +2412,15 @@ class _StackWeights(NamedTuple):
     ple_vocab: torch.Tensor
     ple_offs: torch.Tensor
     ple_tscale: torch.Tensor
+    # `1 + fhc_norm` in fp32 (see `_LayerWeights.ahc_norm_w1`); set by `PrefillTarget` only.
+    fhc_norm_w1: torch.Tensor | None = None
+
+
+def _norm_w1(norm: torch.Tensor) -> torch.Tensor:
+    """A grouped norm's `(1 + w)` in fp32, contiguous: what
+    `qwen4_exp_hc_up_gate_mean_rstd` multiplies the scaled residual by (the `1 + w`
+    `qwen4_exp_hc_inject_norm` forms per element, bitwise)."""
+    return (1.0 + norm.float()).contiguous()
 
 
 def _stack_views(core: Qwen4ExpTp1ModelingV2) -> _StackWeights:
@@ -2961,8 +2990,13 @@ class PrefillTarget:
             if self._contract_pending and core.quant_mode == QM_FP8_KV_CACHE
             else None
         )
-        self._layers = _layer_views(core)
-        self._stack = _stack_views(core)
+        # The rstd sites' `(1 + w)` operands (`_HC_RSTD_MIN_ROWS`), formed once here.
+        self._layers = [
+            L._replace(ahc_norm_w1=_norm_w1(L.ahc_norm), mhc_norm_w1=_norm_w1(L.mhc_norm))
+            for L in _layer_views(core)
+        ]
+        stack = _stack_views(core)
+        self._stack = stack._replace(fhc_norm_w1=_norm_w1(stack.fhc_norm))
         # The step `prepare` built, read by the breaks.
         self._step: _PrefillStep | None = None
 
@@ -3056,6 +3090,30 @@ class PrefillTarget:
             normed.dtype,
         )
         mixed, xq, xsf = qwen4_exp_hc_up_gate_mean_fp4(low, up, normed, core.hc_count, gscale)
+        return mixed, inject, xq, xsf
+
+    def _hc_mixer_rstd(self, hc, rstd, norm, norm_w1, first, up, with_inject):
+        """`_hc_mixer` from the site's residual `hc` and its `[T, C]` rstd
+        (`qwen4_exp_hc_inject_rstd`) instead of a stored normed stream: the first
+        projection forms `bf16(hc * rstd * (1 + norm))` on its A tiles, the up
+        projection's epilogue `hc * rstd * norm_w1` in fp32."""
+        core = self.core
+        low, inject = qwen4_exp_hc_first_rescale_tc(
+            hc, rstd, norm, first, core.hc_count, core.hc_lowrank, with_inject
+        )
+        mixed = qwen4_exp_hc_up_gate_mean_rstd(low, up, hc, rstd, norm_w1, core.hc_count)
+        return mixed, inject
+
+    def _hc_moe_mixer_rstd(self, hc, rstd, norm, norm_w1, first, up, gscale):
+        """`_hc_moe_mixer` on the rstd form (see `_hc_mixer_rstd`). Returns
+        `(mixed, inject, xq, xsf)`."""
+        core = self.core
+        low, inject = qwen4_exp_hc_first_rescale_tc(
+            hc, rstd, norm, first, core.hc_count, core.hc_lowrank, True
+        )
+        mixed, xq, xsf = qwen4_exp_hc_up_gate_mean_rstd_fp4(
+            low, up, hc, rstd, norm_w1, core.hc_count, gscale
+        )
         return mixed, inject, xq, xsf
 
     def _grouped_norm(self, x: torch.Tensor, weights: tuple) -> torch.Tensor:
@@ -4106,7 +4164,12 @@ class PrefillTarget:
 
         Every hyper-connection site is `qwen4_exp_hc_inject_norm` (the previous block's
         injection fused with this site's grouped norm; after a MoE block it also forms that
-        block's output) and then the mixer (`_hc_mixer`, `_hc_moe_mixer`)."""
+        block's output) and then the mixer (`_hc_mixer`, `_hc_moe_mixer`). From
+        `_HC_RSTD_MIN_ROWS` rows the site is `qwen4_exp_hc_inject_rstd` (the same
+        injection, the norm's `[T, C]` rstd instead of the normed stream) and the rstd
+        mixer (`_hc_mixer_rstd`, `_hc_moe_mixer_rstd`); the PLE layer's attention-side
+        site keeps the stored-normed mixer either way, on the normed stream the PLE
+        kernel writes."""
         core = self.core
         num_tokens = input_ids.shape[0]
         assert num_tokens == self._step.physical_tokens, (
@@ -4150,34 +4213,68 @@ class PrefillTarget:
         hc_count = core.hc_count
         hc = torch.cat([h] * hc_count, -1)
         layers, S = self._layers, self._stack
-        _, normed = qwen4_exp_hc_inject_norm(hc, None, None, layers[0].ahc_norm, core.eps, hc_count)
+        # A host decision on `T` alone (each captured bucket takes one branch).
+        by_rstd = num_tokens >= _HC_RSTD_MIN_ROWS
+        normed = rstd = None
+        if by_rstd:
+            _, rstd = qwen4_exp_hc_inject_rstd(hc, None, None, core.eps, hc_count)
+        else:
+            _, normed = qwen4_exp_hc_inject_norm(
+                hc, None, None, layers[0].ahc_norm, core.eps, hc_count
+            )
         for i, L in enumerate(layers):
             if i == core.ple_layer:
                 eager_on_graph(hc, ple_hc, ple_normed, inner=self._ple_block)
                 hc, normed = ple_hc, ple_normed
-            mixed, inject = self._hc_mixer(normed, L.ahc_first, L.ahc_up, True)
+                # The PLE kernel stores this site's normed stream: the stored-normed
+                # mixer reads it (cheaper than a second pass for its rstd).
+                mixed, inject = self._hc_mixer(normed, L.ahc_first, L.ahc_up, True)
+            elif by_rstd:
+                mixed, inject = self._hc_mixer_rstd(
+                    hc, rstd, L.ahc_norm, L.ahc_norm_w1, L.ahc_first, L.ahc_up, True
+                )
+            else:
+                mixed, inject = self._hc_mixer(normed, L.ahc_first, L.ahc_up, True)
             if core.is_attn[i]:
                 block_out = self._attention_block(
                     mixed, i, L, proj_qkv, index_scratch, attn_out, pos3
                 )
             else:
                 block_out = self._gdn_block(mixed, i, L, gdn_out)
-            hc, normed = qwen4_exp_hc_inject_norm(
-                hc, block_out, inject, L.mhc_norm, core.eps, hc_count
-            )
-            mixed, inject, xq, xsf = self._hc_moe_mixer(normed, L.mhc_first, L.mhc_up, L.moe_gscale)
+            if by_rstd:
+                hc, rstd = qwen4_exp_hc_inject_rstd(hc, block_out, inject, core.eps, hc_count)
+                mixed, inject, xq, xsf = self._hc_moe_mixer_rstd(
+                    hc, rstd, L.mhc_norm, L.mhc_norm_w1, L.mhc_first, L.mhc_up, L.moe_gscale
+                )
+            else:
+                hc, normed = qwen4_exp_hc_inject_norm(
+                    hc, block_out, inject, L.mhc_norm, core.eps, hc_count
+                )
+                mixed, inject, xq, xsf = self._hc_moe_mixer(
+                    normed, L.mhc_first, L.mhc_up, L.moe_gscale
+                )
             next_norm = layers[i + 1].ahc_norm if i + 1 < len(layers) else S.fhc_norm
             # The MoE block output is formed inside the injection: routed +
             # sigmoid(gate) * shared, rounded once. Both [T, hidden] operands are
             # released here, not at the next layer's MoE block, whose own peak they
             # would otherwise add to.
             routed, (gate_logits, shared) = self._moe_block(mixed, xq, xsf, L, routed_out)
-            hc, normed = qwen4_exp_hc_inject_norm(
-                hc, routed, inject, next_norm, core.eps, hc_count, shared, gate_logits
-            )
+            if by_rstd:
+                hc, rstd = qwen4_exp_hc_inject_rstd(
+                    hc, routed, inject, core.eps, hc_count, shared, gate_logits
+                )
+            else:
+                hc, normed = qwen4_exp_hc_inject_norm(
+                    hc, routed, inject, next_norm, core.eps, hc_count, shared, gate_logits
+                )
             del routed, gate_logits, shared
         # The stack-final mixer with no injection weight is the final norm.
-        final, _ = self._hc_mixer(normed, S.fhc_first, S.fhc_up, False)
+        if by_rstd:
+            final, _ = self._hc_mixer_rstd(
+                hc, rstd, S.fhc_norm, S.fhc_norm_w1, S.fhc_first, S.fhc_up, False
+            )
+        else:
+            final, _ = self._hc_mixer(normed, S.fhc_first, S.fhc_up, False)
         if not core.mtp_enabled:
             return final
         # `lm_head` reads the `[T, hidden]` mix; the MTP module reads the
