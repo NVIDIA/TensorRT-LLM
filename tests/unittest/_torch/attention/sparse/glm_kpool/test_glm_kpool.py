@@ -515,21 +515,37 @@ def _planner(fp8: bool, pages: int = 4096, tokens_per_block: int = 32):
     return backend
 
 
-def _check_plan(calls, spans, budget, fp8):
-    """Calls cover every row in order, name each row's table, and fit the FP8 logits budget."""
+def _call_costs(backend, calls):
+    """Each planned call's FP32-element cost under the backend's cost model."""
+    state = backend._cache_state(None)
+    kpool = backend.sparse_params.index_kpool
+    capacity_pools = state.block_tables.shape[1] * state.tokens_per_block // kpool
+    return [
+        GlmKpoolSparseAttention._context_score_cost(
+            end - start,
+            last - first,
+            max_kv_len // kpool,
+            fp8=backend._indexer_fp8,
+            head_dim=backend.sparse_params.index_head_dim,
+            capacity_pools=capacity_pools,
+        )
+        for start, end, first, last, max_kv_len in calls
+    ]
+
+
+def _check_plan(backend, calls, spans, budget):
+    """Calls cover every row in order, name each row's table, and fit the budget."""
     request_starts = [0]
     for rows, _ in spans:
         request_starts.append(request_starts[-1] + rows)
     assert calls[0][0] == 0 and calls[-1][1] == request_starts[-1]
     for (_, end, _, _, _), (start, _, _, _, _) in zip(calls, calls[1:]):
         assert end == start
-    kpool = GlmKpoolSparseParams().index_kpool
     for start, end, first, last, max_kv_len in calls:
         assert start < end and first < last
         assert request_starts[first] <= start and end <= request_starts[last]
         assert max_kv_len >= max(visible for _, visible in spans[first:last])
-        if fp8:
-            assert (end - start) * (last - first) * (max_kv_len // kpool) <= budget
+    assert max(_call_costs(backend, calls)) <= budget
 
 
 @pytest.mark.parametrize(
@@ -547,10 +563,7 @@ def test_context_score_plan_stays_within_the_reserved_bound(spans, fp8):
     backend = _planner(fp8)
     budget = GlmKpoolSparseAttention._CONTEXT_SCORE_ELEMENTS
     calls = backend.plan_context_scores(object(), spans)
-    _check_plan(calls, spans, budget, fp8)
-    if not fp8:
-        capacity_pools = 4096 * 32 // GlmKpoolSparseParams().index_kpool
-        assert all((end - start) * capacity_pools <= budget for start, end, *_ in calls)
+    _check_plan(backend, calls, spans, budget)
 
 
 def test_context_score_plan_keeps_a_fresh_prompt_in_one_call():
@@ -564,6 +577,34 @@ def test_context_score_plan_groups_short_requests_and_splits_a_long_one():
     assert grouped == [(0, 300, 0, 3, 100)]
     split = backend.plan_context_scores(object(), [(16384, 131072)])
     assert len(split) > 1 and {call[2:] for call in split} == {(0, 1, 131072)}
+
+
+@pytest.mark.parametrize(
+    "capacities",
+    [
+        dict(max_batch_size=64, max_num_tokens=64, max_seq_len=4096),
+        dict(max_batch_size=8, max_num_tokens=2048, max_seq_len=32768),
+        dict(max_batch_size=64, max_num_tokens=16384, max_seq_len=131072),
+    ],
+    ids=["small-token-budget", "mid", "large"],
+)
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_kv_cache_reserve_covers_every_planned_call(capacities, fp8):
+    tokens, seq_len = capacities["max_num_tokens"], capacities["max_seq_len"]
+    requests = min(capacities["max_batch_size"], tokens)
+    config = SimpleNamespace(pretrained_config=SimpleNamespace(model_type="glm5_next_text"))
+    reserve = GlmKpoolSparseAttention.runtime_workspace_fixed_bytes(
+        config, None, enable_cuda_graph=True, **capacities
+    )
+    backend = _planner(fp8, pages=seq_len // 32)
+    batches = [
+        [(1, seq_len)] * requests,  # one continuation row per request
+        [(tokens, seq_len)],  # one request takes the whole token budget
+        [(tokens // requests, seq_len)] * requests,  # the budget split across requests
+    ]
+    for spans in batches:
+        calls = backend.plan_context_scores(object(), spans)
+        assert max(_call_costs(backend, calls)) * 4 <= reserve
 
 
 def test_kv_cache_sizing_reserves_the_context_score_bound():
