@@ -215,14 +215,17 @@ class StubModule(types.ModuleType):
             return cache[name]
 
         fq = f"{self.__name__}.{name}"
+        # Classify by the public spelling so private bindings such as _KVCache
+        # are classes (usable in ``X | None`` annotations), not modules.
+        bare = name.lstrip("_")
         value: int | type[LookaheadDecodingConfig] | type[_StubBase] | StubModule
         if fq in _EXPLICIT:
             value = _EXPLICIT[fq]
-        elif name.isupper():
+        elif bare.isupper():
             # Module-level constants such as BuildInfo.ENABLE_MULTI_DEVICE:
             # falsy keeps mpi_session and communicator off their mpi4py paths.
             value = 0
-        elif name[:1].isupper():
+        elif bare[:1].isupper():
             value = _make_stub_class(name, self.__name__)
         else:
             # Lower case: either a submodule or a free function. A module is
