@@ -53,7 +53,8 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ..modules.linear import (FP8QDQLinearMethod, FP8RowwiseLinearMethod,
+                              Linear, TensorParallelMode)
 from ..modules.low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                                   low_m_gemm_dispatcher, prepare_low_m_gemm)
 from ..modules.low_m_mma_gemm import (fused_shared_expert,
@@ -1503,3 +1504,10 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
         _precompute_fused_norm_weights(self)
+        # Quantize per token in the input norm when in_proj_qkvz is FP8 rowwise.
+        for layer in self.model.layers[:self.config.num_hidden_layers]:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                layer.input_layernorm.fp8_per_token_out = isinstance(
+                    linear_attn.in_proj_qkvz.quant_method,
+                    FP8RowwiseLinearMethod)
