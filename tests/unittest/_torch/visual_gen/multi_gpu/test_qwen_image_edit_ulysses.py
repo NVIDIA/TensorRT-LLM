@@ -15,38 +15,30 @@
 
 """Multi-GPU coverage for Qwen-Image-Edit Ulysses attention."""
 
+# MPI bootstrap must be disabled before importing TensorRT-LLM.
+# ruff: noqa: E402
+
 import os
-import sys
 from collections.abc import Callable, Generator
-from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _visual_gen_dist_utils import spawn_with_retry
 
 # The unit test creates its own torch.distributed NCCL process group. Disable the
 # TRT-LLM MPI bootstrap path so importing tensorrt_llm does not initialize MPI.
 _OLD_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-REPO_ROOT = Path(__file__).resolve().parents[5]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    QwenJointAttention,
+)
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
-try:
-    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
-    from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
-        QwenJointAttention,
-    )
-except ImportError as e:  # pragma: no cover - import guard for direct collection
-    pytest.skip(f"TensorRT-LLM modules unavailable: {e}", allow_module_level=True)
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True)
@@ -73,42 +65,10 @@ def _cleanup_mpi_env() -> Generator[None, None, None]:
         os.environ["TLLM_DISABLE_MPI"] = _OLD_TLLM_DISABLE_MPI
 
 
-def _distributed_worker(
-    rank: int,
-    world_size: int,
-    backend: str,
-    test_fn: Callable,
-    port: int,
-    kwargs: dict,
-) -> None:
-    os.environ.update(
-        {
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": str(port),
-            "RANK": str(rank),
-            "WORLD_SIZE": str(world_size),
-        }
-    )
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    try:
-        test_fn(rank, world_size, **kwargs)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, "nccl", test_fn, port, kwargs),
-            nprocs=world_size,
-            join=True,
-        )
-    )
+    run_distributed(world_size, test_fn, dist_backend="nccl", preload=("tensorrt_llm",), **kwargs)
 
 
 def _make_config(rank: int, world_size: int, ulysses_size: int) -> DiffusionModelConfig:
@@ -116,18 +76,14 @@ def _make_config(rank: int, world_size: int, ulysses_size: int) -> DiffusionMode
         world_size=world_size,
         rank=rank,
         tp_size=1,
-        cp_size=1,
-        pp_size=1,
         cfg_size=1,
-        sp_size=ulysses_size,
         ulysses_size=ulysses_size,
-        device_mesh=DeviceMeshTopologyImpl.create().initialize(world_size),
     )
     return DiffusionModelConfig(
         mapping=mapping.to_llm_mapping(),
         visual_gen_mapping=mapping,
         attention=AttentionConfig(backend="VANILLA"),
-        dtype="bfloat16",
+        parallel=ParallelConfig(ulysses_size=ulysses_size),
     )
 
 
