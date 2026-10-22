@@ -12,7 +12,7 @@ index-K.
 
 import math
 import os
-from typing import Dict, List, Sequence, Tuple
+from typing import Sequence
 
 import torch
 import triton
@@ -78,9 +78,9 @@ class IndexTpSplit:
     emptied the set.
     """
 
-    _instances: Dict[Tuple[int, int, int], "IndexTpSplit"] = {}
+    _instances: dict[tuple[int, int, int], "IndexTpSplit"] = {}
     # Every split stays allocated: CUDA graphs captured with it address its slots.
-    _alive: List["IndexTpSplit"] = []
+    _alive: list["IndexTpSplit"] = []
 
     @classmethod
     def get(
@@ -154,6 +154,8 @@ class IndexTpSplit:
 
         Returns the view of max_score's storage that holds the scores, blocks
         innermost. Nothing may run between the two kernels: PDL overlaps them.
+        Every TP rank must make the same calls with the same seq_lens, since
+        the reduce waits until all ranks have pushed.
         """
         recv = self.recv[self.sets[layer_idx]]
         torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(

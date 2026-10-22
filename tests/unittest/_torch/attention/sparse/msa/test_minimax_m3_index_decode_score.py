@@ -195,9 +195,15 @@ def test_index_decode_score_multi_round_split_k(dtype):
 
 @skip_not_sm100
 @pytest.mark.parametrize("world", [2, 4])
-def test_index_decode_score_tp_split_matches_unsplit(world):
+@pytest.mark.parametrize(
+    "seq_lens",
+    # 16 requests halve split_k; 65537 tokens give a CTA several block groups.
+    [[4, 129, 1025, 4097, 9001], [4, 129, 1025, 4097, 9001] * 3 + [65537]],
+    ids=["batch5", "batch16"],
+)
+def test_index_decode_score_tp_split_matches_unsplit(world, seq_lens):
     """W ranks scoring rows r, r + W, ... and pushing to the head owners combine to the unsplit scores."""
-    seq_lens, dql = [4, 129, 1025, 4097, 9001], 4
+    dql = 4
     idx_q, k_cache, block_table, seq_lens_dev, _, score, _ = _make_inputs(
         seq_lens, dtype=torch.float8_e4m3fn, num_heads=4, decode_query_len=dql
     )

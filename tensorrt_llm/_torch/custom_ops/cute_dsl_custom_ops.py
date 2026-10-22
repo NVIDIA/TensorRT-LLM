@@ -9297,7 +9297,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Caches compiled kernels keyed on the static params (dtype, num_heads,
         max_decode_query_len, head_dim, shard_world, split_k); batch, query-token
         count, page count and block-table width stay symbolic, so one compile
-        covers every decode step of a given model shape.
+        per split_k covers every decode step of a given model shape.
         """
 
         kernel_cache = dict()

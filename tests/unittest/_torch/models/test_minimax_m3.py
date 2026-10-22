@@ -1615,6 +1615,8 @@ def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
         assert shard_geometry(module, "v") == (kv_world, kv_rank)
         assert shard_geometry(module, "index_q") == (kv_world, kv_rank)
         assert shard_geometry(module, "index_k") == (1, 0)
+        module.replicate_index_q = True
+        assert shard_geometry(module, "index_q") == (1, 0)
 
 
 @pytest.mark.cpu_only
