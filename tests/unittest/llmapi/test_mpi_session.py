@@ -317,7 +317,6 @@ def test_remote_mpi_session(
         env["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"] = (
             f"ipc://{tempfile.gettempdir()}/rpc_test_{uuid.uuid4()}")
 
-    # The script bounds mpirun with its own, shorter timeout.
     print(check_output(command, timeout=120, stderr=PIPE, env=env, cwd=cur_dir))
 
     if task_type == "flashinfer_temporary_cleanup":
