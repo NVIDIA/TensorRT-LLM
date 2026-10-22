@@ -197,6 +197,7 @@ def test_process_results_answer_key_case_insensitive():
 def _make_lm_eval_wrapper(
     sampling_params: SamplingParams | None = None,
     sampling_override: bool = False,
+    preserve_caller_max_tokens: bool = False,
 ) -> LmEvalWrapper:
     """Build a wrapper with a fake llm.
 
@@ -209,6 +210,7 @@ def _make_lm_eval_wrapper(
         fake_llm,
         sampling_params=sampling_params,
         sampling_override=sampling_override,
+        preserve_caller_max_tokens=preserve_caller_max_tokens,
     )
 
 
@@ -1942,3 +1944,31 @@ def test_aime_cli_accepts_preserve_caller_max_tokens(evaluator_cls, args, expect
         result = CliRunner().invoke(evaluator_cls.command, args, standalone_mode=False)
     assert result.exception is None
     assert mock_harness.call_args.kwargs["preserve_caller_max_tokens"] is expected
+
+
+@pytest.mark.parametrize(
+    "preserve_caller_max_tokens, caller_max_tokens, expected_max_tokens, warns",
+    [
+        pytest.param(False, 65536, 32768, True, id="larger_caller_value_dropped_warns"),
+        pytest.param(False, 16, 32768, False, id="smaller_caller_value_no_warning"),
+        pytest.param(True, 65536, 65536, False, id="preserve_keeps_caller_value_no_warning"),
+    ],
+)
+def test_task_max_gen_toks_replacing_larger_caller_value_warns(
+    preserve_caller_max_tokens, caller_max_tokens, expected_max_tokens, warns
+):
+    """Dropping a larger caller ``max_tokens`` for the task's value is logged.
+
+    Without ``preserve_caller_max_tokens``, e.g. ``aime25 --max_output_length
+    65536`` runs at the yaml's 32768; the warning names the flag that keeps it.
+    """
+    wrapper = _make_lm_eval_wrapper(
+        sampling_params=SamplingParams(max_tokens=caller_max_tokens),
+        preserve_caller_max_tokens=preserve_caller_max_tokens,
+    )
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        out = wrapper._get_sampling_params({"max_gen_toks": 32768})
+    assert out.max_tokens == expected_max_tokens
+    assert mock_logger.warning_once.call_count == (1 if warns else 0)
+    if warns:
+        assert "--preserve_caller_max_tokens" in mock_logger.warning_once.call_args.args[0]

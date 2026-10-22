@@ -317,11 +317,17 @@ class LmEvalWrapper(TemplateLM):
                 # a default budget (e.g. 512 for MMMU) which is too small when
                 # thinking mode produces long chain-of-thought output. Default
                 # OFF to preserve behavior for non-thinking models.
-                if (trtllm_key == "max_tokens"
-                        and self.preserve_caller_max_tokens):
+                if trtllm_key == "max_tokens":
                     current = getattr(sampling_params, trtllm_key, None)
                     if current is not None and current > value:
-                        continue
+                        if self.preserve_caller_max_tokens:
+                            continue
+                        logger.warning_once(
+                            f"The task's max_gen_toks ({value}) replaces the "
+                            f"requested max_tokens ({current}); pass "
+                            "--preserve_caller_max_tokens to keep the larger "
+                            "value.",
+                            key=f"lm_eval_max_gen_toks_{current}_{value}")
                 setattr(sampling_params, trtllm_key, value)
         if self.spec_stats:
             # The AR line in _log_spec_stats reads per-request
