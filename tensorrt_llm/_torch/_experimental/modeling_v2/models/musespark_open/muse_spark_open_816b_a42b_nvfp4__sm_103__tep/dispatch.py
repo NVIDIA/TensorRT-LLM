@@ -497,8 +497,10 @@ def dflash_linear(spec_config: Any) -> bool:
     """Whether ``spec_config`` is DFlash drafting a linear chain of ``DRAFT_LEN`` tokens.
 
     That is the drafter every composition's drafter, worker and head paths are
-    written for: one draft per position (no tree), a fixed draft length (no
-    schedule), and the drafter's VANILLA pooled-context attention.
+    written for: one draft per position (no tree) and a fixed draft length (no
+    schedule). Where the drafter keeps its pooled context is not part of it: the
+    fast paths that address the context's dense arena are planned only over one
+    (``DENSE_ARENA_PATHS``).
     """
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
 
@@ -511,7 +513,6 @@ def dflash_linear(spec_config: Any) -> bool:
         and getattr(spec_config, "max_draft_len", None) == DRAFT_LEN
         and getattr(spec_config, "max_total_draft_tokens", None) == DRAFT_LEN
         and getattr(spec_config, "draft_len_schedule", None) is None
-        and getattr(spec_config, "attention_backend", None) == "VANILLA"
     )
 
 
@@ -556,7 +557,7 @@ def served_compositions(compositions: Mapping[CompositionKey, TargetPaths]) -> s
     return (
         f"{keys}, each with DFlash drafting a linear chain of {DRAFT_LEN} tokens "
         "(max_draft_len = max_total_draft_tokens = "
-        f"{DRAFT_LEN}, no draft_len_schedule, VANILLA attention_backend) and an NVFP4 checkpoint"
+        f"{DRAFT_LEN}, no draft_len_schedule) and an NVFP4 checkpoint"
     )
 
 
@@ -945,6 +946,13 @@ FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
 #: The fast paths that act only on a windowed drafter context arena: the per-step window
 #: compaction. None of them is composed over a full-length arena, which never compacts.
 WINDOWED_CONTEXT_ARENA_PATHS: Tuple[str, ...] = ("drafter_window_compact",)
+#: The fast paths that address the drafter's context K/V as the dense arena
+#: ``[slots, L, capacity, Hkv, D]`` of a DFlash worker that does not page it, by
+#: slot and column: the drafter block decode's window attention with its fused
+#: append, and the context-K/V fork's side chain and commit. Over a paged context
+#: (``paged_drafter_context``) the plan leaves them out with every fast path built
+#: on them; every other fast path is independent of where the context lives.
+DENSE_ARENA_PATHS: Tuple[str, ...] = ("drafter_block_decode", "context_kv_fork")
 
 
 def dependents(names: Iterable[str]) -> FrozenSet[str]:
@@ -961,7 +969,24 @@ def windowed_context_arena(spec_worker: Any) -> bool:
     return bool(getattr(spec_worker, "windowed_ctx_arena", False))
 
 
+def paged_drafter_context(model_config: Any, spec_worker: Any = None) -> bool:
+    """Whether the DFlash worker keeps the drafter's context K/V in pages, not a dense arena.
+
+    The worker's own layout rule (``DFlashWorker._lazy_init_ctx_buffers``): a
+    paged attention backend pages the context. The worker's backend is concrete
+    even where the config left AUTO open (the drafter resolves it).
+    """
+    from tensorrt_llm._torch.speculative.dflash import _PAGED_ATTENTION_BACKENDS
+
+    spec_config = getattr(model_config, "spec_config", None)
+    backend = getattr(spec_worker, "_dflash_attention_backend", None) or getattr(
+        spec_config, "attention_backend", None
+    )
+    return backend in _PAGED_ATTENTION_BACKENDS
+
+
 _WINDOWED_ARENA = "a windowed drafter context arena"
+_PAGED_CONTEXT = "a paged drafter context"
 
 
 def compose(
@@ -980,7 +1005,8 @@ def compose(
     is the composition's fast paths, less those written for a windowed arena when
     the worker's arena is not windowed, and, over a windowed arena, less the
     arena-writing paths (``FULL_CONTEXT_ARENA_PATHS``) unless the composition also
-    serves the window compaction (structural as well), and
+    serves the window compaction, and less those written for the dense arena when
+    the worker pages the context (``DENSE_ARENA_PATHS``; all structural as well), and
     the preconditions of those paths are checked once, agreed over the TP group
     (collective; every rank returns the same plan or raises the same error).
 
@@ -998,13 +1024,17 @@ def compose(
             f"{TAG} no fast path for this deployment ({reason}); running the built-in forward"
         )
         return NO_PATHS
-    windowed = windowed_context_arena(spec_worker)
+    paged = paged_drafter_context(model_config, spec_worker)
+    # The window bounds a dense arena only; the worker never windows a paged context.
+    windowed = windowed_context_arena(spec_worker) and not paged
     paths = frozenset(served.served)
     if windowed:
         if not paths & frozenset(WINDOWED_CONTEXT_ARENA_PATHS):
             paths = paths - dependents(FULL_CONTEXT_ARENA_PATHS)
     else:
         paths = paths - dependents(WINDOWED_CONTEXT_ARENA_PATHS)
+    if paged:
+        paths = paths - dependents(DENSE_ARENA_PATHS)
     local = missing_preconditions(text_model, model_config, preconditions(paths, served))
     agreed = agreed_union(mapping, local + ([_WINDOWED_ARENA] if windowed else []))
     missing = [item for item in agreed if not item.startswith(_WINDOWED_ARENA)]
@@ -1021,6 +1051,8 @@ def compose(
     plan = Plan(paths)
     if windowed:
         composed += f" with {_WINDOWED_ARENA}"
+    if paged:
+        composed += f" with {_PAGED_CONTEXT}"
     logger.info(f"{composed}: {plan.describe()}")
     return plan
 
