@@ -16,6 +16,8 @@
  */
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloR.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceRelay.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -31,6 +33,57 @@ namespace kernels
 void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const&)
 {
     TLLM_THROW("Per-layer dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
+}
+
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END
+#endif
+
+#ifdef TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_HALO_R
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
+{
+
+namespace
+{
+
+[[noreturn]] void throwHaloRUnsupported()
+{
+    TLLM_THROW("Per-layer dynamic EPLB HALO-R requires CUDA 13.1+ and a requested SM100, SM103, or SM107 target");
+}
+
+} // namespace
+
+std::size_t getMoeRebalanceHaloRSharedMemoryBytes(int, int)
+{
+    throwHaloRUnsupported();
+}
+
+std::int64_t getMoeRebalanceHaloRRouteAuxEntries(int, int, int)
+{
+    throwHaloRUnsupported();
+}
+
+void invokeMoeRebalanceHaloR(MoeRebalanceHaloRParams const&, cudaStream_t)
+{
+    throwHaloRUnsupported();
+}
+
+std::size_t getMoeRebalanceRelaySharedMemoryBytes()
+{
+    throwHaloRUnsupported();
+}
+
+int getMoeRebalanceRelayThreads()
+{
+    throwHaloRUnsupported();
+}
+
+void invokeMoeRebalanceRelay(MoeRebalanceRelayParams const&, cudaStream_t)
+{
+    throwHaloRUnsupported();
 }
 
 } // namespace kernels
