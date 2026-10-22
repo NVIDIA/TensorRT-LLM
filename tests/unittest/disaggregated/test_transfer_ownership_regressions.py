@@ -1343,6 +1343,8 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
     sender._pre_cancelled_rids = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests, sender._peer_requests_timestamps = {}, {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
@@ -1397,7 +1399,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     session._claim_unsubmitted_aux_failure.assert_not_called()
     make_result.assert_not_called()
     marker = sender._send_task_queues[0].get_nowait()
-    assert marker == transfer_mod._SessionQuiescence(rid, 2, "receiver")
+    assert marker == transfer_mod._SessionQuiescence(rid, 2, "receiver", peer_rid=rid)
     assert sender._send_session_quiesced(marker)
     dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"5", b"97"])
     assert not sender._pending_session_quiescence

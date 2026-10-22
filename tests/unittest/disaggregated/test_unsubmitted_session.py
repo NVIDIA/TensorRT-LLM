@@ -67,8 +67,9 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
 
 
 def _cancel(*, routing: bool = False) -> list[bytes]:
+    # Frame 1 is the sender's key; routing adds the receiver's name, rank and own key.
     message = [transfer_mod.MessageType.CANCEL_SESSION, b"401"]
-    return message + [b"gen", b"0"] if routing else message
+    return message + [b"gen", b"0", b"401"] if routing else message
 
 
 def _request_data() -> list[bytes]:
