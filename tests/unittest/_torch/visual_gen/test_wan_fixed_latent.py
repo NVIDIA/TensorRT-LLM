@@ -10,6 +10,8 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _bare_pipeline(path):
     # Skip __init__ (it builds the whole model); set only what _get_fixed_latent reads.
