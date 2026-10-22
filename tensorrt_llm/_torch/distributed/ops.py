@@ -145,6 +145,8 @@ def _warmup_named_allreduce_topology(mapping: Mapping, group_name: str) -> None:
 
 def warmup_named_allreduce_topologies(model: nn.Module) -> None:
     """Warm each named TP group used by the model's ``AllReduce`` modules, once and in a fixed order."""
+    if not mpi_disabled():
+        return
     mappings = {}
     for module in model.modules():
         if isinstance(module, AllReduce) and module._group_name:
