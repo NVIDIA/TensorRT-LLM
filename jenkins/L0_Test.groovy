@@ -477,6 +477,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     def isolateTestLines = readFile(file: isolateTestList).readLines()
     def rerunFailed = false
     def rerunInfraFailure = null
+    def unrerunInfraFailure = null
     def hasUnrerunFailure = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
@@ -532,6 +533,11 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                         error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
                     }
                 } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
+                    String scope = retryContext?.scope ?: InfraFailure.K8S
+                    def classified = classifyFailure(pipeline, e, scope, retryContext)
+                    if (classified instanceof InfraFailure) {
+                        unrerunInfraFailure = classified
+                    }
                     // Same duration/no-signature gap as the regular-test path: this
                     // finished but failed, and was never actually rerun, so
                     // results_isolated_${i}.xml still carries the original
@@ -563,6 +569,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     return [
         rerunFailed: rerunFailed,
         rerunInfraFailure: rerunInfraFailure,
+        unrerunInfraFailure: unrerunInfraFailure,
         hasUnrerunFailure: hasUnrerunFailure,
     ]
 }
@@ -5327,6 +5334,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noIsolateTests = false
         def rerunFailed = false
         def rerunInfraFailure = null
+        def unrerunInfraFailure = null
         def hasUnrerunFailure = false
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
@@ -5537,6 +5545,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 error "Some tests terminated unexpectedly, please check the test report."
                             }
                         } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
+                            String scope = retryContext?.scope ?: InfraFailure.K8S
+                            def classified = classifyFailure(pipeline, e, scope, retryContext)
+                            if (classified instanceof InfraFailure) {
+                                unrerunInfraFailure = classified
+                            }
                             // Failures that finished (not a timeout) but were never
                             // rerun because duration > 10 min and no known failure
                             // signature matched: results.xml still carries their
@@ -5557,6 +5570,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag, retryContext)
                             rerunFailed = isolatedResult.rerunFailed || rerunFailed
                             rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
+                            unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
                             hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
                         }
                     } else {
@@ -5647,6 +5661,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (hasUnrerunFailure) {
+            if (unrerunInfraFailure != null) {
+                throw unrerunInfraFailure
+            }
             error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
         }
 
