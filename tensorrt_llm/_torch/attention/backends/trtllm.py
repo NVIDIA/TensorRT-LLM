@@ -690,6 +690,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         state = getattr(self, "fp4_mla_state", None)
         if state is not None:
             state.on_update_kv_lens(self)
+        view = self.mixed_precision_staging
+        if (view is not None and view.lengths is not None
+                and view.manager is self.kv_cache_manager):
+            # The engine corrects kv_lens_cuda on the device once the previous
+            # step's accepted draft tokens are known; the staging gather and
+            # writeback follow the same lengths.
+            lengths = view.lengths
+            n = lengths.shape[1]
+            lengths[1].copy_(self.kv_lens_cuda[:n])
+            torch.sub(lengths[1], self.seq_lens_kv_cuda[:n], out=lengths[0])
 
     def update_for_spec_dec(self) -> None:
         if self.enable_flash_mla:

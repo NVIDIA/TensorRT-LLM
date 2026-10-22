@@ -290,3 +290,18 @@ def test_mixed_precision_rejects_custom_managers():
     # A plain dtype never reaches the check.
     manager._init_mixed_precision(KvCacheConfig(), None, 1024, DataType.FP8)
     assert manager.high_layers == {}
+
+
+def test_appended_draft_layers_stay_native(make_manager):
+    """One-model draft layers appended to the target manager keep a plain cache."""
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    manager = make_manager(
+        config=mixed_config(pool_ratio=None),
+        num_layers=2,
+        spec_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+    )
+    assert manager.pp_layers == [0, 1, 2]
+    assert manager.high_layers == {0: 3, 1: 4}
+    assert not manager._is_mixed_precision_layer(2)
+    assert manager.get_buffers(2).dtype == torch.bfloat16

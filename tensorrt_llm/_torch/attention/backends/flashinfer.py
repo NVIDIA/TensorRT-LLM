@@ -928,6 +928,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._logical_kv_lens[row_slice].add_(runtime_offsets, alpha=direction)
         token_offsets = runtime_offsets.repeat_interleave(tokens_per_generation)
         self._positions[token_slice].add_(token_offsets, alpha=direction)
+        view = self.mixed_precision_staging
+        if (view is not None and view.lengths is not None
+                and view.manager is self.kv_cache_manager):
+            # The staging gather and writeback follow the corrected lengths.
+            view.lengths[:, row_slice].add_(runtime_offsets, alpha=direction)
 
         for wrappers in self._plan_params_to_wrappers.values():
             self._publish_decode_wrapper_kv_lens(wrappers.decode_wrapper)

@@ -1354,6 +1354,14 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
         )
+        # Draft layers appended to this manager (ids from num_layers up) keep a
+        # plain cache: the attention staging never covers them.
+        self._first_spec_layer_id: Optional[int] = None
+        if layer_mask is None and spec_config is not None:
+            from tensorrt_llm._torch.speculative import get_num_spec_layers
+
+            if get_num_spec_layers(spec_config) > 0:
+                self._first_spec_layer_id = num_layers
         self.is_draft = is_draft
 
         # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
@@ -3206,11 +3214,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         """Whether this local layer stores its history in the low-precision pool."""
+        layer_id = self.pp_layers[local_layer_idx]
         return (
             self.low_precision_dtype is not None
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
             and self.max_attention_window_vec[local_layer_idx] is None
-            and self.pp_layers[local_layer_idx] not in self._shared_kv_layers
+            and layer_id not in self._shared_kv_layers
+            and (self._first_spec_layer_id is None or layer_id < self._first_spec_layer_id)
         )
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:

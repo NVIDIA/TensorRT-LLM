@@ -164,8 +164,11 @@ mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
 The prototype requires the TRTLLM or FlashInfer attention backend with
-`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
-beam search, sparse attention, cold-page compression or context parallelism.
+`use_kv_cache_manager_v2: true`, and does not support beam search, sparse
+attention, cold-page compression or context parallelism. Speculative decoding
+is supported with one exception: dynamic-tree drafting, which relocates
+accepted KV rows inside the pools. Draft layers keep a plain cache in the
+retained dtype; only the target layers store their history in NVFP4.
 
 ### SWA Endpoint Retention
 

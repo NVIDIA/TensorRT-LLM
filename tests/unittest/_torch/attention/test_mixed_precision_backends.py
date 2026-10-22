@@ -679,9 +679,17 @@ def test_mixed_precision_public_options():
         ({"attn_backend": "VANILLA"}, NotImplementedError, "TRTLLM and FLASHINFER"),
         ({"sparse_attention_config": {"algorithm": "rocket"}}, NotImplementedError, "sparse"),
         (
-            {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 2}},
-            ValueError,
-            "single-beam",
+            {
+                "speculative_config": {
+                    "decoding_type": "MTP",
+                    "num_nextn_predict_layers": 1,
+                    "max_draft_len": 1,
+                    "use_dynamic_tree": True,
+                    "dynamic_tree_max_topK": 2,
+                }
+            },
+            NotImplementedError,
+            "dynamic-tree",
         ),
         (
             {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page"}},
@@ -690,7 +698,7 @@ def test_mixed_precision_public_options():
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
     ],
-    ids=("v1", "auto_v2", "backend", "sparse", "speculative", "compression", "beam"),
+    ids=("v1", "auto_v2", "backend", "sparse", "dynamic_tree", "compression", "beam"),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):
@@ -704,6 +712,44 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
     kwargs.update(overrides)
     with pytest.raises(error, match=match):
         TorchLlmArgs(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"decoding_type": "NGram", "max_draft_len": 2},
+        {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
+    ],
+    ids=("ngram", "mtp"),
+)
+@pytest.mark.cpu_only
+def test_mixed_precision_llm_args_allow_speculative_decoding(speculative_config):
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    args = TorchLlmArgs(
+        model="/tmp/mixed-precision-nonexistent-model",
+        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
+        speculative_config=speculative_config,
+    )
+    assert args.speculative_config is not None
+
+
+@pytest.mark.parametrize("high,expected", [("fp8", "fp8"), ("bfloat16", "auto")])
+@pytest.mark.cpu_only
+def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
+    """The separate draft manager stores its layers in the retained dtype only."""
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    target = KvCacheConfig(
+        dtype=f"mixed_nvfp4_{high}", first_n=16, last_n=64, pool_ratio=[0.9, 0.1]
+    )
+    draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
+        SimpleNamespace(), target, 1024, estimating_kv_cache=True
+    )
+    assert draft.dtype == expected
+    assert draft.mixed_precision_kv is None
+    assert draft.max_attention_window is None
+    assert target.mixed_precision_kv is not None
 
 
 @pytest.mark.parametrize(
@@ -796,5 +842,78 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
         assert metadata.mixed_precision_staging is view
         # The KV quota is not reduced for staging.
         assert manager.kv_cache_manager_py_config.cache_tiers[0].quota > 0
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
+)
+def test_staging_lengths_follow_corrected_kv_lens(backend):
+    """Overlap speculation corrects KV lengths on the device after prepare(); staging follows."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=65536,
+            enable_block_reuse=True,
+            dtype="mixed_nvfp4_bfloat16",
+            first_n=block,
+            last_n=block,
+            pool_ratio=[0.75, 0.25],
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=block,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=mapping,
+        dtype=DataType.BF16,
+    )
+    try:
+        manager.add_dummy_requests([0], [cached + block], is_gen=False)
+        metadata = backend.Metadata(
+            seq_lens=torch.tensor([block], dtype=torch.int32),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+            max_num_requests=2,
+            max_num_tokens=block,
+            max_num_sequences=2,
+            kv_cache_manager=manager,
+            request_ids=[0],
+            prompt_lens=[cached + block],
+            kv_layout="NHD",
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+        )
+        metadata.prepare()
+        view = metadata.mixed_precision_staging
+        assert view.lengths.tolist() == [[cached], [cached + block]]
+        offsets = torch.full((1,), -2, dtype=torch.int32, device="cuda")
+
+        def correct():
+            if backend is TrtllmAttention:
+                metadata.kv_lens_cuda[:1] += offsets
+                metadata.on_update_kv_lens()
+            else:
+                metadata._uses_full_generation_page_table = True
+                metadata.apply_spec_decode_kv_lens_offsets(
+                    offsets, num_generations=0, tokens_per_generation=1, num_chunked_contexts=1
+                )
+
+        correct()
+        assert view.lengths.tolist() == [[cached - 2], [cached + block - 2]]
+        # Draft layers run on another manager through this metadata: the view is
+        # hidden and the staging lengths are left alone.
+        metadata.kv_cache_manager = object()
+        assert metadata.get_mixed_precision_kv_view(0) is None
+        correct()
+        assert view.lengths.tolist() == [[cached - 2], [cached + block - 2]]
+        metadata.kv_cache_manager = manager
+        assert metadata.get_mixed_precision_kv_view(0) is view
     finally:
         manager.shutdown()

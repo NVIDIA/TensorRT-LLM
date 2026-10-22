@@ -7083,12 +7083,15 @@ class TorchLlmArgs(BaseLlmArgs):
             raise NotImplementedError(
                 "Mixed-precision KV is not supported together with sparse attention."
             )
-        if (self.speculative_config is not None
-                or self.kv_cache_compression_config is not None
+        if (self.kv_cache_compression_config is not None
                 or self.max_beam_width != 1):
             raise ValueError(
                 "Mixed-precision KV currently requires single-beam execution "
-                "without speculative decoding or cold-page compression.")
+                "without cold-page compression.")
+        if getattr(self.speculative_config, "use_dynamic_tree", False):
+            raise NotImplementedError(
+                "Mixed-precision KV does not support dynamic-tree speculative "
+                "decoding, which moves accepted KV rows inside the cache pools.")
         return self
 
     @model_validator(mode="after")

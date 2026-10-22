@@ -2294,8 +2294,14 @@ class KvCacheCreator:
         max_attention_window = (None if estimating_kv_cache else
                                 self._get_draft_max_attention_window(
                                     max_seq_len, kv_cache_config))
-        return kv_cache_config.model_copy(
-            update={"max_attention_window": max_attention_window})
+        update = {"max_attention_window": max_attention_window}
+        mixed = kv_cache_config.mixed_precision_kv
+        if mixed is not None:
+            # The draft layers keep a plain cache in the retained dtype: the
+            # target's attention staging never covers them, and a one-group
+            # draft manager cannot take the target's two-group pool layout.
+            update["dtype"] = "fp8" if mixed.high == "fp8" else "auto"
+        return kv_cache_config.model_copy(update=update)
 
     def _create_one_model_draft_kv_cache_manager(
         self,
