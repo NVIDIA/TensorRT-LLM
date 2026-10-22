@@ -23,6 +23,105 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBas
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("n,target", [(10, 32), (40, 100)])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("explicit", [None, True, False])
+def test_oversized_frame_target_keeps_available_frames(
+    adapter, processor, n, target, nested, explicit
+):
+    """An upper frame budget must not cause duplicate encoder work."""
+    video = _video(np.linspace(0, 239, n).astype(int).tolist())
+    controls = {"num_frames": target}
+    if explicit is not None:
+        controls["do_sample_frames"] = explicit
+    kwargs = {"videos_kwargs": controls} if nested else controls
+    result = _run(adapter, processor, [video], **kwargs)
+    reference = _run(adapter, processor, [video], do_sample_frames=False)
+    for key in ("input_ids", "pixel_values_videos", "video_grid_thw"):
+        assert torch.equal(result[key], reference[key])
+    assert list(result["video_metadata"][0].frames_indices) == video.metadata["frames_indices"]
+    assert (
+        adapter.get_num_tokens_per_video(
+            video=video.frames, video_metadata=video.metadata, **kwargs
+        )
+        == int(result["video_grid_thw"][0].prod()) // 4
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("provenance,count", [(False, 46), (True, 699), (None, 699)])
+def test_interior_drop_below_cap_uses_loader_provenance(
+    adapter, processor, nested, provenance, count
+):
+    """Identical non-prefix indices alone cannot distinguish sampling from loss."""
+    indices = [i for i in range(700) if i != 350]
+    video = _video(indices, fps=30, total=700)
+    video.is_sampled = provenance
+    presampled = _video(np.linspace(0, 699, 32).astype(int).tolist(), fps=30, total=700)
+    original = copy.deepcopy(video.metadata)
+    result = _run(
+        adapter, processor, [video, presampled], **({"videos_kwargs": {}} if nested else {})
+    )
+    selected = np.linspace(0, 698, count).round().astype(int).tolist()
+    expected = [indices[i] for i in selected]
+    # HF pads odd frame counts to a temporal pair, without additional sampling.
+    if count % 2:
+        expected.append(expected[-1])
+    metadata = result["video_metadata"][0]
+    assert list(metadata.frames_indices) == expected
+    assert result["video_grid_thw"][:, 0].tolist() == [(count + 1) // 2, 16]
+    assert metadata.fps == 30 and metadata.total_num_frames == 700
+    assert metadata.duration == 700 / 30
+    assert processor._calculate_timestamps(metadata.frames_indices, 30) == pytest.approx(
+        [(expected[i] + expected[i + 1]) / 60 for i in range(0, len(expected), 2)]
+    )
+    assert list(result["video_metadata"][1].frames_indices) == presampled.metadata["frames_indices"]
+    assert video.metadata == original
+    assert (
+        adapter.get_num_tokens_per_video(
+            video=video.frames, video_metadata=video.metadata, video_is_sampled=provenance
+        )
+        == int(result["video_grid_thw"][0].prod()) // 4
+    )
+    n_patches = int(result["video_grid_thw"][0].prod())
+    patches = result["pixel_values_videos"][:n_patches].reshape((count + 1) // 2, -1, 3, 2, 16, 16)
+    padded = selected + ([selected[-1]] if count % 2 else [])
+    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == padded
+
+
+def test_trusted_single_frame_sample_is_preserved(adapter, processor):
+    video = _video([0], fps=30, total=700)
+    video.is_sampled = True
+    result = _run(adapter, processor, [video])
+    assert list(result["video_metadata"][0].frames_indices) == [0, 0]
+
+
+@pytest.mark.parametrize(
+    "kwargs,count",
+    [
+        ({"num_frames": 0}, 699),
+        ({"fps": -1}, 699),
+        ({"do_sample_frames": False}, 699),
+        ({"num_frames": 1000, "fps": 1}, 23),
+        ({"num_frames": 32}, 32),
+    ],
+)
+def test_decode_provenance_respects_explicit_controls(adapter, processor, kwargs, count):
+    """Full-decode provenance only changes the implicit sampling path."""
+    video = _video([i for i in range(700) if i != 350], fps=30, total=700)
+    video.is_sampled = False
+    result = _run(adapter, processor, [video], **kwargs)
+    assert int(result["video_grid_thw"][0, 0]) == (count + 1) // 2
+
+
+def test_disabled_processor_respects_decode_provenance(adapter, processor):
+    processor.video_processor.do_sample_frames = False
+    video = _video([i for i in range(700) if i != 350], fps=30, total=700)
+    video.is_sampled = False
+    result = _run(adapter, processor, [video])
+    assert int(result["video_grid_thw"][0, 0]) == 350
+
+
 @pytest.fixture()
 def adapter(processor) -> Qwen3VLInputProcessorBase:
     instance = object.__new__(Qwen3VLInputProcessorBase)
