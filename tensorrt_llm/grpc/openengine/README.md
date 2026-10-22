@@ -27,8 +27,8 @@ OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC 
 
 | Service | Meaning | Probe use |
 |---------|---------|----------------|
-| `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Startup and readiness probes |
-| `liveness` | The gRPC server is running and no known fatal engine failure requires a restart. | Liveness probe |
+| `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Readiness probe |
+| `liveness` | The gRPC server is running and no known fatal engine failure requires a restart. | Startup and liveness probes |
 
 The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. A check that runs longer than five seconds makes inference `NOT_SERVING`; the server keeps at most one engine check in flight and discards a late result before polling again. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by a poll interval or the check deadline. The multi-frontend coordinator reads the monitor's latest engine result without running another engine check. A known fatal executor or worker failure makes both services `NOT_SERVING` and stops the serving process. Other readiness failures leave liveness `SERVING` and can recover. During orderly shutdown, inference reports `NOT_SERVING` while liveness retains its previous status until the listener closes. Each `Watch` ends after its final status. A stopped server cannot answer the probe.
 
@@ -45,7 +45,7 @@ The sidecar can use `127.0.0.1:30001`. Kubernetes probes connect to the Pod IP o
 startupProbe:
   grpc:
     port: 30001
-    service: inference
+    service: liveness
   periodSeconds: 10
   failureThreshold: 60
 readinessProbe:
@@ -113,7 +113,7 @@ For attention DP, each publisher binds `base_port + global_rank`. When event str
 
 ### Node-local discovery
 
-OpenEngine exposes optional, versioned `ServerInfo.extra.trtllm_node` metadata without changing the protocol schema. It describes a shared engine incarnation (`engine_id`), local hostname (`node_id`), whether this is the leader, node count, KV block size, local publishing DP ranks, and the global rank-to-node ownership map. Consumers can use this information to partition telemetry collection without introducing routing-framework-specific server options.
+OpenEngine exposes optional, versioned `ServerInfo.extra.trtllm_node` metadata without changing the protocol schema. It describes a shared engine incarnation (`engine_id`), local hostname (`node_id`), whether this is the leader, node count, KV block size, local publishing DP ranks, and the global rank-to-node ownership map. The engine ID matches `GetServerInfo.instance_id` on the serving ingress and node metadata listeners. Consumers can use this information to partition telemetry collection without introducing routing-framework-specific server options.
 
 The serving ingress retains engine-wide `GetKvEventSources` discovery for existing clients. With event streaming enabled, one executor on each other hostname starts a bounded metadata-only listener at the configured OpenEngine port. Its `GetKvEventSources` returns only actual local publishers. It exposes neither inference nor engine-wide load; other RPCs are unimplemented. Metadata listeners stop with their executor, and bind errors fail startup collectively.
 
