@@ -18,6 +18,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -333,6 +334,8 @@ class DecoderInputPreparer:
         self.use_beam_search = use_beam_search
         self._steady_gen_cache_supported = steady_gen_cache_supported
         self.guided_decoder: CapturableGuidedDecoder | None = None
+        # Set by the runner once its CUDA graph component exists.
+        self.breakable_cuda_graph_runner: BreakableCUDAGraphRunner | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
         self._gather_ids_buffer = (
             DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
@@ -526,6 +529,14 @@ class DecoderInputPreparer:
                 mapping=self.mapping,
                 dist=self.dist,
             )
+        prefill_cuda_graph_num_tokens = self._config.prefill_cuda_graph_num_tokens
+        breakable_runner = self.breakable_cuda_graph_runner
+        if breakable_runner is not None and not (
+            breakable_runner.is_capturing or breakable_runner.is_warming_up
+        ):
+            # Pad only to a bucket that replays; any other batch runs eagerly
+            # at its real token count. Every TP rank captures the same buckets.
+            prefill_cuda_graph_num_tokens = breakable_runner.captured_num_tokens
         return pad_input_tokens(
             attn_metadata,
             num_tokens,
@@ -540,7 +551,7 @@ class DecoderInputPreparer:
                 if allow_prefill_cuda_graph
                 else PrefillCudaGraphBackend.DISABLED
             ),
-            prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
+            prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
         )
 
     def model_inputs(
