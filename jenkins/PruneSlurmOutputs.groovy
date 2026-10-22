@@ -105,6 +105,9 @@ def pruneCluster(String clusterName, String days, boolean dryRun) {
     CloudManager.withSlurmFrontendFailover(this, clusterName, cluster) { remote ->
         Utils.exec(
             this,
+            // Utils.exec defaults to a 10-minute timeout; the per-cluster stage
+            // timeout bounds this instead.
+            timeout: 0,
             script: Utils.sshUserCmd(
                 remote,
                 Utils.bashWrappedRemoteCmd(pruneCommands(homeDir, days, dryRun))
@@ -158,7 +161,7 @@ pipeline {
                             stage(clusterName) {
                                 // One unreachable cluster must not block the others.
                                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                                    timeout(time: 20, unit: 'MINUTES') {
+                                    timeout(time: 1, unit: 'HOURS') {
                                         pruneCluster(clusterName, params.RETENTION_DAYS, params.DRY_RUN)
                                     }
                                 }
