@@ -277,7 +277,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         return (dense_layers, swa_layers, window_size)
 
     def _load_calibration(self) -> None:
-        raw = torch.load(self.calibration_path, map_location="cpu", weights_only=False)
+        raw = torch.load(self.calibration_path, map_location="cpu", weights_only=True)
         if isinstance(raw, dict) and _REQUIRED_CALIBRATION_KEYS <= set(raw):
             e_q = raw["E_q"]
             e_q_norm = raw["E_q_norm"]
