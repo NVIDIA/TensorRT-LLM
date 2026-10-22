@@ -179,6 +179,11 @@ from .ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (
     qwen4_exp_hc_decode_mix_cute,
     qwen4_exp_hc_decode_mix_fp4_cute,
 )
+from .ops.hc.qwen4_exp_hc_decode_rows_tc import MAX_ROWS as _HC_DECODE_ROWS_MAX
+from .ops.hc.qwen4_exp_hc_decode_rows_tc import (
+    qwen4_exp_hc_decode_rows_first,
+    qwen4_exp_hc_decode_rows_mix,
+)
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_lowrank_act import qwen4_exp_hc_lowrank_act
@@ -4600,6 +4605,23 @@ class DecodeTarget:
         `normed` has no pending block, so it never carries `moe`."""
         core = self.core
         gate_logits, shared, topk_w, topk_rows = moe if moe is not None else (None,) * 4
+        if _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX and topk_rows is None:
+            # Two tensor-core launches; the forward leaves the runner's finalize unfolded here.
+            n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
+            hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
+                hc,
+                block_out,
+                inject,
+                norm,
+                first,
+                core.hc_count,
+                n_cols,
+                core.eps,
+                shared,
+                gate_logits,
+            )
+            mixed, _, _ = qwen4_exp_hc_decode_rows_mix(low, rstd, up, hc, norm, core.hc_count)
+            return hc, mixed, inject
         if hc.shape[0] <= _HC_DECODE_GEMV_MAX_ROWS:
             n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
             hc, part, ss = qwen4_exp_hc_decode_first_cute(
@@ -4643,6 +4665,21 @@ class DecodeTarget:
         projection `qwen4_exp_hc_up_gate_mean_fp4`. Returns
         `(hc, mixed, inject, xq, xsf)`."""
         core = self.core
+        if _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
+            hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
+                hc,
+                block_out,
+                inject,
+                norm,
+                first,
+                core.hc_count,
+                core.hc_lowrank + core.hc_count,
+                core.eps,
+            )
+            mixed, xq, xsf = qwen4_exp_hc_decode_rows_mix(
+                low, rstd, up, hc, norm, core.hc_count, gscale
+            )
+            return hc, mixed, inject, xq, xsf
         if hc.shape[0] <= _HC_DECODE_GEMV_MAX_ROWS:
             hc, part, ss = qwen4_exp_hc_decode_first_cute(
                 hc, block_out, inject, norm, first, core.hc_count, core.hc_lowrank + core.hc_count
@@ -5518,7 +5555,13 @@ class DecodeTarget:
             )
             # The trtllm-gen runner's finalize folds into the next site's first kernel
             # when that site takes the combine (every one but the PLE layer's).
-            fold = core.trunk_moe_backend == "TRTLLM" and i + 1 != core.ple_layer
+            # Not at 2.._HC_DECODE_ROWS_MAX rows either: those sites run on the tensor-core pair,
+            # which reads finalized rows.
+            fold = (
+                core.trunk_moe_backend == "TRTLLM"
+                and i + 1 != core.ple_layer
+                and not _HC_DECODE_GEMV_MAX_ROWS < num_tokens <= _HC_DECODE_ROWS_MAX
+            )
             block_out, moe = self._moe_block(mixed, xq, xsf, L, routed_out, gemm, fold=fold)
         # The stack-final mixer with no injection weight: it returns the mix
         # alone, and that mix *is* this checkpoint's final norm.
