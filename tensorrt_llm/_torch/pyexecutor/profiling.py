@@ -43,6 +43,7 @@ isolating the lifecycle logic in this module for review.
 
 import functools
 import os
+import tempfile
 import time
 import uuid
 import weakref
@@ -287,15 +288,7 @@ class PyExecutorProfileManager:
             activities = ["CPU", "GPU"]
 
         if output_dir is None:
-            # ``/tmp`` is the documented developer default for the
-            # profile trace directory (matches the server docs); the
-            # user-facing override is the
-            # ``TLLM_TORCH_PROFILER_DIR`` env var or the
-            # ``output_dir`` request body field.
-            output_dir = os.environ.get(
-                "TLLM_TORCH_PROFILER_DIR",
-                "/tmp",  # nosec B108
-            )
+            output_dir = os.environ.get("TLLM_TORCH_PROFILER_DIR")
 
         # Fail fast if the directory cannot be created. Returning
         # success here would schedule a profile window that later
@@ -306,11 +299,16 @@ class PyExecutorProfileManager:
         # plumbing as the "already in progress" guard above, so the
         # HTTP handler can map it to a 5xx with a meaningful body.
         try:
-            os.makedirs(output_dir, exist_ok=True)
+            if output_dir is None:
+                with tempfile.TemporaryDirectory(prefix="trtllm-profile-"):
+                    pass
+            else:
+                os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
             from tensorrt_llm.executor.utils import RequestError
 
-            raise RequestError(f"Failed to create profile output_dir {output_dir}: {e}") from e
+            target = output_dir if output_dir is not None else "the system temporary directory"
+            raise RequestError(f"Failed to create profile output directory at {target}: {e}") from e
 
         # Include a unique profile id (monotonic timestamp + short
         # uuid fragment) so successive start/stop cycles under the
@@ -453,9 +451,11 @@ class PyExecutorProfileManager:
         """
         executor = self._executor
         activities = config.get("activities") or ["CPU", "GPU"]
-        # ``/tmp`` matches the documented developer default; see
-        # ``start_profile`` for the rationale.
-        output_dir = config.get("output_dir") or "/tmp"  # nosec B108
+        output_dir = config.get("output_dir")
+        if not output_dir:
+            # Maintain compatibility for callers constructing
+            # configs without output_dir.
+            output_dir = tempfile.mkdtemp(prefix="trtllm-profile-")
         profile_id = config.get("profile_id") or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
         # Prefer the legacy absolute ``start_iter`` form (older unit
         # tests and env-var driven paths set this directly). For the

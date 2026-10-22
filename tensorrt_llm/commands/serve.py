@@ -410,9 +410,8 @@ def _publish_bound_address(report_addr: Optional[str], host: str,
         host = resolved
     report_addr = os.path.abspath(report_addr)
     parent = os.path.dirname(report_addr)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent,
                                     prefix=os.path.basename(report_addr) + ".",
                                     suffix=".tmp")
     try:
@@ -2253,9 +2252,18 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # that dominated per-request latency). Opt-out via the UDS env = "0".
     use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
                              "1") == "1"
-    coord_uds = (
-        f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
-        if use_uds else None)
+    coord_uds_dir = (tempfile.TemporaryDirectory(
+        prefix="trtllm-disagg-coord-") if use_uds else None)
+    coord_uds = (os.path.join(coord_uds_dir.name, "coordinator.sock")
+                 if coord_uds_dir else None)
+    # TMPDIR must be at most 61 bytes to keep this socket path within Linux's
+    # 107-byte limit.
+    if (coord_uds_dir is not None and coord_uds is not None
+            and len(os.fsencode(coord_uds)) > 107):
+        coord_uds_dir.cleanup()
+        raise ValueError(
+            "Coordinator Unix socket path exceeds 107 bytes; TMPDIR must be "
+            "at most 61 bytes")
     # Fleet points at the UDS when enabled; the TCP port stays up for health.
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
@@ -2343,6 +2351,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         for process in fleet:
             if process.poll() is None:
                 process.terminate()
+        if coord_uds_dir is not None:
+            coord_uds_dir.cleanup()
 
 
 def _init_fleet_worker_process():
