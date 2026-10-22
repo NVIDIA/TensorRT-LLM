@@ -333,7 +333,8 @@ class PleGateConvInjectNorm(OpWrapper):
     launch: the conv over packed (row tile, channel block) programs, the
     per-sequence kernel then only publishing the state.
 
-    Returns `(hc_out, normed)`, fresh `[T, C*D]` in `hc`'s dtype.
+    Returns `(hc_out, normed)`, `[T, C*D]` in `hc`'s dtype: fresh, or the
+    two row-strided buffers of `out` (neither overlapping `hc`) written in place.
     `conv_states` is advanced in place. When `conv_input` is given (a
     contiguous `[T, C*D]` buffer in `hc`'s dtype) the conv input `xc` is
     written there, for a caller that has to rebuild the conv state at another
@@ -412,13 +413,17 @@ class PleGateConvInjectNorm(OpWrapper):
         max_rows: int,
         has_initial_states: Optional[torch.Tensor] = None,
         conv_input: Optional[torch.Tensor] = None,
+        out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows, width = hc.shape
         hidden = width // hc_count
         ksize = conv_weight.shape[-1]
         state_len = conv_states.shape[-1]
-        hc_out = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
-        normed = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
+        if out is None:
+            hc_out = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
+            normed = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
+        else:
+            hc_out, normed = out
         num_seqs = state_indices.shape[0]
         if num_seqs == 0 or rows == 0:
             return hc_out, normed
@@ -543,6 +548,7 @@ class PleGateConvInjectNorm(OpWrapper):
         max_rows: int,
         has_initial_states: Optional[torch.Tensor] = None,
         conv_input: Optional[torch.Tensor] = None,
+        out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(hc_out, normed, conv_states)` as the call leaves them: float64
         throughout, rounded to the activation dtype exactly where the op (and
@@ -620,6 +626,7 @@ class PleGateConvInjectNorm(OpWrapper):
         max_rows: int,
         has_initial_states: Optional[torch.Tensor] = None,
         conv_input: Optional[torch.Tensor] = None,
+        out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         rows, width = hc.shape
         assert width % hc_count == 0, f"width {width} not divisible by hc_count {hc_count}"
@@ -667,6 +674,10 @@ class PleGateConvInjectNorm(OpWrapper):
             and conv_input.dtype == hc.dtype
             and conv_input.is_contiguous()
         ), "conv_input must be a contiguous buffer shaped and typed as hc"
+        for t in out or ():
+            assert t.shape == hc.shape and t.dtype == hc.dtype and t.stride(1) == 1, (
+                "out buffers must be shaped and typed as hc, unit column stride"
+            )
 
 
 ple_gate_conv_inject_norm = PleGateConvInjectNorm()

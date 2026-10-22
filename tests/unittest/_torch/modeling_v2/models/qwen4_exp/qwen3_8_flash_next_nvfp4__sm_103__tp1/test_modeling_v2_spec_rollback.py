@@ -175,12 +175,11 @@ def _write_planes(b, layer_index, position, req_idx, logical, keys, anchor_keys,
     layer_index[pages, within] = torch.where(anchor, anchor_keys, layer_index[pages, within])
 
 
-def _verify_step(b, rollback, ple="rows"):
+def _verify_step(b, rollback):
     """The forward's write sequence over all `p` rows of every generation
-    request, staged at the forward's call sites, then the worker's commit.
-    `ple="verify"` stages the PLE pools as the decode target's fused launches do
-    (`stage_ple_verify` before the id history publishes, `stage_ple_conv_input`
-    from the conv input), a generation-only batch's path."""
+    request, staged at the forward's call sites, then the worker's commit. The
+    PLE pools stage as the fused PLE launches do: `stage_ple_verify` before the
+    id history publishes, `stage_ple_conv_input` from the conv input."""
     rollback.discard()
     qsl = b.qsl
     rollback.begin(
@@ -194,15 +193,9 @@ def _verify_step(b, rollback, ple="rows"):
         block_table=b.block_table,
         tokens_per_block=TPB,
     )
-    if ple == "verify":
-        assert b.num_contexts == 0, "the fused PLE staging serves generation-only batches"
-        rollback.stage_ple_verify(b.ngram, b.conv, b.ids)
-        ngram_token_history(b.ids, b.ngram, b.slots, b.carry, qsl, EOS, NGRAM)
-        rollback.stage_ple_conv_input(b.x)
-    else:
-        rollback.stage_ple_pools(b.ngram, b.conv)
-        window = ngram_token_history(b.ids, b.ngram, b.slots, b.carry, qsl, EOS, NGRAM)
-        rollback.stage_ple_rows(window, b.x)
+    rollback.stage_ple_verify(b.ngram, b.conv, b.ids)
+    ngram_token_history(b.ids, b.ngram, b.slots, b.carry, qsl, EOS, NGRAM)
+    rollback.stage_ple_conv_input(b.x)
     dilated_short_conv_paged(
         b.x.t(), b.weight, None, b.conv, qsl, b.slots, b.carry, DILATION, True, -1
     )
@@ -267,8 +260,8 @@ def _assert_state(b, expected, what):
 
 
 # (ctx_lens, gen_starts, p, gen_accepted). Positions straddle pages and land on
-# compression anchors; one request accepts everything. `decode` and `mixed` are the accepted-
-# prefix check; `decode_p8` drives the shared-page and capture tests.
+# compression anchors; one request accepts everything. All three are the accepted-prefix check;
+# `decode_p8` also drives the shared-page and capture tests.
 CASES = {
     "decode": ((), (5, 30, 61, 100), 4, (1, 2, 4, 3)),
     "mixed": ((7, 3), (12, 29, 95), 4, (2, 1, 3)),
@@ -292,23 +285,12 @@ def _rollback(b, batched):
 
 
 @pytest.mark.parametrize("batched", [False, True], ids=["per_layer", "batched"])
-@pytest.mark.parametrize("case", ["decode", "mixed"])
+@pytest.mark.parametrize("case", ["decode", "mixed", "decode_p8"])
 def test_commit_matches_the_accepted_prefix(case, batched):
     ctx_lens, gen_starts, p, gen_accepted = CASES[case]
     b = _Batch(11, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
     b.set_accepted(gen_accepted)
     _verify_step(b, _rollback(b, batched))
-    _assert_state(b, _reference(b), case)
-
-
-@pytest.mark.parametrize("case", ["decode", "decode_p8"])
-def test_fused_ple_staging_matches_the_accepted_prefix(case):
-    """The decode target's verify step stages the PLE pools from their pre-step rows and the
-    rows' ids (`stage_ple_verify`) instead of the id windows: same commit, same state."""
-    ctx_lens, gen_starts, p, gen_accepted = CASES[case]
-    b = _Batch(13, ctx_lens, gen_starts, p, _slots(len(gen_starts)))
-    b.set_accepted(gen_accepted)
-    _verify_step(b, _rollback(b, True), ple="verify")
     _assert_state(b, _reference(b), case)
 
 

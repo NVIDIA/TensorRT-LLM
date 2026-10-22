@@ -173,7 +173,6 @@ from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
 from .ops.attention.vision_rope_2d import vision_rope_2d
-from .ops.embedding.ngram_hash import ngram_hash
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
 from .ops.gemm.fp8_gemv import MAX_ROWS as _FP8_GEMV_HEAD_ROWS
@@ -218,17 +217,13 @@ from .ops.moe.renorm_moe_routing_op import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm import flashinfer_gemma_rmsnorm
 from .ops.norm.layer_norm import layer_norm
 from .ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
-from .ops.ple.gated_ngram_injection import gated_ngram_injection
-from .ops.ple.ngram_token_history import ngram_token_history
 from .ops.ple.ple_gate_conv_inject_norm import ple_gate_conv_inject_norm
 from .ops.ple.ple_ngram_embed import ple_ngram_embed
 from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
-from .ops.quantization.dequantize_e4m3_per_tensor import dequantize_e4m3_per_tensor
 from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from .ops.ssm.causal_conv1d_triton_update import causal_conv1d_triton_update
 from .ops.ssm.causal_conv1d_update import causal_conv1d_update
 from .ops.ssm.cu_seqlens_from_seq_lens import cu_seqlens_from_seq_lens
-from .ops.ssm.dilated_short_conv_paged import dilated_short_conv_paged
 from .ops.ssm.flashinfer_chunk_gated_delta_rule import flashinfer_chunk_gated_delta_rule
 from .ops.ssm.fused_gdn_gating import fused_gdn_gating
 from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
@@ -2403,9 +2398,6 @@ class _StackWeights(NamedTuple):
     fhc_up: torch.Tensor
     ple_key: torch.Tensor
     ple_val: torch.Tensor
-    ple_nk: tuple
-    ple_nq: tuple
-    ple_nc: tuple
     ple_nk_w: torch.Tensor
     ple_nq_w: torch.Tensor
     ple_nc_w: torch.Tensor
@@ -2433,11 +2425,8 @@ def _stack_views(core: Qwen4ExpTp1ModelingV2) -> _StackWeights:
         fhc_up=w["fhc_up"].t(),
         ple_key=w["ple_key_w"].t(),
         ple_val=w["ple_val_w"].t(),
-        ple_nk=core._norm_slices("ple_nk"),
-        ple_nq=core._norm_slices("ple_nq"),
-        ple_nc=core._norm_slices("ple_nc"),
-        # The same three weights whole, for the decode target's fused tail, which
-        # normalizes each stream inside one program.
+        # The three PLE norm weights whole: the fused tail normalizes each stream inside
+        # one program.
         ple_nk_w=w["ple_nk"],
         ple_nq_w=w["ple_nq"],
         ple_nc_w=w["ple_nc"],
@@ -3873,12 +3862,12 @@ class PrefillTarget:
         the hash cannot distinguish. The id history and the conv state publish the
         state after the whole chunk.
 
-        Outside a verify step the window, hash, gather and dequantize are
-        `ple_ngram_embed`, and the gate, the conv, the residual add and the next site's
-        grouped norm `ple_gate_conv_inject_norm`. On a verify step (`stage`) the
-        generation rows' pre-step pool rows, id windows and conv input go to
-        `SpeculativeRollback`, which rewrites both pools to the accepted prefix once the
-        sampler has decided it, so that step takes `_ple_delta`, which exposes them."""
+        The window, hash, gather and dequantize are `ple_ngram_embed`, and the gate, the
+        conv, the residual add and the next site's grouped norm `ple_gate_conv_inject_norm`,
+        which writes both outputs in place. On a verify step (`stage`) the generation rows'
+        pre-step pool rows and ids are staged before the first launch publishes, and the
+        conv input the fused launch writes out after it, for `SpeculativeRollback` to
+        rewrite both pools to the accepted prefix once the sampler has decided it."""
         core = self.core
         S = self._stack
         step = self._step
@@ -3886,102 +3875,50 @@ class PrefillTarget:
         num_tokens = step.num_tokens
         next_norm = self._layers[core.ple_layer].ahc_norm
         hc = hc[:num_tokens]
+        conv_input = None
         if step.stage:
-            stream = torch.add(hc, self._ple_delta(hc))
-            stream, normed = qwen4_exp_hc_inject_norm(
-                stream, None, None, next_norm, core.eps, core.hc_count
-            )
-        else:
-            ngram = ple_ngram_embed(
-                step.input_ids,
-                ngram_pool,
-                si_all,
-                carry_all,
-                qsl,
-                core.w["ple_table"],
-                S.ple_tscale,
-                S.ple_mult,
-                S.ple_vocab,
-                S.ple_offs,
-                core.eos_token_id,
-                num_tokens,
-            )
-            stream, normed = ple_gate_conv_inject_norm(
-                hc,
-                cublas_mm(ngram, S.ple_key),
-                cublas_mm(ngram, S.ple_val),
-                S.ple_nk_w,
-                S.ple_nq_w,
-                S.ple_nc_w,
-                S.ple_conv_w,
-                conv_states,
-                si_all,
-                qsl,
-                next_norm,
-                core.eps,
-                core.hc_count,
-                _PLE_CLAMP_MIN,
-                core.ple_dilation,
-                _PAD_SLOT_ID,
-                num_tokens,
-                carry_all,
-            )
-        hc_out[:num_tokens].copy_(stream)
-        normed_out[:num_tokens].copy_(normed)
+            core.spec_rollback.stage_ple_verify(ngram_pool, conv_states, step.input_ids)
+            conv_input = torch.empty_like(hc)
+        ngram = ple_ngram_embed(
+            step.input_ids,
+            ngram_pool,
+            si_all,
+            carry_all,
+            qsl,
+            core.w["ple_table"],
+            S.ple_tscale,
+            S.ple_mult,
+            S.ple_vocab,
+            S.ple_offs,
+            core.eos_token_id,
+            num_tokens,
+        )
+        ple_gate_conv_inject_norm(
+            hc,
+            cublas_mm(ngram, S.ple_key),
+            cublas_mm(ngram, S.ple_val),
+            S.ple_nk_w,
+            S.ple_nq_w,
+            S.ple_nc_w,
+            S.ple_conv_w,
+            conv_states,
+            si_all,
+            qsl,
+            next_norm,
+            core.eps,
+            core.hc_count,
+            _PLE_CLAMP_MIN,
+            core.ple_dilation,
+            _PAD_SLOT_ID,
+            num_tokens,
+            carry_all,
+            conv_input=conv_input,
+            out=(hc_out[:num_tokens], normed_out[:num_tokens]),
+        )
+        if step.stage:
+            core.spec_rollback.stage_ple_conv_input(conv_input)
         hc_out[num_tokens:].zero_()
         normed_out[num_tokens:].zero_()
-
-    def _ple_delta(self, hc) -> torch.Tensor:
-        """A verify step's PLE output for the batch's `n` stream rows `hc`, before it is
-        added into the stream, through the unfused ops whose intermediates
-        `SpeculativeRollback` stages: the pre-step pool rows, the id windows and the conv
-        input."""
-        core = self.core
-        S = self._stack
-        step = self._step
-        conv_states, ngram_pool, si_all, carry_all, qsl = step.ple
-        core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
-        window = ngram_token_history(
-            step.input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
-        )
-        rows = torch.reshape(
-            ngram_hash(
-                window,
-                layer_multipliers=S.ple_mult,
-                head_vocab_sizes=S.ple_vocab,
-                head_offsets=S.ple_offs,
-                eos_token_id=core.eos_token_id,
-                num_query_tokens=1,
-            ),
-            [-1, core.ngram_heads],
-        )
-        gathered = nn.functional.embedding(rows, core.w["ple_table"])
-        ngram = torch.reshape(
-            dequantize_e4m3_per_tensor(gathered, S.ple_tscale), [-1, core.ple_embed_dim]
-        )
-
-        key_normed = self._grouped_norm(cublas_mm(ngram, S.ple_key), S.ple_nk)
-        query_normed = self._grouped_norm(hc, S.ple_nq)
-        value = cublas_mm(ngram, S.ple_val)
-        gated = gated_ngram_injection(
-            key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
-        )
-        conv_in = self._grouped_norm(gated, S.ple_nc)
-        core.spec_rollback.stage_ple_rows(window, conv_in)
-        # The short conv reads channel-major; a bare transpose is the certified form.
-        convolved = dilated_short_conv_paged(
-            x=torch.transpose(conv_in, 0, 1),
-            weight=S.ple_conv_w,
-            bias=None,
-            conv_states=conv_states,
-            query_start_loc=qsl,
-            cache_indices=si_all,
-            has_initial_state=carry_all,
-            dilation=core.ple_dilation,
-            silu_activation=True,
-            pad_slot_id=_PAD_SLOT_ID,
-        )
-        return torch.add(gated, torch.transpose(convolved, 0, 1))
 
     def _splice(self, h) -> None:
         """Break: write the step's vision rows over their placeholder rows of the token
@@ -6901,12 +6838,12 @@ class SpeculativeRollback:
     * every index-K and position slot written by a row of ordinal `>= a` to its
       pre-verify contents.
 
-    The targets stage during the forward (`begin`, then `stage_ple_pools` /
-    `stage_ple_rows` -- `stage_ple_verify` / `stage_ple_conv_input` on the decode
-    target's fused PLE launches -- in the PLE block and `stage_index` before each attention layer's
-    store) and the spec worker calls `commit_speculative_states` after its draft loop,
-    inside the same model forward. Context rows and non-verify steps stage nothing, and a
-    commit with nothing staged returns. Staging and commit use metadata-sized
+    The targets stage during the forward (`begin`, then `stage_ple_verify` before the
+    fused PLE launches and `stage_ple_conv_input` after them in the PLE block, and
+    `stage_index` before each attention layer's store) and the spec worker calls
+    `commit_speculative_states` after its draft loop, inside the same model forward.
+    Context rows and non-verify steps stage nothing, and a commit with nothing staged
+    returns. Staging and commit use metadata-sized
     allocations, gathers, `torch.where` and indexed writes only, and everything staged is
     allocated by the forward and consumed by that forward's commit, so a captured graph
     holds both ends and replay re-reads the engine's buffers in place."""
@@ -6988,21 +6925,10 @@ class SpeculativeRollback:
         pending["conv_pool"] = conv_pool
         pending["conv_prev"] = conv_pool[slots]
 
-    def stage_ple_rows(self, window: torch.Tensor, conv_input: torch.Tensor) -> None:
-        """After the id history and before the conv: the generation rows' id windows
-        (`[T, ngram_size]`, newest id last) and conv input (`[T, C]`, token-major). Copied
-        rather than viewed, so a long context prefix in a mixed batch is not kept alive
-        through the draft loop."""
-        pending = self._pending
-        prefix, n, p = pending["prefix"], pending["n"], pending["p"]
-        # Row t of the window without its oldest id is the history after token t.
-        pending["ngram_candidates"] = torch.reshape(window[prefix:, 1:], [n, p, -1]).clone()
-        pending["conv_x"] = torch.reshape(conv_input[prefix:], [n, p, -1]).clone()
-
     def stage_ple_verify(
         self, ngram_pool: torch.Tensor, conv_pool: torch.Tensor, input_ids: torch.Tensor
     ) -> None:
-        """A generation-only verify step's PLE staging, before either pool is written:
+        """A verify step's PLE staging, before either pool is written:
         `stage_ple_pools`, plus the n-gram candidates rebuilt from the slots' pre-step id
         history and the rows' ids. Row `t`'s history after the step is the last
         `context` ids of `[history | ids of rows 0..t]` -- what the id window of row `t`
@@ -7018,10 +6944,13 @@ class SpeculativeRollback:
 
     def stage_ple_conv_input(self, conv_input: torch.Tensor) -> None:
         """The generation rows' conv input (`[T, C]`, token-major), as the fused PLE
-        launch wrote it into a buffer the forward allocated for this staging alone."""
+        launch wrote it into a buffer the forward allocated for this staging alone. A
+        mixed batch's rows are copied out, so its context prefix is not kept alive
+        through the draft loop."""
         pending = self._pending
         prefix, n, p = pending["prefix"], pending["n"], pending["p"]
-        pending["conv_x"] = torch.reshape(conv_input[prefix:], [n, p, -1])
+        conv_x = torch.reshape(conv_input[prefix:], [n, p, -1])
+        pending["conv_x"] = conv_x.clone() if prefix else conv_x
 
     def stage_index(self, index_cache: torch.Tensor, position_cache: torch.Tensor) -> None:
         """Before an attention layer's index store: the generation rows' slots of its

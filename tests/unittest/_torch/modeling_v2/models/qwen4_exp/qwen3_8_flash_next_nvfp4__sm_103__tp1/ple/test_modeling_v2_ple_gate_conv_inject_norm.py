@@ -163,6 +163,23 @@ def test_conv_input_is_what_the_conv_consumed() -> None:
     assert torch.equal(torch.reshape(torch.transpose(tail, 1, 2), xc.shape), xc)
 
 
+def test_out_writes_the_rows_of_larger_buffers() -> None:
+    """`out` takes the leading rows of two padded `[T + 8, C*D]` buffers: the same bits as
+    the fresh outputs, the padding rows untouched -- the prefill target's in-place write."""
+    args = _build(dict(lengths=(3001, 5000) + (1,) * 64, carries=(False, True) + (True,) * 64,
+                       pool_slots=461), seed=12)  # fmt: skip
+    plain = _run(args)
+    rows = args[0].shape[0]
+    bufs = [torch.full((rows + 8, args[0].shape[1]), 7.0, dtype=args[0].dtype, device=DEV)
+            for _ in range(2)]  # fmt: skip
+    args[7] = args[7].clone()
+    hc_out, normed = op(*args, out=(bufs[0][:rows], bufs[1][:rows]))
+    assert hc_out.data_ptr() == bufs[0].data_ptr() and normed.data_ptr() == bufs[1].data_ptr()
+    assert torch.equal(bufs[0][:rows], plain[0]) and torch.equal(bufs[1][:rows], plain[1])
+    assert torch.equal(args[7], plain[2])
+    assert bool((bufs[0][rows:] == 7.0).all()) and bool((bufs[1][rows:] == 7.0).all())
+
+
 def test_guard_refuses_a_short_value() -> None:
     args = _build(dict(lengths=(1, 1)), seed=4)
     args[2] = args[2][:, :-1]
