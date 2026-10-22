@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -20,13 +22,17 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
     MoEActivationSupport,
     SiTuActivation,
 )
+from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
+from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import MoESchedulerKind
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -63,6 +69,7 @@ def _wrapper() -> ConfigurableMoE:
     wrapper.activation = DEFAULT_MOE_ACTIVATION
     wrapper.activation_type = ActivationType(DEFAULT_MOE_ACTIVATION.kind)
     wrapper.routing_method = Mock()
+    wrapper.comm = None
     wrapper._override_quant_config = None
     for attr in _BACKEND_SYNC_ATTRS:
         setattr(wrapper, attr, None)
@@ -136,6 +143,70 @@ def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
 
     assert backend.quant_config is layer_config
     backend.create_weights.assert_called_once_with()
+
+
+def test_comm_uses_backend_override_quantization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unquantized MTP override reaches communication without changing the model config."""
+    global_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    layer_config = QuantConfig()
+    model_config = ModelConfig(quant_config=global_config)
+    wrapper = _wrapper()
+    wrapper.model_config = model_config
+    wrapper.quant_config = global_config
+    wrapper._override_quant_config = layer_config
+
+    backend = _create_backend(wrapper, model_config, override_quant_config=layer_config)
+    backend.scheduler_kind = MoESchedulerKind.EXTERNAL_COMM
+    wrapper.enable_dwdp = False
+    wrapper.communication_method = None
+    factory = Mock()
+    monkeypatch.setattr(communication_factory.CommunicationFactory, "create_strategy", factory)
+
+    assert wrapper._create_comm_strategy_auto() is factory.return_value
+    effective_config = factory.call_args.kwargs["model_config"]
+    assert effective_config.quant_config is layer_config
+    assert effective_config.mapping is model_config.mapping
+    assert model_config.quant_config is global_config
+
+
+def test_nccl_ep_layer_quantization_finalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Late unquantized settings disable quantized dispatch and combine before context creation."""
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fake_ep = SimpleNamespace(Layout=SimpleNamespace(RANK_MAJOR=object()))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+    get_context = Mock(return_value=object())
+    monkeypatch.setattr(nccl_ep_utils, "get_nccl_ep_context", get_context)
+    global_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    layer_config = QuantConfig()
+    model_config = ModelConfig(
+        quant_config=global_config,
+        quant_config_dict={"model.layers.0.mlp.experts": layer_config},
+    )
+    wrapper = _wrapper()
+    wrapper.quant_config = global_config
+    _create_backend(wrapper, model_config)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+        quant_config=global_config,
+        use_low_precision_combine=True,
+    )
+    wrapper.comm = comm
+    assert comm.supports_post_quant_dispatch()
+    assert comm.use_low_precision_combine
+
+    wrapper.quant_config = layer_config
+    wrapper.create_weights()
+
+    assert not comm.supports_post_quant_dispatch()
+    assert not comm.use_low_precision_combine
+    assert comm._get_context() is get_context.return_value
+    assert get_context.call_args.kwargs["external_fp8"] is False
+    assert get_context.call_args.kwargs["external_nvfp4"] is False
 
 
 def test_exclusions_only_recreate_matching_moe_weights() -> None:
