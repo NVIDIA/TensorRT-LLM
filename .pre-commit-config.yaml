@@ -1597,6 +1597,7 @@ repos:
           (?x)^(
             \.pre-commit-config\.yaml |
             pyproject\.toml |
+            setup\.py |
             requirements[^/]*\.txt |
             scripts/generate_trtllm_serve_schemas\.py |
             tensorrt_llm/.*\.py |
