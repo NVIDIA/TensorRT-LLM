@@ -221,9 +221,15 @@ def get_kv_cache_manager_cls(
         if model_config.attn_backend != "TRTLLM":
             raise ValueError("FP4 MLA requires the TRTLLM attention backend.")
         if is_disagg:
-            raise NotImplementedError(
-                "FP4 MLA disaggregated serving requires the follow-up "
-                "Python NIXL integration.")
+            # Only the Python NIXL transceiver moves the V2 FP4 MLA roles.
+            backend, runtime = _resolve_disagg_transceiver_route(
+                cache_transceiver_config)
+            if runtime != "PYTHON" or backend != "NIXL":
+                raise ValueError(
+                    "FP4 MLA disaggregated serving requires "
+                    "cache_transceiver_config backend='NIXL' with "
+                    "transceiver_runtime='PYTHON' (got "
+                    f"backend={backend!r}, transceiver_runtime={runtime!r}).")
         if is_hybrid_linear(config):
             raise NotImplementedError(
                 "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
