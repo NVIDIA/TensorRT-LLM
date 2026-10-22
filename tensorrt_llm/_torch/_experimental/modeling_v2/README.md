@@ -111,8 +111,13 @@ models/<family>/
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
+                      kernels/<category>/  kernel sources its entries launch (optional)
 catalog/<category>/ entries more than one target calls
 ```
+
+`kernels/` holds the kernel sources a target's entries launch and nothing else
+does. It has one subdirectory per `ops/` category, plus `common/` for helpers
+that more than one category imports.
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain
@@ -137,6 +142,7 @@ tests/unittest/_torch/modeling_v2/
                                and allreduce at 2/4/8 ranks in one node, mnnvl_allreduce
                                at 8 ranks over two trays (srun only, see its docstring)
   comm/_rank_job.py            starts one of those and asserts on its exit code
+  models/<family>/<target>/comm/_<entry>_op_matrix.py   an owned collective's rank bodies
 ```
 
 That split is not a preference; it is where this repo's CI collects from, and
@@ -278,8 +284,8 @@ Perf is measured, never gated.
 ## Status of every record in this tree
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
-sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
-and the entries it owns are certified on sm_103.
+sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp and
+glm-5.2 targets and the entries they own are certified on sm_103.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
@@ -290,6 +296,9 @@ entry:
   its 2- and 4-rank matrices, in the post-merge 4-GPU job;
 * `mnnvl_allreduce` needs 8 ranks over two trays. Its matrix runs only by
   hand under srun (see its docstring), and no CI job re-runs it.
+
+glm-5.2's 39 owned entries run in the same pre-merge job as the 17, and its
+all-reduce's 4-rank matrix in the pre-merge 4-GPU job.
 
 Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
@@ -311,8 +320,8 @@ widening a tolerance, and each is written up in its own entry:
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
   by the op, not certified here).
 
-Both targets are gated by the accuracy suite's modeling_v2 files,
-`tests/integration/defs/accuracy/modeling_v2/test_{gpt_oss,deepseek_v3}.py`,
+The targets are gated by the accuracy suite's modeling_v2 files,
+`tests/integration/defs/accuracy/modeling_v2/test_<family>.py`,
 with `modeling_v2="require"` in force, which is what rules out the built-in
 implementation having been measured instead. The two `default` targets ran
 gsm8k at every layout before their routing admitted it, gpt-oss's tp1
@@ -323,7 +332,10 @@ at each of the six layouts MTP is admitted at. CI runs a representative
 subset -- one layout per residual-norm path and per expert split, gpt-oss
 tp1, the deepseek `mtp3` pair and acceptance gate at dep4, and deepseek
 chunked prefill at tp4+ep4 and dep4 -- and the default shards tests pin
-every layout's weight cut, the MTP layer's included, on the CPU. The numbers
+every layout's weight cut, the MTP layer's included, on the CPU.
+glm-5.2-nvfp4 / sm_103 / tep4 runs gsm8k for the identity forward and the
+`mtp1` variant paired in one session, and checks the `mtp1` acceptance length
+against an anchor measured on stock modeling, all in one test. The numbers
 live with those runs, not here: a number written into this file is one that
 drifts with nothing to notice.
 

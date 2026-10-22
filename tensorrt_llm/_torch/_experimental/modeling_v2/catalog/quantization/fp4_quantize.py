@@ -54,7 +54,8 @@ class Fp4Quantize(OpWrapper):
     # 2560. A linear buffer has no row padding, so at a row count that is not a
     # multiple of 128 it is shorter than the swizzled one; at a multiple of 128
     # the two are the same length and only the cells' byte order tells them
-    # apart.
+    # apart. glm-5.2 calls it only for its routed experts, past its own
+    # quantizer's 64 rows: linear scales at hidden 6144.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode, hidden 7168, swizzled scales -- the dense MLP's input",
@@ -91,6 +92,26 @@ class Fp4Quantize(OpWrapper):
         Cell(
             why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 decode: 1 token, hidden 6144, linear",
+            spec=dict(shape=(1, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2, 64 rows: its own quantizer's ceiling",
+            spec=dict(shape=(64, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2, 65 rows: the first row count past its own quantizer",
+            spec=dict(shape=(65, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 prefill chunk, 2048 rows at hidden 6144, linear",
+            spec=dict(shape=(2048, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 at its MoE chunk bound, 8192 rows at hidden 6144",
+            spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     )
 
