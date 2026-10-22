@@ -37,8 +37,8 @@ from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa:
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.inputs import media_io  # noqa: E402
 from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData  # noqa: E402
 from tensorrt_llm.inputs.multimodal import MultimodalParams  # noqa: E402
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData  # noqa: E402
 from tensorrt_llm.inputs.registry import (  # noqa: E402
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
@@ -932,7 +932,6 @@ async def test_image_and_video_sources_preserve_global_order(image_video_llm, mo
     ]
 
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("invalid_case", "metadata", "expected_code"),
@@ -1433,10 +1432,11 @@ async def test_placeholder_mismatch_does_not_poison_hashing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["complete", "local_abort", "coordinator_abort", "rpc_cancel"])
+@pytest.mark.parametrize("modality", ["image", "video"])
 async def test_media_preprocessing_is_offloaded_and_abort_aware(
-    image_llm, monkeypatch, outcome, media_pools
+    image_video_llm, monkeypatch, outcome, media_pools, modality
 ):
-    capability_llm, _ = image_llm
+    capability_llm = image_video_llm
     llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
     loop = asyncio.get_running_loop()
     serving_thread = threading.get_ident()
@@ -1468,7 +1468,8 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
 
             def decode():
                 assert threading.current_thread().name.startswith("test_media")
-                return np.zeros((1, 1, 3), dtype=np.uint8)
+                frames = np.zeros((1, 1, 3), dtype=np.uint8)
+                return frames if modality == "image" else VideoData(frames=[frames], metadata={})
 
             return await BaseMediaIO._run_in_executor(decode)
 
@@ -1482,9 +1483,9 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
             assert release.wait(timeout=5), "test must release the preprocessing thread"
             import torch
 
-            params.multimodal_data = {"image": {"pixel_values": torch.ones(1024 * 1024)}}
+            params.multimodal_data = {modality: {"pixel_values": torch.ones(1024 * 1024)}}
             params.to_handle("multimodal_data")
-            handle = params.multimodal_data["image"]["pixel_values"]
+            handle = params.multimodal_data[modality]["pixel_values"]
             export_paths.append(
                 Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
             )
@@ -1500,6 +1501,7 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
         return llm.result_handle
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(request_mapping, "VideoMediaIO", _ImageIo)
     monkeypatch.setattr(llm, "preprocess", preprocess)
     monkeypatch.setattr(llm, "generate_async", generate_async)
     frontend = _Frontend()
@@ -1513,9 +1515,16 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
     request = generation_pb2.GenerateRequest(
         request_id="preprocessing",
         model="image-model",
-        prompt="<image_1>",
+        prompt=f"<{modality}_1>",
         media=[
-            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+            generation_pb2.MediaItem(
+                modality=(
+                    generation_pb2.MODALITY_IMAGE
+                    if modality == "image"
+                    else generation_pb2.MODALITY_VIDEO
+                ),
+                raw_bytes=b"media",
+            )
         ],
     )
     context = FakeServicerContext()

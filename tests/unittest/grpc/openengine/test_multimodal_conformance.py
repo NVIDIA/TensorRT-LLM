@@ -63,7 +63,8 @@ def _model_info(control):
     )
 
 
-def test_image_capability_agrees_with_generate(vlm):
+@pytest.mark.parametrize("input_kind", ["prompt", "token_ids"])
+def test_image_capability_agrees_with_generate(vlm, input_kind):
     inference, control = _servicers(vlm)
     info = _model_info(control)
 
