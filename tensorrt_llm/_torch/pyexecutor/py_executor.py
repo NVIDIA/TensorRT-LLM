@@ -728,6 +728,10 @@ class PyExecutor:
         # events, re-recorded every step: a wait captures the record current at
         # the time of the wait.
         self._stream_ordering_events = (torch.cuda.Event(), torch.cuda.Event())
+        # Phase teardown joins users and synchronizes CUDA before rebinding.
+        # Sampling synchronization resources therefore live with the executor.
+        self.sample_stream = torch.cuda.Stream()
+        self.finish_sample_event = torch.cuda.Event()
         logger.info(
             f"[PyExecutor] execution_stream initialized: {self.execution_stream}; "
             f"encoder_stream initialized: {self.encoder_stream}.")
@@ -1242,8 +1246,6 @@ class PyExecutor:
                 "TLLM_HELIX_AGG_CHECK_SCHEDULE=1 is ignored: the schedule check "
                 "only runs with aggregated helix context parallelism "
                 "and pipeline parallelism disabled.")
-        self.sample_stream = torch.cuda.Stream()
-        self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches
         # or waiting for synchronized PP resource teardown. The scheduler avoids
         # these requests until their prior execution state is safe to reuse.
