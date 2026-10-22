@@ -52,6 +52,7 @@ def _call_preprocess(mm_data, mm_processor_kwargs):
     fake_processor.video_processor.do_sample_frames = True
     fake_processor.video_processor.num_frames = None
     fake_processor.video_processor.fps = 2
+    fake_processor.video_processor.max_frames = 768
     fake_processor.video_processor.sample_frames.return_value = [0, 2, 4, 7]
     instance = object.__new__(Qwen3VLInputProcessorBase)
     instance._processor = fake_processor
