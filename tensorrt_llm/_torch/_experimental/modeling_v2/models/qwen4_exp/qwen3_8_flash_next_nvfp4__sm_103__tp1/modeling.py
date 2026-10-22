@@ -206,16 +206,12 @@ from .ops.ple.ple_ngram_embed import ple_ngram_embed
 from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
 from .ops.quantization.dequantize_e4m3_per_tensor import dequantize_e4m3_per_tensor
 from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
-from .ops.ssm.causal_conv1d_fwd import causal_conv1d_fwd
 from .ops.ssm.causal_conv1d_triton_update import causal_conv1d_triton_update
 from .ops.ssm.causal_conv1d_update import causal_conv1d_update
-from .ops.ssm.chunk_gated_delta_rule import chunk_gated_delta_rule
 from .ops.ssm.cu_seqlens_from_seq_lens import cu_seqlens_from_seq_lens
 from .ops.ssm.dilated_short_conv_paged import dilated_short_conv_paged
-from .ops.ssm.extract_transpose_prefill_slice import extract_transpose_prefill_slice
 from .ops.ssm.flashinfer_chunk_gated_delta_rule import flashinfer_chunk_gated_delta_rule
 from .ops.ssm.fused_gdn_gating import fused_gdn_gating
-from .ops.ssm.fused_gdn_post_conv import fused_gdn_post_conv
 from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
@@ -3484,8 +3480,9 @@ class PrefillTarget:
         out[:, num_tokens:].zero_()
 
     def _gdn_core_verify(self, proj, out, i) -> None:
-        """`_gdn_core` on a verify step: the context rows' conv, post-conv gating and
-        chunked delta rule, and the verify path for the generation rows. A context row
+        """`_gdn_core` on a verify step: the context rows' fused conv + post-conv pass and
+        FlashInfer's chunked delta rule (as without verify rows), and the verify path for the
+        generation rows. A context row
         advances its slot as on the base path; a generation row is a draft chain of unknown
         accepted length, so it goes to the rollback buffers. The q|k|v columns are read in
         place, as the column view of the projection every consumer here is certified on;
@@ -3525,36 +3522,10 @@ class PrefillTarget:
         mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
         a_p, a_d = torch.split(a, [num_prefill_tokens, num_decode_tokens], 0)
         b_p, b_d = torch.split(b, [num_prefill_tokens, num_decode_tokens], 0)
-        # Prefill conv wants channel-major.
-        mq_p_t = extract_transpose_prefill_slice(mq_p, num_prefill_tokens, 0, core.conv_dim)
-        causal_conv1d_fwd(
-            x=mq_p_t,
-            weight=L.conv_w,
-            bias=None,
-            conv_states=conv_states,
-            query_start_loc=qsl_p,
-            cache_indices=si_p,
-            has_initial_state=hi_p,
-            silu_activation=True,
-            pad_slot_id=_PAD_SLOT_ID,
-            out=None,
-        )
-        q, k, v, g, beta = fused_gdn_post_conv(
-            prefill=mq_p_t,
-            decode=None,
-            a=a_p,
-            b=b_p,
-            A_log=L.a_log,
-            dt_bias=L.dt_bias,
-            num_k_heads=core.num_k_heads,
-            head_k_dim=core.head_k_dim,
-            num_v_heads=core.num_v_heads,
-            head_v_dim=core.head_v_dim,
-            l2_norm_eps=_L2_NORM_EPS,
-            softplus_threshold=_SOFTPLUS_THRESHOLD,
-        )
-        # q and k are already L2-normalized by the post-conv call.
-        chunk_gated_delta_rule(
+        # The context rows as on a step without verify rows: one fused conv + post-conv
+        # pass and FlashInfer's chunked recurrence (q and k arrive L2-normalized).
+        q, k, v, g, beta = self._gdn_prefill_prep(mq_p, a_p, b_p, L, i, qsl_p, si_p, hi_p)
+        flashinfer_chunk_gated_delta_rule(
             q,
             k,
             v,
@@ -3566,8 +3537,10 @@ class PrefillTarget:
             inplace_indexed_state_update=True,
             output_final_state=False,
             cu_seqlens=qsl_long_p,
+            head_first=False,
             use_qk_l2norm_in_kernel=False,
             output=out[:, :num_prefill_tokens],
+            state_workspace=None,
         )
         out_d = self._gdn_verify(
             mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
