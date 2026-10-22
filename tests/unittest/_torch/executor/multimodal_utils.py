@@ -40,12 +40,16 @@ def bare_mm_item_scheduler(
 
 
 def make_llm_request(
-    request_id: int, multimodal_data: dict[str, Any] | None = None, *, prompt_len: int = 3
+    request_id: int,
+    multimodal_data: dict[str, Any] | None = None,
+    *,
+    input_tokens: list[int] | None = None,
+    prompt_len: int = 3,
 ) -> LlmRequest:
     return LlmRequest(
         request_id=request_id,
         max_new_tokens=1,
-        input_tokens=list(range(1, prompt_len + 1)),
+        input_tokens=input_tokens if input_tokens is not None else list(range(1, prompt_len + 1)),
         sampling_config=SamplingConfig(),
         is_streaming=False,
         py_multimodal_data=multimodal_data,
@@ -69,23 +73,36 @@ def make_mm_request(
     costs: list[int],
     *,
     ready: Sequence[int] = (),
+    interleaved: bool = False,
     embedding_lengths: Sequence[int] | None = None,
     prompt_len: int = 3,
 ) -> LlmRequest:
+    """Make a request with one single-row item per cost.
+
+    With `interleaved`, the prompt places one text token before each item and
+    after the last one, so item `i` sits at prompt position `2 * i + 1`.
+    """
     if embedding_lengths is None:
         embedding_lengths = [1] * len(costs)
+    multimodal_data = {
+        "image": {"pixel_values": torch.empty(len(costs), 1)},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            item_refs=[("image", item_idx) for item_idx in range(len(costs))],
+            encoder_token_lengths=costs,
+            output_embedding_lengths=list(embedding_lengths),
+        ),
+        "multimodal_embedding_lengths": list(embedding_lengths),
+    }
+    input_tokens = None
+    if interleaved:
+        embed_mask = [0]
+        for length in embedding_lengths:
+            embed_mask.extend([1] * length)
+            embed_mask.append(0)
+        multimodal_data["multimodal_embed_mask_cumsum"] = torch.tensor(embed_mask).cumsum(0)
+        input_tokens = list(range(len(embed_mask)))
     request = make_llm_request(
-        request_id,
-        multimodal_data={
-            "image": {"pixel_values": torch.empty(len(costs), 1)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
-                item_refs=[("image", item_idx) for item_idx in range(len(costs))],
-                encoder_token_lengths=costs,
-                output_embedding_lengths=list(embedding_lengths),
-            ),
-            "multimodal_embedding_lengths": list(embedding_lengths),
-        },
-        prompt_len=prompt_len,
+        request_id, multimodal_data, input_tokens=input_tokens, prompt_len=prompt_len
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
     for item_idx in ready:

@@ -494,7 +494,9 @@ class TestServingChatTemplateGather:
             captured.update(kwargs)
             return [1, 2, 3]
 
-        monkeypatch.setattr(rg, "async_apply_chat_template", fake_async_apply)
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", fake_async_apply)
 
         token_ids = await governor._convert_messages(
             messages=[{"role": "user", "content": "hi"}],
@@ -543,7 +545,9 @@ class TestServingChatTemplateGather:
             captured.update(kwargs)
             return [1, 2, 3] if kwargs["enable_tokenize"] else "rendered prompt"
 
-        monkeypatch.setattr(ru, "async_apply_chat_template", fake_async_apply)
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", fake_async_apply)
         return ru, captured
 
     @staticmethod
@@ -553,20 +557,22 @@ class TestServingChatTemplateGather:
         request = Mock()
         request.tools = None
         request.store = False
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [1, 2, 3]
         return await ru._create_input_tokens(
             request=request,
             prev_response=None,
             prev_msgs=None,
             conversation_store=None,
             enable_store=False,
-            tokenizer=Mock(),
+            tokenizer=tokenizer,
             model_config=Mock(),
             processor=None,
         )
 
     @pytest.mark.asyncio
     async def test_responses_create_input_tokens_text_only(self, monkeypatch):
-        """Text-only input is rendered straight to token ids."""
+        """Text-only input is rendered to text and tokenized to ids, no media attached."""
         ru, captured = self._stub_responses_rendering(
             monkeypatch,
             conversation=[{"role": "user", "content": "hi", "media": []}],
@@ -574,7 +580,9 @@ class TestServingChatTemplateGather:
         )
 
         assert await self._create_responses_input(ru) == [1, 2, 3]
-        assert captured["enable_tokenize"] is True
+        # The shared renderer produces the text and tokenizes it itself; only a template
+        # that tokenizes natively hands back ids.
+        assert captured["enable_tokenize"] is False
 
     @pytest.mark.asyncio
     async def test_responses_create_input_tokens_attaches_mm_data(self, monkeypatch):
