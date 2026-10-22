@@ -2949,3 +2949,67 @@ def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
     )
     transceiver.request_and_receive_async(req)
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.cpu_only
+def test_receiver_rejects_peer_on_another_protocol_version_at_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generation side fails the first request to a mismatched peer and caches it.
+
+    The check runs before REGISTER_RANK_INFO is sent, so no dealer connects to the bad peer
+    and later requests fail fast without another instance-info round trip.
+    """
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+    peer = RankInfo(
+        instance_name="ctx",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=["tcp://ctx:5001"],
+        self_endpoint="tcp://ctx:5000",
+        transfer_engine_info=b"",
+    )
+    peer.protocol_version += 1
+    peer_bytes = peer.to_bytes()
+    messengers: list[object] = []
+
+    class _InfoMessenger:
+        def __init__(self, *, mode: str, endpoint: str) -> None:
+            self.sent: list[list[bytes]] = []
+            self.stopped = False
+            messengers.append(self)
+
+        def send(self, message: list[bytes]) -> None:
+            self.sent.append(message)
+
+        def receive(self) -> list[bytes]:
+            return [peer_bytes]
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", _InfoMessenger)
+    receiver = object.__new__(Receiver)
+    receiver._incompatible_peers = {}
+    receiver._sender_ep_instance_map = {}
+    receiver._dealers = {}
+    params = DisaggregatedParams(ctx_info_endpoint="tcp://ctx:5000")
+
+    with pytest.raises(transfer_mod.PeerIncompatibleError, match="protocol version mismatch"):
+        receiver._get_sender_info(params)
+
+    assert len(messengers) == 1
+    assert messengers[0].sent == [[MessageType.REQUEST_INSTANCE_INFO]]
+    assert messengers[0].stopped
+    assert receiver._dealers == {}
+    assert receiver._sender_ep_instance_map == {}
+    assert "tcp://ctx:5000" in receiver._incompatible_peers
+
+    with pytest.raises(transfer_mod.PeerIncompatibleError, match="protocol version mismatch"):
+        receiver._get_sender_info(params)
+    assert len(messengers) == 1
