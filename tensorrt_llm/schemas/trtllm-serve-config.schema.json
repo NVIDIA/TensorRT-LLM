@@ -1416,8 +1416,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1588,8 +1588,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -2769,6 +2769,19 @@
           "description": "KV cache manager v2 configuration for block reuse policies.",
           "status": "prototype"
         },
+        "cold_tier_offload_min_priority": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset.",
+          "title": "Cold Tier Offload Min Priority"
+        },
         "copy_on_partial_reuse": {
           "default": true,
           "description": "Whether partially matched blocks that are in use can be reused after copying them.",
@@ -3072,7 +3085,12 @@
             }
           ],
           "default": null,
-          "description": "Only blocks with priority > secondary_offload_min_priority can be offloaded to secondary memory.",
+          "deprecated": true,
+          "description": "Deprecated alias for cold_tier_offload_min_priority.",
+          "status": "deprecated",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Secondary Offload Min Priority"
         },
         "sink_token_length": {
@@ -4545,7 +4563,7 @@
       "description": "Configuration for NVFP4 GEMM backend selection.",
       "properties": {
         "allowed_backends": {
-          "description": "List of backends to consider for auto-selection. Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme performance at the cost of longer server launch time.",
+          "description": "List of backends to consider for auto-selection.",
           "items": {
             "enum": [
               "cutlass",
@@ -6267,7 +6285,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -7739,6 +7757,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --config",
   "type": "object"
 }
