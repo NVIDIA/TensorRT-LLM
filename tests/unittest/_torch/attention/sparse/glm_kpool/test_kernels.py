@@ -580,6 +580,7 @@ def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
     backend = object.__new__(GlmKpoolSparseAttention)
     backend.kv_lora_rank = 512
     backend.softmax_scale = 256**-0.5
+    backend._kernel_topk_align = 128 if get_sm_version() == 90 else 64
     backend.kv_scale_quant_orig = torch.tensor([0.5], device="cuda")
     backend._FP8_QUERY_CHUNK_SIZE = 2  # Exercise multiple chunks and a short final chunk.
     generator = torch.Generator(device="cuda").manual_seed(71)

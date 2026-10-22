@@ -129,8 +129,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
 
     #: FlashMLA tiles the top-k axis in blocks of 64 (``B_TOPK``); index rows
     #: are padded to that multiple with ``-1`` (invalid) entries, which is
-    #: semantics-free by the kernel's own contract.
+    #: semantics-free by the kernel's own contract. Its SM90 sparse prefill
+    #: walks two blocks per step and requires a multiple of 128.
     _KERNEL_TOPK_ALIGN = 64
+    _SM90_KERNEL_TOPK_ALIGN = 128
 
     # FlashMLA instantiates 64/128 query heads. Pad TP-local heads to the next
     # size and discard the extra outputs; heads attend independently.
@@ -267,6 +269,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: score scale is unchanged.
         self.softmax_scale = float(self.qk_nope_head_dim) ** -0.5
         self._native_decode = GlmKpoolNativeDecode()
+        self._kernel_topk_align = (
+            self._SM90_KERNEL_TOPK_ALIGN if get_sm_version() == 90 else self._KERNEL_TOPK_ALIGN
+        )
+        self._kernel_output_width = sparse_params.kernel_output_width(self._kernel_topk_align)
         #: ``softmax_scale * kv_scale_quant_orig`` for the native FP8 kernel, read to
         #: the host once outside CUDA graph capture (the KV scale is fixed after
         #: construction). A float lets the kernel take it as an argument, without a
@@ -580,7 +586,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         """Selected pools ``[N, select_k]`` -> latent row ids for the kernel.
 
         Expands each valid pool into its members, appends the always-visible
-        tail, pads with ``-1`` to :attr:`GlmKpoolSparseParams.kernel_output_width`
+        tail, pads with ``-1`` to the kernel's aligned top-k width
         and translates positions to latent-cache row ids in one kernel. Same
         row addressing as :meth:`score_pools`.
         """
@@ -595,7 +601,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             base_row=base_row,
             rows_per_slot=rows_per_slot,
             kpool=self.sparse_params.index_kpool,
-            out_width=self.sparse_params.kernel_output_width,
+            out_width=self._kernel_output_width,
             request_ids=request_ids,
         )
 
@@ -653,7 +659,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                     q_latent[start:stop], selected, local_indices
                 )
             return output
-        pad = (-topk_rows.shape[-1]) % self._KERNEL_TOPK_ALIGN
+        pad = (-topk_rows.shape[-1]) % self._kernel_topk_align
         if pad:
             topk_rows = torch.nn.functional.pad(topk_rows, (0, pad), value=INDEX_SENTINEL)
         local_heads = q_latent.shape[1]
