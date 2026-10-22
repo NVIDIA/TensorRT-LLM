@@ -195,7 +195,7 @@ class ConfigurableMoE(MoE):
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # ========== Create MoE Backend (selected by model_config.moe_backend) ==========
-        self._create_and_sync_backend(
+        backend_model_config = self._create_and_sync_backend(
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
@@ -238,8 +238,10 @@ class ConfigurableMoE(MoE):
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
-        # The default value is max_num_tokens * dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens
+        # The default value is max_num_tokens * dp_size. Read it from the config
+        # the backend was built with: a backend may cap it there (DeepGEMM sizes
+        # its workspace from it).
+        self.moe_max_num_tokens = backend_model_config.moe_max_num_tokens
         default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
 
         # Auxiliary stream for chunking overlap
@@ -311,8 +313,10 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"],
         moe_cls: Optional[Type] = None,
         **kwargs,
-    ) -> None:
+    ) -> ModelConfig:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
+
+        Returns the ``ModelConfig`` the backend was built with.
 
         Why this dance:
         - ``init_load_balancer=False``: the backend would otherwise
@@ -353,8 +357,8 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            # Only quant_config differs; a shallow copy avoids cloning the
-            # per-weight quant_config_dict for every layer.
+            # A shallow copy shares the per-weight quant_config_dict instead of
+            # cloning it for every layer.
             backend_model_config = copy.copy(model_config)
             backend_model_config.quant_config = override_quant_config
 
@@ -405,6 +409,7 @@ class ConfigurableMoE(MoE):
         has_post_init_quant_config = model_config.quant_config_dict is not None
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()
+        return backend_model_config
 
     def _reject_non_divisible_ep_backend(self) -> None:
         """Enforce the non-divisible-EP contract on the resolved backend.
@@ -762,7 +767,7 @@ class ConfigurableMoE(MoE):
         wrapper-owned attribute is assigned (EPLB / num_slots /
         ep_size via ``MoE.__init__`` -> ``_init_load_balancer``,
         ``self.comm`` from ``_create_comm_strategy_auto``, and
-        ``self.moe_max_num_tokens`` from ``model_config``). Backend
+        ``self.moe_max_num_tokens`` from the backend's ``model_config``). Backend
         hooks can therefore inspect them directly without ``getattr``
         guards or sentinel defaults.
         """

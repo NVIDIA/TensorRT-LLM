@@ -22,6 +22,8 @@ those two leaves mix this in, and only they declare ``supports_moe_lora=True``,
 which the scheduler checks before it reaches for ``_moe_lora_active``.
 """
 
+from collections.abc import Callable
+
 import torch
 
 from ....model_config import ModelConfig
@@ -33,6 +35,9 @@ from ....peft.lora.layer import (
 )
 from ....peft.lora.validation import has_moe_lora_targets
 from ..impl_contract import MoERunContext
+
+#: An MoE LoRA module's ``(ranks, weight_ptrs)``.
+_RanksAndPtrs = tuple[torch.Tensor, torch.Tensor]
 
 
 def raise_moe_lora_multichunk_unsupported(num_chunks: int) -> None:
@@ -68,9 +73,6 @@ class CutlassMoELoraMixin:
         )
 
     def _init_moe_lora(self, model_config: ModelConfig) -> None:
-        # Whether the layer was configured with MoE LoRA targets. Read by the
-        # workspace reservation below and, through ConfigurableMoE, by the
-        # torch.compile guard in MoE.forward.
         self._moe_lora_enabled = self._has_moe_lora_targets(model_config)
 
         # Discovery-only marker submodule. The actual LoRA GEMMs are fused into
@@ -224,7 +226,9 @@ class CutlassMoELoraMixin:
     def _empty_kernel_slot_dict() -> dict[str, torch.Tensor | None]:
         return {"fc1": None, "fc2": None, "gated": None}
 
-    def _gather_moe_lora_slots(self, source):
+    def _gather_moe_lora_slots(
+        self, source: Callable[[LoraModuleType], _RanksAndPtrs | None]
+    ) -> tuple[dict[str, torch.Tensor | None], dict[str, torch.Tensor | None]]:
         """Gather per-kernel-slot (ranks, weight_ptrs) tensors.
 
         `source(module_type)` returns the (ranks, weight_ptrs) pair for an MoE
@@ -283,7 +287,7 @@ class CutlassMoELoraMixin:
         # PyTorchModelEngine._build_lora_params; the op expects [num_seqs, 3].
         active_max_rank = 0
 
-        def _source(module_type: LoraModuleType):
+        def _source(module_type: LoraModuleType) -> _RanksAndPtrs | None:
             nonlocal active_max_rank
             entry = layer_params.get(int(module_type))
             if entry is None:
@@ -300,7 +304,7 @@ class CutlassMoELoraMixin:
 
         num_seqs = lora_params["num_seqs"]
 
-        def _slice(t):
+        def _slice(t: torch.Tensor | None) -> torch.Tensor | None:
             return t[:num_seqs].contiguous() if t is not None else None
 
         return {
@@ -335,7 +339,7 @@ class CutlassMoELoraMixin:
         if cuda_graph_params is None:
             return None
 
-        def _source(module_type: LoraModuleType):
+        def _source(module_type: LoraModuleType) -> _RanksAndPtrs | None:
             return cuda_graph_params.get_moe_slot_inputs(self.layer_idx, int(module_type))
 
         slot_ranks, slot_ptrs = self._gather_moe_lora_slots(_source)

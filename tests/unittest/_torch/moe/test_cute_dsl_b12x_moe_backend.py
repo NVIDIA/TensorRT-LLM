@@ -146,9 +146,13 @@ def test_family_name_is_not_an_implementation():
 @pytest.mark.parametrize("alias", [QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC])
 def test_nvfp4_leaf_admits_the_calibration_aliases(alias):
     """The format gate compares identities, so an uncanonicalized alias is
-    admitted, as the CUTLASS NVFP4 leaf admits it."""
+    admitted, as the CUTLASS NVFP4 leaf admits it, and shape-gated as NVFP4 is."""
     problem = MoEProblem(quant=alias.value, dtype_act=torch.bfloat16, intermediate_size=2048)
     assert NVFP4_LEAF.can_implement(problem, _deployment(120)).eligible
+    # FC1 rows 2 * 1000 are not a multiple of 128.
+    unaligned = MoEProblem(quant=alias.value, dtype_act=torch.bfloat16, intermediate_size=1000)
+    verdict = NVFP4_LEAF.can_implement(unaligned, _deployment(120))
+    assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
 
 
 def test_can_implement_rejects_swiglu_gptoss_style():
@@ -209,41 +213,6 @@ def test_can_implement_rejects_unaligned_nvfp4_fc1_shard(
     assert verdict.eligible is eligible
     if not eligible:
         assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
-
-
-# --------------------------------------------------------------------------
-# Hybrid CUTLASS-prefill / b12x-decode dispatch predicate tests
-#
-# ``_route_to_cutlass`` is a pure shape predicate on its input ``x``; we test
-# it via a stub that holds the class constant, sidestepping the full
-# constructor (which needs a routing method, real model config, etc.).
-# --------------------------------------------------------------------------
-
-
-class _RoutePredicateStub:
-    """Minimal carrier for the unbound dispatch predicate."""
-
-    _PREFILL_VIA_CUTLASS_THRESHOLD = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
-
-    _route_to_cutlass = CuteDslB12xNvfp4FusedMoE._route_to_cutlass
-
-
-def test_dispatch_routes_prefill_shape_via_cutlass():
-    stub = _RoutePredicateStub()
-    x = torch.empty(_RoutePredicateStub._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
-    assert stub._route_to_cutlass(x) is True
-
-
-def test_dispatch_just_below_threshold_takes_b12x():
-    stub = _RoutePredicateStub()
-    x = torch.empty(_RoutePredicateStub._PREFILL_VIA_CUTLASS_THRESHOLD - 1, 1024)
-    assert stub._route_to_cutlass(x) is False
-
-
-def test_dispatch_decode_shape_takes_b12x():
-    stub = _RoutePredicateStub()
-    x = torch.empty(1, 1024)
-    assert stub._route_to_cutlass(x) is False
 
 
 def test_nvfp4_decode_applies_the_awq_pre_quant_scale():
@@ -358,8 +327,8 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
 def test_dispatch_rejects_non_tensor():
     """Non-tensor inputs (e.g. Fp4QuantizedTensor) stay on the b12x path
     so the existing ValueError surfaces in quantize_input."""
-    stub = _RoutePredicateStub()
-    assert stub._route_to_cutlass(object()) is False
+    moe = object.__new__(CuteDslB12xNvfp4FusedMoE)
+    assert moe._route_to_cutlass(object()) is False
 
 
 # ---------------------------------------------------------------------------

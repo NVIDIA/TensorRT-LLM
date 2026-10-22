@@ -40,7 +40,6 @@ from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
-from .modeling_utils import moe_experts_quant_config
 
 # Perf heuristics thresholds.
 # Use routing gemv kernels when num_tokens <= 8.
@@ -574,6 +573,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             dtype=dtype,
             tune_max_num_tokens=tune_max_num_tokens,
             model_config=model_config,
+            layer_idx=layer_idx,
         )
 
         # Then, override modules with min-latency versions.
@@ -598,9 +598,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             model_config=model_config,
             apply_router_weight_on_input=True,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
-            override_quant_config=None
-            if layer_idx is None else moe_experts_quant_config(
-                model_config, f"model.layers.{layer_idx}.feed_forward.experts"),
+            override_quant_config=self.experts_quant_config,
         )
 
         self.router = Llama4MinLatencyLinear(

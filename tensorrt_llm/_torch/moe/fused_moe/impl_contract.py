@@ -436,9 +436,8 @@ def nvfp4_fc1_row_alignment_rejection(
     NVFP4 loader, and the op then splits the dequantized buffer the same way.
     """
     from tensorrt_llm._torch.utils import is_gated_activation
-    from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-    if p.quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4) or p.intermediate_size is None:
+    if p.identity_quant not in ("nvfp4", "w4a16_nvfp4") or p.intermediate_size is None:
         return None
     # Non-gated FC1 is one block with no gate/up split, so the rows the loader
     # adds stay a zero tail that the kernel never reads as an operand.
@@ -482,6 +481,11 @@ class MoERejection:
             "reason": self.reason.value,
             "detail": self.detail,
         }
+
+    def describe(self) -> str:
+        """``name: reason (detail)``, as the logs print one rejection."""
+        text = f"{self.legacy_backend}: {self.reason.value}"
+        return f"{text} ({self.detail})" if self.detail else text
 
 
 @dataclass(frozen=True)
@@ -528,12 +532,13 @@ class MoEResolutionReport:
         """The most telling of :attr:`requested_rejections`, if anything degraded.
 
         Reason codes only approximate which implementation was a contender, so
-        the degradation warning lists every requested rejection as well.
+        the degradation warning also names the other requested rejections.
         """
         if not self.degraded or not self.rejected:
             return None
         # The first one declined for a reason other than format/SM, else one
-        # declined on SM, else the first.
+        # declined on SM, else the first; with no requested rejection, the last
+        # rejection of all.
         requested = self.requested_rejections
         for rejection in requested:
             if rejection.reason not in _NOT_A_CONTENDER:
@@ -600,27 +605,18 @@ class MoEResolutionReport:
         )
         return f"{head}; turned down: {turned_down}"
 
-    def describe_rejections(self, *, requested_only: bool = False) -> str:
+    def describe_rejections(self) -> str:
         """Every rejection with its detail, not just the reason code.
 
         For the no-winner case, where the reasons are the outcome rather than
         context for a choice and the operator needs them to know which
-        constraint to relax; with ``requested_only``, for a degradation, where
-        only the requested implementations explain it. :meth:`describe` stays
-        the summary.
+        constraint to relax. :meth:`describe` stays the summary.
         """
-        rejections = (
-            self.requested_rejections if requested_only and self.requested_impls else self.rejected
-        )
-        if not rejections:
+        if not self.rejected:
             # Nothing was turned down because nothing was asked: the candidate
             # list is the bug, and that is a different diagnosis from silence.
             return "(no candidate was considered)"
-        return "; ".join(
-            f"{rejection.legacy_backend}: {rejection.reason.value}"
-            + (f" ({rejection.detail})" if rejection.detail else "")
-            for rejection in rejections
-        )
+        return "; ".join(rejection.describe() for rejection in self.rejected)
 
 
 # ---------------------------------------------------------------------------

@@ -64,7 +64,8 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             moe_experts_quant_config, register_auto_model)
 
 
 def _fused_norm_weight(norm: RMSNorm) -> torch.Tensor:
@@ -261,18 +262,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                                if config.model_type == "qwen3_5_moe_text" else
                                MoEWeightLoadingMode.VANILLA)
-        # For MIXED_PRECISION checkpoints (e.g. ModelOpt), the experts' real
-        # quant algo lives in the per-layer quant_config_dict keyed by TRT-LLM
-        # module name. Pass it as override_quant_config so the backend resolves
-        # the correct quant method (e.g. NVFP4) at construction, instead of
-        # inheriting the unquantized MIXED_PRECISION global and relying on
-        # apply_layerwise_quant_config (which rebinds the ConfigurableMoE
-        # wrapper but not its delegated backend).
         expert_quant_config = None
-        quant_config_dict = getattr(model_config, "quant_config_dict", None)
-        if quant_config_dict and layer_idx is not None:
-            expert_quant_config = quant_config_dict.get(
-                f"model.layers.{layer_idx}.mlp.experts")
+        if layer_idx is not None:
+            expert_quant_config = moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts")
         moe_model_config = model_config
         if _experts_excluded_from_quant(model_config, layer_idx):
             # These experts end up bf16 whatever the per-layer entry says, so

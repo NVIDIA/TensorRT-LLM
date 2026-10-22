@@ -40,8 +40,7 @@ class TrtllmCutlassNvfp4Impl(CutlassFusedMoEBase):
 
     W4A4: ``quantize_input`` quantizes the activations to FP4 as well. Admits
     the NVFP4_AWQ / NVFP4_ARC calibration aliases, which
-    ``MoEProblem.identity_quant`` folds onto ``nvfp4``. Serves MiniMax-style
-    SwigluBias but not a real 1-D gpt-oss expert bias (``check_gptoss_activation``).
+    ``MoEProblem.identity_quant`` folds onto ``nvfp4``.
     """
 
     descriptor = cutlass_descriptor(
@@ -56,9 +55,6 @@ class TrtllmCutlassNvfp4Impl(CutlassFusedMoEBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        # The loader bottom-pads the concatenated [w3; w1] FC1 buffer while the
-        # kernel splits gate/up at half the padded size, so an unaligned shard
-        # would run and return garbage instead of failing.
         return check_cutlass_leaf(cls, p, d, nvfp4_fc1_row_alignment_rejection(p, d))
 
     def _get_quant_method(self) -> object:
@@ -68,10 +64,14 @@ class TrtllmCutlassNvfp4Impl(CutlassFusedMoEBase):
         self,
         x: torch.Tensor | Fp4QuantizedTensor,
         post_quant_comm: bool = True,
-        **kwargs,
+        **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply the AWQ pre-quant scale, then quantize to NVFP4.
+
+        See :meth:`CutlassFusedMoEBase.quantize_input` for the arguments.
+        """
         del kwargs
-        if getattr(self, "fc31_act_scale", None) is not None:
+        if self.fc31_act_scale is not None:
             assert not isinstance(x, Fp4QuantizedTensor), (
                 "Fp4QuantizedTensor is not expected for AWQ quantization."
             )

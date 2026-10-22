@@ -788,6 +788,8 @@ class Step3p7MoE(nn.Module):
         # selected Python path owns expert execution and its dequantized weights.
         self._use_python_experts = self._use_python_clamp and not self._moe_lora_enabled
 
+        # An MTP layer nests its decoder block under ``mtp_block``.
+        block = "mtp_block." if layer_idx >= int(text_config.num_hidden_layers) else ""
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=routing_method,
@@ -798,7 +800,7 @@ class Step3p7MoE(nn.Module):
             reduce_results=False,
             model_config=model_config,
             override_quant_config=moe_experts_quant_config(
-                model_config, f"model.layers.{layer_idx}.moe.experts"
+                model_config, f"model.layers.{layer_idx}.{block}moe.experts"
             ),
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,

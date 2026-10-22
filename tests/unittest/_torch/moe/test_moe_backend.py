@@ -74,10 +74,10 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassFp8Impl,
     TrtllmCutlassNvfp4Impl,
     TrtllmCutlassUnquantizedImpl,
+    TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmTritonFp8BlockScalesImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutlass.base import FusedMoeOpFlags
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     CuteDslFusedMoENvfp4Runner,
@@ -4554,8 +4554,8 @@ def test_unresolvable_layer_error_carries_rejection_details():
 # ============================================================================
 # ``torch.ops.trtllm.fused_moe`` is replaced by a recorder, so a leaf reaching
 # for state it does not carry fails here without a GPU, and the kernel flags,
-# the weight view and the LoRA operands each leaf passes are pinned against
-# ``test_moe_impl.test_cutlass_leaf_declarations``.
+# the weight view and the LoRA operands each leaf passes must follow its own
+# declarations, which ``test_moe_impl.test_cutlass_leaf_declarations`` pins.
 
 _CUTLASS_FUSED_MOE_OP_LEAVES = tuple(
     leaf
@@ -4625,7 +4625,14 @@ def _record_fused_moe(monkeypatch) -> list:
     return calls
 
 
-_FLAG_KWARGS = tuple(FusedMoeOpFlags().op_kwargs())
+# The op's keyword names, spelled out so that renaming a flag fails here.
+_FLAG_KWARGS = (
+    "use_deepseek_fp8_block_scale",
+    "use_w4_group_scaling",
+    "use_int8_woq_per_channel",
+    "use_mxfp8_act_scaling",
+    "use_mxfp8_weight_scaling",
+)
 
 
 @pytest.mark.cpu_only
@@ -4638,13 +4645,11 @@ def test_cutlass_leaf_run_moe_hands_the_op_its_declarations(leaf_cls, monkeypatc
     assert len(calls) == 1
     assert out.shape == (2, 8)
     flags = leaf_cls.FUSED_MOE_OP_FLAGS
-    assert {name: calls[0][name] for name in _FLAG_KWARGS} == {
-        name: getattr(flags, name) for name in _FLAG_KWARGS
-    }
+    assert flags.op_kwargs() == {name: calls[0][name] for name in _FLAG_KWARGS}
     leaf.w3_w1_weight.view.assert_called_once_with(flags.weight_dtype or torch.bfloat16)
     leaf.w2_weight.view.assert_called_once_with(flags.weight_dtype or torch.bfloat16)
     # Only the leaves that fuse LoRA hand lora_params to the op.
-    fuses_lora = leaf_cls in (TrtllmCutlassUnquantizedImpl, TrtllmCutlassFp8Impl)
+    fuses_lora = leaf_cls.capabilities.supports_moe_lora
     assert (calls[0].get("fc1_lora_ranks") == "fc1-ranks") is fuses_lora
 
 
@@ -4695,7 +4700,20 @@ def test_cutlass_nvfp4_dynamic_fc2_scale_reaches_the_op(monkeypatch):
     assert calls[0]["quant_scales"][-1] is leaf.fc2_weight_scale_2
 
 
-_B12X_PREFILL_THRESHOLD = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+@pytest.mark.cpu_only
+def test_cutlass_w4a16_mxfp4_pads_the_activation_to_its_hidden_size(monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmCutlassW4a16Mxfp4Impl)
+    leaf.hidden_size = 16  # padded at construction; the activation stays 8 wide
+    leaf.run_moe(_cpu_run_context())
+
+    x = calls[0]["args"][0]
+    assert x.shape == (2, 16)
+    assert not x[:, 8:].any()
+
+
+# Spelled out, so that moving the threshold is a deliberate test change.
+_B12X_PREFILL_THRESHOLD = 64
 
 
 @pytest.mark.cpu_only

@@ -61,9 +61,9 @@ only names the code that demonstrates them. Paths are relative to
   branch admits every leaf of a family (the CUTLASS branch also takes the B12x
   leaves).
 - `tensorrt_llm/_torch/models/modeling_utils.py`:
-  `moe_experts_quant_config`, which `Qwen3MoE` (`modeling_qwen3_moe.py`) and
-  `NemotronHMOE` (`modeling_nemotron_h.py`) pass to `create_moe` as
-  `override_quant_config`.
+  `moe_experts_quant_config`, which every MoE model without a lookup of its own
+  (for example `Qwen3MoE` in `modeling_qwen3_moe.py`, `NemotronHMOE` in
+  `modeling_nemotron_h.py`) passes to `create_moe` as `override_quant_config`.
 - `tests/unittest/_torch/moe/test_moe_impl.py`: for example
   `test_pinned_identity_fails_hard_where_the_backend_literal_degrades`,
   `test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs`,
@@ -248,7 +248,7 @@ routed/shared index spaces overlap on the same global expert IDs.
 - `tests/unittest/_torch/moe/moe_test_utils.py`: `MoeBackendType` (one value
   per family), `get_backend_class`, `find_backend_class` /
   `find_backend_classes` (a family resolves to the leaf for `quant_algo`;
-  absence returns `None`), backend-specific `should_skip_*`,
+  absence returns `None` and `()` respectively), backend-specific `should_skip_*`,
   `get_quick_skip_reason`, `supports_autotuner_capture`,
   `iter_base_test_configs`, and CI acceleration logic.
 - `tests/unittest/_torch/moe/quantize_utils.py`: quantized test weight

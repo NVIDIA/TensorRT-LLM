@@ -206,9 +206,6 @@ class CuteDslB12xFusedMoEBase:
     # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
     _SUPPORTED_SM_VERSIONS = frozenset({120, 121})
 
-    def supports_moe_output_in_alltoall_workspace(self) -> bool:
-        return True
-
     @classmethod
     def _identity_quant(cls) -> str:
         return normalize_quant(canonical_quant(cls.b12x_quant_algo))
@@ -255,14 +252,6 @@ class CuteDslB12xFusedMoEBase:
                 MoERejectReason.LORA_UNSUPPORTED,
                 f"{cls.__name__} does not fuse routed-expert LoRA",
             )
-        # Only the NVFP4 leaf issues the CUTLASS op, for its prefill chunks.
-        if cls.issues_fused_moe_op:
-            rejection = check_oss_cutlass_build(cls, p, d)
-            if rejection is not None:
-                return replace(
-                    rejection,
-                    detail="NVFP4 prefill routes through CUTLASS: " + rejection.detail,
-                )
         # The decode kernel ships in the FlashInfer wheel.
         if not d.env.has_dep(MoEDep.FLASHINFER):
             return _reject(
@@ -290,14 +279,21 @@ class CuteDslB12xFusedMoEBase:
                 MoERejectReason.TOPOLOGY_UNSUPPORTED,
                 f"{cls.__name__} does not support attention-DP (parallel_size={d.parallel_size})",
             )
-        # Both leaves consume the FC1 buffer the CUTLASS NVFP4 weight pipeline
-        # padded to 128 rows, so they inherit that pipeline's row alignment.
         rejection = nvfp4_fc1_row_alignment_rejection(p, d)
         if rejection is not None:
             return rejection
+        # Last, so a build limit is never blamed for a problem the gates above
+        # turn down anyway. Only the NVFP4 leaf issues the CUTLASS op, for its
+        # prefill chunks.
+        rejection = check_oss_cutlass_build(cls, p, d)
+        if rejection is not None:
+            return replace(
+                rejection,
+                detail="NVFP4 prefill routes through CUTLASS: " + rejection.detail,
+            )
         return MoEEligibility.ok()
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: object, **kwargs: object) -> None:
         # ``ModelConfig`` is consumed by the inherited ``__init__`` for cache
         # / mapping setup but isn't kept on ``self``. The b12x wrapper needs the
         # ``use_cuda_graph`` flag at construction time, so capture it here
@@ -307,9 +303,6 @@ class CuteDslB12xFusedMoEBase:
 
         super().__init__(*args, **kwargs)
 
-        # No alltoall guard here: alltoall is picked by the wrapper's
-        # communication strategy, and the gates already reject the topologies
-        # that could pick it (ep_size != 1, attention-DP with parallel_size > 1).
         self._b12x_weights: dict | None = None
         self.b12x_wrapper = None
 
@@ -323,13 +316,12 @@ class CuteDslB12xFusedMoEBase:
 
         return NVFP4CuteDslB12xFusedMoEMethod()
 
-    @staticmethod
-    def _reject_fp4_input(x: torch.Tensor | Fp4QuantizedTensor, who: str) -> None:
+    def _reject_fp4_input(self, x: torch.Tensor | Fp4QuantizedTensor) -> None:
         """b12x quantizes activations itself and cannot take pre-quantized FP4."""
         if isinstance(x, Fp4QuantizedTensor):
             raise ValueError(
-                f"{who} does not accept Fp4QuantizedTensor input on the b12x "
-                "path; b12x performs its own input quantization."
+                f"{type(self).__name__} does not accept Fp4QuantizedTensor input "
+                "on the b12x path; b12x performs its own input quantization."
             )
 
     @nvtx_range("[b12x] decode")
@@ -359,9 +351,7 @@ class CuteDslB12xFusedMoEBase:
             )
 
         # B12xMoEWrapper allocates its own output buffer for CUDA-graph
-        # compatibility. If the caller provided ``moe_output`` (e.g. an alltoall
-        # workspace tensor), copy into it; the gates reject the topologies that
-        # could pick alltoall, so this path is defensive.
+        # compatibility; copy into ``moe_output`` when the caller provided one.
         if moe_output is not None:
             with nvtx_range("[b12x] out_copy"):
                 moe_output.copy_(out)
@@ -409,7 +399,7 @@ class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
         self,
         x: torch.Tensor | Fp4QuantizedTensor,
         post_quant_comm: bool = True,
-        **kwargs,
+        **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Prefill chunks take the inherited NVFP4 quantization so the
         downstream ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode chunks
@@ -418,13 +408,12 @@ class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
         """
         if self._route_to_cutlass(x):
             return super().quantize_input(x, post_quant_comm=post_quant_comm, **kwargs)
-        self._reject_fp4_input(x, type(self).__name__)
+        self._reject_fp4_input(x)
         # An NVFP4_AWQ / NVFP4_ARC checkpoint carries a per-channel pre-quant
         # scale that the b12x kernel has no operand for; apply it here, as the
         # CUTLASS prefill path does, before b12x quantizes with fc31_input_scale.
-        act_scale = getattr(self, "fc31_act_scale", None)
-        if act_scale is not None:
-            x = x * act_scale
+        if self.fc31_act_scale is not None:
+            x = x * self.fc31_act_scale
         return x, None
 
     @nvtx_range("[b12x] run_moe")
@@ -472,7 +461,7 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
     b12x_quant_algo = QuantAlgo.W4A16_NVFP4
     issues_fused_moe_op = False
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
 
@@ -481,12 +470,12 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
         self,
         x: torch.Tensor | Fp4QuantizedTensor,
         post_quant_comm: bool = True,
-        **kwargs,
+        **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Always a pass-through: b12x consumes bf16 / fp16 and produces its
         own scale factors."""
         del post_quant_comm, kwargs
-        self._reject_fp4_input(x, type(self).__name__)
+        self._reject_fp4_input(x)
         return x, None
 
     @nvtx_range("[b12x] run_moe")

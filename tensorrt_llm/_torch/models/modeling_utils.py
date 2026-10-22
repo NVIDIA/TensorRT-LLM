@@ -366,8 +366,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
-def _layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
-                                moe_name: str) -> QuantConfig | None:
+def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
+                               moe_name: str) -> QuantConfig | None:
     """The ``quant_config_dict`` entry of the MoE module named ``moe_name``.
 
     All linear layers inside a MoE share one quant config, so the first key
@@ -388,7 +388,7 @@ def apply_layerwise_quant_config(
             if getattr(module, '_skip_layerwise_quant_config', False):
                 continue
             if isinstance(module, (MoE, VanillaMoE)):
-                q = _layerwise_moe_quant_config(quant_config_dict, name)
+                q = layerwise_moe_quant_config(quant_config_dict, name)
                 if q is not None:
                     module.quant_config = q
             elif isinstance(module, Linear):
@@ -498,8 +498,8 @@ def moe_experts_quant_config(model_config: ModelConfig,
     """
     override = None
     if model_config.quant_config_dict is not None:
-        override = _layerwise_moe_quant_config(model_config.quant_config_dict,
-                                               experts_prefix)
+        override = layerwise_moe_quant_config(model_config.quant_config_dict,
+                                              experts_prefix)
     global_quant_config = model_config.quant_config
     if (global_quant_config is not None
             and global_quant_config.is_module_excluded_from_quantization(

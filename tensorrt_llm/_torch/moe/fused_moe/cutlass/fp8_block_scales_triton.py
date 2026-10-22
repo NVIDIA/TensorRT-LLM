@@ -66,22 +66,19 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
 
     @classmethod
     def _check_activation(cls, p: MoEProblem) -> MoEEligibility | None:
-        """Reject an activation kind or clamp order the kernel does not run.
+        """Reject an activation ``activation_support`` does not cover.
 
-        Resolution also checks ``activation_support``; this answers a direct
-        call, which the OSS build gate no longer covers for this leaf.
+        Resolution runs the same check; this one answers a direct call.
         """
-        if p.activation_type not in cls.activation_support.kinds:
-            return _reject(
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"{cls.__name__} does not execute {p.activation}",
-            )
-        if p.clamp_after_silu:
-            return _reject(
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"{cls.__name__} does not implement post-SiLU clamping",
-            )
-        return None
+        detail = cls.activation_support.rejection_detail(
+            cls.__name__,
+            p.activation_type,
+            clamp_after_silu=p.clamp_after_silu,
+            constants=p.activation_constants,
+        )
+        if detail is None:
+            return None
+        return _reject(MoERejectReason.ACTIVATION_UNSUPPORTED, detail)
 
     def _get_quant_method(self) -> object:
         return DeepSeekFP8BlockScalesFusedMoEMethod()

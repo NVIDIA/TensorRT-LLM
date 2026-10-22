@@ -24,6 +24,7 @@ or numerical parity across backends, belong in ``test_moe_backend.py``.
 """
 
 import dataclasses
+import importlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -32,7 +33,8 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation, SwigluActivation
+from tensorrt_llm._torch.moe.fused_moe import moe_resolution
+from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
@@ -51,7 +53,12 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmTritonFp8BlockScalesImpl,
     cutlass_leaf,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutlass.base import FusedMoeOpFlags
+from tensorrt_llm._torch.moe.fused_moe.cutlass.base import (
+    CutlassFusedMoEBase,
+    FusedMoeOpFlags,
+    quantize_input_mxfp8,
+    quantize_input_static_e4m3,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xNvfp4FusedMoE,
@@ -117,7 +124,6 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     trtllm_gen_leaves_in_resolution_order,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
-from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # Everything here is a declaration; the one test that reaches a constructor
@@ -1284,8 +1290,10 @@ def test_cutlass_declarations_cover_every_leaf():
     "leaf, sms, dtypes, gptoss, oss_build, flags, fuses_lora", _CUTLASS_DECLARATIONS
 )
 def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, fuses_lora):
-    # SM and dtype support are probed through can_implement, so a gate that
-    # stops enforcing a declaration fails here, not only a declaration change.
+    # Everything but the op flags is probed through can_implement, so a gate
+    # that stops enforcing a declaration fails here, not only a declaration
+    # change; test_cutlass_leaf_run_moe_hands_the_op_its_declarations covers
+    # the flags.
     identity = identity_quant_of(leaf)
     quant = next(
         canonical_quant(algo)
@@ -1293,18 +1301,34 @@ def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, 
         if normalize_quant(canonical_quant(algo)) == identity
     )
 
-    def admits(sm: int, dtype: torch.dtype) -> bool:
-        problem = MoEProblem(quant=quant, dtype_act=dtype)
-        deployment = _single_rank_deployment(MoEEnvironment(sm=sm))
+    def admits(
+        sm: int = min(sms),
+        dtype: torch.dtype = torch.bfloat16,
+        *,
+        oss: bool = True,
+        dynamic: bool = False,
+        lora: bool = False,
+        **problem_fields: object,
+    ) -> bool:
+        problem = MoEProblem(quant=quant, dtype_act=dtype, **problem_fields)
+        deployment = dataclasses.replace(
+            _single_rank_deployment(MoEEnvironment(sm=sm, oss_cutlass_moe=oss)),
+            force_dynamic_quantization=dynamic,
+            moe_lora_enabled=lora,
+        )
         return leaf.can_implement(problem, deployment).eligible
 
-    assert {sm for sm in range(75, 125) if admits(sm, torch.bfloat16)} == set(sms)
-    assert {dtype for dtype in _PROBED_DTYPES if admits(min(sms), dtype)} == set(dtypes)
-    assert (leaf.supports_gptoss_style, leaf.rejects_gptoss_expert_bias) == gptoss
-    assert (leaf.requires_oss_cutlass_build, leaf.uses_dynamic_fc2_scale) == oss_build
+    assert {sm for sm in range(75, 125) if admits(sm)} == set(sms)
+    assert {dtype for dtype in _PROBED_DTYPES if admits(dtype=dtype)} == set(dtypes)
+    gptoss_style = admits(swiglu_gptoss_style=True)
+    gptoss_bias = admits(swiglu_gptoss_style=True, bias=True)
+    assert (gptoss_style, gptoss_style and not gptoss_bias) == gptoss
+    internal = admits(oss=False)
+    assert (not internal, internal and not admits(oss=False, dynamic=True)) == oss_build
     assert leaf.FUSED_MOE_OP_FLAGS == flags
     # The scheduler hands lora_params only to a leaf declaring LoRA support,
     # and only the mixin consumes them.
+    assert admits(lora=True) is fuses_lora
     assert leaf.capabilities.supports_moe_lora is fuses_lora
     assert issubclass(leaf, CutlassMoELoraMixin) is fuses_lora
 
@@ -1313,6 +1337,29 @@ def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, 
     assert leaf.scheduler_kind is leaf.descriptor.scheduler_kind
     assert leaf.capabilities is leaf.descriptor.capabilities
     assert leaf.input_requirement is leaf.descriptor.input_requirement
+
+
+# The ``quantize_input`` each leaf binds where it is not the base pass-through,
+# and the size a leaf pads hidden / intermediate to at construction.
+_CUTLASS_QUANTIZE_INPUT = {
+    TrtllmCutlassFp8Impl: quantize_input_static_e4m3,
+    TrtllmCutlassW4a8Mxfp4Fp8Impl: quantize_input_static_e4m3,
+    TrtllmCutlassMxfp8Impl: quantize_input_mxfp8,
+    TrtllmCutlassW4a8Mxfp4Mxfp8Impl: quantize_input_mxfp8,
+    TrtllmCutlassNvfp4Impl: vars(TrtllmCutlassNvfp4Impl).get("quantize_input"),
+}
+_CUTLASS_PAD_TO = {TrtllmCutlassW4a16Mxfp4Impl: 128}
+
+
+@pytest.mark.parametrize("leaf", CUTLASS_LEAVES, ids=lambda leaf: leaf.__name__)
+def test_cutlass_leaf_input_declarations(leaf):
+    expected = _CUTLASS_QUANTIZE_INPUT.get(leaf, CutlassFusedMoEBase.quantize_input)
+    assert expected is not None
+    assert leaf.quantize_input is expected
+    assert leaf.pad_hidden_and_intermediate_to == _CUTLASS_PAD_TO.get(leaf)
+    # The FP8 leaf quantizes before the op, so its LoRA operands are e4m3 too.
+    lora_input_dtype = torch.float8_e4m3fn if leaf is TrtllmCutlassFp8Impl else None
+    assert getattr(leaf, "LORA_OP_INPUT_DTYPE", None) == lora_input_dtype
 
 
 @pytest.mark.parametrize(
@@ -1348,16 +1395,30 @@ def test_cutlass_leaf_names_the_registered_formats_when_none_serves():
         cutlass_leaf(QuantAlgo.W4A8_NVFP4_FP8, sm=100)
 
 
-def test_degradation_names_the_requested_backends_rejection():
+def test_degradation_names_the_requested_backends_rejection(monkeypatch):
     """The fallback leaves are asked too, after the requested family; their
     rejections must not stand in for why the request could not be served."""
+    logger = MagicMock()
+    monkeypatch.setattr(moe_resolution, "logger", logger)
     with override_moe_environment(_deepgemm_environment(sm=90)):
-        report = resolve_moe_impl(_deepgemm_model_config(), dtype=torch.bfloat16)
+        report = resolve_moe_impl(_deepgemm_model_config(), dtype=torch.bfloat16, layer_idx=3)
 
     assert impl_class_for(report) is DeepgemmCudaHopperFp8BlockScalesImpl
     assert report.degraded
-    assert report.degraded_from.legacy_backend == DeepgemmCudaFp8BlockScalesImpl.__name__
-    assert report.degraded_from.reason is not MoERejectReason.QUANT_UNSUPPORTED
+    cause = report.degraded_from
+    assert cause.legacy_backend == DeepgemmCudaFp8BlockScalesImpl.__name__
+    assert cause.reason is not MoERejectReason.QUANT_UNSUPPORTED
+
+    # The warning gives that cause in full and names no fallback leaf.
+    (warning,), _ = logger.warning.call_args
+    assert "cannot serve this layer [layer_idx=3]" in warning
+    assert cause.describe() in warning
+    assert f"running {DeepgemmCudaHopperFp8BlockScalesImpl.__name__} instead" in warning
+    fallback_rejections = [
+        r.legacy_backend for r in report.rejected if r.legacy_backend not in report.requested_impls
+    ]
+    assert fallback_rejections
+    assert not any(name in warning for name in fallback_rejections)
 
 
 def test_degradation_names_the_first_requested_rejection_not_about_format_or_sm():
@@ -1388,11 +1449,6 @@ def test_degradation_names_the_first_requested_rejection_not_about_format_or_sm(
     # A fallback leaf's SM rejection outranks a format one, but is never the cause.
     with_fallback = dataclasses.replace(report, rejected=(report.rejected[0], report.rejected[3]))
     assert with_fallback.degraded_from.legacy_backend == "OtherFormat"
-
-    # The warning lists every requested rejection, never a fallback's.
-    described = report.describe_rejections(requested_only=True)
-    assert all(name in described for name in ("OtherFormat", "OtherSm", "ServesFormat"))
-    assert "FallbackLeaf" not in described
 
 
 def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
@@ -1522,6 +1578,113 @@ def test_moe_experts_quant_config_reads_the_layer_entry_then_the_exclusion():
     assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
 
 
+# Each MoE block, the constructor arguments besides ``model_config`` and
+# ``layer_idx``, and the attribute its decoder layer holds it under.
+_MOE_BLOCKS = (
+    pytest.param("modeling_mixtral", "MixtralMoE", {"aux_stream": None}, "block_sparse_moe"),
+    pytest.param("modeling_qwen_moe", "QwenMoE", {"aux_stream": None}, "mlp"),
+    pytest.param("modeling_qwen3_moe", "Qwen3MoE", {"aux_stream_dict": {}}, "mlp"),
+    pytest.param("modeling_qwen3_next", "Qwen3NextSparseMoeBlock", {"aux_stream": None}, "mlp"),
+    pytest.param("modeling_gemma4", "Gemma4MoE", {}, "moe"),
+    pytest.param("modeling_hunyuan_moe", "HunyuanMoE", {"aux_stream": None}, "mlp"),
+    pytest.param("modeling_afmoe", "AfmoeMoE", {"aux_stream": None}, "mlp"),
+    pytest.param("modeling_minimaxm2", "MiniMaxM2MoE", {"aux_stream": None}, "block_sparse_moe"),
+    pytest.param("modeling_laguna", "LagunaMoE", {"aux_stream_dict": {}}, "mlp"),
+)
+
+# Replaced wherever a model module imports them: only the create_moe call is
+# under test.
+_MOE_BLOCK_STUBS = (
+    "create_moe",
+    "resolve_moe_cls",
+    "Linear",
+    "GatedMLP",
+    "AllReduce",
+    "Qwen3Gate",
+    "Qwen3NextGate",
+    "AfmoeGate",
+    "Gemma4Router",
+    "LagunaGate",
+)
+
+
+@pytest.mark.parametrize("module_name, class_name, kwargs, attr", _MOE_BLOCKS)
+def test_moe_blocks_pass_their_experts_quant_config(
+    module_name, class_name, kwargs, attr, monkeypatch
+):
+    """A MIXED_PRECISION entry keyed per linear reaches ``create_moe``."""
+    module = importlib.import_module(f"tensorrt_llm._torch.models.{module_name}")
+    for name in _MOE_BLOCK_STUBS:
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, MagicMock())
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            model_type="test",
+            hidden_size=8,
+            intermediate_size=16,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            num_experts=4,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_topk=2,
+            top_k_experts=2,
+            n_group=1,
+            topk_group=1,
+            mlp_bias=False,
+            torch_dtype=torch.float32,
+        ),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict={f"model.layers.3.{attr}.experts.0.gate_proj": nvfp4},
+    )
+
+    getattr(module, class_name)(model_config, layer_idx=3, **kwargs)
+
+    assert module.create_moe.call_args.kwargs["override_quant_config"] is nvfp4
+
+
+def test_llama4_min_latency_experts_keep_the_layer_quant_config(monkeypatch):
+    """The min-latency block replaces Llama4MoE's routed experts with its own
+    layer, which has to be built for the same per-layer format."""
+    import tensorrt_llm._torch.distributed as distributed
+    from tensorrt_llm._torch.models import modeling_llama, modeling_llama_min_latency
+
+    for module, names in (
+        (modeling_llama, ("create_moe", "Linear", "GatedMLP")),
+        (
+            modeling_llama_min_latency,
+            ("Llama4MinLatencyGatedMLP", "Llama4MinLatencyFusedMoE", "Llama4MinLatencyLinear"),
+        ),
+    ):
+        for name in names:
+            monkeypatch.setattr(module, name, MagicMock())
+    monkeypatch.setattr(distributed, "AllReduce", MagicMock())
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock())
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(torch_dtype=torch.float32),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict={"model.layers.3.feed_forward.experts.0.gate_proj": nvfp4},
+    )
+
+    modeling_llama_min_latency.Llama4MinLatencyMoE(
+        num_experts=4,
+        top_k=1,
+        hidden_size=8,
+        intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        aux_stream=None,
+        dtype=torch.float32,
+        model_config=model_config,
+        layer_idx=3,
+    )
+
+    assert modeling_llama.create_moe.call_args.kwargs["override_quant_config"] is nvfp4
+    fused_moe = modeling_llama_min_latency.Llama4MinLatencyFusedMoE
+    assert fused_moe.call_args.kwargs["override_quant_config"] is nvfp4
+
+
 _HOPPER_FP8_BLOCK_SCALES_ID = "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales"
 _TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
 
@@ -1546,20 +1709,6 @@ _TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
             "take no activation clamp",
             id="triton-clamp",
         ),
-        pytest.param(
-            120,
-            _TRITON_FP8_BLOCK_SCALES_ID,
-            SwigluActivation(clamp=5.0, clamp_after_silu=True),
-            "post-SiLU clamping",
-            id="triton-post-silu-clamp",
-        ),
-        pytest.param(
-            120,
-            _TRITON_FP8_BLOCK_SCALES_ID,
-            SimpleActivation(ActivationType.Relu2),
-            "does not execute Relu2",
-            id="triton-relu2",
-        ),
     ],
 )
 def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
@@ -1583,46 +1732,36 @@ def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
         assert rejection in report.rejected[-1].detail
 
 
-@pytest.mark.parametrize("bias", [False, True], ids=["no_bias", "bias"])
-def test_triton_fp8_block_scales_leaf_declines_an_expert_bias(bias):
-    """The Triton kernel has no bias operand, so a biased layer is declined
-    rather than run without its bias."""
-    problem = MoEProblem(
-        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
-        dtype_act=torch.bfloat16,
-        bias=bias,
-    )
-    verdict = TrtllmTritonFp8BlockScalesImpl.can_implement(
-        problem, _single_rank_deployment(MoEEnvironment(sm=120))
-    )
-
-    assert verdict.eligible is not bias
-    assert TrtllmTritonFp8BlockScalesImpl.capabilities.supports_expert_bias is False
-    if bias:
-        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-
-
-@pytest.mark.parametrize("is_oss", [True, False], ids=["oss", "internal"])
 @pytest.mark.parametrize(
-    "activation, clamp_after_silu, detail",
+    "activation, clamp_after_silu, constants, detail",
     [
-        pytest.param("Swiglu", True, "post-SiLU clamping", id="post_silu_clamp"),
-        pytest.param("Relu2", False, "does not execute Relu2", id="relu2"),
+        pytest.param(
+            "Swiglu", True, frozenset({"clamp"}), "post-SiLU clamping", id="post_silu_clamp"
+        ),
+        pytest.param("Swiglu", False, frozenset({"clamp"}), "take no activation clamp", id="clamp"),
+        pytest.param(
+            "Relu2",
+            False,
+            frozenset(),
+            "does not execute Relu2 (executes: Geglu, Swiglu)",
+            id="relu2",
+        ),
     ],
 )
 def test_triton_fp8_block_scales_leaf_declines_what_its_kernel_lacks(
-    is_oss, activation, clamp_after_silu, detail
+    activation, clamp_after_silu, constants, detail
 ):
-    """Declined by the leaf itself, not only by resolution, and never blamed on
+    """Declined by the leaf itself, as resolution declines it, and not blamed on
     the build: the Triton kernel never enters the CUTLASS op."""
     problem = MoEProblem(
         quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
         dtype_act=torch.bfloat16,
         activation=activation,
+        activation_constants=constants,
         clamp_after_silu=clamp_after_silu,
     )
     verdict = TrtllmTritonFp8BlockScalesImpl.can_implement(
-        problem, _single_rank_deployment(MoEEnvironment(sm=120, oss_cutlass_moe=is_oss))
+        problem, _single_rank_deployment(MoEEnvironment(sm=120, oss_cutlass_moe=False))
     )
 
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
@@ -1631,8 +1770,8 @@ def test_triton_fp8_block_scales_leaf_declines_what_its_kernel_lacks(
 
 
 def test_only_leaves_issuing_the_op_are_bound_by_the_oss_build():
-    """The legacy kernel archive limits ``torch.ops.trtllm.fused_moe``; the
-    Triton leaf never calls it, so a legacy build keeps its all-to-all."""
+    """The internal kernel archive limits ``torch.ops.trtllm.fused_moe``; the
+    Triton leaf never calls it, so an internal build keeps its all-to-all."""
     with override_moe_environment(MoEEnvironment(sm=120, oss_cutlass_moe=False)):
         triton_leaf = TrtllmTritonFp8BlockScalesImpl.__new__(TrtllmTritonFp8BlockScalesImpl)
         nvfp4_leaf = TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl)
@@ -1649,6 +1788,50 @@ def test_cutlass_build_gate_does_not_answer_for_an_unsupported_sm():
     )
 
     assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
+    assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
+
+
+@pytest.mark.parametrize(
+    "leaf, problem, deployment, reason",
+    [
+        pytest.param(
+            TrtllmCutlassNvfp4Impl,
+            # FC1 rows 2 * 1000 are not a multiple of 128.
+            MoEProblem(
+                quant=canonical_quant(QuantAlgo.NVFP4),
+                dtype_act=torch.bfloat16,
+                intermediate_size=1000,
+                clamp_after_silu=True,
+            ),
+            _single_rank_deployment(MoEEnvironment(sm=100, oss_cutlass_moe=False)),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="cutlass-unaligned-fc1",
+        ),
+        pytest.param(
+            CuteDslB12xNvfp4FusedMoE,
+            MoEProblem(
+                quant=canonical_quant(QuantAlgo.NVFP4), dtype_act=torch.bfloat16, activation="Relu2"
+            ),
+            MoEDeployment(
+                ep_size=2,
+                tp_size=1,
+                parallel_size=2,
+                use_dp=False,
+                num_slots=8,
+                env=MoEEnvironment(
+                    sm=120, oss_cutlass_moe=False, available_deps=(MoEDep.FLASHINFER,)
+                ),
+            ),
+            MoERejectReason.TOPOLOGY_UNSUPPORTED,
+            id="b12x-ep2",
+        ),
+    ],
+)
+def test_build_gate_runs_after_the_leaf_gates(leaf, problem, deployment, reason):
+    """A problem the leaf turns down on every build is not blamed on this one."""
+    verdict = leaf.can_implement(problem, deployment)
+
+    assert verdict.reject_reason is reason
     assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
 
 

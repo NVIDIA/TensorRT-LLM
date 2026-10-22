@@ -106,20 +106,6 @@ def check_gptoss_activation(cls: type, p: MoEProblem) -> MoEEligibility | None:
     return None
 
 
-def check_expert_bias(cls: type, p: MoEProblem) -> MoEEligibility | None:
-    """Reject an expert FC bias on a leaf whose kernel applies none.
-
-    Declining here lets resolution say so; ``create_moe`` would otherwise
-    refuse the bias only after this leaf was picked.
-    """
-    if p.bias and not cls.capabilities.supports_expert_bias:
-        return _reject(
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{cls.__name__} takes no expert bias",
-        )
-    return None
-
-
 def check_moe_lora(cls: type, d: MoEDeployment) -> MoEEligibility | None:
     """Reject routed-expert MoE LoRA on a leaf whose format the op cannot fuse.
 
@@ -194,7 +180,6 @@ def check_cutlass_leaf(
         check_sm(cls, d),
         check_dtype(cls, p),
         check_gptoss_activation(cls, p),
-        check_expert_bias(cls, p),
         check_moe_lora(cls, d),
         *leaf_gates,
         check_oss_cutlass_build(cls, p, d),

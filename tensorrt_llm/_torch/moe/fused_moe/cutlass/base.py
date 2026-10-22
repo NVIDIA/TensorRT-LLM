@@ -173,7 +173,7 @@ class CutlassFusedMoEBase(MoEImplBase):
         layer_idx: int | None = None,
         activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
-    ):
+    ) -> None:
         """Construct the backend.
 
         Args:
@@ -299,10 +299,21 @@ class CutlassFusedMoEBase(MoEImplBase):
         self,
         x: torch.Tensor | Fp4QuantizedTensor,
         post_quant_comm: bool = True,
-        **kwargs,
+        **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Pass activations through; right for every format whose kernel
-        quantizes them itself or keeps them in high precision."""
+        quantizes them itself or keeps them in high precision.
+
+        Args:
+            x: The activations, or FP4 activations quantized before dispatch.
+            post_quant_comm: Whether communication follows. A format that
+                returns scale factors then lays them out as one 2-D row per
+                token; otherwise in the layout its kernel reads.
+            **kwargs: Unused; accepted for the ``MoE.quantize_input`` interface.
+
+        Returns:
+            The activations to run and their scale factors, or None.
+        """
         del post_quant_comm, kwargs
         return x, None
 
@@ -443,12 +454,12 @@ def quantize_input_static_e4m3(
     self: CutlassFusedMoEBase,
     x: torch.Tensor | Fp4QuantizedTensor,
     post_quant_comm: bool = True,
-    **kwargs,
+    **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Per-tensor FP8: scale by the static FC1 input scale and cast to e4m3.
 
-    A ``quantize_input`` implementation; a leaf binds it as
-    ``quantize_input = quantize_input_static_e4m3``.
+    A :meth:`CutlassFusedMoEBase.quantize_input` implementation; a leaf binds
+    it as ``quantize_input = quantize_input_static_e4m3``.
     """
     del post_quant_comm, kwargs
     x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, self.fc31_input_dequant)
@@ -459,12 +470,12 @@ def quantize_input_mxfp8(
     self: CutlassFusedMoEBase,
     x: torch.Tensor | Fp4QuantizedTensor,
     post_quant_comm: bool = True,
-    **kwargs,
+    **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Dynamic MXFP8 activation quantization, for every MXFP8-activation format.
 
-    A ``quantize_input`` implementation; a leaf binds it as
-    ``quantize_input = quantize_input_mxfp8``.
+    A :meth:`CutlassFusedMoEBase.quantize_input` implementation; a leaf binds
+    it as ``quantize_input = quantize_input_mxfp8``.
     """
     del kwargs
     alignment = self.quant_method.weight_alignment

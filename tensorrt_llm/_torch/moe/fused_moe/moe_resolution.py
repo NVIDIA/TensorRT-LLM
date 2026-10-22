@@ -28,12 +28,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .activation import (
-    ActivationParamShape,
-    MoEActivation,
-    SwigluActivation,
-    activation_constant_names,
-)
+from .activation import MoEActivation, SwigluActivation, activation_constant_names
 from .cutlass import CUTLASS_LEAVES
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
@@ -129,7 +124,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     MarlinCudaNvfp4Impl,
     MarlinCudaW4a16Nvfp4Impl,
     TritonFusedMoE,
-    *CUTLASS_LEAVES,  # widest coverage between them, hence the fallback
+    *CUTLASS_LEAVES,
     VanillaMoE,  # reference implementation, never preferred
 )
 
@@ -471,14 +466,6 @@ def _candidates_for_impl_id(query: MoEImplQuery) -> List[MoEImplClass]:
     return ranked
 
 
-#: ABI register name -> the ``MoEActivationSupport`` field declaring its shape.
-_CONSTANT_SHAPE_FIELDS: Dict[str, str] = {
-    "alpha": "alpha_beta",
-    "beta": "alpha_beta",
-    "clamp": "limit",
-}
-
-
 def _reject_unsupported_activation(
     candidate: MoEImplClass, problem: MoEProblem
 ) -> Optional[MoERejection]:
@@ -499,36 +486,17 @@ def _reject_unsupported_activation(
     support = getattr(candidate, "activation_support", None)
     if support is None:
         return None
-
-    kind = problem.activation_type
-    if kind not in support.kinds:
-        executes = ", ".join(sorted(k.name for k in support.kinds))
-        return MoERejection(
-            _legacy_backend_name(candidate),
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{candidate.__name__} does not execute {kind.name} (executes: {executes})",
-        )
-
-    if problem.clamp_after_silu and not support.clamp_after_silu:
-        return MoERejection(
-            _legacy_backend_name(candidate),
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{candidate.__name__} does not implement post-SiLU clamping",
-        )
-
-    # Sorted so the rejection names the same register every run.
-    for constant in sorted(problem.activation_constants):
-        field = _CONSTANT_SHAPE_FIELDS.get(constant)
-        if field is None:
-            continue
-        if getattr(support, field) is ActivationParamShape.UNSUPPORTED:
-            return MoERejection(
-                _legacy_backend_name(candidate),
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"{candidate.__name__} kernels take no activation {constant}, "
-                f"which this layer's {kind.name} supplies",
-            )
-    return None
+    detail = support.rejection_detail(
+        candidate.__name__,
+        problem.activation_type,
+        clamp_after_silu=problem.clamp_after_silu,
+        constants=problem.activation_constants,
+    )
+    if detail is None:
+        return None
+    return MoERejection(
+        _legacy_backend_name(candidate), MoERejectReason.ACTIVATION_UNSUPPORTED, detail
+    )
 
 
 def resolve_moe_impl(
@@ -669,13 +637,20 @@ def resolve_moe_impl(
             f"(requested {requested}). Each candidate's reason: "
             f"{report.describe_rejections()}"
         )
-    elif report.degraded:
-        logger.warning(
-            f"MoE backend {requested} cannot serve this layer{location} "
-            f"({report.describe_rejections(requested_only=True)}); running "
-            f"{winner_cls.__name__} instead. Full trail: {report.describe()}"
-        )
     else:
+        if report.degraded:
+            cause = report.degraded_from
+            others = ", ".join(
+                f"{rejection.legacy_backend}={rejection.reason.value}"
+                for rejection in report.requested_rejections
+                if rejection is not cause
+            )
+            logger.warning(
+                f"MoE backend {requested} cannot serve this layer{location} "
+                f"({'no candidate was considered' if cause is None else cause.describe()}); "
+                f"running {winner_cls.__name__} instead."
+                + (f" Also turned down: {others}." if others else "")
+            )
         logger.debug(report.describe())
 
     return report

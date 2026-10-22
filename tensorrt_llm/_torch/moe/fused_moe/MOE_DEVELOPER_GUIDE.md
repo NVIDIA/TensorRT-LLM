@@ -258,7 +258,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 
 | File | Role |
 |------|------|
-| `identity.py` | CUTLASS's values of the identity types: the segment constants, the shared contracts (`CUTLASS_CAPABILITIES`, `CUTLASS_INPUT_REQUIREMENT`) and the `cutlass_descriptor` factory, whose `supports_moe_lora` is the one per-leaf contract difference |
+| `identity.py` | CUTLASS's values of the identity types: the segment constants, the shared contracts (`CUTLASS_CAPABILITIES`, `CUTLASS_INPUT_REQUIREMENT`) and the `cutlass_descriptor` factory, whose `supports_moe_lora` and `supports_expert_bias` are the per-leaf contract differences |
 | `base.py` | `CutlassFusedMoEBase` — construction, the layer-format check in `create_weights`, and the defaults: a pass-through `quantize_input` and a `run_moe` that calls the op with the leaf's `FUSED_MOE_OP_FLAGS` (the weight lifecycle itself is `MoEWeightOwnerMixin`'s). Also the one `torch.ops.trtllm.fused_moe` call (`_run_fused_moe_op`, which a leaf's `run_moe` calls with the operands the `run_moe` contract does not carry), `FusedMoeOpFlags`, and the `quantize_input` implementations several formats bind (`quantize_input_static_e4m3`, `quantize_input_mxfp8`) |
 | `eligibility.py` | The checks each leaf's `can_implement` composes |
 | `lora.py` | `CutlassMoELoraMixin` — routed-expert LoRA, mixed in only by the two leaves the op can fuse it for |
@@ -269,7 +269,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 | `none` | `TrtllmCutlassUnquantizedImpl` | `trtllm.cutlass.grouped_gemm.none` | Fuses routed-expert LoRA |
 | `fp8` | `TrtllmCutlassFp8Impl` | `trtllm.cutlass.grouped_gemm.fp8` | Static per-tensor e4m3 input; fuses routed-expert LoRA |
 | `fp8_block_scales` | `DeepgemmCudaHopperFp8BlockScalesImpl` | `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | SM90; `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM |
-| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120; a Triton grouped GEMM that never enters C++ |
+| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias or activation constants |
 | `nvfp4` | `TrtllmCutlassNvfp4Impl` | `trtllm.cutlass.grouped_gemm.nvfp4` | Quantizes activations to NVFP4 itself |
 | `w4a16_nvfp4` | `TrtllmCutlassW4a16Nvfp4Impl` | `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | Dequantizes the weights every forward, then runs unquantized |
 | `mxfp8` | `TrtllmCutlassMxfp8Impl` | `trtllm.cutlass.grouped_gemm.mxfp8` | Dynamic MXFP8 input |

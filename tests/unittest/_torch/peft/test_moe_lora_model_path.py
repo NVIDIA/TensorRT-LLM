@@ -451,6 +451,7 @@ def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora(gate_value: float) ->
 def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:
     """Step3p7 must not bypass routed-expert LoRA through its Python path."""
     text_config = SimpleNamespace(
+        num_hidden_layers=1,
         hidden_size=8,
         moe_num_experts=2,
         moe_top_k=2,
