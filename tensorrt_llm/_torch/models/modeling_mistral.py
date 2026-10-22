@@ -961,7 +961,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         lora_params: Any | None = None,
         **forward_kwargs: Any,
     ) -> dict[str, Any]:
-        del raw_input_ids, position_ids, mm_inputs, forward_kwargs
         return {
             "spec_metadata": spec_metadata,
             "resource_manager": resource_manager,

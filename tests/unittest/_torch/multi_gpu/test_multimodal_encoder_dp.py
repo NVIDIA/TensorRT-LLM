@@ -85,7 +85,6 @@ class _EncoderDpModel(torch.nn.Module, MultimodalModelMixin):
         multimodal_params: list[MultimodalParams],
         **encoder_kwargs,
     ) -> torch.Tensor:
-        del encoder_kwargs
         rows = []
         for param in multimodal_params:
             item_ids = param.multimodal_data["image"]["pixel_values"][:, 0, 0, 0]

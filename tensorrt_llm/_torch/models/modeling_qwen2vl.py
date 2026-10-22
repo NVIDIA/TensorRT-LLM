@@ -2313,7 +2313,6 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         startup memory profiler to invoke the encoder directly; the model's
         own ``forward`` keeps its custom deepstack fusion path.
         """
-        del encoder_kwargs
         params = list(multimodal_params)
         modalities = tuple(modality for modality in ("image", "video") if any(
             param.multimodal_data.get(modality) is not None

@@ -33,6 +33,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    final,
 )
 
 import torch
@@ -369,6 +370,8 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
 
     mapping = model_config.mapping
     encoder_dp_size = mm_config.encoder_data_parallel_size
+    # TorchLlmArgs validates user configs; these checks also cover callers
+    # that construct ModelConfig directly.
     if mapping.pp_size != 1 or mapping.cp_size != 1:
         raise NotImplementedError(
             "Explicit multimodal encoder parallelism requires pipeline "
@@ -390,6 +393,8 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
         tp_size=encoder_tp_size,
         pp_size=mapping.world_size // encoder_tp_size,
     )
+    # ModelConfig is a dataclass with a custom assignment guard. Unlock only
+    # the encoder copy while replacing its mapping, then restore its state.
     encoder_config._frozen = False
     encoder_config.mapping = encoder_mapping
     encoder_config._frozen = model_config._frozen
@@ -579,12 +584,15 @@ class MultimodalModelMixin:
         return {}
 
     @classmethod
+    @final
     def validate_multimodal_encoder_parallelism(cls, model_config: ModelConfig) -> None:
         """Validate declared capabilities before model construction.
 
         Called by the model loader for an explicit encoder parallel setting.
         All enabled encoders must support the selected modes. Shared encoder
         TP with LLM attention DP also requires the item scheduling contract.
+        Models customize ``get_multimodal_encoder_parallel_modes`` rather
+        than overriding this shared validation.
 
         Args:
             model_config: Resolved model config with the requested encoder parallelism.

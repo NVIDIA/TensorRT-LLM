@@ -600,7 +600,12 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 
 
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
-    """Shared multimodal encoder flow for Gemma4 conditional generation models."""
+    """Shared multimodal encoder flow for Gemma4 conditional generation models.
+
+    The mixin's ``build_multimodal_encoder_input`` handles item-major
+    ``pixel_values`` and ``audio_features``, including their per-item position,
+    length, and mask fields, so Gemma4 needs no slicing override.
+    """
 
     supports_encoder_cache = True
 
@@ -904,7 +909,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         **forward_kwargs,
     ) -> Dict:
         """Build Gemma4-specific language-model forward arguments."""
-        del position_ids, forward_kwargs
         mm_token_type_ids = None
         if raw_input_ids is not None and mm_inputs.input_ids is None:
             mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
