@@ -656,9 +656,9 @@ def merge_prefix_and_tail(
 class _SamplingPlan:
     """Host-side description of one n-sample generation step, shared by all layers.
 
-    Rows are generation rows in batch order. Prefix tensors describe groups in
-    ``perm`` order (rows of a group are contiguous there); tail tensors and the
-    KV write indices are in batch order.
+    Rows are generation rows. Prefix and tail tensors are in ``perm`` order (the
+    rows of a group are contiguous there), so one permuted copy of the queries
+    serves both attention calls; the KV write indices are in batch order.
     """
 
     step: int
@@ -675,6 +675,7 @@ class _SamplingPlan:
     prefix_empty: torch.Tensor
     """[rows] bool, grouped order: the row's group has no shared page and its
     prefix call runs over a one-token placeholder that the merge drops."""
+    has_empty: bool
     tail_indptr: torch.Tensor
     tail_indices: torch.Tensor
     tail_last_page_len: torch.Tensor
@@ -692,8 +693,8 @@ class _SamplingDevice:
 
     step: int
     perm: Optional[torch.Tensor]
-    inv_perm: Optional[torch.Tensor]
-    prefix_empty: torch.Tensor
+    prefix_empty: Optional[torch.Tensor]
+    """[rows] bool in grouped order, None when every group has a shared prefix."""
     write_page: torch.Tensor
     write_slot: torch.Tensor
 
@@ -820,10 +821,19 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         torch.int32
     )
 
+    if perm is None:
+        pages_g, blocks_g, kv_g, shared_g = pages_all, num_blocks, kv_lens, row_shared
+    else:
+        pages_g, blocks_g, kv_g, shared_g = (
+            pages_all[perm],
+            num_blocks[perm],
+            kv_lens[perm],
+            row_shared[perm],
+        )
     block_ids = torch.arange(pages_all.size(1), dtype=torch.int64).view(1, -1)
-    in_tail = (block_ids >= row_shared.view(-1, 1)) & (block_ids < num_blocks.view(-1, 1))
+    in_tail = (block_ids >= shared_g.view(-1, 1)) & (block_ids < blocks_g.view(-1, 1))
     tail_indptr = torch.zeros(rows + 1, dtype=torch.int32)
-    tail_indptr[1:] = torch.cumsum((num_blocks - row_shared), dim=0).to(torch.int32)
+    tail_indptr[1:] = torch.cumsum(blocks_g - shared_g, dim=0).to(torch.int32)
     current = kv_lens - 1
     write_page = pages_all[torch.arange(rows), current // tokens_per_block]
 
@@ -838,9 +848,10 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         prefix_indices=torch.cat(prefix_pages).to(torch.int32),
         prefix_last_page_len=torch.tensor(prefix_last, dtype=torch.int32),
         prefix_empty=torch.tensor(prefix_empty, dtype=torch.bool),
+        has_empty=any(prefix_empty),
         tail_indptr=tail_indptr,
-        tail_indices=pages_all[in_tail].to(torch.int32),
-        tail_last_page_len=(kv_lens - (num_blocks - 1) * tokens_per_block).to(torch.int32),
+        tail_indices=pages_g[in_tail].to(torch.int32),
+        tail_last_page_len=(kv_g - (blocks_g - 1) * tokens_per_block).to(torch.int32),
         write_page=write_page,
         write_slot=current % tokens_per_block,
         check_pages=pages_all if _check_enabled() else None,
@@ -856,23 +867,30 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
 
 
 def _sampling_device(state: _SamplingState, device: torch.device) -> _SamplingDevice:
+    """Device copies of the step's index tensors, made by the first layer with one transfer."""
     plan = state.plan
     assert plan is not None
     cached = state.device
     if cached is not None and cached.step == plan.step:
         return cached
-    perm = inv_perm = None
+    rows = plan.num_rows
+    parts = [plan.write_page, plan.write_slot]
     if plan.perm is not None:
-        perm = plan.perm.to(device)
-        inv_perm = torch.empty_like(perm)
-        inv_perm[perm] = torch.arange(perm.numel(), device=device, dtype=perm.dtype)
+        parts.append(plan.perm)
+    if plan.has_empty:
+        parts.append(plan.prefix_empty.to(torch.int64))
+    packed = torch.cat(parts).to(device)
+    perm = packed[2 * rows : 3 * rows] if plan.perm is not None else None
+    empty = None
+    if plan.has_empty:
+        start = (3 if plan.perm is not None else 2) * rows
+        empty = packed[start : start + rows] != 0
     state.device = _SamplingDevice(
         step=plan.step,
         perm=perm,
-        inv_perm=inv_perm,
-        prefix_empty=plan.prefix_empty.to(device),
-        write_page=plan.write_page.to(device),
-        write_slot=plan.write_slot.to(device),
+        prefix_empty=empty,
+        write_page=packed[:rows],
+        write_slot=packed[rows : 2 * rows],
     )
     return state.device
 
@@ -1275,21 +1293,16 @@ class BeamSharedPrefixFmha(PhasedFmha):
         v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(rows, num_kv_heads, head_dim)
 
         # 1. Persist the current token's K/V in the row's own block.
-        pool[indices.write_page, 0, :, indices.write_slot, :] = k
-        pool[indices.write_page, 1, :, indices.write_slot, :] = v
+        pool.permute(0, 3, 1, 2, 4)[indices.write_page, indices.write_slot] = torch.stack(
+            (k, v), dim=1
+        )
 
         # 2. Shared prefix: the queries of each group against its common pages.
         q_grouped = q if indices.perm is None else q.index_select(0, indices.perm)
-        prefix_out, prefix_lse = prefix_wrapper.run(q_grouped.contiguous(), pool, return_lse=True)
-        if indices.inv_perm is not None:
-            prefix_out = prefix_out.index_select(0, indices.inv_perm)
-            prefix_lse = prefix_lse.index_select(0, indices.inv_perm)
-            prefix_empty = indices.prefix_empty.index_select(0, indices.inv_perm)
-        else:
-            prefix_empty = indices.prefix_empty
+        prefix_out, prefix_lse = prefix_wrapper.run(q_grouped, pool, return_lse=True)
 
-        # 3. Private remainder of every row (current token included).
-        tail_out, tail_lse = tail_wrapper.run(q.contiguous(), pool, return_lse=True)
+        # 3. Private remainder of every row (current token included), in the same row order.
+        tail_out, tail_lse = tail_wrapper.run(q_grouped, pool, return_lse=True)
 
         if not state.ran:
             state.ran = True
@@ -1297,19 +1310,26 @@ class BeamSharedPrefixFmha(PhasedFmha):
         output = params.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
-        merged = merge_states(prefix_out, prefix_lse, tail_out, tail_lse, prefix_empty)
+        # 4. Merge in place into the prefix result; rows without a shared prefix take the tail alone.
+        if indices.prefix_empty is not None:
+            prefix_lse.masked_fill_(indices.prefix_empty.view(-1, 1), float("-inf"))
+        flashinfer.merge_state_in_place(prefix_out, prefix_lse, tail_out, tail_lse)
+        out_view = output.view(rows, num_heads, head_dim)
+        if indices.perm is None:
+            out_view.copy_(prefix_out)
+        else:
+            out_view.index_copy_(0, indices.perm, prefix_out.to(output.dtype))
         if plan.check_pages is not None:
             _check_sampling_output(
                 plan,
                 pool,
                 q,
-                merged,
+                out_view.float(),
                 num_kv_heads=num_kv_heads,
                 sm_scale=sm_scale,
                 tokens_per_block=int(metadata.tokens_per_block),
                 layer_idx=attn.layer_idx,
             )
-        output.view(rows, num_heads, head_dim).copy_(merged.to(output.dtype))
 
     def _unfused_tail_and_merge(
         self,

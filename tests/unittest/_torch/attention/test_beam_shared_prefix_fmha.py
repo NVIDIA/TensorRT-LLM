@@ -271,11 +271,12 @@ def test_sampling_plan_groups_rows_with_common_leading_pages():
     assert plan.prefix_indices.tolist()[:2] == [5, 6]
     assert plan.prefix_last_page_len.tolist() == [tpb, 1]
     assert plan.prefix_empty.tolist() == [False, False, False, True]
-    # Private pages start after the shared ones; the last page length covers
-    # the current token.
-    assert plan.tail_indptr.tolist() == [0, 1, 4, 5, 7]
-    assert plan.tail_indices.tolist() == [10, 20, 21, 22, 7, 7, 11]
-    assert plan.tail_last_page_len.tolist() == [2, 1, 4, 2]
+    assert plan.has_empty
+    # Private pages start after the shared ones, in the grouped row order
+    # (rows 0, 2, 3, 1); the last page length covers the current token.
+    assert plan.tail_indptr.tolist() == [0, 1, 2, 4, 7]
+    assert plan.tail_indices.tolist() == [10, 7, 7, 11, 20, 21, 22]
+    assert plan.tail_last_page_len.tolist() == [2, 4, 2, 1]
     assert plan.write_page.tolist() == [10, 22, 7, 11]
     assert plan.write_slot.tolist() == [1, 0, 3, 1]
 
@@ -341,14 +342,14 @@ def test_sampling_prefix_and_tail_match_dense_attention(batch_order):
     indices = lib._sampling_device(state, device)
     prefix_w, tail_w = lib._sampling_wrappers(state, key, meta, device)
     q_grouped = q if indices.perm is None else q.index_select(0, indices.perm)
-    p_out, p_lse = prefix_w.run(q_grouped.contiguous(), pool, return_lse=True)
-    empty = indices.prefix_empty
-    if indices.inv_perm is not None:
-        p_out = p_out.index_select(0, indices.inv_perm)
-        p_lse = p_lse.index_select(0, indices.inv_perm)
-        empty = empty.index_select(0, indices.inv_perm)
-    t_out, t_lse = tail_w.run(q.contiguous(), pool, return_lse=True)
-    merged = lib.merge_states(p_out, p_lse, t_out, t_lse, empty)
+    p_out, p_lse = prefix_w.run(q_grouped, pool, return_lse=True)
+    t_out, t_lse = tail_w.run(q_grouped, pool, return_lse=True)
+    merged_grouped = lib.merge_states(p_out, p_lse, t_out, t_lse, indices.prefix_empty)
+    # Back to batch order for the comparison with the per-row reference.
+    merged = merged_grouped
+    if indices.perm is not None:
+        merged = torch.empty_like(merged_grouped)
+        merged[indices.perm] = merged_grouped
 
     for r in range(rows):
         pages = torch.tensor(tables[r], device=device)
