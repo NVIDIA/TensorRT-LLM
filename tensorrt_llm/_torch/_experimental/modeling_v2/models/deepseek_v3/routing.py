@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, tp_reaches_across_nodes
+from ..._router_index import NoTarget, routes, tp_reaches_across_nodes
 
 # The GPUs the target is certified on: sm_100 (B200, GB200) and sm_103 (B300,
 # GB300). They run the same kernels.
@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
+@routes("DeepseekV3ForCausalLM")
 def route(
     pretrained_config: Any,
     mapping: Any,
