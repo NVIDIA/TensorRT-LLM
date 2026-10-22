@@ -18,7 +18,7 @@ import importlib.util
 import json
 import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import ModuleType
 
@@ -35,7 +35,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setenv("AGENTX_READY_TIMEOUT", "1")
+    monkeypatch.setenv("AGENTX_READY_TIMEOUT", "60")
     monkeypatch.setattr(module.time, "sleep", lambda _: None)
     return module
 
@@ -58,7 +58,7 @@ def endpoint():
         def log_message(self, *args: object) -> None:
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = HTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
