@@ -112,6 +112,7 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
         _mark_cross_kv_projection_consumed=Mock(),
         _kv_connector_wait_for_save=Mock(),
         _forward_on_current_stream=lambda: False,
+        _cached_stream_events=lambda: None,
         _handle_errors=Mock(),
     )
     with (
