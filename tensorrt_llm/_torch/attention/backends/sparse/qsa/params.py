@@ -44,10 +44,11 @@ class QSASparseParams(SparseParams):
     enable_heuristic_topk: bool = False
     # Reuse one indexer selection across the MTP draft loop.
     mtp_index_share: bool = False
-    # Sparse core attention kernel: "auto" (PrimTS on SM100/SM103/SM107 except
-    # for small decode batches, else Triton), "triton", or "prims_ts".
+    # Kernel selection is decided at runtime like the other sparse backends:
+    # PrimTS on SM100/SM103/SM107 except for small decode batches, Triton
+    # otherwise. These fields pin one kernel for tests and A/B measurements;
+    # the LLM API does not expose them.
     sparse_core_backend: str = "auto"
-    # Indexer scorer kernel; "follow" uses the sparse core selection.
     indexer_backend: str = "follow"
 
     def __post_init__(self) -> None:
