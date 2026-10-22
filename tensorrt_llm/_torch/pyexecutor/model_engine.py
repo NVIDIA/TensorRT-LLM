@@ -199,6 +199,11 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        # cleanup() also runs on an engine whose construction failed part-way.
+        self._cleanup_done = False
+        self.model_loader: Optional[ModelLoader] = None
+        self._runner: Optional[ModelRunner] = None
+        self._torch_compile_backend: Optional[Backend] = None
         checkpoint_loader = self._init_from_args(
             model_path=model_path,
             llm_args=llm_args,
@@ -236,10 +241,6 @@ class PyTorchModelEngine(ModelEngine):
         services derived from the arguments; capacity may still be unset."""
         _configure_deep_gemm_pdl()
 
-        self._metrics: dict[str, float] = defaultdict(float)
-        self._cleanup_done = False
-        self._model_caller: Optional[ModelCaller] = None
-        self._runner: Optional[ModelRunner] = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -338,7 +339,6 @@ class PyTorchModelEngine(ModelEngine):
     ) -> None:
         """Load the model, or take the given one, at the requested capacity."""
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
-        self.model_loader: Optional[ModelLoader] = None
         if model is None:
             lora_config: Optional[LoraConfig] = llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
@@ -364,8 +364,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_from_model(self, *, llm_args: TorchLlmArgs,
                          mapping: Optional[Mapping]) -> None:
-        """Copy the loaded model's facts onto the engine and clamp capacity to
-        them, leaving the model in its final pre-compile form."""
+        """Copy the loaded model's facts onto the engine, rewriting the requested
+        capacity, encoder token budget and in-graph sampling flag from them,
+        and leave the model in its final pre-compile form."""
         from ._util import (compute_max_num_sequences,
                             resolved_kv_cache_manager_is_v2,
                             should_enable_overlap_headroom)
@@ -457,7 +458,6 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._torch_compile_backend = None
         self._init_model_capacity()
 
     def _compile_model(self) -> Optional[Backend.Streams]:
@@ -603,8 +603,9 @@ class PyTorchModelEngine(ModelEngine):
     def _init_execution_services(
             self, *, spec_config: Optional[DecodingBaseConfig],
             backend_num_streams: Optional[Backend.Streams]) -> None:
-        """Build the attention backend, the speculation runtime widths, the
-        model caller and the runner around the compiled model."""
+        """Build the attention backend, update the speculation config from the
+        loaded model, and build the model caller and the runner around the
+        compiled model."""
         # Start outside warmup: load-balancer statistics on, serving MoE
         # communication timeouts.
         self._warmup_depth = 0
@@ -635,13 +636,14 @@ class PyTorchModelEngine(ModelEngine):
             self.max_draft_len = 0
             self.max_total_draft_tokens = 0
 
+        self._metrics: dict[str, float] = defaultdict(float)
         self.iter_states = {}
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._lora_owner: Optional[DecoderLoraOwner] = None
         self._lora_model: Optional[torch.nn.Module] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
-        self._model_caller = ModelCaller(
+        self._model_caller: Optional[ModelCaller] = ModelCaller(
             self.model,
             compile_backend=self._torch_compile_backend,
             aux_streams=backend_num_streams,
