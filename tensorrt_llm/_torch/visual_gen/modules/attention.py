@@ -93,6 +93,9 @@ class Attention(nn.Module):
 
         self.tp_size = self.mapping.tp_size if self.mapping else 1
         self.tp_rank = self.mapping.tp_rank if self.mapping else 0
+        # Optional fused self-attention (attn, qkv, freqs_cos, freqs_sin, timestep) -> out;
+        # set by WanBlock from pipeline_config fused_fp8.
+        self.fused_self_attention = None
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
         # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
@@ -731,6 +734,14 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
+            if (
+                self.fused_self_attention is not None
+                and seq_len == kv_seq_len
+                and not kwargs
+                and qkv.dtype == torch.bfloat16
+            ):
+                out = self.fused_self_attention(self, qkv, freqs_cos, freqs_sin, timestep)
+                return self.to_out[0](out)
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)

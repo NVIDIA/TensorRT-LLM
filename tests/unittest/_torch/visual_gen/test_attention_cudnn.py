@@ -26,6 +26,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import (
     _quantize_mxfp8_v,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 # Quantization dtype -> quant_attention_config accepted by AttentionConfig.
@@ -51,8 +52,8 @@ MIN_COSINE = {None: 0.9999, "fp8": 0.995, "mxfp8": 0.995}
 def _require_cudnn(quant_dtype: str | None) -> None:
     if not torch.cuda.is_available():
         pytest.skip("cuDNN attention backend requires CUDA.")
-    if quant_dtype is not None and torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("cuDNN FP8/MXFP8 SDPA requires a Blackwell-class GPU (sm100+).")
+    if quant_dtype is not None and get_sm_version() not in (100, 103, 107):
+        pytest.skip("cuDNN FP8/MXFP8 SDPA requires SM100/SM103/SM107.")
 
 
 def _make_qkv(batch, num_heads, num_kv_heads, seq_q, seq_kv, head_dim, device):
@@ -76,7 +77,7 @@ def _reference(q, k, v, is_causal):
         seq_q, seq_kv = q.shape[2], k.shape[2]
         causal_mask = torch.ones(seq_q, seq_kv, device=q.device, dtype=torch.bool)
         logits = logits.masked_fill(causal_mask.triu(seq_kv - seq_q + 1), float("-inf"))
-    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1).transpose(1, 2)
+    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1)
 
 
 @pytest.mark.parametrize("quant_dtype", list(QUANT_CONFIGS), ids=["unquantized", "fp8", "mxfp8"])
@@ -105,7 +106,7 @@ def test_cudnn_attention(quant_dtype, shape, is_causal):
     ref_out, ref_lse = _reference(q, k, v, is_causal)
     assert output.shape == (batch, seq_q, num_heads, head_dim)
     assert output.dtype == torch.bfloat16
-    assert lse.shape == (batch, seq_q, num_heads)
+    assert lse.shape == (batch, num_heads, seq_q)
 
     cosine = F.cosine_similarity(output.float().flatten(), ref_out.flatten(), dim=0).item()
     assert cosine > MIN_COSINE[quant_dtype], (

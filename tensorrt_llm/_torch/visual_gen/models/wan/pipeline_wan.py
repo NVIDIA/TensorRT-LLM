@@ -120,6 +120,7 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
         "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8",
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
+    defaults={"fused_fp8": "off"},
     doc="Wan 2.1 & 2.2 text-to-video family.",
     supports_nvfp4_vae=True,
 )
@@ -138,13 +139,12 @@ class WanPipeline(BasePipeline):
         # Fixed latent for reproducible benchmarking (e.g. MLPerf).
         # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
         # noise tensor; it will be used in place of freshly sampled random latents for
-        # all T2V requests.  Loaded once at server startup, reused across requests.
+        # all T2V requests. Loaded on first use: torch.load fails under MetaInitMode.
         self._fixed_latent: Optional[torch.Tensor] = None
-        _fixed_latent_path = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
-        if _fixed_latent_path:
-            self._fixed_latent = torch.load(_fixed_latent_path, weights_only=True)
-            logger.warning(
-                f"Loaded fixed latent from {_fixed_latent_path}, shape={self._fixed_latent.shape}"
+        self._fixed_latent_path: Optional[str] = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
+        if self._fixed_latent_path and not os.path.isfile(self._fixed_latent_path):
+            raise FileNotFoundError(
+                f"TRTLLM_VIDEO_FIXED_LATENT_PATH={self._fixed_latent_path} does not exist"
             )
 
         super().__init__(pipeline_config)
@@ -601,8 +601,8 @@ class WanPipeline(BasePipeline):
             latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
                 batch_size, image, height, width, num_frames, generator
             )
-        elif self._fixed_latent is not None:
-            latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
+        elif (fixed_latent := self._get_fixed_latent()) is not None:
+            latents = fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
@@ -803,6 +803,16 @@ class WanPipeline(BasePipeline):
         neg_embeds = get_embeds(neg_prompt)
 
         return prompt_embeds, neg_embeds
+
+    def _get_fixed_latent(self) -> Optional[torch.Tensor]:
+        """Fixed latent, loaded on first use; subclasses must call this."""
+        if self._fixed_latent is None and self._fixed_latent_path is not None:
+            self._fixed_latent = torch.load(self._fixed_latent_path, weights_only=True)
+            logger.warning(
+                f"Loaded fixed latent from {self._fixed_latent_path}, "
+                f"shape={self._fixed_latent.shape}"
+            )
+        return self._fixed_latent
 
     @nvtx_range("_prepare_latents", color="blue")
     def _prepare_latents(

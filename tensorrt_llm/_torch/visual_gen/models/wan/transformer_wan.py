@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+from tensorrt_llm._torch.visual_gen.models.wan import fused_block, fused_fp8_route
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     WanPerTokenAdaLN,
     WanPerTokenAdaLNRuntime,
@@ -38,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+from tensorrt_llm._torch.visual_gen.modules.wan_fused_fp8 import ops as fused_ops
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -289,6 +291,7 @@ class WanBlock(nn.Module):
         model_config: DiffusionModelConfig,
         _layer_idx: int,
         added_kv_proj_dim: int = None,
+        fused_fp8: fused_fp8_route.FusedFp8Route = fused_fp8_route.FusedFp8Route(),
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -354,6 +357,15 @@ class WanBlock(nn.Module):
             separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
+        self._use_fused_block = fused_fp8.block
+        if fused_fp8.attention and fused_ops.supports(self.attn1):
+            self.attn1.fused_self_attention = fused_ops.self_attention
+        elif fused_fp8.attention and fused_fp8.required:
+            raise ValueError(
+                f"pipeline_config {fused_fp8_route.FUSED_FP8_KEY}='require', but blocks."
+                f"{_layer_idx}.attn1 does not fit the fused kernels (head_dim "
+                f"{self.attn1.head_dim}, {self.attn1.local_num_attention_heads} local heads)"
+            )
 
         # Cross-attention with separate Q, K, V
         self.attn2 = Attention(
@@ -549,6 +561,10 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
+        if self._use_fused_block and fused_block.eligible(self, temb):
+            return fused_block.forward(
+                self, x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timestep
+            )
         pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
         if pertoken_adaln is None:
             if temb.ndim == 4:
@@ -791,12 +807,16 @@ class WanTransformer3DModel(BaseDiffusionModel):
             pos_embed_seq_len=pos_embed_seq_len,
         )
 
+        fused_fp8 = fused_fp8_route.route(
+            model_config, model_config.mapping.tp_size if model_config.mapping else 1
+        )
         self.blocks = nn.ModuleList(
             [
                 WanBlock(
                     model_config=model_config,
                     _layer_idx=i,
                     added_kv_proj_dim=added_kv_proj_dim,
+                    fused_fp8=fused_fp8,
                 )
                 for i in range(num_layers)
             ]
