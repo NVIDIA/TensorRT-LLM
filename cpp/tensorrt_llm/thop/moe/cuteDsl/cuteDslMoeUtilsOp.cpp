@@ -502,6 +502,62 @@ std::tuple<torch::Tensor, torch::Tensor> moe_swiglu_nvfp4_quantize(torch::Tensor
     return {output, output_sf};
 }
 
+std::tuple<torch::Tensor, torch::Tensor> swiglu_nvfp4_quantize(
+    torch::Tensor const& input, torch::Tensor const& global_sf)
+{
+    TORCH_CHECK(input.dim() == 2, "input must be 2D.");
+    TORCH_CHECK(input.size(1) % 2 == 0, "input.size(1) must be even.");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous.");
+    TORCH_CHECK(at::cuda::getDeviceProperties(input.get_device())->major >= 10,
+        "swiglu_nvfp4_quantize requires compute capability 10.0 or newer.");
+    TORCH_CHECK(global_sf.is_cuda() && global_sf.device() == input.device(),
+        "global_sf must be a CUDA tensor on the same device as input.");
+    TORCH_CHECK(global_sf.numel() == 1, "global_sf must have 1 element.");
+    TORCH_CHECK(global_sf.scalar_type() == torch::kFloat32, "global_sf must be float32.");
+    int64_t const num_tokens = input.size(0);
+    int64_t const interm_size = input.size(1) / 2;
+    int64_t constexpr kSFVecSize = 16;
+    TORCH_CHECK(interm_size % kSFVecSize == 0, "input.size(1) / 2 must be divisible by ", kSFVecSize, ".");
+
+    auto output
+        = torch::empty({num_tokens, interm_size / 2}, torch::dtype(torch::kFloat4_e2m1fn_x2).device(input.device()));
+    int64_t const padded_rows = (num_tokens + 127) / 128 * 128;
+    int64_t const padded_sf_cols = (interm_size / kSFVecSize + 3) / 4 * 4;
+    auto output_sf = torch::empty({padded_rows * padded_sf_cols}, torch::dtype(torch::kUInt8).device(input.device()));
+    if (num_tokens == 0)
+    {
+        return {output, output_sf};
+    }
+
+    tensorrt_llm::kernels::cutlass_kernels::ActivationParams activation_params{
+        tensorrt_llm::kernels::cutlass_kernels::ActivationType::Swiglu};
+
+    auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+#define DISPATCH_SWIGLU_NVFP4(InputType)                                                                               \
+    tensorrt_llm::kernels::cute_dsl::moeActivation<InputType, __nv_fp4_e2m1, uint8_t>(                                 \
+        static_cast<InputType*>(input.data_ptr()), static_cast<__nv_fp4_e2m1*>(output.data_ptr()),                     \
+        global_sf.data_ptr<float>(), static_cast<uint8_t*>(output_sf.data_ptr()), nullptr, nullptr, activation_params, \
+        num_tokens, interm_size, num_tokens, stream, true)
+
+    if (input.scalar_type() == torch::kHalf)
+    {
+        DISPATCH_SWIGLU_NVFP4(half);
+    }
+    else if (input.scalar_type() == torch::kBFloat16)
+    {
+        DISPATCH_SWIGLU_NVFP4(__nv_bfloat16);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
+    }
+
+#undef DISPATCH_SWIGLU_NVFP4
+
+    return {output, output_sf};
+}
+
 torch::Tensor moe_gelu(torch::Tensor const& input, torch::Tensor const& tile_idx_to_mn_limit,
     torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim)
 {
@@ -582,6 +638,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_swiglu_nvfp4_quantize(Tensor input, Tensor global_sf, Tensor tile_idx_to_mn_limit, Tensor "
         "num_non_exiting_tiles, int tile_tokens_dim) -> (Tensor, Tensor)");
+    m.def("swiglu_nvfp4_quantize(Tensor input, Tensor global_sf) -> (Tensor, Tensor)");
     m.def(
         "moe_gelu(Tensor input, Tensor tile_idx_to_mn_limit, Tensor num_non_exiting_tiles, "
         "int tile_tokens_dim) -> Tensor");
@@ -599,5 +656,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
         &tensorrt_llm::torch_ext::moe_output_memset_from_expert_counts_inplace);
     m.impl("moe_swiglu", &tensorrt_llm::torch_ext::moe_swiglu);
     m.impl("moe_swiglu_nvfp4_quantize", &tensorrt_llm::torch_ext::moe_swiglu_nvfp4_quantize);
+    m.impl("swiglu_nvfp4_quantize", &tensorrt_llm::torch_ext::swiglu_nvfp4_quantize);
     m.impl("moe_gelu", &tensorrt_llm::torch_ext::moe_gelu);
 }

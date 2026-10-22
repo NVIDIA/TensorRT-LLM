@@ -1376,6 +1376,20 @@ def _register_fake():
             device=input.device)
         return output, output_sf
 
+    @torch.library.register_fake("trtllm::swiglu_nvfp4_quantize")
+    def _(
+        input: torch.Tensor,
+        global_sf: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = input.size(0)
+        interm_size = input.size(1) // 2
+        output = input.new_empty((num_tokens, interm_size // 2),
+                                 dtype=torch.float4_e2m1fn_x2)
+        output_sf = input.new_empty((fp4_utils.pad_up(num_tokens, 128) *
+                                     fp4_utils.pad_up(interm_size // 16, 4), ),
+                                    dtype=torch.uint8)
+        return output, output_sf
+
     @torch.library.register_fake("trtllm::moe_gelu")
     def _(
         input: torch.Tensor,
