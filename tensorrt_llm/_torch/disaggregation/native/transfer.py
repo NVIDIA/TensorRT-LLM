@@ -3376,13 +3376,32 @@ class RxSession(RxSessionBase):
                 raise RuntimeError("receive task has no published bounds")
             if transfer_size < 0:
                 raise ValueError("transfer size must be nonnegative")
-            dst_ptrs, sizes, src_base = bounds.validate_result(
-                peer_rank,
-                status == AgentResult.SUCCESS,
-                dst_ptrs,
-                sizes,
-                src_base,
-            )
+            if not bounds.has_writer(peer_rank):
+                raise ValueError(f"writer {peer_rank} is not assigned to this receive piece")
+            try:
+                dst_ptrs, sizes, src_base = bounds.validate_result(
+                    peer_rank,
+                    status == AgentResult.SUCCESS,
+                    dst_ptrs,
+                    sizes,
+                    src_base,
+                )
+            except ValueError as error:
+                # The report token and writer set already prove this frame comes from a
+                # published writer, so a malformed or out-of-bounds result is that writer's
+                # answer rather than noise to drop. Dropping it would leave the request waiting
+                # for kv_transfer_timeout_ms with the writer still outstanding. A SUCCESS whose
+                # payload cannot be trusted becomes the writer's FAILED word; a FAILED or
+                # IN_DOUBT report keeps its status and only loses the unusable tail.
+                logger.error(
+                    f"KV result from writer {peer_rank} for request {self.request_id} "
+                    f"slice={receiver_slice_id} status={status.value} rejected: {error}"
+                )
+                dst_ptrs = sizes = src_base = None
+                if status == AgentResult.SUCCESS:
+                    status = AgentResult.FAILED
+                    is_last_slice = True
+                    transfer_size = 0
             if status == AgentResult.IN_DOUBT:
                 if not self._enforce_physical_ownership:
                     raise RuntimeError(

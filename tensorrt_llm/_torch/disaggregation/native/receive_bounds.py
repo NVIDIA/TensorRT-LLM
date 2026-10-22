@@ -133,6 +133,10 @@ class ReceiveBounds:
         ends = np.array([end for _, end in intervals], dtype=np.uint64).tobytes()
         return cls(starts, ends, MappingProxyType(spans))
 
+    def has_writer(self, peer_rank: int) -> bool:
+        """Whether ``peer_rank`` is one of the writers this piece was published to."""
+        return peer_rank in self._writer_spans
+
     def validate_result(
         self,
         peer_rank: int,

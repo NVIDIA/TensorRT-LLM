@@ -685,8 +685,6 @@ def test_kv_result_report_token_must_match_published_writer_before_recording_res
 @pytest.mark.parametrize(
     ("peer_rank", "slice_id", "dst_ptr", "src_base", "error"),
     [
-        (0, 0, 0x2100, 0x1000, "outside this receive piece"),
-        (0, 0, 0x2000, 0x1100, "different bounce source"),
         (1, 0, 0x2000, 0x1000, "not assigned to this receive piece"),
         (0, -1, 0x2000, 0x1000, "receiver_slice_id=-1"),
     ],
@@ -762,6 +760,53 @@ def test_rejected_result_does_not_claim_writer_before_valid_result(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("dst_ptr", "src_base"),
+    [
+        (0x2100, 0x1000),  # fragment outside the receive piece
+        (0x2000, 0x1100),  # source differs from the published bounce region
+    ],
+)
+def test_bounds_rejected_result_from_published_writer_fails_the_task(
+    monkeypatch: pytest.MonkeyPatch, dst_ptr: int, src_base: int
+) -> None:
+    """Record a bounds-rejected SUCCESS from a verified writer as that writer's FAILED word.
+
+    The request then fails immediately instead of waiting for the transfer timeout.
+    """
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    session = _make_rx_session(receiver, rid=106)
+    chunk = _sole_piece([np.array([0], dtype=np.int64)])
+    session.receive(chunk)
+    task = session._kv_tasks[0]
+    task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(
+        chunk, _paged_receive_table(), {0: (0x1000, 0x100)}
+    )
+    scatter = Mock()
+    monkeypatch.setattr(bounce_mod, "scatter_write_result", scatter)
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        receiver_slice_id=0,
+        is_last_slice=False,
+        status=AgentResult.SUCCESS,
+        dst_ptrs=np.array([dst_ptr], dtype=np.int64),
+        sizes=np.array([8], dtype=np.int64),
+        src_base=src_base,
+        transfer_size=8,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
+
+    assert task._writer_reports == {0: False}
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert session.kv_cache_size_bytes == 0
+    assert receiver._bounce.failed_writers == [((106, 0), 0)]
+    scatter.assert_not_called()
+
+
+@pytest.mark.cpu_only
 def test_result_uses_the_destination_bounds_of_its_own_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -778,21 +823,24 @@ def test_result_uses_the_destination_bounds_of_its_own_slice(
 
     scatter = Mock()
     monkeypatch.setattr(bounce_mod, "scatter_write_result", scatter)
-    with pytest.raises(ValueError, match="outside this receive piece"):
-        session.process_kv_agent_result(
-            peer_rank=0,
-            receiver_slice_id=0,
-            is_last_slice=True,
-            status=AgentResult.SUCCESS,
-            dst_ptrs=np.array([0x2100], dtype=np.int64),
-            sizes=np.array([8], dtype=np.int64),
-            src_base=0x1000,
-            transfer_size=8,
-            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
-        )
+    session.process_kv_agent_result(
+        peer_rank=0,
+        receiver_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.SUCCESS,
+        dst_ptrs=np.array([0x2100], dtype=np.int64),
+        sizes=np.array([8], dtype=np.int64),
+        src_base=0x1000,
+        transfer_size=8,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
 
+    # Slot 1 is a valid destination for slice 1 but not for slice 0, so the result is judged
+    # against slice 0's bounds and fails only that slice's writer.
     assert session.kv_cache_size_bytes == 0
-    assert all(task._writer_reports == {} for task in session._kv_tasks)
+    assert session._kv_tasks[0]._writer_reports == {0: False}
+    assert session._kv_tasks[0].status == transfer_mod.TaskStatus.ERROR
+    assert session._kv_tasks[1]._writer_reports == {}
     scatter.assert_not_called()
 
 
