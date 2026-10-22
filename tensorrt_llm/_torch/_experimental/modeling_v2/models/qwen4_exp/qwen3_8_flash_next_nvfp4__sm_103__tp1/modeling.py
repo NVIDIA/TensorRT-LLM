@@ -5269,54 +5269,14 @@ class DecodeTarget:
            (sequence, stream).
 
         Every generation sequence carries its history by construction, so no carry
-        flags are passed. A verify step (`stage`) takes the unfused ops instead, whose
-        intermediates `SpeculativeRollback` stages (see `PrefillTarget._ple_delta`)."""
+        flags are passed. A verify step (`stage`) stages what `SpeculativeRollback`
+        rewrites the two pools from after sampling: both pools' pre-step rows before
+        either launch publishes, and the conv input the third launch writes out."""
         core = self.core
         S = self._stack
         conv_states, ngram_pool, si_all, carry_all, qsl, gen_p = ple_state
         if stage:
-            core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
-            window = ngram_token_history(
-                input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
-            )
-            rows = torch.reshape(
-                ngram_hash(
-                    window,
-                    layer_multipliers=S.ple_mult,
-                    head_vocab_sizes=S.ple_vocab,
-                    head_offsets=S.ple_offs,
-                    eos_token_id=core.eos_token_id,
-                    num_query_tokens=1,
-                ),
-                [-1, core.ngram_heads],
-            )
-            gathered = nn.functional.embedding(rows, core.w["ple_table"])
-            ngram = torch.reshape(
-                dequantize_e4m3_per_tensor(gathered, S.ple_tscale), [-1, core.ple_embed_dim]
-            )
-            key_normed = self._grouped_norm(cublas_mm(ngram, S.ple_key), S.ple_nk)
-            query_normed = self._grouped_norm(hc, S.ple_nq)
-            value = cublas_mm(ngram, S.ple_val)
-            gated = gated_ngram_injection(
-                key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
-            )
-            conv_in = self._grouped_norm(gated, S.ple_nc)
-            core.spec_rollback.stage_ple_rows(window, conv_in)
-            # The short conv reads channel-major; a bare transpose is the certified form.
-            convolved = dilated_short_conv_paged(
-                x=torch.transpose(conv_in, 0, 1),
-                weight=S.ple_conv_w,
-                bias=None,
-                conv_states=conv_states,
-                query_start_loc=qsl,
-                cache_indices=si_all,
-                has_initial_state=carry_all,
-                dilation=core.ple_dilation,
-                silu_activation=True,
-                pad_slot_id=_PAD_SLOT_ID,
-            )
-            hc = torch.add(hc, torch.add(gated, torch.transpose(convolved, 0, 1)))
-            return qwen4_exp_hc_inject_norm(hc, None, None, next_norm, core.eps, core.hc_count)
+            core.spec_rollback.stage_ple_verify(ngram_pool, conv_states, input_ids)
         ngram = ple_ngram_embed(
             input_ids,
             ngram_pool,
@@ -5331,7 +5291,8 @@ class DecodeTarget:
             core.eos_token_id,
             gen_p,
         )
-        return ple_gate_conv_inject_norm(
+        conv_input = torch.empty_like(hc) if stage else None
+        out = ple_gate_conv_inject_norm(
             hc,
             gemm(ngram, S.ple_key),
             gemm(ngram, S.ple_val),
@@ -5349,7 +5310,11 @@ class DecodeTarget:
             core.ple_dilation,
             _PAD_SLOT_ID,
             gen_p,
+            conv_input=conv_input,
         )
+        if stage:
+            core.spec_rollback.stage_ple_conv_input(conv_input)
+        return out
 
     # -------------------------------------------------------------- forward ---
 
@@ -6641,7 +6606,8 @@ class SpeculativeRollback:
       pre-verify contents.
 
     The targets stage during the forward (`begin`, then `stage_ple_pools` /
-    `stage_ple_rows` in the PLE block and `stage_index` before each attention layer's
+    `stage_ple_rows` -- `stage_ple_verify` / `stage_ple_conv_input` on the decode
+    target's fused PLE launches -- in the PLE block and `stage_index` before each attention layer's
     store) and the spec worker calls `commit_speculative_states` after its draft loop,
     inside the same model forward. Context rows and non-verify steps stage nothing, and a
     commit with nothing staged returns. Staging and commit use metadata-sized
@@ -6736,6 +6702,30 @@ class SpeculativeRollback:
         # Row t of the window without its oldest id is the history after token t.
         pending["ngram_candidates"] = torch.reshape(window[prefix:, 1:], [n, p, -1]).clone()
         pending["conv_x"] = torch.reshape(conv_input[prefix:], [n, p, -1]).clone()
+
+    def stage_ple_verify(
+        self, ngram_pool: torch.Tensor, conv_pool: torch.Tensor, input_ids: torch.Tensor
+    ) -> None:
+        """A generation-only verify step's PLE staging, before either pool is written:
+        `stage_ple_pools`, plus the n-gram candidates rebuilt from the slots' pre-step id
+        history and the rows' ids. Row `t`'s history after the step is the last
+        `context` ids of `[history | ids of rows 0..t]` -- what the id window of row `t`
+        minus its oldest id is, every generation sequence carrying its history."""
+        self.stage_ple_pools(ngram_pool, conv_pool)
+        pending = self._pending
+        prefix, n, p = pending["prefix"], pending["n"], pending["p"]
+        context = ngram_pool.shape[1]
+        ids = torch.reshape(input_ids[prefix : prefix + n * p], [n, p]).to(ngram_pool.dtype)
+        stream = torch.cat([ngram_pool[pending["slots"]], ids], 1)
+        # Window k of the unfold is the history after k rows.
+        pending["ngram_candidates"] = stream.unfold(1, context, 1)[:, 1:]
+
+    def stage_ple_conv_input(self, conv_input: torch.Tensor) -> None:
+        """The generation rows' conv input (`[T, C]`, token-major), as the fused PLE
+        launch wrote it into a buffer the forward allocated for this staging alone."""
+        pending = self._pending
+        prefix, n, p = pending["prefix"], pending["n"], pending["p"]
+        pending["conv_x"] = torch.reshape(conv_input[prefix:], [n, p, -1])
 
     def stage_index(self, index_cache: torch.Tensor, position_cache: torch.Tensor) -> None:
         """Before an attention layer's index store: the generation rows' slots of its

@@ -334,7 +334,10 @@ class PleGateConvInjectNorm(OpWrapper):
     per-sequence kernel then only publishing the state.
 
     Returns `(hc_out, normed)`, fresh `[T, C*D]` in `hc`'s dtype.
-    `conv_states` is advanced in place.
+    `conv_states` is advanced in place. When `conv_input` is given (a
+    contiguous `[T, C*D]` buffer in `hc`'s dtype) the conv input `xc` is
+    written there, for a caller that has to rebuild the conv state at another
+    row of the sequence later (the speculative rollback of a verify step).
 
     Fusion boundary: everything from the key/query norms to the next site's
     norm. The n-gram embedding and the key / value projections are the
@@ -348,6 +351,7 @@ class PleGateConvInjectNorm(OpWrapper):
     # checkpoint's 4 x 2560 bf16 geometry throughout.
     CELLS: tuple[Cell, ...] = (
         _cell("decode 128 x 1 row at the 461-slot pool", (1,) * 128, pool_slots=ENGINE_SLOTS),
+        _cell("MTP3 verify: 64 sequences x 4 rows", (4,) * 64, pool_slots=ENGINE_SLOTS),
         # Context-shaped (prefill / mixed) steps: the packed-row conv.
         _cell("prefill 8192 rows, fresh", (8192,), carries=(False,), pool_slots=ENGINE_SLOTS),
         _cell(
@@ -371,11 +375,10 @@ class PleGateConvInjectNorm(OpWrapper):
     distinct live slots; `query_start_loc[-1] == T`. Operands 2-D with unit
     column stride; weights contiguous. Certified at the checkpoint's 4 x 2560
     bf16 geometry with every slot live (the target never passes `pad_slot_id`),
-    at a 128 x 1-row decode, an 8192-row fresh prefill and a mixed 2-context +
-    64-decode step, all on the 461-slot pool. Not certified: more than one
-    row per sequence on the per-sequence path (`1 < max_rows <=
-    PER_SEQ_MAX_ROWS`) or sequences shorter than `max_rows` -- a verify step
-    takes the unfused ops, so the target's per-sequence path runs one row.
+    at a 128 x 1-row decode, a 64 x 4-row MTP3 verify, an 8192-row fresh
+    prefill and a mixed 2-context + 64-decode step, all on the 461-slot pool.
+    Not certified: sequences shorter than `max_rows` on the per-sequence path
+    (a verify step gives every sequence `max_rows` rows).
 
     Numerics: every rounding point of the composition is kept, so the only
     differences are fp32 reduction order (the three norms' sums of squares
@@ -408,6 +411,7 @@ class PleGateConvInjectNorm(OpWrapper):
         pad_slot_id: int,
         max_rows: int,
         has_initial_states: Optional[torch.Tensor] = None,
+        conv_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows, width = hc.shape
         hidden = width // hc_count
@@ -419,7 +423,11 @@ class PleGateConvInjectNorm(OpWrapper):
         if num_seqs == 0 or rows == 0:
             return hc_out, normed
         gated = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
-        xc = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
+        xc = (
+            conv_input
+            if conv_input is not None
+            else torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
+        )
         block = triton.next_power_of_2(hidden)
         warps = 8 if block >= 2048 else 4
         _ple_gate_kernel[(rows, hc_count)](
@@ -534,6 +542,7 @@ class PleGateConvInjectNorm(OpWrapper):
         pad_slot_id: int,
         max_rows: int,
         has_initial_states: Optional[torch.Tensor] = None,
+        conv_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(hc_out, normed, conv_states)` as the call leaves them: float64
         throughout, rounded to the activation dtype exactly where the op (and
@@ -610,6 +619,7 @@ class PleGateConvInjectNorm(OpWrapper):
         pad_slot_id: int,
         max_rows: int,
         has_initial_states: Optional[torch.Tensor] = None,
+        conv_input: Optional[torch.Tensor] = None,
     ) -> None:
         rows, width = hc.shape
         assert width % hc_count == 0, f"width {width} not divisible by hc_count {hc_count}"
@@ -652,6 +662,11 @@ class PleGateConvInjectNorm(OpWrapper):
         assert has_initial_states is None or has_initial_states.shape == state_indices.shape, (
             "has_initial_states must be one flag per sequence"
         )
+        assert conv_input is None or (
+            conv_input.shape == hc.shape
+            and conv_input.dtype == hc.dtype
+            and conv_input.is_contiguous()
+        ), "conv_input must be a contiguous buffer shaped and typed as hc"
 
 
 ple_gate_conv_inject_norm = PleGateConvInjectNorm()
