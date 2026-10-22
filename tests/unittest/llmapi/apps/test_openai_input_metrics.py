@@ -94,6 +94,7 @@ async def test_total_includes_inline_preprocessing_but_not_generation(route, fai
     server.use_harmony = False
     server.tokenizer = None
     server.processor = None
+    server.chat_template = None
     server.tool_parser = None
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
