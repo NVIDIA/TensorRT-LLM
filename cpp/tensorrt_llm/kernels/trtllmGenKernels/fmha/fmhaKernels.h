@@ -679,7 +679,6 @@ private:
             FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
             int32_t ctaDim = 512;
             std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
-            padTokenSparseMlaQTile(options);
             return {options, optionsFromArgs, ctaDim};
         }
 
@@ -697,7 +696,6 @@ private:
         int32_t ctaDim = 512;
         FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
-        padTokenSparseMlaQTile(options);
         limitCgaSmemReductionCtasKv(options);
         return {options, optionsFromArgs, ctaDim};
     }
@@ -711,8 +709,8 @@ private:
         }
         int const numHeads = options.mNumHeadsQPerKv;
         TLLM_CHECK_WITH_INFO(numHeads > 0, "The MLA Q heads per KV head must be positive.");
-        // Keep the existing head-splitting heuristics for power-of-two and larger groups.
-        if (numHeads >= 64 || (numHeads & (numHeads - 1)) == 0)
+        // Power-of-two groups of at least eight heads already have legal Q tiles.
+        if (numHeads >= 64 || (numHeads >= 8 && (numHeads & (numHeads - 1)) == 0))
         {
             return;
         }
@@ -751,18 +749,6 @@ private:
         // still derives staging, MMA, softmax and launch parameters from the real head counts.
         options.mEnablesAutoTuner = false;
         optionsFromArgs.mIsTileSizeQSet = true;
-    }
-
-    // The token-sparse MLA selection sets tileSizeQ to the Q heads per KV head, while the SwapsMmaAb kernels need a
-    // multiple of 8 Q-tile rows (SmemTile). With fewer than 8 heads per rank (for example 64 MLA heads over 16 ranks)
-    // pad the tile to 8, as the dense MLA selection does; the kernel masks the rows past the heads.
-    static void padTokenSparseMlaQTile(FmhaOptions& options)
-    {
-        if (options.mIsMlaGen && isTokenSparse(options.mSparseType)
-            && options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && options.mTileSizeQ < 8)
-        {
-            options.mTileSizeQ = 8;
-        }
     }
 
     void limitCgaSmemReductionCtasKv(FmhaOptions& options) const
