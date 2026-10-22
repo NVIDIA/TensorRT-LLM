@@ -51,6 +51,7 @@ add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
 
 add_gtest(fusedMoeCommKernelTest moe/fusedMoeCommKernelTest.cpp)
+add_gtest(moeRebalanceHaloRTest moe/moeRebalanceHaloRTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest

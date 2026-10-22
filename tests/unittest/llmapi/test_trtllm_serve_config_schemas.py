@@ -133,6 +133,39 @@ def test_config_validation(
         ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            True,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "auxiliary_sms": 1,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            False,
+        ),
+        # HALO-R relays into the shared helper banks only.
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "planner": "halo_r"}, False),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "helper_slot_mode": "per_layer_resident",
+                "planner": "halo_r",
+            },
+            False,
+        ),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "planner": "halo_m"}, False),
+        # The planner is a per-layer dynamic field; standard EPLB rejects it.
+        ({"num_slots": 320, "planner": "halo_r"}, False),
         ({"mode": "dynamic", "num_slots": 320}, False),
     ],
 )
