@@ -4325,7 +4325,7 @@ class PrefillTarget:
         gate_logits = cublas_mm(x, M.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
-    def _capture_selection(self, md, topk_indices, visible_blocks) -> None:
+    def _capture_selection(self, md, topk_indices, visible_blocks, compact=False) -> None:
         """IndexShare: stash, per request, the selection of the row the draft loop continues
         from, with that row's complete-group count, in the draft layer's row of the shared
         buffers.
@@ -4334,7 +4334,8 @@ class PrefillTarget:
         request's last row of this chunk, and a generation request's last accepted row
         (`num_accepted - 1` past its first). Capturing here rather than at the first draft
         decode step keeps the indexer at one call per draft loop for a batch with context
-        rows too."""
+        rows too. A `compact` selection holds each context request's last row, then every
+        generation row (the draft step's `keep`)."""
         batch = md.num_seqs
         assert md.qsa_mtp_num_accepted is not None, (
             "IndexShare needs the worker's accepted counts to pick each request's capture "
@@ -4346,6 +4347,10 @@ class PrefillTarget:
         offsets = torch.minimum(torch.clamp(accepted - 1, min=0), seq_lens - 1)
         offsets[: md.num_contexts] = seq_lens[: md.num_contexts] - 1
         rows = starts + offsets
+        if compact:
+            num_contexts = md.num_contexts
+            rows[:num_contexts] = torch.arange(num_contexts, device=rows.device)
+            rows[num_contexts:] -= md.num_ctx_tokens - num_contexts
         slot = self.core._draft_bound.share_slot
         md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
         md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
@@ -4501,19 +4506,37 @@ class PrefillTarget:
         mixed, inject = qwen4_exp_gated_residual(
             self._grouped_norm(x, M.ahc_norm), M.ahc_down, M.ahc_up, M.ahc_inject, core.hc_count
         )
+        # The draft loop reads one row per request from this step: a context request's last
+        # row and one row of each generation run (the worker's `gather_ids`). Every row writes
+        # the layer's KV and index planes; past those writes only `keep` -- each context's
+        # last row, then every generation row -- goes on, the query side included on the
+        # sparse path (the dense call's metadata describes every row). The other returned
+        # rows keep the layer's input stream.
+        keep = None
+        if num_ctx > md.num_contexts:
+            ctx_lens = md.seq_lens_cuda[: md.num_contexts].to(torch.long)
+            keep = torch.cat(
+                [torch.cumsum(ctx_lens, 0) - 1, torch.arange(num_ctx, rows, device=dev)]
+            )
+        q_keep = keep if sparse else None
+        q_rows = rows if q_keep is None else q_keep.shape[0]
         qkv = torch.empty([rows, core.qkv_width], dtype=dt, device=dev)
-        attn_out = torch.empty([rows, core.q_width], dtype=dt, device=dev)
-        qg = cublas_mm(mixed, M.q)
+        attn_out = torch.empty([q_rows, core.q_width], dtype=dt, device=dev)
+        qg = cublas_mm(mixed if q_keep is None else mixed[q_keep], M.q)
         k = cublas_mm(mixed, M.k)
         v = cublas_mm(mixed, M.v)
         qkv_h = torch.reshape(qkv, [rows, core.heads_q + 2 * core.heads_kv, core.head_dim])
         q_dst, k_dst, v_dst = torch.split(qkv_h, [core.heads_q, core.heads_kv, core.heads_kv], 1)
         q_src, gate = torch.split(
-            torch.reshape(qg, [rows, core.heads_q, 2 * core.head_dim]),
+            torch.reshape(qg, [q_rows, core.heads_q, 2 * core.head_dim]),
             [core.head_dim, core.head_dim],
             2,
         )
-        q_dst.copy_(q_src)
+        if q_keep is None:
+            q_dst.copy_(q_src)
+        else:
+            # The other rows' query heads stay unwritten: only the rope reads them, row-local.
+            q_dst.index_copy_(0, q_keep, q_src)
         k_dst.copy_(torch.reshape(k, [rows, core.heads_kv, core.head_dim]))
         v_dst.copy_(torch.reshape(v, [rows, core.heads_kv, core.head_dim]))
         # The trunk rope's certified cell at the module's own base (`mtp.rope_theta`).
@@ -4562,8 +4585,12 @@ class PrefillTarget:
             block_table,
             tokens_per_block,
         )
-        index_scratch = torch.empty([rows, core.index_scratch_width], dtype=dt, device=dev)
-        index_scratch[:, : core.index_width].copy_(qk_index)
+        index_scratch = torch.empty([q_rows, core.index_scratch_width], dtype=dt, device=dev)
+        index_scratch[:, : core.index_width].copy_(qk_index if q_keep is None else qk_index[q_keep])
+        q_pos3, q_pos, q_req, q_logical = pos3, pos, req_idx, logical
+        if q_keep is not None:
+            q_pos3 = torch.index_select(pos3, 1, q_keep)
+            q_pos, q_req, q_logical = pos[q_keep], req_idx[q_keep], logical[q_keep]
         fused_qk_norm_rope(
             index_scratch,
             num_heads_q=core.index_heads,
@@ -4576,7 +4603,7 @@ class PrefillTarget:
             k_weight=M.idx_kn,
             base=core.mtp_theta,
             is_neox=True,
-            position_ids=pos3 if _QSA_INDEX_USE_MROPE else pos,
+            position_ids=q_pos3 if _QSA_INDEX_USE_MROPE else q_pos,
             is_qk_norm=True,
             use_gemma=True,
             use_mrope=_QSA_INDEX_USE_MROPE,
@@ -4586,7 +4613,7 @@ class PrefillTarget:
         q_index = torch.split(
             torch.reshape(
                 index_scratch,
-                [rows, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
+                [q_rows, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
             ),
             [core.index_heads, core.index_kv_heads, core.index_kv_heads],
             1,
@@ -4610,68 +4637,77 @@ class PrefillTarget:
             # The append the dense op would have owned, then selection over the draft
             # layer's own compressed keys and the sparse GQA over its pool.
             _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
+            row_starts = md.qsa_topk_row_starts[:rows]
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            seq_lengths = md.qsa_sequence_lengths[:rows]
+            if q_keep is not None:
+                row_starts, visible_blocks = row_starts[q_keep], visible_blocks[q_keep]
+                seq_lengths = seq_lengths[q_keep]
             scores = qsa_paged_index_scores(
                 q=q_index,
                 index_cache=index_cache,
                 block_table=block_table,
-                query_positions=logical,
-                request_indices=req_idx,
+                query_positions=q_logical,
+                request_indices=q_req,
                 tokens_per_block=tokens_per_block,
                 compress_ratio=core.compress_ratio,
                 only_visible_blocks=True,
-                context_rows=True,
+                # A context's run of rows shares one key gather; `keep` has none.
+                context_rows=q_keep is None,
             )
-            topk_indices = md.qsa_topk_indices[:rows]
-            visible_blocks = md.qsa_visible_blocks[:rows]
+            topk_indices = md.qsa_topk_indices[:q_rows]
             _select(
                 core,
                 scores,
-                md.qsa_topk_row_starts[:rows],
+                row_starts,
                 visible_blocks,
                 topk_indices,
                 _live_score_columns(core, md, batch),
             )
             if share:
-                self._capture_selection(md, topk_indices, visible_blocks)
+                self._capture_selection(md, topk_indices, visible_blocks, q_keep is not None)
             selected = qsa_expand_block_indices(
                 topk_indices,
-                logical,
-                md.qsa_sequence_lengths[:rows],
+                q_logical,
+                seq_lengths,
                 compress_ratio=core.compress_ratio,
                 token_topk=core.token_topk,
             )
+            q_att = q_dst if q_keep is None else q_dst[q_keep]
             if kv.k_scale is not None:
-                num_ctx = md.num_ctx_tokens
+                # `keep` holds one row per context request.
+                q_ctx = num_ctx if q_keep is None else md.num_contexts
                 plan = None
-                if num_ctx > _NVFP4_ROWTILE_MIN_ROWS:
+                if q_ctx > _NVFP4_ROWTILE_MIN_ROWS:
                     plan = _nvfp4_context_plan(core, md, req_idx, block_table, tokens_per_block)
                 _sparse_gqa_nvfp4_context(
                     core,
                     kv,
                     plan,
-                    q_dst,
+                    q_att,
                     block_table,
                     selected,
-                    req_idx,
-                    logical,
+                    q_req,
+                    q_logical,
                     tokens_per_block,
-                    num_ctx,
+                    q_ctx,
                     attn_out,
+                    rows_per_request=p,
                 )
             else:
                 attn_out = torch.reshape(
                     _sparse_gqa(
                         core,
                         kv,
-                        q=q_dst,
+                        q=q_att,
                         block_table=block_table,
                         selected_tokens=selected,
-                        request_indices=req_idx,
+                        request_indices=q_req,
                         tokens_per_block=tokens_per_block,
-                        query_positions=logical,
+                        query_positions=q_logical,
                         compress_ratio=core.compress_ratio,
                     ),
-                    [rows, core.q_width],
+                    [q_rows, core.q_width],
                 )
         else:
             attn_out = thop_attention(
@@ -4689,18 +4725,10 @@ class PrefillTarget:
                 **_CALL_CONSTANTS,
             )
         fused_sigmoid_mul_inplace(attn_out, gate)
-        # Past the attention the draft loop reads one row per request: a context request's
-        # last row and one row of each generation run (the worker's `gather_ids`). The other
-        # context rows exist for the KV and index planes they wrote above, so only each
-        # context's last row and every generation row go on; the rest of the returned rows
-        # keep the layer's input stream.
-        keep = None
-        if num_ctx > md.num_contexts:
-            ctx_lens = md.seq_lens_cuda[: md.num_contexts].to(torch.long)
-            keep = torch.cat(
-                [torch.cumsum(ctx_lens, 0) - 1, torch.arange(num_ctx, rows, device=dev)]
-            )
-            out, attn_out, inject = x, attn_out[keep], inject[keep]
+        if keep is not None:
+            if q_keep is None:
+                attn_out = attn_out[keep]
+            out, inject = x, inject[keep]
             x = x[keep]
         x = qwen4_exp_post_inject(x, cublas_mm(attn_out, M.o), inject)
 
