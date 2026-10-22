@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import registered_routes
@@ -149,7 +150,8 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
 
     Checked by reading rather than importing, like the rest of this file: an
     entry declares `Cell(` in its source, and some test under this tree has to
-    name both the entry and `.CELLS`. That is weaker than proving the cells were
+    name both the entry and `.CELLS` -- or `certified_cells(`, which drives the
+    entry's cells and its targets'. That is weaker than proving the cells were
     driven, and it is what a check that runs anywhere can say.
     """
     tests = list(Path(__file__).resolve().parent.rglob("*.py"))
@@ -159,13 +161,110 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
     for entry in sorted(_entry_files()):
         if "Cell(" not in entry.read_text():
             continue
-        if not any(entry.stem in src and ".CELLS" in src for src in sources.values()):
+        if not any(
+            entry.stem in src and (".CELLS" in src or "certified_cells(" in src)
+            for src in sources.values()
+        ):
             undriven.append(str(entry.relative_to(_ROOT)))
 
     assert not undriven, (
         f"{len(undriven)} entry(ies) declare cells that no test drives: "
         f"{', '.join(undriven)}. Parametrize the entry's test off its CELLS."
     )
+
+
+def _cells_files() -> list[Path]:
+    return sorted((_ROOT / "models").rglob("cells.py"))
+
+
+@pytest.mark.parametrize("cells", _cells_files(), ids=lambda p: str(p.relative_to(_ROOT)))
+def test_target_cells_feed_entries_the_target_calls(cells):
+    """A `cells.py` holds a target's configurations for the catalog entries it calls.
+
+    It sits in a target's directory, imports entries only from
+    `catalog/<area>/<entry>.py`, and each of those its target's own code
+    imports too: a cell for an entry nothing under it calls certifies nothing
+    it runs. Each entry's test sits at the mirrored path
+    `<area>/test_modeling_v2_<entry>.py` and drives `certified_cells(`, which
+    is how it reaches these cells, and how CBTS finds the tests a `cells.py`
+    change has to rerun.
+    """
+    target_dir = cells.parent
+    assert (target_dir / "modeling.py").is_file(), f"{cells}: not beside a target's modeling.py"
+    used = "".join(
+        p.read_text()
+        for p in target_dir.rglob("*.py")
+        if p != cells and "__pycache__" not in p.parts
+    )
+    tests_root = Path(__file__).resolve().parent
+    for node in ast.walk(ast.parse(cells.read_text())):
+        if not isinstance(node, ast.ImportFrom) or not node.level:
+            continue
+        module = (node.module or "").split(".")
+        if module == ["catalog", "_op"]:
+            continue
+        assert len(module) == 3 and module[0] == "catalog", (
+            f"{cells}: imports {node.module!r}; cells.py imports catalog entries only"
+        )
+        _, area, entry = module
+        assert re.search(rf"catalog\.{area}\.{entry} import", used), (
+            f"{cells}: declares cells for {area}/{entry}, which its target never imports"
+        )
+        test = tests_root / area / f"test_modeling_v2_{entry}.py"
+        assert test.is_file() and "certified_cells(" in test.read_text(), (
+            f"{cells}: {area}/{entry} has no test at {test.relative_to(tests_root)} "
+            f"driving certified_cells("
+        )
+
+
+_TESTS_ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_every_target_has_the_accuracy_gate_of_its_name():
+    """A target's gate is `Test<TargetClass>` in `accuracy/modeling_v2/test_<family>.py`.
+
+    CBTS reaches a target's gate through that name alone, so a gate renamed
+    away from its target, or a target with none, is one a change to it would
+    never run.
+    """
+    routed = {
+        (_routing_path(arch).parent.name, f"Test{name}")
+        for arch in _ARCHS
+        for _, name in _routed_targets(arch)
+    }
+    gates = set()
+    for path in (_TESTS_ROOT / "integration/defs/accuracy/modeling_v2").glob("test_*.py"):
+        family = path.stem.removeprefix("test_")
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, ast.ClassDef) and node.name.startswith("TestModelingV2"):
+                gates.add((family, node.name))
+    assert routed == gates, (
+        f"targets with no gate of their name: {sorted(routed - gates)}; "
+        f"gates naming no routed target: {sorted(gates - routed)}"
+    )
+
+
+def test_every_unit_test_is_in_a_test_list():
+    """The modeling_v2 unit tests are listed per file or per family directory.
+
+    Lists that name files do not pick up a new file by themselves, and a test
+    no list reaches never runs in CI.
+    """
+    listed = set()
+    for path in (_TESTS_ROOT / "integration/test_lists/test-db").glob("l0_*.yml"):
+        for blocks in (yaml.safe_load(path.read_text()) or {}).values():
+            for block in blocks if isinstance(blocks, list) else ():
+                for entry in block.get("tests") or ():
+                    listed.add(entry.split()[0].split("::")[0])
+
+    unit_root = Path(__file__).resolve().parent
+    unlisted = []
+    for test in sorted(unit_root.rglob("test_*.py")):
+        rel = test.relative_to(_TESTS_ROOT / "unittest")
+        candidates = {f"unittest/{p.as_posix()}" for p in (rel, *rel.parents)}
+        if not candidates & listed:
+            unlisted.append(rel.as_posix())
+    assert not unlisted, f"unit tests no test-db list reaches: {unlisted}"
 
 
 # The phase a step runs at is resolved once, at the dispatcher, and a target is

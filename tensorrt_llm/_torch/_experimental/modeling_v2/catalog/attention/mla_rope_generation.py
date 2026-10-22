@@ -87,28 +87,6 @@ class MlaRopeGeneration(OpWrapper):
                 **_R1,
             ),
         ),
-        Cell(
-            why="deepseek default at attention TP8: 16 heads per rank, production decode",
-            spec=dict(
-                predicted_tokens_per_seq=1,
-                tokens_per_block=32,
-                q_scaling=Q_SCALING_R1,
-                write_scale=None,
-                read_scale=None,
-                **dict(_R1, num_heads=16),
-            ),
-        ),
-        Cell(
-            why="deepseek default MTP3 at attention TP8: P=4 (draft length 3 + 1) at 16 heads",
-            spec=dict(
-                predicted_tokens_per_seq=4,
-                tokens_per_block=32,
-                q_scaling=Q_SCALING_R1,
-                write_scale=None,
-                read_scale=None,
-                **dict(_R1, num_heads=16),
-            ),
-        ),
     )
 
     note = """
