@@ -35,7 +35,6 @@ import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    STATE_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -315,8 +314,7 @@ _SIDE_ROLE = "ple_ngram_context"
 def _sectioned(section_bytes) -> tuple:
     """A convolution-state role: each section sharded on its own over the state grid."""
     return tuple(
-        BufferDecl(nbytes=s, domain=STATE_TP, axes=(("byte", s),), split_axis="byte")
-        for s in section_bytes
+        BufferDecl(nbytes=s, axes=(("byte", s),), split_axis="byte") for s in section_bytes
     )
 
 
@@ -325,7 +323,6 @@ def _by_head(nbytes: int, bytes_per_head: int) -> tuple:
     return (
         BufferDecl(
             nbytes=nbytes,
-            domain=STATE_TP,
             axes=(("head", nbytes // bytes_per_head),),
             split_axis="head",
         ),
@@ -334,7 +331,7 @@ def _by_head(nbytes: int, bytes_per_head: int) -> tuple:
 
 def _replicated(nbytes: int) -> tuple:
     """A side-state role every rank of the state grid holds whole."""
-    return (BufferDecl(nbytes=nbytes, domain=STATE_TP),)
+    return (BufferDecl(nbytes=nbytes),)
 
 
 def _state_page_table(

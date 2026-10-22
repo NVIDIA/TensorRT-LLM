@@ -32,7 +32,6 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -56,15 +55,15 @@ BUF = 128
 
 
 def _hnd(heads=2):
-    return (BufferDecl(BUF, ATTENTION_TP, (("head", heads),), "head"),)
+    return (BufferDecl(BUF, (("head", heads),), "head"),)
 
 
 def _nhd(heads=2):
-    return (BufferDecl(BUF, ATTENTION_TP, (("token", 16), ("head", heads)), "head"),)
+    return (BufferDecl(BUF, (("token", 16), ("head", heads)), "head"),)
 
 
 def _replicated():
-    return (BufferDecl(BUF, ATTENTION_TP),)
+    return (BufferDecl(BUF),)
 
 
 def _regions(pool, layer_roles, buffers=None):
@@ -96,7 +95,7 @@ def _layer_group(regions):
         spec="attention",
         kind=CacheKind.PAGED,
         regions=regions,
-        params={"tokens_per_block": 16, "window": None},
+        params={"window": None},
     )
 
 
@@ -332,7 +331,7 @@ def test_regions_spanning_multiple_peer_layer_groups_form_one_transfer_group_eac
 
 def test_buffer_count_mismatch_raises():
     """Matched regions must declare the same number of buffers on both sides."""
-    sections = (BufferDecl(64, ATTENTION_TP), BufferDecl(64, ATTENTION_TP))
+    sections = (BufferDecl(64), BufferDecl(64))
     self_pt = _page_table([_layer_group(_regions(0, [(0, "key")], _replicated()))])
     peer_pt = _page_table([_layer_group(_regions(0, [(0, "key")], sections))])
 

@@ -29,7 +29,7 @@ import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_specs import ATTENTION_TP, STATE_TP, BufferDecl
+from tensorrt_llm._torch.disaggregation.cache_specs import BufferDecl
 from tensorrt_llm._torch.disaggregation.cache_specs.registry import register, unregister
 from tensorrt_llm._torch.disaggregation.cache_specs.specs import _paged, _state
 from tensorrt_llm._torch.disaggregation.cache_specs.specs._base import StandardSpec
@@ -103,11 +103,11 @@ def make_layout(
 
 
 def _head_split(nbytes, heads):
-    return (BufferDecl(nbytes, ATTENTION_TP, (("head", heads),), "head"),)
+    return (BufferDecl(nbytes, (("head", heads),), "head"),)
 
 
 def _sections(*sizes):
-    return tuple(BufferDecl(n, STATE_TP, (("byte", n),), "byte") for n in sizes)
+    return tuple(BufferDecl(n, (("byte", n),), "byte") for n in sizes)
 
 
 def _replace_buffers(layout, **change):
@@ -159,7 +159,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         lambda: make_layout(tokens_per_block=64),
         lambda: make_layout(layers=((0, 1), (2,))),
         lambda: make_layout(slot_bytes=(104, 40)),
-        lambda: _replace_buffers(make_layout(), decls=(BufferDecl(20, ATTENTION_TP),)),
+        lambda: _replace_buffers(make_layout(), decls=(BufferDecl(20),)),
         lambda: _replace_buffers(make_layout(), decls=_head_split(20, 2)),
         lambda: _replace_buffers(make_layout(), decls=_sections(15, 5)),
         lambda: _replace_buffers(make_layout(), transfer=False),
@@ -213,9 +213,9 @@ def test_layout_id_is_the_hash_of_the_documented_version_2_encoding():
         '{"layer":0,"offset":100,"role":"scale","size":20},'
         '{"layer":1,"offset":0,"role":"key","size":64}],'
         '"groups":[{"layers":[0],"slot_bytes":[100,40]},{"layers":[1],"slot_bytes":[64]}],'
-        '"tokens_per_block":32,"v":3}'
+        '"tokens_per_block":32,"v":4}'
     ).encode()
-    assert LAYOUT_ID_VERSION == 3
+    assert LAYOUT_ID_VERSION == 4
     assert canonical_bytes(layout_document(layout)) == expected
     assert layout_id(layout) == hashlib.sha256(expected).digest()
 
@@ -234,8 +234,8 @@ def test_named_keys_at_their_defaults_are_left_out_and_others_are_written():
         )
     )["buffers"][1]
     assert changed["decls"] == [
-        {"nbytes": 15, "domain": STATE_TP, "axes": [["byte", 15]], "split_axis": "byte"},
-        {"nbytes": 5, "domain": STATE_TP, "axes": [["byte", 5]], "split_axis": "byte"},
+        {"nbytes": 15, "axes": [["byte", 15]], "split_axis": "byte"},
+        {"nbytes": 5, "axes": [["byte", 5]], "split_axis": "byte"},
     ]
     assert changed["transfer"] is False
     assert changed["expansion"] == 4
@@ -282,7 +282,7 @@ def test_declarations_that_do_not_tile_their_buffer_are_refused():
         BufferDesc(0, "conv", (0, 0), 0, 30, decls=_sections(10, 10))
     with pytest.raises(ValueError, match="do not tile"):
         BufferDesc(0, "k", (0, 0), 0, 30, decls=_head_split(32, 2))
-    assert BufferDesc(0, "k", (0, 0), 0, 32, decls=(BufferDecl(32, ATTENTION_TP),)).replicated
+    assert BufferDesc(0, "k", (0, 0), 0, 32, decls=(BufferDecl(32),)).replicated
     assert not BufferDesc(0, "k", (0, 0), 0, 32, decls=_head_split(32, 2)).replicated
 
 
@@ -646,7 +646,7 @@ def test_recurrent_state_is_described_and_sharded_by_rank():
     assert geometry.recurrent == (True,) and geometry.windows == (None,)
     by_role = {b.role: b for b in layout.buffers}
     assert by_role["conv_state"].decls == _sections(32, 32, 32)
-    assert by_role["ssm_state"].decls == (BufferDecl(128, STATE_TP, (("head", 4),), "head"),)
+    assert by_role["ssm_state"].decls == (BufferDecl(128, (("head", 4),), "head"),)
 
 
 @pytest.mark.cpu_only
@@ -811,11 +811,11 @@ def test_a_manager_whose_parts_disagree_is_refused():
                 num_kv_heads=8,
                 mappers={"index_key": "REPLICATED"},
             ),
-            "3871d57fb7bb3e034ed49a91ed46d7bf2c04e279ee06cfc828537a2ba356ee06",
+            "c24dacd9dc34da6e339431350cc73d1286175db2c9d7eb377b543b22dd65e32d",
         ),
         (
             recurrent_state,
-            "2cfb5c839bd38333516b320fff384111b25d58f4a51dc78da34883b94ad2675d",
+            "4ef0664a858b0fdb56431042e7adbc4e3226d8fd391361268d5c11963e8ca5e8",
         ),
     ],
     ids=["head_sharded_with_expanded_replicated_role", "recurrent_state"],

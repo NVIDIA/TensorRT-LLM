@@ -134,17 +134,17 @@ def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
     return TokenRange(start=start_block * _PROJECTION_TPB, end=end_block * _PROJECTION_TPB)
 
 
-def _attention_page_table(tokens_per_block: int, *windows) -> PageTable:
+def _attention_page_table(*windows) -> PageTable:
     """A page table of paged attention layer groups, one per window (``None``: full attention).
 
-    Selection reads only a layer group's spec, unit and params, so the layer groups carry no regions.
+    Selection reads only a layer group's spec, kind and params, so the layer groups carry no regions.
     """
     return PageTable(
         layer_groups=[
             LayerGroup(
                 spec="attention",
                 kind=CacheKind.PAGED,
-                params={"tokens_per_block": tokens_per_block, "window": window},
+                params={"window": window},
             )
             for window in windows
         ]
@@ -169,7 +169,7 @@ def _make_projection_sender() -> Sender:
 
     extractor = MagicMock()
     extractor.page_table = _attention_page_table(
-        _PROJECTION_TPB, _PROJECTION_PROMPT_TOKENS, _PROJECTION_PROMPT_TOKENS
+        _PROJECTION_PROMPT_TOKENS, _PROJECTION_PROMPT_TOKENS
     )
     # extract(region_ids, pool_idx) - the caller passes the pool index
     # positionally, so swallow it.
@@ -197,7 +197,9 @@ def _make_projection_sender() -> Sender:
     ]
 
     registrar = MagicMock()
-    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0)
+    registrar.self_rank_info = SimpleNamespace(
+        cp_size=1, cp_rank=0, attention=SimpleNamespace(tokens_per_block=_PROJECTION_TPB)
+    )
     registrar.self_extractor = extractor
     registrar.get_peer_rank_info.return_value = peer_ri
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
@@ -321,7 +323,9 @@ def _projection_task_for(start_block: int, end_block: int) -> KVSendTask:
 def test_context_parallelism_is_refused_only_for_a_piece_short_of_the_prompt():
     """The guard only fires for a piece short of the whole prompt; a sole whole-prompt piece passes."""
     sender = _make_projection_sender()
-    sender._registrar.self_rank_info = SimpleNamespace(cp_size=2, cp_rank=0)
+    sender._registrar.self_rank_info = SimpleNamespace(
+        cp_size=2, cp_rank=0, attention=SimpleNamespace(tokens_per_block=_PROJECTION_TPB)
+    )
 
     sender._build_kv_write_meta(_projection_task_for(0, 8), _make_projection_req_info())
     with pytest.raises(ValueError, match="context parallelism"):
@@ -570,7 +574,7 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
             LayerGroup(
                 spec="mamba",
                 kind=CacheKind.PAGED,
-                params={"tokens_per_block": 32, "window": None},
+                params={"window": None},
             ),
             LayerGroup(spec="mamba", kind=CacheKind.STATE),
         ]
@@ -978,7 +982,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         get_block_ids=_unexpected_get_block_ids,
         get_block_ordinals=lambda _req, _idx: source_block_ids,
     )
-    transceiver._page_table = _attention_page_table(tokens_per_block, None)
+    transceiver._page_table = _attention_page_table(None)
     transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
     transceiver._dp_rank = 0
     transceiver._context_info_endpoint = "ctx"
@@ -1072,7 +1076,7 @@ def _build_prefill_chunk_tokens_for(
     transceiver = MagicMock()
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
     transceiver._describe_local = MagicMock(return_value=whole)
-    transceiver._page_table = _attention_page_table(_REUSE_TPB, sliding_window_size)
+    transceiver._page_table = _attention_page_table(sliding_window_size)
     transceiver._send_reqs = {}
 
     req = MagicMock()

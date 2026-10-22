@@ -14,16 +14,18 @@
 # limitations under the License.
 """Rank topology: which ranks talk to each other and how a shard domain splits a buffer.
 
-A cache spec never reads ``tp_size`` / ``cp_rank`` itself. It names the *shard domain* its buffers
-are split over (``ATTENTION_TP`` or ``STATE_TP``), and this module turns a ``RankInfo`` into the
-domain's :class:`ShardGrid`. Everything else -- which bytes a rank holds, which rank sends them --
-follows from the grid in ``correspondence``.
+A cache spec never reads ``tp_size`` / ``cp_rank`` itself. A layer group's kind names the *shard
+domain* its buffers are split over (:func:`domain_of`: ``ATTENTION_TP`` or ``STATE_TP``), and this
+module turns a ``RankInfo`` into the domain's :class:`ShardGrid`. Everything else -- which bytes a
+rank holds, which rank sends them -- follows from the grid in ``correspondence``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, List, Tuple
+
+from tensorrt_llm._torch.disaggregation.base import CacheKind
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -69,6 +71,11 @@ _GRIDS: Dict[str, Callable[["RankInfo"], ShardGrid]] = {
     ATTENTION_TP: attention_grid,
     STATE_TP: state_grid,
 }
+
+
+def domain_of(kind: CacheKind) -> str:
+    """The shard domain the buffers of a ``kind`` layer group are split over."""
+    return ATTENTION_TP if kind == CacheKind.PAGED else STATE_TP
 
 
 def shard_grid(domain: str, ri: "RankInfo") -> ShardGrid:

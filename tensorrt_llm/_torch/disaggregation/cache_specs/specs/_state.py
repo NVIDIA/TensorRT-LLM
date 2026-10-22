@@ -43,7 +43,7 @@ def sectioned(section_bytes, nbytes: int, context: str) -> Tuple[BufferDecl, ...
             f"{nbytes} bytes"
         )
     return tuple(
-        BufferDecl(nbytes=int(s), domain=STATE_TP, axes=(("byte", int(s)),), split_axis="byte")
+        BufferDecl(nbytes=int(s), axes=(("byte", int(s)),), split_axis="byte")
         for s in section_bytes
     )
 
@@ -55,14 +55,14 @@ def by_head(nbytes: int, bytes_per_head: int, context: str) -> Tuple[BufferDecl,
             f"{context}: {nbytes} bytes are not a multiple of bytes_per_head={bytes_per_head}"
         )
     heads = nbytes // bytes_per_head
-    return (BufferDecl(nbytes=nbytes, domain=STATE_TP, axes=(("head", heads),), split_axis="head"),)
+    return (BufferDecl(nbytes=nbytes, axes=(("head", heads),), split_axis="head"),)
 
 
 def whole(nbytes: int) -> Tuple[BufferDecl, ...]:
     """State every rank of the state grid holds in full: replicated side state, or a sharded role
     with no declared geometry, which a TP mismatch turns into a size mismatch instead of misplaced
     bytes."""
-    return (BufferDecl(nbytes=nbytes, domain=STATE_TP),)
+    return (BufferDecl(nbytes=nbytes),)
 
 
 def units(slot: Optional[int]) -> np.ndarray:
@@ -142,8 +142,8 @@ def validate_peer(spec_name: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]
                         f"(local={a.nbytes}, peer={b.nbytes})"
                     )
                 continue
-            grid = shard_grid(a.domain, self_ri).size
-            peer_grid = shard_grid(b.domain, peer_ri).size
+            grid = shard_grid(STATE_TP, self_ri).size
+            peer_grid = shard_grid(STATE_TP, peer_ri).size
             if a.nbytes * grid != b.nbytes * peer_grid:
                 raise ValueError(
                     f"{spec_name}: global (TP-aggregated) size of {role} buffer {i} differs: local "

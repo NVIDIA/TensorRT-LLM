@@ -42,7 +42,7 @@ def _layer_group(window=None, tokens_per_block=8, spec="attention"):
     return LayerGroup(
         spec=spec,
         kind=CacheKind.PAGED,
-        params={"tokens_per_block": tokens_per_block, "window": window},
+        params={"window": window},
     )
 
 

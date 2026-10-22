@@ -145,11 +145,10 @@ def lies(geometry):
         )
 
     # The first buffer split differently: replicated if it is sharded, sharded if replicated.
-    domain = first.decls[0].domain
     other = (
-        (BufferDecl(first.size, domain, (("byte", first.size),), "byte"),)
+        (BufferDecl(first.size, (("byte", first.size),), "byte"),)
         if first.replicated
-        else (BufferDecl(first.size, domain),)
+        else (BufferDecl(first.size),)
     )
     out = {
         "offset": {"buffers": buffers(offset=first.offset + first.size)},
@@ -180,7 +179,6 @@ def test_layout_matches_the_page_table_native_builds(real_manager, hybrid_manage
         layout = geometry.layout
         paged = [s for s in page_table.layer_groups if s.kind == CacheKind.PAGED]
         assert paged
-        assert all(s.params["tokens_per_block"] == layout.tokens_per_block for s in paged)
         assert len(derived) == len(native), derived[len(native) :]
         assert all(group["rows"] for group in native)
         for lg, (ours, theirs) in enumerate(zip(derived, native)):

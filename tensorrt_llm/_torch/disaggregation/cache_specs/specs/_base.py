@@ -97,7 +97,7 @@ class StandardSpec(CacheSpec):
             )
         regions.sort(key=lambda r: (r.pool, r.offset))
         if kind == CacheKind.PAGED:
-            params = _paged.params(tokens_per_block, self.window_size(manager, cycle))
+            params = _paged.params(self.window_size(manager, cycle))
         else:
             params = {}
         return LayerGroup(spec=self.name, kind=kind, regions=regions, params=params)

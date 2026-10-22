@@ -45,7 +45,7 @@ from tensorrt_llm._utils import nvtx_range
 from .page_table import BufferDecl, PageTable, Region, RegionKey
 from .registry import specs_in
 from .spec import MatchedPair
-from .topology import elects_sender, replication_factor, shard_grid, shard_span
+from .topology import domain_of, elects_sender, replication_factor, shard_grid, shard_span
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -139,8 +139,6 @@ def matched_pairs(
 
 
 def _check_same_layout(src: BufferDecl, dst: BufferDecl, context: str) -> None:
-    if src.domain != dst.domain:
-        raise ValueError(f"{context}: shard domain differs ({src.domain} vs {dst.domain})")
     if src.split_axis != dst.split_axis or src.axis_names != dst.axis_names:
         raise ValueError(
             f"{context}: layout differs (local axes={src.axis_names} split={src.split_axis!r}, "
@@ -151,14 +149,15 @@ def _check_same_layout(src: BufferDecl, dst: BufferDecl, context: str) -> None:
 def _buffer_runs(
     src: BufferDecl,
     dst: BufferDecl,
+    domain: str,
     self_ri: "RankInfo",
     peer_ri: "RankInfo",
     context: str,
 ) -> List[Run]:
     """Runs of one buffer pair, relative to each buffer's start; empty when not paired."""
     _check_same_layout(src, dst, context)
-    src_grid = shard_grid(src.domain, self_ri)
-    dst_grid = shard_grid(dst.domain, peer_ri)
+    src_grid = shard_grid(domain, self_ri)
+    dst_grid = shard_grid(domain, peer_ri)
     virtual = min(src.units * src_grid.size, dst.units * dst_grid.size)
     src_lo, src_hi = shard_span(src.units, src_grid, virtual)
     dst_lo, dst_hi = shard_span(dst.units, dst_grid, virtual)
@@ -199,9 +198,10 @@ def _buffer_runs(
 
 
 def region_runs(
-    src: Region, dst: Region, self_ri: "RankInfo", peer_ri: "RankInfo", context: str
+    src: Region, dst: Region, domain: str, self_ri: "RankInfo", peer_ri: "RankInfo", context: str
 ) -> List[Run]:
-    """Slot-relative runs of one matched region pair; empty when the two ranks are not paired."""
+    """Slot-relative runs of one matched region pair, whose buffers are split over ``domain``;
+    empty when the two ranks are not paired."""
     if len(src.buffers) != len(dst.buffers):
         raise ValueError(
             f"{context}: buffer count mismatch: local={len(src.buffers)}, peer={len(dst.buffers)}"
@@ -209,7 +209,9 @@ def region_runs(
     runs: List[Run] = []
     src_off, dst_off = src.offset, dst.offset
     for i, (s_buf, d_buf) in enumerate(zip(src.buffers, dst.buffers)):
-        for s, d, n in _buffer_runs(s_buf, d_buf, self_ri, peer_ri, f"{context} buffer {i}"):
+        for s, d, n in _buffer_runs(
+            s_buf, d_buf, domain, self_ri, peer_ri, f"{context} buffer {i}"
+        ):
             runs.append((src_off + s, dst_off + d, n))
         src_off += s_buf.nbytes
         dst_off += d_buf.nbytes
@@ -229,15 +231,14 @@ def _merge(runs: List[Run]) -> List[Run]:
     return merged
 
 
-def _election(src: Region, dst: Region, self_ri: "RankInfo", peer_ri: "RankInfo"):
+def _election(src: Region, dst: Region, domain: str, self_ri: "RankInfo", peer_ri: "RankInfo"):
     first, peer_first = src.buffers[0], dst.buffers[0]
-    factor = replication_factor(
+    return replication_factor(
         first.units,
-        shard_grid(first.domain, self_ri),
+        shard_grid(domain, self_ri),
         peer_first.units,
-        shard_grid(peer_first.domain, peer_ri),
+        shard_grid(domain, peer_ri),
     )
-    return first.domain, factor
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +338,11 @@ def plan_transfers(
         )
         src, dst = layer_group.regions[ri], peer_layer_group.regions[pri]
         context = f"{layer_group.spec} region (layer={src.layer}, role={src.role!r})"
-        runs = region_runs(src, dst, self_ri, peer_ri, context)
+        domain = domain_of(layer_group.kind)
+        runs = region_runs(src, dst, domain, self_ri, peer_ri, context)
         if not runs:
             continue
-        domain, factor = _election(src, dst, self_ri, peer_ri)
+        factor = _election(src, dst, domain, self_ri, peer_ri)
         buckets[(gi, pgi, src.pool, dst.pool, domain, factor)].append((src.offset, ri, runs))
 
     groups = []

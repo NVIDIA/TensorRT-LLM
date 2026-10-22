@@ -23,7 +23,6 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -105,7 +104,7 @@ def test_spec_region_and_spec_region_pair():
 def _kv_table(layer_offsets, bytes_per_layer, kv_heads):
     """One attention layer group whose global layer ``i`` sits at ``layer_offsets[i]`` (K then V)."""
     half = bytes_per_layer // 2
-    buffers = (BufferDecl(half, ATTENTION_TP, (("head", kv_heads),), "head"),)
+    buffers = (BufferDecl(half, (("head", kv_heads),), "head"),)
     regions = []
     for gid, offset in enumerate(layer_offsets):
         if offset is None:
@@ -121,7 +120,7 @@ def _kv_table(layer_offsets, bytes_per_layer, kv_heads):
                 spec="attention",
                 kind=CacheKind.PAGED,
                 regions=regions,
-                params={"tokens_per_block": 4, "window": None},
+                params={"window": None},
             )
         ],
     )

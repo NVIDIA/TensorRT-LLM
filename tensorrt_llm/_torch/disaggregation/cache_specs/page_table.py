@@ -24,6 +24,9 @@ The page table has four parts, none of them specific to a cache spec:
   the key both sides match on) and where it is (pool + offset).
 * :class:`BufferDecl` -- how a region's bytes are laid out and split across ranks.
 
+A buffer is split over the shard grid of its layer group's kind (``topology.domain_of``): attention
+TP for PAGED groups, the recurrent-state grid for STATE groups.
+
 The mapping algorithm reads only regions and their declarations, so a new cache spec adds rows to
 this table without changing its shape. It is exchanged between peers as is (``to_dict``).
 """
@@ -43,8 +46,8 @@ class BufferDecl:
 
     ``axes`` lists the buffer's dimensions outer to inner as ``(name, extent)``; dimensions inside
     ``split_axis`` may be left out, they only make up the bytes of one unit. ``split_axis`` is the
-    dimension the buffer is sharded along over ``domain``'s grid, or ``None`` when every rank of the
-    grid holds the same bytes. A region is its buffers back to back.
+    dimension the buffer is sharded along over its layer group's shard grid, or ``None`` when every
+    rank of the grid holds the same bytes. A region is its buffers back to back.
 
     Examples (``kv`` heads on this rank, ``tpb`` tokens per block)::
 
@@ -55,7 +58,6 @@ class BufferDecl:
     """
 
     nbytes: int
-    domain: str
     axes: Tuple[Tuple[str, int], ...] = ()
     split_axis: Optional[str] = None
 
@@ -105,7 +107,6 @@ class BufferDecl:
     def to_dict(self) -> dict:
         return {
             "nbytes": int(self.nbytes),
-            "domain": self.domain,
             "axes": [[name, int(extent)] for name, extent in self.axes],
             "split_axis": self.split_axis,
         }
@@ -114,7 +115,6 @@ class BufferDecl:
     def from_dict(data: dict) -> "BufferDecl":
         return BufferDecl(
             nbytes=int(data["nbytes"]),
-            domain=str(data["domain"]),
             axes=tuple((str(name), int(extent)) for name, extent in data.get("axes") or ()),
             split_axis=data.get("split_axis"),
         )
@@ -126,25 +126,20 @@ class Pool:
 
     ``slot_bytes`` is the payload of one slot and ``num_slots`` the number of slots. A unit's slot
     starts at ``base_address + unit * slot_stride_bytes``; region offsets are relative to it, and the
-    allocation spans ``num_slots * slot_stride_bytes`` bytes. The strides default to dense storage
-    (``slot_stride_bytes == slot_bytes``, ``layer_stride_bytes == num_slots * slot_stride_bytes``).
+    allocation spans ``num_slots * slot_stride_bytes`` bytes. The stride defaults to dense storage
+    (``slot_stride_bytes == slot_bytes``).
     """
 
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
     slot_stride_bytes: Optional[int] = None
-    layer_stride_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.slot_stride_bytes is None:
             self.slot_stride_bytes = self.slot_bytes
-        if self.layer_stride_bytes is None:
-            self.layer_stride_bytes = self.num_slots * self.slot_stride_bytes
         if self.slot_stride_bytes < self.slot_bytes:
             raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
-        if self.layer_stride_bytes < self.slot_bytes:
-            raise ValueError("layer_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
         return {
@@ -152,7 +147,6 @@ class Pool:
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
-            "layer_stride_bytes": int(self.layer_stride_bytes),
         }
 
     @staticmethod
@@ -162,7 +156,6 @@ class Pool:
             slot_bytes=int(data["slot_bytes"]),
             num_slots=int(data["num_slots"]),
             slot_stride_bytes=data.get("slot_stride_bytes"),
-            layer_stride_bytes=data.get("layer_stride_bytes"),
         )
 
 
@@ -176,7 +169,8 @@ class Region:
 
     ``layer`` is a global layer id: unique per (layer, role) within a spec and equal on every PP
     split, so the two sides match regions by ``(spec, layer, role)``. ``local_layer`` is the
-    manager's own id of the layer, kept for the plugin that described the region.
+    manager's own id of the layer; it stays on this rank (``-1`` on a peer's page table) and is
+    not part of what a region is.
     """
 
     pool: int
@@ -184,7 +178,7 @@ class Region:
     role: str
     offset: int
     buffers: Tuple[BufferDecl, ...]
-    local_layer: int = -1
+    local_layer: int = field(default=-1, compare=False)
 
     def __post_init__(self) -> None:
         if not self.buffers:
@@ -202,7 +196,7 @@ class Region:
 
     @property
     def replicated(self) -> bool:
-        """Every rank of the domain holds the same bytes, so one elected rank sends them."""
+        """Every rank of the shard grid holds the same bytes, so one elected rank sends them."""
         return all(b.split_axis is None for b in self.buffers)
 
 
@@ -212,8 +206,8 @@ class LayerGroup:
 
     ``kind`` says how the ids are read: PAGED ids are blocks by ordinal (entry ``i`` covers tokens
     ``[i * tokens_per_block, ...)``), STATE ids are one slot per request. ``spec`` names the plugin
-    whose rules select a request's units; ``params`` holds what those rules need (window size,
-    tokens per block, ...) and must be msgpack-able.
+    whose rules select a request's units; ``params`` holds what those rules need (the attention
+    window, ...) and must be msgpack-able.
     """
 
     spec: str
@@ -234,9 +228,7 @@ class LayerGroup:
         rows = []
         for r in self.regions:
             index = layouts.setdefault(r.buffers, len(layouts))
-            rows.append(
-                [int(r.pool), int(r.layer), str(r.role), int(r.offset), index, r.local_layer]
-            )
+            rows.append([int(r.pool), int(r.layer), str(r.role), int(r.offset), index])
         return {
             "spec": self.spec,
             "kind": int(self.kind),
@@ -262,9 +254,8 @@ class LayerGroup:
                     role=str(role),
                     offset=int(offset),
                     buffers=layouts[int(index)],
-                    local_layer=int(local_layer),
                 )
-                for pool, layer, role, offset, index, local_layer in data.get("regions", [])
+                for pool, layer, role, offset, index in data.get("regions", [])
             ],
         )
 

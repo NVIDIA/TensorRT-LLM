@@ -17,8 +17,6 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
-    STATE_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -30,7 +28,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _hnd(nbytes=128, heads=8):
-    return BufferDecl(nbytes, ATTENTION_TP, (("head", heads),), "head")
+    return BufferDecl(nbytes, (("head", heads),), "head")
 
 
 def _kv_regions(layer, offset, local_layer=0, pool=0, nbytes=128):
@@ -46,7 +44,7 @@ def _attention_layer_group(regions, window=None, tokens_per_block=64):
         spec="attention",
         kind=CacheKind.PAGED,
         regions=regions,
-        params={"tokens_per_block": tokens_per_block, "window": window},
+        params={"window": window},
     )
 
 
@@ -56,7 +54,6 @@ def test_physical_pool_construction():
     assert pool.slot_bytes == 256
     assert pool.num_slots == 4
     assert pool.slot_stride_bytes == 256
-    assert pool.layer_stride_bytes == 1024
 
 
 def test_physical_pool_roundtrip():
@@ -65,7 +62,6 @@ def test_physical_pool_roundtrip():
         slot_bytes=256,
         num_slots=4,
         slot_stride_bytes=2048,
-        layer_stride_bytes=512,
     )
     d = pool.to_dict()
     restored = Pool.from_dict(d)
@@ -73,23 +69,23 @@ def test_physical_pool_roundtrip():
     assert restored.slot_bytes == pool.slot_bytes
     assert restored.num_slots == pool.num_slots
     assert restored.slot_stride_bytes == pool.slot_stride_bytes
-    assert restored.layer_stride_bytes == pool.layer_stride_bytes
 
 
-def test_physical_pool_rejects_strides_smaller_than_slot():
+def test_physical_pool_rejects_stride_smaller_than_slot():
     with pytest.raises(ValueError, match="slot_stride_bytes"):
         Pool(base_address=0, slot_bytes=256, num_slots=4, slot_stride_bytes=128)
-    with pytest.raises(ValueError, match="layer_stride_bytes"):
-        Pool(base_address=0, slot_bytes=256, num_slots=4, layer_stride_bytes=128)
 
 
 def test_region_roundtrip():
-    """Each (layer, role) buffer is one region; its pool, offset and ids survive the wire."""
+    """Each (layer, role) buffer is one region; its pool, offset and global layer id survive.
+
+    The manager's own layer id stays on this rank.
+    """
     layer_group = _attention_layer_group(_kv_regions(layer=5, offset=0, local_layer=0))
     restored = LayerGroup.from_dict(layer_group.to_dict())
     assert restored.regions == layer_group.regions
     key, value = restored.regions
-    assert (key.pool, key.layer, key.role, key.offset, key.local_layer) == (0, 5, "key", 0, 0)
+    assert (key.pool, key.layer, key.role, key.offset, key.local_layer) == (0, 5, "key", 0, -1)
     assert (value.pool, value.layer, value.role, value.offset) == (0, 5, "value", 128)
     assert key.key == (5, "key")
     assert key.nbytes == value.nbytes == 128
@@ -98,10 +94,8 @@ def test_region_roundtrip():
 @pytest.mark.parametrize(
     "buffers",
     [
-        pytest.param((BufferDecl(128, ATTENTION_TP),), id="replicated"),
-        pytest.param(
-            (BufferDecl(128, ATTENTION_TP, (("token", 4), ("head", 8)), "head"),), id="nhd"
-        ),
+        pytest.param((BufferDecl(128),), id="replicated"),
+        pytest.param((BufferDecl(128, (("token", 4), ("head", 8)), "head"),), id="nhd"),
         pytest.param((_hnd(),), id="hnd"),
     ],
 )
@@ -122,16 +116,14 @@ def test_layer_group_roundtrip():
     restored = LayerGroup.from_dict(layer_group.to_dict())
     assert restored.spec == "attention"
     assert restored.kind == CacheKind.PAGED
-    assert restored.params == {"tokens_per_block": 64, "window": 512}
+    assert restored.params == {"window": 512}
     assert restored.layers == [5, 6]
     assert restored.pools == [0]
     assert len(restored.regions) == 4
 
 
 def test_layer_group_sends_each_distinct_layout_once():
-    regions = _kv_regions(layer=0, offset=0) + [
-        Region(0, 0, "index_key", 256, (BufferDecl(64, ATTENTION_TP),))
-    ]
+    regions = _kv_regions(layer=0, offset=0) + [Region(0, 0, "index_key", 256, (BufferDecl(64),))]
     d = _attention_layer_group(regions).to_dict()
     # K and V share one declaration; the replicated index key has its own.
     assert len(d["layouts"]) == 2
@@ -148,7 +140,7 @@ def test_kv_cache_page_table_roundtrip():
     assert len(restored.layer_groups) == 1
     assert len(restored.pools) == 1
     assert restored.pools[0].base_address == 0x10000
-    assert restored.layer_groups[0].params["tokens_per_block"] == 64
+    assert restored.layer_groups[0].params == {"window": None}
     assert restored.pool_of(restored.layer_groups[0].regions[0]) is restored.pools[0]
 
 
@@ -158,7 +150,7 @@ def test_kv_cache_page_table_roundtrip():
 
 
 def test_region_nbytes_sums_buffers():
-    sections = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in (512, 256, 256))
+    sections = tuple(BufferDecl(s, (("byte", s),), "byte") for s in (512, 256, 256))
     region = Region(0, 3, "conv_state", 0, sections)
     assert region.nbytes == 1024
     assert not region.replicated
@@ -166,30 +158,30 @@ def test_region_nbytes_sums_buffers():
 
 def test_buffer_decl_rows_and_units():
     # NHD: the head axis repeats once per token.
-    nhd = BufferDecl(256, ATTENTION_TP, (("token", 4), ("head", 8)), "head")
+    nhd = BufferDecl(256, (("token", 4), ("head", 8)), "head")
     assert (nhd.rows, nhd.units, nhd.unit_bytes("nhd")) == (4, 8, 8)
     # HND: one contiguous head-major slice.
     hnd = _hnd(nbytes=256, heads=8)
     assert (hnd.rows, hnd.units, hnd.unit_bytes("hnd")) == (1, 8, 32)
     # Replicated: a single unit.
-    replicated = BufferDecl(256, ATTENTION_TP)
+    replicated = BufferDecl(256)
     assert (replicated.rows, replicated.units) == (1, 1)
 
 
 def test_buffer_decl_unit_not_byte_aligned_raises():
-    decl = BufferDecl(100, ATTENTION_TP, (("head", 8),), "head")
+    decl = BufferDecl(100, (("head", 8),), "head")
     with pytest.raises(ValueError, match="not evenly divisible"):
         decl.unit_bytes("odd")
 
 
 def test_buffer_decl_split_axis_must_be_an_axis():
     with pytest.raises(ValueError, match="split axis 'head' is not one of the axes"):
-        BufferDecl(128, ATTENTION_TP, (("token", 4),), "head")
+        BufferDecl(128, (("token", 4),), "head")
 
 
 def test_buffer_decl_empty_raises():
     with pytest.raises(ValueError, match="at least one byte"):
-        BufferDecl(0, ATTENTION_TP)
+        BufferDecl(0)
 
 
 def test_region_negative_offset_raises():

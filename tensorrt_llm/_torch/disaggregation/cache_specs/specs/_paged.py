@@ -31,7 +31,6 @@ from tensorrt_llm import logger
 from ..correspondence import log_incompatible
 from ..page_table import BufferDecl, LayerGroup, PageTable
 from ..spec import ChunkContext, LocalUnitsContext, PairContext, RegistrationRegion
-from ..topology import ATTENTION_TP
 
 HEAD_MAJOR = "HND"
 """K/V stored ``[head, token, dim]`` per block: a head range is one contiguous slice per buffer."""
@@ -45,13 +44,13 @@ def kv_heads_per_rank(manager) -> int:
     return next((h for h in manager.num_kv_heads_per_layer if h > 0), 0)
 
 
-def params(tokens_per_block: int, window: Optional[int]) -> Dict:
-    return {"tokens_per_block": int(tokens_per_block), "window": window}
+def params(window: Optional[int]) -> Dict:
+    return {"window": window}
 
 
 def replicated(nbytes: int) -> BufferDecl:
     """A buffer every attention-TP rank holds identically (index-key caches, MLA side tails)."""
-    return BufferDecl(nbytes=nbytes, domain=ATTENTION_TP)
+    return BufferDecl(nbytes=nbytes)
 
 
 def kv(nbytes: int, heads: int, tokens_per_block: int, layout: str, context: str) -> BufferDecl:
@@ -64,7 +63,7 @@ def kv(nbytes: int, heads: int, tokens_per_block: int, layout: str, context: str
         axes = (("head", heads),)
     else:
         raise ValueError(f"{context}: unknown K/V layout {layout!r}")
-    return BufferDecl(nbytes=nbytes, domain=ATTENTION_TP, axes=axes, split_axis="head")
+    return BufferDecl(nbytes=nbytes, axes=axes, split_axis="head")
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +132,7 @@ def pair_units(
         # partition_context_for_helix), so its table is the strided subset of ours; block reuse is
         # rejected under helix.
         src_units = src_units[ctx.peer_ri.cp_rank :: ctx.peer_ri.cp_size]
-    tokens_per_block = ctx.layer_group.params["tokens_per_block"]
+    tokens_per_block = ctx.self_ri.attention.tokens_per_block
     dst_start_block = (
         ctx.dst_start_token // tokens_per_block if ctx.dst_start_token is not None else 0
     )

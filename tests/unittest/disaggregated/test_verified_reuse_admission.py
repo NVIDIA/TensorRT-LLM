@@ -39,7 +39,6 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -421,7 +420,7 @@ def _attention_layer_group(regions) -> LayerGroup:
         spec="attention",
         kind=CacheKind.PAGED,
         regions=sorted(regions, key=lambda r: (r.pool, r.offset)),
-        params={"tokens_per_block": _TOKENS_PER_BLOCK, "window": None},
+        params={"window": None},
     )
 
 
@@ -441,8 +440,8 @@ def _coalesced_page_table() -> PageTable:
     test_minimax_m3_pool_view_scheme_coalesced_vs_separate.
     """
     u = _UNIT
-    nhd = (BufferDecl(u, ATTENTION_TP, (("token", _TOKENS_PER_BLOCK), ("head", 1)), "head"),)
-    replicated = (BufferDecl(u, ATTENTION_TP),)
+    nhd = (BufferDecl(u, (("token", _TOKENS_PER_BLOCK), ("head", 1)), "head"),)
+    replicated = (BufferDecl(u),)
     offsets = {0: 0, 1: 2, 2: 5, 3: 7}  # in units: K at offset, V right after it
     regions = []
     for layer, off in offsets.items():
@@ -461,7 +460,7 @@ def _ignored_role_page_table() -> PageTable:
     but get no region, so no writer ever covers them.
     """
     u = _UNIT
-    hnd = (BufferDecl(u, ATTENTION_TP, (("head", 1),), "head"),)
+    hnd = (BufferDecl(u, (("head", 1),), "head"),)
     regions = [
         Region(pool=0, layer=0, role="key", offset=0, buffers=hnd),
         Region(pool=0, layer=1, role="key", offset=2 * u, buffers=hnd),

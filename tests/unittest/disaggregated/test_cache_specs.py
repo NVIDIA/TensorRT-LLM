@@ -45,8 +45,6 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExt
 
 pytestmark = pytest.mark.cpu_only
 
-A, S = cs.ATTENTION_TP, cs.STATE_TP
-
 
 # ---------------------------------------------------------------------------
 # Oracle: an independent model of sharding the transfer plan is checked against
@@ -76,12 +74,14 @@ def check_page_table_round_trip(page_table: PageTable) -> None:
     cs.specs_in(restored)
 
 
-def _byte_ids(region: Region, ri, global_units: GlobalUnits) -> Dict[Address, ByteId]:
+def _byte_ids(
+    region: Region, kind: CacheKind, ri, global_units: GlobalUnits
+) -> Dict[Address, ByteId]:
     """Slot address -> identity of every byte the region holds on one rank."""
     ids: Dict[Address, ByteId] = {}
     offset = region.offset
     for index, decl in enumerate(region.buffers):
-        grid = cs.shard_grid(decl.domain, ri)
+        grid = cs.shard_grid(cs.domain_of(kind), ri)
         if decl.split_axis is None:
             for b in range(decl.nbytes):
                 ids[(region.pool, offset + b)] = (region.layer, region.role, index, 0, 0, b)
@@ -107,8 +107,9 @@ def _layer_group_byte_ids(
     page_table: PageTable, layer_group: int, ri, global_units
 ) -> Dict[Address, ByteId]:
     ids: Dict[Address, ByteId] = {}
-    for region in page_table.layer_groups[layer_group].regions:
-        ids.update(_byte_ids(region, ri, global_units))
+    group = page_table.layer_groups[layer_group]
+    for region in group.regions:
+        ids.update(_byte_ids(region, group.kind, ri, global_units))
     return ids
 
 
@@ -164,7 +165,9 @@ def check_resharding(
                 for region in layer_group.regions:
                     if (layer_group.spec, region.key) not in src_layers:
                         continue
-                    for address, byte_id in _byte_ids(region, dst_ri, global_units).items():
+                    for address, byte_id in _byte_ids(
+                        region, layer_group.kind, dst_ri, global_units
+                    ).items():
                         expected[(group_index, address)] = byte_id
         missing = [k for k in expected if writes[k] == 0]
         repeated = [k for k, count in writes.items() if count > 1]
@@ -237,9 +240,9 @@ def _stage_layers(model: Model, par: Par, pp_rank: int) -> List[int]:
 def _attention_layer_group(model, layers, kv, pools, base) -> LayerGroup:
     buf = int(model.tokens_per_block * kv * model.head_dim * model.element_bytes)
     axes = (("token", model.tokens_per_block), ("head", kv)) if model.nhd else (("head", kv),)
-    kv_decl = (BufferDecl(buf, A, axes, "head"),)
+    kv_decl = (BufferDecl(buf, axes, "head"),)
     roles = ["key"] if model.mla else ["key", "value"]
-    idx = (BufferDecl(model.index_key, A),) if model.index_key else None
+    idx = (BufferDecl(model.index_key),) if model.index_key else None
     regions = []
     if idx and model.index_coalesced:
         stride = len(roles) * buf + model.index_key
@@ -259,7 +262,7 @@ def _attention_layer_group(model, layers, kv, pools, base) -> LayerGroup:
             )
             for i, gid in enumerate(layers):
                 regions.append(Region(1, gid, "index_key", i * model.index_key, idx, i))
-    params = {"tokens_per_block": model.tokens_per_block, "window": None}
+    params = {"window": None}
     return LayerGroup("attention", CacheKind.PAGED, regions, params)
 
 
@@ -269,15 +272,15 @@ def _state_layer_group(model, layers, grid_size, pools, base) -> LayerGroup:
     roles = [
         (
             "conv_state",
-            tuple(BufferDecl(s, S, (("byte", s),), "byte") for s in sections),
+            tuple(BufferDecl(s, (("byte", s),), "byte") for s in sections),
         ),
         (
             "ssm_state",
-            (BufferDecl(heads * model.ssm_bytes_per_head, S, (("head", heads),), "head"),),
+            (BufferDecl(heads * model.ssm_bytes_per_head, (("head", heads),), "head"),),
         ),
     ]
     if model.ple:
-        roles.append(("ple", (BufferDecl(model.ple, S),)))
+        roles.append(("ple", (BufferDecl(model.ple),)))
     n = len(layers)
     first_pool = len(pools)
     regions = []
@@ -361,14 +364,14 @@ def test_page_table_round_trips_and_dedups_layouts_on_the_wire():
 
 
 def test_region_and_buffer_declarations():
-    nhd = BufferDecl(64, A, (("token", 4), ("head", 2)), "head")
+    nhd = BufferDecl(64, (("token", 4), ("head", 2)), "head")
     assert (nhd.rows, nhd.units, nhd.unit_bytes("t")) == (4, 2, 8)
-    replicated = Region(0, 3, "index_key", 128, (BufferDecl(24, A),))
+    replicated = Region(0, 3, "index_key", 128, (BufferDecl(24),))
     assert replicated.replicated and replicated.key == (3, "index_key") and replicated.nbytes == 24
     with pytest.raises(ValueError, match="split axis"):
-        BufferDecl(8, A, (("head", 2),), "token")
+        BufferDecl(8, (("head", 2),), "token")
     with pytest.raises(ValueError, match="not byte-aligned"):
-        BufferDecl(10, A, (("head", 4),), "head").unit_bytes("t")
+        BufferDecl(10, (("head", 4),), "head").unit_bytes("t")
     with pytest.raises(ValueError, match="declares no buffers"):
         Region(0, 0, "key", 0, ())
 
@@ -529,8 +532,8 @@ def test_v2_life_cycles_become_spaces_of_regions():
     table = cs.build_page_table(manager)
     assert [s.spec for s in table.layer_groups] == ["attention", "attention"]
     assert [s.kind for s in table.layer_groups] == [CacheKind.PAGED, CacheKind.PAGED]
-    assert table.layer_groups[0].params == {"tokens_per_block": 4, "window": None}
-    assert table.layer_groups[1].params == {"tokens_per_block": 4, "window": 64}
+    assert table.layer_groups[0].params == {"window": None}
+    assert table.layer_groups[1].params == {"window": 64}
     assert [(r.pool, r.layer, r.role, r.offset) for r in table.layer_groups[0].regions] == [
         (0, 10, key, 0),
         (0, 10, value, 64),
@@ -539,9 +542,9 @@ def test_v2_life_cycles_become_spaces_of_regions():
     ]
     # The padding buffer keeps its slot offset but has no region.
     assert [(r.role, r.offset) for r in table.layer_groups[1].regions] == [(key, 0), (value, 128)]
-    kv_decl = BufferDecl(64, A, (("head", 2),), "head")
+    kv_decl = BufferDecl(64, (("head", 2),), "head")
     assert table.layer_groups[0].regions[0].buffers == (kv_decl,)
-    assert table.layer_groups[0].regions[2].buffers == (BufferDecl(64, A),)
+    assert table.layer_groups[0].regions[2].buffers == (BufferDecl(64),)
     assert table.pools == [Pool(0x1000, 4096, 32)]
 
 
@@ -560,9 +563,9 @@ def test_specs_own_their_role_layouts():
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 
     paged, key = CacheKind.PAGED, str(Role.KEY)
-    hnd = (BufferDecl(64, A, (("head", 2),), "head"),)
-    nhd = (BufferDecl(64, A, (("token", 4), ("head", 2)), "head"),)
-    replicated = (BufferDecl(64, A),)
+    hnd = (BufferDecl(64, (("head", 2),), "head"),)
+    nhd = (BufferDecl(64, (("token", 4), ("head", 2)), "head"),)
+    replicated = (BufferDecl(64),)
     plain = SimpleNamespace()
     assert _role_buffers("attention", plain, paged, key) == hnd
     assert _role_buffers("attention", plain, paged, str(Role.INDEX_KEY)) == replicated
@@ -573,7 +576,7 @@ def test_specs_own_their_role_layouts():
         minimax = SimpleNamespace(_main_kv_layout_name=lambda layout=layout: layout)
         assert _role_buffers("minimax_m3", minimax, paged, key) == expected
     # A state role with no declared geometry is held whole by every rank of the state grid.
-    assert _role_buffers("mamba", plain, CacheKind.STATE, "kda_extra") == (BufferDecl(64, S),)
+    assert _role_buffers("mamba", plain, CacheKind.STATE, "kda_extra") == (BufferDecl(64),)
 
 
 def test_mamba_describes_attention_and_state_life_cycles():
@@ -607,7 +610,7 @@ def test_mamba_describes_attention_and_state_life_cycles():
     conv_region = state.regions[0]
     assert (conv_region.pool, conv_region.role) == (1, conv)
     assert [b.nbytes for b in conv_region.buffers] == [16, 8, 8]
-    assert state.regions[2].buffers == (BufferDecl(128, S, (("head", 4),), "head"),)
+    assert state.regions[2].buffers == (BufferDecl(128, (("head", 4),), "head"),)
     spec = cs.spec_for(state)
     assert not spec.sends_incrementally(state) and spec.sends_incrementally(attention)
     ctx = cs.LocalUnitsContext(SimpleNamespace(py_request_id=7), 1, state, manager, None, 12, 0)
@@ -876,8 +879,8 @@ def test_helix_receiver_takes_its_strided_blocks():
 def test_chunk_units_defer_windows_and_whole_request_spaces():
     spec = cs.spec_named("attention")
     units = np.arange(6)
-    full = LayerGroup("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": None})
-    swa = LayerGroup("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": 8})
+    full = LayerGroup("attention", CacheKind.PAGED, params={"window": None})
+    swa = LayerGroup("attention", CacheKind.PAGED, params={"window": 8})
     state = LayerGroup("attention", CacheKind.STATE)
 
     def chunk(layer_group, values, is_last):
@@ -1015,9 +1018,9 @@ def _linear_rank(model: LinearModel, par: Par, name: str, tp_rank: int) -> RankI
     grid = par.tp
     sections = [s // grid for s in model.sections]
     heads = model.heads // grid
-    conv = tuple(BufferDecl(s, S, (("channel", s),), "channel") for s in sections)
+    conv = tuple(BufferDecl(s, (("channel", s),), "channel") for s in sections)
     dims = (("head", heads), ("d_k", model.d_k), ("d_v", model.d_v))
-    state = (BufferDecl(heads * model.d_k * model.d_v, S, dims, "head"),)
+    state = (BufferDecl(heads * model.d_k * model.d_v, dims, "head"),)
     conv_bytes, state_bytes = sum(sections), state[0].nbytes
     base = 0x30_0000_0000 if name == "ctx" else 0x40_0000_0000
     n = model.layers

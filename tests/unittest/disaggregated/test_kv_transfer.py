@@ -250,7 +250,7 @@ def _paged_layer_group(tokens_per_block: int, window: Optional[int] = None) -> L
     return LayerGroup(
         spec="attention",
         kind=CacheKind.PAGED,
-        params={"tokens_per_block": tokens_per_block, "window": window},
+        params={"window": window},
     )
 
 

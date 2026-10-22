@@ -22,8 +22,6 @@ import torch
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
-    STATE_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -52,13 +50,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 
 
 def _hnd(nbytes, heads):
-    return (BufferDecl(nbytes, ATTENTION_TP, (("head", heads),), "head"),)
+    return (BufferDecl(nbytes, (("head", heads),), "head"),)
 
 
 def _nhd(nbytes, heads, tokens_per_block):
-    return (
-        BufferDecl(nbytes, ATTENTION_TP, (("token", tokens_per_block), ("head", heads)), "head"),
-    )
+    return (BufferDecl(nbytes, (("token", tokens_per_block), ("head", heads)), "head"),)
 
 
 def _layout(layer_group):
@@ -130,7 +126,6 @@ def test_build_page_table():
         for layer_group in page_table.layer_groups:
             assert layer_group.spec == "attention"
             assert layer_group.kind == CacheKind.PAGED
-            assert layer_group.params["tokens_per_block"] == tokens_per_block
             roles = {}
             for region in layer_group.regions:
                 roles.setdefault(region.layer, set()).add(region.role)
@@ -189,7 +184,7 @@ def test_page_table_meta_serialization():
                 spec="attention",
                 kind=CacheKind.PAGED,
                 regions=regions,
-                params={"tokens_per_block": 16, "window": 512},
+                params={"window": 512},
             )
         ],
     )
@@ -198,7 +193,6 @@ def test_page_table_meta_serialization():
     assert layer_group.spec == "attention"
     assert layer_group.kind == CacheKind.PAGED
     assert layer_group.params["window"] == 512
-    assert layer_group.params["tokens_per_block"] == 16
     assert layer_group.layers == [0, 1]
     assert layer_group.regions == regions
     assert restored.pools[0].to_dict() == kv_pool.to_dict()
@@ -285,9 +279,9 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
     ]
     (layer_group,) = page_table.layer_groups
     assert layer_group.spec == "minimax_m3"
-    assert layer_group.params == {"tokens_per_block": 16, "window": None}
+    assert layer_group.params == {"window": None}
     nhd = _nhd(128, 1, 16)
-    replicated = (BufferDecl(128, ATTENTION_TP),)
+    replicated = (BufferDecl(128),)
     assert _layout(layer_group) == [
         (0, 0, "key", 0, nhd),
         (0, 0, "value", 128, nhd),
@@ -321,7 +315,7 @@ def test_v2_builder_splits_mixed_kind_pool_into_per_role_regions():
     assert len(page_table.pools) == 1
     (layer_group,) = page_table.layer_groups
     nhd = _nhd(128, 1, 16)
-    replicated = (BufferDecl(128, ATTENTION_TP),)
+    replicated = (BufferDecl(128),)
     # All regions address the same physical pool; the INDEX_KEY interleaves after layer 0.
     assert _layout(layer_group) == [
         (0, 0, "key", 0, nhd),
@@ -350,8 +344,8 @@ def test_v2_builder_defaults_to_head_major_kv():
 def test_state_layer_group_serialization():
     conv_sections = (512, 256, 256)
     ssm_bytes, ssm_bytes_per_head = 256, 128
-    conv = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in conv_sections)
-    ssm = (BufferDecl(ssm_bytes, STATE_TP, (("head", ssm_bytes // ssm_bytes_per_head),), "head"),)
+    conv = tuple(BufferDecl(s, (("byte", s),), "byte") for s in conv_sections)
+    ssm = (BufferDecl(ssm_bytes, (("head", ssm_bytes // ssm_bytes_per_head),), "head"),)
     regions = []
     for lid, layer in enumerate((10, 11, 12)):
         base = lid * (sum(conv_sections) + ssm_bytes)
@@ -376,11 +370,12 @@ def test_state_layer_group_serialization():
     assert [b.nbytes for b in conv_region.buffers] == list(conv_sections)
     assert conv_region.nbytes == sum(conv_sections)
     assert ssm_region.buffers[0].unit_bytes("ssm") == ssm_bytes_per_head
-    assert [(r.local_layer, r.layer) for r in restored.regions[::2]] == [(0, 10), (1, 11), (2, 12)]
+    assert [r.layer for r in restored.regions[::2]] == [10, 11, 12]
+    # The manager's own layer ids stay on this rank and do not take part in equality.
+    assert all(r.local_layer == -1 for r in restored.regions)
 
     legacy_pool = Pool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
-    assert legacy_pool.layer_stride_bytes == legacy_pool.num_slots * legacy_pool.slot_bytes
 
 
 def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
@@ -493,9 +488,9 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
         (1, 1),
     ]
 
-    ssm = (BufferDecl(64, STATE_TP, (("head", 2),), "head"),)
-    conv = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in (16, 16, 32))
-    ple = (BufferDecl(32, STATE_TP),)
+    ssm = (BufferDecl(64, (("head", 2),), "head"),)
+    conv = tuple(BufferDecl(s, (("byte", s),), "byte") for s in (16, 16, 32))
+    ple = (BufferDecl(32),)
     ssm_role, conv_role = str(MambaRole.SSM_STATE), str(MambaRole.CONV_STATE)
     assert _layout(recurrent) == [
         (0, 0, ssm_role, 0, ssm),
@@ -516,7 +511,7 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     # Attention life cycle is untouched by the recurrent one.
     assert attention.pools == [2]
     assert attention.layers == [2]
-    assert attention.params == {"tokens_per_block": 16, "window": None}
+    assert attention.params == {"window": None}
     assert _layout(attention) == [(2, 2, "key", 0, _hnd(64, 1)), (2, 2, "value", 64, _hnd(64, 1))]
 
 
@@ -546,7 +541,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     # Equal-sized SSM and convolution states share one interleaved V2 pool.
     physical_slot_bytes = state_bytes * num_layers * 2
     physical_pool = Pool(base_address=1000, slot_bytes=physical_slot_bytes, num_slots=num_slots)
-    replicated = (BufferDecl(state_bytes, STATE_TP),)
+    replicated = (BufferDecl(state_bytes),)
     regions = [
         Region(0, layer, role, (2 * lid + i) * state_bytes, replicated, local_layer=lid)
         for lid, layer in enumerate((1, 2))
@@ -569,7 +564,7 @@ def test_region_offsets_past_four_gib_survive_rank_info_roundtrip() -> None:
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
     slot_bytes = 1 << 33  # 8 GiB slot: later regions sit past 4 GiB
-    buffers = (BufferDecl(1 << 31, STATE_TP),)
+    buffers = (BufferDecl(1 << 31),)
     regions = [
         Region(0, 10 + lid, "conv_state", lid * (1 << 31), buffers, local_layer=lid)
         for lid in range(4)
@@ -606,8 +601,8 @@ def test_mixed_page_table_serialization():
         Region(0, 0, "value", 256, _hnd(256, 4), local_layer=0),
     ]
     # Recurrent state layer group (life cycle 1): layers 1 and 2.
-    conv = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in (256, 128, 128))
-    ssm = (BufferDecl(2048, STATE_TP, (("head", 32),), "head"),)
+    conv = tuple(BufferDecl(s, (("byte", s),), "byte") for s in (256, 128, 128))
+    ssm = (BufferDecl(2048, (("head", 32),), "head"),)
     state_regions = [
         region
         for lid, layer in enumerate((1, 2))
@@ -623,7 +618,7 @@ def test_mixed_page_table_serialization():
                 spec="mamba",
                 kind=CacheKind.PAGED,
                 regions=attn_regions,
-                params={"tokens_per_block": 16, "window": None},
+                params={"window": None},
             ),
             LayerGroup(spec="mamba", kind=CacheKind.STATE, regions=state_regions),
         ],
@@ -637,7 +632,7 @@ def test_mixed_page_table_serialization():
     assert paged.layers == [0]
     assert state.layers == [1, 2]
     assert state.pools == [1, 2]
-    assert [(r.local_layer, r.layer) for r in state.regions[::2]] == [(0, 1), (1, 2)]
+    assert [r.layer for r in state.regions[::2]] == [1, 2]
     assert state.regions == state_regions
 
     # Which layer group holds each layer comes straight from the regions.

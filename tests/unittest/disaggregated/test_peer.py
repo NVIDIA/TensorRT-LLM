@@ -21,8 +21,6 @@ import tensorrt_llm._torch.disaggregation.native.peer as peer_module
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
-    STATE_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -54,12 +52,12 @@ _STATE_SPACE = 1
 def _attention_decl(layout, nbytes, heads, tokens_per_block):
     """The declaration of one attention buffer laid out as ``layout`` (hnd / nhd / replicated)."""
     if layout == "replicated":
-        return BufferDecl(nbytes, ATTENTION_TP)
+        return BufferDecl(nbytes)
     if layout == "nhd":
         axes = (("token", tokens_per_block), ("head", heads))
     else:
         axes = (("head", heads),)
-    return BufferDecl(nbytes, ATTENTION_TP, axes, "head")
+    return BufferDecl(nbytes, axes, "head")
 
 
 def make_page_table(
@@ -103,7 +101,7 @@ def make_page_table(
         spec="mamba",
         kind=CacheKind.PAGED,
         regions=attn_regions,
-        params={"tokens_per_block": tokens_per_block, "window": None},
+        params={"window": None},
     )
 
     conv_slot_bytes = 4096 // mamba_tp
@@ -117,9 +115,7 @@ def make_page_table(
                 layer=gid,
                 role=MAMBA_CONV_ROLE,
                 offset=lid * conv_slot_bytes,
-                buffers=tuple(
-                    BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in conv_sections
-                ),
+                buffers=tuple(BufferDecl(s, (("byte", s),), "byte") for s in conv_sections),
                 local_layer=lid,
             )
         )
@@ -130,9 +126,7 @@ def make_page_table(
                 layer=gid,
                 role=MAMBA_SSM_ROLE,
                 offset=lid * ssm_slot_bytes,
-                buffers=(
-                    BufferDecl(ssm_slot_bytes, STATE_TP, (("head", ssm_slot_bytes // 64),), "head"),
-                ),
+                buffers=(BufferDecl(ssm_slot_bytes, (("head", ssm_slot_bytes // 64),), "head"),),
                 local_layer=lid,
             )
         )
@@ -465,7 +459,7 @@ def _single_group_table(layer_offsets, bytes_per_layer, heads, tokens_per_block,
                 spec="attention",
                 kind=CacheKind.PAGED,
                 regions=regions,
-                params={"tokens_per_block": tokens_per_block, "window": None},
+                params={"window": None},
             )
         ],
     )
@@ -1072,9 +1066,9 @@ def test_nhd_head_mismatch_rejects_tokens_per_block_mismatch():
 def test_buffer_declarations_reject_invalid_geometry():
     """A region's layout is validated where it is declared."""
     with pytest.raises(ValueError, match="split axis 'head' is not one of the axes"):
-        BufferDecl(16, ATTENTION_TP, (("token", 2),), "head")
+        BufferDecl(16, (("token", 2),), "head")
     with pytest.raises(ValueError, match="at least one byte"):
-        BufferDecl(0, ATTENTION_TP)
+        BufferDecl(0)
     with pytest.raises(ValueError, match="declares no buffers"):
         Region(pool=0, layer=0, role="key", offset=0, buffers=())
 
@@ -1298,7 +1292,7 @@ def _add_replicated_side_regions(page_table, *, bytes_per_layer=8):
             layer=gid,
             role="ple_ngram_context",
             offset=lid * bytes_per_layer,
-            buffers=(BufferDecl(bytes_per_layer, STATE_TP),),
+            buffers=(BufferDecl(bytes_per_layer),),
             local_layer=lid,
         )
         for lid, gid in enumerate([100, 101])
@@ -1388,9 +1382,7 @@ def test_replicated_validation_covers_state_spaces():
 def test_attention_replicated_validation_rejects_missing_index_key_region():
     self_pt = _single_group_table([0], 64, 2, 16, buffers=2, layout="hnd")
     self_pt.layer_groups[0].regions.append(
-        Region(
-            pool=0, layer=0, role="index_key", offset=64, buffers=(BufferDecl(16, ATTENTION_TP),)
-        )
+        Region(pool=0, layer=0, role="index_key", offset=64, buffers=(BufferDecl(16),))
     )
     peer_pt = _single_group_table([0], 64, 2, 16, buffers=2, layout="hnd")
     ri = make_rankinfo(instance_name="local", page_table=self_pt)

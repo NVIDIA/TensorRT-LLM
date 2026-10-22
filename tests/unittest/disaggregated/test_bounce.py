@@ -44,8 +44,6 @@ except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
 # base and cache_specs are pure numpy, always importable on CPU.
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.cache_specs import (
-    ATTENTION_TP,
-    STATE_TP,
     BufferDecl,
     LayerGroup,
     PageTable,
@@ -245,9 +243,9 @@ def test_fanin_bounce_safe_gate() -> None:
     def pt(replicated: bool) -> PageTable:
         # One attention region, either replicated (index-key) or sharded by head (NHD).
         if replicated:
-            decl = BufferDecl(64, ATTENTION_TP)
+            decl = BufferDecl(64)
         else:
-            decl = BufferDecl(64, ATTENTION_TP, (("token", 16), ("head", 2)), "head")
+            decl = BufferDecl(64, (("token", 16), ("head", 2)), "head")
         region = Region(pool=0, layer=0, role="index_key", offset=0, buffers=(decl,))
         return PageTable(
             pools=[Pool(base_address=0x1000, slot_bytes=64, num_slots=4)],
@@ -256,7 +254,7 @@ def test_fanin_bounce_safe_gate() -> None:
                     spec="attention",
                     kind=CacheKind.PAGED,
                     regions=[region],
-                    params={"tokens_per_block": 16, "window": None},
+                    params={"window": None},
                 )
             ],
         )
@@ -416,7 +414,7 @@ class TestFanInReserve:
                 layer=0,
                 role=role,
                 offset=offset,
-                buffers=(BufferDecl(nbytes, ATTENTION_TP, (("head", 1),), "head"),),
+                buffers=(BufferDecl(nbytes, (("head", 1),), "head"),),
             )
 
         page_table = PageTable(
@@ -434,7 +432,7 @@ class TestFanInReserve:
                         region(1, "key_block_scale", 0, 12),
                         region(1, "value_block_scale", 12, 12),
                     ],
-                    params={"tokens_per_block": 32, "window": None},
+                    params={"window": None},
                 )
             ],
         )
@@ -757,14 +755,14 @@ def _k3_page_table() -> PageTable:
                 layer=i,
                 role="all",
                 offset=i * mla_layer_bytes,
-                buffers=(BufferDecl(mla_layer_bytes, ATTENTION_TP, (("head", 1),), "head"),),
+                buffers=(BufferDecl(mla_layer_bytes, (("head", 1),), "head"),),
                 local_layer=i,
             )
             for i in range(24)
         ],
-        params={"tokens_per_block": 32, "window": None},
+        params={"window": None},
     )
-    # Layer-major state pools: a layer's state sits ``layer_stride_bytes`` past the previous one.
+    # Layer-major state pools: a layer's state sits one whole pool (all slots) past the previous one.
     conv_pool = Pool(0x200000, _K3_CONV_SLOT_BYTES, 8)
     ssm_pool = Pool(0x300000, _K3_SSM_SLOT_BYTES, 8)
     conv_section = _K3_CONV_SLOT_BYTES // 3
@@ -775,10 +773,9 @@ def _k3_page_table() -> PageTable:
                 pool=1,
                 layer=gid,
                 role="conv_state",
-                offset=lid * conv_pool.layer_stride_bytes,
+                offset=lid * conv_pool.num_slots * conv_pool.slot_stride_bytes,
                 buffers=tuple(
-                    BufferDecl(conv_section, STATE_TP, (("byte", conv_section),), "byte")
-                    for _ in range(3)
+                    BufferDecl(conv_section, (("byte", conv_section),), "byte") for _ in range(3)
                 ),
                 local_layer=lid,
             )
@@ -788,8 +785,8 @@ def _k3_page_table() -> PageTable:
                 pool=2,
                 layer=gid,
                 role="ssm_state",
-                offset=lid * ssm_pool.layer_stride_bytes,
-                buffers=(BufferDecl(_K3_SSM_SLOT_BYTES, STATE_TP, (("head", 4),), "head"),),
+                offset=lid * ssm_pool.num_slots * ssm_pool.slot_stride_bytes,
+                buffers=(BufferDecl(_K3_SSM_SLOT_BYTES, (("head", 4),), "head"),),
                 local_layer=lid,
             )
         )
@@ -830,7 +827,7 @@ def _state_paired(sender_ri, peer_ri, global_heads=8):
             layer=0,
             role="ssm_state",
             offset=0,
-            buffers=(BufferDecl(heads * 4, STATE_TP, (("head", heads),), "head"),),
+            buffers=(BufferDecl(heads * 4, (("head", heads),), "head"),),
         )
         return PageTable(
             pools=[Pool(0x100, heads * 4, 4)],

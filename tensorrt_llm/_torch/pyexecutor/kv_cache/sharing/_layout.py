@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 # A new field left out at its default keeps the version; changing the encoding or the meaning of
 # an existing field bumps it.
-LAYOUT_ID_VERSION = 3
+LAYOUT_ID_VERSION = 4
 
 
 @dataclass(frozen=True)

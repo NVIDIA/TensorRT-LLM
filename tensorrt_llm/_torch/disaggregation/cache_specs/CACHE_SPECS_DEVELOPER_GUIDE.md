@@ -27,11 +27,12 @@ transceiver.
 
 ```
 PageTable
-├─ pools:  [Pool]        base address, slot bytes, slot / layer strides
+├─ pools:  [Pool]        base address, slot bytes, slot stride
 └─ layer_groups: [LayerGroup]  one per V2 life cycle (index == life-cycle id)
      ├─ spec:    "csa2"           the spec owning the layer group's rules (peers must agree)
-     ├─ kind:    PAGED | STATE    blocks by ordinal, or one slot per request
-     ├─ params:  {...}            read only by the spec (window, tokens_per_block, ...)
+     ├─ kind:    PAGED | STATE    blocks by ordinal, or one slot per request; picks the shard
+     │                            domain: attention TP or the recurrent-state grid
+     ├─ params:  {...}            read only by the spec (window, ...)
      └─ regions: [Region]         one per (layer, role) buffer
           ├─ layer, role          global layer id + role: what it is, matched with the peer
           ├─ pool, offset         where it is inside a unit's slot
@@ -43,14 +44,14 @@ On the wire, regions are rows and declarations are sent once per distinct layout
 
 ### Declaring a layout: `BufferDecl`
 
-Each buffer names its axes outer to inner, the axis it is split along, and the shard domain that
-splits it:
+Each buffer names its axes outer to inner and the axis it is split along; its layer group's kind
+names the shard domain that splits it (`topology.domain_of`):
 
 ```python
-BufferDecl(nbytes, ATTENTION_TP, axes=(("token", tpb), ("head", kv)), split_axis="head")  # NHD key
-BufferDecl(nbytes, ATTENTION_TP, axes=(("head", kv),), split_axis="head")                 # HND key
-BufferDecl(section_bytes, STATE_TP, axes=(("byte", section_bytes),), split_axis="byte")
-BufferDecl(nbytes, ATTENTION_TP)                                                          # replicated
+BufferDecl(nbytes, axes=(("token", tpb), ("head", kv)), split_axis="head")  # NHD key
+BufferDecl(nbytes, axes=(("head", kv),), split_axis="head")                 # HND key
+BufferDecl(section_bytes, axes=(("byte", section_bytes),), split_axis="byte")
+BufferDecl(nbytes)                                                          # replicated
 ```
 
 `nbytes` is what this rank holds. The algorithm derives the rest:
@@ -121,7 +122,7 @@ cache layout (named reuse).
    * `validate_peer` / `check_rank_compatible` -- checks the declarations do not cover;
    * `requires_physical_ownership` -- a transfer mode the deployment needs;
    * `registration_regions` -- memory outside the manager's pools.
-   A new shard domain is one entry in `topology._GRIDS`.
+   A new shard domain is one entry in `topology._GRIDS` and its cache kind in `topology.domain_of`.
 4. Add the spec's layouts to the resharding matrix in
    `tests/unittest/disaggregated/test_cache_specs.py`, which checks on synthetic page tables
    across TP / PP / CP layouts that the page table survives the wire and, byte by byte, that every
