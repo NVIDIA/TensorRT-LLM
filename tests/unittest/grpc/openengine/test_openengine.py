@@ -17,6 +17,7 @@
 import asyncio
 import gc
 import socket
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -220,7 +221,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_standard_grpc_health_watch_reports_shutdown() -> None:
-    """Active Watch clients receive non-serving status before shutdown closes them."""
+    """Shutdown withdraws inference and finishes watchers without failing liveness."""
     llm = SimpleNamespace(
         args=SimpleNamespace(guided_decoding_backend=None),
         llm_id="test-instance",
@@ -243,11 +244,11 @@ def test_standard_grpc_health_watch_reports_shutdown() -> None:
                     ).status == health_pb2.HealthCheckResponse.SERVING
 
                 stop_task = asyncio.create_task(server.stop(grace=10))
-                for stream in (liveness, inference):
-                    assert (
-                        await asyncio.wait_for(stream.read(), 5)
-                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
-                    assert await asyncio.wait_for(stream.read(), 5) is grpc.aio.EOF
+                assert (
+                    await asyncio.wait_for(inference.read(), 5)
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert await asyncio.wait_for(inference.read(), 5) is grpc.aio.EOF
+                assert await asyncio.wait_for(liveness.read(), 5) is grpc.aio.EOF
                 await asyncio.wait_for(stop_task, 5)
         finally:
             if stop_task is None:
@@ -255,6 +256,142 @@ def test_standard_grpc_health_watch_reports_shutdown() -> None:
             elif not stop_task.done():
                 await server.stop(grace=0)
                 await stop_task
+
+    asyncio.run(exercise_server())
+
+
+def test_inference_health_timeout_does_not_start_overlapping_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled predicate withdraws readiness without accumulating worker threads."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+    calls = []
+
+    def check_health() -> bool:
+        calls.append(1)
+        if len(calls) > 1:
+            release.wait(5)
+        return True
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=check_health,
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                inference = health_pb2.HealthCheckRequest(service="inference")
+                stream = health.Watch(inference)
+                try:
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(
+                            health_pb2.HealthCheckRequest(service="liveness"), timeout=5
+                        )
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    await asyncio.sleep(0.1)
+                    assert len(calls) == 2
+                    release.set()
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                finally:
+                    stream.cancel()
+        finally:
+            release.set()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+@pytest.mark.parametrize("fatal_field", ["_fatal_error", "_engine_dead"])
+def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
+    monkeypatch: pytest.MonkeyPatch, fatal_field: str
+) -> None:
+    """Only a sticky fatal error fails liveness; temporary readiness can recover."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    engine = {"healthy": True}
+    executor = SimpleNamespace(_fatal_error=None, _engine_dead=False)
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _executor=executor,
+        _check_health=lambda: engine["healthy"] and executor._fatal_error is None,
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                inference = health_pb2.HealthCheckRequest(service="inference")
+                liveness = health_pb2.HealthCheckRequest(service="liveness")
+                stream = health.Watch(inference)
+                live_stream = health.Watch(liveness)
+                try:
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    assert (
+                        await asyncio.wait_for(live_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    engine["healthy"] = False
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(liveness, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    engine["healthy"] = True
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    setattr(
+                        executor,
+                        fatal_field,
+                        RuntimeError("engine failed") if fatal_field == "_fatal_error" else True,
+                    )
+                    assert (
+                        await asyncio.wait_for(stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await asyncio.wait_for(live_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    setattr(executor, fatal_field, None if fatal_field == "_fatal_error" else False)
+                    await asyncio.sleep(0.05)
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(liveness, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                finally:
+                    stream.cancel()
+                    live_stream.cancel()
+        finally:
+            await server.stop(grace=0)
 
     asyncio.run(exercise_server())
 

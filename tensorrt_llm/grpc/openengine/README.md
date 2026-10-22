@@ -28,9 +28,9 @@ OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC 
 | Service | Meaning | Probe use |
 |---------|---------|----------------|
 | `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Startup and readiness probes |
-| `liveness` | The gRPC server has started and is not shutting down. | Liveness probe |
+| `liveness` | The gRPC server is running and no known fatal engine failure requires a restart. | Liveness probe |
 
-The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by up to one poll interval. The launcher stops the serving process when its engine health check fails; an external supervisor must restart it. Both services report `NOT_SERVING` during graceful shutdown. Each `Watch` ends after this final status. A stopped or failed server cannot answer the probe.
+The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. A check that runs longer than five seconds makes inference `NOT_SERVING`; the server keeps at most one engine check in flight and discards a late result before polling again. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by a poll interval or the check deadline. The multi-frontend coordinator reads the monitor's latest engine result without running another engine check. A known fatal executor or worker failure makes both services `NOT_SERVING` and stops the serving process. Other readiness failures leave liveness `SERVING` and can recover. During orderly shutdown, inference reports `NOT_SERVING` while liveness retains its previous status until the listener closes. Each `Watch` ends after its final status. A stopped server cannot answer the probe.
 
 For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
 
