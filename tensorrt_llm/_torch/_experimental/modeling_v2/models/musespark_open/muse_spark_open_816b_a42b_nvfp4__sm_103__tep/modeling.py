@@ -45,9 +45,11 @@ target then runs only the built-in modules as described above. A missing public
 precondition of a planned fast path is an error, whatever the mode. Over a
 full-length drafter context arena the fast paths written for a windowed one
 are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``); over a
-windowed arena the paths that write the arena by column
-(``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and the verify fold)
-stay only where the composition serves the window compaction too (sm103 tep4). The installers
+windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``) the paths that write the
+arena by column (``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and
+the verify fold) stay where the composition serves the window compaction too
+(sm103 tep4) or on sm107 (``dispatch.WINDOWED_COMMIT_SMS``: their commit compacts
+in its own kernel), and are left out otherwise. The installers
 ask the plan per fast path (``Plan.enabled``); each paragraph below names one
 fast path of ``dispatch.FAST_PATHS``. Their installers live under
 ``kernels/<fast path>/`` and their launches under ``ops/<category>/``.
@@ -175,7 +177,7 @@ Hops and boundaries:
   forks no prefetch of the pool weight. After the weights load,
   ``verify_direct_publish`` checks the kernel the published o_proj captures; a
   step that raises while armed resets the transport.
-* ``wide_post_attention_hop`` (tep4 on one tray only) arms the same joins on decode
+* ``multi_request_post_attention_hop`` (sm103 tep4 only) arms the same joins on decode
   steps of 9..1024 rows (two to 128 requests at K = 7) with ``ops/allreduce/post_attn_hop_wide``:
   the o_proj partial skips the built-in MNNVL all-reduce and one kernel reduces it, joins
   it into the residual and applies the pre-FFN norm on the cluster boundary's 9..32-row
@@ -266,11 +268,12 @@ MoE:
 
 Context steps:
 
-* ``context_sequence_parallel`` (tep4 on one tray only) has ``PrefillTarget`` run a
+* ``context_sequence_parallel`` (tep4 on one tray only, sm_103 and sm_107; row
+  thresholds per SM in ``kernels/context_sequence_parallel``) has ``PrefillTarget`` run a
   step with context rows through the built-in decoder layers' sequence-parallel arm
   when it is captured into the breakable prefill CUDA graph with at least
   ``kernels/context_sequence_parallel``'s ``MIN_ROWS`` rows, or runs eagerly with at
-  least its ``EAGER_MIN_ROWS`` rows: each
+  least its ``EAGER_MIN_ROWS_BY_SM`` rows for the SM: each
   rank keeps a quarter of the rows for the residual stream, the norms, the router,
   the pool and unpool projections and the pre-expert norm and NVFP4 quantization,
   while attention and the experts see every row (all-gathers in front of them,
@@ -301,6 +304,9 @@ installed by the shell's ``load_weights`` after the built-in loader
   the stacked calls run over the rank's own expert block (the owner-only window,
   ``ring_buddy.install(windows=1)``), with nothing replicated.
 * ``three_window_placement`` stacks a third ring window on them.
+* ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
+  them, which the prologue's routed kernel places onto; only up to the
+  ``max_batch_size`` of its capacity gate (``dispatch.CAPACITY_GATES``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
 * ``hot_replicas`` (tep4 on sm_103 only) hooks the NVFP4 layers' expert and routing
@@ -384,7 +390,10 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import resolved_mode
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    resolved_max_batch_size,
+    resolved_mode,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenModel
@@ -470,7 +479,7 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
         model._wide_projections = adopted.wide_projections
         model._published_projections = adopted.published_projections
         model._batch_dense_gemms = adopted.batch_dense_gemms
-        model._prefill = PrefillTarget(model)
+        model._prefill = PrefillTarget(model, _dispatch.sm_of(compute_capability))
         model._decode = DecodeTarget(model)
         return model
 
@@ -544,7 +553,7 @@ class PrefillTarget:
     #: The op every layer call carries as ``context_prep``; None without the path.
     context_prep: Optional[PreattnPrep] = None
 
-    def __init__(self, core: MuseSparkOpenTepModelingV2) -> None:
+    def __init__(self, core: MuseSparkOpenTepModelingV2, sm: Optional[int] = None) -> None:
         self.core = core
         if core._plan.enabled("context_prep"):
             self.context_prep = preattn_prep
@@ -552,7 +561,7 @@ class PrefillTarget:
         if core._plan.enabled("context_sequence_parallel"):
             from .kernels.context_sequence_parallel import forward as _context_sp
 
-            self.sequence_parallel = _context_sp.install(core)
+            self.sequence_parallel = _context_sp.install(core, sm)
 
     def forward(
         self,
@@ -629,7 +638,7 @@ class DecodeTarget:
     the direct publication: o_proj writes into the hop's transport and the join
     runs the consumer hop.
 
-    With ``wide_post_attention_hop``, a step of 9..1024 rows arms the same joins with
+    With ``multi_request_post_attention_hop``, a step of 9..1024 rows arms the same joins with
     the wide hop (``WideHopCall.armed``) and every layer call carries the same
     ``all_reduce_params``: the joins run ``post_attn_hop_wide`` in place of the
     built-in o_proj all-reduce and residual join.
@@ -818,9 +827,27 @@ class DecodeTarget:
         return hidden_states
 
 
-#: The fast paths validated at a tep4 rank's shape on sm103 only, which no other composition
-#: serves: the multi-request decode prep append, the windowed drafter arena compaction, the
-#: router GEMM of multi-request calls, the multi-request decode FMHA, the full-attention
+#: The fast paths written for one tray of four only: those of decode steps of two to
+#: four requests (the wide (16..32-row) TP4 inboxes, the wide post-attention hop
+#: transport and the multi-request sliding-window block), and the half expert window
+#: (a 64-expert block's upper half replicated on the ring successor), and the TP4
+#: gather of the sharded drafter fc over the tray's NVLink.
+_TEP4_ONLY_PATHS = frozenset(
+    {
+        "half_window_experts",
+        "drafter_fc_inbox",
+        "wide_prologue",
+        "wide_post_attention_hop",
+        "wide_swa_block",
+        "wide_persistent_experts",
+        "wide_full_attention",
+        "wide_dense_gemms",
+    }
+)
+#: The fast paths validated at a tep4 rank's shape on sm103, which no TEP8 composition
+#: serves (sm107 TEP4 adds ``_SM107_TEP4_CONTEXT_PATHS`` of them): the multi-request
+#: decode prep append, the windowed drafter arena compaction, the router GEMM of
+#: multi-request calls, the multi-request decode FMHA, the full-attention
 #: decode FMHA over an over-subscribed KV split, the MoE output all-reduce of 129..1024-row
 #: decode steps on the MNNVL two-shot, the post-attention hop of 9..1024-row decode steps
 #: on its own transports, the projection gathers and the split-K QKV of 9..32-row decode
@@ -841,7 +868,7 @@ _SM103_TEP4_ONLY_PATHS = frozenset(
         "multi_request_split_kv",
         "decode_kv_splits",
         "wide_moe_allreduce",
-        "wide_post_attention_hop",
+        "multi_request_post_attention_hop",
         "wide_projection_gathers",
         "projection_publish",
         "context_sequence_parallel",
@@ -853,8 +880,8 @@ _SM103_TEP4_ONLY_PATHS = frozenset(
         "context_prep",
     }
 )
-#: TEP8: every other fast path.
-_TEP8_PATHS = _dispatch.FAST_PATH_NAMES - _SM103_TEP4_ONLY_PATHS
+#: TEP8: every fast path but the TP4-only ones of either architecture.
+_TEP8_PATHS = _dispatch.FAST_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS
 #: The fast paths written for any rank count whose output is bitwise the built-in
 #: model's.
 _TEP4_BITWISE_PATHS = frozenset(
@@ -915,6 +942,119 @@ _SM103_TEP4_PATHS = (
         }
     )
 )
+#: The sm103 TEP4 communication paths of decode steps above 32 rows that sm107 TEP4 also
+#: serves: the MoE output all-reduce of 129..1024-row steps on the MNNVL two-shot, the
+#: post-attention hop of 33..1024-row steps on its own transports (the 8-row hop and its
+#: wide TP4 transport keep 1..32 rows), the expert finalize + two-shot all-reduce of
+#: 96..512-row steps (``finalize_two_shot.install.MIN_ROWS_BY_SM``) and the pool / unpool
+#: slices of 33..448-row steps published from their GEMMs.
+_SM107_TEP4_COMM_PATHS = frozenset(
+    {
+        "wide_moe_allreduce",
+        "multi_request_post_attention_hop",
+        "finalize_two_shot",
+        "projection_publish",
+    }
+)
+#: TEP4 on sm107 adds the attention paths at a tep4 rank's 32 query / 4 KV heads (the
+#: split-KV FMHA at half the device's SMs per pair of KV heads), the dense projections
+#: and drafter GEMMs on their sm107 tep4 kernel tables, the drafter hops and PDL chain
+#: on the tray's MNNVL one-shot, the expert paths on the owner-only 64-expert window
+#: (eight weight stages there, ``persistent_experts.OPTIONS_BY_SM``), and the
+#: sharded-projection gathers, the MoE prologue and the finalize transport on the tray;
+#: the sharded projections and the TP4 local finalize they build on are the built-in
+#: model's fused kernels, opted in on sm107 (``SM107_FUSED_KERNELS``). On top of those it
+#: serves the single-request decode paths of TEP8 that need no ring replication and no
+#: eight-rank kernel: the L2 prefetches of the dense projections' weights (the next
+#: layer's QKV from the expert call), the expert kernel starting from the routed
+#: kernel's early ids, the attention output and unpool projections writing straight
+#: into the hop's and the post-FFN boundary's transports, and the pool projection and
+#: router shard writing straight into the routed kernel's transport
+#: (``pool_into_route``, on the tray's TP4 layout). Its NVFP4 expert layers also
+#: hold their ring predecessor's upper expert half (``half_window_experts``), so the
+#: routed kernel balances the selected experts of a step of at most 8 rows over the
+#: four ranks; that window costs 45 GiB of KV cache per rank, so a plan carries it
+#: only up to ``max_batch_size`` 8 (``dispatch.CAPACITY_GATES``). The sharded drafter fc
+#: of up to 128 rows is gathered over the tray's NVLink (``drafter_fc_inbox``). Decode
+#: steps of two to four
+#: requests (16..32 rows) also take the TP4 sharded MoE prologue and projection gathers
+#: on wide inboxes (``wide_prologue``), the post-attention hop on a wide transport
+#: (``wide_post_attention_hop``) and the sliding-window attention block of one call for
+#: all their sequences (``wide_swa_block``); two-request steps run the persistent expert
+#: kernel's 16-column build (``wide_persistent_experts``); the full-attention layers run
+#: the folded prep, split-KV partials and merge of all their sequences in one call each
+#: (``wide_full_attention``); QKV and the pooler / unpooler slices of 9..32-row steps run
+#: flashinfer's split-K (``wide_dense_gemms``).
+_SM107_TEP4_PATHS = _TEP4_PATHS | frozenset(
+    {
+        "dense_gemm_prefetch",
+        "next_qkv_prefetch",
+        "early_expert_ids",
+        "attention_output_into_hop",
+        "unpool_into_boundary",
+        "pool_into_route",
+        "half_window_experts",
+        "drafter_fc_inbox",
+        "wide_prologue",
+        "wide_post_attention_hop",
+        "wide_swa_block",
+        "wide_persistent_experts",
+        "wide_full_attention",
+        "dense_gemms",
+        "wide_dense_gemms",
+        "drafter_fixed_gemms",
+        "drafter_hops",
+        "drafter_pdl_chain",
+        "swa_paged_decode",
+        "swa_block",
+        "full_attention_split_kv",
+        "full_attention_prep_fold",
+        "drafter_block_decode",
+        "persistent_experts",
+        "bf16_routed_experts",
+        "projection_gathers",
+        "boundary_early_release",
+        "capture_fold",
+        "moe_prologue",
+        "finalize_transport",
+    }
+)
+#: The multi-request attention paths of the sm103 tep4 set that sm107 tep4 serves too: the
+#: decode FMHA of steps of five or more requests (``multi_request_split_kv``; steps of two to
+#: four requests stay on ``wide_full_attention``).
+_SM107_TEP4_ATTENTION_PATHS = frozenset({"multi_request_split_kv"})
+_SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_ATTENTION_PATHS
+_SM107_TEP4_PATHS |= _SM107_TEP4_COMM_PATHS
+#: The GB300 TEP4 GEMM and expert-balance paths also served at sm107 TEP4, tuned for
+#: R200: the router GEMM of decode steps of five or more requests (33..512 rows; 16..32
+#: rows stay on ``wide_prologue``'s router shard), with one CTA per SM of the device;
+#: the attention block's QKV TGV GEMM on the rows of the R200 table and the PDL
+#: norm-gates of 33..512-row decode steps (``batch_dense_gemms``); and the hot NVFP4
+#: expert copies of 33..512-row decode steps, which yield to ``half_window_experts``
+#: wherever its capacity gate keeps it (``dispatch.YIELDS``).
+_SM107_TEP4_GEMM_EXPERT_PATHS = frozenset({"router_gemm", "batch_dense_gemms", "hot_replicas"})
+_SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_GEMM_EXPERT_PATHS
+#: The sm103 tep4 decode-prep and drafter-at-batch paths sm107 TEP4 serves too, above
+#: the two-to-four-request band its own paths hold: the multi-request decode prep append
+#: on steps of five or more requests (``wide_full_attention`` and ``wide_swa_block`` fold
+#: the two-to-four-request steps' append themselves), the drafter window attention of
+#: 33..1024-row block decodes on the multi-request split geometry (sized by the device's
+#: SM count), the draft head's rank top-k key exchange on draft steps of 33 or more rows,
+#: and the split verify sampler on 129..1024-row decode steps.
+_SM107_TEP4_DRAFTER_AT_BATCH_PATHS = frozenset(
+    {
+        "multi_request_prep_append",
+        "wide_drafter_window_attention",
+        "wide_draft_topk",
+        "wide_split_sampler",
+    }
+)
+_SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_DRAFTER_AT_BATCH_PATHS
+#: The context-step paths sm107 TEP4 serves from the sm103 TEP4-only set: large context
+#: steps sequence-parallel over the tray and the context steps' pre-attention prep in one
+#: launch. Neither acts on a decode step, so they share no decode-row band with the
+#: other sm107 TEP4 paths.
+_SM107_TEP4_CONTEXT_PATHS = frozenset({"context_sequence_parallel", "context_prep"})
 
 #: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
 #: the fast paths served and the GPU topology they were validated on, with DFlash
@@ -933,7 +1073,7 @@ TARGET_PATHS = {
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL,),
     ),
     (107, 4): _dispatch.TargetPaths(
-        served=_TEP4_PATHS,
+        served=_SM107_TEP4_PATHS | _SM107_TEP4_CONTEXT_PATHS,
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL, _dispatch.SM107_FUSED_KERNELS),
     ),
@@ -991,6 +1131,7 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
             TARGET_PATHS,
             capability,
             spec_worker=getattr(self.llm, "spec_worker", None),
+            max_batch_size=resolved_max_batch_size(type(self)),
         )
         self._plan = plan
         self._mapping = getattr(model_config, "mapping", None)

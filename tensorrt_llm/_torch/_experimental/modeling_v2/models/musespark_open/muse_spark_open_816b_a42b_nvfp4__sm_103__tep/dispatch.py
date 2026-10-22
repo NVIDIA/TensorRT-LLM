@@ -86,6 +86,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("preattn_prep", "swa_paged_decode"),
     ),
     FastPath(
+        "wide_swa_block",
+        "sliding-window decode attention block of 2..4-request decode steps in one call",
+        "construct",
+        ("swa_block",),
+    ),
+    FastPath(
         "full_attention_prep_append",
         "full-attention layers' K/V append folded into the decode prep",
         "construct",
@@ -100,6 +106,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath(
         "full_attention_prep_fold",
         "full-attention decode prep folded into the split-KV FMHA",
+        "construct",
+        ("full_attention_split_kv",),
+    ),
+    FastPath(
+        "wide_full_attention",
+        "full-attention folded prep, split-KV partials and merge of 2..4-request decode steps",
         "construct",
         ("full_attention_split_kv",),
     ),
@@ -121,6 +133,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     # Dense projections and prefetch.
     FastPath("dense_gemms", "dense projections on one named kernel per shape", "construct"),
+    FastPath(
+        "wide_dense_gemms",
+        "dense projections of 9..32-row decode steps on flashinfer's split-K at sm107 tep4",
+        "construct",
+        ("dense_gemms",),
+    ),
     FastPath(
         "dense_gemm_prefetch",
         "L2 prefetch of the next dense projection's weight",
@@ -147,13 +165,19 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
     ),
     FastPath(
+        "wide_post_attention_hop",
+        "post-attention hop of 9..32-row decode steps on a wide TP4 transport",
+        "construct",
+        ("post_attention_hop",),
+    ),
+    FastPath(
         "attention_output_into_hop",
         "attention output projection writing into the hop's transport",
         "construct",
         ("post_attention_hop", "dense_gemms"),
     ),
     FastPath(
-        "wide_post_attention_hop",
+        "multi_request_post_attention_hop",
         "the post-attention hop on 9..1024-row decode steps (several requests)",
         "construct",
         ("post_attention_hop",),
@@ -208,6 +232,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("moe_prologue", "dense_gemms"),
     ),
     FastPath(
+        "wide_prologue",
+        "MoE prologue and projection gathers of 16..32-row decode steps on wide TP4 inboxes",
+        "construct",
+        ("moe_prologue",),
+    ),
+    FastPath(
         "finalize_transport",
         "expert finalize all-reduce on the fused hop's transport",
         "construct",
@@ -244,6 +274,18 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     # persistent_experts and bf16_routed_experts run over the ring-buddy stack with
     # replicated_experts, else over the rank's own expert block (the owner-only window).
     FastPath("persistent_experts", "NVFP4 experts as one persistent launch", "load"),
+    FastPath(
+        "wide_persistent_experts",
+        "NVFP4 experts of 9..16-row decode steps on the persistent kernel's wide build",
+        "load",
+        ("persistent_experts",),
+    ),
+    FastPath(
+        "half_window_experts",
+        "the ring predecessor's upper expert half on each TP4 rank, balanced per step",
+        "load",
+        ("persistent_experts", "moe_prologue"),
+    ),
     FastPath(
         "three_window_placement",
         "a third ring window for the replicated experts",
@@ -284,6 +326,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("draft_head",),
     ),
     FastPath("drafter_fc_shard", "drafter fc projection column-sharded", "draft"),
+    FastPath(
+        "drafter_fc_inbox",
+        "TP4 sharded drafter fc gathered over the tray's NVLink",
+        "draft",
+        ("drafter_fc_shard",),
+    ),
     FastPath("fused_accept", "acceptance and forced acceptance in one launch", "draft"),
     FastPath("drafter_fixed_gemms", "drafter GEMMs on fixed low-M tactics", "draft"),
     FastPath("context_kv_fork", "drafter context-K/V store on a side stream", "draft"),
@@ -853,9 +901,9 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
         ("post_attention_hop",),
     ),
     Precondition(
-        "the CuTe DSL for the wide post-attention hop",
+        "the CuTe DSL for the multi-request post-attention hop",
         _cute_dsl_kernels(("ops.allreduce.post_attn_hop_wide", "HAS_CUTE_DSL")),
-        ("wide_post_attention_hop",),
+        ("multi_request_post_attention_hop",),
     ),
     Precondition(
         "the CuTe DSL for the drafter hops",
@@ -933,11 +981,12 @@ def missing_preconditions(
 #: The fast paths that write the drafter's context-K/V arena by token column: the
 #: context-K/V fork's side chain and commit, and the verify fold's written-out
 #: context store. Over a windowed arena they address each slot's window from its
-#: base (``_ctx_base``) and end with the built-in's window compaction, and are
-#: composed only together with this target's compaction (``WINDOWED_CONTEXT_ARENA_PATHS``,
-#: which they were validated with); without it a windowed arena leaves them out.
-#: (The drafter block decode reads only the physical length the built-in prepare
-#: hands it, so it composes over either arena.)
+#: base (``_ctx_base``). Where the composition serves this target's compaction
+#: (``WINDOWED_CONTEXT_ARENA_PATHS``) they end with it; on an architecture of
+#: ``WINDOWED_COMMIT_SMS`` their commit compacts in its own kernel
+#: (``ops/spec/context_kv_commit_windowed.py``); elsewhere a windowed arena leaves
+#: them out. (The drafter block decode reads only the physical length the built-in
+#: prepare hands it, so it composes over either arena.)
 FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
     "context_kv_fork",
     "verify_fold",
@@ -945,6 +994,10 @@ FULL_CONTEXT_ARENA_PATHS: Tuple[str, ...] = (
 #: The fast paths that act only on a windowed drafter context arena: the per-step window
 #: compaction. None of them is composed over a full-length arena, which never compacts.
 WINDOWED_CONTEXT_ARENA_PATHS: Tuple[str, ...] = ("drafter_window_compact",)
+#: The architectures (SM numbers) whose compositions serve ``FULL_CONTEXT_ARENA_PATHS``
+#: over a windowed arena without this target's compaction, on the windowed commit that
+#: compacts in its own kernel.
+WINDOWED_COMMIT_SMS: FrozenSet[int] = frozenset({107})
 
 
 def dependents(names: Iterable[str]) -> FrozenSet[str]:
@@ -964,6 +1017,92 @@ def windowed_context_arena(spec_worker: Any) -> bool:
 _WINDOWED_ARENA = "a windowed drafter context arena"
 
 
+@dataclasses.dataclass(frozen=True)
+class CapacityGate:
+    """A served fast path left out above a request capacity, because of what it costs.
+
+    ``path`` (and every fast path built on it) is in the plan only when the
+    engine's ``max_batch_size`` is at most ``most_requests``; an unknown
+    ``max_batch_size`` leaves it out. ``cost`` says in words what the path takes
+    from the deployment.
+    """
+
+    path: str
+    most_requests: int
+    cost: str
+
+
+#: The fast paths a plan carries only at a few concurrent requests.
+#: ``half_window_experts`` stacks a second half expert window on every TP4 rank,
+#: which takes 45 GiB per rank from the KV cache; it is measured ahead of the
+#: owner-only window through 8 concurrent requests, and beyond that the
+#: prefix cache's capacity is worth more.
+CAPACITY_GATES: Tuple[CapacityGate, ...] = (
+    CapacityGate(
+        "half_window_experts",
+        8,
+        "a second half expert window per TP4 rank, 45 GiB of KV cache",
+    ),
+)
+
+
+def capacity_gated(
+    paths: FrozenSet[str], max_batch_size: Optional[int]
+) -> Tuple[FrozenSet[str], List[CapacityGate]]:
+    """``paths`` without the gates closed at ``max_batch_size``, and the gates that closed.
+
+    A gate closes when its path is in ``paths`` and ``max_batch_size`` is None or
+    above its ``most_requests``; the path and its dependents leave the set, which
+    stays closed under ``depends_on``. Changes nothing.
+    """
+    closed = [
+        gate
+        for gate in CAPACITY_GATES
+        if gate.path in paths and (max_batch_size is None or max_batch_size > gate.most_requests)
+    ]
+    if not closed:
+        return paths, closed
+    return paths - dependents(gate.path for gate in closed), closed
+
+
+@dataclasses.dataclass(frozen=True)
+class Yield:
+    """A served fast path left out of a plan that carries another one doing its job.
+
+    ``path`` (and every fast path built on it) leaves the plan when ``to`` is in it,
+    after the capacity gates. ``why`` says in words what the two share.
+    """
+
+    path: str
+    to: str
+    why: str
+
+
+#: The fast paths a plan leaves to another one it carries. ``hot_replicas`` and
+#: ``half_window_experts`` both stack extra NVFP4 experts on every TP4 rank and place
+#: each step's experts over them; the half window is measured ahead through 8
+#: concurrent requests (its capacity gate), so a plan carrying it leaves the hot copies
+#: out and the two never both hold memory or both arm.
+YIELDS: Tuple[Yield, ...] = (
+    Yield(
+        "hot_replicas",
+        "half_window_experts",
+        "both stack extra NVFP4 experts per TP4 rank and place each step's experts over them",
+    ),
+)
+
+
+def yielded(paths: FrozenSet[str]) -> Tuple[FrozenSet[str], List[Yield]]:
+    """``paths`` without those that yield to another path in it, and the yields applied.
+
+    Closed under ``depends_on`` like ``capacity_gated``. Changes nothing.
+    """
+    applied = [rule for rule in YIELDS if rule.path in paths and rule.to in paths]
+    if not applied:
+        return paths, applied
+    return paths - dependents(rule.path for rule in applied), applied
+
+
 def compose(
     text_model: Any,
     model_config: Any,
@@ -971,6 +1110,7 @@ def compose(
     compositions: Mapping[CompositionKey, TargetPaths],
     compute_capability: Optional[Tuple[int, int]],
     spec_worker: Any = None,
+    max_batch_size: Optional[int] = None,
 ) -> Plan:
     """The plan this model is built with: its composition, or ``NO_PATHS``.
 
@@ -980,8 +1120,13 @@ def compose(
     is the composition's fast paths, less those written for a windowed arena when
     the worker's arena is not windowed, and, over a windowed arena, less the
     arena-writing paths (``FULL_CONTEXT_ARENA_PATHS``) unless the composition also
-    serves the window compaction (structural as well), and
-    the preconditions of those paths are checked once, agreed over the TP group
+    serves the window compaction or the architecture is one of
+    ``WINDOWED_COMMIT_SMS`` (whose windowed commit addresses the arena by its
+    physical columns and compacts itself; structural as well), less the paths a
+    capacity gate closes at the engine's ``max_batch_size`` (``CAPACITY_GATES``;
+    every rank reads the same engine argument), less the paths that yield to another
+    path still in the plan (``YIELDS``), and the preconditions of those
+    paths and the arena kind are checked once, agreed over the TP group
     (collective; every rank returns the same plan or raises the same error).
 
     Raises:
@@ -999,9 +1144,12 @@ def compose(
         )
         return NO_PATHS
     windowed = windowed_context_arena(spec_worker)
-    paths = frozenset(served.served)
+    paths, gated = capacity_gated(frozenset(served.served), max_batch_size)
+    paths, yields = yielded(paths)
     if windowed:
-        if not paths & frozenset(WINDOWED_CONTEXT_ARENA_PATHS):
+        if not paths & frozenset(WINDOWED_CONTEXT_ARENA_PATHS) and (
+            sm_of(compute_capability) not in WINDOWED_COMMIT_SMS
+        ):
             paths = paths - dependents(FULL_CONTEXT_ARENA_PATHS)
     else:
         paths = paths - dependents(WINDOWED_CONTEXT_ARENA_PATHS)
@@ -1021,6 +1169,13 @@ def compose(
     plan = Plan(paths)
     if windowed:
         composed += f" with {_WINDOWED_ARENA}"
+    for gate in gated:
+        composed += (
+            f" without {gate.path} (max_batch_size {max_batch_size} above {gate.most_requests};"
+            f" it costs {gate.cost})"
+        )
+    for rule in yields:
+        composed += f" without {rule.path} (it yields to {rule.to}: {rule.why})"
     logger.info(f"{composed}: {plan.describe()}")
     return plan
 

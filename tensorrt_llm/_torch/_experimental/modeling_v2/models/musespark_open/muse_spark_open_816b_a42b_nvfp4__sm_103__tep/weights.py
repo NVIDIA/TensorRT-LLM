@@ -54,7 +54,9 @@ def install_loaded_features(
 
     Without ``replicated_experts``, ``persistent_experts`` and ``bf16_routed_experts``
     are installed on the owner-only window (``_install_owner_window``: no
-    replication, every expert on its owner), at tp 4 or tp 8.
+    replication, every expert on its owner), at tp 4 or tp 8; with
+    ``half_window_experts`` (tp 4) the NVFP4 layers also stack the ring predecessor's
+    upper half, which the prologue's routed kernel places onto (``half=True``).
 
     Then ``hot_replicas`` (``hot_replicas.install``: hooks only, at tp 4; the copies are
     gathered on the first forward of a deployment that serves 33..512-row decode steps),
@@ -136,8 +138,14 @@ def _install_owner_window(text_model, mapping, plan: "_dispatch.Plan") -> None:
     from .kernels.replicated_experts import ring_buddy as _ring_buddy
 
     extra = {"persistent": True} if plan.enabled("persistent_experts") else {}
+    if plan.enabled("wide_persistent_experts"):
+        from .ops.moe import persistent_experts as _persistent
+
+        extra["persistent_rows"] = _persistent.WIDE_MAX_ROWS
     if plan.enabled("bf16_routed_experts"):
         extra["bf16_unpacked"] = True
+    if plan.enabled("half_window_experts"):
+        extra["half"] = True
     _ring_buddy.install(text_model, mapping, balance=False, windows=1, **extra)
 
 
