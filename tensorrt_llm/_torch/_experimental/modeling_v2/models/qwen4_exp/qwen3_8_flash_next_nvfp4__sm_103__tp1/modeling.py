@@ -586,10 +586,11 @@ def _mtp_draft_head_mode() -> str:
 _DENSE_FP8_ENV = "TRTLLM_MODELING_V2_DENSE_FP8"
 
 #: Rows from which a projection takes the FP8 entry, per projection kind: the input
-#: projections at every row count the bf16 GEMV / fused paths do not serve, the K=6144 output
-#: projections only where the GEMM saving outgrows the activation quantization's two launches
-#: (GB300 micro-bench: cuBLASLt bf16 8-10 us vs FP8 6-7 us + ~4 us below ~512 rows).
-_DENSE_FP8_MIN_ROWS = {"in": 1, "out": 512}  # capacity: fixed: dispatch thresholds
+#: projections from 2 rows (one row stays on the bf16 GEMV / fused launches, whose PDL
+#: overlap the two quantization launches would break), the K=6144 output projections only
+#: where the GEMM saving outgrows the activation quantization's two launches (GB300
+#: micro-bench: cuBLASLt bf16 8-10 us vs FP8 6-7 us + ~4 us below ~512 rows).
+_DENSE_FP8_MIN_ROWS = {"in": 2, "out": 512}  # capacity: fixed: dispatch thresholds
 
 
 def _dense_fp8_enabled() -> bool:
