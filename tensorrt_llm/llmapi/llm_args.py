@@ -4858,8 +4858,6 @@ class BaseLlmArgs(StrictBaseModel):
     """Base class for the LLM arguments. It contains all the common arguments."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    _rank_info_auth_key: Optional[bytes] = PrivateAttr(default=None)
-
     # Explicit arguments
     model: Union[str, Path] = Field(
         description=

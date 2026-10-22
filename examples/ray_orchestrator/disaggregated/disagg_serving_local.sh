@@ -90,12 +90,14 @@ fi
 
 # All independently launched workers and the proxy must share this secret.
 INTERNAL_REQUEST_AUTH_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-trap 'rm -f extra_llm_config.yaml disagg_config_local.yaml' EXIT
+AUTH_CONFIG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/trtllm-disagg.XXXXXX") || exit 1
+trap 'rm -rf "${AUTH_CONFIG_DIR}"' EXIT
+umask 077
 
 # Generate extra_llm_config.yaml based on executor type
 echo "Generating extra_llm_config.yaml for executor: $BACKEND"
 if [[ "$BACKEND" == "ray" ]]; then
-    cat > extra_llm_config.yaml << EOF
+    cat > "${AUTH_CONFIG_DIR}/extra_llm_config.yaml" << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
 internal_request_auth_key: "$INTERNAL_REQUEST_AUTH_KEY"
 cache_transceiver_config:
@@ -107,7 +109,7 @@ disable_overlap_scheduler: true
 orchestrator_type: "ray"
 EOF
 else
-    cat > extra_llm_config.yaml << EOF
+    cat > "${AUTH_CONFIG_DIR}/extra_llm_config.yaml" << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
 internal_request_auth_key: "$INTERNAL_REQUEST_AUTH_KEY"
 cache_transceiver_config:
@@ -121,7 +123,7 @@ fi
 
 # Generate disaggregated server config
 echo "Generating disagg_config_local.yaml"
-cat > disagg_config_local.yaml << EOF
+cat > "${AUTH_CONFIG_DIR}/disagg_config_local.yaml" << EOF
 hostname: localhost
 port: 8000
 model: $MODEL_DIR
@@ -173,18 +175,18 @@ if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config "${AUTH_CONFIG_DIR}/extra_llm_config.yaml" &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
 fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config "${AUTH_CONFIG_DIR}/extra_llm_config.yaml" &> output_gen0 &
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."
-trtllm-serve disaggregated -c disagg_config_local.yaml -t 300
+trtllm-serve disaggregated -c "${AUTH_CONFIG_DIR}/disagg_config_local.yaml" -t 300
 
 # Cleanup
 if [[ "$RAY_STARTED" == "true" && "$ATTACH_MODE" != "true" ]]; then

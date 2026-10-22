@@ -176,6 +176,9 @@ def _create_transceivers(tp, managers, config, enable_attention_dp=False):
     results = [None] * tp
     errors = [None] * tp
 
+    config = config.model_copy(deep=True)
+    config._rank_info_auth_key = b"test-rank-info-auth-key"
+
     def _init(rank):
         try:
             mapping = Mapping(

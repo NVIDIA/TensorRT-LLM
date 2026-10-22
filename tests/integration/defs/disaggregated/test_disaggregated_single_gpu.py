@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import os
 import pickle
@@ -174,10 +177,10 @@ async def run_worker(kv_cache_config,
     set_mpi_comm(session)
     mpi_session = MpiCommSession(comm=session, n_workers=session.Get_size())
 
+    cache_transceiver_config._rank_info_auth_key = b"test-rank-info-auth-key"
     try:
         llm = LLM(tensor_parallel_size=1,
                   model=model_name,
-                  internal_request_auth_key="test-rank-info-auth-key",
                   enable_chunked_prefill=False,
                   **pytorch_config,
                   _mpi_session=mpi_session,

@@ -15,7 +15,6 @@
 
 import atexit
 import os
-import secrets
 import socket
 import threading
 import time
@@ -57,7 +56,6 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .disagg_utils import _validate_internal_request_auth_key
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
@@ -68,17 +66,6 @@ from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
-
-_PROCESS_RANK_INFO_AUTH_KEY = secrets.token_bytes(32)
-
-
-def _resolve_rank_info_auth_key(internal_request_auth_key: Optional[str],
-                                rank_info_auth_key: Optional[bytes]) -> bytes:
-    if rank_info_auth_key is not None:
-        return rank_info_auth_key
-    if internal_request_auth_key is not None:
-        return internal_request_auth_key.encode("utf-8")
-    return _PROCESS_RANK_INFO_AUTH_KEY
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -378,7 +365,6 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
-        rank_info_auth_key = kwargs.pop("_rank_info_auth_key", None)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
         self._disaggregated_params: dict | None = None
@@ -410,7 +396,7 @@ class BaseLLM:
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
-                ['_mpi_session', '_rank_info_auth_key', 'backend'])
+                ['_mpi_session', 'backend'])
             if issubclass(llm_args_cls, TorchLlmArgs):
                 # Values are vetted by TorchLlmArgs._drop_removed_args.
                 valid_keys |= TORCH_LLMARGS_REMOVED_ARGS
@@ -430,7 +416,6 @@ class BaseLLM:
                                      revision=revision,
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
-            self.args._rank_info_auth_key = rank_info_auth_key
 
         except Exception as e:
             logger.error(
@@ -1816,11 +1801,6 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
-        internal_request_auth_key = _validate_internal_request_auth_key(
-            kwargs.pop("internal_request_auth_key", None))
-        rank_info_auth_key = _resolve_rank_info_auth_key(
-            internal_request_auth_key, kwargs.pop("_rank_info_auth_key", None))
-        kwargs["_rank_info_auth_key"] = rank_info_auth_key
         self._usage_lifecycle_active = False
         self._usage_lifecycle_lock = threading.Lock()
         telemetry_config = kwargs.get("telemetry_config")
@@ -2034,7 +2014,7 @@ class _TorchLLM(BaseLLM):
         # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
         accepted_keys = (set(TorchLlmArgs.model_fields.keys())
                          | TORCH_LLMARGS_REMOVED_ARGS
-                         | {'_mpi_session', '_rank_info_auth_key', 'backend'})
+                         | {'_mpi_session', 'backend'})
 
         # Check if any arguments not supported by the PyTorch backend are passed.
         unsupported_args = [key for key in kwargs if key not in accepted_keys]

@@ -256,6 +256,35 @@ generation_servers:
       - "localhost:8003"
 ```
 
+### Native RankInfo authentication
+
+The Python/native KV-cache transceiver also uses `internal_request_auth_key` to
+protect its ZMQ RankInfo endpoint. Configure the same non-empty key on every
+context worker, generation worker, and proxy. The serving command provisions it
+into the transceiver configuration before executor processes start. Managed MPI
+launches generate a shared RankInfo key when no explicit key is configured.
+Independently launched native workers without a key fail during initialization.
+
+Upgrade communicating context and generation workers together: authenticated
+RankInfo exchanges are incompatible with workers using the old protocol.
+
+For programmatic native-transceiver applications, provision the same bytes in
+each worker's configuration before constructing its LLM:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import CacheTransceiverConfig
+
+# Obtain shared_key_bytes from your deployment's secret provisioning mechanism.
+config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+config._rank_info_auth_key = shared_key_bytes
+llm = LLM(model=model_path, cache_transceiver_config=config)
+```
+
+This internal configuration attribute is carried with the configuration object;
+it is not a YAML field and is excluded from configuration dumps. CLI users should
+continue to use `internal_request_auth_key` in their server YAML files.
+
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
 server config and in each context/generation worker config. The proxy signs internal

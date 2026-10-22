@@ -102,7 +102,22 @@ _RANK_INFO_AUTH_CONTEXT = b"trtllm-rank-info-request-v1\0"
 _RANK_INFO_NONCE_BYTES = 32
 _RANK_INFO_AUTH_TAG_BYTES = 32
 _RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
-_PROCESS_RANK_INFO_AUTH_KEY = secrets.token_bytes(32)
+_RANK_INFO_CHALLENGE_TTL_S = 30.0
+
+
+def _require_rank_info_auth_key(key: Optional[bytes]) -> bytes:
+    if not isinstance(key, bytes) or not key:
+        raise ValueError(
+            "Native RankInfo authentication requires a shared key. Configure the same "
+            "internal_request_auth_key on all context, generation, and proxy servers; "
+            "programmatic callers must provision CacheTransceiverConfig._rank_info_auth_key "
+            "before creating their LLMs."
+        )
+    return key
+
+
+class RankInfoAuthenticationError(PermissionError):
+    """A peer failed the native RankInfo authentication handshake."""
 
 
 def _rank_info_auth_tag(auth_key: bytes, endpoint: str, nonce: bytes) -> bytes:
@@ -2503,7 +2518,7 @@ class Receiver(ReceiverBase):
         # Internal component gate only. Production wiring is added after the
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
-        self._rank_info_auth_key = rank_info_auth_key or _PROCESS_RANK_INFO_AUTH_KEY
+        self._rank_info_auth_key = _require_rank_info_auth_key(rank_info_auth_key)
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -2701,7 +2716,7 @@ class Receiver(ReceiverBase):
         sender_dp_rank = params.ctx_dp_rank
         try:
             peer_infos: RankInfo = self._get_sender_info(params)
-        except PeerIncompatibleError as e:
+        except (PeerIncompatibleError, RankInfoAuthenticationError) as e:
             # Fail only this request via the normal transfer-error path
             # (task ERROR -> session ERROR -> WaitResult.FAILED ->
             # DISAGG_TRANS_ERROR), so one incompatible context peer does not
@@ -2714,7 +2729,7 @@ class Receiver(ReceiverBase):
             # bounce reservation exists yet, and session._sender_endpoints
             # is still empty, so the unpublished owner can close locally.
             logger.error(
-                "dispatch_task: context peer incompatible, failing request "
+                "dispatch_task: context peer rejected, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
             if self._enforce_physical_ownership:
@@ -2894,7 +2909,10 @@ class Receiver(ReceiverBase):
                     or challenge[0] != MessageType.AUTHENTICATION_CHALLENGE
                     or len(challenge[1]) != _RANK_INFO_NONCE_BYTES
                 ):
-                    raise PermissionError("Invalid RankInfo authentication challenge")
+                    raise RankInfoAuthenticationError(
+                        "Invalid RankInfo authentication challenge: context and generation "
+                        "workers must use compatible versions supporting RankInfo authentication"
+                    )
                 nonce = challenge[1]
                 messenger.send(
                     [
@@ -2905,7 +2923,10 @@ class Receiver(ReceiverBase):
                 )
                 message = messenger.receive()
                 if message == [MessageType.AUTHENTICATION_ERROR]:
-                    raise PermissionError("RankInfo request authentication failed")
+                    raise RankInfoAuthenticationError(
+                        "RankInfo authentication failed: configure the same internal_request_auth_key "
+                        "on all context, generation, and proxy servers; retry if the challenge expired"
+                    )
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
@@ -3740,8 +3761,8 @@ class RankInfoServer:
         rank_info_auth_key: Optional[bytes] = None,
     ):
         self._rank_info = rank_info
-        self._rank_info_auth_key = rank_info_auth_key or _PROCESS_RANK_INFO_AUTH_KEY
-        self._rank_info_auth_challenges: OrderedDict[bytes, bytes] = OrderedDict()
+        self._rank_info_auth_key = _require_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
@@ -3780,21 +3801,32 @@ class RankInfoServer:
         self._messenger.start_listener(handle_message)
 
     def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
+        now = time.monotonic()
+        while self._rank_info_auth_challenges:
+            _, expires = next(iter(self._rank_info_auth_challenges.values()))
+            if expires > now:
+                break
+            self._rank_info_auth_challenges.popitem(last=False)
         if len(message) == 1:
+            if (
+                send_id not in self._rank_info_auth_challenges
+                and len(self._rank_info_auth_challenges) >= _RANK_INFO_CHALLENGE_CACHE_SIZE
+            ):
+                self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+                return
             challenge = secrets.token_bytes(_RANK_INFO_NONCE_BYTES)
-            self._rank_info_auth_challenges[send_id] = challenge
+            self._rank_info_auth_challenges[send_id] = (challenge, now + _RANK_INFO_CHALLENGE_TTL_S)
             self._rank_info_auth_challenges.move_to_end(send_id)
-            if len(self._rank_info_auth_challenges) > _RANK_INFO_CHALLENGE_CACHE_SIZE:
-                self._rank_info_auth_challenges.popitem(last=False)
             self._messenger.send([send_id, MessageType.AUTHENTICATION_CHALLENGE, challenge])
             return
 
+        pending = self._rank_info_auth_challenges.pop(send_id, None)
         if len(message) != 3:
             self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
             return
 
         nonce, provided_tag = message[1:]
-        expected_nonce = self._rank_info_auth_challenges.pop(send_id, None)
+        expected_nonce = pending[0] if pending is not None else None
         authenticated = (
             len(nonce) == _RANK_INFO_NONCE_BYTES
             and len(provided_tag) == _RANK_INFO_AUTH_TAG_BYTES
@@ -3887,7 +3919,7 @@ class TransferWorkerConfig:
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
-        self._rank_info_auth_key = config.rank_info_auth_key or _PROCESS_RANK_INFO_AUTH_KEY
+        self._rank_info_auth_key = _require_rank_info_auth_key(config.rank_info_auth_key)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len

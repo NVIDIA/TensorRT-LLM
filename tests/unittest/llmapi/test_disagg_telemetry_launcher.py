@@ -487,7 +487,8 @@ def test_launch_disaggregated_server_sets_worker_role(
         serve._launch_disaggregated_server("disagg.yaml", llm_args, rank_info_auth_key)
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == expected_role
-    assert llm_args["_rank_info_auth_key"] == rank_info_auth_key
+    assert llm_args["cache_transceiver_config"]._rank_info_auth_key == rank_info_auth_key
+    assert "_rank_info_auth_key" not in llm_args
     mock_launch_server.assert_called_once_with(
         host="127.0.0.1",
         port=8000,
@@ -495,3 +496,43 @@ def test_launch_disaggregated_server_sets_worker_role(
         allow_request_chat_template=False,
         multi_frontend_enabled=False,
     )
+
+
+@pytest.mark.parametrize("encoded", [None, "", "not-hex"])
+def test_rank_info_auth_rejects_invalid_remote_key(monkeypatch, encoded):
+    name = serve.DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY
+    if encoded is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, encoded)
+    with pytest.raises(RuntimeError, match="authentication key"):
+        serve._resolve_rank_info_auth_key(SimpleNamespace(), True, mock.Mock())
+
+
+def test_nonzero_rank_receives_key_without_generating_one():
+    comm = mock.Mock()
+    comm.Get_rank.return_value = 1
+    comm.bcast.return_value = b"shared-key"
+    with mock.patch.object(serve.secrets, "token_bytes") as generate:
+        assert serve._resolve_rank_info_auth_key(SimpleNamespace(), False, comm) == b"shared-key"
+    generate.assert_not_called()
+    comm.bcast.assert_called_once_with(None, root=0)
+
+
+def test_rank_info_key_is_carried_by_transceiver_config():
+    import pickle
+
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    args = {"cache_transceiver_config": {"backend": "NIXL"}}
+    serve._set_rank_info_auth_key(args, b"shared-key")
+    config = args["cache_transceiver_config"]
+    # Exercise the model boundary and serialization used to reach spawned executors.
+    llm_args = TorchLlmArgs.model_construct(cache_transceiver_config=config)
+    restored = pickle.loads(pickle.dumps(llm_args))
+    assert restored.cache_transceiver_config._rank_info_auth_key == b"shared-key"
+    assert "_rank_info_auth_key" not in config.model_dump()
+    assert "shared-key" not in repr(config)
+    with pytest.raises(ValueError, match="Conflicting"):
+        serve._set_rank_info_auth_key(args, b"different-key")
+    assert config._rank_info_auth_key == b"shared-key"

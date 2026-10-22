@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #SBATCH --partition=${partition}
 #SBATCH --account=${account}
 #SBATCH --job-name=${job_name}
@@ -10,15 +12,33 @@ work_path=""
 ctx_port=8001
 gen_port=8002
 
-internal_request_auth_key=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
-auth_config_dir=$(mktemp -d "${work_path}/.trtllm-disagg.XXXXXX")
-for config_name in ctx gen disagg; do
-    {
-        printf 'internal_request_auth_key: "%s"\n' "${internal_request_auth_key}"
-        cat "${work_path}/${config_name}_config.yaml"
-    } >"${auth_config_dir}/${config_name}_config.yaml"
-done
+# Generated configs must be on a shared path mounted at the same location on each node.
+: "${work_path:?Set work_path to the shared configuration directory}"
+auth_config_dir=$(mktemp -d "${work_path}/.trtllm-disagg.XXXXXX") || exit 1
 trap 'rm -rf "${auth_config_dir}"' EXIT
+python3 - "${work_path}" "${auth_config_dir}" <<'PYCONFIG' || exit 1
+import os
+import secrets
+import sys
+from pathlib import Path
+import yaml
+
+source, destination = map(Path, sys.argv[1:])
+configs = {}
+for name in ("ctx", "gen", "disagg"):
+    with (source / f"{name}_config.yaml").open() as stream:
+        configs[name] = yaml.safe_load(stream) or {}
+keys = [config["internal_request_auth_key"] for config in configs.values()
+        if config.get("internal_request_auth_key") is not None]
+if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) > 1:
+    raise ValueError("Configure one matching, non-empty internal_request_auth_key")
+key = keys[0] if keys else secrets.token_hex(32)
+for name, config in configs.items():
+    config["internal_request_auth_key"] = key
+    fd = os.open(destination / f"{name}_config.yaml", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        yaml.safe_dump(config, stream)
+PYCONFIG
 
 # The `container_image` must have the TensorRT-LLM wheel package pre-installed.
 # Once the task is successfully launched, an API service will be available externally at http://host_ip:PORT.

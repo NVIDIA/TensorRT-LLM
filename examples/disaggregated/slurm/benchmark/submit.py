@@ -72,13 +72,31 @@ def get_server_health_timeout(env_config: Dict[str, Any]) -> int:
 
 def resolve_internal_request_auth_key(config):
     """Return one shared key, generating it when the launch config omits it."""
-    return (config.get('internal_request_auth_key') or config.get(
-        'server_config_extra', {}).get('internal_request_auth_key')
-            or config.get('worker_config', {}).get(
-                'ctx', {}).get('internal_request_auth_key')
-            or config.get('worker_config', {}).get(
-                'gen', {}).get('internal_request_auth_key')
-            or secrets.token_hex(32))
+    values = [
+        config.get('internal_request_auth_key'),
+        config.get('server_config_extra', {}).get('internal_request_auth_key'),
+        config.get('worker_config',
+                   {}).get('ctx', {}).get('internal_request_auth_key'),
+        config.get('worker_config', {}).get('gen',
+                                            {}).get('internal_request_auth_key')
+    ]
+    keys = [key for key in values if key is not None]
+    if any(not isinstance(key, str) or not key for key in keys):
+        raise ValueError("internal_request_auth_key must be a non-empty string")
+    if len(set(keys)) > 1:
+        raise ValueError(
+            "internal_request_auth_key must match across all launch configurations"
+        )
+    return keys[0] if keys else secrets.token_hex(32)
+
+
+def write_private_yaml(config, output_path):
+    """Write a secret-bearing config without exposing it through default file modes."""
+    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.truncate(0)
+        yaml.safe_dump(config, stream, default_flow_style=False)
 
 
 def save_worker_config(worker_config,
@@ -89,8 +107,7 @@ def save_worker_config(worker_config,
     if internal_request_auth_key is not None:
         worker_config['internal_request_auth_key'] = internal_request_auth_key
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        yaml.dump(worker_config, f, default_flow_style=False)
+    write_private_yaml(worker_config, output_path)
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
@@ -626,8 +643,8 @@ def submit_job(config, log_dir, dry_run):
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])
     server_config['internal_request_auth_key'] = internal_request_auth_key
-    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
-        yaml.dump(server_config, f)
+    write_private_yaml(server_config,
+                       os.path.join(log_dir, "server_config_base.yaml"))
     disagg_server_hostname = server_config['hostname']
     disagg_server_port = server_config['port']
 

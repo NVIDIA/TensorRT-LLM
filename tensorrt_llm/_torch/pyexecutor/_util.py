@@ -3969,8 +3969,6 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    if cache_transceiver_config is not None:
-        cache_transceiver_config._rank_info_auth_key = llm_args._rank_info_auth_key
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config, mamba_cache_manager)
