@@ -37,6 +37,7 @@ from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_c
 from ...utils import get_model_extra_attrs
 from ..linear import Linear
 from ..mamba.causal_conv1d import causal_conv1d_fn
+from ..mamba.causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
@@ -129,6 +130,21 @@ def _kda_split_conv_sections(
         conv_state[:, dim : 2 * dim].contiguous(),
         conv_state[:, 2 * dim :].contiguous(),
     )
+
+
+def _adjacent_sections_view(*sections: torch.Tensor) -> Optional[torch.Tensor]:
+    """``torch.cat(sections, -1)`` as a view when the sections already sit back to
+    back in one buffer (strided slices of a fused projection), else None."""
+    first = sections[0]
+    offset = first.storage_offset()
+    for section in sections:
+        if section.stride() != first.stride() or section.storage_offset() != offset:
+            return None
+        if section.untyped_storage().data_ptr() != first.untyped_storage().data_ptr():
+            return None
+        offset += section.shape[-1]
+    shape = (*first.shape[:-1], sum(section.shape[-1] for section in sections))
+    return first.as_strided(shape, first.stride(), first.storage_offset())
 
 
 def _kda_expand_fla_conv_cache(conv_state: torch.Tensor) -> torch.Tensor:
@@ -337,6 +353,7 @@ class KimiKDALinearAttention(nn.Module):
         # Output buffer for the inplace-only ``trtllm::kda_decode`` op.
         self._o_dense: Optional[torch.Tensor] = None
         self._packed_conv_weight: Optional[torch.Tensor] = None
+        self._verify_index_cache: dict = {}
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
         self.register_to_config = False
@@ -1520,6 +1537,20 @@ class KimiKDALinearAttention(nn.Module):
             "speculative verification requires the cache manager's "
             "SpeculativeState (legacy intermediate-buffer path)"
         )
+        if self._packed_conv_weight is not None and intermediate_ssm.dtype in (
+            torch.float32,
+            ssm_pool.dtype,
+        ):
+            return self._forward_verify_batched(
+                x2d,
+                num_steps,
+                intermediate_conv,
+                intermediate_ssm,
+                conv_pool,
+                ssm_pool,
+                slot_indices,
+                output=output,
+            )
 
         d = self.proj_size
         num_generations = x2d.shape[0] // num_steps
@@ -1594,6 +1625,115 @@ class KimiKDALinearAttention(nn.Module):
         core = self._output_gate(x, o, onorm_g)
         # Can be removed once attention writes the core in place.
         return self._store_core(core, output)
+
+    def _forward_verify_batched(
+        self,
+        x2d,
+        num_steps,
+        intermediate_conv,
+        intermediate_ssm,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """All verify steps in one convolution and one recurrent launch.
+
+        Same contract as the per-step loop of :meth:`forward_verify_sequential`:
+        the live pools are only read, and step ``t``'s convolution window and
+        recurrent state land in ``intermediate_conv[:B, t]`` and
+        ``intermediate_ssm[:B, t]`` for ``update_mamba_states()``.
+        """
+        from einops import rearrange
+        from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+
+        d = self.proj_size
+        num_generations = x2d.shape[0] // num_steps
+        num_tokens = num_generations * num_steps
+        device = x2d.device
+        x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
+
+        projections = self._project_verify_inputs(x, x2d.shape[0], preserve_section_strides=True)
+        if projections is None:
+            qkv = torch.cat((self.q_proj(x), self.k_proj(x), self.v_proj(x)), dim=-1)
+            g = self.f_b_proj(self.f_a_proj(x))
+            beta = self.b_proj(x)
+            onorm_g = None
+        else:
+            q_proj_states, k_proj_states, v_proj_states, g, beta, onorm_g = projections
+            qkv = _adjacent_sections_view(q_proj_states, k_proj_states, v_proj_states)
+            if qkv is None:
+                qkv = torch.cat((q_proj_states, k_proj_states, v_proj_states), dim=-1)
+            if onorm_g is not None:
+                onorm_g = onorm_g.contiguous()
+
+        batch_rows, state_rows, cu_seqlens = self._verify_index_tensors(
+            num_generations, num_steps, intermediate_ssm.shape[1], device
+        )
+        # The convolution kernel slides the window it is given, so it runs on a
+        # gathered copy of the rows; per-step windows go to intermediate_conv.
+        conv_rows = conv_pool.index_select(0, slot_indices.long())
+        conv_out = causal_conv1d_update_triton(
+            qkv.transpose(1, 2),  # [B, 3D, T]
+            conv_rows,
+            self._packed_conv_weight,
+            None,
+            "silu",
+            conv_state_indices=batch_rows,
+            intermediate_conv_window=intermediate_conv,
+            intermediate_state_indices=batch_rows,
+        )
+        q, k, v = fused_kda_post_conv(
+            conv_out.transpose(1, 2).reshape(num_tokens, 3 * d).t(),
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+        )
+
+        # Step t of request b reads its state from row (b, 0), seeded with the
+        # pool state, and writes it to row (b, t) of intermediate_ssm.
+        intermediate_ssm[:num_generations, 0].copy_(ssm_pool.index_select(0, slot_indices.long()))
+        o, _ = fused_recurrent_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=rearrange(g, "b t (h d) -> 1 (b t) h d", d=self.head_dim).contiguous(),
+            beta=beta.reshape(1, num_tokens, -1).contiguous(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=intermediate_ssm.view(-1, *intermediate_ssm.shape[2:]),
+            scale=self.head_k_dim**-0.5,
+            inplace_final_state=True,
+            state_v_first=True,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=state_rows,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            lower_bound=self.gate_lower_bound,
+        )
+        core = self._output_gate(x, o.view(num_generations, num_steps, *o.shape[2:]), onorm_g)
+        # Can be removed once attention writes the core in place.
+        return self._store_core(core, output)
+
+    def _verify_index_tensors(
+        self, num_generations: int, num_steps: int, t_max: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch rows, ``[B, T]`` intermediate-state rows and ``cu_seqlens`` for
+        :meth:`_forward_verify_batched`, built once per shape so CUDA graph
+        replays do not rerun them."""
+        key = (num_generations, num_steps, t_max, device)
+        cached = self._verify_index_cache.get(key)
+        if cached is None:
+            batch_rows = torch.arange(num_generations, device=device, dtype=torch.int32)
+            state_rows = (
+                batch_rows[:, None] * t_max
+                + torch.arange(num_steps, device=device, dtype=torch.int32)[None, :]
+            )
+            cu_seqlens = torch.arange(
+                0, num_generations * num_steps + 1, num_steps, device=device, dtype=torch.long
+            )
+            cached = (batch_rows, state_rows, cu_seqlens)
+            self._verify_index_cache[key] = cached
+        return cached
 
     def _output_gate(
         self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
