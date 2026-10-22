@@ -17,6 +17,10 @@
 # primers (the published runs use 3600 s), so each lane fits a CI stage;
 # 1800 s is above the AgentX scenario's 900 s minimum.
 metadata:
+  # Cache-transceiver precheck hint, read only when no checkpoint is staged (the
+  # checkpoint's own DeepseekV41ForCausalLM takes precedence). DeepseekV41ForCausalLM
+  # inherits the KV-cache-manager and transceiver preferences of this base class.
+  architecture: DeepseekV4ForCausalLM
   model_name: deepseek_v41_flash_nvfp4_dspark
   precision: fp4
   model_dir_name: DeepSeek-V4.1-Flash-NVFP4
