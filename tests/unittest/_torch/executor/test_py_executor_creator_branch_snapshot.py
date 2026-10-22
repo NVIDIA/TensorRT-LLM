@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import _branch_snapshot_ctx_chunk_config
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
 
@@ -26,8 +27,8 @@ FCFS = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
 FORCE = ContextChunkingPolicy.FORCE_CHUNK
 
 
-RECORDS = SimpleNamespace(records_branch_snapshots=True)
-NO_RECORDS = SimpleNamespace(records_branch_snapshots=False)
+RECORDS = Mock(spec=KVCacheManagerV2, records_branch_snapshots=True)
+NO_RECORDS = Mock(spec=KVCacheManagerV2, records_branch_snapshots=False)
 
 
 @pytest.mark.parametrize(
@@ -41,7 +42,7 @@ NO_RECORDS = SimpleNamespace(records_branch_snapshots=False)
         # layers, a V1 manager, and no manager.
         (NO_RECORDS, (FCFS, 256), (FCFS, 256)),
         (NO_RECORDS, None, None),
-        (object(), (FCFS, 256), (FCFS, 256)),
+        (Mock(records_branch_snapshots=True), (FCFS, 256), (FCFS, 256)),
         (None, None, None),
     ],
 )
@@ -49,3 +50,25 @@ def test_branch_snapshot_ctx_chunk_config(
     manager: object, ctx_chunk_config: tuple | None, expected: tuple | None
 ) -> None:
     assert _branch_snapshot_ctx_chunk_config(ctx_chunk_config, manager, 32) == expected
+
+
+@pytest.mark.parametrize(
+    ("ctx_chunk_config", "configured_policy", "warned"),
+    [
+        # Chunked prefill was off, so forcing chunks is reported.
+        (None, None, True),
+        # A user-set policy is replaced and reported.
+        ((FCFS, 256), FCFS, True),
+        # The default policy and an explicit FORCE_CHUNK are not reported.
+        ((FCFS, 256), None, False),
+        ((FORCE, 32), FORCE, False),
+    ],
+)
+def test_branch_snapshot_ctx_chunk_config_reports_overrides(
+    ctx_chunk_config: tuple | None,
+    configured_policy: ContextChunkingPolicy | None,
+    warned: bool,
+) -> None:
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
+        _branch_snapshot_ctx_chunk_config(ctx_chunk_config, RECORDS, 32, configured_policy)
+    assert logger.warning_once.called == warned

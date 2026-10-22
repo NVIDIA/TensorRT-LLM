@@ -18,7 +18,8 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
@@ -54,6 +55,7 @@ from .dwdp import DwdpManager, get_global_dwdp_manager
 from .engine.runners.decoder.runner import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -333,17 +335,34 @@ def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
         engine.attn_runtime_features.cache_reuse = cache_reuse
 
 
-def _branch_snapshot_ctx_chunk_config(ctx_chunk_config: Optional[tuple],
-                                      kv_cache_manager,
-                                      tokens_per_block: int) -> Optional[tuple]:
+def _branch_snapshot_ctx_chunk_config(
+    ctx_chunk_config: Optional[tuple],
+    kv_cache_manager: Optional[BaseResourceManager],
+    tokens_per_block: int,
+    configured_policy: Optional[ContextChunkingPolicy] = None
+) -> Optional[tuple]:
     """Force chunk boundaries at SWA branch points if the manager records them.
 
     Decided on the built manager, which alone knows whether branch points apply
     (SWA layers present, no joint target/draft reuse). Otherwise the configured
     chunking is kept unchanged.
     """
-    if not getattr(kv_cache_manager, "records_branch_snapshots", False):
+    if not (isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.records_branch_snapshots):
         return ctx_chunk_config
+    if ctx_chunk_config is None:
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot turns on chunked "
+            "prefill with the FORCE_CHUNK policy, although "
+            "enable_chunked_prefill is False.",
+            key="branch_snapshot_enables_chunking")
+    elif (configured_policy is not None
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot replaces "
+            f"scheduler_config.context_chunking_policy={configured_policy} "
+            "with FORCE_CHUNK.",
+            key="branch_snapshot_replaces_chunking_policy")
     # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
     chunk_unit_size = (ctx_chunk_config[1]
                        if ctx_chunk_config is not None else tokens_per_block)
@@ -1220,7 +1239,7 @@ def _create_py_executor(
             ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
                 ctx_chunk_config,
                 resources.get(ResourceManagerType.KV_CACHE_MANAGER),
-                tokens_per_block),
+                tokens_per_block, scheduler_config.context_chunking_policy),
             model_engine=model_engine,
             start_worker=False,
             sampler=sampler,
@@ -1304,7 +1323,7 @@ def _create_py_executor(
                 ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
                     ctx_chunk_config,
                     resources.get(ResourceManagerType.KV_CACHE_MANAGER),
-                    tokens_per_block),
+                    tokens_per_block, scheduler_config.context_chunking_policy),
                 model_engine=model_engine,
                 start_worker=False,
                 sampler=sampler,
