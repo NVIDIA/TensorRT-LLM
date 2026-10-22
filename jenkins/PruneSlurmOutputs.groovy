@@ -89,14 +89,15 @@ def defaultClusterNames() {
         .sort()
 }
 
-// Runs under bash on the login node. Avoids `$` so no shell along the ssh path
+// Runs under bash on the login node. -H follows the top-level dirs, which some
+// clusters symlink to scratch storage. Avoids `$` so no shell along the ssh path
 // expands anything.
 def pruneCommands(String homeDir, String days, boolean dryRun) {
     def removeDir = dryRun ? "echo would remove {}" : "(echo removing {} && rm -rf {})"
     def deleteLog = dryRun ? "-print" : "-print -delete"
     return [
-        "find ${homeDir}/bloom/scripts -mindepth 1 -maxdepth 1 -type d -name '*-multi_node_test-*' -exec bash -c 'find {} -mtime -${days} -print -quit | grep -q . || ${removeDir}' \\; 2>/dev/null || true",
-        "find ${homeDir}/slurm-logs -maxdepth 1 -type f -name 'slurm-*-test-*.out' ! -mtime -${days} ${deleteLog} 2>/dev/null | wc -l | sed 's/^/agent logs ${dryRun ? 'to prune' : 'pruned'}: /'",
+        "find -H ${homeDir}/bloom/scripts -mindepth 1 -maxdepth 1 -type d -name '*-multi_node_test-*' -exec bash -c 'find {} -mtime -${days} -print -quit | grep -q . || ${removeDir}' \\; 2>/dev/null || true",
+        "find -H ${homeDir}/slurm-logs -maxdepth 1 -type f -name 'slurm-*-test-*.out' ! -mtime -${days} ${deleteLog} 2>/dev/null | wc -l | sed 's/^/agent logs ${dryRun ? 'to prune' : 'pruned'}: /'",
     ].join(" ; ")
 }
 
