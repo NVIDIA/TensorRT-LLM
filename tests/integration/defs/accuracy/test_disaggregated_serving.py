@@ -1700,6 +1700,8 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.5,
+                # "auto" resolves Qwen3 to V1; the shared draft KV needs V2.
+                "use_kv_cache_manager_v2": True,
             },
             # KVCacheManagerV2 requires the Python transceiver.
             "cache_transceiver_config": {
