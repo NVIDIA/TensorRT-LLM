@@ -556,6 +556,10 @@ _MTP_NUM_LAYERS = 1
 #: draft rejected; only the acceptance gate can tell.
 _MTP_EMBED_BLOCK_ALL_STREAMS = True
 
+#: Set to 1 to run the decode draft step on the composed (unfused) draft layer instead of the
+#: trunk's fused site, attention and projection launches (`DecodeTarget.mtp_forward`).
+_MTP_UNFUSED_ENV = "TRTLLM_MODELING_V2_MTP_UNFUSED"
+
 #: Decode batches up to this many rows run each trunk hyper-connection site as
 #: `qwen4_exp_hc_decode_first_cute` + `qwen4_exp_hc_decode_mix_cute` (or its NVFP4
 #: variant at an MoE site; two GEMV launches); larger ones as `qwen4_exp_hc_inject_norm`
@@ -1282,6 +1286,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self.moe_prefill_copy = _moe_prefill_copy(
             self.trunk_moe_backend, model_config.max_num_tokens
         )
+        self.max_num_tokens = model_config.max_num_tokens
 
         # ---- PLE -----------------------------------------------------------
         ple_ids = list(getattr(cfg, "ple_layer_ids", None) or [])
@@ -1519,6 +1524,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         )
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
+        self._mtp_fused: "_MtpFused | None" = None
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
@@ -1572,6 +1578,11 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             for tag in ("ahc", "mhc")
         }
         self._hc_first["fhc"] = fuse(w["fhc_down"])
+        if self.mtp_enabled:
+            p = f"l{self.mtp_layer_idx}_mtp_"
+            self._hc_first["mtp_ahc"] = fuse(w[f"{p}ahc_down"], w[f"{p}ahc_inject"])
+            self._hc_first["mtp_mhc"] = fuse(w[f"{p}mhc_down"], w[f"{p}mhc_inject"])
+            self._hc_first["mtp_fhc"] = fuse(w[f"{p}fhc_down"])
 
     def post_load_weights(self) -> None:
         """Derive what the targets read, then build them, now that the weights are real.
@@ -1637,6 +1648,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             self._mtp = _mtp_views(self)
 
         self._fuse_hc_first_projections()
+        if self.mtp_enabled:
+            self._mtp_fused = _mtp_fused_views(self)
 
         # The CPU-only load checks build the targets over host weights; they launch nothing.
         self._side_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -2344,6 +2357,48 @@ def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
         fhc_norm=core._norm_slices(f"{p}fhc_norm"),
         fhc_down=w[f"{p}fhc_down"],
         fhc_up=w[f"{p}fhc_up"],
+    )
+
+
+class _MtpFused(NamedTuple):
+    """The draft layer's operands in the trunk's fused layouts, built after load: the
+    `[q | k | v | gate | index | pad]` input projection (`weights._attn_in_w`), each
+    hyper-connection's `[down; block_inject; 0]` first projection (`_fuse_hc_first_projections`)
+    with its up projection and whole grouped-norm weight, and a unit injection weight (the
+    front end's per-stream `x_h + x_e` as the first site's injection)."""
+
+    attn_in: torch.Tensor
+    ahc_norm: torch.Tensor
+    ahc_first: torch.Tensor
+    ahc_up: torch.Tensor
+    mhc_norm: torch.Tensor
+    mhc_first: torch.Tensor
+    mhc_up: torch.Tensor
+    fhc_norm: torch.Tensor
+    fhc_first: torch.Tensor
+    fhc_up: torch.Tensor
+    unit_inject: torch.Tensor
+
+
+def _mtp_fused_views(core: Qwen4ExpTp1ModelingV2) -> _MtpFused:
+    w = core.w
+    p = f"l{core.mtp_layer_idx}_mtp_"
+    attn_in = _weights._attn_in_w((w[f"{p}q_w"], w[f"{p}k_w"], w[f"{p}v_w"], w[f"{p}idx_w"]), core)
+    assert attn_in.shape == (core.attn_in_width, core.hidden), attn_in.shape
+    return _MtpFused(
+        attn_in=attn_in.t(),
+        ahc_norm=w[f"{p}ahc_norm"],
+        ahc_first=core._hc_first["mtp_ahc"].t(),
+        ahc_up=w[f"{p}ahc_up"].t(),
+        mhc_norm=w[f"{p}mhc_norm"],
+        mhc_first=core._hc_first["mtp_mhc"].t(),
+        mhc_up=w[f"{p}mhc_up"].t(),
+        fhc_norm=w[f"{p}fhc_norm"],
+        fhc_first=core._hc_first["mtp_fhc"].t(),
+        fhc_up=w[f"{p}fhc_up"].t(),
+        unit_inject=torch.ones(
+            [core.max_num_tokens, core.hc_count], dtype=attn_in.dtype, device=attn_in.device
+        ),
     )
 
 
@@ -4420,6 +4475,7 @@ class DecodeTarget:
         )
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
+        self._mtp_unfused = os.environ.get(_MTP_UNFUSED_ENV, "0") == "1"
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast; see PrefillTarget._check_step_contract."""
@@ -5495,6 +5551,289 @@ class DecodeTarget:
         gate_logits = cublas_mm(x, M.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
+    def _mtp_layer(
+        self,
+        embed_tokens,
+        input_ids,
+        hidden_states,
+        md,
+        step,
+        draft,
+        layer_idx,
+        rows,
+        gen_seqs,
+        p,
+        sparse,
+        share,
+        reuse,
+        pos3,
+        pos,
+        coords,
+    ) -> torch.Tensor:
+        """The draft layer on the trunk's decode machinery: the front end's two projections,
+        both hyper-connection sites as `_hc_site` (the front end's per-stream `x_h + x_e` is
+        the first site's injection at unit weight, the attention output the second's), the
+        attention as `_mtp_attention`, the FP8 MoE as `_mtp_moe_block`. Returns the stream
+        with the MoE output injected, as the composed step does. The hyper-connection
+        mixers compute the composed `qwen4_exp_gated_residual`'s formulas with fp32 logits
+        and an fp32 bottleneck (the trunk sites' numerics), so the draft's tokens may differ
+        from the composed step's in the last place; the verify step decides acceptance."""
+        core = self.core
+        M, F = core._mtp, core._mtp_fused
+        gemm = _decode_projection if md.is_cuda_graph else cublas_mm
+        e = nn.functional.embedding(input_ids, embed_tokens)
+        x_e = gemm(flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e)
+        h_n = self._grouped_norm(hidden_states, M.pre_h_norm)
+        x_h = torch.reshape(
+            gemm(torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h),
+            [rows, core.stream],
+        )
+        x, mixed, inject = self._hc_site(
+            x_h, x_e, F.unit_inject[:rows], F.ahc_norm, F.ahc_first, F.ahc_up, True
+        )
+        attn = self._mtp_attention(
+            mixed,
+            md,
+            step,
+            draft,
+            layer_idx,
+            rows,
+            gen_seqs,
+            p,
+            sparse,
+            share,
+            reuse,
+            pos3,
+            pos,
+            coords,
+            gemm,
+        )
+        x, mixed, inject = self._hc_site(x, attn, inject, F.mhc_norm, F.mhc_first, F.mhc_up, True)
+        return qwen4_exp_post_inject(x, self._mtp_moe_block(mixed, x.dtype), inject)
+
+    def _mtp_attention(
+        self,
+        x,
+        md,
+        step,
+        draft,
+        layer_idx,
+        rows,
+        gen_seqs,
+        p,
+        sparse,
+        share,
+        reuse,
+        pos3,
+        pos,
+        coords,
+        gemm,
+    ) -> torch.Tensor:
+        """The draft layer's gated GQA and QSA index branch, as `_attention_block` runs a
+        trunk layer over the draft manager's planes (`draft`): one input projection
+        against `_MtpFused.attn_in`, the composed prologue (norm + rope of both planes at
+        the module's rope base, the index store and compression on the side stream), the
+        K/V append, the index scores and the one-launch top-k + expansion, sparse GQA, the
+        output gate and projection. Under IndexShare a draft decode step (`reuse`) skips the
+        index branch and rebuilds its selection from the draft-extend step's capture; the
+        draft-extend step (`share`) captures it."""
+        core = self.core
+        M, F = core._mtp, core._mtp_fused
+        dt, dev = x.dtype, x.device
+        proj = gemm(x, F.attn_in)
+        qkv_view, gate, index_view = torch.split(
+            proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
+        )
+        q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
+        index_scratch = torch.empty([rows, core.index_scratch_width], dtype=dt, device=dev)
+        q_index = torch.split(
+            torch.reshape(
+                index_scratch,
+                [rows, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
+            ),
+            [core.index_heads, core.index_kv_heads, core.index_kv_heads],
+            1,
+        )[0]
+        index_section = (_QSA_MROPE_SECTION or (0, 0, 0)) if _QSA_INDEX_USE_MROPE else (0, 0, 0)
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+        main = torch.cuda.current_stream()
+        side = core._side_stream
+        side.wait_stream(main)
+        qwen4_exp_qk_norm_rope(
+            proj,
+            q_index,
+            pos3,
+            core._mtp_cos_sin,
+            M.q_norm,
+            M.k_norm,
+            M.idx_qn,
+            num_heads_q=core.heads_q,
+            num_heads_k=core.heads_kv,
+            head_dim=core.head_dim,
+            index_heads=core.index_heads,
+            index_head_dim=core.index_head_dim,
+            index_q_col=core.qkv_width + core.q_width,
+            rotary_dim=core.rotary_dim,
+            eps=core.eps,
+            mrope_section1=core.mrope_section1,
+            mrope_section2=core.mrope_section2,
+            index_mrope_section1=index_section[1],
+            index_mrope_section2=index_section[2],
+        )
+        if not reuse:
+            # Raw key stored before anything normalizes it (see `_attention_prologue`).
+            with torch.cuda.stream(side):
+                token_k = torch.split(
+                    torch.reshape(
+                        index_view,
+                        [
+                            rows,
+                            core.index_scratch_width // core.index_head_dim,
+                            core.index_head_dim,
+                        ],
+                    ),
+                    [core.index_heads, core.index_kv_heads, 1],
+                    1,
+                )[1]
+                qsa_paged_index_store(
+                    token_k,
+                    coords,
+                    draft.index_cache,
+                    draft.position_cache,
+                    req_idx,
+                    logical,
+                    block_table,
+                    tokens_per_block,
+                )
+                qsa_prefill_compress(
+                    logical_positions=logical,
+                    request_indices=req_idx,
+                    block_table=block_table,
+                    index_cache=draft.index_cache,
+                    position_cache=draft.position_cache,
+                    k_norm_weight=M.idx_kn,
+                    cos_sin=core._mtp_cos_sin,
+                    eps=core.eps,
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    mrope_section=_QSA_MROPE_SECTION,
+                )
+        main.wait_stream(side)
+        gated = False
+        if sparse:
+            kv = draft.kv
+            _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
+            topk_indices = md.qsa_topk_indices[:rows]
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            seq_lens_q = md.qsa_sequence_lengths[:rows]
+            if reuse:
+                slot = draft.share_slot
+                assert slot in md.qsa_shared_topk_captured_slots, (
+                    "a draft decode step would reuse a selection that no draft-extend step "
+                    "of this loop captured"
+                )
+                qsa_mtp_reuse_topk(
+                    shared_indices=md.qsa_shared_topk_indices[slot],
+                    shared_visible_blocks=md.qsa_shared_topk_visible_blocks[slot],
+                    request_indices=req_idx,
+                    visible_blocks=visible_blocks,
+                    output=topk_indices,
+                )
+                selected = qsa_expand_block_indices(
+                    topk_indices,
+                    logical,
+                    seq_lens_q,
+                    compress_ratio=core.compress_ratio,
+                    token_topk=core.token_topk,
+                )
+            else:
+                scores = qsa_paged_index_scores(
+                    q=q_index,
+                    index_cache=draft.index_cache,
+                    block_table=block_table,
+                    query_positions=logical,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    only_visible_blocks=True,
+                    context_rows=False,
+                )
+                if _topk_expand_supports(scores):
+                    selected = qsa_topk_expand_decode(
+                        scores,
+                        visible_blocks,
+                        logical,
+                        seq_lens_q,
+                        topk_indices,
+                        core.compress_ratio,
+                        core.token_topk,
+                    )
+                else:
+                    _select(
+                        core, scores, md.qsa_topk_row_starts[:rows], visible_blocks, topk_indices
+                    )
+                    selected = qsa_expand_block_indices(
+                        topk_indices,
+                        logical,
+                        seq_lens_q,
+                        compress_ratio=core.compress_ratio,
+                        token_topk=core.token_topk,
+                    )
+                if share:
+                    self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
+            if kv.k_scale is not None:
+                attn = _sparse_gqa(
+                    core,
+                    kv,
+                    q=q_dst,
+                    block_table=block_table,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    query_positions=None,
+                    compress_ratio=None,
+                )
+            else:
+                gated = qsa_paged_sparse_gqa.fuses_output_gate(q_dst, kv.k, selected, gate)
+                attn = qsa_paged_sparse_gqa(
+                    q=q_dst,
+                    k_cache=kv.k,
+                    v_cache=kv.v,
+                    block_table=block_table,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    softmax_scale=core.softmax_scale,
+                    query_positions=None,
+                    compress_ratio=None,
+                    output_gate=gate if gated else None,
+                )
+            out = torch.reshape(attn, [rows, core.q_width])
+        else:
+            qkv = torch.empty([rows, core.qkv_width], dtype=dt, device=dev)
+            qkv.copy_(qkv_view)
+            attn_out = torch.empty([rows, core.q_width], dtype=dt, device=dev)
+            out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=layer_idx,
+                predicted_tokens_per_seq=p,
+                num_heads=core.heads_q,
+                num_kv_heads=core.heads_kv,
+                head_size=core.head_dim,
+                quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
+                **step,
+                **_CALL_CONSTANTS,
+            )
+        if not gated:
+            fused_sigmoid_mul_inplace(out, gate)
+        return gemm(out, M.o)
+
     def _capture_selection(self, md, topk_indices, visible_blocks, batch, p) -> None:
         """IndexShare: stash, per request, the selection of its last accepted draft-extend
         row with that row's complete-group count, in the draft layer's row of the shared
@@ -5635,6 +5974,26 @@ class DecodeTarget:
         # index rope reads) and `coords` (the `[N, 3]` transpose the position plane stores).
         pos = torch.reshape(torch.split(pos3, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
         coords = torch.transpose(pos3, 0, 1)
+
+        if core._mtp_fused is not None and not self._mtp_unfused:
+            return self._mtp_layer(
+                embed_tokens,
+                input_ids,
+                hidden_states,
+                md,
+                step,
+                draft,
+                layer_idx,
+                rows,
+                gen_seqs,
+                p,
+                sparse,
+                share,
+                reuse,
+                pos3,
+                pos,
+                coords,
+            )
 
         # ---- the front end --------------------------------------------------
         e = nn.functional.embedding(input_ids, embed_tokens)
@@ -6135,13 +6494,21 @@ class MTPLayer:
         mixer with its own parameters, not a plain RMSNorm), then the trunk's
         `lm_head` through the shell's `logits_processor`."""
         core = self.core
-        M = core._mtp
-        parts = torch.split(hidden_states, [core.hidden] * core.hc_count, 1)
-        normed = torch.cat(
-            [flashinfer_gemma_rmsnorm(part, w, core.eps) for w, part in zip(M.fhc_norm, parts)],
-            1,
-        )
-        final, _ = qwen4_exp_gated_residual(normed, M.fhc_down, M.fhc_up, None, core.hc_count)
+        F = core._mtp_fused
+        if F is not None and not core._decode._mtp_unfused:
+            # The decode target's norm-only site: the GEMV pair at one row, the fused norm
+            # and mixer above (fp32 logits, as the trunk's stack-final mixer).
+            _, final, _ = core._decode._hc_site(
+                hidden_states, None, None, F.fhc_norm, F.fhc_first, F.fhc_up, False
+            )
+        else:
+            M = core._mtp
+            parts = torch.split(hidden_states, [core.hidden] * core.hc_count, 1)
+            normed = torch.cat(
+                [flashinfer_gemma_rmsnorm(part, w, core.eps) for w, part in zip(M.fhc_norm, parts)],
+                1,
+            )
+            final, _ = qwen4_exp_gated_residual(normed, M.fhc_down, M.fhc_up, None, core.hc_count)
         return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
 
     def forward(
