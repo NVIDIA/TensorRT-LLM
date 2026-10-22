@@ -29,7 +29,6 @@
 #include <nvml.h>
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -775,11 +774,7 @@ void BatchedPageCopier::computeConfigs()
     // ~13.5 GB/s per CTA (vs ~30 on C2C), so the grid sizing below under-provisions it. That is
     // fixable with a per-link-class kPerCtaGBs, but the ceiling is the copy engine either way, so
     // PCIe simply uses cuMemcpyBatchAsync -- which also costs zero SMs.
-    // Chunked host registration (a kernel-version workaround; see HostMem) breaks the copy-engine path,
-    // whose descriptors may not cross a registered region. The kernel works on virtual addresses
-    // and does not care, so chunking forces the kernel on regardless of link type -- accepting the
-    // PCIe slowdown above rather than reintroducing per-page splitting on the CPU.
-    bool const kernelViable = mTopology.coherentLink || HostMem::shouldUseChunkedRegistration();
+    bool const kernelViable = mTopology.coherentLink;
 
     auto build = [&](int stages, double gridMult) -> KernelConfig
     {
@@ -907,26 +902,16 @@ void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stre
         copyEngineDsts[slot] = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
         copyEngineSrcs[slot] = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
     }
-#if CUDA_VERSION >= 12080
+    // Stream-ordered source access is what keeps this asynchronous when the host side is
+    // unregistered memory, which is what the mmap host backing provides. A plain cuMemcpyAsync
+    // would instead snapshot the source during the call and block. Any replacement for this
+    // submission has to preserve that property.
     CUmemcpyAttributes attributes{};
     attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
     attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
     size_t firstCopy = 0;
-#if CUDA_VERSION < 13000
-    size_t failIdx = std::numeric_limits<size_t>::max();
-    TLLM_CU_CHECK(cuMemcpyBatchAsync(copyEngineDsts.data(), copyEngineSrcs.data(), copyEngineSizes.data(),
-        args.numPairs, &attributes, &firstCopy, 1, &failIdx, stream));
-#else
     TLLM_CU_CHECK(cuMemcpyBatchAsync(copyEngineDsts.data(), copyEngineSrcs.data(), copyEngineSizes.data(),
         args.numPairs, &attributes, &firstCopy, 1, stream));
-#endif
-#else
-    // cuMemcpyBatchAsync needs CUDA 12.8; fall back to one enqueue per page.
-    for (uint32_t slot = 0; slot < args.numPairs; ++slot)
-    {
-        TLLM_CU_CHECK(cuMemcpyAsync(copyEngineDsts[slot], copyEngineSrcs[slot], copyEngineSizes[slot], stream));
-    }
-#endif
 }
 
 void BatchedPageCopier::launchKernel(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const
@@ -1004,56 +989,6 @@ void BatchedPageCopier::launchKernel(PoolCopyArgs const& args, CopyDirection dir
 
 namespace detail
 {
-#if CUDA_VERSION < 12080
-namespace
-{
-
-constexpr size_t kPageIndexKernelParamBytes = 2U << 10U;
-constexpr size_t kPageIndicesPerKernel = kPageIndexKernelParamBytes / sizeof(PageIndexPair);
-constexpr uint32_t kPageIndexCopyThreads = 256;
-
-using PageIndexKernelParams = std::array<PageIndexPair, kPageIndicesPerKernel>;
-static_assert(sizeof(PageIndexKernelParams) == kPageIndexKernelParamBytes);
-static_assert(kPageIndicesPerKernel <= kPageIndexCopyThreads);
-
-#if CUDA_VERSION >= 11070
-#define TLLM_KVCM2_GRID_CONSTANT __grid_constant__
-#else
-#define TLLM_KVCM2_GRID_CONSTANT
-#endif
-
-__global__ void copyPageIndicesKernel(
-    PageIndexPair* dst, PageIndexKernelParams const TLLM_KVCM2_GRID_CONSTANT src, size_t count)
-{
-    size_t const index = threadIdx.x;
-    if (index < count)
-    {
-        dst[index] = src[index];
-    }
-}
-
-#undef TLLM_KVCM2_GRID_CONSTANT
-
-} // namespace
-
-void copyPageIndicesToDeviceWithKernel(
-    CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream)
-{
-    TLLM_CHECK_WITH_INFO(dst != 0 && src != nullptr, "Page-index copy requires valid source and destination");
-
-    PageIndexKernelParams params{};
-    size_t offset = 0;
-    while (offset < numPageIndices)
-    {
-        size_t const count = std::min(numPageIndices - offset, kPageIndicesPerKernel);
-        std::copy_n(src + offset, count, params.begin());
-        copyPageIndicesKernel<<<1, kPageIndexCopyThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-            reinterpret_cast<PageIndexPair*>(dst) + offset, params, count);
-        TLLM_CUDA_CHECK(cudaGetLastError());
-        offset += count;
-    }
-}
-#endif
 
 void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream)
 {
@@ -1065,7 +1000,6 @@ void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t n
         numPageIndices <= std::numeric_limits<size_t>::max() / sizeof(PageIndexPair), "Page-index array is too large");
     TLLM_CHECK_WITH_INFO(dst != 0 && src != nullptr, "Page-index copy requires valid source and destination");
 
-#if CUDA_VERSION >= 12080
     size_t numBytes = numPageIndices * sizeof(PageIndexPair);
     CUdeviceptr srcAddress = reinterpret_cast<CUdeviceptr>(src);
     CUmemcpyAttributes attributes{};
@@ -1076,15 +1010,7 @@ void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t n
     // CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL semantics above (driver bug nvbugs 6718200).
     attributes.flags = 0;
     size_t firstCopy = 0;
-#if CUDA_VERSION < 13000
-    size_t failIdx = std::numeric_limits<size_t>::max();
-    TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &srcAddress, &numBytes, 1, &attributes, &firstCopy, 1, &failIdx, stream));
-#else
     TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &srcAddress, &numBytes, 1, &attributes, &firstCopy, 1, stream));
-#endif
-#else
-    copyPageIndicesToDeviceWithKernel(dst, src, numPageIndices, stream);
-#endif
 }
 
 } // namespace detail

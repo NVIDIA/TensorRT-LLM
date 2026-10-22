@@ -379,6 +379,7 @@ def build_moe_deployment(
         eplb_enabled=eplb_enabled,
         # Routed-expert LoRA only; attention-only LoRA stays False.
         moe_lora_enabled=has_moe_lora_targets(lora_config),
+        force_dynamic_quantization=model_config.force_dynamic_quantization,
         # Same expression the impls use to set ``use_fused_finalize``; any
         # LoRA counts, not just routed-expert LoRA.
         fused_finalize_enabled=(
@@ -646,6 +647,7 @@ def resolve_moe_impl(
         raise ValueError(
             f"MoE backend {requested} was requested with degradation disallowed "
             f"but cannot serve this layer{location}. {report.describe()}"
+            f" Each candidate's reason: {report.describe_rejections()}"
         )
 
     if winner_cls is None:

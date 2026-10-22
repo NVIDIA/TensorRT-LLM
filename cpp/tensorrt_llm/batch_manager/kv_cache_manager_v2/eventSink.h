@@ -44,6 +44,9 @@ public:
     virtual void addCacheLevelUpdated(
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle)
         = 0;
+
+    //! Protocols that expose retention metadata receive native page priority changes.
+    virtual void addPriorityUpdated(Digest const&, Priority, Priority, LifeCycleId) {}
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -3,7 +3,7 @@
 
 import dataclasses
 from collections.abc import Mapping as AbcMapping
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 
 import torch
 import transformers
@@ -16,6 +16,13 @@ from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
+
+
+class _NamedLayerType(Protocol):
+    name: str
+
+
+_LayerType = Union[str, _NamedLayerType]
 
 
 def resolve_cache_transceiver_config(
@@ -80,7 +87,7 @@ def uses_vswa_kv_cache_layout(
                     for window in max_attention_windows))
 
 
-def _is_sliding_attention_layer(layer_type: object) -> bool:
+def _is_sliding_attention_layer(layer_type: _LayerType) -> bool:
     """Return whether a config layer type denotes sliding attention."""
     layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
     return "sliding" in layer_type_name
@@ -130,14 +137,6 @@ def get_layer_attention_window(
         raise ValueError(
             "Sliding attention requires a positive integer sliding_window.")
     return sliding_window
-
-
-def is_gemma4_hybrid(config):
-    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
-    global_head_dim = getattr(config, 'global_head_dim', None)
-    head_dim = getattr(config, 'head_dim', None)
-    return (global_head_dim is not None and isinstance(head_dim, int)
-            and global_head_dim != head_dim)
 
 
 def is_hybrid_linear(config):
@@ -339,8 +338,8 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
     kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
     verify then stage the addressed rows through an fp32 copy and round the
     committed state back to bf16. The fused MTP verify kernel
-    (``trtllm::kda_mtp_decode``) has no such staging and rejects a non-fp32
-    pool outright, so bf16 and fused KDA MTP verify are mutually exclusive.
+    (``trtllm::kda_mtp_decode``) reads and writes a bf16 pool directly and
+    rounds the committed state to nearest.
     A checkpoint-declared
     mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
     checkpoints do not carry the field); it is logged when it would have

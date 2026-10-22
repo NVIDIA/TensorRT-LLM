@@ -83,6 +83,8 @@ MODEL_PATH_DICT = {
     # DSpark draft stages are embedded in this checkpoint, so it is also the
     # `speculative_model` of the DSpark perf-sanity cases.
     "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
+    "deepseek_v41_flash_nvfp4": "DeepSeek-V4.1-Flash-NVFP4",
+    "deepseek_v41_flash_nvfp4_dspark": "DeepSeek-V4.1-Flash-NVFP4",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
@@ -94,6 +96,10 @@ MODEL_PATH_DICT = {
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
     "kimi_k3": "Kimi-K3",
+    # Kimi K3 NVFP4 requant (MIXED_PRECISION routed experts). Its DSpark drafter
+    # is the separate Inferact-Kimi-K3-DSpark checkpoint, given per config as
+    # `speculative_model`.
+    "kimi_k3_nvfp4": "Kimi-K3-NVFP4",
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
