@@ -82,6 +82,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     ModelingV2Mode,
+    NoTarget,
     resolved_mode,
     step_contract_enabled,
 )
@@ -771,16 +772,16 @@ def _validate_runtime(model_config: ModelConfig) -> None:
         or getattr(sparse, "algorithm", None) != "minimax_m3"
         or sparse.implementation != "msa"
     ):
-        raise ValueError(
+        raise NoTarget(
             "this MiniMax-M3 target requires sparse_attention_config.algorithm='minimax_m3' with implementation='msa'"
         )
     if getattr(sparse, "indexer_kv_dtype", None) != "fp8":
-        raise ValueError(
+        raise NoTarget(
             "this MiniMax-M3 target requires sparse_attention_config.indexer_kv_dtype='fp8'"
         )
     mode = model_config.quant_config.quant_mode
     if mode is None or not (mode.has_fp8_kv_cache() or mode.has_fp4_kv_cache()):
-        raise ValueError("this MiniMax-M3 target requires an FP8 or NVFP4 KV cache")
+        raise NoTarget("this MiniMax-M3 target requires an FP8 or NVFP4 KV cache")
 
 
 def _sparse_layer_ids(cfg: PretrainedConfig) -> List[int]:
@@ -3110,7 +3111,7 @@ class M3Eagle3Draft(nn.Module):
             or getattr(cfg, "bias", False)
             or getattr(cfg, "tie_word_embeddings", False)
         ):
-            raise ValueError(
+            raise NoTarget(
                 "this MiniMax-M3 target drafts with a one-layer Llama-style Eagle3 drafter with per-layer "
                 "fc_norms over "
                 "several captured layers, the target's hidden size and vocabulary and no biases"
@@ -3156,7 +3157,7 @@ class M3Eagle3Draft(nn.Module):
             sparse_params=None,
         )
         if not self.attn.support_fused_rope() or not self.attn.support_fused_qkv():
-            raise ValueError(
+            raise NoTarget(
                 f"the drafter's attention backend {type(self.attn).__name__} must fuse RoPE and QKV"
             )
         self.attn.update_quant_config(quant_config)
@@ -4126,7 +4127,7 @@ def _build_speculation(shell, model_config: ModelConfig):
         or spec.eagle3_model_arch != "llama3"
         or getattr(spec, "use_dynamic_tree", False)
     ):
-        raise ValueError(
+        raise NoTarget(
             "this MiniMax-M3 target speculates with linear one-model Eagle3 (llama3 drafter) only"
         )
     draft_config = ModelConfig.from_pretrained(

@@ -32,7 +32,12 @@ from pydantic import ValidationError
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    _RESOLVED_MODES,
+    DISAGG_ROLE_ENV,
+    DeploymentRole,
     ModelingV2Mode,
+    NoTarget,
+    deployment_role,
     modeling_v2_resolve,
     resolved_mode,
 )
@@ -40,6 +45,7 @@ from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
@@ -177,7 +183,8 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
 
 @pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
 def test_off_resolves_nothing(mode):
-    """The default must be indistinguishable from modeling_v2 not existing.
+    """The default must be indistinguishable from modeling_v2 not existing for an architecture whose routing module
+    enables nothing by default.
 
     Leaving the argument alone and an explicit "off" have to behave
     identically: the common case is that nobody has heard of this package.
@@ -449,6 +456,71 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
     # boolean would write, and it is the reading that must not be invented.
     with pytest.raises(ValidationError, match="modeling_v2"):
         _llm_args("yes")
+
+
+def test_the_default_mode_is_default():
+    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "default"
+
+
+def test_no_target_is_a_value_error():
+    """A refusal is the ValueError ``require`` has always raised, so callers that catch ValueError still do."""
+    assert issubclass(NoTarget, ValueError)
+
+
+@pytest.mark.parametrize(
+    ("transceiver", "env", "role"),
+    [
+        (False, None, DeploymentRole.AGGREGATED),
+        (False, "generation", DeploymentRole.AGGREGATED),
+        (True, "generation", DeploymentRole.GENERATION),
+        (True, "gen0", DeploymentRole.GENERATION),
+        (True, "context", DeploymentRole.CONTEXT),
+        (True, "ctx1", DeploymentRole.CONTEXT),
+        (True, None, DeploymentRole.UNKNOWN),
+        (True, "coordinator", DeploymentRole.UNKNOWN),
+    ],
+)
+def test_deployment_role(monkeypatch, transceiver, env, role):
+    """No cache transceiver is aggregated serving; a disaggregated worker's side is the launcher's role variable."""
+    if env is None:
+        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(DISAGG_ROLE_ENV, env)
+    kwargs = dict(cache_transceiver_config=CacheTransceiverConfig()) if transceiver else {}
+    assert deployment_role(_llm_args(**kwargs)) is role
+
+
+class _RefusingTarget:
+    """A target that refuses its runtime at construction."""
+
+    def __init__(self, config):
+        raise NoTarget("this runtime is not the one the target is written for")
+
+
+class _BuiltIn:
+    def __init__(self, config):
+        self.config = config
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_a_refusal_at_construction_falls_back_unless_required(monkeypatch, mode):
+    """A target's construction-time refusal builds the built-in implementation under ``auto`` (the mode
+    ``default`` records) and is the error under ``require``."""
+    import tensorrt_llm._torch.models.modeling_auto as modeling_auto
+
+    monkeypatch.setattr(modeling_auto, "get_registered_model_class", lambda arch: _BuiltIn)
+    monkeypatch.setitem(_RESOLVED_MODES, _RefusingTarget, ModelingV2Mode(mode))
+    config = replace(_model_config(_gpt_oss_config()), modeling_v2_target=_RefusingTarget)
+    config.extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
+    if mode == "require":
+        with pytest.raises(NoTarget, match="not the one the target is written for"):
+            AutoModelForCausalLM.from_config(config)
+        return
+    model = AutoModelForCausalLM.from_config(config)
+    assert isinstance(model, _BuiltIn)
+    assert model.config.modeling_v2_target is None
+    # The loader's settings reach the built-in model.
+    assert model.config.extra_attrs["nvfp4_gemm_allowed_backends"] == ["cutlass"]
 
 
 # --- speculative decoding is an identity criterion ------------------------------
@@ -779,6 +851,61 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
     assert modeling_v2_resolve(config, _m3_llm_args("auto", "auto")) is None
     target = modeling_v2_resolve(config, _m3_llm_args("auto", "fp8"))
     assert target.__name__ == "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"
+
+
+def _m3_default_args(monkeypatch, role, kv_dtype="nvfp4"):
+    """modeling_v2 left at its default, for an engine serving ``role``."""
+    if role == "aggregated":
+        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
+        return _llm_args("default", kv_cache_config=dict(dtype=kv_dtype))
+    if role is None:
+        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(DISAGG_ROLE_ENV, role)
+    return _llm_args(
+        "default",
+        kv_cache_config=dict(dtype=kv_dtype),
+        cache_transceiver_config=CacheTransceiverConfig(),
+    )
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_minimax_m3_default_enables_the_generation_side(monkeypatch, tp):
+    """With modeling_v2 left alone, the GB300 targets serve the generation side of disaggregated serving, the
+    deployment they were measured in, and record ``auto`` (so a later refusal falls back)."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(), None, tp)
+    target = modeling_v2_resolve(config, _m3_default_args(monkeypatch, "generation"))
+    assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
+    assert resolved_mode(target) is ModelingV2Mode.AUTO
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+@pytest.mark.parametrize(
+    "role", ["aggregated", "context", None], ids=["aggregated", "context", "unknown"]
+)
+def test_minimax_m3_default_keeps_other_roles_on_the_builtin_model(monkeypatch, role):
+    """Aggregated serving, the context side and a disaggregated worker of unknown side build the built-in model
+    by default; ``auto`` still takes the target there."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(), None)
+    assert modeling_v2_resolve(config, _m3_default_args(monkeypatch, role)) is None
+    assert modeling_v2_resolve(config, _m3_llm_args("auto", "nvfp4")) is not None
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+def test_minimax_m3_default_falls_back_where_route_declines(monkeypatch):
+    """By default a deployment no target fits (here a BF16 KV cache) builds the built-in model, as under auto."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
+    assert modeling_v2_resolve(config, _m3_default_args(monkeypatch, "generation", "auto")) is None
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
