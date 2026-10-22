@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ...interface import (
@@ -145,6 +146,27 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     # bound and runtime_workspace_fixed_bytes reserves it in KV-cache sizing.
     _CONTEXT_SCORE_ELEMENTS = 1 << 26
 
+    @staticmethod
+    def _context_score_cost(
+        rows: int, tables: int, pools: int, *, fp8: bool, head_dim: int, capacity_pools: int
+    ) -> int:
+        """FP32 elements a scoring call of ``rows`` rows over ``tables`` tables holds at once.
+
+        Counts the buffers that grow with the visible ``pools``: the BF16 scorer's
+        capacity-wide output, or every buffer :func:`kpool_score_fp8` keeps alive
+        together -- the padded logits, a multi-table call's gather temporary and
+        aligned row copy, and per gathered key its BF16 row, FP8 row, scale and
+        int64 slot index.
+        """
+        if not fp8 or pools == 0:
+            return rows * capacity_pools
+        # fp8_mqa_logits pads each row to a multiple of 256 columns, plus 256.
+        logits = -(-tables * pools // 256) * 256 + 256
+        copy = max(1024, -(-pools // 64) * 64) + pools if tables > 1 else 0
+        keys = tables * pools * (head_dim // 2 + head_dim // 4 + 3)
+        # int64 pool positions, pages and offsets.
+        return rows * (logits + copy) + keys + 6 * pools
+
     @classmethod
     def runtime_workspace_fixed_bytes(
         cls,
@@ -156,9 +178,25 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         max_seq_len: int,
         enable_cuda_graph: bool,
     ) -> int:
+        """Bytes of the largest scoring call plan_context_scores can emit for these capacities."""
         if max_num_tokens <= 0 or max_seq_len <= 0:
             return 0
-        return min(cls._CONTEXT_SCORE_ELEMENTS, max_num_tokens * max_seq_len) * 4
+        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+        defaults = GlmKpoolSparseParams()
+        kpool = getattr(config, "index_kpool", defaults.index_kpool)
+        head_dim = getattr(config, "index_head_dim", defaults.index_head_dim)
+        pools = -(-max_seq_len // kpool)
+        tables = max(1, min(max_batch_size, max_num_tokens))
+
+        def cost(rows: int, tables: int, fp8: bool) -> int:
+            return cls._context_score_cost(
+                rows, tables, pools, fp8=fp8, head_dim=head_dim, capacity_pools=pools
+            )
+
+        largest = max(cost(max_num_tokens, tables, True), cost(max_num_tokens, 1, False))
+        # Calls fit the budget, except that a single row is never split.
+        bound = max(cls._CONTEXT_SCORE_ELEMENTS, cost(1, 1, True), cost(1, 1, False))
+        return min(largest, bound) * 4
 
     def __init__(
         self,
@@ -414,15 +452,16 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         budget = self._CONTEXT_SCORE_ELEMENTS
         # The BF16 scorer writes every pool column of the configured capacity.
         capacity_pools = -(-state.block_tables.shape[1] * state.tokens_per_block // kpool)
-        # Gathered BF16 pool keys plus their FP8 copy, in FP32 elements.
-        key_elements = self.sparse_params.index_head_dim * 3 // 4
 
         def cost(rows: int, tables: int, pools: int) -> int:
-            if not self._indexer_fp8 or pools == 0:
-                return rows * capacity_pools
-            logits = -(-tables * pools // 256) * 256
-            copy = max(1024, -(-pools // 64) * 64) if tables > 1 else 0
-            return rows * (logits + copy) + tables * pools * key_elements
+            return self._context_score_cost(
+                rows,
+                tables,
+                pools,
+                fp8=self._indexer_fp8,
+                head_dim=self.sparse_params.index_head_dim,
+                capacity_pools=capacity_pools,
+            )
 
         calls: list[tuple[int, int, int, int, int]] = []
         group: list[int] | None = None  # [row_start, rows, table_start, tables, max visible]

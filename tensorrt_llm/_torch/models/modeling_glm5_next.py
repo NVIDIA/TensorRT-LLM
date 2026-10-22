@@ -1364,7 +1364,7 @@ class Glm5NextSparseAttention(nn.Module):
             else num_candidates
         )
         selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=q_index.device)
-        # Each call scores and selects its own rows; scores are dropped before the next.
+        # Each call scores and selects its own rows.
         if context_spans is None:
             calls = [(slice(None), max_visible, None)]
         else:
@@ -1394,6 +1394,8 @@ class Glm5NextSparseAttention(nn.Module):
                 sequence_lengths=num_cand[part],
                 scan_lengths=num_cand[part],
             )
+            # Release this call's scores before the next call allocates its own.
+            del scores
         topk_rows = self.attn_backend.expand_selection(
             selected,
             metadata,

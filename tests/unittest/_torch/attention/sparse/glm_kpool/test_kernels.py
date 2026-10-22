@@ -426,6 +426,56 @@ def test_fp8_pool_scores_track_bf16_selection(single_request):
 @pytest.mark.skipif(
     get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
 )
+@pytest.mark.parametrize("lens", [[16384], [16000, 12000, 8000]], ids=["one-table", "three-tables"])
+def test_fp8_pool_score_peak_memory_fits_the_planned_cost(lens):
+    """kpool_score_fp8's peak allocation beyond its row-sized buffers fits the planner's cost."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import GlmKpoolSparseAttention
+
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    heads, tpb, rows_per_table = 32, 32, 256
+    pages = [(length + tpb - 1) // tpb for length in lens]
+    pool = torch.randn(sum(pages) + 8, 2, tpb, 3 * HD, generator=gen, device="cuda")
+    pool = pool.to(torch.bfloat16)[:, 1]
+    tables = torch.zeros(len(lens), max(pages), dtype=torch.int64, device="cuda")
+    start = 0
+    for i, count in enumerate(pages):
+        tables[i, :count] = torch.arange(start, start + count, device="cuda")
+        start += count
+    # The last rows_per_table queries of each prompt, so most pools are visible.
+    request_ids = torch.cat(
+        [torch.full((rows_per_table,), i, dtype=torch.int32) for i in range(len(lens))]
+    ).cuda()
+    kv_lens = torch.cat(
+        [
+            torch.arange(length - rows_per_table + 1, length + 1, dtype=torch.int32)
+            for length in lens
+        ]
+    ).cuda()
+    n = kv_lens.shape[0]
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.randn(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(head_dim=HD, kpool=KPOOL, q_scale=HD**-0.5, w_scale=heads**-0.5)
+    args = (q, w, pool, tables, kv_lens, tpb)
+    kpool_score_fp8(*args, request_ids=request_ids, max_kv_len=max(lens), **kwargs)  # JIT warmup
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    scores = kpool_score_fp8(*args, request_ids=request_ids, max_kv_len=max(lens), **kwargs)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    del scores
+    cost = GlmKpoolSparseAttention._context_score_cost(
+        n, len(lens), max(lens) // KPOOL, fp8=True, head_dim=HD, capacity_pools=0
+    )
+    # Quantized queries (with the quantizer's scratch), head weights and per-row
+    # indices grow only with rows; startup profiling measures them.
+    row_bytes = n * heads * (2 * HD + 16) + 64 * n
+    assert peak <= cost * 4 + row_bytes + (64 << 10)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+)
 def test_fp8_pool_scores_of_a_table_range_match_the_packed_call():
     """Scoring one request against its own table equals its rows of a multi-table call."""
     gen = torch.Generator(device="cuda").manual_seed(11)
