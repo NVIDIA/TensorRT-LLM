@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import time
 
 import pytest
@@ -14,7 +16,7 @@ from utils.llm_data import llm_models_root
 from utils.util import similar, skip_single_gpu
 # isort: on
 
-model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+model_path = llm_models_root() / "Qwen3/Qwen3-0.6B"
 
 
 class TestRpcProxy:
@@ -32,7 +34,6 @@ class TestRpcProxy:
 
         proxy = GenerationExecutorRpcProxy(
             worker_kwargs={
-                "engine": model_path,
                 "llm_args": llm_args,
                 "model_world_size": tp_size,
                 "hf_model_dir": model_path,

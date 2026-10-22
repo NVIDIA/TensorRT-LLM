@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from os import environ, getenv
+from os import getenv
 from typing import Any, Dict, List, NamedTuple, Optional
 
 import tensorrt_llm
@@ -14,6 +14,7 @@ from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.config_utils import resolve_cache_transceiver_config
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.kv_cache.mamba_cache_manager import (
     BaseMambaCacheManager, CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
@@ -30,38 +31,8 @@ _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
 _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
-_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
-
-
-def maybe_enable_fabric_memory_for_python_transceiver(
-        cache_transceiver_config: Optional[CacheTransceiverConfig],
-        kv_cache_manager_cls: type) -> None:
-    """Default the C++ V1 KV pool to fabric memory for the Python transceiver.
-
-    This must run before any KV pool allocation because the C++ environment
-    getter caches the value on first read. Explicit user settings are always
-    respected.
-
-    Args:
-        cache_transceiver_config: Configuration used to select the cache
-            transceiver runtime and backend.
-        kv_cache_manager_cls: KV-cache manager class to check for C++ V1 pool
-            allocation.
-    """
-    if (cache_transceiver_config is None
-            or cache_transceiver_config.backend is None
-            or cache_transceiver_config.transceiver_runtime != "PYTHON"):
-        return
-    if not issubclass(kv_cache_manager_cls, KVCacheManager):
-        return
-    if getenv(_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV) is None:
-        environ[_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV] = "1"
-        logger.info(
-            "Python cache transceiver with C++ KV cache manager detected; "
-            f"defaulting {_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV}=1 (set it "
-            "to 0 explicitly to disable)")
 
 
 def is_disagg_inflight_cancel_enabled() -> bool:
@@ -144,7 +115,7 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 def create_kv_cache_transceiver(
     mapping: Mapping,
     dist: Distributed,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
@@ -183,43 +154,63 @@ def create_kv_cache_transceiver(
             "hangs or lower-than-expected performance.")
 
     # Select transceiver implementation based on transceiver_runtime.
-    # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
-    # transceiver_runtime == "PYTHON" -> use Python transceiver.
+    # transceiver_runtime == None or "CPP" -> use C++ transceiver.
+    # transceiver_runtime == "PYTHON" -> use Python transceiver (default).
     #
-    # MambaHybridCacheManagerV2 is backed by the Python KVCacheManagerV2 core,
-    # not the C++ BaseKVCacheManager binding required by CacheTransceiverCpp.
-    is_v2_mamba_hybrid = isinstance(mamba_cache_manager,
-                                    MambaHybridCacheManagerV2)
+    # V2 managers use a Python core, not the C++ BaseKVCacheManager binding
+    # required by CacheTransceiverCpp.
+    uses_v2_manager = (isinstance(kv_cache_manager, KVCacheManagerV2)
+                       or isinstance(mamba_cache_manager,
+                                     MambaHybridCacheManagerV2))
     use_python_transceiver = (
         cache_transceiver_config.transceiver_runtime == "PYTHON")
 
-    if is_v2_mamba_hybrid and not use_python_transceiver:
+    if uses_v2_manager and not use_python_transceiver:
         raise ValueError(
-            "MambaHybridCacheManagerV2 requires transceiver_runtime='PYTHON' "
-            "with backend='NIXL'; it cannot use the C++ transceiver.")
+            "KV cache manager V2 requires transceiver_runtime='PYTHON' "
+            "with backend='NIXL'; it cannot use the C++ transceiver. "
+            "To use the C++ transceiver, set "
+            "kv_cache_config.use_kv_cache_manager_v2=False for a model "
+            "that supports V1.")
 
     if use_python_transceiver:
         if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
             raise ValueError(
                 "transceiver_runtime='PYTHON' cannot drive "
                 "CppMambaHybridCacheManager (C++ pool backed). Use "
-                "transceiver_runtime='CPP', or select the V2 manager "
+                "transceiver_runtime='CPP' with "
+                "kv_cache_config.use_kv_cache_manager_v2=False, or select "
+                "the V2 manager "
                 "with use_kv_cache_manager_v2=True.")
         # DEFAULT has already been resolved above, so Python must see NIXL.
         if cache_transceiver_config.backend != "NIXL":
             raise ValueError(
                 f"Python transceiver currently only supports the NIXL backend, "
                 f"got {cache_transceiver_config.backend}. "
-                f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+                "Please use transceiver_runtime='CPP' with "
+                "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+                "or MOONCAKE backends, with a model that supports V1.")
+        if (not isinstance(kv_cache_manager, KVCacheManagerV2) or
+            (mamba_cache_manager is not None and
+             not isinstance(mamba_cache_manager, MambaHybridCacheManagerV2))):
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support KV cache manager V1. "
+                f"Selected managers: KV={type(kv_cache_manager).__name__}, "
+                f"Mamba={type(mamba_cache_manager).__name__}. "
+                "Use a compatible KVCacheManagerV2 configuration for "
+                "transceiver_runtime='PYTHON'; enabling "
+                "use_kv_cache_manager_v2=True does not override incompatible "
+                "model features. To use V1, select transceiver_runtime='CPP' "
+                "with use_kv_cache_manager_v2=False for a model that supports V1."
             )
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
-        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
+        # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
-    # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
+    # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,
                                   mamba_cache_manager)

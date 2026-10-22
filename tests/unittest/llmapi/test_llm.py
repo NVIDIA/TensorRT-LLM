@@ -136,7 +136,7 @@ def llm_check_output(llm: LLM,
                  stop_reasons=stop_reasons)
 
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)
@@ -267,8 +267,7 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str,
     num_samples = 100
     cnn_dailymail = datasets.load_dataset(cnn_dailymail_path,
                                           name='3.0.0',
-                                          split='train',
-                                          trust_remote_code=True)
+                                          split='train')
     alpaca_chinese = datasets.load_dataset(alpaca_chinese_path,
                                            split='train',
                                            trust_remote_code=True)
@@ -672,17 +671,24 @@ class MyLogitsProcessor(LogitsProcessor):
 def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    max_tokens = 6
     sampling_params = SamplingParams(
-        max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
+        max_tokens=max_tokens,
+        logits_processor=MyLogitsProcessor(biased_word_id))
 
     prompts = ["A B C"]
     if llm_kwargs.get('enable_chunked_prefill', None):
         prompts[0] = prompts[0] * 256
         llm_kwargs["max_num_tokens"] = 256
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
-        prompts, ["Z Z Z Z Z Z"],
+        prompts, [expected_output],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
@@ -713,83 +719,89 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         # in the 2nd reuse of llm.generate() in streaming mode
         kv_cache_args_extra["enable_block_reuse"] = False
 
-    llm = LLM(
-        llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                      **kv_cache_args_extra),
-        tensor_parallel_size=tp_size,
-        gather_generation_logits=True,
-    )
+    with LLM(
+            llama_model_path,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                          **kv_cache_args_extra),
+            tensor_parallel_size=tp_size,
+            gather_generation_logits=True,
+    ) as llm:
 
-    prompts = ["A B C D E F G H I J K"]
-    sampling_params = SamplingParams(
-        logprobs=logprobs,
-        prompt_logprobs=prompt_logprobs,
-        return_context_logits=return_context_logits,
-        return_generation_logits=return_generation_logits)
+        prompts = ["A B C D E F G H I J K"]
+        sampling_params = SamplingParams(
+            logprobs=logprobs,
+            prompt_logprobs=prompt_logprobs,
+            return_context_logits=return_context_logits,
+            return_generation_logits=return_generation_logits)
 
-    for output in llm.generate(prompts, sampling_params):
-        context_logits = output.context_logits
-        generation_logits = output.outputs[0].generation_logits
-        logprobs_result = output.outputs[0].logprobs
-        prompt_logprobs_result = output.outputs[0].prompt_logprobs
-        token_ids = output.outputs[0].token_ids
+        for output in llm.generate(prompts, sampling_params):
+            context_logits = output.context_logits
+            generation_logits = output.outputs[0].generation_logits
+            logprobs_result = output.outputs[0].logprobs
+            prompt_logprobs_result = output.outputs[0].prompt_logprobs
+            token_ids = output.outputs[0].token_ids
 
-        # ensure logits are dropped unless users specify return_context_logits=True
-        if prompt_logprobs and not return_context_logits:
-            assert context_logits is None
+            # ensure logits are dropped unless users specify return_context_logits=True
+            if prompt_logprobs and not return_context_logits:
+                assert context_logits is None
 
-        if logprobs and not return_generation_logits:
-            assert generation_logits is None
+            if logprobs and not return_generation_logits:
+                assert generation_logits is None
 
-        if return_context_logits:
-            assert isinstance(context_logits, torch.Tensor)
+            if return_context_logits:
+                assert isinstance(context_logits, torch.Tensor)
 
-        if return_generation_logits:
-            assert isinstance(generation_logits, torch.Tensor)
+            if return_generation_logits:
+                assert isinstance(generation_logits, torch.Tensor)
 
-        if prompt_logprobs:
-            assert prompt_logprobs_result and len(
-                prompt_logprobs_result[0].keys()) == prompt_logprobs
-            print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
+            if prompt_logprobs:
+                assert prompt_logprobs_result
+                prompt_tokens = output.prompt_token_ids[1:] + token_ids[:1]
+                assert len(prompt_logprobs_result) == len(prompt_tokens)
+                for token, step_logprobs in zip(prompt_tokens,
+                                                prompt_logprobs_result):
+                    assert len(step_logprobs) in {
+                        prompt_logprobs, prompt_logprobs + 1
+                    }
+                    assert token in step_logprobs
+                    top_ranks = sorted(
+                        value.rank
+                        for value in step_logprobs.values())[:prompt_logprobs]
+                    assert top_ranks == list(range(1, prompt_logprobs + 1))
 
-        if logprobs:
-            assert logprobs_result and len(
-                logprobs_result[0].keys()) in {logprobs, logprobs + 1}
-            # Most contain log prob of the sample token, even if it's not within K
-            assert token_ids[0] in logprobs_result[0].keys()
-            for step_logprobs in logprobs_result:
-                assert len(step_logprobs) == logprobs
-                logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
-                                 for logprob_obj in step_logprobs.values()]
-                sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+            if logprobs:
+                assert logprobs_result
+                assert len(logprobs_result) == len(token_ids)
+                for token, step_logprobs in zip(token_ids, logprobs_result):
+                    assert len(step_logprobs) in {logprobs, logprobs + 1}
+                    assert token in step_logprobs
+                    logprob_items = [(value.logprob, value.rank)
+                                     for value in step_logprobs.values()]
+                    sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+                    assert [rank for _, rank in sorted_by_rank[:logprobs]
+                            ] == list(range(1, logprobs + 1))
+                    for i in range(logprobs - 1):
+                        assert sorted_by_rank[i][0] >= sorted_by_rank[i + 1][0]
 
-                for i in range(logprobs - 1):
-                    current_logprob, current_rank = sorted_by_rank[i]
-                    next_logprob, next_rank = sorted_by_rank[i + 1]
-                    assert current_logprob >= next_logprob
-                    assert current_rank == i + 1
-                    assert next_rank == current_rank + 1
-            print("logprobs[0]: ", logprobs_result[0])
+        if streaming:
 
-    if streaming:
+            async def task(id: int, prompt: str):
+                logprobs_result_streaming = []
+                async for output in llm.generate_async(prompt,
+                                                       sampling_params,
+                                                       streaming=True):
+                    logprobs_result_streaming += output.outputs[0].logprobs_diff
 
-        async def task(id: int, prompt: str):
-            logprobs_result_streaming = []
-            async for output in llm.generate_async(prompt,
-                                                   sampling_params,
-                                                   streaming=True):
-                logprobs_result_streaming += output.outputs[0].logprobs_diff
+                # comparing streaming logprobs result to non-streaming
+                assert logprobs_result_streaming == logprobs_result
+                assert output.outputs[
+                    0].prompt_logprobs == prompt_logprobs_result
 
-            # comparing streaming logprobs result to non-streaming
-            assert logprobs_result_streaming == logprobs_result
-            assert output.outputs[0].prompt_logprobs == prompt_logprobs_result
+            async def main():
+                tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
+                await asyncio.gather(*tasks)
 
-        async def main():
-            tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
-            await asyncio.gather(*tasks)
-
-        asyncio.run(main())
+            asyncio.run(main())
 
 
 def validate_stats(
@@ -797,6 +809,7 @@ def validate_stats(
     results,
     pytorch_backend,
     max_tokens,
+    prompt_len,
     pp_size=1,
     use_overlap=False,
     enable_chunked_prefill=False,
@@ -849,18 +862,20 @@ def validate_stats(
                 assert req_stat[
                     "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS", f"iter: {iter}"
                 assert req_stat[
-                    "contextPrefillPosition"] == 54 if use_overlap else 32, f"iter: {iter}"
+                    "contextPrefillPosition"] == prompt_len if use_overlap else 32, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == 0, f"iter: {iter}"
             elif iter < (context_iterations - 1 + generation_iterations):
                 assert req_stat[
                     "stage"] == "GENERATION_IN_PROGRESS", f"iter: {iter}"
-                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == prompt_len, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == iter - (
                     context_iterations - 1) + 1, f"iter: {iter}"
             else:
                 assert req_stat[
                     "stage"] == "GENERATION_COMPLETE", f"iter: {iter}"
-                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == prompt_len, f"iter: {iter}"
                 assert req_stat[
                     "numGeneratedTokens"] == max_tokens, f"iter: {iter}"
             assert req_stat["scheduled"] == True, f"iter: {iter}"
@@ -969,9 +984,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
             "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
         ]
 
+        prompt_len = None
         for output in llm.generate(long_prompts,
                                    sampling_params=sampling_params):
             print(output)
+            prompt_len = len(output.prompt_token_ids)
 
         time.sleep(2)
         results = llm.get_stats(2)
@@ -979,6 +996,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         validate_stats(results=results,
                        pp_size=pp_size,
                        pytorch_backend=pytorch_backend,
+                       prompt_len=prompt_len,
                        max_tokens=max_tokens,
                        use_overlap=use_overlap,
                        enable_chunked_prefill=enable_chunked_prefill,
@@ -1097,12 +1115,16 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
         ]
 
+        prompt_len = None
+
         async def task0():
+            nonlocal prompt_len
             async for output in llm.generate_async(
                     long_prompts[0],
                     streaming=True,
                     sampling_params=sampling_params):
                 print(output)
+                prompt_len = len(output.prompt_token_ids)
 
         async def task1(repetition_index: int):
             results = []
@@ -1119,6 +1141,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                     pp_size=pp_size,
                     pytorch_backend=pytorch_backend,
                     max_tokens=max_tokens,
+                    prompt_len=prompt_len,
                     use_overlap=use_overlap,
                     # After the first repetition, context will be reused and there will be no chunking.
                     enable_chunked_prefill=enable_chunked_prefill
@@ -1504,7 +1527,10 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               tensor_parallel_size=tp_size,
               num_postprocess_workers=2,
               postprocess_tokenizer_dir=llama_model_path)
-    golden_result = "D E F G H I"
+    # Qwen3's byte-level BPE tokenizer folds the space before the first
+    # generated token into that token itself, so the decoded continuation
+    # of "A B C" carries a leading space that TinyLlama's tokenizer didn't.
+    golden_result = " D E F G H I"
     outputs = []
     for output in llm.generate_async(prompts[0],
                                      sampling_params=sampling_params,

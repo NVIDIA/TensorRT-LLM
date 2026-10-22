@@ -49,11 +49,19 @@ class _StartupTimer:
         logger.info(f"[startup][pid={os.getpid()}] {self.name}/{name}: done in {elapsed:.3f}s")
 
     @contextmanager
-    def phase(self, name: str) -> Iterator[None]:
+    def phase(
+        self,
+        name: str,
+        *,
+        metrics: dict[str, float] | None = None,
+        metric_name: str | None = None,
+    ) -> Iterator[None]:
         """Record outermost elapsed time, including failures, and log status.
 
         Failed work still contributes to startup time; its exception propagates
         and its completion marker is explicitly labelled ``failed``.
+        When ``metrics`` is provided, accumulate the same elapsed value under
+        ``metric_name`` (or ``name``), including nested phases.
         """
         logger.info(f"[startup][pid={os.getpid()}] {self.name}/{name}: start")
         start = time.perf_counter()
@@ -68,6 +76,9 @@ class _StartupTimer:
             self.depth -= 1
             if outermost:
                 self.timings[name] = self.timings.get(name, 0.0) + elapsed
+            if metrics is not None:
+                key = metric_name if metric_name is not None else name
+                metrics[key] = metrics.get(key, 0.0) + elapsed
             status = "done" if completed else "failed"
             logger.info(
                 f"[startup][pid={os.getpid()}] {self.name}/{name}: {status} in {elapsed:.3f}s"

@@ -17,6 +17,7 @@
 import os
 from contextlib import contextmanager
 from enum import Enum
+from functools import lru_cache
 from typing import Callable, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
@@ -162,6 +163,19 @@ def _run_probe(dep: MoEDep, probe: DepProbe) -> bool:
     return available
 
 
+@lru_cache(maxsize=1)
+def _is_oss_cutlass_moe() -> bool:
+    """Query the native build mode, preserving the default for older libraries."""
+    import torch
+
+    try:
+        query = torch.ops.trtllm.is_oss_cutlass_moe
+    except AttributeError:
+        logger.debug("CUTLASS MoE build-mode query is unavailable; assuming OSS kernels")
+        return True
+    return bool(query())
+
+
 def collect_moe_environment(force: bool = False) -> MoEEnvironment:
     """Collect and cache the frozen MoE selection environment."""
     global _CACHED_ENVIRONMENT
@@ -181,7 +195,14 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
             for flag, default in _ENV_FLAG_DEFAULTS.items()
         )
     )
-    environment = MoEEnvironment(sm=get_sm_version(), available_deps=available, env_flags=env_flags)
+    if force:
+        _is_oss_cutlass_moe.cache_clear()
+    environment = MoEEnvironment(
+        sm=get_sm_version(),
+        available_deps=available,
+        env_flags=env_flags,
+        oss_cutlass_moe=_is_oss_cutlass_moe(),
+    )
     logger.debug(
         f"collected MoE environment: sm={environment.sm} deps={available} "
         f"flags={env_flags} ({environment.fingerprint()})"
@@ -194,6 +215,7 @@ def reset_moe_environment_cache() -> None:
     """Drop the cached probe result. For tests that change probe outcomes."""
     global _CACHED_ENVIRONMENT
     _CACHED_ENVIRONMENT = None
+    _is_oss_cutlass_moe.cache_clear()
 
 
 @contextmanager

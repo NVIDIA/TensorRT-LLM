@@ -1,6 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import traceback
-from collections import deque
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Union)
@@ -40,6 +41,15 @@ class PostprocArgs:
     num_prompt_tokens_offset: int = 0
     tokenizer: Optional[TransformersTokenizer] = None
     ctx_usage: Optional[Any] = None
+    # Per-request speculative-decoding acceptance stats. Set on the base so
+    # every endpoint's args subclass inherits one opt-in path. Mirrors the
+    # server's per_request_spec_decode_stats setting; there is no per-request
+    # opt-in, so clients need send nothing.
+    return_spec_decode_stats: bool = False
+    # Fixed per-step draft bound, or None when draft_len_schedule makes it vary
+    # by batch size. Sizes the emitted acceptance histogram so its length is a
+    # function of configuration rather than of what a request happened to hit.
+    spec_decode_num_spec_tokens: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -88,6 +98,9 @@ class PostprocWorker:
         should_abort: bool = False
         finish_reason: Optional[str] = None
         num_generated_tokens: Optional[int] = None
+        decoding_iter: int = 0
+        avg_decoded_tokens_per_iter: Optional[float] = None
+        cached_tokens: int = 0
 
     def __init__(
         self,
@@ -125,8 +138,6 @@ class PostprocWorker:
             for i, addr in enumerate(push_pipe_addrs)
         ]
         self._to_stop = asyncio.Event()
-
-        self._q = deque()
 
         # Load the tokenizer and share in all records.
         # Guard against a None tokenizer_dir: transformers'
@@ -237,8 +248,9 @@ class PostprocWorker:
                 self._records.pop(client_id, None)
                 return
             try:
-                is_final = inp.rsp.result.is_final if is_llm_response(
-                    inp.rsp) else True
+                response_result = inp.rsp.result if is_llm_response(
+                    inp.rsp) else None
+                is_final = response_result.is_final if response_result else True
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
@@ -264,6 +276,13 @@ class PostprocWorker:
                         should_abort=should_abort,
                         finish_reason=finish_reason,
                         num_generated_tokens=num_generated_tokens,
+                        decoding_iter=getattr(response_result, "decoding_iter",
+                                              0),
+                        avg_decoded_tokens_per_iter=getattr(
+                            response_result, "avg_decoded_tokens_per_iter",
+                            None),
+                        cached_tokens=getattr(response_result, "cached_tokens",
+                                              0),
                     ))
                 if is_final:
                     self._records.pop(client_id, None)

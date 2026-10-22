@@ -17,12 +17,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
-from .backend import Chunk
+if TYPE_CHECKING:
+    from ..native.extent import Chunk
 
 
 class SessionStatus(Enum):
@@ -199,12 +200,18 @@ class RxSessionBase(_SessionBase):
         self._receiver = receiver
 
     @abstractmethod
-    def receive(self, chunk: Chunk) -> None:
+    def receive(self, chunk: Chunk, expected_write_bytes: Optional[int] = None) -> None:
         """Post where one piece is to land. ``chunk`` carries destination blocks here, the mirror
         of the source blocks ``send`` takes.
 
         Pieces are addressed by the order they are posted in rather than by anything inside the
         chunk, so they cannot be posted out of order or skipped.
+
+        ``expected_write_bytes`` is the local byte total the remote writers
+        must cover for this piece; when provided, implementations should
+        track attested written bytes against it so reuse admission can be
+        restricted to verifiably written ranges (see
+        ``RxSession.kv_write_verified``).
         """
         ...
 

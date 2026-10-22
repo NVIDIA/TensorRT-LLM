@@ -6,13 +6,8 @@ from typing import Any
 
 import yaml
 
-from agent_flow import (
-    CLAUDE_CODE_DEFAULT_MODEL,
-    AgentLayer,
-    AgentLayerConfig,
-    BackendConfig,
-    SessionConfig,
-)
+from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig, SessionConfig
+from agent_flow.agent_runtime import AgentConfig, resolve_agent_config
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 
@@ -25,6 +20,7 @@ from .progress import (
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .prompts._common import profile_ranks_note
+from .roles import ROLES
 from .sol_methodology import SolMethodology, output_instruction, projector_instruction
 from .state import (
     STAGE_ANALYZER,
@@ -37,6 +33,8 @@ from .state import (
     save_state,
 )
 from .task_schema import (
+    CASEBOOK_SKILL_NAMES,
+    casebook_enabled,
     concurrency_points,
     dump_task_yaml,
     is_curve_mode,
@@ -103,20 +101,23 @@ def _progress_has_entries(path: Path) -> bool:
 def _make_agent(
     name: str,
     system_prompt: str,
+    agent_config: AgentConfig,
     tools: list | None = None,
     required_tools: list[str] | None = None,
-    backend_kind: str = "claude-code",
-    model: str = CLAUDE_CODE_DEFAULT_MODEL,
     session_mode: str = "persistent",
+    disabled_skills: tuple[str, ...] = (),
 ) -> AgentLayer:
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
             backend=BackendConfig(
-                kind=backend_kind,
-                model=model,
+                kind=agent_config.backend,
+                model=agent_config.model,
+                reasoning_effort=agent_config.reasoning_effort,
+                disabled_skills=disabled_skills,
                 tools=tools,
+                extra_mcp_servers=agent_config.extra_mcp_servers,
             ),
             session=SessionConfig(mode=session_mode),
             required_tools=tuple(required_tools or ()),
@@ -234,33 +235,11 @@ class PerfAnalyzeWorkflow:
         self._progress_ctx = ProgressContext(path=self.progress_path)
         progress_tools = build_progress_tools(self._progress_ctx)
 
-        self.benchmarker = _make_agent(
-            "benchmarker",
-            self.prompts.benchmarker,
-            progress_tools["benchmarker"],
-            required_tools=["append_benchmarker_progress"],
-        )
-        # Constructed unconditionally (the stage gate lives in ``run``);
-        # the backend client is lazy, so a skipped projector costs nothing.
-        self.projector = _make_agent(
-            "projector",
-            self.prompts.projector,
-            progress_tools["projector"],
-            required_tools=["append_projector_progress"],
-        )
-        self.analyzer = _make_agent(
-            "analyzer",
-            self.prompts.analyzer,
-            progress_tools["analyzer"],
-            required_tools=["append_analyzer_progress"],
-        )
-        self.reporter = _make_agent(
-            "reporter",
-            self.prompts.reporter,
-            progress_tools["reporter"],
-            required_tools=["append_reporter_progress"],
-        )
         self._progress_tools = progress_tools
+        self._agent_configs: dict[str, AgentConfig] = {}
+        self._disabled_skills: tuple[str, ...] = ()
+        for role in ROLES:
+            setattr(self, role, None)
 
     def __enter__(self) -> "PerfAnalyzeWorkflow":
         return self
@@ -269,8 +248,28 @@ class PerfAnalyzeWorkflow:
         self.close()
 
     def close(self) -> None:
-        for layer in (self.benchmarker, self.projector, self.analyzer, self.reporter):
-            layer.__exit__(None, None, None)
+        for role in ROLES:
+            layer = getattr(self, role)
+            if layer is not None:
+                layer.__exit__(None, None, None)
+
+    def _configure_agents(self) -> None:
+        task_data = self._task_data()
+        self._disabled_skills = () if casebook_enabled(task_data) else CASEBOOK_SKILL_NAMES
+        self._agent_configs = {role: resolve_agent_config(task_data, role) for role in ROLES}
+        for role in ROLES:
+            setattr(
+                self,
+                role,
+                _make_agent(
+                    role,
+                    getattr(self.prompts, role),
+                    self._agent_configs[role],
+                    self._progress_tools[role],
+                    required_tools=[f"append_{role}_progress"],
+                    disabled_skills=self._disabled_skills,
+                ),
+            )
 
     # ------------------------------------------------------------- orchestration
 
@@ -280,6 +279,7 @@ class PerfAnalyzeWorkflow:
         state = self._init_state(task, log)
         if state is None:
             return
+        self._configure_agents()
 
         try:
             # Each stage checkpoints before advancing, so a crash / Ctrl-C
@@ -424,11 +424,13 @@ class PerfAnalyzeWorkflow:
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, the optional `extra_llm_api_options` path, "
             f"and the `benchmark` block.\n\n"
-            f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as read-only reference, as your system prompt "
-            f"directs, so your Configuration/Notes are grounded in known "
-            f"TRT-LLM performance precedents.\n\n"
-            f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
+            + self._casebook_instruction(
+                "Then **load the `perf-optimization-casebook` skill** (via the "
+                "`Skill` tool) as read-only reference, as your system prompt "
+                "directs, so your Configuration/Notes are grounded in known "
+                "TRT-LLM performance precedents.\n\n"
+            )
+            + f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
             f"set), poll it to "
             f"readiness, {load_instruction}. Use the "
             f"**canonical `benchmark_serving.py` command in your system "
@@ -532,12 +534,14 @@ class PerfAnalyzeWorkflow:
             f"baseline.\n\n"
             + curve_context
             + projection_context
-            + f"Early on, **load the `perf-optimization-casebook` skill** (via "
-            f"the `Skill` tool) as read-only reference, as your system prompt "
-            f"directs, and match each ranked bottleneck hypothesis against its "
-            f"*bottleneck signal → candidate pattern* index so the Reporter "
-            f"inherits a known precedent.\n\n"
-            f"First **verify this checkout's profiling knobs** with "
+            + self._casebook_instruction(
+                "Early on, **load the `perf-optimization-casebook` skill** (via "
+                "the `Skill` tool) as read-only reference, as your system prompt "
+                "directs, and match each ranked bottleneck hypothesis against its "
+                "*bottleneck signal → candidate pattern* index so the Reporter "
+                "inherits a known precedent.\n\n"
+            )
+            + f"First **verify this checkout's profiling knobs** with "
             f"`grep -rn`/`rg` via `Bash` under "
             f"`{self._trtllm_hint()}` — `py_executor.py` for "
             f"`TLLM_PROFILE_START_STOP` (the iteration-window gate), and "
@@ -686,6 +690,9 @@ class PerfAnalyzeWorkflow:
         On by default — only ``sol.enabled: false`` turns it off.
         """
         return sol_enabled(self._task_data())
+
+    def _casebook_instruction(self, text: str) -> str:
+        return "" if self._disabled_skills else text
 
     def _profile_ranks(self) -> tuple[int, ...]:
         """The rank ids nsys must capture, from the resolved spec."""

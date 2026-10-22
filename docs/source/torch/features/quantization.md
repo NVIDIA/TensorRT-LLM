@@ -23,7 +23,13 @@ Dense decoder-only models with FP16 or BF16 weights can store their KV cache in
 INT8 using the `TRTLLM` attention backend. The KV tensors use one byte per element,
 half the storage of an FP16/BF16 cache with the same number of elements. Allocator
 granularity can prevent small pools from reserving exactly half the GPU memory.
-Model weights and other runtime allocations are unchanged.
+Model weights and other runtime allocations are unchanged. FP8 KV cache also
+uses one byte per element; INT8 does not provide an additional storage reduction
+over FP8.
+
+INT8 requires the legacy TRTLLM decode path. Devices routed to TRTLLM-Gen decode
+kernels, including SM100 and SM103, reject INT8 during attention configuration.
+Use FP8 KV cache with FP8-calibrated scales on those devices.
 
 The checkpoint must contain calibrated, positive scalar dequantization scales
 `model.layers.<layer>.self_attn.k_proj.k_scale` and
@@ -40,11 +46,15 @@ position embeddings on K; FP8 or FP4 scales cannot be reused unchanged.
 `TRTLLM_LOAD_KV_SCALES` must remain enabled (`1`, the default) for INT8;
 disabling calibrated scale loading raises an error.
 
-The attention backend validates both runtime scales on every call: they must be
-finite, positive FP32 scalars on the attention input device, and their product
-must equal one within a tolerance of `1e-5`. Eager execution raises `ValueError`
-for invalid values and synchronizes to read the scales. CUDA Graph execution
-records a device assertion that checks the live scale buffers on each replay.
+Both runtime scales must be finite, positive FP32 scalars on the attention
+input device, and their product must equal one within a tolerance of `1e-5`.
+Eager execution caches validation for non-inference scale tensors. It rereads
+the values when the tensors, storage pointers, mutation versions, attention
+dtype/device, or cache/attention mode changes. Inference tensors have no mutation
+version and are checked on every call. Invalid values raise `ValueError`; reading
+the values synchronizes with the device. CUDA Graph capture always records a
+device assertion, including after an eager cache hit, to check the live scale
+buffers on each replay.
 An invalid scale during replay invalidates the CUDA context; restart the worker
 before continuing inference.
 

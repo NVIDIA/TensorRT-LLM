@@ -77,6 +77,49 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        {
+            'patterns': ['deepseek_v41_flash_nvfp4'],
+            'config': {
+                'gpus_per_node': 4,
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'allreduce_strategy': 'NCCL',
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                },
+                'custom_tokenizer': 'deepseek_v41',
+                'trust_remote_code': True,
+                'max_seq_len': 9344,
+                'enable_chunked_prefill': True,
+                'disable_overlap_scheduler': False,
+                'enable_iter_perf_stats': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32],
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'tokens_per_block': 128,
+                    'max_tokens': 262144,
+                    'enable_block_reuse': False,
+                    'enable_swa_scratch_reuse': False,
+                },
+                'sparse_attention_config': {
+                    'algorithm': 'csa2'
+                },
+                'speculative_config': None,
+            }
+        },
+        {
+            'patterns': ['deepseek_v41_flash_nvfp4_dspark'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'DSpark',
+                    'max_draft_len': 5,
+                    'block_size': 5,
+                },
+            }
+        },
         # MAX NVFP4 TP8/MTP3 follows accuracy PR #18071.
         {
             'patterns': ['qwen3.8_max_fp4_mtp-serve-pytorch'],
@@ -519,22 +562,51 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Qwen3.6-35B-A3B NVFP4 streaming (Spark) cases: CuteDSL MoE, FP8 KV cache with block reuse.
+        {
+            'patterns': ['qwen3.6_35b_a3b_fp4-bench-pytorch-streaming'],
+            'config': {
+                'trust_remote_code': True,
+                'kv_cache_config': {
+                    'enable_block_reuse': True,
+                },
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+                'nvfp4_gemm_config': {
+                    'allowed_backends':
+                    ['marlin', 'cutlass', 'cublaslt', 'cuda_core'],
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'enable_chunked_prefill': True,
+                'num_postprocess_workers': 4,
+                'print_iter_log': True,
+                'stream_interval': 10,
+                'disable_overlap_scheduler': False,
+            }
+        },
         # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
         {
             'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
             'config': {
                 'trust_remote_code': True,
                 'moe_config': {
-                    'backend': 'CUTLASS',
+                    'backend': 'CUTEDSL',
                 },
-                'enable_chunked_prefill': True,
+                'nvfp4_gemm_config': {
+                    'allowed_backends':
+                    ['marlin', 'cutlass', 'cublaslt', 'cuda_core'],
+                },
                 'cuda_graph_config': {
                     'enable_padding': True,
                 },
-                'kv_cache_config': {
-                    'enable_block_reuse': False,
-                    'dtype': 'fp8',
-                },
+                'enable_chunked_prefill': True,
+                'num_postprocess_workers': 4,
+                'print_iter_log': True,
+                'stream_interval': 10,
+                'disable_overlap_scheduler': False,
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'max_draft_len': 1,
@@ -713,7 +785,6 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4,
                 'cuda_graph_config': {
                     'enable_padding': True,
-                    'max_batch_size': 16,
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
@@ -885,6 +956,11 @@ def get_model_yaml_config(model_label: str,
         if _get_sm_version_safe() >= 100:
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
+
+    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly; other
+    # GPUs keep the model's own get_model_defaults() choice.
+    if 'gemma_4_' in model_label.lower() and _get_sm_version_safe() == 121:
+        base_config['attn_backend'] = 'FLASHINFER'
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:

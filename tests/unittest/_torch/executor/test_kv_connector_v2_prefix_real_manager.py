@@ -55,6 +55,7 @@ class FakeConnectorManager:
 
     def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
         self.prefix_reservations_enabled = False
+        self.capacity_only = False
         self.reservations = {}
         self.reservation_requests = {}
         self.next_reservation_id = 1
@@ -255,6 +256,32 @@ def test_offer_is_backed_by_real_pages(manager, connector):
     assert len(page_indices) >= PROMPT_LEN // TOKENS_PER_BLOCK
     assert all(index != BAD_PAGE_INDEX for index in page_indices)
     assert len(set(page_indices)) == len(page_indices)
+
+
+def test_a_served_cache_is_allocated_off_the_execution_stream(connector):
+    """The fence waits for the allocation, not for the execution stream."""
+    torch.cuda.init()
+    execution_stream = torch.cuda.Stream()
+    manager = make_manager(connector, execution_stream=execution_stream)
+    try:
+        request = make_request()
+        assert schedule(manager, request)
+        kv_cache = manager.kv_cache_map[request.py_request_id]
+        assert kv_cache.cuda_stream == manager._allocation_stream.cuda_stream
+
+        batch = run(manager, request)
+        manager.report_batch_to_connector(batch)
+        assert kv_cache.cuda_stream == execution_stream.cuda_stream
+
+        with torch.cuda.stream(execution_stream):
+            torch.cuda._sleep(1 << 31)
+            forward_done = torch.cuda.Event()
+            forward_done.record(execution_stream)
+        manager.wait_allocation_fences([request.py_request_id])
+        assert not forward_done.query(), "the fence waited for the execution stream"
+        execution_stream.synchronize()
+    finally:
+        manager.shutdown()
 
 
 def test_the_unchunked_path_allocates_nothing_for_the_prefix(manager, connector):
@@ -466,7 +493,7 @@ def test_attention_sinks_are_never_masked(vswa_manager: KVCacheManagerV2) -> Non
 
     life_cycles = list(vswa_manager._life_cycle_by_layer_group())
     life_cycles[sliding] = AttnLifeCycle.make(VSWA_WINDOW, num_sink_tokens, tokens_per_block)
-    vswa_manager._connector_life_cycle_by_group = life_cycles
+    vswa_manager._layer_group_life_cycles = life_cycles
 
     request = make_request(prompt_len=VSWA_PROMPT_LEN)
     assert schedule(vswa_manager, request)
@@ -667,7 +694,7 @@ def test_a_sliding_single_group_reports_sentinels_in_the_flat_list():
 def test_a_served_prefix_survives_re_entry_under_a_sliding_window():
     """Here the rewind is not only wasted work.
 
-    ``_resize_for_connector_prefix`` sets the cache's ``history_length`` to the
+    ``_resize_for_served_prefix`` sets the cache's ``history_length`` to the
     served end, and raising history unlocks the blocks the window has passed. A
     cursor settled below that end points the forward pass at ordinals whose
     pages are gone.
@@ -723,7 +750,7 @@ def test_rejected_connector_candidate_releases_and_rewinds(
     assert request.context_current_position == 0
     assert request.prepopulated_prompt_len == 0
     assert request.context_chunk_size == PROMPT_LEN
-    assert request.py_connector_served_position == 0
+    assert request.py_served_prefix_end == 0
     assert schedule(manager, request)
     assert connector.get_prefix_reservation(request).reservation_id == 2
     assert connector.queries == [(request.request_id, 0), (request.request_id, 0)]

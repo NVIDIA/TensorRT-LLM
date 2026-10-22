@@ -108,8 +108,50 @@ configured `pool_ratio` does not match the derived group count, the manager
 logs a warning and keeps the single-window default, so existing configurations
 continue to run.
 
+The C++ implementation of V2 supports beam search for dense-attention models,
+including context-first disaggregated serving with the Python transceiver
+(`cache_transceiver_config.transceiver_runtime: PYTHON`, `backend: NIXL`).
+Select V2 on both workers and configure their `max_beam_width` for the requested
+beam width. The transceiver transfers the shared prompt KV once; the generation
+worker expands the beams after the transfer completes. Block reuse remains
+supported. The Python implementation selected by
+`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python` is separate from the Python transceiver
+and does not support beam search. Hybrid Mamba, sparse attention, KV connectors,
+and pipelined KV transfer remain unsupported with V2 beam search.
+
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
+
+### SWA Endpoint Retention
+
+To prefer cached sliding-window attention (SWA) blocks near a prompt's endpoint
+under cache pressure, opt in with the prototype
+`kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` option:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    policy: all_reusable
+    swa_endpoint_rewind_tokens: 1024
+```
+
+For newly created pages, positive values assign priority `70` to sink blocks
+and SWA blocks overlapping the final `window_size + swa_endpoint_rewind_tokens`
+tokens of the reusable prompt prefix, excluding the final prompt token that is
+recomputed. Other SWA pages receive priority `0`; full-attention and other
+life cycles retain the default priority `35`. Blocks remain reusable until
+evicted. Within each eviction pool, lower priorities are evicted first, with
+LRU ordering among pages of equal priority.
+
+The endpoint is fixed for each request. Existing reused pages retain their
+assigned priorities: advancing the conversation does not automatically promote
+or demote them, and decoding does not advance the callback's endpoint.
+This preference does not guarantee residency or change attention windows or
+prefix matching. It excludes dummy and draft requests. The default, `0`, disables
+the entire endpoint-priority callback, including its preference for the final window.
+This option requires V2, block reuse, and the `all_reusable` policy.
 
 ### Mamba Snapshot Boundaries
 
@@ -164,7 +206,9 @@ snapshots only.
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
 
-To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be a user ID, tenant ID, or hash string. V2 uses the complete UTF-8 string in its reuse scope; an empty string is distinct from an omitted salt.
+
+V2 stored events report the scope's string in `cache_salt`. For ordinary requests this is the supplied value. CSA2 with encoder replay enabled adds its encoder-replay namespace to the scope, so its events report that effective namespace. The integer salt conversion used by `v1_block_key` events is confined to event hashing and matches the router; it does not affect V2 reuse identity.
 
 This isolation is enforced entirely by the block-key hash: the salt is mixed into the hashed input and prefix matching is decided by digest equality alone (blocks are not re-compared token-by-token). The block-key hash is therefore required to be a cryptographic hash with strong collision resistance and a 256-bit digest (SHA-256 provides ~128-bit collision resistance, which is ample here); substituting a non-cryptographic hash would allow crafted collisions to bypass salt isolation and must not be done.
 
@@ -207,7 +251,7 @@ V2 derives `mm_keys` directly from the cached token sequence. Each entry identif
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
 
-When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
+When offloading is enabled, `KvCacheConfig.cold_tier_offload_min_priority` controls which unreferenced blocks can be offloaded. Blocks below the threshold are discarded from GPU memory; blocks at or above it can move to a cold tier. The default threshold is 30. The old name, `secondary_offload_min_priority`, remains accepted as a deprecated alias.
 
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
@@ -267,22 +311,26 @@ shows whether the switch actually did anything.
 
 ### KV Cache Events
 
-KV cache events report block **stored**, **removed**, **created** and **updated** operations
-so an external KV-cache-aware router (for example NVIDIA Dynamo) can route a request to the
-engine that already holds its prefix. Two delivery paths are available.
+KV cache events let an external KV-cache-aware router (for example NVIDIA Dynamo) route a
+request to the engine that already holds its prefix. The buffered path reports block **stored**,
+**removed**, **created** and **updated** operations. The streaming path exposes the narrower
+router-facing contract described below.
 
 #### Buffered path (default)
 
 Set ```event_buffer_max_size``` to a positive integer and ```enable_block_reuse``` to True.
 Events are buffered per rank, gathered onto rank 0 under attention data parallelism, and
-pulled per iteration through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
-or over the `/kv_cache_events` endpoint of `trtllm-serve`.
+exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`, or over the
+`/kv_cache_events` endpoint of `trtllm-serve`.
 
 #### Streaming path (prototype)
 
-Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
-publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
-rank-0 gather and no per-iteration pull.
+Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
+publishing overhead under attention data parallelism: each emitting rank publishes its own
+events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
+LLM API. Each emitting rank still drains its local native event source, converts the events to
+wire structs and enqueues one batch at the iteration boundary. A background thread performs
+msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -297,12 +345,22 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** The streaming path requires KV cache manager V2 running on its Python
-backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
-consume the Python event sink and raises an error naming this variable. Pipeline
-parallelism and context parallelism are rejected. Events are not published for draft
-models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
-returns an empty list rather than raising.
+**Limitations.** Pipeline and context parallelism are unsupported. Buffered polling returns
+no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
+events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
+
+Streaming exposes only the full-block residency information external routers need, using the
+attention lifecycle with the largest window. Conversion to `BlockStored`/`BlockRemoved` is
+centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
+contained and avoiding Python callbacks from native cache operations.
+
+**Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
+integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
+in `block_hashes[i]`, using the `hash` and `start_offset` fields defined above. This payload
+support does not establish end-to-end multimodal-aware routing compatibility. The final
+identity and normalization contract will be revisited separately after
+[Dynamo #15095](https://github.com/ai-dynamo/dynamo/pull/15095) and
+[TensorRT-LLM #19529](https://github.com/NVIDIA/TensorRT-LLM/pull/19529) merge.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
@@ -319,15 +377,17 @@ have no port, each rank appends a `_dp<rank>` suffix instead.
 **Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
 an 8-byte big-endian sequence number, and a msgpack payload
 `[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
-`BlockStored`, `BlockRemoved` or `AllBlocksCleared` — carrying int64 block hashes derived
-from the V2 radix block keys. This is the format documented for custom router backends; it
-differs from vLLM's positional-array encoding of the individual events, though the batch
-envelope is positional in both.
+`BlockStored` or `BlockRemoved` — carrying int64 block hashes derived from the V2 radix block
+keys. This is the format documented for custom router backends; it differs from vLLM's
+positional-array encoding of the individual events, though the batch envelope is positional in
+both.
 
-**Delivery guarantees.** Delivery is best effort, but loss is observable. Every accepted
+**Delivery guarantees.** Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue
 (```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
-treat any gap as lost KV-cache state and resynchronize rather than assuming continuity.
+treat any gap as lost KV-cache state and resynchronize rather than assuming continuity. A
+producer-side safety-cap drop is reported in the producer's logs and counters but does not
+create a sequence gap.
 
 **Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and

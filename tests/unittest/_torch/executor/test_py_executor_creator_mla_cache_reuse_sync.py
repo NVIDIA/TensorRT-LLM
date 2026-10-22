@@ -13,21 +13,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    ContextChunkingPolicy,
+    ExecutorMemoryType,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_executor_creation_stage_metric_names_are_descriptive():
+    """Verify executor creation stages use the expected public metric names."""
+    assert py_executor_creator._ExecutorMemoryMonitor.creation_stage_metric_names == {
+        ExecutorMemoryType.SAMPLER: "sampler_creation_seconds",
+        ExecutorMemoryType.DRAFTER: "speculative_drafter_creation_seconds",
+        ExecutorMemoryType.GUIDED_DECODER: "guided_decoder_creation_seconds",
+        ExecutorMemoryType.SPEC_RESOURCES: (
+            "speculative_decoding_resource_manager_creation_seconds"
+        ),
+        ExecutorMemoryType.INIT_KV_CACHE: "initial_kv_cache_creation_seconds",
+        ExecutorMemoryType.INIT_EXTRA_RESOURCES: (
+            "initial_py_executor_creation_seconds_for_kv_cache_estimation"
+        ),
+        ExecutorMemoryType.MODEL_EXTRA: "kv_cache_capacity_configuration_seconds",
+        ExecutorMemoryType.EXTRA_RESOURCES: "final_py_executor_creation_seconds",
+        ExecutorMemoryType.KV_CACHE: "final_kv_cache_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "model_engine_creation_seconds",
+    }
 
 
 class _DummyCalibrator:
@@ -79,6 +106,7 @@ class _DummyPyExecutor:
         """
         self.resource_manager = _DummyResourceManager(resources)
         self.model_engine = model_engine
+        self.metrics = {}
         self.peft_cache_config = peft_cache_config
         self.execution_stream = execution_stream
         self.started = False
@@ -146,6 +174,7 @@ class _DummyModelEngine:
 
         self._warmup_timer = _WarmupTimer(rank=0)
         self.attn_runtime_features = attn_runtime_features
+        self.metrics = {}
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
         self.sparse_attention_config = (
@@ -158,6 +187,7 @@ class _DummyModelEngine:
                 sparse_attention_config=self.sparse_attention_config,
                 enable_flash_mla=enable_flash_mla,
                 is_generation=True,
+                is_encoder_decoder=False,
                 pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
                 quant_config=QuantConfig(
                     kv_cache_quant_algo=(
@@ -223,20 +253,21 @@ def _make_llm_args():
 
 
 def _run_create_py_executor(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     *,
-    sm_version,
-    kv_cache_quant_algo,
-    sparse_algorithm=None,
-    attn_backend="TRTLLM",
-    cache_transceiver_config=None,
-    enable_flash_mla=False,
-    model_max_seq_len=128,
-    enable_chunked_prefill=False,
-    is_hybrid_linear_model=False,
-    ctx_chunk_configs=None,
-    kv_cache_creator_cls=_DummyKvCacheCreator,
-):
+    sm_version: int,
+    kv_cache_quant_algo: QuantAlgo,
+    sparse_algorithm: str | None = None,
+    attn_backend: str = "TRTLLM",
+    cache_transceiver_config: CacheTransceiverConfig | None = None,
+    enable_flash_mla: bool = False,
+    model_max_seq_len: int = 128,
+    enable_chunked_prefill: bool = False,
+    is_hybrid_linear_model: bool = False,
+    ctx_chunk_configs: list | None = None,
+    kv_cache_creator_cls: type[_DummyKvCacheCreator] = _DummyKvCacheCreator,
+    is_mla_model: bool = True,
+) -> tuple[bool, bool, bool]:
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
     Mocks all external dependencies (model engine, resource managers, etc.) to isolate
@@ -256,6 +287,7 @@ def _run_create_py_executor(
         is_hybrid_linear_model: Whether to emulate a hybrid linear model.
         ctx_chunk_configs: Optional list that receives the executor chunk config.
         kv_cache_creator_cls: Mock cache creator, including optional capacity estimation.
+        is_mla_model: Whether the model uses MLA.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
@@ -296,7 +328,7 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: True)
+    monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla_model)
     monkeypatch.setattr(
         py_executor_creator,
         "is_hybrid_linear",
@@ -354,6 +386,112 @@ def _run_create_py_executor(
         py_executor.model_engine.attn_runtime_features.cache_reuse,
         py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
+
+
+@pytest.mark.parametrize("requires_encoder_features", [False, True])
+@pytest.mark.parametrize("requested_reuse", [False, True])
+@pytest.mark.parametrize("wrapped_model", [False, True])
+def test_encoder_reuse_override_syncs_config_and_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    requires_encoder_features: bool,
+    requested_reuse: bool,
+    wrapped_model: bool,
+) -> None:
+    """Resolve feature-encoder reuse before cache construction and telemetry."""
+    llm_args = _make_llm_args()
+    llm_args.kv_cache_config.enable_block_reuse = requested_reuse
+    monkeypatch.setattr(sys.modules[__name__], "_make_llm_args", lambda: llm_args)
+    monkeypatch.setattr(
+        _DummyModelEngine,
+        "input_processor",
+        SimpleNamespace(requires_encoder_features=requires_encoder_features),
+        raising=False,
+    )
+
+    def prepare_model(self: _DummyCalibrator, model: SimpleNamespace) -> SimpleNamespace:
+        model.model_config.is_encoder_decoder = True
+        if wrapped_model:
+            return SimpleNamespace(
+                _orig_mod=model,
+                model_config=model.model_config,
+                vocab_size_padded=model.vocab_size_padded,
+            )
+        return model
+
+    monkeypatch.setattr(_DummyCalibrator, "maybe_wrap_model", prepare_model)
+    manager_reuse, runtime_reuse, _ = _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        is_mla_model=False,
+    )
+
+    expected_reuse = requested_reuse and not requires_encoder_features
+    assert llm_args.kv_cache_config.enable_block_reuse is expected_reuse
+    assert manager_reuse is expected_reuse
+    assert runtime_reuse is expected_reuse
+
+
+def test_move_model_engine_metrics_moves_and_clears() -> None:
+    """Verify engine metrics are exposed by the executor and cleared at source."""
+    py_executor = object.__new__(PyExecutor)
+    py_executor._metrics = {}
+    model_engine = SimpleNamespace(metrics={"total_warmup_seconds": 2.5})
+
+    py_executor_creator._move_model_engine_metrics(py_executor, model_engine, "initial")
+    assert model_engine.metrics == {}
+
+    model_engine.metrics["total_warmup_seconds"] = 3.5
+    py_executor_creator._move_model_engine_metrics(py_executor, model_engine, "final")
+
+    assert py_executor.metrics == {
+        "initial_model_engine": {"total_warmup_seconds": 2.5},
+        "final_model_engine": {"total_warmup_seconds": 3.5},
+    }
+    assert model_engine.metrics == {}
+
+
+def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeypatch) -> None:
+    """Verify creation timing finishes on errors and completed metrics attach on success."""
+    captured_metrics = None
+
+    @contextmanager
+    def _timing_metric(metric_name, metrics):
+        nonlocal captured_metrics
+        captured_metrics = metrics
+        try:
+            yield
+        finally:
+            metrics[metric_name] = 1.5
+
+    def _raise_during_creation(**kwargs):
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr(py_executor_creator, "timing_metric", _timing_metric)
+    monkeypatch.setattr(py_executor_creator, "_create_py_executor", _raise_during_creation)
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        py_executor_creator.create_py_executor(SimpleNamespace())
+
+    assert captured_metrics == {"total_py_executor_creation_seconds": 1.5}
+
+    py_executor = object.__new__(PyExecutor)
+    py_executor._metrics = {"worker_start_seconds": 0.25}
+
+    def _return_executor(*, creation_metrics: dict[str, float], **kwargs: object) -> PyExecutor:
+        assert "total_py_executor_creation_seconds" not in creation_metrics
+        creation_metrics["model_engine_creation_seconds"] = 1.0
+        return py_executor
+
+    monkeypatch.setattr(py_executor_creator, "_create_py_executor", _return_executor)
+    result = py_executor_creator.create_py_executor(SimpleNamespace())
+
+    assert result is py_executor
+    assert result.metrics == {
+        "worker_start_seconds": 0.25,
+        "model_engine_creation_seconds": 1.0,
+        "total_py_executor_creation_seconds": 1.5,
+    }
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):

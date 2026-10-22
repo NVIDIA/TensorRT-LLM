@@ -121,6 +121,9 @@ class MoEProblem:
     activation_constants: frozenset[str] = frozenset()
     #: ``RoutingMethodType`` member name; None means the call site did not say.
     routing: Optional[str] = None
+    #: True when a clamped SwiGLU must clamp its activated gate rather than
+    #: preserving the historical raw-gate clamp order.
+    clamp_after_silu: bool = False
 
     @property
     def routing_method_type(self) -> Optional["RoutingMethodType"]:
@@ -238,6 +241,7 @@ class MoEEnvironment:
     sm: int  # e.g. 100, 103
     available_deps: Tuple[str, ...] = ()
     env_flags: Tuple[Tuple[str, str], ...] = ()  # sorted (name, value) pairs
+    oss_cutlass_moe: bool = True
 
     def has_dep(self, name: str) -> bool:
         return name in self.available_deps
@@ -256,7 +260,7 @@ class MoEEnvironment:
 
     def fingerprint(self) -> str:
         """Return a stable fingerprint for the selection environment."""
-        payload = repr((self.sm, sorted(self.available_deps), self.env_flags))
+        payload = repr((self.sm, sorted(self.available_deps), self.env_flags, self.oss_cutlass_moe))
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -283,6 +287,7 @@ class MoEDeployment:
     # ``model_config.locality_domain_policy.enabled``. Whether the machine can
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
+    force_dynamic_quantization: bool = False
 
     @property
     def smart_router(self) -> bool:
@@ -503,6 +508,7 @@ class MoEResolutionReport:
                 "bias": self.problem.bias,
                 "activation": self.problem.activation,
                 "activation_constants": sorted(self.problem.activation_constants),
+                "clamp_after_silu": self.problem.clamp_after_silu,
                 "routing": self.problem.routing,
             },
             "deployment": {
@@ -514,6 +520,8 @@ class MoEResolutionReport:
                 "num_slots": self.deployment.num_slots,
                 "eplb_enabled": self.deployment.eplb_enabled,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
+                "force_dynamic_quantization": self.deployment.force_dynamic_quantization,
+                "oss_cutlass_moe": self.deployment.env.oss_cutlass_moe,
                 "sm": self.deployment.env.sm,
                 "env_flags": dict(self.deployment.env.env_flags),
             },
@@ -605,6 +613,10 @@ class MoERunContext:
     # produced by quantize_input
     x: torch.Tensor  # activations [num_tokens, hidden_size]
     x_sf: Optional[torch.Tensor]  # scale factors, when the input is quantized
+    # set when x/x_sf were produced on an auxiliary stream (async input
+    # quantization); the impl must wait on it before the first kernel that
+    # reads x/x_sf. None when quantization ran on the main stream.
+    x_ready_event: Optional[torch.cuda.Event] = None
     # produced by the outer forward
     output_dtype: Optional[torch.dtype] = None
     do_finalize: bool = True

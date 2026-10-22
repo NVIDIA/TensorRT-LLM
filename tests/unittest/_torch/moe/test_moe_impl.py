@@ -30,6 +30,7 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
@@ -126,6 +127,45 @@ def test_pinned_deepgemm_identity_resolves_to_the_leaf():
     assert not report.degraded
 
 
+def test_pinned_deepgemm_rejects_post_silu_clamping():
+    activation = SwigluActivation(clamp=5.0, clamp_after_silu=True)
+    with override_moe_environment(_deepgemm_environment()):
+        report = resolve_moe_impl(
+            _deepgemm_model_config(),
+            activation=activation,
+            impl_id=_DEEPGEMM_IMPL_ID,
+        )
+
+    assert report.winner is None
+    assert report.rejected[-1].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert "post-SiLU clamping" in report.rejected[-1].detail
+
+
+@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False)])
+def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        activation_constants=frozenset({"clamp"}),
+        clamp_after_silu=True,
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=sm),
+        parallel_size=1,
+    )
+
+    verdict = CutlassFusedMoE.can_implement(problem, deployment)
+
+    assert verdict.eligible is eligible
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+        assert "Triton fallback" in verdict.detail
+
+
 def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
     """The two request tracks are meant to differ exactly here."""
     config = _deepgemm_model_config(QuantAlgo.NVFP4)
@@ -196,8 +236,8 @@ def _megamoe_problem(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8) -> MoEProblem:
     return MoEProblem(
         quant=canonical_quant(quant_algo),
         dtype_act=torch.bfloat16,
-        # Both widths are % 512 == 0, which is what the packed-UE8M0 SF rows
-        # need to stay TMA-aligned.
+        # Both widths are % 512 == 0, which is what keeps the packed-UE8M0 SF
+        # records in DeepGEMM's dispatch buffer TMA-aligned.
         hidden_size=1024,
         intermediate_size=1024,
         num_experts=8,
@@ -1280,3 +1320,295 @@ def test_an_identity_reusing_a_token_across_its_own_fields_is_rejected():
 
     with pytest.raises(ValueError, match=r"token 'torch' is already a value of field 'provider'"):
         registry.register(_SelfCollidingImpl)
+
+
+@pytest.mark.parametrize("is_oss", [False, True], ids=["internal", "oss"])
+@pytest.mark.parametrize(
+    "activation,quant_algo,sm,reason",
+    [
+        pytest.param("SiTu", None, 90, MoERejectReason.ACTIVATION_UNSUPPORTED, id="situ"),
+        pytest.param("Relu2", None, 90, MoERejectReason.ACTIVATION_UNSUPPORTED, id="relu2"),
+        pytest.param(
+            "Swiglu", QuantAlgo.W4A16_MXFP4, 90, MoERejectReason.QUANT_UNSUPPORTED, id="w4a16_mxfp4"
+        ),
+        pytest.param(
+            "Swiglu", QuantAlgo.W4A8_AWQ, 90, MoERejectReason.QUANT_UNSUPPORTED, id="w4a8_awq"
+        ),
+        pytest.param("Swiglu", QuantAlgo.MXFP8, 100, MoERejectReason.QUANT_UNSUPPORTED, id="mxfp8"),
+        pytest.param(
+            "Swiglu",
+            QuantAlgo.W4A8_MXFP4_MXFP8,
+            100,
+            MoERejectReason.QUANT_UNSUPPORTED,
+            id="w4a8_mxfp4_mxfp8",
+        ),
+    ],
+)
+def test_cutlass_build_mode_resolution(is_oss, activation, quant_algo, sm, reason):
+    report = resolve_moe_impl(
+        ModelConfig(moe_backend="CUTLASS"),
+        problem=MoEProblem(
+            quant=quant_algo.value if quant_algo is not None else None,
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            activation=activation,
+        ),
+        deployment=MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            env=MoEEnvironment(sm=sm, oss_cutlass_moe=is_oss),
+        ),
+    )
+    if is_oss:
+        assert impl_class_for(report) is CutlassFusedMoE
+        assert not report.rejected
+    else:
+        assert report.winner is None
+        assert len(report.rejected) == 1
+        assert report.rejected[0].reason is reason
+        with pytest.raises(ValueError, match="USING_OSS_CUTLASS_MOE_GEMM=ON"):
+            impl_class_for(report)
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_cutlass_dynamic_scale_resolution(is_oss: bool, dynamic: bool) -> None:
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import build_moe_deployment
+
+    deployment = build_moe_deployment(
+        ModelConfig(force_dynamic_quantization=dynamic),
+        num_experts=8,
+        environment=MoEEnvironment(sm=100, oss_cutlass_moe=is_oss),
+    )
+    assert deployment.force_dynamic_quantization is dynamic
+    report = resolve_moe_impl(
+        ModelConfig(moe_backend="CUTLASS"),
+        problem=MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+        ),
+        deployment=deployment,
+    )
+    if dynamic and not is_oss:
+        assert report.winner is None
+        assert report.rejected[0].reason is MoERejectReason.QUANT_UNSUPPORTED
+    else:
+        assert impl_class_for(report) is CutlassFusedMoE
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+@pytest.mark.parametrize("alltoall", [False, True])
+def test_cutlass_communication_validation(is_oss: bool, alltoall: bool) -> None:
+    from types import SimpleNamespace
+
+    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    moe = SimpleNamespace(enable_alltoall=alltoall)
+    with override_moe_environment(MoEEnvironment(sm=90, oss_cutlass_moe=is_oss)):
+        if alltoall and not is_oss:
+            with pytest.raises(ValueError, match="all-to-all.*USING_OSS_CUTLASS_MOE_GEMM=ON"):
+                backend.validate_configurable_moe(moe)
+        else:
+            backend.validate_configurable_moe(moe)
+
+
+@pytest.mark.parametrize("mode", [None, False, True])
+def test_cutlass_build_mode_probe(monkeypatch: pytest.MonkeyPatch, mode: bool | None) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe import impl_environment
+
+    query = MagicMock(return_value=mode)
+    debug = MagicMock()
+    monkeypatch.setattr(impl_environment.logger, "debug", debug)
+    namespace = SimpleNamespace() if mode is None else SimpleNamespace(is_oss_cutlass_moe=query)
+    monkeypatch.setattr(torch.ops, "trtllm", namespace)
+    impl_environment.reset_moe_environment_cache()
+    try:
+        expected = True if mode is None else mode
+        assert impl_environment._is_oss_cutlass_moe() is expected
+        assert impl_environment._is_oss_cutlass_moe() is expected
+        assert query.call_count == (0 if mode is None else 1)
+        if mode is None:
+            debug.assert_called_once_with(
+                "CUTLASS MoE build-mode query is unavailable; assuming OSS kernels"
+            )
+        else:
+            debug.assert_not_called()
+    finally:
+        impl_environment.reset_moe_environment_cache()
+
+
+def test_cutlass_build_mode_fingerprint() -> None:
+    assert (
+        MoEEnvironment(sm=90).fingerprint()
+        != MoEEnvironment(sm=90, oss_cutlass_moe=False).fingerprint()
+    )
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+@pytest.mark.parametrize("method", [None, "ALLGATHER", "NVLINK_ONE_SIDED"])
+@pytest.mark.parametrize("force_source", ["model", "env"])
+def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_source):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    if force_source == "env" and method is not None:
+        monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", method)
+    mapping = SimpleNamespace(
+        enable_attention_dp=True,
+        dp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+        has_cp_helix=lambda: False,
+    )
+    config = SimpleNamespace(
+        mapping=mapping,
+        pretrained_config=SimpleNamespace(hidden_size=128),
+        torch_dtype=torch.bfloat16,
+        quant_config=None,
+        max_num_tokens=8,
+        moe_max_num_tokens=8,
+        use_cuda_graph=False,
+        use_low_precision_moe_combine=False,
+        moe_load_balancer=None,
+    )
+    constructors = {}
+    for name in (
+        "AllGatherReduceScatter",
+        "NVLinkOneSided",
+        "NVLinkTwoSided",
+        "NVLinkTwoSidedFlashinfer",
+        "NcclEP",
+        "DeepEP",
+        "DeepEPLowLatency",
+    ):
+        constructors[name] = MagicMock(name=name)
+        monkeypatch.setattr(communication_factory, name, constructors[name])
+    monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
+    moe = SimpleNamespace(
+        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        enable_dwdp=False,
+        model_config=config,
+        num_experts=4,
+        num_slots=4,
+        routing_method=SimpleNamespace(experts_per_token=1),
+        expert_size_per_partition=2,
+        use_flashinfer=False,
+        hidden_size=128,
+        communication_method=method if force_source == "model" else None,
+    )
+    with override_moe_environment(MoEEnvironment(sm=90, oss_cutlass_moe=is_oss)):
+        if not is_oss and method == "NVLINK_ONE_SIDED":
+            with pytest.raises(ValueError, match="requires all-to-all.*use ALLGATHER"):
+                ConfigurableMoE._create_comm_strategy_auto(moe)
+            assert all(constructor.call_count == 0 for constructor in constructors.values())
+        else:
+            strategy = ConfigurableMoE._create_comm_strategy_auto(moe)
+            selected = (
+                "AllGatherReduceScatter"
+                if not is_oss or method == "ALLGATHER"
+                else "NVLinkOneSided"
+            )
+            assert strategy is constructors[selected].return_value
+            constructors[selected].assert_called_once()
+            assert all(
+                constructor.call_count == 0
+                for name, constructor in constructors.items()
+                if name != selected
+            )
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+@pytest.mark.parametrize("sm", [120, 121])
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
+@pytest.mark.parametrize("activation", ["Relu2", "Swiglu"])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, dynamic):
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+
+    report = resolve_moe_impl(
+        ModelConfig(moe_backend="CUTEDSL"),
+        problem=MoEProblem(
+            quant=canonical_quant(quant_algo),
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            activation=activation,
+        ),
+        deployment=MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            force_dynamic_quantization=dynamic,
+            env=MoEEnvironment(sm=sm, oss_cutlass_moe=is_oss, available_deps=(MoEDep.FLASHINFER,)),
+        ),
+    )
+    rejection = not is_oss and quant_algo == QuantAlgo.NVFP4 and (activation == "Relu2" or dynamic)
+    if rejection:
+        assert report.winner is None
+        b12x_rejection = next(
+            r for r in report.rejected if r.legacy_backend == "CuteDslB12xFusedMoE"
+        )
+        expected = (
+            MoERejectReason.ACTIVATION_UNSUPPORTED
+            if activation == "Relu2"
+            else MoERejectReason.QUANT_UNSUPPORTED
+        )
+        assert b12x_rejection.reason is expected
+        assert "USING_OSS_CUTLASS_MOE_GEMM=ON" in b12x_rejection.detail
+        assert "CuteDslB12xFusedMoE" in b12x_rejection.detail
+        assert b12x_rejection.detail.startswith("NVFP4 prefill routes through CUTLASS:")
+    else:
+        assert impl_class_for(report) is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+def test_b12x_lora_rejection_is_build_independent(is_oss):
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+
+    verdict = CuteDslB12xFusedMoE.can_implement(
+        MoEProblem(quant=canonical_quant(QuantAlgo.NVFP4), dtype_act=torch.bfloat16),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            moe_lora_enabled=True,
+            env=MoEEnvironment(sm=120, oss_cutlass_moe=is_oss, available_deps=(MoEDep.FLASHINFER,)),
+        ),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.LORA_UNSUPPORTED
+    assert verdict.detail == "CuteDslB12xFusedMoE does not fuse routed-expert LoRA"
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4, None])
+@pytest.mark.parametrize("num_tokens", [63, 64, 65])
+def test_b12x_cutlass_prefill_routing(quant_algo, num_tokens):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+
+    backend = CuteDslB12xFusedMoE.__new__(CuteDslB12xFusedMoE)
+    torch.nn.Module.__init__(backend)
+    backend.quant_config = SimpleNamespace(quant_algo=quant_algo) if quant_algo else None
+    expected = quant_algo == QuantAlgo.NVFP4 and num_tokens >= 64
+    assert backend._route_to_cutlass(torch.empty(num_tokens, 1)) is expected

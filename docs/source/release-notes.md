@@ -4,9 +4,25 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.4
+
+### Key Features and Enhancements
+
+### Infrastructure Changes
+
+### API Changes
+
+- <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, all production `insertRequestInOrder` overloads, and the unused `requestUtils.h` and `orchestratorUtils.h` helpers have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available. Executor factory and worker constructors no longer accept the unused `engine` and `batched_logits_processor` arguments; callers should omit them and continue passing model configuration through `llm_args` and `hf_model_dir`. Unused decoder, request-cancellation, executor, legacy-model, orchestration, and speculative-decoding MPI tag names have also been removed; values 1–23, 127–129, and 1023–1025 are retired. The default, KV-cache event, and context-transfer tags retain their existing values. Internal `LogprobParams` and `LogProbsResult` tuples now contain only prompt-logprob fields; generation logprobs remain supplied by the sampler. The unused `TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT` environment variable has been removed.
+
+### Fixed Issues
+
+### Known Issues
+
 ## TensorRT-LLM Release 1.3
 
 ### API Changes
+
+- NVFP4 cold-page compression remains opt-in and disabled by default. When enabled for DeepSeek-V4, NoPE uses NVFP4 and RoPE now defaults to 2FP4 (`nvfp4_residual_dim=64`). Set `skip_rope_quantization=True` to keep RoPE at its original precision, as before, or `nvfp4_residual_dim=0` to use single NVFP4. The active GPU KV-cache dtype is unchanged. See the [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4).
 
 - **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
 

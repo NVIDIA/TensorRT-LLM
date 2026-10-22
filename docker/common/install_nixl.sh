@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="v1.4.0"
+NIXL_VERSION="v1.5.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
@@ -19,7 +19,7 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 pip3 install meson ninja pybind11 setuptools
 

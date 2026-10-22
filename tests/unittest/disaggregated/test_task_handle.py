@@ -27,16 +27,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import (
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import (
     CacheExtent,
-    CacheKind,
     Cancelled,
     Chunk,
     Delivered,
     Failed,
-    TokenRange,
 )
-from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import (
@@ -81,6 +80,7 @@ def _stub_receiver():
     """Only what a receive session calls on its receiver; dispatch is what the peers would do."""
     receiver = MagicMock()
     receiver._enforce_physical_ownership = False
+    receiver._ownership_poisoned = None
     receiver._bounce.is_bounced.return_value = False
     return receiver
 

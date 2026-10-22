@@ -29,7 +29,7 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
-  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full -- the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
+  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full, so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
   * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
@@ -64,6 +64,10 @@ These methods run on the leader process and drive the connector's behavior.
 
     Both example connectors walk `new_requests` only, so neither one demonstrates this.
 
+* **`request_reset(self, request: LlmRequest)`**
+  * **Description**: Optional, with a no-op default. The request's allocation has been released and it will run again from the start, unlike `request_finished`, which ends it. Any per-request state held in page indices now describes pages another request may own, so it must be dropped or rebuilt here.
+  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
+
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
 * **`request_finished_by_layer_group(self, request: LlmRequest, cache_block_ids_by_layer_group: list[list[int]]) -> bool`**
   * **Description**: the per-layer-group forms of the two callbacks above, indexed by layer group id. Entry `[g][i]` is the page slot of block ordinal `i` in layer group `g`.
@@ -72,12 +76,16 @@ These methods run on the leader process and drive the connector's behavior.
 
     | Set | Models it covers |
     |---|---|
-    | per-layer-group | every model, VSWA included |
+    | per-layer-group | single-layer-group models and VSWA with KVCacheManagerV2 |
     | flat | non-VSWA, non-hybrid only |
 
-    A set is complete when both of its methods are defined. Mixing the two — one method from each — is rejected during executor bring-up, naming the method that is missing. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
+    A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
 
 ##### Running under VSWA
+
+KVCacheManagerV2 supports multiple layer groups with a connector implementing the grouped APIs below. KVCacheManagerV1 registers a single primary pool and cannot describe VSWA to a connector. Single-window SWA remains allowed with either manager.
+
+With V2, a connector that transfers KV rejects requests carrying `KvCacheRetentionConfig` when the cache has multiple layer groups: `RequestData.priorities` is a single list and cannot describe priorities per group. This is a request validation error; the service can start and process requests without an explicit retention config. Capacity-only connectors are exempt from this restriction because they do not transfer KV or emit this priority metadata. Native V2 retention without a connector remains supported across layer groups.
 
 Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:
 
@@ -89,7 +97,7 @@ Under variable sliding-window attention the KV cache allocates one pool per atte
 
 Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.
 
-All three are checked during executor bring-up, before any request is admitted. `register_kv_cache_layout` refuses there, naming the group and region counts it could not describe, and the two scheduler methods are checked alongside it. Nothing is deferred to the first request, so a partial implementation costs a start-up failure rather than one after the model is loaded.
+The executor checks that both per-layer-group scheduler callbacks are implemented during bring-up for a multi-group cache. The worker then receives the layout through `register_kv_cache_layout`; its default implementation rejects multiple groups if only flat registration is implemented.
 
 `examples/llm-api/llm_kv_cache_connector_vswa.py` is a worked connector for this case. A VSWA connector has to do five things:
 
@@ -204,9 +212,9 @@ Two `RequestData` fields can be reported empty depending on the cache configurat
 | Field | When empty | Consequence |
 |---|---|---|
 | `block_hashes` | `[]` | No block-hash accessor exists on this path. Nothing in the runtime reads the field, and neither example connector uses it — both hash the token sequence themselves. A connector that keys its external store on `block_hashes` gets no key and therefore no hits and no saves; it does not mis-address a transfer. |
-| `priorities` | `None` | `KvCacheRetentionConfig` is not honoured, so every page carries the default priority. A warning is logged the first time a request carrying a retention config is reported. The gap is wider than the connector: the retention config has no effect either way in that configuration. |
+| `priorities` | `None` when the request has no explicit `KvCacheRetentionConfig` | Priority metadata is omitted; this does not imply that reused pages have default priority. For a single-group V2 cache, requests with an explicit retention config report native page priorities aligned with `new_block_ids`. Multi-group retention requests are rejected as described above. |
 
-Both are gaps to be closed rather than intended behaviour.
+The missing V2 block hashes remain a gap. Omitting priority metadata for requests without an explicit retention config is intentional.
 
 ##### Blocks with no page
 
@@ -337,6 +345,12 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Reports locally completed reservation identities for loads dispatched through `SchedulerOutput.prefix_loads`, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.
   * **Compatibility**: Legacy request-ID load and save completions continue through `get_finished`.
 
+* **`shutdown(self)`**
+  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
+
+* **`capacity_only(self) -> bool`** (property)
+  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
+
 ## Example Implementation
 
 The file `examples/llm-api/llm_kv_cache_connector.py` provides a reference implementation of a **Persistent KV Cache**.
@@ -382,3 +396,150 @@ The script demonstrates:
 3. Creating a new LLM instance with the same connector config.
 4. Generating text for the same prompt (Second run).
 5. Asserting that the outputs match, proving the state was correctly restored from the disk cache.
+
+## Mooncake store
+
+`connector: mooncake-store` is a connector shipped with TensorRT-LLM. It backs the KV cache with a
+[Mooncake](https://github.com/kvcache-ai/Mooncake) store: a pool of host memory, lent by the
+participating ranks and addressed by content, that every server joining it can read and write. A
+prefix computed by one engine is therefore replayable by another, which block reuse alone cannot do
+because it never leaves the instance that computed it.
+
+The Python bindings it needs come from `mooncake-transfer-engine-cuda13`, pinned in
+`requirements.txt` and installed with TensorRT-LLM.
+
+### Starting the pool
+
+The pool's own settings — its master's address, the transport, the key namespace — are properties of
+the pool rather than of any engine in it, so a master publishes them once as a manifest and each
+server names that file:
+
+```bash
+# Once per deployment, before any server starts.
+trtllm-serve mooncake_master --pool_file /shared/pool.json --run_dir /shared/run
+
+# Afterwards, on any node: capacity the pool actually had, and where blocks landed.
+trtllm-serve mooncake_pool_report --run_dir /shared/run
+```
+
+Each server then renders its own Mooncake client config from the manifest and exports
+`MOONCAKE_CONFIG_PATH` for the ranks it spawns. A deployment that provisions the pool itself sets
+that variable instead, and an inherited value wins over the `mooncake_store` block.
+
+### Configuring a server
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json   # the manifest, or a master's host:port
+    role: both
+    segment_size: 32GiB              # host memory each rank lends
+    model_key: qwen2-1.5b-instruct   # what the pool keys this checkpoint by
+```
+
+`examples/llm-api/configs/trtllm_mooncake_store_connector_extra.yaml` is this file ready to pass to
+`trtllm-serve --extra_llm_api_options`. `KvCacheConnectorConfig.mooncake_store` documents every
+field; two are worth calling out. `model_key` has no default, because two engines that disagree
+about it read each other's pages as their own and a model path is a poor identity — `org-a/model`
+and `org-b/model` share a directory name while meaning different weights. `segment_size` is per
+rank against a per-node memory limit, so a node's demand is `ranks_on_node × segment_size` and is
+checked against available memory at startup.
+
+### Roles
+
+Capacity and traffic are separate: every role lends the memory its config asks for, and the role
+says only what the engine then does with the pool.
+
+| `role` | Reads the pool | Writes the pool | Typical use |
+|---|---|---|---|
+| `both` | yes | yes | An aggregated server, or a context server in a disaggregated deployment |
+| `producer` | no | yes | A server that fills the pool for others |
+| `consumer` | yes | no | A server that only replays what others stored |
+| `capacity` | no | no | A generation server: it lends memory and needs no GPUDirect RDMA |
+
+`capacity` is the right role for a disaggregated generation server. Generated tokens are rarely a
+reused prefix, and prompt KV reaches decode over the cache transceiver rather than through the
+pool, so decode-side traffic would cost bandwidth for no hits. Because such a rank registers no
+page addresses with the pool, it is also exempt from everything that exists to protect them: it
+keeps its own host and disk cache tiers, including the host tier
+[`MAX_UTILIZATION` suspends pages into](#kv-cache-tiers-are-gpu-only-under-a-connector), and pays
+no per-request or per-layer connector cost.
+
+### Settings this connector overrides
+
+For a role that transfers KV, the pool *is* the deployment's offload tier, so the server's own
+tiers would claim a second share of the same node's DRAM and their page migrations would invalidate
+the addresses registered with the pool. Two settings are therefore overridden, with a log line
+naming each, rather than rejected:
+
+| Setting | Effective value | Why |
+|---|---|---|
+| `kv_cache_config.host_cache_size`, `kv_cache_config.disk_cache_size` | `0` | Put the memory into `mooncake_store.segment_size`, where every server on the node can reuse what any of them stored. |
+| `kv_cache_config.enable_partial_reuse` | `False` | The connector addresses whole blocks, so a partial match leaves the matched length off a block boundary and the lookup is declined — trading part of one block for every stored block of the remaining prefix. |
+
+Both are settled in the `LLM` constructor, before the ranks are spawned and before the usage report
+reads the arguments, so `trtllm-serve`, `trtllm-bench` and a direct `LLM(...)` all see the same
+settings. A `capacity` server keeps both as configured.
+
+### Restrictions
+
+Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
+without all of the state it was computed with — a wrong answer rather than a slow one.
+
+Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
+are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
+sliding-window attention, and `sparse_attention_config` with an index-V cache unless
+`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
+multimodal content without hashes, leaving the rest of the deployment served.
+
+### GPUDirect RDMA
+
+By default the connector registers the KV pools with Mooncake so the NIC reads and writes pages in
+GPU memory directly. A KV cache manager V2 pool is many `cuMemCreate` allocations mapped back to back,
+and no registration may cross two of them, so the connector registers one allocation at a time.
+Which registration path Mooncake then takes is decided by `WITH_NVIDIA_PEERMEM`, and each path has
+its own preconditions:
+
+| `WITH_NVIDIA_PEERMEM` | Mooncake calls | Requires | Typical failure |
+|---|---|---|---|
+| unset or nonzero (default) | `ibv_reg_mr` | the `nvidia_peermem` kernel module, and KV pools allocated with `gpuDirectRDMACapable=1` | `EFAULT` ("Bad address") |
+| `0` | `ibv_reg_dmabuf_mr` | dma-buf support in the driver and NIC stack | `EINVAL` |
+
+Under `ibv_reg_mr`, a missing module and memory without `gpuDirectRDMACapable` both fail with the
+same `EFAULT` as a range crossing two allocations, so the error code alone does not say which. The
+cache manager asks for `gpuDirectRDMACapable` and logs a warning when the platform refuses it and it
+falls back to memory without it; `nvidia_peermem` cannot register such memory, while dma-buf can.
+
+Hosts with the open kernel modules and no `nvidia_peermem`, common on GB200 and GB300, need the
+dma-buf path. When the protocol is `rdma`, `WITH_NVIDIA_PEERMEM` is unset, neither `nvidia_peermem`
+nor the legacy `nv_peer_mem` module is loaded, and every visible device reports dma-buf support, the
+connector sets `WITH_NVIDIA_PEERMEM=0` itself and logs a warning saying so. A value the deployment
+sets is never overridden.
+
+Mooncake reads `WITH_NVIDIA_PEERMEM` once per process, when the first Mooncake client starts, so the
+connector only chooses for that first client. A later client that registers the KV pools over RDMA
+fails at startup when the path Mooncake already read is not the one it needs, for example after a
+TCP client started first on a host without `nvidia_peermem`. In a process that starts more than one
+Mooncake client, export the variable before the first one.
+
+A failed registration fails startup with a report of what the driver says about each range. At
+debug log level (`TLLM_LOG_LEVEL=debug`) the same report is logged before registering.
+
+The pools are registered once, at startup, and stay registered until shutdown. That is only valid
+while the memory behind them stays mapped, which is why `enable_kv_pool_rebalance` is
+[ignored under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector): a rebalance remaps
+pool memory, and every range would have to be unregistered before it is unmapped and registered
+again afterwards.
+
+### Without GPUDirect RDMA
+
+A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, which the connector
+selects on its own where it can. When neither path is available, set `stage_through_host: true` to
+copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
+needs neither, since it registers no pages.

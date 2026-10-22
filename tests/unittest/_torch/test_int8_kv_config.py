@@ -39,6 +39,19 @@ def _model_config(kv_quant: QuantAlgo | None = QuantAlgo.INT8) -> ModelConfig:
     )
 
 
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_int8_kv_rejects_trtllm_gen_devices(sm: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject an unsupported decode path before native attention is initialized."""
+    from tensorrt_llm._torch.attention.backends import trtllm as backend
+
+    monkeypatch.setattr(backend, "get_sm_version", lambda: sm)
+    attention = backend.TrtllmAttention.__new__(backend.TrtllmAttention)
+    attention.is_mla_enable = False
+    attention.sparse_params = None
+    with pytest.raises(ValueError, match=f"INT8 KV cache.*TRTLLM-Gen.*SM{sm}"):
+        attention.update_quant_config(QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8))
+
+
 @pytest.mark.parametrize("checkpoint_quant", [None, QuantAlgo.FP8, QuantAlgo.INT8])
 def test_int8_kv_explicit_override_keeps_layers_in_sync(
     checkpoint_quant: QuantAlgo | None, monkeypatch: pytest.MonkeyPatch
