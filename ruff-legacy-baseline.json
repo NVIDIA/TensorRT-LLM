@@ -164,7 +164,7 @@
   "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
     "E711": 2
   },
-  "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
+  "tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
     "E741": 3
   },
   "tensorrt_llm/_torch/distributed/ops.py": {

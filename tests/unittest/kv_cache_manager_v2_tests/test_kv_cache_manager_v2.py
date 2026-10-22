@@ -24,7 +24,8 @@ import sys
 import time
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import timedelta
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -36,6 +37,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
+        DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
         GPU_LEVEL,
         AttentionLayerConfig,
         Batch,
@@ -50,8 +52,10 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
+        KVCacheEventManager,
         KVCacheManager,
         KVCacheManagerConfig,
+        KVCacheUpdatedData,
         LayerGroupId,
         LayerId,
         LogicError,
@@ -59,6 +63,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         OutOfPagesError,
         PageIndexMode,
         PlannedDropHandle,
+        PoolRebalanceConfig,
         ReuseScope,
         SlidingWindowSize,
         SsmLayerConfig,
@@ -81,7 +86,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         MemToMemTask,
         copy_device_to_device,
     )
+    from bindings.executor import KvCacheRetentionConfig, KvCacheTransferMode  # isort: skip
 else:
+    from tensorrt_llm.bindings.executor import KvCacheRetentionConfig, KvCacheTransferMode
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
         MemToMemTask,
         copy_device_to_device,
@@ -89,6 +96,7 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
+        DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
         GPU_LEVEL,
         AttentionLayerConfig,
         Batch,
@@ -103,8 +111,10 @@ else:
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
+        KVCacheEventManager,
         KVCacheManager,
         KVCacheManagerConfig,
+        KVCacheUpdatedData,
         LayerGroupId,
         LayerId,
         LogicError,
@@ -112,6 +122,7 @@ else:
         OutOfPagesError,
         PageIndexMode,
         PlannedDropHandle,
+        PoolRebalanceConfig,
         ReuseScope,
         SlidingWindowSize,
         SsmLayerConfig,
@@ -407,6 +418,376 @@ class TestKVCacheManagerV2(unittest.TestCase):
         self.manager = KVCacheManager(self.cfg)
 
 
+class TestRetention(TestKVCacheManagerV2):
+    def setUp(self) -> None:
+        super().setUp()
+        self.caches: list[_KVCache] = []
+        self.stream = CachedCudaStream()
+
+    def tearDown(self) -> None:
+        self._close_caches()
+        super().tearDown()
+
+    def _close_caches(self) -> None:
+        for cache in reversed(self.caches):
+            cache.close()
+        self.caches.clear()
+
+    def _prepare_retention(
+        self,
+        *,
+        host_quota: int = 0,
+        window_size: SlidingWindowSize = None,
+        enable_partial_commit: bool = True,
+        offload_threshold: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
+    ) -> None:
+        self.cfg = create_config(4, 2 << 20, host_quota, 0, 1, window_size, 0, 65536)
+        self.cfg.enable_partial_commit = enable_partial_commit
+        self.cfg.cold_tier_offload_min_priority = offload_threshold
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+    def _new_cache(
+        self,
+        tokens: list[TokenIdExt],
+        config: KvCacheRetentionConfig | None = None,
+        prompt_length: int | None = None,
+    ) -> _KVCache:
+        cache = self.manager.create_kv_cache(
+            input_tokens=tokens,
+            expected_prompt_length=len(tokens) if prompt_length is None else prompt_length,
+            kv_cache_retention_config=config,
+        )
+        self.caches.append(cache)
+        return cache
+
+    def _cache(
+        self,
+        tokens: list[TokenIdExt],
+        config: KvCacheRetentionConfig | None = None,
+        prompt_length: int | None = None,
+    ) -> _KVCache:
+        cache = self._new_cache(tokens, config, prompt_length)
+        self.assertTrue(cache.resume(self.stream.handle))
+        self.assertTrue(cache.resize(len(tokens)))
+        remaining = tokens[cache.num_committed_tokens :]
+        if tokens:
+            self.engine.execute(
+                [Step(cache, remaining, tokens[: cache.num_committed_tokens])], self.stream.handle
+            )
+        if remaining:
+            cache.commit(remaining)
+        return cache
+
+    def _apply_memory_pressure(self) -> _KVCache:
+        free = self.manager.get_storage_statistics(GPU_LEVEL)[0].free
+        pressure = self._cache([])
+        self.assertTrue(pressure.resize((free + 1) * self.cfg.tokens_per_block))
+        return pressure
+
+    @staticmethod
+    def _config(
+        priority: int | None, duration: timedelta | None = None
+    ) -> KvCacheRetentionConfig | None:
+        if priority is None:
+            return None
+        return KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, priority, duration)]
+        )
+
+    def test_page_priorities_reject_invalid_layer_groups(self) -> None:
+        self._prepare_retention()
+        for num_tokens in (0, 4):
+            cache = self._cache(list(range(num_tokens)))
+            for layer_group in (-1, 1):
+                with self.subTest(num_tokens=num_tokens, layer_group=layer_group):
+                    with self.assertRaises(IndexError):
+                        cache.get_page_priorities(layer_group)
+            self.assertEqual(cache.get_page_priorities(0), [35] * (num_tokens // 4))
+
+    @parameterized.expand([(4, False), (4, True), (5, False), (5, True)])
+    def test_beam_priorities_share_prompt_and_keep_private_tail(
+        self, prompt_length: int, commit: bool
+    ) -> None:
+        self._prepare_retention(enable_partial_commit=False)
+        config = KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)],
+            decode_retention_priority=10,
+        )
+        tokens = list(range(prompt_length))
+        cache = self._new_cache(tokens, config)
+        self.assertTrue(cache.resume(self.stream.handle))
+        self.assertTrue(cache.resize(12))
+        self.engine.execute([Step(cache, tokens, [])], self.stream.handle)
+        if commit:
+            cache.commit(tokens)
+        cache.stop_committing()
+        cache.beam_width = 3
+
+        prompt_blocks = div_up(prompt_length, 4)
+        shared_blocks = prompt_length // 4
+        for capacity in (12, 16):
+            self.assertTrue(cache.resize(capacity))
+            indices = [cache.get_aggregated_page_indices(0, beam) for beam in range(3)]
+            for beam in range(3):
+                self.assertEqual(
+                    cache.get_page_priorities(0, beam),
+                    [80] * prompt_blocks + [10] * (capacity // 4 - prompt_blocks),
+                )
+                if beam:
+                    self.assertEqual(
+                        indices[beam][:shared_blocks], [BAD_PAGE_INDEX] * shared_blocks
+                    )
+            # The partial prompt tail and both preallocated and newly allocated decode pages
+            # are writable independently by every beam.
+            for ordinal in range(shared_blocks, capacity // 4):
+                pages = {row[ordinal] for row in indices}
+                self.assertNotIn(BAD_PAGE_INDEX, pages)
+                self.assertEqual(len(pages), 3)
+        for invalid_beam in (-1, 3):
+            with self.assertRaises(IndexError):
+                cache.get_page_priorities(0, invalid_beam)
+        self.stream.synchronize()
+
+    def test_beam_priorities_read_each_private_page(self) -> None:
+        self._prepare_retention(enable_partial_commit=False)
+        priority = 60
+        tokens = list(range(5))
+        cache = self.manager.create_kv_cache(
+            input_tokens=tokens,
+            expected_prompt_length=len(tokens),
+            custom_priority_callback=lambda ordinal, lifecycle: priority,
+        )
+        self.caches.append(cache)
+        self.assertTrue(cache.resume(self.stream.handle))
+        self.assertTrue(cache.resize(12))
+        self.engine.execute([Step(cache, tokens, [])], self.stream.handle)
+        cache.stop_committing()
+        # Give each new beam's private pages a distinct allocation-time priority.
+        for beam_width, priority in ((2, 80), (3, 90)):
+            cache.beam_width = beam_width
+        self.assertEqual(cache.get_page_priorities(0, 0), [60, 60, 60])
+        self.assertEqual(cache.get_page_priorities(0, 1), [60, 80, 80])
+        self.assertEqual(cache.get_page_priorities(0, 2), [60, 90, 90])
+        self.stream.synchronize()
+
+    def test_offload_default_and_dataclass_replace(self) -> None:
+        config = create_config(4, 2 << 20, 0, 0, 1, None, 0, 65536)
+        self.assertEqual(
+            config.cold_tier_offload_min_priority, DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+        )
+        self.assertEqual(
+            replace(config).cold_tier_offload_min_priority, DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+        )
+        for threshold in (0, 80):
+            self.assertEqual(
+                replace(
+                    config, cold_tier_offload_min_priority=threshold
+                ).cold_tier_offload_min_priority,
+                threshold,
+            )
+
+    @parameterized.expand(
+        [(80, 10, False), (80, 10, True), (10, 80, False), (10, 80, True), (80, None, False)]
+    )
+    def test_shared_claim_order_controls_eviction(
+        self, first: int, second: int | None, close_newer_first: bool
+    ) -> None:
+        self._prepare_retention()
+        prompt = [1, 2, 3, 4]
+        late = self._new_cache(prompt, self._config(100))
+        self.assertTrue(late.resume(self.stream.handle))
+        self.assertTrue(late.resize(len(prompt)))
+        self.engine.execute([Step(late, prompt, [])], self.stream.handle)
+        older = self._cache(prompt, self._config(first))
+        newer = self._cache(prompt, self._config(second))
+        priority = first if second is None else second
+        # Deduplicating an already computed page is not a new request claim.
+        late.commit(prompt)
+        self.assertEqual(late.get_page_priorities(0), [priority])
+        late.close()
+        self.assertEqual(older.get_page_priorities(0), [priority])
+        self.assertEqual(newer.get_aggregated_page_indices(0), older.get_aggregated_page_indices(0))
+        requests = [newer, older] if close_newer_first else [older, newer]
+        requests[0].close()
+        self.assertEqual(requests[1].get_page_priorities(0), [priority])
+        competitor = self._cache([5, 6, 7, 8], self._config(50))
+        competitor.close()
+        # Referenced pages cannot be permanently evicted, irrespective of priority.
+        pin = self._apply_memory_pressure()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 4)
+        self.assertEqual(self.manager.probe_reuse(input_tokens=[5, 6, 7, 8]), 0)
+        pin.close()
+        requests[1].close()
+        competitor = self._cache([5, 6, 7, 8], self._config(50))
+        competitor.close()
+        self._apply_memory_pressure()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 4 if priority > 50 else 0)
+        self.assertEqual(
+            self.manager.probe_reuse(input_tokens=[5, 6, 7, 8]), 0 if priority > 50 else 4
+        )
+
+    def test_prompt_and_decode_priorities_expire_after_last_release(self) -> None:
+        self._prepare_retention()
+        duration = timedelta(milliseconds=20)
+        config = KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(1, None, 80, duration)],
+            decode_retention_priority=10,
+            decode_duration_ms=duration,
+        )
+        tokens = list(range(12))
+        # A five-token prompt occupies two blocks; its partial second block stays context.
+        first = self._cache(tokens[:5], config)
+        self.assertTrue(first.resize(len(tokens)))
+        self.engine.execute([Step(first, tokens[5:], tokens[:5])], self.stream.handle)
+        first.commit(tokens[5:])
+        second = self._cache(tokens, config, prompt_length=5)
+        self.assertEqual(first.get_page_priorities(0), [35, 80, 10])
+        first.close()
+        time.sleep(0.04)
+        self.manager.refresh_retention()
+        self.assertEqual(second.get_page_priorities(0), [35, 80, 10])
+        second.close()
+        time.sleep(0.04)
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self.manager.refresh_retention()
+        reclaimed = self._cache(tokens)
+        self.assertEqual(reclaimed.get_page_priorities(0), [35, 35, 35])
+
+    def test_unconfigured_claim_preserves_priority_and_clears_expiry(self) -> None:
+        self._prepare_retention()
+        tokens = list(range(12))
+        long_duration = timedelta(seconds=1)
+        config = KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(1, None, 80, long_duration)],
+            decode_retention_priority=10,
+            decode_duration_ms=long_duration,
+        )
+        timed = self._cache(tokens, config, prompt_length=5)
+        timed.close()
+        untimed = self._cache(tokens)
+        untimed.close()
+        time.sleep(1.05)
+        self.manager.refresh_retention()
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [35, 80, 10])
+
+    @parameterized.expand([(False,), (True,)])
+    def test_sliding_window_release_preserves_priority_without_expiry(self, shared: bool) -> None:
+        self._prepare_retention(window_size=4)
+        tokens = list(range(8))
+        config = self._config(80, timedelta(milliseconds=20))
+        source = self._cache(tokens[:4], config)
+        sharer = self._cache(tokens[:4], config) if shared else None
+        self.assertTrue(source.resize(8))
+        self.engine.execute([Step(source, tokens[4:], tokens[:4])], self.stream.handle)
+        source.commit(tokens[4:])
+        source.close()
+        if sharer is not None:
+            sharer.close()
+        time.sleep(0.04)
+        self.manager.refresh_retention()
+        self.assertEqual(self._cache(tokens[:4]).get_page_priorities(0), [80])
+
+    def test_prefetch_rejects_invalid_cache_levels(self) -> None:
+        self._prepare_retention()
+        for level in (-1, 1):
+            with self.subTest(level=level), self.assertRaises(IndexError):
+                self.manager.prefetch_reuse(ReuseScope(), [1, 2, 3, 4], CacheLevel(level))
+
+    def test_offload_reload_preserves_priority_and_partial_reuse(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = [1, 2, 3, 4]
+        cached = self._cache(tokens, self._config(80))
+        cached.suspend()
+        pressure = self._apply_memory_pressure()
+        self.assertEqual(_introspection.active_page_stats(cached)[0], [0, 1])
+        pressure.close()
+        self.assertTrue(cached.resume(self.stream.handle))
+        self.assertEqual(cached.get_page_priorities(0), [80])
+        self.assertEqual(cached.get_page_storage_snapshot(0).cache_levels, [GPU_LEVEL])
+        self.engine.execute([Step(cached, [], tokens)], self.stream.handle)
+        self.stream.synchronize()
+        for config in (None, self._config(10)):
+            partial = self._cache(tokens[:3], config)
+            self.assertEqual(partial.num_committed_tokens, 3)
+            self.assertEqual(partial.get_page_priorities(0), [80])
+            self.assertEqual(cached.get_page_priorities(0), [80])
+            self.assertNotEqual(
+                partial.get_aggregated_page_indices(0), cached.get_aggregated_page_indices(0)
+            )
+        self._close_caches()
+        self.manager.clear_reusable_blocks()
+        for level in (GPU_LEVEL, CacheLevel(1)):
+            for stats in self.manager.get_storage_statistics(level):
+                self.assertEqual(stats.free, stats.total)
+                self.assertEqual(stats.evictable, 0)
+
+    def test_failed_resize_preserves_capacity_priority_and_data(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = [1, 2, 3, 4]
+        cached = self._cache(tokens, self._config(80))
+        capacity = cached.capacity
+        total = self.manager.get_storage_statistics()[0].total
+        self.assertFalse(cached.resize((total + 1) * 4))
+        self.assertEqual(cached.capacity, capacity)
+        self.assertEqual(cached.get_page_priorities(0), [80])
+        self.engine.execute([Step(cached, [], tokens)], self.stream.handle)
+        self.stream.synchronize()
+
+    def test_unsupported_transfer_modes_do_not_claim_reusable_pages(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = [1, 2, 3, 4]
+        self._cache(tokens, self._config(80)).close()
+        # Unsupported file-transfer semantics fail before claiming any reusable pages.
+        for mode in (KvCacheTransferMode.GDS, KvCacheTransferMode.POSIX_DEBUG_FALLBACK):
+            config = KvCacheRetentionConfig([], transfer_mode=mode, directory="/tmp")
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "per-request GDS/POSIX"),
+            ):
+                self.manager.create_kv_cache(input_tokens=tokens, kv_cache_retention_config=config)
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [80])
+
+    def test_deferred_partial_copies_use_latest_claim_priority(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
+        donor = self._cache(list(range(8)), self._config(80))
+        donor.close()
+        pending = [self._new_cache(list(range(3)), self._config(priority)) for priority in (10, 90)]
+        for copy in pending:
+            self.assertTrue(copy.resume(self.stream.handle))
+            self.assertEqual(copy.get_page_priorities(0), [90])
+            self.engine.execute([Step(copy, [], list(range(3)))], self.stream.handle)
+        self.stream.synchronize()
+
+    @parameterized.expand([(29, 30), (30, 30), (49, 50), (50, 50), (0, -1), (100, 101)])
+    def test_released_offload_threshold(self, priority: int, threshold: int) -> None:
+        self._prepare_retention(host_quota=2 << 20, offload_threshold=threshold)
+        tokens = [1, 2, 3, 4]
+        cached = self._cache(tokens, self._config(priority, timedelta(seconds=2)))
+        cached.close()
+        pressure = self._apply_memory_pressure()
+        retained = priority >= threshold
+        self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), 4 if retained else 0)
+        self.assertEqual(
+            self.manager.get_storage_statistics(CacheLevel(1))[0].evictable, 1 if retained else 0
+        )
+        pressure.close()
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [priority if retained else 35])
+
+    def test_eviction_offload_preserves_priority_and_clears_expiry(self) -> None:
+        self._prepare_retention(host_quota=2 << 20, offload_threshold=50)
+        tokens = [1, 2, 3, 4]
+        self._cache(tokens, self._config(80, timedelta(seconds=2))).close()
+        pressure = self._apply_memory_pressure()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), 4)
+        self.assertEqual(self.manager.get_storage_statistics(CacheLevel(1))[0].evictable, 1)
+        pressure.close()
+        time.sleep(2.05)
+        self.manager.refresh_retention()
+        # GPU eviction-driven offload clears the old duration, retaining the priority.
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [80])
+
+
 class TestStorageStatistics(TestKVCacheManagerV2):
     def test_statistics_are_detached_snapshots(self) -> None:
         self.prepare(8 << 20, 8 << 20, 0, 2, 16, 0, tokens_per_block=4, kv_buf_size=4096)
@@ -460,6 +841,50 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    def test_side_stream_waits_for_a_busy_recycled_slot(self) -> None:
+        """A full pool hands out a slot its previous owner's stream still writes.
+
+        The cache's stream waits for the slot, so a writer outside every stream,
+        such as the NIC, can allocate on a side stream and synchronize only it.
+        """
+        import torch
+
+        tokens_per_block = 4
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tokens_per_block,
+                cache_tiers=[GpuCacheTierConfig(4 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])],
+            )
+        )
+        owner_stream = torch.cuda.Stream()
+        loader_stream = torch.cuda.Stream()
+        execution_stream = torch.cuda.Stream()
+
+        owner = self.manager.create_kv_cache()
+        self.assertTrue(owner.resume(owner_stream.cuda_stream))
+        capacity = tokens_per_block
+        while owner.resize(capacity + tokens_per_block):
+            capacity += tokens_per_block
+        with torch.cuda.stream(owner_stream):
+            torch.cuda._sleep(1 << 31)
+            owner_done = torch.cuda.Event()
+            owner_done.record(owner_stream)
+        owner.close()
+
+        loader = self.manager.create_kv_cache()
+        try:
+            self.assertTrue(loader.resume(loader_stream.cuda_stream))
+            self.assertTrue(loader.resize(tokens_per_block))
+            self.assertFalse(owner_done.query(), "the owner's work finished before the check")
+            loader_stream.synchronize()
+            self.assertTrue(owner_done.query())
+            # Adopting the cache orders the new stream behind the old one.
+            loader.cuda_stream = execution_stream.cuda_stream
+        finally:
+            loader.close()
+        execution_stream.synchronize()
+
     def test_batch_publishes_sparse_gpu_metadata(self) -> None:
         import torch
 
@@ -1320,7 +1745,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         tokens = [TokenId(i) for i in range(64)]
         capacity = 128
         default_scope = ReuseScope()
-        scoped = ReuseScope(lora_id=7, salt=11)
+        scoped = ReuseScope(lora_id=7, salt="11")
 
         def commit_for(reuse_scope: ReuseScope | None) -> None:
             kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
@@ -1347,10 +1772,10 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         commit_for(scoped)
         self.assertGreater(num_reused(scoped), 0)
-        self.assertEqual(num_reused(ReuseScope(lora_id=7, salt=12)), 0)
-        self.assertEqual(num_reused(ReuseScope(lora_id=8, salt=11)), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=7, salt="12")), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=8, salt="11")), 0)
         self.assertEqual(num_reused(ReuseScope(lora_id=7)), 0)
-        self.assertEqual(num_reused(ReuseScope(salt=11)), 0)
+        self.assertEqual(num_reused(ReuseScope(salt="11")), 0)
         self.assertEqual(num_reused(None), 0)
 
         commit_for(None)
@@ -3400,7 +3825,16 @@ class TestSSMSupport(unittest.TestCase):
         stream = cast(CudaStream, stream_holder.handle)
         prompt = [self.next_token() for _ in range(48)]
 
-        kv_cache = self.manager.create_kv_cache()
+        kv_cache = self.manager.create_kv_cache(
+            expected_prompt_length=len(prompt),
+            kv_cache_retention_config=KvCacheRetentionConfig(
+                [
+                    KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                        0, None, 80, timedelta(milliseconds=20)
+                    )
+                ]
+            ),
+        )
         kv_cache.resume(stream)
         kv_cache.capacity = len(prompt)
         kv_cache.history_length = len(prompt)
@@ -3412,7 +3846,10 @@ class TestSSMSupport(unittest.TestCase):
         ssm_slot = kv_cache.get_ssm_block_base_index(LayerGroupId(ssm_lc_id))
 
         kv_cache.commit(prompt, is_end=True)
-        kv_cache.close()
+        try:
+            self.assertEqual(kv_cache.get_page_priorities(LayerGroupId(ssm_lc_id))[-1], 80)
+        finally:
+            kv_cache.close()
 
         _, attn_pages = _introspection.reuse_match_pages(
             self.manager, ReuseScope(), prompt, attn_lc_id, self.manager.enable_partial_match
@@ -3429,6 +3866,14 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(attn_page[0], attn_tail_slot)
         self.assertEqual(ssm_page[0], ssm_slot)
         self.assertEqual(ssm_page[1], 16)
+        time.sleep(0.04)
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), prompt, GPU_LEVEL))
+        self.manager.refresh_retention()
+        probe = self.manager.create_kv_cache(input_tokens=prompt)
+        try:
+            self.assertEqual(probe.get_page_priorities(LayerGroupId(ssm_lc_id))[-1], 35)
+        finally:
+            probe.close()
 
     def test_ssm_snapshot_moves_to_covering_block(self) -> None:
         """A snapshot on a partial block survives the full sibling that replaces it."""
@@ -4811,6 +5256,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         gpu_quota: int = 64 << 20,
         window_size: int | None = None,
         reuse_match_backoff: int = 0,
+        event_manager=None,
     ) -> None:
         kv_buf_size = 8192
         window_size = self.WINDOW_SIZE if window_size is None else window_size
@@ -4839,7 +5285,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             reuse_match_backoff=reuse_match_backoff,
         )
         self.engine = FakeEngine(self.cfg)
-        self.manager = KVCacheManager(self.cfg)
+        self.manager = KVCacheManager(self.cfg, event_manager=event_manager)
 
     @property
     def _full_attn_lc_id(self) -> int:
@@ -4982,7 +5428,8 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         s.take_finish_event().synchronize()
 
     def test_rewind_endpoint_survives_longer_sibling_created_after(self) -> None:
-        self.prepare_partial()
+        events = KVCacheEventManager(max_kv_event_entries=128)
+        self.prepare_partial(event_manager=events)
         base = [TokenId(i) for i in range(80)]
         extended = base + [TokenId(i) for i in range(1000, 1080)]
         rewind = base + [TokenId(2000)]
@@ -5001,6 +5448,26 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         # The partial SWA page is stale at the longer endpoint and must not constrain
         # the full-attention lifecycle's reusable prefix.
         self.assertEqual(self.manager.probe_reuse(input_tokens=extended), len(extended))
+        events.flush_iteration_events()
+        events.get_latest_events(0)
+        claimant = self.manager.create_kv_cache(
+            input_tokens=rewind,
+            expected_prompt_length=len(rewind),
+            kv_cache_retention_config=KvCacheRetentionConfig(
+                [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)]
+            ),
+        )
+        try:
+            events.flush_iteration_events()
+            updates = [
+                event
+                for event in events.get_latest_events(0)
+                if isinstance(event.data, KVCacheUpdatedData)
+            ]
+            self.assertTrue(updates)
+            self.assertEqual({event.layer_group_id for event in updates}, {self._full_attn_lc_id})
+        finally:
+            claimant.close()
 
     def test_rewind_endpoint_attaches_to_longer_sibling_created_before(self) -> None:
         self.prepare_partial()
@@ -5098,11 +5565,15 @@ class TestPoolRebalance(TestKVCacheManagerV2):
     _PROMPT_LEN = 64
     _DECODE_LEN = 96
 
-    def prepare_two_pool_groups(self, gpu_quota: int = 256 << 20) -> None:
+    def prepare_two_pool_groups(self, gpu_quota: int = 256 << 20, **rebalance_overrides) -> None:
         """Two attention life cycles with different slot sizes -> two pool groups.
 
         Pool groups are formed per distinct slot layout, so differing window
         sizes alone are not enough -- the buffer sizes have to differ too.
+
+        ``rebalance_overrides`` forwards to ``PoolRebalanceConfig`` (e.g.
+        ``min_sampled_kv_caches=...``) for tests that exercise non-default
+        auto-tuner gating.
         """
         self.cfg = KVCacheManagerConfig(
             tokens_per_block=self._TOKENS_PER_BLOCK,
@@ -5128,6 +5599,7 @@ class TestPoolRebalance(TestKVCacheManagerV2):
             ],
             typical_step=BatchDesc(kv_caches=[KVCacheDesc(capacity=160, history_length=0)]),
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=160, history_length=0)])],
+            pool_rebalance=PoolRebalanceConfig(**rebalance_overrides),
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -5208,6 +5680,186 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         slots_after = self._slot_totals()
         self.assertGreater(slots_after[0], slots_before[0], f"{slots_before} -> {slots_after}")
         self.assertLess(slots_after[1], slots_before[1], f"{slots_before} -> {slots_after}")
+
+    def _clear_cooldown(self) -> None:
+        """Push the last adjustment far enough back to clear the configured cooldown.
+
+        A literal 0.0 is not enough: on a freshly booted host ``time.monotonic()``
+        can be smaller than the configured cooldown, which would leave the gate shut.
+        """
+        cooldown = self.cfg.pool_rebalance.cooldown_secs
+        _introspection.set_last_adjustment_time(self.manager, time.monotonic() - cooldown - 1.0)
+
+    def _skew_target_ratio(self, skew: float = 2.0) -> None:
+        """Perturb the target GPU ratio without touching the sample/cooldown gates."""
+        current = self._gpu_ratios()
+        skewed = [current[0] * skew] + current[1:]
+        total = sum(skewed)
+        _introspection.set_target_ratio_list_gpu(self.manager, [x / total for x in skewed])
+
+    def test_custom_min_sampled_kv_caches_gates_adjustment(self) -> None:
+        """A non-default min_sampled_kv_caches must move the sample-count gate."""
+        self.prepare_two_pool_groups(min_sampled_kv_caches=5000)
+        self._run_sequence()
+        self._skew_target_ratio()
+        self._clear_cooldown()
+
+        # Above the default threshold (2000) but below this config's custom one.
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "need_adjustment fired below the configured min_sampled_kv_caches",
+        )
+
+        # Exactly at the threshold: the gate is ``<``, so this must pass.
+        _introspection.set_num_sampled_kv_caches(self.manager, 5000)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "need_adjustment did not fire once min_sampled_kv_caches was reached",
+        )
+
+    def test_custom_cooldown_secs_gates_adjustment(self) -> None:
+        """A non-default cooldown_secs must move the cooldown gate."""
+        self.prepare_two_pool_groups(cooldown_secs=10_000.0)
+        self._run_sequence()
+        self._skew_target_ratio()
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+
+        # Recent adjustment: still within this config's long custom cooldown.
+        _introspection.set_last_adjustment_time(self.manager, time.monotonic())
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "need_adjustment fired inside the configured cooldown_secs",
+        )
+
+        # Long-past adjustment: clears even a long custom cooldown.
+        self._clear_cooldown()
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "need_adjustment did not fire once cooldown_secs elapsed",
+        )
+
+    def test_custom_ratio_tolerance_gates_adjustment(self) -> None:
+        """A non-default ratio_tolerance must move the deviation gate."""
+        # tolerance 9.0 -> drift must exceed 10x in either direction.
+        self.prepare_two_pool_groups(ratio_tolerance=9.0)
+        self._run_sequence()
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        self._clear_cooldown()
+
+        # A 2x skew is well under this config's 10x band.
+        self._skew_target_ratio(skew=2.0)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "need_adjustment fired below the configured ratio_tolerance",
+        )
+
+        # A 20x skew clears it.
+        self._skew_target_ratio(skew=20.0)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "need_adjustment did not fire once ratio_tolerance was exceeded",
+        )
+
+    def _set_uniform_target_drift(self, drift: float) -> None:
+        """Set every pool group's target so that target/current == ``drift`` exactly."""
+        _introspection.set_target_ratio_list_gpu(
+            self.manager, [c * drift for c in self._gpu_ratios()]
+        )
+
+    @parameterized.expand([("tolerance_below_drift", 0.5, True), ("tolerance_above", 2.0, False)])
+    def test_ratio_tolerance_is_symmetric(
+        self, _name: str, tolerance: float, expected: bool
+    ) -> None:
+        """The deviation gate must not depend on which side has drifted.
+
+        A 2x drift and its reciprocal 0.5x are the same relative deviation, so at any
+        given tolerance the auto-tuner must reach the same verdict for both.
+        """
+        self.prepare_two_pool_groups(ratio_tolerance=tolerance)
+        self._run_sequence()
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        self._clear_cooldown()
+
+        for drift in (2.0, 0.5):
+            with self.subTest(drift=drift):
+                self._set_uniform_target_drift(drift)
+                self.assertEqual(
+                    self.manager.need_adjustment,
+                    expected,
+                    f"tolerance={tolerance} drift={drift}: expected need_adjustment={expected}",
+                )
+
+    def test_invalid_rebalance_settings_raise(self) -> None:
+        """PoolRebalanceConfig must reject invalid values at construction.
+
+        The checks live in PoolRebalanceConfig::validate() (C++), which the binding's
+        constructor calls; std::invalid_argument surfaces as ValueError.
+        """
+        invalid_overrides = {
+            "negative_min_sampled_kv_caches": dict(min_sampled_kv_caches=-1),
+            "negative_cooldown_secs": dict(cooldown_secs=-1.0),
+            "non_finite_cooldown_secs": dict(cooldown_secs=math.inf),
+            "non_positive_target_ratio_update_interval": dict(target_ratio_update_interval=0),
+            "ratio_tolerance_zero": dict(ratio_tolerance=0.0),
+            "ratio_tolerance_negative": dict(ratio_tolerance=-0.25),
+            "non_finite_ratio_tolerance": dict(ratio_tolerance=math.inf),
+            "moving_average_decay_zero": dict(moving_average_decay=0.0),
+            "moving_average_decay_one": dict(moving_average_decay=1.0),
+            "non_finite_moving_average_decay": dict(moving_average_decay=math.nan),
+        }
+        for name, override in invalid_overrides.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    PoolRebalanceConfig(**override)
+
+    def test_replace_preserves_pool_rebalance(self) -> None:
+        """dataclasses.replace() on a config must carry pool_rebalance over.
+
+        KVCacheManagerV2._build_cache_config rebuilds the config it just built with
+        replace(config, layers=...), so anything replace() drops never reaches the
+        manager. The C++ binding replaces the Python dataclass, so
+        replace() is keyed on the __dataclass_fields__ spec advertised in
+        tensorrt_llm/runtime/kv_cache_manager_v2/__init__.py: a field missing from
+        that spec is silently reset to its constructor default.
+        """
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=1024)],
+            ),
+        ]
+        # All exactly representable, so the round trip through the binding's float
+        # ratio_tolerance and double fields compares equal.
+        rebalance = PoolRebalanceConfig(
+            min_sampled_kv_caches=7,
+            cooldown_secs=3.5,
+            target_ratio_update_interval=11,
+            ratio_tolerance=0.5,
+            moving_average_decay=0.5,
+        )
+        config = KVCacheManagerConfig(
+            tokens_per_block=self._TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+            layers=layers,
+            pool_rebalance=rebalance,
+        )
+
+        rebuilt = replace(config, layers=layers)
+
+        for field, expected in (
+            ("min_sampled_kv_caches", 7),
+            ("cooldown_secs", 3.5),
+            ("target_ratio_update_interval", 11),
+            ("ratio_tolerance", 0.5),
+            ("moving_average_decay", 0.5),
+        ):
+            with self.subTest(field):
+                self.assertEqual(
+                    getattr(rebuilt.pool_rebalance, field),
+                    expected,
+                    f"replace() dropped pool_rebalance.{field}",
+                )
 
     def _close_one_cache(self, capacity: int, *, dummy: bool, cache_id: int) -> None:
         """Create, size and close one KV cache, optionally marked as a dummy.

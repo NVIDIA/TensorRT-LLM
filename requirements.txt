@@ -50,15 +50,14 @@ omegaconf
 pillow
 PyNvVideoCodec~=2.1.0
 optimum
-# evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
-datasets==3.1.0
+datasets
 evaluate
 mpmath>=1.3.0
 click>=8.4.2
 click_option_group>=0.5.3
 aenum
 pyzmq
-fastapi>=0.136.3
+fastapi>=0.136.3,<0.140.0
 starlette>=1.3.1
 uvicorn
 setuptools<80
@@ -68,6 +67,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
+fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
 flashinfer-python==0.6.18
 xgrammar==0.1.32
 llguidance==0.7.29
@@ -88,8 +88,8 @@ triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_trito
 tiktoken
 blobfile
 openai-harmony==0.0.4
-# 4.8.0.dev0 is the first release exposing Rubin/SM107.
-nvidia-cutlass-dsl[cu13]==4.8.0.dev0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
+# 4.8.0 is the first final release exposing Rubin/SM107 (replaces the 4.8.0.dev0 pre-release pin).
+nvidia-cutlass-dsl[cu13]==4.8.0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
 quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; only published release compatible with CUTLASS DSL >= 4.7
 jinja2 # required for MinimaxM3 MSA

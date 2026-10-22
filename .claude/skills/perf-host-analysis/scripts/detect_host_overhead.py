@@ -531,7 +531,7 @@ def _format_report(result):
         lines.append("Use `perf-host-optimization` skill to profile and optimize.")
     else:
         lines.append("Host overhead is not the bottleneck.")
-        lines.append("Use `nsight-compute-analysis` for kernel-level SOL% analysis.")
+        lines.append("Use `perf-nsight-compute-analysis` for kernel-level SOL% analysis.")
 
     return "\n".join(lines)
 

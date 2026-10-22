@@ -246,7 +246,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
 # model builder (registered via ``@register_draft_model``). Keyed by the enum
 # member *name* rather than the enum itself so this module keeps importing
 # nothing. Modes absent from this table have no one-engine draft model to build
-# (two-model / drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
+# (model-free or drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
 #
 # Adding a speculative decoding mode
 # ----------------------------------
