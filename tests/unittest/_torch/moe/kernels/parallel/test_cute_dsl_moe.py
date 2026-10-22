@@ -1182,7 +1182,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     ep_size: int,
     tile_size: int,
     activation_type: ActivationType,
-):
+) -> None:
     """Test gather-based grouped GEMM with fused activation.
 
     This test validates the gather kernel which:
@@ -1192,6 +1192,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
        non-gated)
     4. Quantizes output to FP4 with scale factor generation
     """
+    torch.manual_seed(143)
     is_gated = is_gated_activation(activation_type)
     is_situ = activation_type == ActivationType.SiTu
     # SiTU rejects the SwiGLU clamp (matching MegaMoE and DeepGEMM).
@@ -1307,6 +1308,8 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         hidden_size,
     )
 
+    # Match the fused epilogue's FP32 GEMM and activation before rounding
+    # to the BF16 input type supported by the reference FP4 quantizer.
     c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
         a_gathered,
         b,
@@ -1316,10 +1319,10 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
+    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit).to(torch.bfloat16)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 

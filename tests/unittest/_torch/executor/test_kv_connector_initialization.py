@@ -36,7 +36,7 @@ def test_v2_connector_registers_layer_groups(
     monkeypatch: pytest.MonkeyPatch, windows: tuple[int | None, ...], capacity_only: bool
 ) -> None:
     executor = object.__new__(PyExecutor)
-    executor.kv_connector_manager = Mock(capacity_only=capacity_only)
+    executor.kv_connector_manager = Mock(capacity_only=capacity_only, enable_attention_dp=False)
     executor.kv_cache_transceiver = None
     executor.dist = SimpleNamespace(pp_size=1, cp_size=1)
     executor.max_beam_width = 1

@@ -507,6 +507,7 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
 
 
 def create_model_engine_and_kvcache(
+    test_case: unittest.TestCase,
     llm_args: TorchLlmArgs | None = None,
     execution_stream: torch.cuda.Stream | None = None,
     spec_config: DecodingBaseConfig | None = None,
@@ -554,6 +555,8 @@ def create_model_engine_and_kvcache(
         execution_stream=execution_stream,
     )
 
+    # Retire GPU caches on the test thread before background GC can collect them.
+    test_case.addCleanup(kv_cache_manager.shutdown)
     return model_engine, kv_cache_manager
 
 
@@ -1528,8 +1531,8 @@ class DecoderForwardTestCase(unittest.TestCase):
         self,
         model: DummyModel | None = None,
     ) -> tuple[PyTorchModelEngine, KVCacheManagerV2, ResourceManager, Mock]:
-        engine, kv_cache_manager = create_model_engine_and_kvcache(model=model)
-        self.addCleanup(kv_cache_manager.shutdown)
+        engine, kv_cache_manager = create_model_engine_and_kvcache(self,
+                                                                   model=model)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
         graph_runner = _install_graph_runner_stub(engine._runner)
@@ -2191,7 +2194,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                                     None, True))
 
     def test_padding_request_input_id_rows_are_zeroed(self) -> None:
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
         attn_metadata = AttentionMetadata(max_num_requests=4,
@@ -2239,7 +2242,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             draft_len_schedule={1: 1},
         )
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            spec_config=spec_config)
+            self, spec_config=spec_config)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
         attn_metadata = AttentionMetadata(max_num_requests=4,
@@ -2357,7 +2360,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
 
     def test_pad_generation_requests(self) -> None:
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2411,7 +2414,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # — including the per-iteration stats populate block in
         # PyExecutor._update_iter_stats — rely on never observing
         # cudagraph dummies.
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2467,7 +2470,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # it guards the invariant on the error path. A refactor that
         # accidentally dropped the `finally` would be caught here but not
         # by the clean-exit variant.
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2493,8 +2496,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_position_id_preparation(self):
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+    def test_position_id_preparation(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2535,8 +2538,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_warmup(self):
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+    def test_warmup(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2562,7 +2565,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_warmup_skips_padding_dummy_when_padding_impossible(self):
+    def test_warmup_skips_padding_dummy_when_padding_impossible(self) -> None:
         # With max_batch_size=1 and a graph for batch size 1, every batch
         # already matches a graph size, so no padded batch can ever occur and
         # warmup must not retain a padding dummy (it would permanently hold
@@ -2573,7 +2576,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                 cuda_graph_config=CudaGraphConfig(
                                     enable_padding=True, batch_sizes=[1, 2, 4]))
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            llm_args)
+            self, llm_args)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2587,12 +2590,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_warmup_skips_padding_dummy_during_estimation(self):
+    def test_warmup_skips_padding_dummy_during_estimation(self) -> None:
         # The estimation-phase KV cache is sized with no headroom for retained
         # dummies; holding blocks there can leave the estimation requests
         # unschedulable. Warmup must skip the preallocation for managers
         # created for KV cache capacity estimation.
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         kv_cache_manager.is_estimating_kv_cache = True
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
@@ -2607,13 +2610,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_preallocate_padding_dummies_uses_captured_draft_lens(self):
+    def test_preallocate_padding_dummies_uses_captured_draft_lens(self) -> None:
         # Speculative engines pad batches with the runtime draft length, so
         # the preallocation must create dummies for the draft lengths of the
         # captured graphs — not draft_len 0 unconditionally (an extra
         # draft_len-0 dummy would permanently hold KV blocks that runtime
         # padding never uses).
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2631,11 +2634,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 kv_cache_manager.free_resources(dummy)
             kv_cache_manager.shutdown()
 
-    def test_release_padding_dummy_covers_every_manager(self):
+    def test_release_padding_dummy_covers_every_manager(self) -> None:
         # A padding dummy's request ID is spread across several managers, so
         # releasing only the main KV cache manager leaves the others holding
         # it — and re-creation reuses the same ID.
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         spec_manager = Mock()
         cross_manager = Mock()
         resource_manager = ResourceManager({
@@ -2674,13 +2677,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             runner.padding_dummy_requests.clear()
             kv_cache_manager.shutdown()
 
-    def test_layerwise_nvtx_marker(self):
+    def test_layerwise_nvtx_marker(self) -> None:
         llm_args = TorchLlmArgs(
             model="dummy",
             enable_layerwise_nvtx_marker=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True))
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            llm_args)
+            self, llm_args)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -2714,12 +2717,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(model_engine._cuda_graph_batch_sizes,
                          [1, 2, 3, model_engine.max_seq_len])
 
-    def test_forward_pass_callable_on_cuda_graph_on(self):
+    def test_forward_pass_callable_on_cuda_graph_on(self) -> None:
         llm_args = TorchLlmArgs(model="dummy",
                                 cuda_graph_config=CudaGraphConfig(
                                     enable_padding=True, ))
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            llm_args)
+            self, llm_args)
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -2737,8 +2740,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         mock_callable.assert_called_once()
 
-    def test_forward_pass_callable_on_cuda_graph_off(self):
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+    def test_forward_pass_callable_on_cuda_graph_off(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -2756,8 +2759,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         mock_callable.assert_called_once()
 
-    def test_foward_pass_callable_off(self):
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+    def test_foward_pass_callable_off(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         self.assertTrue(model_engine._runner.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -2773,8 +2776,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
-    def test_foward_pass_callable_backward_compat(self):
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+    def test_foward_pass_callable_backward_compat(self) -> None:
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         self.assertTrue(model_engine._runner.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -3048,7 +3051,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         """The per-forward item-scheduler payload must not replace the
         request's own multimodal data, or each chunked prefill would keep its
         last chunk's joined embedding rows until prefill completes."""
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(self)
         model_engine.model.config.vocab_size = 100
         attn_metadata = AttentionMetadata(max_num_requests=4,
                                           max_num_tokens=32,
@@ -3092,7 +3095,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         execution_stream = torch.cuda.Stream()
 
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            execution_stream=execution_stream)
+            self, execution_stream=execution_stream)
 
         # Verify the KVCacheManagerV2 uses the provided execution stream
         self.assertEqual(
@@ -3125,7 +3128,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         execution_stream = torch.cuda.Stream()
         transfer_stream = torch.cuda.Stream()
         _, kv_cache_manager = create_model_engine_and_kvcache(
-            execution_stream=execution_stream)
+            self, execution_stream=execution_stream)
 
         source = torch.zeros(1, dtype=torch.int32, device="cuda")
         observed = torch.zeros_like(source)
