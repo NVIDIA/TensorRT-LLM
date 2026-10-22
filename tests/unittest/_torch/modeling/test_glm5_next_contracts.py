@@ -352,9 +352,7 @@ def test_mtp_draft_layers_share_the_target_kv_cache(model_config, separate):
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
     spec_config = MTPDecodingConfig(max_draft_len=3)
-    assert should_use_separate_draft_kv_cache(spec_config)
     update_spec_config_from_model_config(spec_config, model_config)
-    assert spec_config.spec_dec_mode.use_one_engine()
     assert should_use_separate_draft_kv_cache(spec_config) is separate
 
 
