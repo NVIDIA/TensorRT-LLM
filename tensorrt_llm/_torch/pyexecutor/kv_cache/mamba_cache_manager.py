@@ -54,8 +54,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
-                                                      BatchDesc, BufferConfig,
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (BatchDesc, BufferConfig,
                                                       DataRole, KVCacheDesc)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -326,13 +325,10 @@ def _host_slots_to_device(slots: List[int],
                         and prefer_pinned()).to(device, non_blocking=True)
 
 
-# In-forward Mamba snapshots (GDN models with hybrid block reuse; default off).
-# With additional_snapshot_offsets_from_end the last reusable snapshot point P
-# lies a few tokens before the prompt end L, and FORCE_CHUNK would run the tail
-# [P, L) as an extra context iteration. TRTLLM_MAMBA_INFORWARD_SNAPSHOT=1 runs
-# the prompt through L in one chunk instead: the GDN layers leave the state at P
-# in the live slot and stage the state at L, the manager commits the snapshot at
-# P after the forward and copies the staged state back.
+# In-forward Mamba snapshots (GDN, hybrid block reuse; default off): run the prompt
+# through its end L in one chunk instead of an extra iteration for the tail [P, L).
+# The GDN layers leave the state at P live and stage the state at L; see
+# _finish_inforward_snapshots.
 INFORWARD_SNAPSHOT_ENV = "TRTLLM_MAMBA_INFORWARD_SNAPSHOT"
 # Staging rows, i.e. requests per batch that can take the path; 0 sizes them
 # from INFORWARD_SNAPSHOT_MIB_ENV (at most 8 rows).
@@ -3775,15 +3771,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _finish_inforward_snapshots(
             self, scheduled_batch: ScheduledRequests,
             plan: Dict[int, InforwardSnapshotEntry]) -> None:
-        """Record the snapshots at P and restore the prompt-end states.
+        """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
 
-        After a forward with in-forward snapshots the GDN layers left each
-        planned request's live state at its snapshot point P and staged the
-        state at the prompt end. Commit the prompt up to P (the commit copies
-        the live recurrent page into the radix tree), then copy the staged
-        state back into the live slot. Both run on the execution stream before
-        the next forward; a disaggregated KV send of these requests waits for
-        the event recorded after the copies (``py_mamba_restore_event``).
+        A disaggregated KV send of these requests waits for ``py_mamba_restore_event``,
+        recorded after the copies.
         """
         dst, src, done = [], [], []
         for request in scheduled_batch.context_requests:
@@ -4063,7 +4054,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Snapshot where this request leaves the reuse tree, for its siblings."""
         if not self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
             return
-        if req.is_dummy_request:
+        # Generation-only requests receive their prompt state from the context
+        # worker and never prefill here, so they cannot take a snapshot.
+        if req.is_dummy_request or req.is_disagg_generation_init_state:
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
@@ -4992,13 +4985,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                            non_blocking=True))
 
     def _is_steady_state_index_batch(self, requests: List[LlmRequest]) -> bool:
-        """Whether the state-index buffers already hold this batch's values.
+        """Whether the last upload (same requests, SSM base blocks and dummy flags) still holds.
 
-        True for a steady decode batch: the same requests on the same SSM base
-        blocks with the same dummy flags as the last upload, so the host
-        staging buffer, the device indices, the dummy mask and the
-        per-request maps hold exactly what a full setup would write. Records
-        the batch as the new reference otherwise.
+        Records the batch as the new reference otherwise.
         """
         base_indices = []
         for req in requests:
@@ -5347,7 +5336,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if (request.context_current_position in request.expect_snapshot_points
                 and commit_end > kv_cache.num_committed_tokens):
             tokens = self._augment_tokens_for_block_reuse(
-                request.get_tokens(DEFAULT_BEAM_INDEX),
+                self._reuse_token_source(request),
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=commit_end,

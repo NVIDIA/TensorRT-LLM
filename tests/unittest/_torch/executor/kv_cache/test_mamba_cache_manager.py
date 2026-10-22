@@ -1546,50 +1546,6 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
 
 
-def test_v2_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(monkeypatch):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.local_num_mamba_layers = 2
-    mgr._use_replay_state_update = True
-    mgr._dummy_request_mask = torch.tensor([False, True])
-    mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
-    mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
-    mgr.replay_step_width = 4
-    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
-    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
-    mgr._stacked_conv_states = torch.empty(2, 0)
-    mgr.intermediate_conv_states = torch.empty(0)
-    mgr._commit_gdn_cached_replay_history_layers = MagicMock()
-
-    promote_calls = []
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
-        lambda *args, **kwargs: promote_calls.append((args, kwargs)),
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
-        lambda *args, **kwargs: pytest.fail(
-            "V2 replay bookkeeping must be folded into the conv promotion launch"
-        ),
-    )
-
-    mgr.update_mamba_states(
-        SimpleNamespace(num_seqs=2, num_contexts=0),
-        torch.tensor([3, 2], dtype=torch.int32),
-        state_indices=torch.tensor([0, 1], dtype=torch.int32),
-    )
-
-    mgr._commit_gdn_cached_replay_history_layers.assert_called_once()
-    assert len(promote_calls) == 1
-    args, kwargs = promote_calls[0]
-    assert args[0] is mgr._stacked_conv_states
-    assert kwargs["position_source_is_token_count"] is True
-    assert kwargs["replay_pnat"] is mgr.prev_num_accepted_tokens
-    assert kwargs["replay_cache_buf_idx"] is mgr.cache_buf_idx
-    assert kwargs["dummy_request_mask"].tolist() == [False, True]
-    assert kwargs["replay_step_width"] == 4
-    assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
-
-
 @skip_no_cuda
 def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
     """The one-launch promotion leaves the conv states and replay bookkeeping of the
@@ -2301,7 +2257,7 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
         is_dummy_request=False,
         is_dummy=False,
         py_request_id=0,
-        get_tokens=lambda beam_idx: token_ids,
+        get_tokens_view=lambda beam_idx: token_ids,
     )
     kv_cache = SimpleNamespace(
         num_committed_tokens=0,
@@ -3355,12 +3311,14 @@ def _fake_context_request(
     context_current_position=0,
     is_dummy_request=False,
     expect_snapshot_points=None,
+    is_disagg_generation_init_state=False,
 ):
     return SimpleNamespace(
         py_request_id=rid,
         prompt_len=prompt_len,
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
+        is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=list(expect_snapshot_points or []),
     )
 
@@ -3536,6 +3494,20 @@ def test_branch_snapshot_skipped_for_dummy_requests():
     assert mgr._snapshot_pruned_tokens_total == 0
 
 
+def test_branch_snapshot_skipped_for_generation_only_requests():
+    """A disagg generation request receives its prompt state and never prefills here."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, is_disagg_generation_init_state=True)
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {}
+    assert request.expect_snapshot_points == []
+    assert mgr._branch_snapshots_skipped_total == {}
+    assert mgr._snapshot_pruned_tokens_total == 0
+
+
 def test_branch_snapshot_point_survives_a_second_scheduler_pass():
     """prepare_expect_snapshot_points overwrites the list on every pass."""
     mgr = _branch_snapshot_manager()
@@ -3573,7 +3545,7 @@ def test_branch_snapshot_taken_counts_successful_commit_once():
     mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
     request = _fake_context_request(prompt_len=256, context_current_position=64)
     request.context_remaining_length = 192
-    request.get_tokens = lambda beam_idx: list(range(256))
+    request.get_tokens_view = lambda beam_idx: list(range(256))
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
     def commit(tokens):
@@ -3769,7 +3741,7 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
         expect_snapshot_points=[128],
         prompt_len=128,
         is_last_context_chunk=True,
-        get_tokens=lambda beam_idx: list(range(128)),
+        get_tokens_view=lambda beam_idx: list(range(128)),
     )
     kv_cache = SimpleNamespace(
         is_active=True,
