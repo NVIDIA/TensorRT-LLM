@@ -143,6 +143,16 @@ def _warmup_named_allreduce_topology(mapping: Mapping, group_name: str) -> None:
         _named_allreduce_topology_warmups.add(group_name)
 
 
+def warmup_named_allreduce_topologies(model: nn.Module) -> None:
+    """Warm each named TP group used by the model's ``AllReduce`` modules, once and in a fixed order."""
+    mappings = {}
+    for module in model.modules():
+        if isinstance(module, AllReduce) and module._group_name:
+            mappings.setdefault(module._group_name, module.mapping)
+    for group_name in sorted(mappings):
+        _warmup_named_allreduce_topology(mappings[group_name], group_name)
+
+
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
@@ -1146,14 +1156,12 @@ class AllReduce(nn.Module):
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
-        self._group_name = (mapping.tp_group_name if self._disable_mpi
-                            and mapping.tp_size > 1 else None)
+        self._group_name = (mapping.tp_group_name
+                            if self._disable_mpi and mapping.tp_size > 1
+                            and torch.distributed.is_initialized() else None)
 
         self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name if
                               self._disable_mpi else torch.ops.trtllm.allreduce)
-
-        if self._disable_mpi and self.mapping.tp_size > 1:
-            _warmup_named_allreduce_topology(self.mapping, self._group_name)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
