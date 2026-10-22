@@ -30,6 +30,7 @@ The following is a table of supported models for the PyTorch backend:
 | `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
 | `KimiLinearForCausalLM` [^15]        | Kimi-K3 (text decoder)             | `moonshotai/Kimi-K3`                         |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
+| `LiLiCorrDraftModel`                | [LiLiCorr draft model](../features/speculative-decoding.md#dflash) | Compatible checkpoint via `DFlashDecodingConfig.speculative_model` |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
 | `MBartForConditionalGeneration`      | mBART                              | `facebook/mbart-large-50-many-to-one-mmt`    |
@@ -189,9 +190,11 @@ The following optimizations are available to models that implement
     `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
     encoder work is selected, so they use none of the per-iteration encoder item or token budget.
     Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
-    items populate the cache for later requests. The item path also keeps encoder outputs in this
-    cache until the request's prefill completes, so the cache is never smaller than the output of
-    one encoder iteration, even when `encoder_cache_max_bytes` is `0`. Item scheduling does not
+    items populate the cache for later requests. With KV cache manager V2, items covered by confirmed
+    KV reuse are not encoded. With chunked prefill, each chunk waits only for its required items
+    and releases encoder outputs after use. KV cache manager V1 keeps whole-request encoder
+    scheduling. The cache is never smaller than the output of one encoder iteration, even when
+    `encoder_cache_max_bytes` is `0`. Item scheduling does not
     support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
     the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
     the `EAGER` policy raises an error.

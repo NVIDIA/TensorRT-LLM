@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
 from ...functional import RotaryScalingType
@@ -62,15 +63,10 @@ def dspark_layer_window_size(
     return (swa_window - 1, swa_window - 1)
 
 
-def _is_dflash2_architecture(config: PretrainedConfig) -> bool:
-    """Whether a draft checkpoint advertises itself as a DFlash 2 drafter.
-
-    Matches on the "dflash2" stem (released drafters use ``DFlash2DraftModel``)
-    so per-target variants of the label are picked up too.
-    """
-    return any(
-        "dflash2" in str(arch).lower().replace("_", "").replace("-", "")
-        for arch in (getattr(config, "architectures", None) or [])
+def declares_lilicorr(config: PretrainedConfig) -> bool:
+    """Whether the checkpoint requires the LiLiCorr candidate scorer."""
+    return is_lilicorr_checkpoint(
+        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
     )
 
 
@@ -336,6 +332,7 @@ class DFlashForCausalLM(nn.Module):
     # sets were built for, while an MLA drafter runs its own block decode and
     # has a third implementation they cannot express.
     _default_attention_backend = "VANILLA"
+    _uses_lilicorr = False
     _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4")
     # Where AUTO lands when the preferred backend cannot run. None means AUTO
     # propagates the reason instead: a family whose only deployable target can
@@ -450,7 +447,7 @@ class DFlashForCausalLM(nn.Module):
 
         # Get mask_token_id from dflash_config
         pretrained_config = draft_config.pretrained_config
-        dflash_config = getattr(pretrained_config, "dflash_config", {})
+        dflash_config = getattr(pretrained_config, "dflash_config", None) or {}
         self.mask_token_id = dflash_config.get(
             "mask_token_id",
             getattr(pretrained_config, "mask_token_id", pretrained_config.vocab_size),
@@ -537,10 +534,9 @@ class DFlashForCausalLM(nn.Module):
         self._dflash2_conv_group_size = int(dflash_config.get("conv_group_size", 0) or 0)
         self._dflash2_selector_rank = int(dflash_config.get("selector_rank", 0) or 0)
         self._dflash2_selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
-        self._is_dflash2 = (
-            self._dflash2_conv_taps > 0
-            or self._dflash2_selector_rank > 0
-            or _is_dflash2_architecture(pretrained_config)
+        # LiLiCorr supplies its own scorer and permits convolution-free checkpoints.
+        self._is_dflash2 = not self._uses_lilicorr and is_dflash2_checkpoint(
+            getattr(pretrained_config, "architectures", None), dflash_config
         )
         if self._is_dflash2:
             self._validate_dflash2_config()
@@ -832,7 +828,7 @@ class DFlashForCausalLM(nn.Module):
         # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
         remapped = {}
         for key, value in weights.items():
-            if key in ("fc.weight", "hidden_norm.weight"):
+            if key.startswith("fc.") or key == "hidden_norm.weight":
                 # DFlash-specific projection weights - store directly
                 remapped[key] = value
             elif key == "norm.weight":
@@ -854,16 +850,7 @@ class DFlashForCausalLM(nn.Module):
             )
 
         # Load DFlash-specific weights directly
-        if "fc.weight" in remapped:
-            self.fc = nn.Linear(
-                remapped["fc.weight"].shape[1],
-                remapped["fc.weight"].shape[0],
-                bias=False,
-                device="cuda",
-                dtype=remapped["fc.weight"].dtype,
-            )
-            self.fc.weight.data.copy_(remapped["fc.weight"])
-            del remapped["fc.weight"]
+        self._load_target_projection(remapped)
 
         if "hidden_norm.weight" in remapped:
             rms_norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
@@ -885,7 +872,16 @@ class DFlashForCausalLM(nn.Module):
             weights=remapped, weight_mapper=weight_mapper, allow_partial_loading=True
         )
 
-    def _load_dflash2_weights(self, weights: Dict) -> Dict:
+    def _load_target_projection(self, weights: Dict) -> None:
+        if "fc.weight" not in weights:
+            return
+        weight = weights.pop("fc.weight")
+        self.fc = nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
+        )
+        self.fc.weight.data.copy_(weight)
+
+    def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
         """Build the DFlash 2 convolutions and candidate selector.
 
         Returns ``weights`` minus the keys consumed here.
@@ -918,18 +914,17 @@ class DFlashForCausalLM(nn.Module):
                     )
                 )
 
-        selector = DFlash2CandidateSelector(
-            predecessor_codebook=take("candidate_selector.predecessor_codebook"),
-            successor_codebook=take("candidate_selector.successor_codebook"),
-            hidden_projection_weight=take("candidate_selector.hidden_projection.weight"),
-            top_k=self._dflash2_selector_top_k,
-            vocab_size=self.config.vocab_size,
-            rank=self._dflash2_selector_rank,
-        )
-
         self.attention_convs = attention_convs
         self.mlp_convs = mlp_convs
-        self.candidate_selector = selector
+        if load_selector:
+            self.candidate_selector = DFlash2CandidateSelector(
+                predecessor_codebook=take("candidate_selector.predecessor_codebook"),
+                successor_codebook=take("candidate_selector.successor_codebook"),
+                hidden_projection_weight=take("candidate_selector.hidden_projection.weight"),
+                top_k=self._dflash2_selector_top_k,
+                vocab_size=self.config.vocab_size,
+                rank=self._dflash2_selector_rank,
+            )
         return {k: v for k, v in weights.items() if k not in consumed}
 
     #: Tensors the wrapper itself owns: not in draft_model_full, built from the
@@ -1277,12 +1272,13 @@ class DFlashForCausalLM(nn.Module):
         sliding_window = get_layer_attention_window(self.config, layer_idx)
         is_sliding_layer = is_sliding_layer or sliding_window is not None
 
-        # A DFlash 2 checkpoint's top-level is_causal wins over the layer-type
-        # default (which would read an all-sliding drafter as causal). Only
-        # consulted for DFlash 2: is_causal is common enough elsewhere that
-        # honoring it everywhere could silently retarget an older drafter.
+        # LiLiCorr uses non-causal block attention with symmetric sliding windows.
+        # DFlash 2 honors explicit is_causal metadata when present; otherwise,
+        # causality follows the layer-type default.
         explicit_causal = getattr(self.config, "is_causal", None) if self._is_dflash2 else None
-        if explicit_causal is not None:
+        if self._uses_lilicorr:
+            causal = False
+        elif explicit_causal is not None:
             causal = bool(explicit_causal)
         elif not is_sliding_layer:
             return False, (-1, -1)
@@ -1925,7 +1921,7 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         if getattr(config, "mlp_layer_types", None) is None:
             config.mlp_layer_types = ["dense"] * config.num_hidden_layers
         if getattr(config, "block_size", None) is None:
-            dflash_config = getattr(config, "dflash_config", {})
+            dflash_config = getattr(config, "dflash_config", None) or {}
             if isinstance(dflash_config, dict):
                 config.block_size = dflash_config.get("block_size", None)
 
@@ -2060,6 +2056,15 @@ def _build_dflash_draft(model_config, draft_config, lm_head, model):
         )
     draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
     dflash_attention_backend = model_config.spec_config.attention_backend
+    if declares_lilicorr(draft_config.pretrained_config):
+        if any("Laguna" in arch for arch in draft_arches):
+            raise NotImplementedError(
+                "LiLiCorr currently requires the generic GQA DFlash backbone; "
+                "Laguna's draft-layer specialization is not supported."
+            )
+        from .modeling_lilicorr import LiLiCorrForCausalLM
+
+        return LiLiCorrForCausalLM(draft_config, dflash_attention_backend=dflash_attention_backend)
     if any("Laguna" in arch for arch in draft_arches):
         return DFlashLagunaForCausalLM(
             draft_config,

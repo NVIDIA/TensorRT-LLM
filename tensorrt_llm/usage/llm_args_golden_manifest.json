@@ -622,6 +622,11 @@
       "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.cold_tier_offload_min_priority"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.copy_on_partial_reuse"
@@ -741,6 +746,36 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.moving_average_decay"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.ratio_tolerance"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",
@@ -795,11 +830,6 @@
       "capture_policy": "list[float]|none",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
-      "path": "kv_cache_config.secondary_offload_min_priority"
     },
     {
       "capture_policy": "int|none",
@@ -1380,6 +1410,11 @@
       "path": "sparse_attention_config.fuse_qkv_index_projection"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.gvr_deterministic_topk"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1807,6 +1842,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "speculative_config.skip_ctx_buffer_budget_check"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.spec_dec_variant"
     },
     {
       "capture_policy": "list[int]|none",

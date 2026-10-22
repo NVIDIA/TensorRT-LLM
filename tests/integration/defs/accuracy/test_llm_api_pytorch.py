@@ -229,7 +229,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
-            use_kv_cache_manager_v2=False,
         )
         # Keep the TP=1 worker in this process so the call counter observes the
         # real PrimTS launch. Compile Inductor kernels synchronously because its
@@ -3774,7 +3773,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_guided_decoding(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto",
-                                        use_kv_cache_manager_v2=False)
+                                        use_kv_cache_manager_v2=True)
         with self._create_1gpu_llm(
                 kv_cache_config=kv_cache_config,
                 moe_backend="CUTLASS",
@@ -6466,34 +6465,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                             layer_updates_per_iter=2)
         self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
-    @skip_post_blackwell
-    @pytest.mark.skip_less_mpi_world_size(4)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_nvfp4_4gpus_hopper_w4a16(self):
-        """W4A16 NVFP4 dequant fallback on Hopper (SM 90), MTP draft_len=4."""
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            mamba_ssm_cache_dtype="float16",
-            free_gpu_memory_fraction=0.5,
-        )
-        max_batch_size = 32
-        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
-                                            enable_padding=True)
-        mtp_config = MTPDecodingConfig(max_draft_len=4)
-        pytorch_config = dict(cuda_graph_config=cuda_graph_config)
-        with LLM(
-                model_path,
-                kv_cache_config=kv_cache_config,
-                max_batch_size=max_batch_size,
-                tensor_parallel_size=4,
-                speculative_config=mtp_config,
-                **pytorch_config,
-        ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
     @skip_pre_hopper
     @skip_post_hopper
     @pytest.mark.skip_less_device_memory(80000)
@@ -7517,6 +7488,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             overlap_scheduler=True,
             fuse_qkv_index_projection=fuse_qkv_index_projection,
             eval_mode="default",
+            kv_dtype="nvfp4",
             piecewise=True)
 
     def _run_nvfp4_eagle3(self,
