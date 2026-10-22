@@ -289,7 +289,7 @@ def sync_schema_version_metadata(output_dir: Path, *, check: bool = False) -> li
     """Update version-derived metadata without importing TensorRT-LLM or Pydantic."""
     version = _source_version()
     paths = []
-    stale = []
+    updates = {}
     missing = []
     for filename, command in _SCHEMA_COMMANDS.items():
         path = output_dir / filename
@@ -297,21 +297,22 @@ def sync_schema_version_metadata(output_dir: Path, *, check: bool = False) -> li
         if not path.is_file():
             missing.append(filename)
             continue
-        schema = json.loads(path.read_text(encoding="utf-8"))
+        original = path.read_text(encoding="utf-8")
+        schema = json.loads(original)
         _set_schema_version_metadata(schema, filename, command, version)
         content = json.dumps(schema, indent=2, sort_keys=True) + "\n"
-        if path.read_text(encoding="utf-8") == content:
-            continue
-        if check:
-            stale.append(filename)
-        else:
-            path.write_text(content, encoding="utf-8")
+        if original != content:
+            updates[path] = content
     if missing:
         raise ValueError(
             f"Cannot sync version metadata for missing schemas: {', '.join(missing)}. "
             "Run python3 scripts/generate_trtllm_serve_schemas.py with a matching build first."
         )
-    _raise_stale(stale, sync_version=True)
+    if check:
+        _raise_stale([path.name for path in updates], sync_version=True)
+    else:
+        for path, content in updates.items():
+            path.write_text(content, encoding="utf-8")
     return paths
 
 

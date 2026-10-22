@@ -575,6 +575,8 @@ def test_checked_in_schemas_are_current() -> None:
 def test_check_detects_stale_files_without_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
+    for name in ("generate_serve_schema", "generate_disagg_schema", "generate_visual_gen_schema"):
+        monkeypatch.setitem(generator.write_schemas.__globals__, name, lambda: {"type": "object"})
     paths = generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
     if change == "missing":
@@ -583,7 +585,7 @@ def test_check_detects_stale_files_without_writing(
         paths[0].write_text("{}\n", encoding="utf-8")
     else:
         version = generator._source_version() + ".post1"
-        monkeypatch.setattr(generator, "_source_version", lambda: version)
+        monkeypatch.setitem(generator.write_schemas.__globals__, "_source_version", lambda: version)
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(ValueError, match="Missing or stale configuration schemas"):
         generator.write_schemas(tmp_path, check=True)
@@ -639,3 +641,25 @@ def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> 
 
     subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
     assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check
+
+
+@pytest.mark.parametrize("change", ["missing", "malformed"])
+def test_version_metadata_sync_validates_all_files_before_writing(
+    tmp_path: Path, change: str
+) -> None:
+    """A bad final snapshot must not leave preceding snapshots modified."""
+    paths = [tmp_path / filename for filename in generator._SCHEMA_COMMANDS]
+    for path in paths:
+        path.write_text('{"type": "object", "title": "old"}\n', encoding="utf-8")
+    if change == "missing":
+        paths[-1].unlink()
+        error = ValueError
+    else:
+        paths[-1].write_text("{\n", encoding="utf-8")
+        error = json.JSONDecodeError
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    with pytest.raises(error):
+        generator.sync_schema_version_metadata(tmp_path)
+
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
