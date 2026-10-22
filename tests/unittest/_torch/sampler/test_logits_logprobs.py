@@ -1580,3 +1580,23 @@ def test_selected_raw_logprobs():
         torch.testing.assert_close(
             top_values, sparse_reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
         )
+
+    # Sparse selection above 16 rows exercises the 512-token tile top-k path.
+    sparse_logits = torch.randn((65, 4099), device="cuda", generator=generator)
+    sparse_rows = torch.arange(17, device="cuda") * 3
+    sparse_tokens = torch.arange(17, device="cuda") * 7
+    reference = sparse_logits[sparse_rows].log_softmax(-1)
+    sampled = reference.gather(1, sparse_tokens[:, None]).squeeze(1)
+    values, ranks, top_values, top_tokens = selected_raw_logprobs(
+        sparse_logits, sparse_rows, sparse_tokens, 100
+    )
+    torch.testing.assert_close(values, sampled, atol=2e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        ranks, (reference > sampled[:, None]).sum(-1, dtype=torch.int32), atol=0, rtol=0
+    )
+    torch.testing.assert_close(top_values, reference.topk(100).values, atol=2e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        top_values, reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+    )
+    sorted_tokens = top_tokens.sort(-1).values
+    assert (sorted_tokens[:, 1:] != sorted_tokens[:, :-1]).all()
