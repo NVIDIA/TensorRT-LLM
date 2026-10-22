@@ -435,14 +435,27 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         """
         if not cls.serves_only_extra_page_sizes():
             return
+        from .fallback import FallbackFmha
         from .registry import get_enabled_fmha_lib_classes
 
         where = f"SM{get_sm_version()} with {tokens_per_block}-token KV pages"
-        if cls not in get_enabled_fmha_lib_classes():
+        enabled_libs = get_enabled_fmha_lib_classes()
+        if cls not in enabled_libs:
             raise RuntimeError(
                 f"{where} needs the flashinfer_trtllm_gen FMHA library, the only one with "
                 "paged-context kernels for this page size here, but TLLM_FMHA_LIBS excludes it. "
                 "Keep flashinfer_trtllm_gen in TLLM_FMHA_LIBS (or unset it)."
+            )
+        # Libraries are tried in TLLM_FMHA_LIBS order, and FallbackFmha raises on a paged
+        # prefill at an extra page size, so it must not come first.
+        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
+            cls
+        ):
+            raise RuntimeError(
+                f"{where} needs the flashinfer_trtllm_gen FMHA library to be tried before "
+                "fallback, which cannot serve paged prefill at this page size, but "
+                "TLLM_FMHA_LIBS lists fallback first. "
+                "List flashinfer_trtllm_gen before fallback in TLLM_FMHA_LIBS (or unset it)."
             )
         if not cls.is_environment_available():
             raise RuntimeError(

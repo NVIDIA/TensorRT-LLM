@@ -423,6 +423,9 @@ def test_draft_kv_cache_view_accessor_respects_local_layers(
         (107, None, True, None),
         (107, "-flashinfer_trtllm_gen", True, "TLLM_FMHA_LIBS excludes it"),
         (107, "fallback", True, "TLLM_FMHA_LIBS excludes it"),
+        # Libraries are tried in list order; fallback raises on P128 paged prefill.
+        (107, "fallback,flashinfer_trtllm_gen", True, "lists fallback first"),
+        (107, "flashinfer_trtllm_gen,fallback", True, None),
         (107, None, False, "install flashinfer-python"),
         # Elsewhere the fallback has P128 paged-context kernels, so nothing is required.
         (103, "-flashinfer_trtllm_gen", False, None),
