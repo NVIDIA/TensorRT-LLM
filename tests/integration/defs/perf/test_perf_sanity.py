@@ -358,6 +358,30 @@ GEN_ONLY_REGRESSION_METRICS = (
     "d_median_gen_worker_per_iter_device_step_time",
 )
 
+# Oldest ts_created (epoch ms, 2026-10-01T12:09:03Z) whose gen-worker device step
+# time may enter a gen_only-mode baseline. From that moment on, the gen_only
+# modes describe the expected steady-state num_generation_tokens bucket
+# (expected_gen_only_ngen); rows created earlier describe the modal bucket
+# instead. Where two buckets are near-tied -- a full-batch wave and a short tail
+# wave, both ~420 iterations when concurrency / dp exceeds max_batch_size -- the
+# two definitions publish values 3x apart for the same run, so an older row mixed
+# into the 90-day history drags the P5 baseline down to the tail wave and flags
+# every current run. e2e still describes the modal bucket, so its series is
+# continuous and is not floored.
+#
+# TODO(2026-12-31): remove this floor and GEN_ONLY_METRIC_HISTORY_FLOORS_MS. From
+# that day the 90-day history window (QUERY_LOOKBACK_DAYS) starts after the floor,
+# so it no longer filters any row.
+GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS = 1790856543000
+
+# Metric -> ts_created floor applied when computing gen_only-mode baselines. Every
+# uploaded gen-worker device-step-time statistic is floored, gated or not, so the
+# diagnostic diff lines in s_regression_info describe the same definition the
+# gate uses.
+GEN_ONLY_METRIC_HISTORY_FLOORS_MS = {
+    f"d_{name}": GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS for name in DEVICE_STEP_TIME_METRICS
+}
+
 # Test-id modifier that additionally captures the per-request lifecycle
 # breakdown. It is a segment of its own, between the benchmark mode and the
 # config stem, so that instrumentation and mode stay orthogonal:
@@ -5351,6 +5375,7 @@ class PerfSanityTestConfig:
             # metric whose baseline is absent or non-positive, so it stays inert
             # until enough runs accrue -- it cannot fail a build before then.
             regression_metrics = list(GEN_ONLY_REGRESSION_METRICS)
+            metric_history_floors_ms = GEN_ONLY_METRIC_HISTORY_FLOORS_MS
         else:
             # e2e lands here and keeps the throughput
             # metrics. They upload the same five device-step-time statistics, but
@@ -5360,6 +5385,7 @@ class PerfSanityTestConfig:
             # meaningful signal and already gates, and device step time is there
             # to attribute a regression rather than to declare one.
             regression_metrics = list(REGRESSION_METRICS)
+            metric_history_floors_ms = None
             has_spec_decoding = any(
                 cc.spec_decoding
                 for clients in self.server_client_configs.values()
@@ -5377,6 +5403,7 @@ class PerfSanityTestConfig:
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
             fail_on_regression=fail_on_regression,
+            metric_history_floors_ms=metric_history_floors_ms,
         )
 
 

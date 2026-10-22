@@ -333,7 +333,6 @@ def test_qwen4_cache_manager_uses_only_qsa_index_geometry(
         dtype=torch.bfloat16,
         mamba_ssm_cache_dtype=torch.bfloat16,
     )
-    monkeypatch.setattr(_util, "is_gemma4_hybrid", lambda config: False)
     monkeypatch.setattr(_util, "is_kimi_linear", lambda config: False)
     monkeypatch.setattr(_util, "is_mla", lambda config: False)
     monkeypatch.setattr(_util, "is_nemotron_hybrid", lambda config: False)

@@ -5458,30 +5458,31 @@ class PyExecutor:
         return need
 
     def _consume_previous_batch_for_rebalance(self) -> None:
-        """Drain ``previous_batch`` so its _KVCache instances are quiescent.
+        """Drain in-flight batch work before KV pool rebalance.
 
-        No-op when ``previous_batch is None`` -- i.e., always a no-op in
-        the non-overlap loop, since that loop never sets previous_batch.
-        In the overlap loop this fires when the rebalance hook catches a
-        pending in-flight iteration; we consume it inline so suspend can
-        safely run.
-
-        Mirrors the inline sequence in ``_executor_loop_overlap`` that
-        handles ``previous_batch``.  Unlike the inline code we are not
-        guarded by ``should_process_previous_batch``: the rebalance gate
-        already excludes the multi-rank-divergence cases that flag exists
-        to handle.
+        In overlap mode, ADP ranks must participate in the transfer-response,
+        batch-response, and KV-event collectives even without a local batch.
+        Other modes remain a no-op when there is no previous batch.
         """
-        if self.previous_batch is None:
+        previous_batch = self.previous_batch
+        if previous_batch is None and (not self.enable_attention_dp
+                                       or self.disable_overlap_scheduler):
             return
-        self._update_requests(self.previous_batch.sample_state)
-        self._send_kv_async(
-            self.previous_batch.scheduled_requests.all_requests())
+        if previous_batch is not None:
+            self._update_requests(previous_batch.sample_state)
+            self._send_kv_async(
+                previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()
-        self._process_previous_batch()
-        self.perf_manager.compute_batch_gpu_times(
-            self.previous_batch.scheduled_requests.all_requests())
-        self.previous_batch = None
+        if previous_batch is not None:
+            self._process_previous_batch()
+        else:
+            self._enqueue_responses([])
+        if self.enable_kv_cache_events:
+            self._add_kv_cache_events()
+        if previous_batch is not None:
+            self.perf_manager.compute_batch_gpu_times(
+                previous_batch.scheduled_requests.all_requests())
+            self.previous_batch = None
 
     def _maybe_rebalance_kv_pools(self) -> None:
         """Rebalance KV pool ratios when the V2 auto-tuner asks for it.
@@ -6007,6 +6008,12 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # KV-cache event flushing performs an attention-DP allgather.
+                # Keep it outside the rank-divergent previous-batch branch so
+                # every rank enters the collective in the same order.
+                if self.enable_kv_cache_events:
+                    self._add_kv_cache_events()
+
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to
                 # the _enqueue_responses([]) call in the else branch.
@@ -6175,8 +6182,6 @@ class PyExecutor:
             attn_metadata,
             kv_cache_dtype_byte_size,
             skip_kv_cache_manager=self._is_kv_manager_v2)
-        if self.enable_kv_cache_events:
-            self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
@@ -7770,16 +7775,19 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
-    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+    def _update_adp_dummy_role(self,
+                               candidates: list[RequestQueueItem]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
         has_ctx = False
         has_gen = False
-        for req in candidates:
-            rt = getattr(req, "llm_request_type", None)
-            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+        for candidate in candidates:
+            req = candidate.request
+            assert req is not None
+            request_type = req.request_type
+            if request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
                 has_ctx = True
-            elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+            elif request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 has_gen = True
         # Prefer the CTX role when both types are present this iteration so the
         # dummy follows the same request lifecycle as ranks doing real context
@@ -8100,6 +8108,18 @@ class PyExecutor:
                 kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
+        # Cache state that the generation worker derives from the imported KV
+        # (e.g. FP4 MLA V scales and packed V) is not transferred. Rebuild it
+        # before the first forward reads it. The sampler setup above may have
+        # terminated requests, whose caches must not be touched.
+        kv_mgr = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        rebuild = getattr(kv_mgr, "rebuild_disagg_imported_cache", None)
+        if rebuild is not None:
+            rebuild([
+                req for req in cache_trans_complete_requests
+                if req.is_disagg_generation_transmission_complete
+            ])
 
         for req in scheduled_batch.generation_requests:
             if (getattr(req, "py_csa2_remote_tail_mode", None) == "destination"

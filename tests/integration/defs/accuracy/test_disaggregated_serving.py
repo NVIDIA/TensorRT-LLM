@@ -46,7 +46,8 @@ from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+                        skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
+                        skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
                             LlmapiAccuracyTestHarness,
@@ -801,6 +802,60 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 request_timeout_s=DEFAULT_REQUEST_TIMEOUT_S,
                 request_max_retries=None,
         ) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @skip_no_rubin
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_nvfp4_kv_cache_nixl(self):
+        """FP4 MLA: the generation worker decodes from an imported NVFP4 cache."""
+        kv_cache_config = {
+            "dtype": "nvfp4",
+            "use_kv_cache_manager_v2": True,
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.75,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 8192,
+        }
+        speculative_config = {"decoding_type": "MTP", "max_draft_len": 3}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": False,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config, ctx_server_config,
+                gen_server_config,
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
+        ) as llm:
+            # The DuckLLM args do not carry the served quantization, so set
+            # the specs the accuracy reference lookup matches on.
+            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.args.speculative_config = MTPDecodingConfig(max_draft_len=3)
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)

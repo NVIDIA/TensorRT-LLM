@@ -25,8 +25,9 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,

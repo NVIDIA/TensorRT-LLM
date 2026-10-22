@@ -414,6 +414,10 @@ def _parse_assistant_message_content(message: Dict[str, Any],
             # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
             # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
             tool_calls = list(tool_calls)
+            # Put the list back: the iterator is spent now, and the router forwards this same
+            # request (or counts its tokens) after rendering it. A validation error still
+            # surfaces from the `list()` above, so the raw-body fallback is unchanged.
+            message["tool_calls"] = tool_calls
             result["tool_calls"] = [
                 _normalize_tool_call_arguments(index, item, lenient_json)
                 for index, item in enumerate(tool_calls)
@@ -465,6 +469,8 @@ def parse_chat_messages_coroutines(
             (e.g. `--media_io_kwargs`); defaults to empty.
         request_media_io_kwargs: Per-request override merged per
             modality with the server default via `BaseMediaIO.create`.
+        model_type_override: The model type to parse for, for a caller that
+            has no `model_config` (the KV-aware router) but knows the type.
         resolve_media: When False the returned coroutine closes the
             pending loads instead of running them and yields
             `(None, None)`.
@@ -477,7 +483,8 @@ def parse_chat_messages_coroutines(
     """
     conversation = []
     mm_placeholder_counts = []
-    model_type = resolve_top_level_model_type(model_config)
+    model_type = model_type_override or resolve_top_level_model_type(
+        model_config)
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,

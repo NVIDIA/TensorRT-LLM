@@ -521,7 +521,11 @@ The FMHA package is split by role:
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
-  batch state, cache storage, and kernels live in `fp4_mla/`.
+  batch state, cache storage, and kernels live in `fp4_mla/`. Disaggregated
+  serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
+  HP-tail roles; before its first forward, the generation worker rebuilds the
+  derived V-scale and packed-V sidecars from the imported cache
+  (`rebuild_disagg_imported_cache`).
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
