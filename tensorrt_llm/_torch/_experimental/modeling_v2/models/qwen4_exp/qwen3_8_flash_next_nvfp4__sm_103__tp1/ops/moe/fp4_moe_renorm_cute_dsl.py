@@ -203,13 +203,15 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
             )
 
         # The memset of the rows FC2 scatter-adds into runs beside FC1 on `memset_stream` (a
-        # stream nothing else is queued on: the join before FC2 waits for all of it).
+        # stream nothing else is queued on: the join before FC2 waits for all of it). `out` is
+        # a main-stream allocation the side stream is done with before main's next use of it
+        # (the join), so its block needs no `record_stream` -- which would make the caching
+        # allocator poll an event on every later allocation (~2000 cudaEventQuery a mixed step).
         main = torch.cuda.current_stream()
         if memset_stream is not None:
             memset_stream.wait_stream(main)
             with torch.cuda.stream(memset_stream):
                 memset()
-            out.record_stream(memset_stream)
         h, h_sf = fc1.forward(
             [
                 hidden_states.view(_FP4),
