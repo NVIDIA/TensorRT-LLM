@@ -36,7 +36,7 @@ void StaticHostMem::Deleter::operator()(void* ptr) const noexcept
     {
         char const* errorString = nullptr;
         cuGetErrorString(result, &errorString);
-        TLLM_LOG_ERROR("Failed to free static host memory: %s", errorString != nullptr ? errorString : "unknown");
+        TLLM_LOG_ERROR("Failed to free static host memory: {}", errorString != nullptr ? errorString : "unknown");
     }
 }
 

@@ -1041,7 +1041,7 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
                                   (mInterleavesTmemSAndP ? 0 : 2 * mNumTmemColsP);
       TLLM_CHECK_ERROR_FMT(
         mNumTmemCols - numTmemColsNeeded >= 0,
-        "Not enough TMEM columns available. Have {}, need {} (S: {}, stats: {}, O: {}, P: {})",
+        "Not enough TMEM columns available. Have %d, need %d (S: %d, stats: %d, O: %d, P: %d)",
         mNumTmemCols,
         numTmemColsNeeded,
         numTmemColsS,
@@ -1091,7 +1091,7 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
         numTmemColsS + numTmemColsStats + numTmemColsO + numTmemColsP + numMmaSumCols;
       TLLM_CHECK_ERROR_FMT(
         numTmemColsNeededForMmaSum <= mNumTmemCols,
-        "UsesMmaForSoftmaxSum needs {} TMEM columns, but only {} are available",
+        "UsesMmaForSoftmaxSum needs %d TMEM columns, but only %d are available",
         numTmemColsNeededForMmaSum,
         mNumTmemCols);
     }

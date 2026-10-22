@@ -424,7 +424,7 @@ void launchFusedDiTQKNormRopeQuantFp8(void const* qkv, void* q_out, void* k_out,
         case 64: LAUNCH_QUANT_KERNEL(64, true); break;
         case 128: LAUNCH_QUANT_KERNEL(128, true); break;
         case 256: LAUNCH_QUANT_KERNEL(256, true); break;
-        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: %d", head_dim);
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: {}", head_dim);
         }
     }
     else
@@ -434,7 +434,7 @@ void launchFusedDiTQKNormRopeQuantFp8(void const* qkv, void* q_out, void* k_out,
         case 64: LAUNCH_QUANT_KERNEL(64, false); break;
         case 128: LAUNCH_QUANT_KERNEL(128, false); break;
         case 256: LAUNCH_QUANT_KERNEL(256, false); break;
-        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: %d", head_dim);
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: {}", head_dim);
         }
     }
 #undef LAUNCH_QUANT_KERNEL

@@ -148,13 +148,13 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
                   "allow_remote_numa_fallback=true to accept first-touch placement.");
         }
         TLLM_LOG_WARNING(
-            "KVCM2 host tier: mbind to NUMA node %d failed with errno %d; falling back to first-touch placement by "
+            "KVCM2 host tier: mbind to NUMA node {} failed with errno {}; falling back to first-touch placement by "
             "the fill worker, which is bound to that node (in a container this usually means CAP_SYS_NICE is "
             "absent). Placement is preserved; no behaviour is lost here.",
             node, errno);
         return;
     }
-    TLLM_LOG_INFO("KVCM2 host tier: pages bound to NUMA node %d (%s)", node,
+    TLLM_LOG_INFO("KVCM2 host tier: pages bound to NUMA node {} ({})", node,
         allowRemoteFallback ? "remote fallback allowed" : "strict");
 }
 
@@ -254,7 +254,7 @@ void HostMemBacking::commit(size_t offset, size_t size)
         auto const [closeAddr, closeSize] = pagesWithin(mAddr + offset + committed, size - committed);
         if (closeSize != 0 && ::mprotect(reinterpret_cast<void*>(closeAddr), closeSize, PROT_NONE) != 0)
         {
-            TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed while unwinding a commit, errno %d", errno);
+            TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed while unwinding a commit, errno {}", errno);
         }
         throw;
     }
@@ -299,13 +299,13 @@ void HostMemBacking::decommit(size_t offset, size_t size) noexcept
     //! mprotect it does not split the mapping.
     if (::madvise(reinterpret_cast<void*>(dropAddr), dropSize, MADV_DONTNEED) != 0)
     {
-        TLLM_LOG_WARNING("KVCM2 host tier: madvise(MADV_DONTNEED) failed with errno %d", errno);
+        TLLM_LOG_WARNING("KVCM2 host tier: madvise(MADV_DONTNEED) failed with errno {}", errno);
     }
     // Back to unreachable, so a reader that outlives the shrink faults instead
     // of silently re-faulting a zero page.
     if (::mprotect(reinterpret_cast<void*>(dropAddr), dropSize, PROT_NONE) != 0)
     {
-        TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed with errno %d", errno);
+        TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed with errno {}", errno);
     }
 }
 

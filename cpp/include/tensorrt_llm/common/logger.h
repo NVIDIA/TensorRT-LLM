@@ -352,11 +352,8 @@ void log(Logger::Level const level, Logger::Module module, int const rank, std::
 
 TRTLLM_NAMESPACE_END
 
-//! Check the level before the arguments are evaluated, so disabled messages cost nothing.
-#define TLLM_LOG(level, ...)                                                                                           \
-    (::tensorrt_llm::common::Logger::getLogger()->isEnabled((level), ::tensorrt_llm::common::Logger::Module{}.name)    \
-            ? ::tensorrt_llm::common::log((level), ::tensorrt_llm::common::Logger::Module{}, __VA_ARGS__)              \
-            : (void) 0)
+//! Capture the call-site module; logImpl filters messages before formatting.
+#define TLLM_LOG(level, ...) ::tensorrt_llm::common::log((level), ::tensorrt_llm::common::Logger::Module{}, __VA_ARGS__)
 
 #define TLLM_LOG_TRACE(...) TLLM_LOG(tensorrt_llm::common::Logger::TRACE, __VA_ARGS__)
 #define TLLM_LOG_DEBUG(...) TLLM_LOG(tensorrt_llm::common::Logger::DEBUG, __VA_ARGS__)

@@ -569,8 +569,8 @@ void runPrepareCustomMask(TllmGenFmhaRunnerParams const& runnerParams, FmhaKerne
     int64_t const required = getCustomMaskSizeUpperBound(kernelType, runnerParams.mBatchSize, runnerParams.mMaxSeqLenQ,
         runnerParams.mNumHeadsQPerKv, stepQ, stepKv, tileSizeQ, tileSizeKv);
     TLLM_CHECK_WITH_INFO(required <= runnerParams.customMaskCapacity,
-        "Custom mask buffer holds %ld uint32 but kernel type %d (stepQ %d, stepKv %d, tileSizeQ %d) may write %ld "
-        "for batch %d, maxSeqLenQ %d, numHeadsQPerKv %d.",
+        "Custom mask buffer holds {} uint32 but kernel type {} (stepQ {}, stepKv {}, tileSizeQ {}) may write {} "
+        "for batch {}, maxSeqLenQ {}, numHeadsQPerKv {}.",
         static_cast<long>(runnerParams.customMaskCapacity), static_cast<int>(kernelType), stepQ, stepKv, tileSizeQ,
         static_cast<long>(required), runnerParams.mBatchSize, runnerParams.mMaxSeqLenQ, runnerParams.mNumHeadsQPerKv);
     if (isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelType)))

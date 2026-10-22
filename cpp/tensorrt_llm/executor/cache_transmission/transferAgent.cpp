@@ -49,7 +49,10 @@ void promoteHostLibraryToGlobalScope()
             void* handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
             if (handle == nullptr)
             {
-                TLLM_LOG_DEBUG("global-scope promotion skipped for {}: {}", info.dli_fname, dlerror());
+                // dlerror() is null when RTLD_NOLOAD merely finds the library not loaded.
+                char const* error = dlerror();
+                TLLM_LOG_DEBUG(
+                    "global-scope promotion skipped for {}: {}", info.dli_fname, error ? error : "not loaded");
                 return;
             }
             TLLM_LOG_DEBUG("promoted {} to the global symbol scope", info.dli_fname);

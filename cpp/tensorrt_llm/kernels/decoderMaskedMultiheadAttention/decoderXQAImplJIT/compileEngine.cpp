@@ -37,7 +37,7 @@ void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, 
         std::vector<char> log(tllmXqaJitGetLastErrorStringSize());
         tllmXqaJitGetLastErrorString(log.data());
         throw tensorrt_llm::common::TllmException(
-            location, std::format("[TensorRT-LLM][ERROR] TllmXqaJit runtime error in {}: {}", func, log.data()));
+            location, "[TensorRT-LLM][ERROR] TllmXqaJit runtime error in {}: {}", func, log.data());
     }
 }
 

@@ -71,6 +71,13 @@ public:
 
     explicit TllmException(std::source_location const& location, std::string_view msg);
 
+    //! Build the message from a checked format string.
+    template <typename... Args>
+    explicit TllmException(std::source_location const& location, std::format_string<Args...> format, Args&&... args)
+        : TllmException(location, std::format(format, std::forward<Args>(args)...))
+    {
+    }
+
     ~TllmException() noexcept override;
 
     [[nodiscard]] std::string getTrace() const;
@@ -85,7 +92,7 @@ private:
 //! Throw a TllmException for an assertion that failed at location.
 [[noreturn]] inline void throwRuntimeError(std::source_location const& location, std::string_view info)
 {
-    throw TllmException(location, std::format("[TensorRT-LLM][ERROR] Assertion failed: {}", info));
+    throw TllmException(location, "[TensorRT-LLM][ERROR] Assertion failed: {}", info);
 }
 
 //! Throw a TllmException for an assertion that failed at location, describing it with a std::format message.

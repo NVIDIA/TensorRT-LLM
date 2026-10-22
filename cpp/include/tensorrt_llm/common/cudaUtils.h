@@ -136,7 +136,7 @@ void check(T ptr, char const* const func, std::source_location const& location)
     if (ptr)
     {
         throw TllmException(
-            location, std::format("[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr)));
+            location, "[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr));
     }
 }
 
@@ -147,7 +147,7 @@ void checkEx(
     if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
         throw TllmException(
-            location, std::format("[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr)));
+            location, "[TensorRT-LLM][ERROR] CUDA runtime error in {}: {}", func, _cudaGetErrorEnum(ptr));
     }
 }
 
