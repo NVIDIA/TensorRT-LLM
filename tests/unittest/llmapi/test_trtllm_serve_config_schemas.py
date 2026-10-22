@@ -19,6 +19,7 @@ import copy
 import importlib.util
 import json
 import runpy
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -581,12 +582,60 @@ def test_check_detects_stale_files_without_writing(
     elif change == "modified":
         paths[0].write_text("{}\n", encoding="utf-8")
     else:
-        from tensorrt_llm import version
-
-        monkeypatch.setattr(version, "__version__", version.__version__ + ".post1")
+        version = generator._source_version() + ".post1"
+        monkeypatch.setattr(generator, "_source_version", lambda: version)
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(ValueError, match="Missing or stale configuration schemas"):
         generator.write_schemas(tmp_path, check=True)
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
     generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
+
+
+def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> None:
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    for filename, command in generator._SCHEMA_COMMANDS.items():
+        (schema_dir / filename).write_text(
+            json.dumps(
+                {
+                    "$comment": "preserve this metadata",
+                    "$id": f"https://example.invalid/old/{filename}",
+                    "title": f"TensorRT-LLM old {command}",
+                    "sentinel": {"preserved": True},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    command = [
+        sys.executable,
+        "-S",
+        str(_REPO_ROOT / "scripts/generate_trtllm_serve_schemas.py"),
+        "--sync-version",
+        "--output-dir",
+        str(schema_dir),
+    ]
+    before_sync = {path.name: path.read_bytes() for path in schema_dir.iterdir()}
+    result = subprocess.run(command + ["--check"], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "Missing or stale configuration schemas" in result.stderr
+    assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_sync
+
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    version = generator._source_version()
+    before_check = {}
+    for filename, expected_command in generator._SCHEMA_COMMANDS.items():
+        path = schema_dir / filename
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        assert schema["$id"] == f"{generator._DOCS_URL}/{version}/_static/schemas/{filename}"
+        assert schema["title"] == f"TensorRT-LLM {version} {expected_command}"
+        assert schema["$comment"] == "preserve this metadata"
+        assert schema["sentinel"] == {"preserved": True}
+        before_check[filename] = path.read_bytes()
+
+    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
+    assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check

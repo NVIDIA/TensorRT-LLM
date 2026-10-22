@@ -245,7 +245,6 @@ unittest/llmapi/test_llm_pytorch.py::test_llm_disagg_streaming_gen_cancelled[PYT
 unittest/llmapi/test_memory_profiling.py::test_profile_kvcache SKIP (https://nvbugs/5580781)
 unittest/llmapi/test_mpi_session.py::test_remote_mpi_session[submit] SKIP (https://nvbugs/6964779)
 unittest/llmapi/test_mpi_session.py::test_remote_mpi_session[task_kwargs] SKIP (https://nvbugs/6964799)
-unittest/llmapi/test_trtllm_serve_config_schemas.py::test_checked_in_schemas_are_current SKIP (https://nvbugs/6971880)
 unittest/others/test_web_dependency_security.py::test_web_framework_security_floors SKIP (https://nvbugs/6930053)
 verl/test_verl_cases.py::test_async_generate SKIP (https://nvbugs/6683838)
 verl/test_verl_cases.py::test_async_memory_management SKIP (https://nvbugs/6683838)
