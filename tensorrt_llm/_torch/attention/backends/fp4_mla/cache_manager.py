@@ -554,6 +554,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             pin_memory=prefer_pinned(),
         )
 
+        self._prepare_page_table_materializer(index_mapper_capacity)
+
     def _validate_fp4_mla_layer_groups(self) -> None:
         cache_groups = {
             int(self.impl.get_layer_group_id(layer_id))
