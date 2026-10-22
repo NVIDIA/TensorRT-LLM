@@ -162,10 +162,10 @@ class CuteDslB12xFusedMoEBase:
     ``CuteDslB12xFusedMoE`` names this class, so ``isinstance`` /
     ``issubclass`` against it matches both leaves.
 
-    ``CuteDslFusedMoE.run_moe_nvfp4*`` is never reached from either leaf, so
-    neither sets up the ``AuxStreamType.MoeOutputMemset`` stream or the
-    ``event_dict`` it needs. Add them, and ``limit_when_absent``, before
-    routing any CuteDSL path through these classes.
+    ``TrtllmCutedslGroupedGemmNvfp4Impl.run_moe_nvfp4*`` is never reached from
+    either leaf, so neither sets up the ``AuxStreamType.MoeOutputMemset``
+    stream or the ``event_dict`` it needs. Add them, and ``limit_when_absent``,
+    before routing any CuteDSL path through these classes.
     """
 
     #: Neither leaf publishes an identity; without this the NVFP4 leaf would

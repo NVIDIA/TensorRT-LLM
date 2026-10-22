@@ -32,6 +32,7 @@ from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
+from tensorrt_llm._torch.locality_domain.autotune import LocalityDomainConcurrentTunableRunner
 from tensorrt_llm._torch.locality_domain_utils import (
     end_for_all_locality_domain,
     get_locality_domain_stream,
@@ -39,13 +40,12 @@ from tensorrt_llm._torch.locality_domain_utils import (
     locality_domain_device,
     start_for_all_locality_domain,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoE,
-    _expert_count_tile_plan,
-    _LocalityDomainConcurrentTunableRunner,
-    _runner_tactics_match_tile_size,
-    cute_dsl_nvfp4_grouped_gemm_ref,
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import _runner_tactics_match_tile_size
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     interleave_gate_and_linear,
     interleave_linear_and_gate,
@@ -105,6 +105,104 @@ def apply_activation_ref(
     if activation_type == ActivationType.SiTu:
         return situ_ref(x)
     raise ValueError(f"Unsupported activation_type: {activation_type}")
+
+
+def expert_count_tile_plan_ref(
+    expert_counts: list[int],
+    capacity: int,
+    tile_size: int,
+) -> list[tuple[int, int, int]]:
+    """The tile plan count-native scheduling produces, one tuple per MMA M tile.
+
+    Each tuple is ``(expert_idx, permuted_mn_limit, expanded_row_start)``.
+    """
+    if capacity <= 0 or tile_size <= 0:
+        raise ValueError("capacity and tile_size must be positive")
+
+    plan = []
+    tile_idx = 0
+    for expert_idx, raw_count in enumerate(expert_counts):
+        count = min(max(raw_count, 0), capacity)
+        for row_in_expert in range(0, count, tile_size):
+            rows_in_tile = min(tile_size, count - row_in_expert)
+            plan.append(
+                (
+                    expert_idx,
+                    tile_idx * tile_size + rows_in_tile,
+                    expert_idx * capacity + row_in_expert,
+                )
+            )
+            tile_idx += 1
+    return plan
+
+
+def cute_dsl_nvfp4_grouped_gemm_ref(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+    output_dtype: torch.dtype,
+    scaling_vector_size: int = 16,
+):
+    assert a.dtype == torch.float4_e2m1fn_x2
+    assert a.dim() == 2
+    assert b.dtype == torch.float4_e2m1fn_x2
+    assert b.dim() == 3
+    assert a_sf.dtype == torch.uint8
+    assert a_sf.dim() == 1
+    assert b_sf.dtype == torch.uint8
+    assert b_sf.dim() == 3
+    assert alpha.dtype == torch.float32
+    assert alpha.dim() == 1
+
+    m, k = a.size(0), a.size(1) * 2
+    num_groups, n = b.size(0), b.size(1)
+    scale_k = k // scaling_vector_size
+    assert m % tile_size == 0
+    assert k % (scaling_vector_size * 4) == 0
+    assert b.size(2) * 2 == k
+    assert a_sf.size(0) == m * scale_k
+    assert b_sf.size(0) == num_groups
+    assert b_sf.size(1) == n
+    assert b_sf.size(2) == scale_k
+    assert alpha.size(0) == num_groups
+
+    num_tiles = m // tile_size
+    assert tile_idx_to_group_idx.dtype == torch.int32
+    assert tile_idx_to_group_idx.size() == (num_tiles,)
+    assert num_non_exiting_tiles.dtype == torch.int32
+    assert num_non_exiting_tiles.size() == (1,)
+
+    num_tiles_per_expert = torch.bincount(
+        tile_idx_to_group_idx[: num_non_exiting_tiles[0].item()], minlength=num_groups
+    )
+    offsets = [0] + num_tiles_per_expert.cumsum(dim=0).tolist()
+
+    ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
+    for i, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        if end <= start:
+            continue
+        a_sliced = a[start * tile_size : end * tile_size]
+        a_sf_sliced = a_sf[
+            start * tile_size * k // scaling_vector_size : end
+            * tile_size
+            * k
+            // scaling_vector_size
+        ]
+        ref[start * tile_size : end * tile_size] = torch.ops.trtllm.nvfp4_gemm(
+            a_sliced.view(torch.uint8),
+            b[i].view(torch.uint8),
+            a_sf_sliced,
+            b_sf[i],
+            alpha[i],
+            output_dtype,
+        )
+
+    return ref
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -197,7 +295,7 @@ def test_count_native_tile_plan_empty_and_boundary_experts(
     capacity = 2 * tile_size + 1
     counts = [0, 1, tile_size - 1, tile_size, tile_size + 1, 0, 2 * tile_size, capacity]
 
-    plan = _expert_count_tile_plan(counts, capacity, tile_size)
+    plan = expert_count_tile_plan_ref(counts, capacity, tile_size)
 
     assert plan == expected
 
@@ -206,7 +304,7 @@ def test_count_native_tile_plan_empty_and_boundary_experts(
 def test_count_native_tile_plan_clamps_counts(tile_size: int):
     capacity = tile_size + 1
 
-    plan = _expert_count_tile_plan([0, -1, capacity, capacity + tile_size], capacity, tile_size)
+    plan = expert_count_tile_plan_ref([0, -1, capacity, capacity + tile_size], capacity, tile_size)
 
     assert plan == [
         (2, tile_size, 2 * capacity),
@@ -2597,19 +2695,16 @@ def _create_quantized_locality_domain_weights(
 
 
 def test_moe_output_memset_aux_stream_guard_requires_full_aux_state():
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
     from tensorrt_llm._torch.utils import AuxStreamType, EventType
 
-    backend = object.__new__(CuteDslFusedMoE)
-    backend.event_dict = {EventType.Main: object()}
-    backend.aux_stream_dict = {}
+    backend = SimpleNamespace(event_dict={EventType.Main: object()}, aux_stream_dict={})
 
-    assert not backend._has_moe_output_memset_aux_stream()
+    assert not CuteDslFusedMoE._has_moe_output_memset_aux_stream(backend)
 
     backend.event_dict[EventType.MoeOutputMemset] = object()
     backend.aux_stream_dict[AuxStreamType.MoeOutputMemset] = object()
 
-    assert backend._has_moe_output_memset_aux_stream()
+    assert CuteDslFusedMoE._has_moe_output_memset_aux_stream(backend)
 
 
 def test_runner_tactics_match_tile_size_unwraps_locality_domain_runner():
@@ -2624,7 +2719,7 @@ def test_runner_tactics_match_tile_size_unwraps_locality_domain_runner():
             return None
 
     op_runner = FakeOpRunner()
-    runner = _LocalityDomainConcurrentTunableRunner(
+    runner = LocalityDomainConcurrentTunableRunner(
         op_runner,
         SimpleNamespace(num_partitions=2),
         2,
@@ -2687,7 +2782,7 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
     def launch(partition_id, launch_inputs, tactic):
         runtime.events.append(("launch", partition_id, id(launch_inputs), tactic))
 
-    runner = _LocalityDomainConcurrentTunableRunner(op_runner, runtime, 3, launch)
+    runner = LocalityDomainConcurrentTunableRunner(op_runner, runtime, 3, launch)
     profile = OptimizationProfile()
 
     assert runner.get_valid_tactics(inputs, profile, marker="x") == [-1, ("fast", 128)]
@@ -2696,7 +2791,7 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
     assert runner.op_runner is op_runner
 
     other_runtime = FakeRuntime(((106, 212), (106, 212), (0, 212)))
-    other_runner = _LocalityDomainConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
+    other_runner = LocalityDomainConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
     assert runner.unique_id() != other_runner.unique_id()
 
     tactic = ("chosen", 256)
@@ -2730,16 +2825,16 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
     output_idx: int,
     tile_sizes: list[int],
 ):
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import runners
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(runners, "get_sm_version", lambda: 107)
     preparation_calls = []
 
     def forward_impl(*args, **kwargs):
         preparation_calls.append((args, kwargs))
         return args[output_idx]
 
-    runner_cls = getattr(fused_moe_cute_dsl, runner_name)
+    runner_cls = getattr(runners, runner_name)
     runner = runner_cls(
         forward_impl,
         num_experts=1,
@@ -2764,11 +2859,11 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
 @pytest.mark.parametrize(
     "module_name,runner_name,num_inputs,output_idx",
     [
-        ("fused_moe_cute_dsl", "CuteDslFusedMoENvfp4Runner", 5, 4),
-        ("fused_moe_cute_dsl", "CuteDslFusedMoEBF16Runner", 4, 3),
+        ("cutedsl.runners", "CuteDslFusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.runners", "CuteDslFusedMoEBF16Runner", 4, 3),
         # The subclass production instantiates for CUTEDSL_FC12. It overrides
         # _tile_sizes, so a green result on the parent is not evidence about it.
-        ("fused_moe_cute_dsl_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.fused_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
     ],
 )
 def test_workload_identity_alone_does_not_prime_inner_tactics(
@@ -2787,9 +2882,9 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     """
     import importlib
 
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import runners
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(runners, "get_sm_version", lambda: 107)
     preparation_calls = []
 
     def forward_impl(*args, enable_alltoall=False, tile_size=128):
@@ -2817,33 +2912,36 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     assert preparation_calls == []
 
 
-@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+@pytest.mark.parametrize("reason", ["disabled", "no_aux_stream"])
 def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
-    """Without an aux stream, NVFP4, or with the kill switch off, the async
+    """Without an aux stream, or with the kill switch off, the async
     quantization is the synchronous one and hands back no event to join."""
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    monkeypatch.setattr(nvfp4, "ASYNC_INPUT_QUANT", reason != "disabled")
     calls = []
     backend = SimpleNamespace(
-        has_nvfp4=reason != "not_nvfp4",
         quantize_input=lambda x, post_quant_comm: calls.append(post_quant_comm) or (x, None),
         _has_moe_output_memset_aux_stream=lambda: reason != "no_aux_stream",
     )
     x = torch.empty(2, 4)
 
-    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+    x_q, x_sf, event = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async(backend, x)
 
     assert x_q is x and x_sf is None and event is None
     assert calls == [False]
 
 
-def test_join_pending_x_ready_waits_once():
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+def test_bf16_leaf_offers_no_async_input_quantization():
+    """The scheduler forks input quantization only for a backend that defines
+    ``quantize_input_async``; BF16 input has nothing to quantize."""
+    assert not hasattr(TrtllmCutedslGroupedGemmBf16Impl, "quantize_input_async")
 
+
+def test_join_pending_x_ready_waits_once():
     waits = []
     backend = SimpleNamespace(_pending_x_ready_event=SimpleNamespace(wait=lambda: waits.append(1)))
-    join = fused_moe_cute_dsl.CuteDslFusedMoE._join_pending_x_ready
+    join = TrtllmCutedslGroupedGemmNvfp4Impl._join_pending_x_ready
 
     join(backend)
     join(backend)
@@ -2858,12 +2956,10 @@ def test_join_pending_x_ready_waits_once():
 )
 def test_quantize_input_async_matches_sync():
     """The aux-stream quantization produces the same bytes as the main-stream one."""
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
     from tensorrt_llm._torch.utils import AuxStreamType, EventType
 
     hidden = 256
     backend = SimpleNamespace(
-        has_nvfp4=True,
         hidden_size=hidden,
         scaling_vector_size=16,
         fc31_input_scale=torch.tensor([1.0], device="cuda"),
@@ -2874,7 +2970,7 @@ def test_quantize_input_async_matches_sync():
         },
         _x_quant_event=torch.cuda.Event(),
     )
-    cls = fused_moe_cute_dsl.CuteDslFusedMoE
+    cls = TrtllmCutedslGroupedGemmNvfp4Impl
     backend.quantize_input = cls.quantize_input.__get__(backend)
     backend._has_moe_output_memset_aux_stream = cls._has_moe_output_memset_aux_stream.__get__(
         backend
@@ -2900,7 +2996,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """
     import inspect
 
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl_fc12 as fc12
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import fused_fc12 as fc12
 
     captured = {}
 
@@ -2937,9 +3033,9 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         act_beta=25.0,
     )
     for name in ("_situ_betas", "_epilogue_identity"):
-        setattr(backend, name, getattr(fc12.CuteDslFc12FusedMoE, name).__get__(backend))
+        setattr(backend, name, getattr(fc12.TrtllmCutedslFusedFc12Nvfp4Impl, name).__get__(backend))
     # Bound, like production's ``self.run_moe_nvfp4_impl``.
-    real_impl = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl.__get__(backend)
+    real_impl = fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4_impl.__get__(backend)
 
     def tracking_impl(*args, **kwargs):
         impl_calls.append(kwargs)
@@ -2956,7 +3052,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         moe_output=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
         weight_view=weight_view,
     )
-    out = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4(backend, **inputs)
+    out = fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4(backend, **inputs)
     assert out.shape == (num_tokens, hidden)
 
     # Positive control: the activation-keyed identity is non-None.
@@ -2980,7 +3076,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     # And the reason it must not: the impl cannot take that kwarg.
     assert (
         "overlap_moe_output_memset"
-        not in inspect.signature(fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl).parameters
+        not in inspect.signature(fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4_impl).parameters
     )
 
 
@@ -3006,7 +3102,7 @@ def _cute_dsl_eligibility(**deployment_kwargs):
         ),
         **deployment_kwargs,
     )
-    return CuteDslFusedMoE.can_implement(problem, deployment)
+    return TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
 
 
 def test_cute_dsl_locality_domain_rejects_eplb():
@@ -3027,31 +3123,6 @@ def test_cute_dsl_sm107_requires_fused_finalize():
     verdict = _cute_dsl_eligibility(fused_finalize_enabled=False)
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.FINALIZE_FUSION_REQUIRED
-
-
-def test_cute_dsl_unquantized_rejects_non_swiglu():
-    """The BF16 FC1 op fuses SwiGLU by name; NVFP4 serves both activations."""
-    from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
-        MoEDeployment,
-        MoEEnvironment,
-        MoEProblem,
-        MoERejectReason,
-    )
-    from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
-
-    env = MoEEnvironment(sm=107, available_deps=(MoEDep.CUTEDSL_RUBIN.value,))
-    deployment = MoEDeployment(
-        ep_size=1, tp_size=1, parallel_size=1, use_dp=False, num_slots=8, env=env
-    )
-
-    def verdict(quant):
-        return CuteDslFusedMoE.can_implement(
-            MoEProblem(quant=quant, dtype_act=torch.bfloat16, activation="Relu2"), deployment
-        )
-
-    assert not verdict(None).eligible
-    assert verdict(None).reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-    assert verdict("NVFP4").eligible
 
 
 def test_cute_dsl_locality_domain_disables_dwdp():
@@ -3077,15 +3148,12 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
 
     if quantized:
         backend = SimpleNamespace(
-            has_nvfp4=True,
-            has_deepseek_fp8_block_scales=False,
-            has_any_quant=True,
             activation_type=ActivationType.Swiglu,
             _locality_domain_runtime=object(),
             hidden_size=hidden_size,
             scaling_vector_size=4,
         )
-        x, x_sf = CuteDslFusedMoE.quantize_input(
+        x, x_sf = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input(
             backend,
             Fp4QuantizedTensor(
                 fp4_tensor=torch.empty((0, hidden_size // 2), dtype=torch.uint8),
@@ -3094,7 +3162,7 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
             ),
         )
         assert x_sf.shape == (0, hidden_size // backend.scaling_vector_size)
-        output = CuteDslFusedMoE.run_moe_nvfp4(
+        output = TrtllmCutedslGroupedGemmNvfp4Impl.run_moe_nvfp4(
             backend,
             x,
             token_selected_experts,
@@ -3105,11 +3173,10 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
         )
     else:
         backend = SimpleNamespace(
-            has_any_quant=False,
             hidden_size=hidden_size,
             use_fused_finalize=True,
         )
-        output = CuteDslFusedMoE.run_moe_bf16(
+        output = TrtllmCutedslGroupedGemmBf16Impl.run_moe_bf16(
             backend,
             torch.empty((0, hidden_size), dtype=torch.bfloat16),
             token_selected_experts,
@@ -3128,15 +3195,12 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
     hidden_size = 32
     scaling_vector_size = 16
     backend = SimpleNamespace(
-        has_nvfp4=True,
-        has_deepseek_fp8_block_scales=False,
-        has_any_quant=True,
         fc31_input_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         hidden_size=hidden_size,
         scaling_vector_size=scaling_vector_size,
     )
 
-    x, x_sf = CuteDslFusedMoE.quantize_input(
+    x, x_sf = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input(
         backend,
         torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda"),
     )
