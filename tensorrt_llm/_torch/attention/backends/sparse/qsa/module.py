@@ -775,10 +775,10 @@ class QSASparseHooks(AttentionSparseHooks):
                 itertools.accumulate(attn_metadata.seq_lens[: attn_metadata.num_seqs].tolist())
             )
         output = torch.empty_like(q)
-        for start in range(0, num_tokens, chunk_size):
-            end = min(start + chunk_size, num_tokens)
+
+        def select(start: int, end: int) -> torch.Tensor:
             packed_slice = slice(start, end)
-            selected = select_qsa_paged_tokens(
+            return select_qsa_paged_tokens(
                 q_index[packed_slice],
                 index_cache,
                 logical[packed_slice],
@@ -793,34 +793,49 @@ class QSASparseHooks(AttentionSparseHooks):
                 context_rows=True,
                 expand_blocks=not use_prims_ts,
             )
-            if use_prims_ts:
+
+        bounds = [
+            (start, min(start + chunk_size, num_tokens))
+            for start in range(0, num_tokens, chunk_size)
+        ]
+        if use_prims_ts:
+            # The next chunk's scoring and Top-K are queued before this chunk's
+            # PrimTS launch is prepared on the host, so the GPU has work while
+            # the host runs the wrapper. Chunks write disjoint Top-K rows.
+            selected_next = select(*bounds[0])
+            for i, (start, end) in enumerate(bounds):
+                selected = selected_next
+                if i + 1 < len(bounds):
+                    selected_next = select(*bounds[i + 1])
                 prims_ts_sparse_gqa(
-                    q[packed_slice],
+                    q[start:end],
                     k_cache,
                     v_cache,
                     attn_metadata.qsa_block_table,
                     selected,
-                    req_idx[packed_slice],
-                    logical[packed_slice],
+                    req_idx[start:end],
+                    logical[start:end],
                     page_size=tokens_per_block,
                     max_seq_len_kv=max_seq_len_kv,
                     softmax_scale=softmax_scale,
                     is_decode=False,
                     request_boundaries=slice_request_boundaries(cu_seq_lens, start, end),
-                    out=output[packed_slice],
+                    out=output[start:end],
                 )
-                continue
-            output[packed_slice] = qsa_sparse_gqa(
-                q=q[packed_slice],
-                k_cache=k_cache,
-                v_cache=v_cache,
-                selected_tokens=selected,
-                request_indices=req_idx[packed_slice],
-                metadata=attn_metadata,
-                softmax_scale=softmax_scale,
-                query_positions=logical[packed_slice],
-                compress_ratio=params.compress_ratio,
-            )
+        else:
+            for start, end in bounds:
+                selected = select(start, end)
+                output[start:end] = qsa_sparse_gqa(
+                    q=q[start:end],
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    selected_tokens=selected,
+                    request_indices=req_idx[start:end],
+                    metadata=attn_metadata,
+                    softmax_scale=softmax_scale,
+                    query_positions=logical[start:end],
+                    compress_ratio=params.compress_ratio,
+                )
         output = output.reshape(num_tokens, -1)
         if output_gate is not None:
             output = attention.apply_output_gate(output, output_gate)
