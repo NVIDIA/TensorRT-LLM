@@ -57,13 +57,22 @@ _KV_IDS = ["bf16_kv", "fp8_kv"]
 
 # Worst row's max |out - ref| / max |ref|. "float" is vs the FP32 reference (FP8 KV context
 # also quantizes Q to E4M3, which the reference mirrors; FP8 KV generation keeps BF16 Q);
-# "unchunked" is a chunk vs the same rows of the unchunked run (same cached K / V).
-# FP8 bounds sit above the SM107 measurements (Hecate 822960: context 0.175 with an
-# unquantized-Q reference, generation 0.077, verify 0.094, mixed generation 0.089).
+# "unchunked" is a chunk vs the same rows of the unchunked run (same cached K / V): 0 means
+# bitwise equal. Each bound is 1.25x the worst case of a seed sweep at this 16:1 shape
+# (Hecate 826693: 32 seeds per context case, 16 seeds x {zero, NaN} tails per generation
+# case), rounded up. Per-case worst (BF16 / FP8 KV):
+#   context rows: fresh 0.0048 / 0.045, cached prefixes 0.0053 / 0.047, chunked 0.0052 / 0.046,
+#     mixed batches 0.0061 / 0.049;
+#   generation rows: q_len 1 0.0054 / 0.094, verify 1+3 0.0057 / 0.116, mixed 0.0057 / 0.143.
+#     FP8 grows with the past (q_len 1: 0.083 at 640 -> 0.143 at 165000); BF16 does not;
+#   chunks vs unchunked: 0 for every seed and case.
 _TOLERANCE = {
-    torch.bfloat16: {"ctx": 2e-2, "gen": 2e-2, "unchunked": 1e-2},
-    torch.float8_e4m3fn: {"ctx": 1.5e-1, "gen": 1.2e-1, "unchunked": 3e-2},
+    torch.bfloat16: {"ctx": 7.7e-3, "gen": 7.2e-3, "unchunked": 0.0},
+    torch.float8_e4m3fn: {"ctx": 6.2e-2, "gen": 1.8e-1, "unchunked": 0.0},
 }
+# A kernel that dropped the cached prefix would match attention over the chunk alone; in the
+# sweep that error was >= 1.05, at least 4x above every "ctx" bound.
+_DROPPED_PREFIX_MARGIN = 4
 
 # (case id, steps): each step is a batch of (request id, cached tokens, new tokens) context rows, run in order.
 _CACHED_CONTEXT_CASES = [
@@ -285,7 +294,7 @@ def test_cached_context_matches_unchunked(served, case, kv_dtype) -> None:
                 if c:
                     # A kernel that dropped the cached prefix would match attention over the chunk alone.
                     dropped = _float_reference(qkv[r], c, n, c, fp8)
-                    assert _relative_error(got, dropped) > 4 * tolerance["ctx"]
+                    assert _relative_error(got, dropped) > _DROPPED_PREFIX_MARGIN * tolerance["ctx"]
         assert served["fi_ctx"] > 0 and served["fallback"] == 0, served
         torch.cuda.synchronize()
         for r in rids:
