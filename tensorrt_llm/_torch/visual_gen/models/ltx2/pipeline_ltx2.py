@@ -35,6 +35,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     RoleSpec,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.token_order import require_native_token_order
 from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -648,6 +649,7 @@ class LTX2Pipeline(BasePipeline):
                 "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
                 "sparse_attention_config for LTX-2."
             )
+        require_native_token_order(_sa_cfg, "LTX-2")
         super().__init__(model_config)
 
     @classmethod

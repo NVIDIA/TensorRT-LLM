@@ -954,8 +954,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, hidden_size
             temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
-            if temb_proj.shape[1] == seq_len:
-                temb_proj = self._token_reorder.permute(temb_proj, dim=1)
+            if self._token_reorder.active and temb_proj.shape[1] != seq_len:
+                raise ValueError(
+                    f"token_order={self._token_reorder.order!r} needs one timestep per "
+                    f"token: got {temb_proj.shape[1]} timesteps for {seq_len} tokens."
+                )
+            temb_proj = self._token_reorder.permute(temb_proj, dim=1)
             # Shard per-patch temb_proj to match the local sequence chunk
             temb_proj = self.sharder.shard(temb_proj, dim=1, expected_seq_len=seq_len)
         else:

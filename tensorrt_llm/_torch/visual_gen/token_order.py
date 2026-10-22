@@ -26,13 +26,12 @@ before the block stack and the inverse after it; everything in between (norms,
 MLP, adaLN, attention) is per-token or permutation-equivariant.
 """
 
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from tensorrt_llm.logger import logger
-
-TokenOrder = Literal["native", "morton"]
+from tensorrt_llm.visual_gen.sparse_attention import TokenOrder
 
 _MORTON_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -68,18 +67,33 @@ def morton3d_permutation(
         h = rem // width
         w = rem - h * width
         code = _part1by2(w) | (_part1by2(h) << 1) | (_part1by2(t) << 2)
-        perm = linear[torch.argsort(code)]
+        perm = torch.argsort(code)
         hit = (perm, torch.argsort(perm))
         _MORTON_CACHE[key] = hit
     return hit[0].to(device), hit[1].to(device)
 
 
 def resolve_token_order(sparse_attention_config) -> TokenOrder:
-    """Read the ``token_order`` a sparse-attention config asks for (``native`` if none)."""
-    order = getattr(sparse_attention_config, "token_order", None) or "native"
-    if order not in ("native", "morton"):
-        raise ValueError(f"Unknown token_order {order!r}; expected 'native' or 'morton'.")
-    return order
+    """Read the ``token_order`` a sparse-attention config asks for (``native`` if none).
+
+    The value is already validated by ``SolAttentionConfig``.
+    """
+    return getattr(sparse_attention_config, "token_order", None) or "native"
+
+
+def require_native_token_order(sparse_attention_config, model_name: str) -> None:
+    """Raise when a config asks for a token order that ``model_name`` does not wire.
+
+    Only models that apply :class:`TokenReorder` around their block stack honor
+    ``token_order``; everywhere else a non-native order would silently run as
+    native, so the pipeline rejects it at construction.
+    """
+    order = resolve_token_order(sparse_attention_config)
+    if order != "native":
+        raise ValueError(
+            f"sparse_attention_config.token_order={order!r} is only supported by the "
+            f"Wan pipelines; use token_order='native' for {model_name}."
+        )
 
 
 class TokenReorder:
@@ -87,7 +101,9 @@ class TokenReorder:
 
     ``permute`` / ``restore`` are identities when the order is ``native``. The
     permutation is a fixed index tensor per grid, so it is safe under CUDA graph
-    capture and torch.compile.
+    capture and torch.compile. Index tensors are kept for every grid and device
+    this instance has prepared: a captured graph replays the pointers it saw at
+    capture time, so switching grids must not release them.
     """
 
     def __init__(self, order: TokenOrder):
@@ -95,6 +111,9 @@ class TokenReorder:
         self._perm: Optional[torch.Tensor] = None
         self._inverse: Optional[torch.Tensor] = None
         self._grid: Optional[Tuple[int, int, int]] = None
+        self._indices: Dict[
+            Tuple[Tuple[int, int, int], torch.device], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     @property
     def active(self) -> bool:
@@ -107,11 +126,15 @@ class TokenReorder:
         key = tuple(int(x) for x in grid)
         if self._grid == key and self._perm is not None and self._perm.device == device:
             return
-        self._perm, self._inverse = morton3d_permutation(key, device)
+        hit = self._indices.get((key, device))
+        if hit is None:
+            hit = morton3d_permutation(key, device)
+            self._indices[(key, device)] = hit
+            logger.info(
+                f"[token-order] {self.order} ordering over grid {key} ({hit[0].numel()} tokens)"
+            )
+        self._perm, self._inverse = hit
         self._grid = key
-        logger.info(
-            f"[token-order] {self.order} ordering over grid {key} ({self._perm.numel()} tokens)"
-        )
 
     def permute(self, tensor: Optional[torch.Tensor], dim: int = 1) -> Optional[torch.Tensor]:
         if tensor is None or not self.active:

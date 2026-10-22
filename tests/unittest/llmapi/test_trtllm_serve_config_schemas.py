@@ -170,6 +170,45 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "native",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "morton",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "hilbert",
+                    }
+                }
+            },
+            False,
+        ),
     ],
 )
 def test_config_validation(

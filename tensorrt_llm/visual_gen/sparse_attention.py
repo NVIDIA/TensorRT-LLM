@@ -23,6 +23,10 @@ from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
+# Token orderings a model may apply around its block stack; see
+# tensorrt_llm._torch.visual_gen.token_order.
+TokenOrder = Literal["native", "morton"]
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
 
@@ -301,7 +305,7 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         ),
     )
 
-    token_order: Literal["native", "morton"] = PydanticField(
+    token_order: TokenOrder = PydanticField(
         "native",
         description=(
             "Order of the video tokens seen by the routing blocks. 'morton' applies "
