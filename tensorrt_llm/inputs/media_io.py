@@ -11,7 +11,10 @@ import os
 import socket
 import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from concurrent.futures import Executor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
@@ -342,38 +345,33 @@ async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            try:
-                async with fetch_session.get(
-                    current_url, timeout=timeout, allow_redirects=False
-                ) as response:
-                    if response.status in _REDIRECT_STATUSES:
-                        redirect_url = response.headers.get("Location", "")
-                        current_url = urljoin(current_url, redirect_url)
-                        await asyncio.to_thread(_validate_url, current_url)
-                        continue
-                    maybe_coro = response.raise_for_status()
-                    if asyncio.iscoroutine(maybe_coro):
-                        await maybe_coro
-                    return await _read_aiohttp_content(response)
-            except MediaFetchError:
-                raise
-            except aiohttp.ClientResponseError as error:
-                if error.status in (408, 429) or error.status >= 500:
-                    raise MediaFetchError(
-                        f"remote media server returned HTTP {error.status}"
-                    ) from error
-                raise
-            except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                raise MediaFetchError(f"remote media fetch failed: {error}") from error
-        raise RuntimeError("Too many redirects")
-
-    return await _fetch(await _get_aiohttp_session())
+    session = await _get_aiohttp_session()
+    current_url = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            async with session.get(current_url, timeout=timeout, allow_redirects=False) as response:
+                if response.status in _REDIRECT_STATUSES:
+                    redirect_url = response.headers.get("Location", "")
+                    current_url = urljoin(current_url, redirect_url)
+                    await asyncio.to_thread(_validate_url, current_url)
+                    continue
+                maybe_coro = response.raise_for_status()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+                return await _read_aiohttp_content(response)
+        except MediaFetchError:
+            raise
+        except aiohttp.ClientResponseError as error:
+            if error.status in (408, 429) or error.status >= 500:
+                raise MediaFetchError(
+                    f"remote media server returned HTTP {error.status}"
+                ) from error
+            raise
+        except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            raise MediaFetchError(f"remote media fetch failed: {error}") from error
+    raise RuntimeError("Too many redirects")
 
 
 def _load_and_convert_image(image):
@@ -1135,6 +1133,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
+    _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
+        "media_io_executor", default=None
+    )
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -1150,6 +1151,16 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         than once replaces the previously configured executor.
         """
         BaseMediaIO._executor = executor
+
+    @classmethod
+    @contextmanager
+    def use_executor(cls, executor: Optional[Executor]) -> Iterator[None]:
+        """Scope decode work to a server-owned executor without replacing other servers' pools."""
+        token = BaseMediaIO._request_executor.set(executor)
+        try:
+            yield
+        finally:
+            BaseMediaIO._request_executor.reset(token)
 
     @classmethod
     def create(
@@ -1236,7 +1247,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         if kwargs:
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
+        executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
+        return await loop.run_in_executor(executor, fn, *args)
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):

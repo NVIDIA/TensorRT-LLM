@@ -77,6 +77,8 @@ def resolve_media_capabilities(
     input_processor = getattr(llm, "input_processor", None)
     if not isinstance(input_processor, BaseMultimodalInputProcessor):
         return MediaCapabilities({})
+    if getattr(getattr(llm, "args", None), "disable_mm_encoder", False):
+        return MediaCapabilities({})
     model_type = _loaded_model_type(llm)
     if not model_type:
         return MediaCapabilities({})

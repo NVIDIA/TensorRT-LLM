@@ -10,10 +10,12 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")')
+grpc = pytest.importorskip(
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+)
 
 import torch  # noqa: E402
-from conftest import FakeServicerContext  # noqa: E402
+from conftest import AbortError, FakeServicerContext  # noqa: E402
 from utils.llm_data import llm_models_root  # noqa: E402
 
 from tensorrt_llm import LLM  # noqa: E402
@@ -76,10 +78,14 @@ def test_image_capability_agrees_with_generate(vlm):
     image_path = llm_models_root(check=True) / "multimodals/test_data/seashore.png"
     image_bytes = image_path.read_bytes()
     data_uri = "data:image/png;base64," + base64.b64encode(image_bytes).decode()
+    request_input = (
+        {"prompt": prompt}
+        if input_kind == "prompt"
+        else {"token_ids": generation_pb2.TokenIds(ids=prompt_token_ids)}
+    )
     request = generation_pb2.GenerateRequest(
-        request_id="openengine-image-conformance",
+        request_id=f"openengine-image-conformance-{input_kind}",
         model=MODEL_NAME,
-        token_ids=generation_pb2.TokenIds(ids=prompt_token_ids),
         stopping=generation_pb2.StoppingOptions(max_tokens=4),
         media=[
             generation_pb2.MediaItem(
@@ -88,7 +94,30 @@ def test_image_capability_agrees_with_generate(vlm):
                 uuid="seashore",
             )
         ],
+        **request_input,
     )
+
+    malformed = generation_pb2.GenerateRequest()
+    malformed.CopyFrom(request)
+    malformed.request_id += "-extra-pad"
+    malformed_prompt = prompt.replace("Describe", "<|image_pad|>Describe", 1)
+    if input_kind == "prompt":
+        malformed.prompt = malformed_prompt
+    else:
+        malformed.token_ids.CopyFrom(
+            generation_pb2.TokenIds(ids=vlm.tokenizer.encode(malformed_prompt))
+        )
+    hashing_supported = vlm.input_processor.multimodal_hashing_supported
+    malformed_context = FakeServicerContext()
+
+    async def reject_malformed():
+        return [response async for response in inference.Generate(malformed, malformed_context)]
+
+    with pytest.raises(AbortError):
+        asyncio.run(reject_malformed())
+    assert malformed_context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+    assert vlm.input_processor.multimodal_hashing_supported is hashing_supported
+    assert inference.active_request_count() == 0
 
     async def collect():
         return [response async for response in inference.Generate(request, FakeServicerContext())]
