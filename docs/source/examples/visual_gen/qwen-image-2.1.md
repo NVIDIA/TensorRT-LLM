@@ -2,8 +2,8 @@
 
 This page documents the TRTLLM VisualGen enablement artifacts for
 `qwen-image-2.1`.  The implementation is intentionally split between the
-native TRTLLM candidate runtime and a frozen Diffusers reference/oracle used
-only for parity evidence.
+TRTLLM pipeline/transformer runtime and a frozen Diffusers reference used
+for parity evidence. The runtime reuses selected Diffusers components.
 
 ## Checked-in artifacts
 
@@ -22,6 +22,13 @@ pipeline, transformer/DiT, attention implementation, or video/image generation
 pipeline as a runtime component.  Selective Diffusers reuse is limited to the
 items declared in `design/external_component_reuse.yaml` for the run, with the
 pinned version, reason, and parity evidence recorded there.
+
+Reused components are `AutoencoderKLQwenImage21`,
+`FlowMatchEulerDiscreteScheduler`, `TimestepEmbedding` (with bias disabled),
+and regular `RMSNorm` for attention Q/K. The scheduler adapter preserves
+Qwen-specific defaults and local checkpoint loading. Scheduler steps use
+Diffusers' model-output dtype; the pipeline restores the latent dtype afterward.
+The zero-centered text norm remains separate because its scale is `weight + 1`.
 
 The production example uses the same denoising step count as the frozen
 reference manifest.  When a source-specified value is unavailable, the VisualGen
