@@ -210,6 +210,47 @@ def _ldg_s32p(gaddr, pred, dflt, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ldg_u16p(gaddr, pred, *, loc=None, ip=None):
+    """One 16-bit value from global, zero-extended, if `pred` != 0, else 0. Nothing in the asm
+    reads it, so the thread runs on until the value's first use."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [_ir(gaddr, cutlass.Int64, loc, ip), _ir(pred, cutlass.Int32, loc, ip)],
+            "{ .reg .pred p; setp.ne.b32 p, $2, 0; mov.b32 $0, 0; @p ld.global.u16 $0, [$1]; }",
+            "=r,l,r",
+            loc,
+            ip,
+            side=True,
+        )
+    )
+
+
+@dsl_user_op
+def _ldg_v2p(gaddr, pred, *, loc=None, ip=None):
+    """8 bytes from global (read-only) if `pred` != 0, else zeros, as two words."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_ir(gaddr, cutlass.Int64, loc, ip), _ir(pred, cutlass.Int32, loc, ip)],
+        "{ .reg .pred p; setp.ne.b32 p, $3, 0; mov.b32 $0, 0; mov.b32 $1, 0; "
+        "@p ld.global.nc.v2.b32 {$0, $1}, [$2]; }",
+        "=r,=r,l,r",
+        loc,
+        ip,
+        side=True,
+    )
+    return _unpack(res, 2, cutlass.Int32, loc, ip)
+
+
+@dsl_user_op
+def _bf16_lo(v, *, loc=None, ip=None):
+    """The bf16 in the low half of `v` as fp32."""
+    return cutlass.Float32(
+        _asm(T.f32(), [_ir(v, cutlass.Int32, loc, ip)], "shl.b32 $0, $1, 16;", "=f,r", loc, ip)
+    )
+
+
+@dsl_user_op
 def _round_bf16(x, *, loc=None, ip=None):
     return cutlass.Float32(
         _asm(
@@ -220,6 +261,64 @@ def _round_bf16(x, *, loc=None, ip=None):
             loc,
             ip,
         )
+    )
+
+
+@dsl_user_op
+def _conv4_silu_bf16(c0, c1, c2, x, w01, w23, *, loc=None, ip=None):
+    """`causal_conv1d_triton_update`'s arithmetic for one output of a width-4 window: the
+    window `(c0, c1, c2, x)` (bf16 bits in the low half of each word) times the taps (bf16x2
+    words `(w0 | w1 << 16, w2 | w3 << 16)`), each product rounded to bf16 (`mul.rn.bf16x2`),
+    the four summed in fp32 in tap order from +0, then SiLU as
+    `acc / (1 + ex2.approx(acc * -log2 e))` with `div.full.f32` -- the instruction sequence
+    the Triton kernel compiles to. Returns the fp32 result (rounded to bf16 by the store)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [_ir(v, cutlass.Int32, loc, ip) for v in (c0, c1, c2, x, w01, w23)],
+            "{ .reg .b32 u, v; .reg .b16 p0, p1, p2, p3; .reg .f32 s, q, e; "
+            "prmt.b32 u, $1, $2, 0x5410; prmt.b32 v, $3, $4, 0x5410; "
+            "mul.rn.bf16x2 u, u, $5; mul.rn.bf16x2 v, v, $6; "
+            "mov.b32 {p0, p1}, u; mov.b32 {p2, p3}, v; "
+            "cvt.f32.bf16 s, p0; add.rn.f32 s, s, 0f00000000; "
+            "cvt.f32.bf16 q, p1; add.rn.f32 s, q, s; "
+            "cvt.f32.bf16 q, p2; add.rn.f32 s, q, s; "
+            "cvt.f32.bf16 q, p3; add.rn.f32 s, q, s; "
+            "mul.rn.f32 e, s, 0fBFB8AA3B; ex2.approx.f32 e, e; add.rn.f32 e, e, 0f3F800000; "
+            "div.full.f32 $0, s, e; }",
+            "=f,r,r,r,r,r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16_bits(x, *, loc=None, ip=None):
+    """`x` rounded to bf16, as its bits in the low half of a word."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [_ir(x, cutlass.Float32, loc, ip)],
+            "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.u32.u16 $0, h; }",
+            "=r,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_b16(gaddr, v, *, loc=None, ip=None):
+    """The low half of `v` to global."""
+    _asm(
+        T.i32(),
+        [_ir(gaddr, cutlass.Int64, loc, ip), _ir(v, cutlass.Int32, loc, ip)],
+        "{ st.global.b16 [$1], $2; mov.u32 $0, 0; }",
+        "=r,l,r",
+        loc,
+        ip,
+        side=True,
     )
 
 
@@ -497,14 +596,19 @@ XRS = 320  # bytes of one activation row slice (128 bf16 + 64 B pad: conflict-fr
 
 
 class _Fp8Gemv:
-    def __init__(self, *, n, k, m, plan: Plan, pdl, tile_major, conv_dim=0, pad_slot=-1):
+    def __init__(self, *, n, k, m, plan: Plan, pdl, tile_major, conv_dim=0, pad_slot=-1, conv_p=0):
         assert k % BLOCK_K == 0 and 1 <= m <= MAX_ROWS
         self.n, self.k, self.m, self.pdl = n, k, m, pdl
         self.tile_major = tile_major
         # conv1d epilogue (`conv_dim` > 0): columns below conv_dim of a non-pad row get the
-        # causal conv step (window of 3, 4 taps) + SiLU; see `fp8_gemv_conv1d`
-        self.conv_dim, self.pad_slot = conv_dim, pad_slot
+        # causal conv step (window of 3, 4 taps) + SiLU; see `fp8_gemv_conv1d`. With
+        # `conv_p` > 1 the rows are m / conv_p requests of conv_p consecutive tokens each, and
+        # the epilogue runs the multi-token step with per-token window snapshots; see
+        # `fp8_gemv_conv1d_verify`.
+        self.conv_dim, self.pad_slot, self.conv_p = conv_dim, pad_slot, conv_p
         assert conv_dim == 0 or plan.ks == 1
+        assert conv_p == 0 or (conv_dim > 0 and conv_p >= 2 and m % conv_p == 0), (conv_p, m)
+        self.nreq = m // conv_p if conv_p else 0
         self.nt8 = -(-m // 8)
         self.n_tiles = -(-n // TILE_N)
         self.nkb = k // BLOCK_K
@@ -557,6 +661,12 @@ class _Fp8Gemv:
         cs_s0: cutlass.Int32,
         cs_s1: cutlass.Int32,
         cs_s2: cutlass.Int32,
+        iw_ptr: cute.Pointer,
+        iidx_ptr: cute.Pointer,
+        iw_s0: cutlass.Int32,
+        iw_s1: cutlass.Int32,
+        iw_s2: cutlass.Int32,
+        iw_s3: cutlass.Int32,
         stream,
     ):
         args = (
@@ -571,6 +681,12 @@ class _Fp8Gemv:
             cs_s0,
             cs_s1,
             cs_s2,
+            iw_ptr.toint(),
+            iidx_ptr.toint(),
+            iw_s0,
+            iw_s1,
+            iw_s2,
+            iw_s3,
         )
         if const_expr(self.ks > 1):
             self.kernel(*args).launch(
@@ -696,6 +812,12 @@ class _Fp8Gemv:
         cs_s0: cutlass.Int32,
         cs_s1: cutlass.Int32,
         cs_s2: cutlass.Int32,
+        iw_base: cutlass.Int64,
+        iidx_base: cutlass.Int64,
+        iw_s0: cutlass.Int32,
+        iw_s1: cutlass.Int32,
+        iw_s2: cutlass.Int32,
+        iw_s3: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -808,7 +930,40 @@ class _Fp8Gemv:
             kwi = warp % kw
             twi = warp // kw
             n_ep: cutlass.Constexpr = -(-(rt * m * TILE_N) // (cw * 32))
-            if const_expr(self.conv_dim > 0):
+            # verify epilogue items: (tile, request, row of the tile), each all conv_p tokens
+            n_ev: cutlass.Constexpr = -(-(rt * max(self.nreq, 1) * TILE_N) // (cw * 32))
+            if const_expr(self.conv_p > 0):
+                # Before the PDL wait, as below: each item's slot, snapshot row, 4 taps (two
+                # words) and the 3-value window it starts from, kept as raw bits: only the
+                # window's address waits on a load (the slot) before the main loop.
+                nreq: cutlass.Constexpr = self.nreq
+                cvs = cute.make_rmem_tensor(
+                    cute.make_layout((n_ev, 8), stride=(8, 1)), cutlass.Int32
+                )
+                cslots = cute.make_rmem_tensor(
+                    cute.make_layout((n_ev,), stride=(1,)), cutlass.Int32
+                )
+                crows = cute.make_rmem_tensor(cute.make_layout((n_ev,), stride=(1,)), cutlass.Int32)
+                for ic in cutlass.range_constexpr(n_ev):
+                    ec = tidx + ic * (cw * 32)
+                    rc_ = ec % TILE_N
+                    sc_ = (ec // TILE_N) % nreq
+                    tc_ = ec // (TILE_N * nreq)
+                    oc_ = (t0 + tc_) * TILE_N + rc_
+                    okc = (tc_ < nt) & (oc_ < self.conv_dim)
+                    sl_c = _ldg_s32p(
+                        idx_base + cutlass.Int64(sc_) * 4, cutlass.Int32(okc), self.pad_slot
+                    )
+                    cslots[ic] = sl_c
+                    okw = cutlass.Int32(okc & (sl_c != self.pad_slot))
+                    crows[ic] = _ldg_s32p(iidx_base + cutlass.Int64(sc_) * 4, okw, 0)
+                    taps = _ldg_v2p(cw_base + cutlass.Int64(oc_) * 8, cutlass.Int32(okc))
+                    cvs[ic, 0] = taps[0]
+                    cvs[ic, 1] = taps[1]
+                    wbase = cs_base + (cutlass.Int64(sl_c) * cs_s0 + cutlass.Int64(oc_) * cs_s1) * 2
+                    for q in cutlass.range_constexpr(3):
+                        cvs[ic, 4 + q] = _ldg_u16p(wbase + cutlass.Int64(q) * cs_s2 * 2, okw)
+            elif const_expr(self.conv_dim > 0):
                 # The conv operands of this thread's epilogue outputs -- slot, 4 taps and the 3-value
                 # window -- before the PDL wait: the slots are host-filled, and the window is this
                 # layer's, last written by this kernel a step ago.
@@ -918,7 +1073,78 @@ class _Fp8Gemv:
                         _sts_f32(p + 8 * 4, acc[i, j, 2])
                         _sts_f32(p + TILE_N * 4 + 8 * 4, acc[i, j, 3])
             _bar_sync(1, cw * 32)
-            if const_expr(ks == 1):
+            if const_expr(self.conv_p > 0):
+                # Item (tile, request s, row): column `orow` of the request's rows s p .. s p + p - 1.
+                # A conv column runs the p tokens through the window in order -- output, snapshot
+                # t = the window after token t, then the advanced window into the pool; the other
+                # columns are the plain projection. Out: [m, conv_dim] conv output, then
+                # [m, n - conv_dim] projection, both row-major in the one buffer.
+                cp: cutlass.Constexpr = self.conv_p
+                cdim: cutlass.Constexpr = self.conv_dim
+                n_rest: cutlass.Constexpr = n_out - self.conv_dim
+                rest_base = out_base + cutlass.Int64(m * cdim * 2)
+                for it in cutlass.range_constexpr(n_ev):
+                    e_ = tidx + it * (cw * 32)
+                    er = e_ % TILE_N
+                    es = (e_ // TILE_N) % nreq
+                    etl = e_ // (TILE_N * nreq)
+                    orow = (t0 + etl) * TILE_N + er
+                    if (etl < nt) & (orow < n_out):
+                        if orow < cdim:
+                            live = cslots[it] != self.pad_slot
+                            # bf16 bits throughout; taps as two bf16x2 words
+                            c0 = cvs[it, 4]
+                            c1 = cvs[it, 5]
+                            c2 = cvs[it, 6]
+                            iwb = (
+                                iw_base
+                                + (cutlass.Int64(crows[it]) * iw_s0 + cutlass.Int64(orow) * iw_s2)
+                                * 2
+                            )
+                            for tk in cutlass.range_constexpr(cp):
+                                en = es * cp + tk
+                                tot = cutlass.Float32(0.0)
+                                for q in cutlass.range_constexpr(kw):
+                                    tot = tot + _lds_f32(
+                                        red + (((q * rt + etl) * np_ + en) * TILE_N + er) * 4
+                                    )
+                                xv = _bf16_bits(tot)
+                                res = _bf16_lo(xv)
+                                if live:
+                                    res = _conv4_silu_bf16(c0, c1, c2, xv, cvs[it, 0], cvs[it, 1])
+                                    sb = iwb + cutlass.Int64(tk) * cutlass.Int64(iw_s1) * 2
+                                    _stg_b16(sb, c1)
+                                    _stg_b16(sb + cutlass.Int64(iw_s3) * 2, c2)
+                                    _stg_b16(sb + cutlass.Int64(iw_s3) * 4, xv)
+                                _stg_bf16(out_base + (cutlass.Int64(en) * cdim + orow) * 2, res)
+                                c0 = c1
+                                c1 = c2
+                                c2 = xv
+                            if live:
+                                wb = (
+                                    cs_base
+                                    + (
+                                        cutlass.Int64(cslots[it]) * cs_s0
+                                        + cutlass.Int64(orow) * cs_s1
+                                    )
+                                    * 2
+                                )
+                                _stg_b16(wb, c0)
+                                _stg_b16(wb + cutlass.Int64(cs_s2) * 2, c1)
+                                _stg_b16(wb + cutlass.Int64(cs_s2) * 4, c2)
+                        else:
+                            for tk in cutlass.range_constexpr(cp):
+                                en = es * cp + tk
+                                tot = cutlass.Float32(0.0)
+                                for q in cutlass.range_constexpr(kw):
+                                    tot = tot + _lds_f32(
+                                        red + (((q * rt + etl) * np_ + en) * TILE_N + er) * 4
+                                    )
+                                _stg_bf16(
+                                    rest_base + (cutlass.Int64(en) * n_rest + orow - cdim) * 2,
+                                    tot,
+                                )
+            elif const_expr(ks == 1):
                 for it in cutlass.range_constexpr(n_ep):
                     e_ = tidx + it * (cw * 32)
                     er = e_ % TILE_N
@@ -1155,7 +1381,15 @@ def default_plan(n: int, k: int, m: int, sms: int) -> Plan:
 
 @functools.lru_cache(maxsize=None)
 def _compiled(
-    n, k, m, plan: Plan, pdl: bool, tile_major: bool, conv_dim: int = 0, pad_slot: int = -1
+    n,
+    k,
+    m,
+    plan: Plan,
+    pdl: bool,
+    tile_major: bool,
+    conv_dim: int = 0,
+    pad_slot: int = -1,
+    conv_p: int = 0,
 ):
     kern = _Fp8Gemv(
         n=n,
@@ -1166,6 +1400,7 @@ def _compiled(
         tile_major=tile_major,
         conv_dim=conv_dim,
         pad_slot=pad_slot,
+        conv_p=conv_p,
     )
     dev = "cuda"
     out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
@@ -1185,6 +1420,12 @@ def _compiled(
         cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
+        make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=2),
+        make_ptr(cutlass.Int32, s.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -1193,6 +1434,14 @@ def _compiled(
 @functools.lru_cache(maxsize=None)
 def _sms() -> int:
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
+#: The launch arguments past `x_stride` of a call without a conv epilogue.
+_NO_CONV = (0,) * 12
+
+#: Most tokens per request of `fp8_gemv_conv1d_verify` (`max_draft_len + 1` of the widest
+#: verify step the target runs).
+VERIFY_MAX_P = 8
 
 
 def _env_pdl() -> bool:
@@ -1216,7 +1465,14 @@ def fp8_gemv(
     if plan is None:
         plan = default_plan(w.n, k, m, _sms())
     fn = _compiled(w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major)
-    fn(out, x.data_ptr(), w.data.data_ptr(), w.scale.data_ptr(), x.stride(0), 0, 0, 0, 0, 0, 0)
+    fn(
+        out,
+        x.data_ptr(),
+        w.data.data_ptr(),
+        w.scale.data_ptr(),
+        x.stride(0),
+        *_NO_CONV,
+    )
     return out
 
 
@@ -1261,8 +1517,77 @@ def fp8_gemv_conv1d(
         conv_weight.data_ptr(),
         conv_state_indices.data_ptr(),
         *conv_state.stride(),
+        *_NO_CONV[6:],
     )
     return out
+
+
+def fp8_gemv_conv1d_verify(
+    x: torch.Tensor,
+    w: PackedFp8Weight,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    intermediate_conv_window: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    conv_dim: int,
+    rows_per_seq: int,
+    pad_slot_id: int,
+    pdl: bool = True,
+    plan: Plan | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`fp8_gemv` + `causal_conv1d_triton_update` of a speculative verify step in one launch.
+
+    `x` is `n` requests of `p = rows_per_seq` consecutive token rows (row `s p + t` is token
+    `t` of request `s`); `proj = round_bf16(x @ dequant(w)^T)`. For request `s` with slot
+    `c = conv_state_indices[s]` != pad_slot_id and snapshot row `r =
+    intermediate_state_indices[s]`, over the window sequence `win = [conv_state[c, :, 0..2],
+    proj[s p .. s p + p - 1, :conv_dim]]` (per channel): `conv[s p + t] = silu(sum_j
+    bf16(conv_weight[:, j] * win[t + j]))` (bf16 products, fp32 sum, the Triton kernel's
+    SiLU), `intermediate_conv_window[r, t, :conv_dim, :] = win[t + 1 .. t + 3]` for t < p, and
+    `conv_state[c] = win[p .. p + 2]`; a pad request's rows get the plain projection and
+    write no state. Returns `(conv [M, conv_dim], proj[:, conv_dim:] [M, N - conv_dim])`,
+    both contiguous views of one fresh buffer.
+
+    `conv_state` `[slots, conv_dim, 3]` and `intermediate_conv_window` `[rows, >= p,
+    conv_dim, 3]` bf16 (any strides), `conv_weight` `[conv_dim, 4]` bf16 contiguous, both
+    index vectors int32 `[n]` contiguous. The slots, snapshot rows, taps and the windows are
+    read before the PDL wait (as `fp8_gemv_conv1d` does)."""
+    m, k = x.shape
+    p = int(rows_per_seq)
+    assert k == w.k and x.dtype == torch.bfloat16 and x.stride(1) == 1 and 2 <= m <= MAX_ROWS
+    assert x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0
+    assert 2 <= p <= VERIFY_MAX_P and m % p == 0, (m, p)
+    nreq = m // p
+    assert conv_state.dtype == torch.bfloat16 and tuple(conv_state.shape[1:]) == (conv_dim, 3)
+    assert conv_weight.dtype == torch.bfloat16 and tuple(conv_weight.shape) == (conv_dim, 4)
+    assert conv_weight.is_contiguous() and conv_weight.data_ptr() % 8 == 0 and 0 < conv_dim < w.n
+    iw, iidx = intermediate_conv_window, intermediate_state_indices
+    assert iw.dtype == torch.bfloat16 and iw.dim() == 4 and iw.shape[1] >= p
+    assert tuple(iw.shape[2:]) == (conv_dim, 3)
+    for v in (conv_state_indices, iidx):
+        assert v.dtype == torch.int32 and v.is_contiguous() and v.numel() == nreq
+    buf = torch.empty(m * w.n, dtype=torch.bfloat16, device=x.device)
+    if plan is None:
+        plan = default_plan(w.n, k, m, _sms())
+    fn = _compiled(
+        w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major, conv_dim, int(pad_slot_id), p
+    )
+    fn(
+        buf.view(m, w.n),
+        x.data_ptr(),
+        w.data.data_ptr(),
+        w.scale.data_ptr(),
+        x.stride(0),
+        conv_state.data_ptr(),
+        conv_weight.data_ptr(),
+        conv_state_indices.data_ptr(),
+        *conv_state.stride(),
+        iw.data_ptr(),
+        iidx.data_ptr(),
+        *iw.stride(),
+    )
+    return buf[: m * conv_dim].view(m, conv_dim), buf[m * conv_dim :].view(m, w.n - conv_dim)
 
 
 def _gemv_cell(why: str, n: int, k: int, m: int) -> Cell:
@@ -1275,7 +1600,8 @@ class Fp8Gemv(OpWrapper):
     `pack_weight` / `pack_from_bf16`), the bf16 activation never quantized. fp32 accumulation per
     128-wide k-block, block scale applied in fp32, one bf16 rounding at the store.
 
-    Fusion boundary: the projection; `fp8_gemv_conv1d` also fuses the GDN causal-conv step."""
+    Fusion boundary: the projection; `fp8_gemv_conv1d` also fuses the GDN causal-conv step of
+    decode rows, `fp8_gemv_conv1d_verify` the multi-token step of a verify step's rows."""
 
     ARCHS = frozenset({Arch.SM_103})
 
@@ -1333,5 +1659,161 @@ class Fp8GemvConv1d(OpWrapper):
         raise NotImplementedError("the test builds the fp32 reference from the dequantized weight")
 
 
+#: The checkpoint's GDN in_proj (q|k|v|z|a|b) and its q|k|v conv width.
+GDN_IN_N, GDN_IN_K, GDN_CONV_DIM = 16480, 2560, 10240
+
+
+def _verify_cell(why: str, p: int, slots: tuple, steps: int | None = None) -> Cell:
+    return Cell(
+        why=why,
+        spec=dict(
+            n=GDN_IN_N,
+            k=GDN_IN_K,
+            conv_dim=GDN_CONV_DIM,
+            p=p,
+            slots=slots,
+            snapshot_steps=steps or p,
+            pool_slots=461,
+            snapshot_rows=32,
+        ),
+    )
+
+
+class Fp8GemvConv1dVerify(OpWrapper):
+    """`fp8_gemv_conv1d_verify`: the GDN input projection of a speculative verify step (n
+    requests x p tokens) with `causal_conv1d_triton_update`'s multi-token conv step as its
+    epilogue -- per conv column and request, the p tokens through the cached window (bf16
+    products, fp32 sum, SiLU), the window after each token into the per-step snapshot buffer,
+    and the pool slot advanced by all p tokens. Returns `(conv [M, conv_dim], projection
+    columns conv_dim.. [M, N - conv_dim])`.
+
+    Fusion boundary: projection, conv, SiLU, snapshots and the pool advance. The q/k/v and
+    z/a/b splits, the recurrence and the post-acceptance promotion of a snapshot are the
+    caller's."""
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    # spec keys: n, k (the in_proj), conv_dim, p (tokens per request), slots (one per
+    # request; -1 the pad sentinel), snapshot_steps (the buffer's step depth), pool_slots,
+    # snapshot_rows. Every cell: bf16, width 4, no bias, SiLU, pad_slot_id -1,
+    # intermediate_state_indices = arange(n), the engine's 461-slot pool and 32-row buffer.
+    CELLS: tuple[Cell, ...] = (
+        _verify_cell("MTP3 verify, 1 request (4 rows)", 4, (37,)),
+        _verify_cell("MTP3 verify, 2 requests (8 rows)", 4, (0, 460)),
+        _verify_cell("MTP3 verify, 4 requests (16 rows)", 4, (3, 17, 233, 459)),
+        _verify_cell("MTP1 verify, 8 requests x 2 rows (16 rows)", 2, tuple(range(5, 461, 57))),
+        _verify_cell("MTP7 verify, 2 requests x 8 rows", 8, (100, 7)),
+        _verify_cell("3 rows a request into an 8-step buffer: steps 3..7 untouched", 3, (9, 41), 8),
+        _verify_cell("MTP3, a pad request beside a live one", 4, (-1, 21)),
+    )
+
+    note = """
+    Call site: the decode target's GDN in_proj of an MTP verify step under the dense FP8 mode
+    in a captured graph, 2..16 rows (p = runtime_draft_len + 1 = 2..8 tokens per request,
+    a request's rows consecutive); the conv output feeds the cached replay as its contiguous
+    packed q|k|v, z/a/b are column views of the second output.
+    `conv_state` `[slots, conv_dim, 3]` and `intermediate_conv_window` `[rows, >= p, conv_dim,
+    3]` bf16 (any strides), `conv_weight` `[conv_dim, 4]` bf16 contiguous, int32 slot and
+    snapshot-row vectors of n entries. Same arithmetic as `causal_conv1d_triton_update`
+    (bitwise the two-launch fp8_gemv + Triton path under the same plan); a pad request gets
+    the plain projection and writes neither pool nor snapshots (the Triton op leaves its rows
+    unwritten). Slots, snapshot rows, taps and windows are read before the PDL wait: nothing
+    in a captured step writes this layer's pool ahead of it.
+    Not guarded (content): duplicate slots or snapshot rows race; slot / row values out of
+    range are illegal accesses.
+    """
+
+    def __call__(
+        self,
+        x,
+        w,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        conv_dim,
+        rows_per_seq,
+        pad_slot_id,
+    ):
+        return fp8_gemv_conv1d_verify(
+            x,
+            w,
+            conv_state,
+            conv_weight,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            conv_dim,
+            rows_per_seq,
+            pad_slot_id,
+        )
+
+    def reference(
+        self,
+        x,
+        codes,
+        scale,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        conv_dim,
+        rows_per_seq,
+        pad_slot_id,
+    ):
+        """`(conv, rest, conv_state, intermediate_conv_window)` as the call leaves them, from
+        an fp32 matmul over the dequantized weight rounded once to bf16, then the Triton
+        op's reference conv (products in bf16, fp32 sum, `acc / (1 + exp(-acc))`); mutates
+        nothing. A pad request's conv rows are its projection."""
+        with true_fp32_matmul():
+            proj = (x.float() @ dequantize_fp8_block(codes, scale).t()).to(torch.bfloat16)
+        m, p = x.shape[0], rows_per_seq
+        conv = proj[:, :conv_dim].clone()
+        state, window = conv_state.clone(), intermediate_conv_window.clone()
+        slots = conv_state_indices.tolist()
+        rows = intermediate_state_indices.tolist()
+        for s in range(m // p):
+            if slots[s] == pad_slot_id:
+                continue
+            seq = torch.cat([conv_state[slots[s]], proj[s * p : (s + 1) * p, :conv_dim].t()], 1)
+            for t in range(p):
+                acc = torch.zeros(conv_dim, dtype=torch.float32, device=x.device)
+                for j in range(4):
+                    acc = acc + (conv_weight[:, j] * seq[:, t + j]).float()
+                conv[s * p + t] = (acc / (1.0 + torch.exp(-acc))).to(torch.bfloat16)
+                window[rows[s], t] = seq[:, t + 1 : t + 4]
+            state[slots[s]] = seq[:, p : p + 3]
+        return conv, proj[:, conv_dim:].contiguous(), state, window
+
+    def is_valid(
+        self,
+        x,
+        w,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        conv_dim,
+        rows_per_seq,
+        pad_slot_id,
+        **kwargs,
+    ) -> None:
+        m = x.shape[0]
+        assert 2 <= rows_per_seq <= VERIFY_MAX_P and m % rows_per_seq == 0, (
+            f"{m} rows are not whole requests of {rows_per_seq} tokens (2..{VERIFY_MAX_P})"
+        )
+        assert m <= MAX_ROWS, f"{m} rows; the kernel holds at most {MAX_ROWS}"
+        assert intermediate_conv_window.shape[1] >= rows_per_seq, (
+            f"a snapshot buffer of {intermediate_conv_window.shape[1]} steps holds fewer than "
+            f"the {rows_per_seq} tokens a request writes"
+        )
+        assert conv_state.shape[2] == 3 and conv_weight.shape[1] == 4, "width-4 conv only"
+        assert conv_state.shape[1] == conv_dim and intermediate_conv_window.shape[2] == conv_dim
+
+
 fp8_gemv_op = Fp8Gemv()
 fp8_gemv_conv1d_op = Fp8GemvConv1d()
+fp8_gemv_conv1d_verify_op = Fp8GemvConv1dVerify()

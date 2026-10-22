@@ -177,7 +177,12 @@ from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
 from .ops.gemm.fp8_gemv import MAX_ROWS as _FP8_GEMV_HEAD_ROWS
-from .ops.gemm.fp8_gemv import fp8_gemv_conv1d_op, fp8_gemv_op, pack_from_bf16
+from .ops.gemm.fp8_gemv import (
+    fp8_gemv_conv1d_op,
+    fp8_gemv_conv1d_verify_op,
+    fp8_gemv_op,
+    pack_from_bf16,
+)
 from .ops.gemm.fp8_per_tensor_mm import amax_partials, fp8_per_tensor_mm, fp8_per_tensor_weight
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
@@ -5415,29 +5420,32 @@ class DecodeTarget:
         return _dense_mm(out, L.o, L.o8, gemm, "out", L.o_g)
 
     def _gdn_verify(
-        self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay
+        self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay, mq_out=None
     ) -> torch.Tensor:
         """Recurrent half of a speculative verify step; see
-        `PrefillTarget._gdn_verify`."""
+        `PrefillTarget._gdn_verify`. `mq_out` is the conv output when the in_proj ran the
+        conv step as its epilogue (`fp8_gemv_conv1d_verify`, then `mq_d` is None); else the
+        conv runs here over the projection's q|k|v columns `mq_d`."""
         core = self.core
-        # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
-        x3 = torch.transpose(torch.reshape(mq_d, [n, p, core.conv_dim]), 1, 2)
-        conv_out = causal_conv1d_triton_update(
-            x=x3,
-            conv_state=core._bound.conv[i],
-            weight=L.conv_w,
-            bias=None,
-            activation="silu",
-            conv_state_indices=si_d,
-            pad_slot_id=_PAD_SLOT_ID,
-            # Snapshots, not the accepted-token roll.
-            num_accepted_tokens=None,
-            intermediate_conv_window=core._bound.int_conv[i],
-            intermediate_state_indices=int_idx,
-            launch_dependent_kernels=False,
-        )
-        # Back to token-major (a view).
-        mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
+        if mq_out is None:
+            # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
+            x3 = torch.transpose(torch.reshape(mq_d, [n, p, core.conv_dim]), 1, 2)
+            conv_out = causal_conv1d_triton_update(
+                x=x3,
+                conv_state=core._bound.conv[i],
+                weight=L.conv_w,
+                bias=None,
+                activation="silu",
+                conv_state_indices=si_d,
+                pad_slot_id=_PAD_SLOT_ID,
+                # Snapshots, not the accepted-token roll.
+                num_accepted_tokens=None,
+                intermediate_conv_window=core._bound.int_conv[i],
+                intermediate_state_indices=int_idx,
+                launch_dependent_kernels=False,
+            )
+            # Back to token-major (a view).
+            mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
         if replay is not None:
             return _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
         q, k, v = pack_gdn_decode_qkv(
@@ -5492,14 +5500,43 @@ class DecodeTarget:
         them, and at every batch size over a bf16 pool, after the conv step, as one
         streaming launch (`gdn_decode_rows_gated_norm`). That kernel computes each (row,
         v-head) on its own, so over a bf16 pool a row's output and state do not depend on
-        its batch."""
+        its batch.
+
+        A graph-captured verify step whose in_proj takes `fp8_gemv` (dense FP8 mode, up to
+        `_FP8_GEMV_ROWS["in"]` rows) runs the multi-token conv step -- window snapshots and
+        the pool advance included -- as that GEMM's epilogue too (`fp8_gemv_conv1d_verify`,
+        bitwise the projection + `causal_conv1d_triton_update` it replaces); the conv output
+        is its own contiguous buffer, and z, a and b are column views of the rest."""
         core = self.core
         si_all, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
         num_tokens = x.shape[0]
         ssm_states = core._bound.ssm[i]
 
         conv_fused = fused_conv and not is_verify and num_tokens <= _GDN_CONV_FUSED_MAX_ROWS
-        if conv_fused and L.in_proj_g is not None and _gemv_ready(x):
+        # The verify conv as the in_proj's epilogue reads the pool, taps and slots before its
+        # PDL wait, like the single-token fusion: captured steps only.
+        verify_fused = (
+            fused_conv
+            and is_verify
+            and L.in_proj_g is not None
+            and _gemv_ready(x)
+            and num_tokens <= _FP8_GEMV_ROWS["in"][1]
+        )
+        mq_out = None
+        if verify_fused:
+            mq_out, zab = fp8_gemv_conv1d_verify_op(
+                x,
+                L.in_proj_g,
+                core._bound.conv[i],
+                L.conv_w,
+                si_all,
+                core._bound.int_conv[i],
+                int_idx,
+                core.conv_dim,
+                gen_p,
+                _PAD_SLOT_ID,
+            )
+        elif conv_fused and L.in_proj_g is not None and _gemv_ready(x):
             proj = fp8_gemv_conv1d_op(
                 x,
                 L.in_proj_g,
@@ -5522,7 +5559,11 @@ class DecodeTarget:
             )
         else:
             proj = _dense_mm(x, L.in_proj, L.in_proj8, gemm, "in", L.in_proj_g)
-        mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
+        if verify_fused:
+            mixed_qkv = None
+            z, a, b = torch.split(zab, core.in_proj_split[1:], 1)
+        else:
+            mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
 
         if (
             ssm_states.dtype == torch.float32
@@ -5558,6 +5599,7 @@ class DecodeTarget:
                 num_decodes,
                 gen_p,
                 replay,
+                mq_out,
             )
             return self._gdn_epilogue(out, z, L, num_tokens, gemm)
         if not conv_fused:
