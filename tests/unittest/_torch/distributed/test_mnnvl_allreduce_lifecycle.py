@@ -305,7 +305,8 @@ def test_workspace_lookup_traces_under_fullgraph(monkeypatch: pytest.MonkeyPatch
     The MNNVL all-reduce runs inside torch.compile'd decoder layers whenever TP spans nodes.
     The workspace handle is a nanobind object whose methods Dynamo cannot trace, and the CUDA
     graph capture query returns a plain bool, so neither may be reached while compiling. The
-    compiled graph keeps the buffers as constants, which counts as captured.
+    compiled graph keeps the buffers as constants, which counts as captured and requires
+    retaining the workspace when a later eager call grows it.
     """
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     _patch_workspace_dependencies(monkeypatch)
@@ -336,6 +337,22 @@ def test_workspace_lookup_traces_under_fullgraph(monkeypatch: pytest.MonkeyPatch
     workspace["handle"] = SimpleNamespace(is_mapped=lambda: False)
     with pytest.raises(RuntimeError, match="not attached"):
         get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32, buffer_size_bytes=16)
+
+    _patch_workspace_dependencies(monkeypatch)
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", lambda *args, **kwargs: _FakeMcastBuffer())
+    monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {mapping: workspace})
+    monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_retired_workspaces", {})
+    workspace["handle"] = _FakeMcastBuffer()
+    grown_workspace = get_or_scale_allreduce_mnnvl_workspace(
+        mapping, torch.float32, buffer_size_bytes=workspace["buffer_size_bytes"] + 1
+    )
+
+    assert grown_workspace is not workspace
+    assert grown_workspace["buffer_size_bytes"] > workspace["buffer_size_bytes"]
+    assert not grown_workspace["captured"]
+    retired = MNNVLAllReduce.allreduce_mnnvl_retired_workspaces[mapping]
+    assert len(retired) == 1
+    assert retired[0] is workspace
 
 
 @pytest.mark.cpu_only
