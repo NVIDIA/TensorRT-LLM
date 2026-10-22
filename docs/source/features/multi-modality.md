@@ -26,6 +26,65 @@ Further optimizations are under development and will be updated as they become a
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
 
+### Encoder attention backend
+
+Use `multimodal_config.encoder_attention_backend` to select attention for a logical
+encoder without changing the language model's `attn_backend`. Image and video share
+the `vision` encoder; an audio tower uses `audio`. Omit a key to preserve the
+model's current default, including decoder-backend inheritance where applicable.
+
+For example, select FlashInfer for Qwen vision through the serving config:
+
+```yaml
+multimodal_config:
+  encoder_attention_backend:
+    vision: FLASHINFER
+```
+
+```bash
+trtllm-serve Qwen/Qwen3.8-27B --config config.yaml
+```
+
+The Python API accepts the same mapping through `MultimodalConfig`:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import MultimodalConfig
+
+llm = LLM(
+    model="Qwen/Qwen3.8-27B",
+    multimodal_config=MultimodalConfig(
+        encoder_attention_backend={"vision": "FLASHINFER"},
+    ),
+)
+```
+
+The following encoder implementations consume this option. Backend names are
+case-insensitive. Explicit unknown encoder names or unsupported backends raise
+an initialization error; an explicit FlashInfer request requires FlashInfer to
+be installed.
+
+| Encoder family | Vision backends | Audio backends |
+| --- | --- | --- |
+| Native Qwen2.5-VL/EXAONE4.5, Qwen3-VL, Qwen3.5/3.8, Qwen4Exp, Cosmos3 | `TRTLLM`, `FLASHINFER`, `VANILLA` | No audio tower |
+| Nemotron H VL/Omni | `TRTLLM`, `FLASHINFER`, `VANILLA` | `SDPA` when the checkpoint has a sound encoder |
+| Gemma4 | `TRTLLM`, `FLASHINFER`, `VANILLA` | `VANILLA` |
+| Mistral3/Pixtral | `TRTLLM`, `FLASHINFER`, `VANILLA` | No audio tower |
+| Kimi K2.5/K3, Step3.7 | `TRTLLM`, `FLASHINFER`, `VANILLA` | No audio tower |
+| MiniCPM-V4.6 full attention | `TRTLLM`, `FLASHINFER`, `VANILLA` | No audio tower |
+| GLM5 Next | `TRTLLM` | No audio tower |
+| DeepSeek-V4.1, MiniMax M3 | `SDPA` | No audio tower |
+| Hugging Face Qwen2/2.5-VL vision | `FLASH_ATTENTION_2`, `SDPA`, `VANILLA` | No audio tower |
+| Gemma4 Unified | No encoder attention | No encoder attention |
+
+For a Nemotron checkpoint with both towers, use
+`{"vision": "FLASHINFER", "audio": "SDPA"}` to configure them separately.
+Gemma4 audio retains its custom relative-position and softcap attention, exposed
+as `VANILLA`; it does not implement the vision backends. Gemma4 Unified uses
+encoder-free projections and rejects encoder-attention overrides.
+MiniCPM-V4.6's fixed-size window merger retains its batched SDPA implementation;
+the selection applies to its variable-length full attention.
+
 ## Optional dependencies
 
 Video input decoding uses OpenCV (`cv2`) and is not installed by default. Install it only for models with video inputs:

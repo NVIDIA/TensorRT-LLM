@@ -31,7 +31,7 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
-                                          ModelExpressConfig,
+                                          ModelExpressConfig, MultimodalConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -101,6 +101,18 @@ _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
 )
+
+
+def _validate_encoder_attention_backend_support(
+        model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
+    """Reject explicit encoder backend settings that the model would ignore."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    if not getattr(model_cls, "supports_encoder_attention_backend", False):
+        model_name = model_cls.__name__ if model_cls is not None else "The model"
+        raise ValueError(
+            f"{model_name} does not support multimodal_config.encoder_attention_backend"
+        )
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -812,6 +824,9 @@ class ModelLoader:
         if architectures:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
+
+        _validate_encoder_attention_backend_support(preference_cls,
+                                                    llm_args.multimodal_config)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}

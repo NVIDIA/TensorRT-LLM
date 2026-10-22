@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import dataclasses
 import math
 import re
 from functools import lru_cache
@@ -1353,11 +1354,30 @@ class Qwen2VisionModelBase(nn.Module):
                 Qwen2_5_VisionTransformerPretrainedModel
         ]:
             # NOTE: For Qwen2VL, we use flash_attention_2 for attention implementation to avoid OOM issue.
-            self.config._attn_implementation = 'flash_attention_2'
+            encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+                defaults={"vision": "FLASH_ATTENTION_2"},
+                supported_backends=Qwen2VLModel.
+                get_supported_encoder_attention_backends(model_config),
+            )
+            self.config._attn_implementation = {
+                "FLASH_ATTENTION_2": "flash_attention_2",
+                "SDPA": "sdpa",
+                "VANILLA": "eager",
+            }[encoder_backends["vision"]]
             self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
                 model_class(model_config.pretrained_config.vision_config),
                 self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
+            encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+                defaults={"vision": model_config.attn_backend},
+                supported_backends=Qwen2VLModelBase.
+                get_supported_encoder_attention_backends(model_config),
+            )
+            if encoder_backends["vision"] != model_config.attn_backend:
+                self.model_config = dataclasses.replace(
+                    self.model_config, attn_backend=encoder_backends["vision"])
+                self.model_config.extra_attrs = model_config.extra_attrs
+                self.model_config._frozen = model_config._frozen
             self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
                 model_class(self.model_config), self.model_dtype)
         else:
@@ -2156,6 +2176,17 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supports_mm_encoder_item_scheduling = True
 
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+            cls, model_config: ModelConfig) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config",
+                   None) is None:
+            return {}
+        return {"vision": frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})}
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -2429,6 +2460,15 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+            cls, model_config: ModelConfig) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config",
+                   None) is None:
+            return {}
+        return {"vision": frozenset({"FLASH_ATTENTION_2", "SDPA", "VANILLA"})}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):

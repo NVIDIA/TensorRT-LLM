@@ -3097,11 +3097,29 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     blobs under that namespace.
     """
 
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: "ModelConfig[PretrainedConfig]"
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config", None) is None:
+            return {}
+        return {"vision": frozenset({"SDPA"})}
+
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in
         # the text subconfig so we can read ``vision_config`` /
         # ``projector_hidden_size`` for the vision tower construction.
         raw_pretrained = model_config.pretrained_config
+        has_vision_encoder = getattr(raw_pretrained, "vision_config", None) is not None
+        model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": "SDPA"} if has_vision_encoder else {},
+            supported_backends=MiniMaxM3VLForConditionalGeneration.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         super().__init__(model_config)
 
         # Expose multimodal token IDs at the top-level model so the

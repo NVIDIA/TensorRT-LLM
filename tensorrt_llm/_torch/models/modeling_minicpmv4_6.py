@@ -524,8 +524,17 @@ class MiniCPMV4_6VisionModel(nn.Module):
         # do NOT switch this to the LLM's real mapping -- a row-parallel
         # projection would then all-reduce data that was never sharded across
         # ranks and produce wrong output.
+        backends = model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": model_config.attn_backend},
+            supported_backends=MiniCPMV4_6Model.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         vision_model_config = dataclasses.replace(
-            model_config, quant_config=QuantConfig(), mapping=Mapping()
+            model_config,
+            quant_config=QuantConfig(),
+            mapping=Mapping(),
+            attn_backend=backends["vision"],
         )
         self.model_config = vision_model_config
         self.config = self.vision_config
@@ -540,7 +549,7 @@ class MiniCPMV4_6VisionModel(nn.Module):
         self.vit_merger = MiniCPMV4_6ViTWindowAttentionMerger(vision_model_config)
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
-        self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        self.metadata_cls = get_attention_backend(vision_model_config.attn_backend).Metadata
 
     def _make_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
         num_segments = len(seq_lens)
@@ -549,7 +558,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
             max_num_tokens=sum(seq_lens) + 1,
             kv_cache_manager=None,
         )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=max(seq_lens, default=1)
+        )
 
     @staticmethod
     def _grid_seq_lens(target_sizes: torch.Tensor) -> List[int]:
@@ -878,6 +889,17 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     ),
 )
 class MiniCPMV4_6Model(PreTrainedModel):
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config", None) is None:
+            return {}
+        return {"vision": frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})}
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
         super().__init__(config)

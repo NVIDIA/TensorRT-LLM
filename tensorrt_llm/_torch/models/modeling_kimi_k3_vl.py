@@ -291,6 +291,12 @@ class KimiK3VisionModel(KimiK25VisionModel):
         self.model_config = copy.copy(model_config)
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
+        self.model_config.attn_backend = model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": model_config.attn_backend},
+            supported_backends=KimiK25ForConditionalGeneration.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )["vision"]
         # Vision tower is not quantized (checkpoint quant ignore list covers
         # vision_tower.* / mm_projector.*), and its encoder layers keep no KV
         # cache — so do not carry the text model's kv_cache_quant_algo over:

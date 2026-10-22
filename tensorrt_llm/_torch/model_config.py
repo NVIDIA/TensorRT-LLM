@@ -19,6 +19,8 @@ import json
 import os
 import struct
 import tempfile
+from collections.abc import Collection
+from collections.abc import Mapping as MappingType
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Optional,
@@ -347,6 +349,58 @@ class ModelConfig(Generic[TConfig]):
     # The modeling_v2 target class to build, or None for the built-in
     # implementation. Set by the model loader, read by `_resolve_class`.
     modeling_v2_target: Optional[type] = None
+
+    def get_multimodal_encoder_attention_backends(
+        self,
+        *,
+        defaults: MappingType[str, str],
+        supported_backends: MappingType[str, Collection[str]],
+    ) -> dict[str, str]:
+        """Resolve encoder overrides once during model construction.
+
+        Logical encoder names belong to the model: image/video can share
+        ``vision`` while ``audio`` uses a different implementation. An omitted
+        entry preserves the supplied default, including existing inheritance
+        from the decoder. Only explicit overrides are validated. The returned
+        mapping does not modify this config or the decoder's backend.
+
+        Args:
+            defaults: Current backend for each enabled logical encoder.
+            supported_backends: Backends implemented by those encoders.
+
+        Returns:
+            Selected backends for every enabled logical encoder.
+
+        Raises:
+            ValueError: An override names an unavailable encoder or backend.
+        """
+        backends = dict(defaults)
+        overrides = (self.multimodal_config.encoder_attention_backend
+                     if self.multimodal_config is not None else None)
+        if not overrides:
+            return backends
+        enabled_encoders = defaults.keys() & supported_backends.keys()
+        unknown_encoders = overrides.keys() - enabled_encoders
+        if unknown_encoders:
+            raise ValueError(
+                "multimodal_config.encoder_attention_backend contains unknown "
+                f"encoders {sorted(unknown_encoders)}; enabled encoders: {sorted(enabled_encoders)}"
+            )
+        for encoder, backend in overrides.items():
+            if backend not in supported_backends[encoder]:
+                raise ValueError(
+                    f"The {encoder} encoder does not support attention backend {backend!r}; "
+                    f"supported backends: {sorted(supported_backends[encoder])}"
+                )
+            if backend == "FLASHINFER":
+                from .flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+                if not IS_FLASHINFER_AVAILABLE:
+                    raise ValueError(
+                        f"The {encoder} encoder requested FLASHINFER, but FlashInfer is unavailable"
+                    )
+            backends[encoder] = backend
+        return backends
 
     @property
     def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:

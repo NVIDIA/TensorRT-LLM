@@ -291,8 +291,8 @@ def _make_dummy_pixel_input(vision_cfg, B=1, side=6, dtype=torch.float32, device
 def _build_trt_vision_tower(vision_cfg, dtype=torch.float32, device="cuda"):
     """Build the refactored TRT-LLM ``Gemma4VisionModel`` with the TRTLLM attn backend.
 
-    ``get_sub_model_config`` in ``modeling_gemma4mm.py`` always picks
-    ``attn_backend="TRTLLM"`` for the vision tower, so unit tests mirror that.
+    ``get_sub_model_config`` in ``modeling_gemma4mm.py`` defaults to
+    ``attn_backend="TRTLLM"`` for the vision tower; these tests use that default.
     """
     mc = ModelConfig(
         pretrained_config=vision_cfg,
