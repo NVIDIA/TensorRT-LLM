@@ -257,6 +257,34 @@ def test_top_level_shallow(workspace: Path) -> None:
     _run_top_level_cycles(workspace, shallow=True)
 
 
+def test_loose_ref_overrides_packed_ref(workspace: Path) -> None:
+    cache = workspace / "cache"
+    src = _init_worktree(workspace / "src", "https://example.com/sample.git")
+    payloads = {}
+    for payload in (b"original\n", b"rewritten\n"):
+        (src / "a.txt").write_bytes(payload)
+        _git("add", "a.txt", cwd=src)
+        tree = _git("write-tree", cwd=src).stdout.strip()
+        sha = _git("commit-tree", tree, "-m", "fixture", cwd=src).stdout.strip()
+        payloads[sha] = payload
+
+    # Unrelated commits keep the current tip out of the stale tip's ancestry.
+    # Choose the stale SHA first in sort order to expose duplicate ref names.
+    stale, current = sorted(payloads)
+    _git("update-ref", "refs/heads/main", stale, cwd=src)
+    _git("pack-refs", "--all", cwd=src)
+    _git("update-ref", "refs/heads/main", current, cwd=src)
+    _git("reset", "--hard", current, cwd=src)
+
+    _fetch_cache_update(cache, src)
+
+    bare = cache / "full" / "sample.git"
+    consumer = workspace / "consumer"
+    _git("clone", "--reference", bare, _file_url(src), consumer)
+    assert (consumer / "a.txt").read_bytes() == payloads[current]
+    assert _local_object_counts(consumer) == (0, 0)
+
+
 # ---------------------------------------------------------------------------
 # submodule — bare materializes for both parent and submodule
 # ---------------------------------------------------------------------------
