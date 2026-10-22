@@ -48,6 +48,11 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
         # Resident helper experts need helper rows that only their layer writes.
         self.helper_residency = helper_slot_mode == "per_layer_resident"
+        self.planner = str(getattr(config, "planner", "halo_q"))
+        if self.planner not in ("halo_q", "halo_r"):
+            raise ValueError(f"unknown per-layer dynamic EPLB planner {self.planner!r}")
+        if self.planner == "halo_r" and self.helper_residency:
+            raise ValueError("planner 'halo_r' requires helper_slot_mode 'shared_banks'")
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None
@@ -77,7 +82,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         return (
             f"PerLayerDynamicMoeLoadBalancer(ep_rank={self.ep_rank}, "
             f"ep_size={self.ep_size}, num_slots={self.num_slots}, "
-            f"auxiliary_sms={self.auxiliary_sms})"
+            f"auxiliary_sms={self.auxiliary_sms}, planner={self.planner})"
         )
 
     def is_static_routing(self) -> bool:
