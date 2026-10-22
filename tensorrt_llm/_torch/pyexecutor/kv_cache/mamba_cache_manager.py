@@ -46,11 +46,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 nvtx_range, prefer_pinned,
+                                 get_sm_version, nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import (
-    LinearAttentionMetadata, LinearCacheType)
+    KvCacheStats, LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -68,7 +68,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
-from ..config_utils import mamba_effective_tp_size
+from ..config_utils import is_nemotron_hybrid, mamba_effective_tp_size
 
 GB = 1 << 30
 
@@ -95,6 +95,43 @@ class _PrefixReuseDiagnostics(Protocol):
 # combining larger histories with new kernel designs that stay efficient when
 # the window is only partly full.
 MIN_REPLAY_HISTORY_SIZE = 16
+
+
+def _mamba_replay_disabled_reason(
+    spec_config: Optional["DecodingBaseConfig"],
+    ssm_dtype: torch.dtype,
+    stochastic_rounding: bool,
+    sm: int,
+) -> Optional[str]:
+    """Why Nemotron's linear replay path is disabled, or None if enabled.
+
+    Shared by the cache manager factory and the cache budget estimator.
+    """
+    if spec_config is None:
+        return "speculative decoding is not configured"
+    if sm < 80:
+        return "replay requires SM80 or newer"
+    if getattr(spec_config, "use_dynamic_tree", False):
+        return "dynamic tree verification is unsupported"
+    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") == "0":
+        return "TRTLLM_USE_MAMBA_REPLAY=0"
+    if (stochastic_rounding and ssm_dtype == torch.float16
+            and (sm < 100 or sm in (120, 121))):
+        return f"FP16 replay stochastic rounding is unsupported on SM{sm}"
+    return None
+
+
+def _mamba_replay_history_bytes(num_layers: int, capacity: int,
+                                history_size: int, nheads: int, head_dim: int,
+                                d_state: int, n_groups: int,
+                                dtype: torch.dtype) -> int:
+    """Exact tensor bytes for double-buffered history and its two counters."""
+    values_per_token = nheads * head_dim + n_groups * d_state
+    history_bytes = (num_layers * capacity * 2 * history_size *
+                     (values_per_token * dtype.itemsize +
+                      2 * nheads * torch.float32.itemsize))
+    return history_bytes + capacity * 2 * torch.int32.itemsize
+
 
 _KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
 
@@ -344,6 +381,11 @@ class BaseMambaCacheManager(ABC):
             self) -> Optional[ReplayStateUpdateMetadata]:
         """Return replay metadata tensors and fixed replay sizes."""
         return None
+
+    def get_replay_state_indices(self,
+                                 state_indices: torch.Tensor) -> torch.Tensor:
+        """Map int32 SSM slot IDs [batch] to int32 replay slot IDs [batch]."""
+        return state_indices
 
     @property
     def use_kda_replay_update(self) -> bool:
@@ -1490,14 +1532,15 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if spec_config is None or not self._use_replay_state_update:
             return False
 
+        history_capacity = self._replay_history_capacity(cache_size)
         history_size = self.replay_history_size
         assert history_size is not None
         nheads, head_dim, d_state = self.ssm_state_shape
-        common_shape = [self.local_num_mamba_layers, cache_size, 2]
-        self.prev_num_accepted_tokens = torch.zeros(cache_size,
+        common_shape = [self.local_num_mamba_layers, history_capacity, 2]
+        self.prev_num_accepted_tokens = torch.zeros(history_capacity,
                                                     dtype=torch.int32,
                                                     device=device)
-        self.cache_buf_idx = torch.zeros(cache_size,
+        self.cache_buf_idx = torch.zeros(history_capacity,
                                          dtype=torch.int32,
                                          device=device)
         self.old_x = torch.zeros(
@@ -1522,6 +1565,10 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         )
         return True
 
+    def _replay_history_capacity(self, cache_size: int) -> int:
+        """Return the replay-history slot count for ``cache_size`` SSM slots."""
+        return cache_size
+
     @torch.inference_mode()
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
         if self._dummy_request_mask is None:
@@ -1543,16 +1590,17 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if (self._use_replay_state_update
                 and self.prev_num_accepted_tokens is not None
                 and self.cache_buf_idx is not None):
-            self.prev_num_accepted_tokens.index_fill_(0, context_slots, 0)
-            self.cache_buf_idx.index_fill_(0, context_slots, 0)
+            replay_slots = self.get_replay_state_indices(context_slots).long()
+            self.prev_num_accepted_tokens.index_fill_(0, replay_slots, 0)
+            self.cache_buf_idx.index_fill_(0, replay_slots, 0)
             if self.old_x is not None:
-                self.old_x.index_fill_(1, context_slots, 0)
+                self.old_x.index_fill_(1, replay_slots, 0)
             if self.old_B is not None:
-                self.old_B.index_fill_(1, context_slots, 0)
+                self.old_B.index_fill_(1, replay_slots, 0)
             if self.old_dt is not None:
-                self.old_dt.index_fill_(1, context_slots, 0)
+                self.old_dt.index_fill_(1, replay_slots, 0)
             if self.old_dA_cumsum is not None:
-                self.old_dA_cumsum.index_fill_(1, context_slots, 0)
+                self.old_dA_cumsum.index_fill_(1, replay_slots, 0)
 
         if self.mamba_ssm_rand_seed is None:
             return
@@ -2204,6 +2252,7 @@ def _estimate_mamba_hybrid_cache_cost(
     num_reserved_dummy_slots: int,
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
+    include_replay_history: bool = False,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
     **kwargs,
@@ -2260,6 +2309,22 @@ def _estimate_mamba_hybrid_cache_cost(
                                    unaligned_fixed_rules)
     intercept = (fixed_state_slots * state_bytes_per_rank +
                  partial_attention_slots * attention_block_bytes)
+    if (include_replay_history and local_mamba_layers > 0
+            and is_nemotron_hybrid(model_config.pretrained_config)):
+        quant_config = model_config.quant_config
+        stochastic_rounding = (quant_config is not None
+                               and quant_config.mamba_ssm_stochastic_rounding)
+        if _mamba_replay_disabled_reason(spec_config,
+                                         params.mamba_ssm_cache_dtype,
+                                         stochastic_rounding,
+                                         get_sm_version()) is None:
+            tp_size = mamba_effective_tp_size(mapping)
+            intercept += _mamba_replay_history_bytes(
+                local_mamba_layers,
+                max_resident_sequences + num_reserved_dummy_slots,
+                max(MIN_REPLAY_HISTORY_SIZE, spec_config.tokens_per_gen_step),
+                params.num_heads // tp_size, params.head_dim, params.state_size,
+                params.n_groups // tp_size, params.dtype)
 
     if interval is None:
         regular_slope = 0
@@ -3056,6 +3121,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _ple_layer_ids: list[int] = []
     _ple_conv_state_shape: list[int] = []
     _ple_ngram_context_shape: list[int] = []
+    _compact_replay = False
+    _replay_history_bytes = 0
 
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # The incoming recurrent state overwrites the whole local slot and summarizes the
@@ -3274,6 +3341,24 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 per_layer_kv_heads[i] = 0
 
         self._setup_mtp_intermediate_states(spec_config, max_batch_size)
+
+        self._compact_replay = (use_replay_state_update
+                                and conv_state_layout == "x_b_c"
+                                and self.local_num_mamba_layers > 0)
+        self._request_id_to_replay_slot: dict[int, int] = {}
+        self._free_replay_slots: list[int] = []
+        self._ssm_to_replay_slot: Optional[torch.Tensor] = None
+        self._ssm_to_replay_slot_host: dict[int, int] = {}
+        if self._compact_replay:
+            # Suspended requests remain admitted and keep their replay slots.
+            self._replay_capacity = (max_batch_size * mapping.pp_size +
+                                     self._num_reserved_dummy_slots)
+            self._free_replay_slots = list(
+                reversed(range(self._replay_capacity)))
+            self._replay_history_bytes = _mamba_replay_history_bytes(
+                self.local_num_mamba_layers, self._replay_capacity,
+                self.replay_history_size, *self.ssm_state_shape,
+                self._n_groups_per_rank, self.conv_state_dtype)
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
@@ -3540,6 +3625,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_v_cache = None
         self.kda_beta_cache = None
         self.kda_state_tok = None
+
+        if allocated and self._compact_replay:
+            allocated_bytes = sum(
+                get_tensor_size_bytes(buffer)
+                for buffer, _ in self._compact_replay_buffers())
+            if allocated_bytes != self._replay_history_bytes:
+                raise RuntimeError(
+                    "Mamba replay allocation differs from its budget: "
+                    f"allocated {allocated_bytes}, expected {self._replay_history_bytes}"
+                )
+            self._ssm_to_replay_slot = torch.zeros(cache_size,
+                                                   dtype=torch.int32,
+                                                   device=device)
 
         if (not self.use_kda_replay_update or self.local_num_mamba_layers == 0):
             return allocated
@@ -3900,6 +3998,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             num_reserved_dummy_slots=num_reserved_dummy_slots,
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
+            include_replay_history=True,
             **kwargs,
         )
 
@@ -4045,6 +4144,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return slots * self._mamba_state_bytes_per_slot()
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        """Return the construction budget for pools and replay history."""
         attention_quota = super()._get_quota_from_max_tokens(max_tokens)
         num_request_lineages = self._max_resident_sequences()
         snapshot_slots = self._num_ssm_snapshots_for_capacity(
@@ -4059,7 +4159,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                  self._attention_cache_bytes_per_token() *
                                  self.tokens_per_block
                                  if snapshot_slots > 0 else 0)
-        return attention_quota + state_quota + extra_attention_quota
+        return (attention_quota + state_quota + extra_attention_quota +
+                self._replay_history_bytes)
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         if self._get_quota_from_max_tokens(0) > quota:
@@ -4082,14 +4183,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return low
 
     def _minimum_live_gpu_quota(self) -> int:
-        """Return the minimum quota for live states and one attention page."""
+        """Return the minimum pool quota, excluding replay history."""
         attention_block_quota = (self._attention_cache_bytes_per_token() *
                                  self.tokens_per_block)
         num_state_slots = (self._max_resident_sequences() +
                            self._num_reserved_dummy_slots)
         state_quota = self._state_quota(num_state_slots)
         return max(
-            self._get_quota_from_max_tokens(0),
+            self._get_quota_from_max_tokens(0) - self._replay_history_bytes,
             state_quota + attention_block_quota,
         )
 
@@ -4146,15 +4247,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
-        if (getattr(self, "_use_kda_replay_update", False)
+        if ((self.use_kda_replay_update or self._compact_replay)
                 and self.local_num_mamba_layers > 0
                 and kv_cache_config.enable_kv_pool_rebalance):
-            # The KDA replay caches and prev_num_accepted_tokens hold one
-            # entry per SSM slot the pool keeps at construction; a rebalance
-            # can grow the SSM pool past them, and the verify kernels index
-            # them by slot without a bound.
+            # Replay slot maps, seeds, and KDA caches have fixed SSM-slot
+            # capacity. Rebalancing can assign slots beyond those tensors.
             raise ValueError(
-                "The KDA replay caches (speculative decoding on KDA layers) "
+                "Replay caches and slot maps "
                 "are sized once from the SSM pool's slot count, and a KV pool "
                 "rebalance can grow that pool past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False.")
@@ -4171,7 +4270,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 "kv_cache_config.pool_ratio unset, and attention layers on "
                 "this rank.")
         cache_tiers = config.cache_tiers
-        total_gpu_quota = cache_tiers[0].quota
+        total_gpu_quota = cache_tiers[0].quota - self._replay_history_bytes
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > total_gpu_quota:
             raise ValueError(
@@ -4199,6 +4298,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"{draft_record_quota / (1 << 30)}GiB of the "
                 f"{total_gpu_quota / (1 << 30)}GiB device quota; the pools "
                 f"get {pool_gpu_quota / (1 << 30)}GiB")
+
+        if self._replay_history_bytes and not ssm_pool_at_live_floor:
+            # Replay history is allocated outside the pool, after it.
+            cache_tiers = [
+                GpuCacheTierConfig(quota=pool_gpu_quota), *cache_tiers[1:]
+            ]
         # _build_base_config already constructed every attention layer,
         # including dtype-specific scale and subclass-provided side buffers.
         # Preserve those configs and replace only the local Mamba layers.
@@ -4412,6 +4517,71 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             pin_memory=prefer_pinned(),
         )
 
+    def get_replay_state_indices(self,
+                                 state_indices: torch.Tensor) -> torch.Tensor:
+        if not self._compact_replay:
+            return state_indices
+        return self._ssm_to_replay_slot[state_indices.long()]
+
+    def _replay_history_capacity(self, cache_size: int) -> int:
+        return self._replay_capacity if self._compact_replay else cache_size
+
+    def _compact_replay_buffers(self) -> list[tuple[torch.Tensor, int]]:
+        return [(self.old_x, 1), (self.old_B, 1), (self.old_dt, 1),
+                (self.old_dA_cumsum, 1), (self.prev_num_accepted_tokens, 0),
+                (self.cache_buf_idx, 0)]
+
+    def get_kv_cache_stats(self) -> KvCacheStats:
+        stats = super().get_kv_cache_stats()
+        # Capacity profiling subtracts cache-owned allocations from its peak.
+        stats.allocated_bytes += self._replay_history_bytes
+        return stats
+
+    def _release_replay_slot(self, request_id: int) -> None:
+        slot = self._request_id_to_replay_slot.pop(request_id, None)
+        if slot is not None:
+            self._free_replay_slots.append(slot)
+
+    def _setup_compact_replay_slots(self, requests: list[LlmRequest],
+                                    state_values: list[int],
+                                    num_contexts: int) -> None:
+        if not self._compact_replay:
+            return
+        changed_states = []
+        changed_slots = []
+        new_generation_slots = []
+        device = self._ssm_to_replay_slot.device
+        for i, (request, state_slot) in enumerate(zip(requests, state_values)):
+            request_id = request.py_request_id
+            slot = self._request_id_to_replay_slot.get(request_id)
+            if slot is None:
+                assert self._free_replay_slots, (
+                    "Mamba replay capacity exhausted: admitted requests "
+                    "(including suspended requests) and padding dummies must "
+                    f"fit within {self._replay_capacity} replay slots")
+                slot = self._free_replay_slots.pop()
+                self._request_id_to_replay_slot[request_id] = slot
+                if i >= num_contexts:
+                    new_generation_slots.append(slot)
+            if self._ssm_to_replay_slot_host.get(state_slot) == slot:
+                continue
+            changed_states.append(state_slot)
+            changed_slots.append(slot)
+            self._ssm_to_replay_slot_host[state_slot] = slot
+        # Stable resident batches need no mapping transfers or metadata resets.
+        # Fresh pinned staging is owned by the async copy until DMA completes.
+        if changed_states:
+            self._ssm_to_replay_slot.index_copy_(
+                0, _host_slots_to_device(changed_states, device),
+                torch.tensor(changed_slots,
+                             dtype=torch.int32,
+                             pin_memory=prefer_pinned()).to(device,
+                                                            non_blocking=True))
+        if new_generation_slots:
+            slots = _host_slots_to_device(new_generation_slots, device)
+            self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
+            self.cache_buf_idx.index_fill_(0, slots, 0)
+
     def _attention_cache_bytes_per_token(self) -> int:
         # Mamba layers have zero KV heads, so the generic calculation naturally
         # returns only bytes owned by local attention layers.
@@ -4561,7 +4731,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                buffer.index_select(dim, source_slots))
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend the request's KV cache with its whole KDA state in V2.
+        """Suspend the request's KV cache while preserving replay history.
+
+        Compact Nemotron replay slots stay owned by admitted requests, including
+        suspended ones. Only their SSM-slot lookup needs refreshing on resume.
 
         The KDA replay state is indexed by SSM slot, outside the V2 pools: the
         drafts the last verify accepted are pending there, and so is the conv
@@ -4689,12 +4862,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if kv_cache is not None and kv_cache.is_active:
             self.try_commit_blocks(request, kv_cache)
         self._request_id_to_state_index.pop(request.py_request_id, None)
+        self._release_replay_slot(request.py_request_id)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
         self._kda_replay_suspended.discard(request.py_request_id)
         self._kda_replay_acceptance_pending.discard(request.py_request_id)
         self._kda_replay_unseeded.discard(request.py_request_id)
         super().free_resources(request, pin_on_release)
+
+    def release_index_slot(self, request_id: int) -> None:
+        """Release context-only replay ownership while retaining transfer KV."""
+        super().release_index_slot(request_id)
+        if self._compact_replay:
+            # Final context forward is complete; transfers read the recurrent
+            # KV state, not replay history. New prefills can reuse that history.
+            self._release_replay_slot(request_id)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -4756,6 +4938,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
+        self._setup_compact_replay_slots(requests, state_values, num_contexts)
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
@@ -5028,7 +5211,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             assert replay_metadata is not None
             _advance_replay_state(
                 replay_metadata,
-                state_indices_d,
+                self.get_replay_state_indices(state_indices_d),
                 num_accepted_tokens[num_contexts:num_contexts + num_gens],
                 is_dummy_request,
             )
@@ -5181,4 +5364,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._kda_replay_acceptance_pending.clear()
         self.kda_state_tok = None
         self._kda_replay_unseeded.clear()
+        self._request_id_to_replay_slot.clear()
+        self._free_replay_slots.clear()
+        self._ssm_to_replay_slot_host.clear()
+        self._ssm_to_replay_slot = None
         super().shutdown()
