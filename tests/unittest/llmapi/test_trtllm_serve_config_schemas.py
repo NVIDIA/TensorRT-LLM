@@ -54,6 +54,12 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
     [
         (generator.SERVE_SCHEMA, {}, True),
         (generator.SERVE_SCHEMA, {"max_batch_size": 8}, True),
+        (generator.SERVE_SCHEMA, {"compact_beam_widths": [], "max_beam_width": 5}, True),
+        (generator.SERVE_SCHEMA, {"compact_beam_widths": [2, 4], "max_beam_width": 5}, True),
+        (generator.SERVE_SCHEMA, {"compact_beam_widths": [1], "max_beam_width": 5}, False),
+        (generator.SERVE_SCHEMA, {"compact_beam_widths": [0], "max_beam_width": 5}, False),
+        (generator.SERVE_SCHEMA, {"compact_beam_widths": [-1], "max_beam_width": 5}, False),
+        (generator.SERVE_SCHEMA, {"compact_beam_widths": [2.5], "max_beam_width": 5}, False),
         (generator.SERVE_SCHEMA, {"max_batch_szie": 8}, False),
         (generator.SERVE_SCHEMA, {"max_batch_size": "eight"}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),

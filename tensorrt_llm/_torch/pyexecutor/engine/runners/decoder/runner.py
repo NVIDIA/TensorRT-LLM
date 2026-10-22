@@ -45,6 +45,7 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -408,6 +409,33 @@ class DecoderRunner(ScheduledModelRunner):
             register_hooks(cuda_graph_runner)
         return cuda_graph_runner
 
+    def _supported_compact_beam_widths(self) -> tuple[int, ...]:
+        widths = self._config.compact_beam_widths
+        if not widths:
+            return ()
+        # Require an explicit declaration on each model class: subclasses may
+        # introduce additional token-indexed state or outputs.
+        supported = (
+            type(self.model).__dict__.get("supports_compact_beam", False)
+            and self._config.attention_backend.Metadata is TrtllmAttentionMetadata
+            and self.mapping.world_size == 1
+            and not self._config.is_encode_only
+            and not self._config.is_spec_decode
+            and not self._config.use_mrope
+            and not self._config.is_multimodal
+            and not self._config.without_logits
+            and not self._config.torch_compile_enabled
+            and not self._config.enable_in_graph_sampling
+            and self.sparse_attention_config is None
+        )
+        if not supported:
+            logger.warning(
+                "compact_beam_widths is unsupported for this model configuration; "
+                "using capacity-width execution."
+            )
+            return ()
+        return widths
+
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return CUDAGraphRunnerConfig(
             use_cuda_graph=(
@@ -417,6 +445,7 @@ class DecoderRunner(ScheduledModelRunner):
             cuda_graph_batch_sizes=self._config.cuda_graph_batch_sizes,
             max_cuda_graph_batch_size=self._config.max_cuda_graph_batch_size,
             max_beam_width=self._config.max_beam_width,
+            compact_beam_widths=self._supported_compact_beam_widths(),
             spec_config=self._config.spec_config,
             cuda_graph_mem_pool=self._cuda_graph_mem_pool,
             dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
@@ -636,6 +665,12 @@ class DecoderRunner(ScheduledModelRunner):
                     gather_context_logits=gather_context_logits,
                 )
             inputs = prepared.kwargs
+            self.cuda_graph_runner.beam_compaction.prepare_inputs(
+                inputs,
+                self.cuda_graph_runner.beam_compaction.execution_width(
+                    execution_requests, new_tensors_device is not None
+                ),
+            )
             runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
@@ -716,12 +751,28 @@ class DecoderRunner(ScheduledModelRunner):
             and isinstance(metadata, TrtllmAttentionMetadata)
             else contextlib.nullcontext()
         )
+        compact = kwargs.pop("beam_compaction", None)
         moe_reclaimer = self._moe_workspace_reclaimer
         moe_scope = contextlib.nullcontext()
         if moe_reclaimer is not None:
             moe_scope = moe_reclaimer.forward(warmup=is_dummy, num_tokens=metadata.num_tokens)
-        with reclaim_scope, moe_scope:
-            return self._model_caller(**kwargs)
+        try:
+            with reclaim_scope, moe_scope:
+                if compact is None:
+                    return self._model_caller(**kwargs)
+                # The reclaimer owns the original metadata. Bind scratch only
+                # after it has begun tracking this forward's workspace demand.
+                compact.metadata.workspace = metadata.workspace
+                compact.metadata.cuda_graph_workspace = metadata.cuda_graph_workspace
+                kwargs = compact.pack_inputs(kwargs)
+                outputs = self._model_caller(**kwargs)
+                metadata.workspace_reclaimable &= compact.metadata.workspace_reclaimable
+                return compact.restore_logits(outputs)
+        finally:
+            if compact is not None and not metadata.is_cuda_graph:
+                # Reclamation may replace the original workspace tensor; a
+                # cached view must not keep the previous allocation alive.
+                compact.metadata.workspace = None
 
     @nvtx_range("_forward_step")
     def _forward_step(
