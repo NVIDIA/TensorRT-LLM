@@ -176,7 +176,15 @@ class ReceiveBounds:
             )
         if np.any(dst_ptrs < 0) or np.any(sizes <= 0):
             raise ValueError("bounce fragments require non-negative addresses and positive sizes")
-        if dst_ptrs.size > capacity or sum(map(int, sizes)) > capacity:
+        # Vectorized total check: this runs on the listener thread under the session lock and a
+        # TP-mismatched result can carry hundreds of thousands of fragments. Every size is
+        # positive and at most ``capacity`` (< 2**63), so a running uint64 sum exceeds
+        # ``capacity`` strictly before it could wrap around; the prefix comparison is exact.
+        if (
+            dst_ptrs.size > capacity
+            or np.any(sizes > capacity)
+            or np.any(np.cumsum(sizes, dtype=np.uint64) > np.uint64(capacity))
+        ):
             raise ValueError("bounce fragments exceed the writer's receive region")
 
         starts = np.frombuffer(self._starts, dtype=np.uint64)
