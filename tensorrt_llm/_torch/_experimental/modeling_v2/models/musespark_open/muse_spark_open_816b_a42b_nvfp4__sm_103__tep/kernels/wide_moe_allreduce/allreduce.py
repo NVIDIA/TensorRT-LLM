@@ -134,8 +134,11 @@ class WideMoeAllReduce(torch.nn.Module):
 
 def refusal(model: torch.nn.Module) -> Optional[str]:
     """Why ``install`` cannot take the model's MoE all-reduces, or None. Changes nothing."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        return "it is written for sm_103"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 3),
+        (10, 7),
+    ):
+        return "it is written for sm_103 and sm_107"
     mapping = model.layers[0].mapping
     if mapping.tp_size != 4 or mapping.is_multi_node():
         return f"it serves TP4 on one node, got TP{mapping.tp_size}"

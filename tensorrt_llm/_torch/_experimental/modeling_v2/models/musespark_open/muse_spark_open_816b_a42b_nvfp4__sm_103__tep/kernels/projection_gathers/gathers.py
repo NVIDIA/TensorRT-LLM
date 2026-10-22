@@ -112,11 +112,17 @@ def _require_aligned(**tensors: torch.Tensor) -> None:
 
 
 class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
-    """The built-in MoE, whose pool and unpool may hand their slices on ungathered."""
+    """The built-in MoE, whose pool and unpool may hand their slices on ungathered.
+
+    ``_defer_max_rows``: the most rows whose slices are handed on ungathered;
+    ``MAX_ROWS``, or ``WIDE_MAX_ROWS`` once ``wide_prologue`` gave the layer's consumers
+    wide inboxes (``kernels/wide_prologue``).
+    """
 
     _defer_unpool: bool
     _defer_pool: bool
     _pool_inbox: Optional[ProjectionInbox]
+    _defer_max_rows: int = MAX_ROWS
     #: ``wide_projection_gathers``: its arming (``WideProjections``) and the pool site's
     #: 32-row inbox; None without the path.
     _wide = None
@@ -143,7 +149,7 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             or torch.compiler.is_compiling()
             or hidden_states.dtype != torch.bfloat16
             or hidden_states.ndim != 2
-            or not 0 < hidden_states.shape[0] <= fused_rows(self)
+            or not 0 < hidden_states.shape[0] <= max(self._defer_max_rows, fused_rows(self))
             or not hidden_states.is_contiguous()
         ):
             return super()._replicated_projection(module, hidden_states, workspace)
@@ -195,9 +201,13 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             pooled = self._pool_gather_workspace.gather(pooled)
         return super().prepare_expert_input(pooled)
 
-    def _pool_quant_args(self, pooled: torch.Tensor):
+    def _pool_quant_args(self, pooled: torch.Tensor, max_rows: Optional[int] = None):
         """(gain, global scale) exactly when the built-in would quantize the gathered row
-        with flashinfer's fused ``rmsnorm_fp4quant``; ``None`` otherwise.
+        with flashinfer's fused ``rmsnorm_fp4quant``, on a call of at most ``max_rows`` rows
+        (the inbox the caller's fused op uses: ``moe_prologue``'s 8-row or ``wide_prologue``'s
+        wide one); ``None`` otherwise. Without ``max_rows``, on this class's own inboxes: the
+        8-row one up to 8 rows, ``wide_projection_gathers``' 32-row one above while it is
+        armed (``fused_rows``).
 
         The built-in conditions of ``prepare_expert_input``, evaluated for the
         gathered row it would have seen (same rows, BF16, CUDA, contiguous).
@@ -210,7 +220,11 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
 
         backend = getattr(self.experts, "backend", self.experts)
         rows = pooled.shape[0]
-        inbox = self._pool_inbox if rows <= MAX_ROWS else self._wide_pool_inbox
+        if max_rows is None:
+            inbox = self._pool_inbox if rows <= MAX_ROWS else self._wide_pool_inbox
+            max_rows = fused_rows(self)
+        else:
+            inbox = self._pool_inbox
         if (
             inbox is None
             or not getattr(self, "_pre_expert_quant_fused", True)
@@ -222,7 +236,7 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             or not isinstance(getattr(backend, "op_backend", None), TRTLLMOpBackend)
             or not getattr(backend, "has_nvfp4", False)
             or getattr(backend, "fc31_act_scale", None) is not None
-            or not 1 <= rows <= fused_rows(self)
+            or not 1 <= rows <= max_rows
             or rows > getattr(self.experts, "moe_max_num_tokens", rows)
             or not rmsnorm_fp4_quant_available()
         ):
@@ -252,9 +266,12 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
     ``_capture_fold`` (set by ``capture_fold`` for one call) is a
     DFlash capture view the fused kernel also writes ``updated.to(bfloat16)``
     into; ``_capture_stored`` records that it did. Unset, the join is the plain fused gather join.
+    ``_gather_inbox_wide`` (``wide_prologue``) is the TP4 wide inbox the join takes for
+    9..32-row calls; ``None`` leaves those to the built-in gather.
     """
 
     _gather_inbox: Optional[ProjectionInbox]
+    _gather_inbox_wide: Optional[ProjectionInbox] = None
     _gather: Optional[object]
     #: ``wide_projection_gathers``: its arming and the unpool site's 32-row inbox; None
     #: without the path.
@@ -287,7 +304,8 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
             and residual.shape[-1] == _unpool.HIDDEN
         ):
             alpha, beta = self.coefficients()
-            fused = self._fits_fused(residual, branch, next_norm, gain, alpha, beta)
+            inbox = self._inbox_for(residual)
+            fused = self._fits_fused(residual, branch, next_norm, gain, alpha, beta, inbox)
             if branch.shape[0] > MAX_ROWS and self._wide is not None:
                 self._wide.report("unpool", branch.shape[0], fused)
             if fused:
@@ -298,9 +316,6 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
                     alpha=alpha,
                     beta=beta,
                     weight=next_norm.weight,
-                )
-                inbox = (
-                    self._gather_inbox if residual.shape[0] <= MAX_ROWS else self._wide_gather_inbox
                 )
                 capture = self._capture_fold
                 if capture is not None and not _unpool.capture_fits(
@@ -345,7 +360,18 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
             branch = self._gather.gather(branch)
         return super()._add_after_rmsnorm_and_norm(residual, branch, eps, next_norm, gain)
 
-    def _fits_fused(self, residual, branch, next_norm, gain, alpha, beta) -> bool:
+    def _inbox_for(self, residual: torch.Tensor) -> Optional[ProjectionInbox]:
+        """The inbox a call of ``residual``'s row count takes: the 8-row one up to 8 rows,
+        the wide one above (``wide_prologue``'s when installed, else
+        ``wide_projection_gathers``'). Reads only the shape."""
+        rows = residual.shape[0] if residual.dim() == 2 else 0
+        if rows <= MAX_ROWS:
+            return self._gather_inbox
+        if self._gather_inbox_wide is not None:
+            return self._gather_inbox_wide
+        return self._wide_gather_inbox
+
+    def _fits_fused(self, residual, branch, next_norm, gain, alpha, beta, inbox=None) -> bool:
         """Exactly when the built-in join would run the cluster boundary kernel.
 
         ``_add_after_rmsnorm_and_norm`` takes the cluster kernel when its fused
@@ -360,12 +386,18 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
 
         hidden = _unpool.HIDDEN
         rows = residual.shape[0] if residual.dim() == 2 else 0
-        inbox = self._gather_inbox if rows <= MAX_ROWS else self._wide_gather_inbox
+        if inbox is None:
+            inbox = self._inbox_for(residual)
+        # wide_prologue's inbox bounds its own calls; otherwise wide_projection_gathers'
+        # arming bounds them too (``fused_rows``).
+        most = _unpool.max_rows(inbox) if inbox is not None else 0
+        if self._gather_inbox_wide is None:
+            most = min(fused_rows(self), most)
         if not (
             inbox is not None
             and self._fused_enabled
             and not torch.compiler.is_compiling()
-            and 1 <= rows <= min(fused_rows(self), _unpool.max_rows(inbox))
+            and 1 <= rows <= most
             and branch.shape[0] == rows
             and residual.is_cuda
             and residual.dtype == torch.float32

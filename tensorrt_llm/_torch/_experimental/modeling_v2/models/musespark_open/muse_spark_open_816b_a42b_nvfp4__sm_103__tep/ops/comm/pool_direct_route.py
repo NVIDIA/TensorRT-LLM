@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The routed pool kernel on a transport its producers publish into themselves (``pool_into_route``).
 
-``pool_gather_route`` (the tagged routed pool kernel of ``moe_prologue``) loads this rank's ``[M, 512]`` pool
-slice and ``[M, 32]`` router logits after its dependency wait, publishes both to
+``pool_gather_route`` (the tagged routed pool kernel of ``moe_prologue``) loads this rank's ``[M, C]`` pool
+slice and ``[M, L]`` router logits after its dependency wait (``C`` = 512 columns
+and ``L`` = 32 experts at TP8, 1024 and 64 at TP4), publishes both to
 the peers as tagged 64-bit words, and polls the peers' words. Here the pool GEMM's
 output tensor *is* this rank's pool slot of a multicast transport, and the router
 shard (``ops/moe/router_shard.router_shard_publish``, on the router fork's side stream)
@@ -14,12 +15,15 @@ publication and RMSNorm + NVFP4 quantization statement for statement. Off
 the critical path: the dependency-wait release followed by the reload of the
 local slice and logits and their publication.
 
-Transport (Lamport, payload as flag). Every rank holds ``3 buffers x 8 source
-ranks`` records of ``RECORD_WORDS`` 32-bit words, filled with the sentinel word
-``0xFFFEFFFE``. A record is the source rank's pool slot -- ``[8, 512]`` BF16,
+Transport (Lamport, payload as flag). Every rank holds ``3 buffers x world source
+ranks`` records of ``record_words(world)`` 32-bit words, filled with the sentinel word
+``0xFFFEFFFE``. A record is the source rank's pool slot -- ``[8, C]`` BF16,
 row-major, one contiguous block, a GEMM output as it is -- followed by
-``CTAS`` logit boxes of ``[8, 32]`` FP32, one per CTA of the routed kernel (a
+``CTAS`` logit boxes of ``[8, L]`` FP32, one per CTA of the routed kernel (a
 CTA routes every row, so each CTA reads a full copy and resets only its own).
+A thread of the quantizing warps polls its ``_VECTORS`` 16-byte pieces of a row
+where the tagged kernel would have them: vector ``v`` in sender ``owner(v)``'s slot
+(one sender per vector at TP8, two vectors per sender at TP4).
 
 * Pool slot: float-to-BF16 rounding (``cvt.rn.bf16{x2}.f32``, the GEMM
   epilogues') turns every NaN into ``0x7FFF``, so no product holds the half
@@ -87,11 +91,13 @@ from tensorrt_llm.mapping import Mapping
 
 from . import pool_gather_route as _route
 from . import unpool_direct_boundary as _direct
-from .pool_gather_fp4quant import BLOCK, HIDDEN, local_columns
+from .pool_gather_fp4quant import _VECTOR_SPAN_WORDS, _VECTORS, BLOCK, HIDDEN, local_columns
 from .projection_inbox import MAX_ROWS
 
-#: The TP size this transport is laid out for: TP8 over two trays. TP4 keeps the
-#: inbox path of ``pool_gather_route`` (``moe_prologue``).
+#: The TP sizes this transport is laid out for: TP8 over two trays and TP4 on one.
+WORLDS = (4, 8)
+#: The TP8 layout's values, which the TP8-only callers read; ``record_words(world)``
+#: and its siblings give every layout.
 WORLD = 8
 LOCAL_COLUMNS = local_columns(WORLD)
 
@@ -101,6 +107,7 @@ TOP_K = _route.TOP_K
 PLACE_NONE = _route.PLACE_NONE
 PLACE_BALANCE = _route.PLACE_BALANCE
 PLACE_BALANCE3 = _route.PLACE_BALANCE3
+PLACE_HALF = _route.PLACE_HALF
 #: Buffers: two that alternate call by call, a third for the last call of an odd count.
 BUFFERS = _direct.BUFFERS
 buffer_sequence = _direct.buffer_sequence
@@ -110,12 +117,41 @@ DIRECT_SENTINEL = _direct.DIRECT_SENTINEL
 _SENTINEL_I32 = DIRECT_SENTINEL - (1 << 32)
 #: CTAs of the routed kernel at ``MAX_ROWS`` rows (two rows each): one logit box each.
 CTAS = MAX_ROWS // 2
-#: 32-bit words of one row of a pool slot, of a pool slot, of a logit box, of a record.
-POOL_ROW_WORDS = LOCAL_COLUMNS // 2
-POOL_SLOT_WORDS = MAX_ROWS * POOL_ROW_WORDS
-BOX_WORDS = MAX_ROWS * LOCAL_EXPERTS
-RECORD_WORDS = POOL_SLOT_WORDS + CTAS * BOX_WORDS
-WORKSPACE_BYTES = BUFFERS * WORLD * RECORD_WORDS * 4
+CHUNKS = _route.CHUNKS
+
+
+def pool_row_words(world: int) -> int:
+    """32-bit words of one row of a pool slot: ``local_columns(world)`` BF16."""
+    return local_columns(world) // 2
+
+
+def pool_slot_words(world: int) -> int:
+    """32-bit words of a pool slot: ``MAX_ROWS`` rows."""
+    return MAX_ROWS * pool_row_words(world)
+
+
+def box_words(world: int) -> int:
+    """32-bit words of a logit box: ``[MAX_ROWS, local_experts(world)]`` FP32."""
+    return MAX_ROWS * _route.local_experts(world)
+
+
+def record_words(world: int) -> int:
+    """32-bit words of a record: the pool slot, then ``CTAS`` logit boxes."""
+    return pool_slot_words(world) + CTAS * box_words(world)
+
+
+def workspace_bytes(world: int) -> int:
+    """Bytes of one rank's copy of the transport: ``BUFFERS x world`` records."""
+    return BUFFERS * world * record_words(world) * 4
+
+
+#: 32-bit words of one row of a pool slot, of a pool slot, of a logit box, of a record
+#: (the TP8 layout).
+POOL_ROW_WORDS = pool_row_words(WORLD)
+POOL_SLOT_WORDS = pool_slot_words(WORLD)
+BOX_WORDS = box_words(WORLD)
+RECORD_WORDS = record_words(WORLD)
+WORKSPACE_BYTES = workspace_bytes(WORLD)
 #: Per-rank control words in pinned host memory: ``GUARD_WORD`` is set by a poll that
 #: outlived the guard.
 CONTROL_WORDS = 4
@@ -219,12 +255,26 @@ if _AVAILABLE:
             stamps: int,
             guard_ns: int,
             guard_break: bool,
+            world: int = WORLD,
         ):
             super().__init__(
-                peer_rank, place, static_from, True, False, publish, epoch_word, trigger, stamps
+                peer_rank,
+                place,
+                static_from,
+                True,
+                False,
+                publish,
+                epoch_word,
+                trigger,
+                stamps,
+                world,
             )
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
+            self.pool_row_words = pool_row_words(world)
+            self.pool_slot_words = pool_slot_words(world)
+            self.box_words = box_words(world)
+            self.record_words = record_words(world)
 
         @cute.jit
         def __call__(
@@ -351,9 +401,12 @@ if _AVAILABLE:
             sWeights = smem.allocate_tensor(
                 Uint32, cute.make_layout((MAX_ROWS * TOP_K,)), byte_alignment=16
             )
-            sCensus = smem.allocate_tensor(Uint32, cute.make_layout((WORLD,)), byte_alignment=16)
-            # This buffer's records in the local copy: sender b's at records + b * RECORD_WORDS * 4.
-            records = receive + Int64(buffer) * Int64(WORLD * RECORD_WORDS * 4)
+            sCensus = smem.allocate_tensor(Uint32, cute.make_layout((CHUNKS,)), byte_alignment=16)
+            world = self.world
+            local_count = self.local_experts
+            record_bytes = self.record_words * 4
+            # This buffer's records in the local copy: sender b's at records + b * record_bytes.
+            records = receive + Int64(buffer) * Int64(world * record_bytes)
 
             # A dry launch only makes the driver load the module, outside any capture.
             if dry == Int32(0):
@@ -382,26 +435,31 @@ if _AVAILABLE:
                     tXsX = thr_copy_X.partition_D(sX)
                     tXrX = cute.make_fragment_like(tXgX)
 
-                    # Phase 1: the pool gather, from the eight senders' slots.
+                    # Phase 1: the pool gather, from the senders' slots: vector v of a
+                    # thread lies in sender owner(v)'s slot at word offset(v) + 4 * lane.
                     actual_row_idx = bidx * rows_per_block + row_in_block
                     if actual_row_idx < M:
                         word = Int64(lane_in_row * 4)
                         row64 = Int64(actual_row_idx)
-                        piece = (row64 * POOL_ROW_WORDS + word) * 4
-                        received = cute.make_rmem_tensor(cute.make_layout((4 * WORLD,)), Uint32)
+                        piece = (row64 * self.pool_row_words + word) * 4
+                        received = cute.make_rmem_tensor(cute.make_layout((4 * _VECTORS,)), Uint32)
                         start = Int64(0)
                         if cutlass.const_expr(self.guard_ns > 0):
                             start = _globaltimer()
                         pending = Uint32(1)
                         while pending != Uint32(0):
                             pending = Uint32(0)
-                            for b in cutlass.range_constexpr(WORLD):
-                                box = records + Int64(b * RECORD_WORDS * 4) + piece
+                            for v in cutlass.range_constexpr(_VECTORS):
+                                box = (
+                                    records
+                                    + Int64(self.owner(v) * record_bytes + self.offset(v) * 4)
+                                    + piece
+                                )
                                 p0, p1, p2, p3 = _poll_x4(box)
-                                received[4 * b] = p0
-                                received[4 * b + 1] = p1
-                                received[4 * b + 2] = p2
-                                received[4 * b + 3] = p3
+                                received[4 * v] = p0
+                                received[4 * v + 1] = p1
+                                received[4 * v + 2] = p2
+                                received[4 * v + 3] = p3
                                 pending = pending | _pending(p0, p1, p2, p3)
                             if cutlass.const_expr(self.guard_ns > 0):
                                 if pending != Uint32(0):
@@ -410,14 +468,18 @@ if _AVAILABLE:
                                         if cutlass.const_expr(self.guard_break):
                                             pending = Uint32(0)
                         gathered_row = mX.iterator.toint() + row64 * (H * 2)
-                        for b in cutlass.range_constexpr(WORLD):
+                        for v in cutlass.range_constexpr(_VECTORS):
                             # Retire the consumed bytes before this grid can complete.
-                            _reset_x4(records + Int64(b * RECORD_WORDS * 4) + piece)
-                            w0 = received[4 * b]
-                            w1 = received[4 * b + 1]
-                            w2 = received[4 * b + 2]
-                            w3 = received[4 * b + 3]
-                            column = b * LOCAL_COLUMNS + lane_in_row * 8
+                            _reset_x4(
+                                records
+                                + Int64(self.owner(v) * record_bytes + self.offset(v) * 4)
+                                + piece
+                            )
+                            w0 = received[4 * v]
+                            w1 = received[4 * v + 1]
+                            w2 = received[4 * v + 2]
+                            w3 = received[4 * v + 3]
+                            column = v * (2 * _VECTOR_SPAN_WORDS) + lane_in_row * 8
                             _store_shared_words(
                                 sX.iterator + row_in_block * H + column, w0, w1, w2, w3
                             )
@@ -498,14 +560,14 @@ if _AVAILABLE:
                     # ======================================================
                     # Warps 4-7: the logit boxes of this CTA (one per sender),
                     # the routing of all M rows (warp 4 + w takes rows w and
-                    # w + 4; lane l holds expert 32k + l of block k) and the
+                    # w + 4; lane l holds expert 32k + l of chunk k) and the
                     # placement.
                     # ======================================================
                     rt = tidx - QUANT_THREADS
                     rwarp = warp - QUANT_WARPS
                     # The expert bias is a parameter: read before the wait.
                     bias_k = [
-                        _ld_global_b32(bias + Int64((32 * k + lane) * 4)) for k in range(WORLD)
+                        _ld_global_b32(bias + Int64((32 * k + lane) * 4)) for k in range(CHUNKS)
                     ]
                     if enable_pdl:
                         cute.arch.griddepcontrol_wait()
@@ -522,20 +584,22 @@ if _AVAILABLE:
                         if rt == 0:
                             _stamp_timer(Int64(self.stamps) + Int64(bidx * 64))
                     if cutlass.const_expr(self.place != PLACE_NONE):
-                        if rt < WORLD:
+                        if rt < CHUNKS:
                             _st_shared_b32(sCensus.iterator + rt, Uint32(0))
-                    if rt * 4 < M * LOCAL_EXPERTS:
+                    if rt * 4 < M * local_count:
                         word = Int64(rt * 4)
-                        piece = (Int64(POOL_SLOT_WORDS) + Int64(bidx * BOX_WORDS) + word) * 4
-                        received = cute.make_rmem_tensor(cute.make_layout((4 * WORLD,)), Uint32)
+                        piece = (
+                            Int64(self.pool_slot_words) + Int64(bidx * self.box_words) + word
+                        ) * 4
+                        received = cute.make_rmem_tensor(cute.make_layout((4 * world,)), Uint32)
                         start = Int64(0)
                         if cutlass.const_expr(self.guard_ns > 0):
                             start = _globaltimer()
                         pending = Uint32(1)
                         while pending != Uint32(0):
                             pending = Uint32(0)
-                            for b in cutlass.range_constexpr(WORLD):
-                                box = records + Int64(b * RECORD_WORDS * 4) + piece
+                            for b in cutlass.range_constexpr(world):
+                                box = records + Int64(b * record_bytes) + piece
                                 q0, q1, q2, q3 = _poll_x4(box)
                                 received[4 * b] = q0
                                 received[4 * b + 1] = q1
@@ -548,16 +612,16 @@ if _AVAILABLE:
                                         _set_guard_word(control + Int64(GUARD_WORD * 4))
                                         if cutlass.const_expr(self.guard_break):
                                             pending = Uint32(0)
-                        # This thread's words: row (4 rt) // 32 of the block, experts
-                        # (4 rt) % 32 .. + 3 of each sender's 32.
-                        logit_row = (rt * 4) // LOCAL_EXPERTS
-                        logit_col = (rt * 4) % LOCAL_EXPERTS
-                        for b in cutlass.range_constexpr(WORLD):
-                            _reset_x4(records + Int64(b * RECORD_WORDS * 4) + piece)
+                        # This thread's words: row (4 rt) // L of the block, experts
+                        # (4 rt) % L .. + 3 of each sender's L.
+                        logit_row = (rt * 4) // local_count
+                        logit_col = (rt * 4) % local_count
+                        for b in cutlass.range_constexpr(world):
+                            _reset_x4(records + Int64(b * record_bytes) + piece)
                             _store_shared_words(
                                 sLogits.iterator
                                 + logit_row * EXPERTS
-                                + b * LOCAL_EXPERTS
+                                + b * local_count
                                 + logit_col,
                                 received[4 * b],
                                 received[4 * b + 1],
@@ -586,7 +650,7 @@ if _AVAILABLE:
                     for half in cutlass.range_constexpr(2):
                         row = rwarp + 4 * half
                         keys = []
-                        for k in cutlass.range_constexpr(WORLD):
+                        for k in cutlass.range_constexpr(CHUNKS):
                             expert = 32 * k + lane
                             logit = _ld_shared_b32(sLogits.iterator + row * EXPERTS + expert)
                             keys.append(
@@ -635,66 +699,121 @@ if _AVAILABLE:
                         w0, w1, w2, w3 = _load_shared_words(sCensus.iterator)
                         w4, w5, w6, w7 = _load_shared_words(sCensus.iterator + 4)
                         words = [w0, w1, w2, w3, w4, w5, w6, w7]
-                        loads = [_popc(w) for w in words]
-                        lane_r = Uint32(lane) & Uint32(WORLD - 1)
+                        # Per block: its chunk (TP8) or its chunk pair (TP4).
+                        per = CHUNKS // world
+                        loads = []
+                        for b in cutlass.range_constexpr(world):
+                            load_b = _popc(words[per * b])
+                            for c in cutlass.range_constexpr(1, per):
+                                load_b = load_b + _popc(words[per * b + c])
+                            loads.append(load_b)
+                        lane_r = Uint32(lane) & Uint32(world - 1)
                         x2s = None
                         if cutlass.const_expr(self.place == PLACE_BALANCE):
                             held = loads[0]
-                            for b in cutlass.range_constexpr(1, WORLD):
+                            for b in cutlass.range_constexpr(1, world):
                                 held = _sel(_eq(lane_r, Uint32(b)), loads[b], held)
                             arc = Uint32(0)
                             arcs = []
                             need = Uint32(0)
-                            for k in cutlass.range_constexpr(WORLD):
+                            for k in cutlass.range_constexpr(world):
                                 span = k + 1
                                 arc = arc + _shfl_idx_b32(
-                                    held, (lane_r - Uint32(k)) & Uint32(WORLD - 1)
+                                    held, (lane_r - Uint32(k)) & Uint32(world - 1)
                                 )
                                 arcs.append(arc)
-                                if cutlass.const_expr(span == WORLD):
-                                    need = _max_s32(need, _div_u32(arc + Uint32(WORLD - 1), WORLD))
+                                if cutlass.const_expr(span == world):
+                                    need = _max_s32(need, _div_u32(arc + Uint32(world - 1), world))
                                 else:
                                     need = _max_s32(need, _div_u32(arc + Uint32(span), span + 1))
                             t = _redux_max_s32(need)
                             moved_r = Uint32(0)
-                            for k in cutlass.range_constexpr(WORLD):
+                            for k in cutlass.range_constexpr(world):
                                 moved_r = _max_s32(moved_r, arcs[k] - Uint32(k + 1) * t)
-                            xs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(WORLD)]
+                            xs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(world)]
+                        elif cutlass.const_expr(self.place == PLACE_HALF):
+                            # pool_gather_route's half window (TP4): the two-window flow with
+                            # T >= ceil((arc - movable[r]) / (k + 1)) for every arc ending at
+                            # rank r, movable[r] the present experts of r's upper half.
+                            held = loads[0]
+                            for b in cutlass.range_constexpr(1, world):
+                                held = _sel(_eq(lane_r, Uint32(b)), loads[b], held)
+                            movable = _popc(words[1])
+                            for b in cutlass.range_constexpr(1, world):
+                                movable = _sel(
+                                    _eq(lane_r, Uint32(b)), _popc(words[2 * b + 1]), movable
+                                )
+                            arc = Uint32(0)
+                            arcs = []
+                            need = Uint32(0)
+                            for k in cutlass.range_constexpr(world):
+                                span = k + 1
+                                arc = arc + _shfl_idx_b32(
+                                    held, (lane_r - Uint32(k)) & Uint32(world - 1)
+                                )
+                                arcs.append(arc)
+                                if cutlass.const_expr(span == world):
+                                    need = _max_s32(need, _div_u32(arc + Uint32(world - 1), world))
+                                else:
+                                    need = _max_s32(need, _div_u32(arc + Uint32(span), span + 1))
+                                # arc >= load[r] >= movable[r]: no wrap.
+                                need = _max_s32(
+                                    need, _div_u32(arc - movable + Uint32(span - 1), span)
+                                )
+                            t = _redux_max_s32(need)
+                            moved_r = Uint32(0)
+                            for k in cutlass.range_constexpr(world):
+                                moved_r = _max_s32(moved_r, arcs[k] - Uint32(k + 1) * t)
+                            xs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(world)]
                         elif cutlass.const_expr(self.place == PLACE_BALANCE3):
                             held = loads[0]
-                            for b in cutlass.range_constexpr(1, WORLD):
+                            for b in cutlass.range_constexpr(1, world):
                                 held = _sel(_eq(lane_r, Uint32(b)), loads[b], held)
                             arc = Uint32(0)
                             arcs = []
                             need = Uint32(0)
-                            for k in cutlass.range_constexpr(WORLD):
-                                reach = min(k + 3, WORLD)
+                            for k in cutlass.range_constexpr(world):
+                                reach = min(k + 3, world)
                                 arc = arc + _shfl_idx_b32(
-                                    held, (lane_r - Uint32(k)) & Uint32(WORLD - 1)
+                                    held, (lane_r - Uint32(k)) & Uint32(world - 1)
                                 )
                                 arcs.append(arc)
                                 need = _max_s32(need, _div_u32(arc + Uint32(reach - 1), reach))
                             t = _redux_max_s32(need)
                             moved_r = Uint32(0)
-                            for k in cutlass.range_constexpr(WORLD):
+                            for k in cutlass.range_constexpr(world):
                                 moved_r = _max_s32(moved_r, arcs[k] - Uint32(k + 1) * t)
-                            cs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(WORLD)]
-                            xs = [_min_u32(cs[b], loads[b]) for b in range(WORLD)]
+                            cs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(world)]
+                            xs = [_min_u32(cs[b], loads[b]) for b in range(world)]
                             x2s = [
-                                _max_s32(Uint32(0), cs[(b + 1) % WORLD] - loads[(b + 1) % WORLD])
-                                for b in range(WORLD)
+                                _max_s32(Uint32(0), cs[(b + 1) % world] - loads[(b + 1) % world])
+                                for b in range(world)
                             ]
                         elif cutlass.const_expr(self.place == _route.PLACE_STATIC):
-                            xs = [_popc(w >> self.static_from) for w in words]
+                            if cutlass.const_expr(world == WORLD):
+                                xs = [_popc(w >> self.static_from) for w in words]
+                            else:
+                                # Present experts at index static_from or above of each block.
+                                xs = []
+                                for b in cutlass.range_constexpr(world):
+                                    count = Uint32(0)
+                                    for c in cutlass.range_constexpr(per):
+                                        shift = self.static_from - _route.CHUNK * c
+                                        if shift <= 0:
+                                            count = count + _popc(words[per * b + c])
+                                        elif shift < _route.CHUNK:
+                                            count = count + _popc(words[per * b + c] >> shift)
+                                    xs.append(count)
                             moved_r = xs[0]
-                            for b in cutlass.range_constexpr(1, WORLD):
+                            for b in cutlass.range_constexpr(1, world):
                                 moved_r = _sel(_eq(lane_r, Uint32(b)), xs[b], moved_r)
                         else:
-                            xs = [Uint32(0) for _ in range(WORLD)]
+                            xs = [Uint32(0) for _ in range(world)]
                             moved_r = Uint32(0)
                         from_prev = _shfl_idx_b32(
-                            moved_r, (lane_r + Uint32(WORLD - 1)) & Uint32(WORLD - 1)
+                            moved_r, (lane_r + Uint32(world - 1)) & Uint32(world - 1)
                         )
+                        half = self.place == PLACE_HALF
                         if cutlass.const_expr(self.publish != 0):
                             # Early ids: CTA 0 publishes every row's placed ids, before its own
                             # rows' stores, as in pool_gather_route.
@@ -706,7 +825,9 @@ if _AVAILABLE:
                                 if pubs != Uint32(0):
                                     pslot = prow * TOP_K + lane
                                     pg = _ld_shared_b32(sSelected.iterator + pslot)
-                                    pplaced = _placed_expert(pg, words, xs, self.peer_rank, x2s)
+                                    pplaced = _placed_expert(
+                                        pg, words, xs, self.peer_rank, x2s, world, half
+                                    )
                                     pplaced = _sel(
                                         _lt_u(Uint32(prow), Uint32(M)),
                                         pplaced,
@@ -727,22 +848,22 @@ if _AVAILABLE:
                         if writes != Uint32(0):
                             slot_index = own_row * TOP_K + lane
                             g = _ld_shared_b32(sSelected.iterator + slot_index)
-                            placed = _placed_expert(g, words, xs, self.peer_rank, x2s)
+                            placed = _placed_expert(g, words, xs, self.peer_rank, x2s, world, half)
                             _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
                             w_bits = _ld_shared_b32(sWeights.iterator + slot_index)
                             _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
                         held_load = loads[0]
-                        for b in cutlass.range_constexpr(1, WORLD):
+                        for b in cutlass.range_constexpr(1, world):
                             held_load = _sel(_eq(lane_r, Uint32(b)), loads[b], held_load)
                         reports = (
                             _eq(Uint32(bidx), Uint32(0))
                             & _eq(Uint32(rwarp), Uint32(2))
-                            & _lt_u(Uint32(lane), Uint32(WORLD))
+                            & _lt_u(Uint32(lane), Uint32(world))
                         )
                         if reports != Uint32(0):
                             _st_global_b32(stats + Int64(lane) * 4, held_load)
                             _st_global_b32(
-                                stats + Int64(lane + WORLD) * 4, held_load - moved_r + from_prev
+                                stats + Int64(lane + world) * 4, held_load - moved_r + from_prev
                             )
                     if cutlass.const_expr(self.stamps != 0):
                         if rt == 0:
@@ -764,6 +885,7 @@ if _AVAILABLE:
         stamps: int,
         guard_ns: int,
         guard_break: bool,
+        world: int = WORLD,
     ):
         kernel = _PoolDirectRouteKernel(
             peer_rank,
@@ -775,6 +897,7 @@ if _AVAILABLE:
             stamps,
             guard_ns,
             guard_break,
+            world,
         )
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
@@ -850,11 +973,12 @@ def variant(
 
 
 class PoolDirectWorkspace:
-    """The direct transport of the routed pool kernel (``pool_into_route``) for one TP8 group.
+    """The direct transport of the routed pool kernel (``pool_into_route``) for one TP8 or TP4 group.
 
-    ``slot(buffer, rows)`` is this rank's ``[rows, 512]`` BF16 pool slot of
-    ``buffer`` and ``boxes(buffer, rows)`` its ``[publish_copies(rows), 256]`` FP32
-    logit boxes, both on the multicast address: a producer given them as its output
+    ``slot(buffer, rows)`` is this rank's ``[rows, local_columns(world)]`` BF16 pool
+    slot of ``buffer`` (512 columns at TP8, 1024 at TP4) and ``boxes(buffer, rows)``
+    its ``[publish_copies(rows), box_words(world)]`` FP32 logit boxes, both on the
+    multicast address: a producer given them as its output
     publishes into every rank's copy. ``kernel(variant)`` is the compiled routed
     kernel for a call's settings. Construction is collective over the group (fabric
     allocation and sentinel fill), and so is ``build_variants``; both succeed on
@@ -880,9 +1004,14 @@ class PoolDirectWorkspace:
             _mnnvl_workspace_all_succeeded,
         )
 
-        if mapping.tp_size != WORLD or mapping.enable_attention_dp or mapping.cp_size != 1:
-            raise ValueError("the direct pool transport needs TP8 without attention DP or CP")
+        if mapping.tp_size not in WORLDS or mapping.enable_attention_dp or mapping.cp_size != 1:
+            raise ValueError(
+                "the direct pool transport needs TP8 or TP4 without attention DP or CP"
+            )
         self.rank = mapping.tp_rank
+        #: The group size, which fixes the layout (``record_words(world)``).
+        self.world = int(mapping.tp_size)
+        self.record_words = record_words(self.world)
         self.guard_ns = int(guard_ns)
         self.guard_break = bool(guard_break)
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
@@ -908,13 +1037,12 @@ class PoolDirectWorkspace:
         error: Optional[BaseException] = None
         try:
             use_fabric = mapping.is_multi_node()
-            self._handle = _make_mnnvl_mcast_buffer(
-                self._comm, WORKSPACE_BYTES, mapping, use_fabric
-            )
-            words = WORKSPACE_BYTES // 4
+            nbytes = workspace_bytes(self.world)
+            self._handle = _make_mnnvl_mcast_buffer(self._comm, nbytes, mapping, use_fabric)
+            words = nbytes // 4
             self._receive = self._handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
             self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
-            self._records = self._mc.view(BUFFERS, WORLD, RECORD_WORDS)
+            self._records = self._mc.view(BUFFERS, self.world, self.record_words)
             with torch.cuda.device(self.device):
                 self._receive.fill_(_SENTINEL_I32)
                 self.control = torch.zeros(
@@ -939,29 +1067,33 @@ class PoolDirectWorkspace:
         return self._records[buffer, self.rank]
 
     def slot(self, buffer: int, rows: int) -> torch.Tensor:
-        """This rank's ``[rows, 512]`` BF16 pool slot of ``buffer``, on the multicast address.
+        """This rank's ``[rows, local_columns(world)]`` BF16 pool slot of ``buffer``, on the multicast address.
 
         Write-only: a store through it reaches every rank's copy; nothing may read it.
         """
         if not 1 <= rows <= MAX_ROWS:
             raise ValueError(f"no slot for {rows} rows")
         record = self._record(buffer)
-        return record[: rows * POOL_ROW_WORDS].view(torch.bfloat16).view(rows, LOCAL_COLUMNS)
+        return (
+            record[: rows * pool_row_words(self.world)]
+            .view(torch.bfloat16)
+            .view(rows, local_columns(self.world))
+        )
 
     def boxes(self, buffer: int, rows: int) -> torch.Tensor:
-        """This rank's ``[publish_copies(rows), 256]`` FP32 logit boxes of ``buffer`` (multicast; write-only)."""
+        """This rank's ``[publish_copies(rows), box_words(world)]`` FP32 logit boxes of ``buffer``.
+
+        Multicast and write-only.
+        """
         if not 1 <= rows <= MAX_ROWS:
             raise ValueError(f"no boxes for {rows} rows")
         copies = (rows + 1) // 2
         record = self._record(buffer)
-        return (
-            record[POOL_SLOT_WORDS : POOL_SLOT_WORDS + copies * BOX_WORDS]
-            .view(torch.float32)
-            .view(copies, BOX_WORDS)
-        )
+        start, box = pool_slot_words(self.world), box_words(self.world)
+        return record[start : start + copies * box].view(torch.float32).view(copies, box)
 
     def receive(self) -> torch.Tensor:
-        """This rank's copy of the whole transport, ``int32 [3 * 8 * RECORD_WORDS]`` (tests)."""
+        """This rank's copy of the whole transport, ``int32 [3 * world * record_words(world)]`` (tests)."""
         return self._receive
 
     def control_ptr(self) -> int:
@@ -1071,10 +1203,11 @@ class PoolDirectWorkspace:
             stamps,
             self.guard_ns,
             self.guard_break,
+            self.world,
         )
         # A dry launch loads the module now, not inside a capture.
         with torch.cuda.device(self.device):
-            outputs = _outputs(1, self.device, place != PLACE_NONE, store_gathered)
+            outputs = _outputs(1, self.device, place != PLACE_NONE, store_gathered, self.world)
             gain = torch.zeros(HIDDEN, dtype=torch.bfloat16, device=self.device)
             scale = torch.zeros(1, dtype=torch.float32, device=self.device)
             _launch(compiled, outputs, gain, scale, 1, 1e-6, 1e-20, 0, 0, 0, 0, dry=1)
@@ -1083,7 +1216,9 @@ class PoolDirectWorkspace:
         return compiled
 
 
-def _outputs(rows: int, device, placed: bool, store_gathered: bool) -> _route.RouteOutputs:
+def _outputs(
+    rows: int, device, placed: bool, store_gathered: bool, world: int = WORLD
+) -> _route.RouteOutputs:
     return _route.RouteOutputs(
         fp4=torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device),
         scale=torch.empty((rows, HIDDEN // BLOCK), dtype=torch.uint8, device=device),
@@ -1095,7 +1230,7 @@ def _outputs(rows: int, device, placed: bool, store_gathered: bool) -> _route.Ro
         weights_bf16=(
             torch.empty((rows, TOP_K), dtype=torch.bfloat16, device=device) if placed else None
         ),
-        stats=torch.empty((2 * WORLD,), dtype=torch.int32, device=device) if placed else None,
+        stats=torch.empty((2 * world,), dtype=torch.int32, device=device) if placed else None,
     )
 
 
@@ -1159,7 +1294,7 @@ class PoolDirectRoute(OpWrapper):
     ``stamps`` are ``pool_gather_route``'s. Returns its ``RouteOutputs`` for the
     same slices and logits.
 
-    A collective over the TP8 group: every rank calls it with the same row count
+    A collective over the TP8 or TP4 group: every rank calls it with the same row count
     and buffer, in the same order relative to its other calls on ``workspace``,
     and no two consecutive calls on one buffer (``buffer_sequence``). Launched
     with programmatic dependent launch.
@@ -1204,7 +1339,7 @@ class PoolDirectRoute(OpWrapper):
             0 if stamps is None else stamps.data_ptr(),
         )
         compiled = workspace.kernel(key)
-        out = _outputs(rows, gain.device, placed, True)
+        out = _outputs(rows, gain.device, placed, True, workspace.world)
         _launch(
             compiled,
             out,
@@ -1308,8 +1443,11 @@ class PoolDirectRoute(OpWrapper):
                 )
         if place not in (PLACE_NONE,) + tuple(_route.EARLY_PLACES):
             raise ValueError(f"unknown placement kind {place}")
-        if not 0 <= static_from <= LOCAL_EXPERTS:
-            raise ValueError(f"static_from must be in [0, {LOCAL_EXPERTS}]")
+        if place not in _route.PLACES[workspace.world]:
+            raise ValueError(f"placement kind {place} is not served at TP{workspace.world}")
+        local = _route.local_experts(workspace.world)
+        if not 0 <= static_from <= local:
+            raise ValueError(f"static_from must be in [0, {local}]")
         if stamps is not None and (
             stamps.dtype != torch.int64
             or not stamps.is_contiguous()

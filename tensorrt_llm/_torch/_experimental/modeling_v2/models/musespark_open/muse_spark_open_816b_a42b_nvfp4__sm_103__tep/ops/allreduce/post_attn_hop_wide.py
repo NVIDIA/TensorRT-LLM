@@ -812,8 +812,8 @@ class WideHopWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) != (10, 3):
-                raise RuntimeError("the wide hop runs on SM103 only")
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the wide hop runs on SM103 and SM107 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, self.workspace_bytes, mapping, use_fabric
@@ -1044,7 +1044,7 @@ class PostAttnHopWide(OpWrapper):
     itself with ``norm_fp32``).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of
@@ -1128,14 +1128,15 @@ def log_once_enabled(
     multicast: bool,
     two_shot_rows: int = TWO_SHOT_ROWS,
     early_launch: bool = SERVED_EARLY_LAUNCH,
+    min_rows: int = MIN_ROWS,
 ) -> None:
     if two_shot_rows > MAX_ROWS:
-        transports = f"one-shot AR at {MIN_ROWS}..{MAX_ROWS} rows"
-    elif two_shot_rows <= MIN_ROWS:
-        transports = f"two-shot AR at {MIN_ROWS}..{MAX_ROWS} rows"
+        transports = f"one-shot AR at {min_rows}..{MAX_ROWS} rows"
+    elif two_shot_rows <= min_rows:
+        transports = f"two-shot AR at {min_rows}..{MAX_ROWS} rows"
     else:
         transports = (
-            f"one-shot AR at {MIN_ROWS}..{two_shot_rows - 1} rows, "
+            f"one-shot AR at {min_rows}..{two_shot_rows - 1} rows, "
             f"two-shot at {two_shot_rows}..{MAX_ROWS}"
         )
     transports += (
@@ -1146,7 +1147,7 @@ def log_once_enabled(
         "launched as a programmatic dependent" if early_launch else "launched after its producer"
     )
     logger.info(
-        "[musespark_open] wide_post_attention_hop: fused post-attention hop (AR + residual "
+        "[musespark_open] multi_request_post_attention_hop: fused post-attention hop (AR + residual "
         f"join + pre-FFN norm) on the decode path of all {layers} layers: {transports} "
         f"({'multicast' if multicast else 'unicast'} publication, {launch}, early "
         "dependent-launch trigger, stale-only polling)"

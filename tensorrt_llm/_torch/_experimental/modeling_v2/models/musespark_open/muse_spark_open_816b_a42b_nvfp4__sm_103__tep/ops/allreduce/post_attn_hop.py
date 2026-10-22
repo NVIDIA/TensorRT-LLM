@@ -134,6 +134,30 @@ GRID_STEP = 64
 GRID_SHIFT = 6
 assert GRID_STEP == 1 << GRID_SHIFT and GRID_STEP >= MAX_ROWS * 8 and GRID_STEP >= 16
 
+#: Rows of the wide transport (``PostAttnHopWorkspace(max_rows=WIDE_MAX_ROWS)``, 4 ranks only):
+#: a TP4 decode step of up to four requests at K = 7. Its calls of 9..32 rows run on the
+#: boundary's 4-CTA split (``cluster_for_rows``), up to 128 CTAs, so its arrival counter
+#: steps by ``WIDE_GRID_STEP`` per call.
+WIDE_MAX_ROWS = 32
+WIDE_GRID_STEP = 128
+WIDE_GRID_SHIFT = 7
+assert WIDE_GRID_STEP == 1 << WIDE_GRID_SHIFT and WIDE_GRID_STEP >= WIDE_MAX_ROWS * 4
+
+
+def slab_bytes(max_rows: int) -> int:
+    """Bytes of one (buffer, source rank) slot of a transport sized for ``max_rows`` rows."""
+    return max_rows * HIDDEN * 2
+
+
+def workspace_bytes(max_rows: int) -> int:
+    """Bytes of a transport sized for ``max_rows`` rows: two buffers of ``MAX_RANKS`` slots."""
+    return BUFFERS * MAX_RANKS * slab_bytes(max_rows)
+
+
+def grid_step(max_rows: int) -> Tuple[int, int]:
+    """``(step, shift)`` of the arrival counter of a transport sized for ``max_rows`` rows."""
+    return (WIDE_GRID_STEP, WIDE_GRID_SHIFT) if max_rows > MAX_ROWS else (GRID_STEP, GRID_SHIFT)
+
 
 #: Fewest rows of a call that a ``stale_poll`` workspace polls with the stale-only
 #: schedule (8: the K = 7 verify step). Smaller calls keep the default schedule.
@@ -142,6 +166,8 @@ STALE_POLL_MIN_ROWS = 8
 
 def cluster_for_rows(rows: int) -> int:
     """The cluster boundary's split for ``rows``; the variance tree depends on it."""
+    if rows > MAX_ROWS:
+        return 4
     return 16 if rows == 1 else 8
 
 
@@ -375,9 +401,13 @@ if HAS_CUTE_DSL:
             pdl: bool,
             early_trigger: bool,
             stale_poll: bool = False,
+            max_rows: int = MAX_ROWS,
         ):
             self.ranks = ranks
             self.cluster = cluster
+            # The transport's slot size and arrival step: the 8-row ones unless wide.
+            self.slab_bytes = slab_bytes(max_rows)
+            self.grid_step, self.grid_shift = grid_step(max_rows)
             self.threads = HIDDEN // (cluster * VECTOR)
             self.iters = HIDDEN // (cluster * self.threads * VECTOR)
             self.warps = self.threads // 32
@@ -540,7 +570,7 @@ if HAS_CUTE_DSL:
                 # 64 of this one (this CTA arrives only after all its threads
                 # have read it), so its 64s place is the call's parity.
                 counter = _load_counter(control_address + 4)
-                buffer = Int64((counter >> GRID_SHIFT) & Uint32(1))
+                buffer = Int64((counter >> self.grid_shift) & Uint32(1))
                 slot = (Int64(row) * HIDDEN + Int64(offset)) * 2
                 words = _load_x4(partial.toint() + slot)
                 a = self.load(alpha + offset, Float32)
@@ -555,7 +585,7 @@ if HAS_CUTE_DSL:
                     _sanitize_bf16x2(words[2]),
                     _sanitize_bf16x2(words[3]),
                 )
-                own_slab = (buffer * MAX_RANKS + Int64(rank)) * SLAB_BYTES
+                own_slab = (buffer * MAX_RANKS + Int64(rank)) * self.slab_bytes
                 if cutlass.const_expr(self.multicast):
                     _store_multicast_x4(mcast.toint() + own_slab + slot, *own)
                 else:
@@ -577,7 +607,9 @@ if HAS_CUTE_DSL:
                     # rounds carry no branch per slot. Every load of a round is
                     # issued before any of its words is tested.
                     for p in cutlass.range_constexpr(self.ranks):
-                        address = receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot
+                        address = (
+                            receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
+                        )
                         v0, v1, v2, v3 = _poll_x4(
                             address, Uint32(rank != p), own[0], own[1], own[2], own[3]
                         )
@@ -593,7 +625,9 @@ if HAS_CUTE_DSL:
                     while stale != Uint32(0):
                         polled = stale
                         for p in cutlass.range_constexpr(self.ranks):
-                            address = receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot
+                            address = (
+                                receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
+                            )
                             v0, v1, v2, v3 = _poll_x4(
                                 address,
                                 (polled >> Uint32(p)) & Uint32(1),
@@ -620,7 +654,9 @@ if HAS_CUTE_DSL:
                     while pending != 0:
                         pending = Int32(0)
                         for p in cutlass.range_constexpr(self.ranks):
-                            address = receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot
+                            address = (
+                                receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
+                            )
                             v0, v1, v2, v3 = _poll_x4(
                                 address, Uint32(rank != p), own[0], own[1], own[2], own[3]
                             )
@@ -638,7 +674,7 @@ if HAS_CUTE_DSL:
                                 pending = Int32(1)
                 # Retire every consumed slot before this grid can complete.
                 for p in cutlass.range_constexpr(self.ranks):
-                    address = receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot
+                    address = receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
                     _reset_x4(address, Uint32(rank != p))
                 # Early trigger: past the last transport access. A dependent may
                 # start its prologue now; its griddepcontrol.wait still returns
@@ -720,7 +756,7 @@ if HAS_CUTE_DSL:
                     blocks = cute.arch.grid_dim()[0]
                     amount = Uint32(1)
                     if block == 0:
-                        amount = Uint32(GRID_STEP + 1 - blocks)
+                        amount = Uint32(self.grid_step + 1 - blocks)
                     _arrive(control_address + 4, amount)
                 # Late trigger: after every store, the boundary kernel's own placement.
                 if cutlass.const_expr(self.pdl and not self.early_trigger):
@@ -751,9 +787,19 @@ if HAS_CUTE_DSL:
         pdl: bool,
         early_trigger: bool,
         stale_poll: bool = False,
+        max_rows: int = MAX_ROWS,
     ):
         kernel = _PostAttnHopKernel(
-            ranks, cluster, multicast, post_eps, pre_eps, norm_fp32, pdl, early_trigger, stale_poll
+            ranks,
+            cluster,
+            multicast,
+            post_eps,
+            pre_eps,
+            norm_fp32,
+            pdl,
+            early_trigger,
+            stale_poll,
+            max_rows,
         )
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -798,6 +844,11 @@ class PostAttnHopWorkspace:
     values (see the module docstring); fewer loads per polling round. It
     applies to calls of at least ``stale_poll_min_rows`` rows (default
     ``STALE_POLL_MIN_ROWS``); smaller calls run the default schedule.
+
+    ``max_rows=WIDE_MAX_ROWS`` builds the wide transport (4 ranks only): slots of 32 rows,
+    calls of ``MAX_ROWS + 1 .. WIDE_MAX_ROWS`` rows (the boundary's 4-CTA split), an arrival
+    step of ``WIDE_GRID_STEP``. It is a separate allocation with its own counter, so its
+    calls and the 8-row transport's interleave freely.
     """
 
     def __init__(
@@ -809,6 +860,7 @@ class PostAttnHopWorkspace:
         early_trigger: bool = False,
         stale_poll: bool = False,
         stale_poll_min_rows: int = STALE_POLL_MIN_ROWS,
+        max_rows: int = MAX_ROWS,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -826,6 +878,16 @@ class PostAttnHopWorkspace:
         self.stale_poll_min_rows = int(stale_poll_min_rows)
         if self.ranks not in (4, MAX_RANKS):
             raise ValueError(f"the fused hop serves 4 or 8 ranks, got {self.ranks}")
+        if max_rows not in (MAX_ROWS, WIDE_MAX_ROWS) or (
+            max_rows == WIDE_MAX_ROWS and self.ranks != 4
+        ):
+            raise ValueError(
+                f"the fused hop's transport holds {MAX_ROWS} rows, or {WIDE_MAX_ROWS} at 4 ranks; "
+                f"got {max_rows} rows at {self.ranks} ranks"
+            )
+        self.max_rows = int(max_rows)
+        #: The row counts this transport's calls take.
+        self.min_rows = 1 if self.max_rows == MAX_ROWS else MAX_ROWS + 1
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
         self._kernels = {}
         self._comm = _get_mnnvl_workspace_comm(mapping)
@@ -837,9 +899,9 @@ class PostAttnHopWorkspace:
                 raise RuntimeError("the fused hop runs on SM103 or SM107 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
-                self._comm, WORKSPACE_BYTES, mapping, use_fabric
+                self._comm, workspace_bytes(self.max_rows), mapping, use_fabric
             )
-            words = WORKSPACE_BYTES // 4
+            words = workspace_bytes(self.max_rows) // 4
             self._uc = [
                 self._handle.get_uc_buffer(peer, (words,), torch.int32, 0)
                 for peer in range(self.ranks)
@@ -873,11 +935,11 @@ class PostAttnHopWorkspace:
 
         error: Optional[BaseException] = None
         try:
-            # Every (split, schedule) pair some row count 1..MAX_ROWS launches.
+            # Every (split, schedule) pair some row count of this transport launches.
             kinds = sorted(
                 {
                     (cluster_for_rows(rows), self._stale_for(rows))
-                    for rows in range(1, MAX_ROWS + 1)
+                    for rows in range(self.min_rows, self.max_rows + 1)
                 },
                 reverse=True,
             )
@@ -916,6 +978,7 @@ class PostAttnHopWorkspace:
             self.pdl,
             self.early_trigger,
             bool(stale),
+            self.max_rows,
         )
         # A dry launch loads the module now, not inside a capture.
         dummy = self.control.data_ptr()
@@ -942,6 +1005,11 @@ class PostAttnHopWorkspace:
                 f"post_attn_hop inputs are on {partial.device}, its workspace on {self.device}"
             )
         rows = partial.shape[0]
+        if not self.min_rows <= rows <= self.max_rows:
+            raise ValueError(
+                f"this post_attn_hop transport takes {self.min_rows}..{self.max_rows} rows, "
+                f"got {rows}"
+            )
         compiled = self._kernel(
             cluster_for_rows(rows), post_eps, pre_eps, norm_fp32, self._stale_for(rows)
         )
@@ -974,6 +1042,7 @@ def shared_workspace(
     variants: Sequence[Tuple[float, float, bool]] = (),
     early_trigger: bool = False,
     stale_poll: bool = False,
+    max_rows: int = MAX_ROWS,
 ) -> PostAttnHopWorkspace:
     """The one workspace of this group and transport, built on first use.
 
@@ -983,6 +1052,8 @@ def shared_workspace(
     any variant it names built as well, instead of a second fabric allocation.
     """
     key = (mapping, bool(multicast), bool(early_trigger), _LAUNCH_PDL, bool(stale_poll))
+    if max_rows != MAX_ROWS:
+        key = key + (int(max_rows),)
     workspace = _SHARED.get(key)
     if workspace is None:
         workspace = PostAttnHopWorkspace(
@@ -991,6 +1062,7 @@ def shared_workspace(
             variants=variants,
             early_trigger=early_trigger,
             stale_poll=stale_poll,
+            max_rows=max_rows,
         )
         _SHARED[key] = workspace
     else:
@@ -1004,16 +1076,18 @@ def hop_takes(
     alpha: torch.Tensor,
     beta: torch.Tensor,
     next_weight: torch.Tensor,
+    max_rows: int = MAX_ROWS,
 ) -> bool:
     """Whether the hop computes this call: row count, dtypes, shapes and devices only.
 
     Every rank of the group gives the same answer for the same layer call, which
     is what lets a caller choose between this collective and the built-in
     all-reduce on it. A tensor's address and strides are rank-local and are not
-    consulted (``hop_layout_ok`` / ``readable``).
+    consulted (``hop_layout_ok`` / ``readable``). ``max_rows``: the row bound of the
+    transport the caller would launch on (``WIDE_MAX_ROWS`` for the wide one).
     """
     rows = partial.shape[0] if partial.ndim == 2 else 0
-    if not 1 <= rows <= MAX_ROWS:
+    if not 1 <= rows <= max_rows:
         return False
     if (
         partial.dtype != torch.bfloat16
@@ -1061,9 +1135,10 @@ def hop_supported(
     alpha: torch.Tensor,
     beta: torch.Tensor,
     next_weight: torch.Tensor,
+    max_rows: int = MAX_ROWS,
 ) -> bool:
     """Whether the kernel reads these inputs correctly as they are: ``hop_takes`` and layout."""
-    return hop_takes(partial, residual, alpha, beta, next_weight) and hop_layout_ok(
+    return hop_takes(partial, residual, alpha, beta, next_weight, max_rows) and hop_layout_ok(
         partial, residual, alpha, beta, next_weight
     )
 
@@ -1995,7 +2070,9 @@ class PostAttnHop(OpWrapper):
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step
     of at most 8 rows, from the target's attention-side residual join, in place
-    of the built-in MNNVL one-shot all-reduce and cluster boundary.
+    of the built-in MNNVL one-shot all-reduce and cluster boundary; with the wide
+    transport (wide_post_attention_hop, TP4) also steps of 9..32 rows, where the
+    built-in boundary runs its 4-CTA split.
 
     Bit-identical to that pair, gated by its own multi-GPU test (both outputs,
     every cell, both transport variants, graph replay with changing inputs and
@@ -2009,7 +2086,8 @@ class PostAttnHop(OpWrapper):
     Loud preconditions: `hop_supported` must hold. A caller choosing between
     this collective and the built-in all-reduce decides on `hop_takes` alone,
     which every rank answers alike, and makes the layout fit with `readable`.
-    Not certified: rows above 8, widths other than 8192, a weighted
+    Not certified: rows above 8 on the 8-row transport or above 32 on the
+    wide one, the wide transport at 8 ranks, widths other than 8192, a weighted
     attention-side post norm.
     """
 
@@ -2025,9 +2103,10 @@ class PostAttnHop(OpWrapper):
         norm_fp32: bool,
         workspace: PostAttnHopWorkspace,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not hop_supported(partial, residual, alpha, beta, next_weight):
+        if not hop_supported(partial, residual, alpha, beta, next_weight, workspace.max_rows):
             raise ValueError(
-                "post_attn_hop takes a contiguous BF16 [1..8, 8192] partial, an FP32 residual "
+                f"post_attn_hop takes a contiguous BF16 [1..{workspace.max_rows}, 8192] partial, "
+                "an FP32 residual "
                 "of the same shape, FP32 alpha/beta and a BF16 weight of 8192, 16-byte aligned; "
                 f"got {partial.dtype} {tuple(partial.shape)} / {residual.dtype} "
                 f"{tuple(residual.shape)}"
@@ -2079,7 +2158,11 @@ post_attn_hop = PostAttnHop()
 
 
 def log_once_enabled(
-    layers: int, multicast: bool, early_trigger: bool = False, stale_poll: bool = False
+    layers: int,
+    multicast: bool,
+    early_trigger: bool = False,
+    stale_poll: bool = False,
+    wide_rows: Optional[int] = None,
 ) -> None:
     logger.info(
         "[musespark_open] post_attention_hop: fused post-attention hop (one-shot AR + residual join + pre-FFN norm) "
@@ -2089,3 +2172,9 @@ def log_once_enabled(
         f"{'early' if early_trigger else 'late'} dependent-launch trigger"
         f"{', stale-only polling from %d rows' % STALE_POLL_MIN_ROWS if stale_poll else ''})"
     )
+    if wide_rows is not None:
+        logger.info(
+            f"[musespark_open] wide_post_attention_hop: the fused post-attention hop on a "
+            f"{wide_rows}-row transport for decode steps of {MAX_ROWS + 1}..{wide_rows} rows "
+            "(the boundary's 4-CTA split)"
+        )

@@ -3,10 +3,10 @@
 """Fast path ``pool_into_route``: the pool GEMM and the forked router shard publish into the routed pool kernel.
 
 With ``moe_prologue`` and ``router_fork`` a decode MoE layer of at most 8 rows runs the router
-shard on a side stream (a plain launch that writes ``[M, 32]`` FP32 logits) and
+shard on a side stream (a plain launch that writes ``[M, L]`` FP32 logits, L = 32 at TP8 and 64 at TP4) and
 the pool slice GEMM on the main stream. After the join, the routed pool kernel
 (``ops/comm/pool_gather_route``) waits for both, reloads this rank's
-``[M, 512]`` slice and logits, publishes them to its peers as tagged words, and
+``[M, C]`` slice (C = 512 at TP8, 1024 at TP4) and logits, publishes them to its peers as tagged words, and
 polls the peers' words.
 
 Here, on the decode CUDA graph of 8 rows (the DFlash2 K = 7 verify step), the
@@ -134,6 +134,7 @@ class DirectPoolSite:
                     moe.metap_multiplier,
                     warps,
                     boxes,
+                    ranks=workspace.world,
                 )
         with moe.nvtx("pool"):
             slot = workspace.slot(buffer, rows)

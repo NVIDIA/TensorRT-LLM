@@ -53,12 +53,16 @@ PROJECTION_WIDTHS = (4096, 8192)
 #: Rows (tokens) per call the inbox has room for: a decode step of one request with
 #: up to seven DFlash drafts. The built-in sharded projections stop at the same bound.
 MAX_ROWS = 8
-#: Rows per call of a wide inbox (``ProjectionInbox(..., max_rows=WIDE_ROWS)``): a decode
-#: step of up to four requests with seven DFlash drafts each, at TP4 only, where the
-#: fused consumers' per-CTA columns still fall inside one rank's slice at those rows.
-WIDE_ROWS = 32
-#: The row capacities an inbox can be built with.
-CAPACITIES = (MAX_ROWS, WIDE_ROWS)
+#: Rows per call of a wide inbox (``ProjectionInbox(max_rows=WIDE_MAX_ROWS)``): a TP4
+#: decode step of up to four requests with seven DFlash drafts each, where the fused
+#: consumers' per-CTA columns still fall inside one rank's slice at those rows. A wide
+#: inbox is a separate allocation with its own row layout; the 8-row inboxes are unchanged.
+WIDE_MAX_ROWS = 32
+#: ``WIDE_MAX_ROWS`` under the name ``wide_projection_gathers`` reads.
+WIDE_ROWS = WIDE_MAX_ROWS
+#: The row capacities an inbox is built with.
+ROW_CAPACITIES = (MAX_ROWS, WIDE_MAX_ROWS)
+CAPACITIES = ROW_CAPACITIES
 #: Bytes of one tagged payload word.
 _TAGGED_BYTES = 8
 
@@ -98,13 +102,14 @@ class ProjectionInbox:
     Construction is collective over the TP group.
 
     ``max_rows`` is the most rows one call may carry: ``MAX_ROWS`` (8), or
-    ``WIDE_ROWS`` (32) at TP4 for the wide sites of ``wide_projection_gathers``.
+    ``WIDE_MAX_ROWS`` (32) at TP4 for the wide sites of ``wide_prologue`` and
+    ``wide_projection_gathers``.
 
     Attributes read by the fused ops: ``base`` (address of rank 0's segment
     through the fabric mapping), ``stride`` (bytes between ranks' segments),
     ``counters`` (``int32 [max_rows, 2]``, the per-row tag and slot), ``rank``,
-    ``world`` (the TP size) and ``max_rows`` (the rows per slot), which the fused
-    ops compile in.
+    ``world`` (the TP size) and ``max_rows`` (the rows a call may carry, which sets
+    the slot layout), the last two compiled into the fused ops.
     ``segment()`` is this rank's receive memory as ``int64`` words (all zero
     whenever no call is in flight).
     """
@@ -113,13 +118,13 @@ class ProjectionInbox:
         if mapping.tp_size not in WORLDS or mapping.enable_attention_dp or mapping.cp_size != 1:
             raise ValueError("ProjectionInbox needs TP4 or TP8 without attention DP or CP")
         world = mapping.tp_size
+        if max_rows not in ROW_CAPACITIES or (max_rows != MAX_ROWS and world != 4):
+            raise ValueError(
+                f"max_rows must be {MAX_ROWS}, or {WIDE_MAX_ROWS} at TP4; got {max_rows} at TP{world}"
+            )
         allowed = tuple(row_words_of(width, world) for width in PROJECTION_WIDTHS)
         if row_words not in allowed:
             raise ValueError(f"row_words must be one of {allowed} at TP{world}, got {row_words}")
-        if max_rows not in CAPACITIES or (max_rows != MAX_ROWS and world != 4):
-            raise ValueError(
-                f"max_rows must be {MAX_ROWS}, or {WIDE_ROWS} at TP4; got {max_rows} at TP{world}"
-            )
         if not all(Distributed.get(mapping).tp_allgather(MnnvlMemory.supports_mnnvl())):
             raise ValueError("ProjectionInbox needs NVLink fabric memory on every TP rank")
         MnnvlMemory.initialize()

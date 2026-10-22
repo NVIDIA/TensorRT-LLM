@@ -118,8 +118,14 @@ GUARD_RELOG_S = 60.0
 #: The producers the census certified: at every served row count of both sites, cuBLAS
 #: (``torch.mm`` into the slot) picks beta-zero kernels that store each element once, and
 #: splits K only through a separate reduction kernel. Keyed by (torch version, cuBLASLt
-#: version, SM count): cuBLAS's kernel choice depends on all three.
-CERTIFIED_PRODUCERS = frozenset({("2.14.0a0+b2c75dd062.nv26.09", 130800, 152)})
+#: version, SM count): cuBLAS's kernel choice depends on all three. 152 SMs is GB300 (sm103),
+#: 212 SMs Rubin (sm107).
+CERTIFIED_PRODUCERS = frozenset(
+    {
+        ("2.14.0a0+b2c75dd062.nv26.09", 130800, 152),
+        ("2.14.0a0+b2c75dd062.nv26.09", 130800, 212),
+    }
+)
 #: Environment variables that resize torch's cuBLAS workspaces, which changes cuBLAS's choice
 #: of split-K kernels; the census ran with none set.
 CUBLAS_WORKSPACE_ENV = ("CUBLAS_WORKSPACE_CONFIG", "CUBLASLT_WORKSPACE_SIZE")
@@ -173,8 +179,8 @@ class PublishTransport:
         self.allocated = 0
         self._comm = comm if comm is not None else _get_mnnvl_workspace_comm(mapping)
         refusal: Optional[str] = None
-        if torch.cuda.get_device_capability(self.device) != (10, 3):
-            refusal = "the projection publish transport runs on SM103 only"
+        if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+            refusal = "the projection publish transport runs on SM103 and SM107 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):
@@ -515,7 +521,7 @@ class UnpoolPublishJoin(OpWrapper):
     none) and ``guard_break`` select the poll guard (``guard_break`` for tests only).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Certified bit for bit against the built-in Triton join run on the gathered branch

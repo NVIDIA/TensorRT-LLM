@@ -45,24 +45,27 @@ from ...ops.moe import finalize_two_shot as _two
 #: one that bounds the calls it hands to ``finalize_chunked``.
 ATTRIBUTE = "_finalize_ar_workspace"
 MAX_TOKENS_ATTRIBUTE = "_finalize_ar_max_tokens"
-#: The rows this fast path arms (decode steps of 9 to 64 requests at K = 7). At 64 rows the
-#: built-in fused finalize + one-shot all-reduce is as fast, so the band starts one request
-#: above the kernel's smallest call (``_two.MIN_ROWS``).
-MIN_ROWS = 72
+#: The fewest rows this fast path arms, per SM (``10 * major + minor``): below them the built-in
+#: fused finalize + one-shot all-reduce is as fast or faster behind its FC2 producer. On sm103
+#: that holds at 64 rows, so the band starts one request (8 rows at K = 7) above the kernel's
+#: smallest call (``_two.MIN_ROWS``); on sm107 the one-shot stays ahead up to 80 rows and the
+#: two-shot leads from 96 (12 requests).
+MIN_ROWS_BY_SM = {103: 72, 107: 96}
+MIN_ROWS = MIN_ROWS_BY_SM[103]
 MAX_ROWS = _two.MAX_ROWS
 
 
 class FinalizeTwoShotSwitch:
     """What ``DecodeTarget`` arms: the workspace's ``active`` flag and the layers' chunk bound."""
 
-    def __init__(self, workspace, moes: List[torch.nn.Module]) -> None:
+    def __init__(self, workspace, moes: List[torch.nn.Module], min_rows: int = MIN_ROWS) -> None:
         self.workspace = workspace
         self.moes = moes
+        self.min_rows = int(min_rows)
 
-    @staticmethod
-    def takes(rows: int) -> bool:
+    def takes(self, rows: int) -> bool:
         """Whether a decode forward of ``rows`` rows is armed."""
-        return MIN_ROWS <= rows <= MAX_ROWS
+        return self.min_rows <= rows <= MAX_ROWS
 
     @contextlib.contextmanager
     def armed(self) -> Iterator[None]:
@@ -84,8 +87,11 @@ class FinalizeTwoShotSwitch:
 
 def refusal(model: MuseSparkOpenModel) -> Optional[str]:
     """Why ``install`` cannot take this model's MoE finalize, or None. Changes nothing."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        return "it is written for sm_103"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 3),
+        (10, 7),
+    ):
+        return "it is written for sm_103 and sm_107"
     mapping = model.layers[0].mapping
     if mapping.tp_size not in _two.RANK_COUNTS or mapping.is_multi_node():
         return f"it serves TP4 on one node, got TP{mapping.tp_size}"
@@ -144,5 +150,7 @@ def install(model: MuseSparkOpenModel) -> FinalizeTwoShotSwitch:
         setattr(layer.feed_forward, ATTRIBUTE, workspace)
         moes.append(layer.feed_forward)
     bound_unarmed_calls(wrapped, moes)
-    _two.log_once_enabled(len(model.layers), workspace.max_rows)
-    return FinalizeTwoShotSwitch(workspace, moes)
+    major, minor = torch.cuda.get_device_capability(workspace.device)
+    min_rows = MIN_ROWS_BY_SM[10 * major + minor]
+    _two.log_once_enabled(len(model.layers), workspace.max_rows, min_rows)
+    return FinalizeTwoShotSwitch(workspace, moes, min_rows)
