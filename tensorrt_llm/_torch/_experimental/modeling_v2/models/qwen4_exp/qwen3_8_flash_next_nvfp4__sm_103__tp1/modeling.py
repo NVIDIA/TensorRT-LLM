@@ -177,7 +177,7 @@ from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
 from .ops.gemm.fp8_gemv import MAX_ROWS as _FP8_GEMV_HEAD_ROWS
 from .ops.gemm.fp8_gemv import fp8_gemv_conv1d_op, fp8_gemv_op, pack_from_bf16
-from .ops.gemm.fp8_per_tensor_mm import fp8_per_tensor_mm, fp8_per_tensor_weight
+from .ops.gemm.fp8_per_tensor_mm import amax_partials, fp8_per_tensor_mm, fp8_per_tensor_weight
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
@@ -622,19 +622,29 @@ def _gemv_ready(x: torch.Tensor) -> bool:
 
 
 def _dense_mm(
-    x: torch.Tensor, weight_t: torch.Tensor, fp8, gemm, kind: str, packed=None
+    x: torch.Tensor, weight_t: torch.Tensor, fp8, gemm, kind: str, packed=None, amax_parts=None
 ) -> torch.Tensor:
     """A dense projection under the dense FP8 mode: `fp8_gemv` over the packed decode copy
     (`packed`) within `_FP8_GEMV_ROWS[kind]` rows, the per-tensor FP8 GEMM (`fp8` =
     `(codes_t, scale)`) from `_DENSE_FP8_MIN_ROWS[kind]` rows, else the step's bf16 entry
-    `gemm` -- which is every call with the mode off (both copies None)."""
+    `gemm` -- which is every call with the mode off (both copies None). `amax_parts` are the
+    partial maxima `x`'s producer folded (`_fp8_amax_parts`) for the FP8 GEMM."""
     rows = x.shape[0]
     lo, hi = _FP8_GEMV_ROWS[kind]
     if packed is not None and lo <= rows <= hi and _gemv_ready(x):
         return fp8_gemv_op(x, packed)
     if fp8 is not None and rows >= _DENSE_FP8_MIN_ROWS[kind]:
-        return fp8_per_tensor_mm(x, *fp8)
+        return fp8_per_tensor_mm(x, *fp8, amax_parts)
     return gemm(x, weight_t)
+
+
+def _fp8_amax_parts(rows: int, fp8, kind: str, device) -> torch.Tensor | None:
+    """For the producer of a prefill `_dense_mm` input (no packed decode copy) of `rows` rows:
+    a zeroed partial-maximum buffer when the call takes the per-tensor FP8 GEMM, so the
+    producer folds `max(|x|)` as it stores `x` and the GEMM skips its maximum pass; else None."""
+    if fp8 is None or rows < _DENSE_FP8_MIN_ROWS[kind]:
+        return None
+    return amax_partials(device)
 
 
 #: Decode batches up to this many rows run each trunk hyper-connection site as
@@ -3306,8 +3316,9 @@ class PrefillTarget:
             if not self._kv_probe.observe(i, k_dst, v_dst):
                 self._kv_probe = None
         eager_on_graph(proj, proj_qkv, index_scratch, attn_out, i, inner=self._attention_core)
-        fused_sigmoid_mul_inplace(attn_out, gate)
-        return _dense_mm(attn_out, L.o, L.o8, cublas_mm, "out")
+        parts = _fp8_amax_parts(attn_out.shape[0], L.o8, "out", attn_out.device)
+        fused_sigmoid_mul_inplace(attn_out, gate, parts)
+        return _dense_mm(attn_out, L.o, L.o8, cublas_mm, "out", amax_parts=parts)
 
     def _attention_core(self, proj, proj_qkv, index_scratch, attn_out, i) -> None:
         """Break: the index plane's store and compression, the dense/sparse decision and the
@@ -3836,6 +3847,7 @@ class PrefillTarget:
         """Gated RMS norm and output projection shared by every recurrence."""
         core = self.core
         # Sigmoid gate and a plain (non-gemma) weight (`output_gate_type`).
+        parts = _fp8_amax_parts(num_tokens, L.out8, "out", out.device)
         o = rms_norm_gated_token_major(
             torch.reshape(out, [-1, core.head_v_dim]),
             torch.reshape(z, [num_tokens, core.num_v_heads, core.head_v_dim]),
@@ -3843,9 +3855,10 @@ class PrefillTarget:
             eps=core.eps,
             fp8_scale=None,
             gate_activation="sigmoid",
+            amax_parts=parts,
         )
         o = torch.reshape(o, [num_tokens, core.value_dim])
-        return _dense_mm(o, L.out, L.out8, cublas_mm, "out")
+        return _dense_mm(o, L.out, L.out8, cublas_mm, "out", amax_parts=parts)
 
     def _ple_block(self, hc, hc_out, normed_out) -> None:
         """Break: the n-gram side path on one decoder layer, over the step's `n` rows,
