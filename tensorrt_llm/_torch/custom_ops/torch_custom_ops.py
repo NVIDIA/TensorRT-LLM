@@ -26,6 +26,7 @@ import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch import q35_env
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version
@@ -2623,6 +2624,22 @@ def _(
     return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
+def q35_ar_no_nccl_symm() -> bool:
+    """Whether NCCL_SYMMETRIC is neither tuned nor run (plain NCCL instead) under the Qwen3.5 fast paths.
+
+    NCCL_SYMMETRIC gives wrong sums for small inputs outside the NCCL window at TP4.
+    """
+    return q35_env.fast_paths_enabled()
+
+
+def q35_ar_strategy_without_nccl_symm(strategy: int) -> int:
+    """NCCL_SYMMETRIC -> NCCL when q35_ar_no_nccl_symm(); any other strategy unchanged."""
+    if (strategy == AllReduceStrategy.NCCL_SYMMETRIC.value
+            and q35_ar_no_nccl_symm()):
+        return AllReduceStrategy.NCCL.value
+    return strategy
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
@@ -2732,6 +2749,8 @@ class AllReduceRunner(TunableRunner):
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
+        if q35_ar_no_nccl_symm():
+            valid_strategies = [AllReduceStrategy.NCCL.value]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2823,6 +2842,7 @@ class AllReduceRunner(TunableRunner):
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+        tactic = q35_ar_strategy_without_nccl_symm(tactic)
 
         return torch.ops.trtllm.allreduce(
             input,

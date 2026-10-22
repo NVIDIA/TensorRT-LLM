@@ -1,8 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch.nn.parameter import Parameter
 
 from tensorrt_llm.functional import AllReduceParams
@@ -12,6 +28,60 @@ from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
+
+
+@triton.jit
+def _q35_embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
+                                 H: tl.constexpr, BLOCK: tl.constexpr,
+                                 PDL: tl.constexpr):
+    """out[t] = weight[ids[t]] for ids in [0, num_embeddings), zeros otherwise (flashinfer's rejection sampler
+    pads with -1): the non-parallel masked lookup's values in one launch per call."""
+    t = tl.program_id(0)
+    if PDL:
+        tl.inline_asm_elementwise("griddepcontrol.wait; // dummy $0",
+                                  "=r,~{memory}", [],
+                                  dtype=tl.int32,
+                                  is_pure=False,
+                                  pack=1)
+    tok = tl.load(ids_ptr + t).to(tl.int64)
+    ok = (tok >= 0) & (tok < num_embeddings)
+    row = tl.where(ok, tok, 0)
+    for h0 in tl.static_range(0, H, BLOCK):
+        offs = h0 + tl.arange(0, BLOCK)
+        m = offs < H
+        v = tl.load(w_ptr + row * H + offs, mask=m & ok, other=0.0)
+        tl.store(out_ptr + t.to(tl.int64) * H + offs, v, mask=m)
+    if PDL:
+        # PDL rule: release the dependents only after a CTA barrier that follows the last global access (the ids
+        # may live in a block the caching allocator recycles for a dependent's pre-wait write)
+        tl.debug_barrier()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def q35_embedding_gather(input: torch.Tensor,
+                         weight: torch.Tensor) -> torch.Tensor:
+    """One-launch lookup of a full (non-parallel) table, bitwise the masked F.embedding path."""
+    ids = input.reshape(-1)
+    if not ids.is_contiguous():
+        ids = ids.contiguous()
+    num_embeddings, hidden = weight.shape
+    out = torch.empty((ids.numel(), hidden),
+                      dtype=weight.dtype,
+                      device=weight.device)
+    if ids.numel() > 0:
+        from ..flashinfer_utils import get_env_enable_pdl
+        pdl = get_env_enable_pdl()
+        block = min(triton.next_power_of_2(hidden), 8192)
+        _q35_embedding_gather_kernel[(ids.numel(), )](ids,
+                                                      weight,
+                                                      out,
+                                                      num_embeddings,
+                                                      H=hidden,
+                                                      BLOCK=block,
+                                                      PDL=pdl,
+                                                      num_warps=4,
+                                                      launch_pdl=pdl)
+    return out.view(*input.shape, hidden)
 
 
 class LMHead(Linear):
@@ -293,12 +363,27 @@ class Embedding(LMHead):
             self.vocab_start_index = 0
             self.vocab_end_index = num_embeddings
 
-    def forward(self, input):
+    def forward(self,
+                input,
+                all_reduce_params: Optional[AllReduceParams] = None):
+        """Embedding lookup.
+
+        Args:
+            input: Token ids.
+            all_reduce_params: COLUMN tensor parallel only: fuses the following RMSNorm into the
+                vocab-parallel all-reduce (RMS_NORM, or RESIDUAL_RMS_NORM with a zero residual); the
+                result is then the all-reduce's output for that fusion op.
+
+        A module whose ``q35_gather`` attribute is set (by the model, on a full, non-parallel table)
+        does the masked lookup as one gather launch.
+        """
+        if (self.tp_size == 1 and self.__dict__.get("q35_gather", False)
+                and input.is_cuda and self.weight.dim() == 2
+                and self.weight.is_contiguous()):
+            return q35_embedding_gather(input, self.weight)
         if self.tp_size > 1 and not torch.compiler.is_compiling():
-            # Outside torch.compile tracing, build the wrapper once per module:
-            # every torch.compile() call constructs an Inductor backend wrapper
-            # (deep-copying the Inductor config), even with disable=True, where
-            # it returns the plain function.
+            # Build the wrapper once per module: every torch.compile() call
+            # deep-copies the Inductor config, even with disable=True.
             embedding_ops_func = self.__dict__.get("_pre_comm_ops_func")
             if embedding_ops_func is None:
                 embedding_ops_func = (torch.compile(
@@ -326,7 +411,8 @@ class Embedding(LMHead):
         if self.tp_size > 1:
             if self.tp_mode == TensorParallelMode.COLUMN:
                 # Reduce across all the model parallel GPUs.
-                output = self.all_reduce(output)
+                output = self.all_reduce(output,
+                                         all_reduce_params=all_reduce_params)
             elif self.tp_mode == TensorParallelMode.ROW:
                 if self.gather_output:
                     # Run allgather.
