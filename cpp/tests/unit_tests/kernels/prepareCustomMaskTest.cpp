@@ -19,7 +19,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <random>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "tensorrt_llm/common/assert.h"
@@ -39,7 +42,9 @@ using tensorrt_llm::kernels::FmhaKernelType;
 using tensorrt_llm::kernels::getCustomMaskCapacityUpperBound;
 using tensorrt_llm::kernels::getCustomMaskSizeUpperBound;
 using tensorrt_llm::kernels::runPrepareCustomMask;
+using tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos;
 using tensorrt_llm::kernels::TllmGenFmhaRunnerParams;
+using tensorrt_llm::kernels::TrtllmGenAttentionMaskType;
 using tensorrt_llm::runtime::BufferManager;
 using tensorrt_llm::runtime::CudaStream;
 using tensorrt_llm::runtime::MemoryType;
@@ -492,6 +497,56 @@ TEST(PrepareCustomMaskCapacityTest, RejectsUndersizedBuffer)
     EXPECT_THROW(runPrepareCustomMask(runnerParams, FmhaKernelType::SwapsMmaAbForGeneration, tileSizeQ, stepKv,
                      tileSizeQ, tileSizeKv, /* stream */ nullptr),
         tensorrt_llm::common::TllmException);
+}
+
+//! Returns the mask type in the kernel name, which follows the QKV layout (e.g. "PagedKvCausalP32").
+std::optional<TrtllmGenAttentionMaskType> maskTypeFromName(std::string_view name)
+{
+    static constexpr std::string_view kLayouts[] = {"SeparateQkv", "PackedQkv", "PagedKv", "ContiguousKv"};
+    static constexpr std::pair<std::string_view, TrtllmGenAttentionMaskType> kMasks[] = {
+        {"Dense", TrtllmGenAttentionMaskType::Dense},
+        {"Causal", TrtllmGenAttentionMaskType::Causal},
+        {"SlidingOrChunkedCausal", TrtllmGenAttentionMaskType::SlidingOrChunkedCausal},
+        {"Custom", TrtllmGenAttentionMaskType::Custom},
+        {"SlidingWindowCustom", TrtllmGenAttentionMaskType::SlidingWindowCustom},
+        {"VariableWindow", TrtllmGenAttentionMaskType::VariableWindow},
+    };
+    for (auto const layout : kLayouts)
+    {
+        auto const pos = name.find(layout);
+        if (pos == std::string_view::npos)
+        {
+            continue;
+        }
+        auto const rest = name.substr(pos + layout.size());
+        for (auto const& [maskName, maskType] : kMasks)
+        {
+            if (rest.starts_with(maskName))
+            {
+                return maskType;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// The cubin lookup is keyed on the registered mask type, so it must match the one in the kernel name.
+TEST(FmhaKernelMetaInfoTest, MaskTypeMatchesKernelName)
+{
+    for (auto const& meta : sTllmGenFmhaKernelMetaInfos)
+    {
+        std::string_view const name{meta.mFuncName};
+        auto const nameMask = maskTypeFromName(name);
+        ASSERT_TRUE(nameMask.has_value()) << "No mask type in kernel name " << name;
+
+        auto const mask = static_cast<TrtllmGenAttentionMaskType>(meta.mMaskType);
+        // algoFilterForCubinPath requests Causal for Dense non-MLA generation kernels.
+        bool const isDenseGenRegisteredAsCausal
+            = static_cast<FmhaKernelType>(meta.mKernelType) != FmhaKernelType::Context
+            && *nameMask == TrtllmGenAttentionMaskType::Dense && mask == TrtllmGenAttentionMaskType::Causal;
+        EXPECT_TRUE(mask == *nameMask || isDenseGenRegisteredAsCausal)
+            << name << " is registered with mMaskType " << meta.mMaskType;
+    }
 }
 
 } // namespace
