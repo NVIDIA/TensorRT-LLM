@@ -571,6 +571,10 @@ class PyExecutor:
         # two operate on disjoint request sets. Per-request CUDA events
         # carry the encoder->decoder dependency to the eventual consumer.
         self.encoder_stream = torch.cuda.Stream()
+        # Phase teardown joins users and synchronizes CUDA before rebinding.
+        # Sampling synchronization resources therefore live with the executor.
+        self.sample_stream = torch.cuda.Stream()
+        self.finish_sample_event = torch.cuda.Event()
         logger.info(
             f"[PyExecutor] execution_stream initialized: {self.execution_stream}; "
             f"encoder_stream initialized: {self.encoder_stream}.")
@@ -1045,8 +1049,6 @@ class PyExecutor:
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
         self.pp_multi_stream_sample = os.environ.get(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
-        self.sample_stream = torch.cuda.Stream()
-        self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches
         # or waiting for synchronized PP resource teardown. The scheduler avoids
         # these requests until their prior execution state is safe to reuse.
