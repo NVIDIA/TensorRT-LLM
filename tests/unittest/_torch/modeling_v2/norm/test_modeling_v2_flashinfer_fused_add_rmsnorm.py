@@ -18,6 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "flashinfer_fused_add_rmsnorm requires a CUDA device"
@@ -32,7 +33,10 @@ def _build(spec, seed):
     return x, residual, weight, spec["eps"]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+CELLS = certified_cells(op)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:40] for c in CELLS])
 def test_certified_cells(cell) -> None:
     """Every certified configuration, kernel against reference.
 

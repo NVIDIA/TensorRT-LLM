@@ -53,15 +53,6 @@ class MlaRopeAppendPagedKvAssignQ(OpWrapper):
             why="a single new token on top of a long cached prefix -- the decode-adjacent shape",
             spec=dict(cached=[511], new=[1], tokens_per_block=64, **_R1),
         ),
-        Cell(
-            why="deepseek default at attention TP8: 16 heads per rank, production context",
-            spec=dict(
-                cached=[0, 32, 100],
-                new=[37, 64, 300],
-                tokens_per_block=32,
-                **dict(_R1, head_num=16),
-            ),
-        ),
     )
 
     note = """

@@ -12,6 +12,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op impor
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"
@@ -26,7 +27,10 @@ def _build(spec, seed):
     return logits, bias, spec["n_group"], spec["topk_group"], spec["topk"], spec["scale"]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+CELLS = certified_cells(op)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):

@@ -12,6 +12,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_no
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import (  # noqa: E402,F401 — needs the path declared above
     ULP,
     assert_within_ulp,
@@ -134,7 +135,10 @@ def _deviation(out: torch.Tensor, ref: torch.Tensor) -> str:
     return f"max abs {(o - r).abs().max().item():.6f}, elt {elt:.2f} ulp, rms {rms:.3f} ulp"
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+CELLS = certified_cells(op)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     certifying(op)
     qkv, kwargs, compare_kwargs = _build(cell.spec, seed=_seed(cell.why))
@@ -157,7 +161,7 @@ def test_the_v_heads_are_left_alone() -> None:
     right size, and every cell compares against a reference that makes the same
     claim -- so this pins it against the input instead.
     """
-    spec = dict(op.CELLS[1].spec)
+    spec = dict(CELLS[1].spec)
     qkv, kwargs, _ = _build(spec, seed=11)
     before = qkv.clone()
     op(qkv, **kwargs)
@@ -170,7 +174,7 @@ def _qwen_spec(num_heads_q: int, tokens: int) -> dict:
     """The certified qwen4_exp mRoPE cell at this geometry, at `tokens` rows."""
     matches = [
         c.spec
-        for c in op.CELLS
+        for c in CELLS
         if c.spec["num_heads_q"] == num_heads_q and c.spec.get("use_mrope", False)
     ]
     assert matches, f"no certified mRoPE cell with {num_heads_q} query heads"
@@ -259,7 +263,7 @@ def test_mrope_reduces_to_plain_rope_when_rows_agree(num_heads_q: int) -> None:
 
 
 def _ok(**over):
-    spec = dict(op.CELLS[0].spec)
+    spec = dict(CELLS[0].spec)
     spec.update(over)
     return _build(spec, seed=3)[:2]
 

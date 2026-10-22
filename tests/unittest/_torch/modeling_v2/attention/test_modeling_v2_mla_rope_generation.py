@@ -61,6 +61,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_generation requires a CUDA device"
@@ -1286,7 +1287,10 @@ def test_fp8_kv_mtp_append_race_control() -> None:
         env.shutdown()
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+CELLS = certified_cells(op)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     """Drive every configuration the entry claims, through the entry's own
     reference and its own gate.
