@@ -918,7 +918,13 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 
 
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
-    """Shared multimodal encoder flow for Gemma4 conditional generation models."""
+    """Shared multimodal encoder flow for Gemma4 conditional generation models.
+
+    Gemma4 declares its item-major ``pixel_values`` and ``audio_features``
+    layouts, including their per-item position, length, and mask fields, through
+    ``get_multimodal_item_partitions``, so the mixin's
+    ``build_multimodal_encoder_input`` slices them without a Gemma4 override.
+    """
 
     supports_encoder_cache = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
@@ -1235,7 +1241,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         **forward_kwargs,
     ) -> Dict:
         """Build Gemma4-specific language-model forward arguments."""
-        del position_ids, forward_kwargs
         mm_token_type_ids = None
         if raw_input_ids is not None and mm_inputs.input_ids is None:
             mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
