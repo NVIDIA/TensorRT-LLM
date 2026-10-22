@@ -1087,8 +1087,6 @@ class CUDAGraphRunner:
                 cross_kv_cache_manager)
 
         # Get draft KV cache manager only for one-model speculative decoding.
-        # In two-model mode, each model has its own KV cache manager, so
-        # draft_kv_cache_manager should be None.
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self.spec_config, resource_manager)
 
