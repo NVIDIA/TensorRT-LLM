@@ -4,9 +4,14 @@
 """Unit tests for OpenEngine image input mapping and discovery."""
 
 import asyncio
+import base64
+import gc
 import re
 import threading
 from collections.abc import AsyncIterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,12 +24,17 @@ grpc = pytest.importorskip(
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.request_mapping as request_mapping  # noqa: E402
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2, model_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    generation_pb2,
+    model_pb2,
+    server_pb2,
+)
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
+from tensorrt_llm.inputs.multimodal import MultimodalParams  # noqa: E402
 from tensorrt_llm.inputs.registry import (  # noqa: E402
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
@@ -204,6 +214,15 @@ class _Frontend:
 
 
 @pytest.fixture
+def media_pools():
+    with (
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="test_input") as input_pool,
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="test_media") as media_pool,
+    ):
+        yield input_pool, media_pool
+
+
+@pytest.fixture
 def image_llm(monkeypatch):
     config = _ImageConfig()
     input_processor = _ImageInputProcessor(config)
@@ -287,6 +306,167 @@ def test_media_capabilities_are_hashable():
 def test_unknown_decoded_image_type_is_rejected():
     with pytest.raises(TypeError, match="unsupported decoded image type"):
         request_mapping._decoded_image_bytes(object())
+
+
+@pytest.mark.parametrize("abandon_first", [False, True])
+def test_abandoned_preprocessing_reclaims_exports_regardless_of_completion_order(abandon_first):
+    import torch
+
+    from tensorrt_llm.grpc.openengine.servicer import _PreprocessingWork
+
+    params = MultimodalParams(multimodal_data={"image": [torch.ones(1024 * 1024)]})
+    params.to_handle("multimodal_data")
+    handle = params.multimodal_data["image"][0]
+    path = Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+    result = PreprocessedInputs(prompt_token_ids=[1], multimodal_params=params)
+    work = _PreprocessingWork()
+    assert path.exists()
+    if abandon_first:
+        work.abandon()
+    work.run(lambda: result)
+    work.abandon()
+    work.abandon()
+    gc.collect()
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("tokenized", [False, True])
+@pytest.mark.parametrize("fast_path", [False, True])
+def test_passthrough_placeholder_policy_follows_processor_input_path(
+    image_llm, monkeypatch, tokenized, fast_path
+):
+    from tensorrt_llm.inputs.content_format import ContentFormat
+
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    monkeypatch.setattr(llm.input_processor, "supports_token_id_mm_expansion", fast_path)
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_content_format",
+        lambda model_type: ContentFormat.PASSTHROUGH,
+    )
+    request = generation_pb2.GenerateRequest(
+        media=[generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")]
+    )
+    if tokenized:
+        request.token_ids.ids.extend(llm.tokenizer.encode("Describe this image"))
+    else:
+        request.prompt = "Describe this image"
+    prepared = request_mapping._prepare_input_from_request(request, llm)
+    if tokenized and fast_path:
+        with pytest.raises(ValueError, match="placeholder count"):
+            request_mapping._validate_media_placeholders(prepared, llm)
+    else:
+        request_mapping._validate_media_placeholders(prepared, llm)
+        assert not llm.input_processor.requires_input_placeholders(tokenized=tokenized)
+
+
+def test_submitted_preprocessing_preserves_exports_for_a_delayed_consumer():
+    import torch
+
+    from tensorrt_llm.grpc.openengine.servicer import _PreprocessingWork
+
+    params = MultimodalParams(multimodal_data={"image": torch.ones(8)})
+    params.to_handle("multimodal_data")
+    handle = params.multimodal_data["image"]
+    path = Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+    work = _PreprocessingWork()
+    work.run(lambda: PreprocessedInputs(prompt_token_ids=[1], multimodal_params=params))
+    work.transfer()
+    work.abandon()
+    assert path.exists()
+    assert params.multimodal_data["image"] is handle
+    params.to_tensor("multimodal_data")
+    torch.testing.assert_close(params.multimodal_data["image"], torch.ones(8))
+    params.multimodal_data = {}
+    gc.collect()
+    assert not path.exists()
+
+
+def test_native_processor_registration_overrides_hf_config_policy(monkeypatch):
+    from tensorrt_llm.inputs.content_format import ContentFormat
+
+    class NativeProcessor(_ImageInputProcessor):
+        _registered_model_type = "mistral_common"
+
+    def content_format(model_type):
+        assert model_type == "mistral_common"
+        return ContentFormat.PASSTHROUGH
+
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "get_content_format", content_format)
+    assert not NativeProcessor(_ImageConfig()).requires_input_placeholders()
+
+
+@pytest.mark.parametrize(
+    "tokens,sequences",
+    [
+        ([], [(1,)]),
+        ([1, 1, 1, 2], [(1,), (1, 1), (1, 1, 2), (2,)]),
+        ([0, 1, 2, 0, 1, 2], [(1, 2), (2,), (9,)]),
+    ],
+)
+def test_marker_scan_matches_reference_including_overlaps(tokens, sequences):
+    counts = request_mapping._count_token_sequences(tokens, sequences)
+    for sequence in sequences:
+        expected = sum(
+            tuple(tokens[index : index + len(sequence)]) == sequence
+            for index in range(len(tokens) - len(sequence) + 1)
+        )
+        assert counts[sequence] == expected
+
+
+@pytest.mark.asyncio
+async def test_media_and_preprocessing_do_not_block_control_executor(image_llm, monkeypatch):
+    from tensorrt_llm.inputs.media_io import BaseMediaIO
+
+    loop = asyncio.get_running_loop()
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm.args = SimpleNamespace(
+        guided_decoding_backend=None,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        context_parallel_size=1,
+        max_batch_size=8,
+        max_num_tokens=2048,
+        kv_cache_config=SimpleNamespace(tokens_per_block=32),
+    )
+    llm._executor = SimpleNamespace(
+        get_kv_cache_capacity=lambda: {}, get_openengine_discovery=lambda: {}
+    )
+    with (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="test_input") as input_pool,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="test_media") as media_pool,
+    ):
+        release = threading.Event()
+        entered = [asyncio.Event(), asyncio.Event()]
+
+        def block(index):
+            loop.call_soon_threadsafe(entered[index].set)
+            assert release.wait(timeout=5)
+            return threading.current_thread().name
+
+        # Saturate both media pools, then require a real Control GetServerInfo RPC
+        # (which uses asyncio's default executor) to remain responsive.
+        tasks = [loop.run_in_executor(input_pool, block, 0)]
+        with BaseMediaIO.use_executor(media_pool):
+            tasks.append(asyncio.create_task(BaseMediaIO._run_in_executor(block, 1)))
+        try:
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), timeout=2)
+            inference = OpenEngineInferenceServicer(
+                llm, "image-model", input_executor=input_pool, media_executor=media_pool
+            )
+            control = OpenEngineControlServicer(llm, "image-model", inference)
+            info = await asyncio.wait_for(
+                control.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext()),
+                timeout=1,
+            )
+            assert info.engine_name == "tensorrt_llm"
+        finally:
+            release.set()
+            names = await asyncio.gather(*tasks)
+        assert names[0].startswith("test_input")
+        assert names[1].startswith("test_media")
 
 
 def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, monkeypatch):
@@ -890,15 +1070,28 @@ async def test_placeholder_mismatch_does_not_poison_hashing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["complete", "local_abort", "coordinator_abort", "rpc_cancel"])
-async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monkeypatch, outcome):
+async def test_media_preprocessing_is_offloaded_and_abort_aware(
+    image_llm, monkeypatch, outcome, media_pools
+):
     capability_llm, _ = image_llm
     llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
     loop = asyncio.get_running_loop()
     serving_thread = threading.get_ident()
+    request_context = ContextVar("preprocess_request_context", default=None)
     started = asyncio.Event()
     finished = asyncio.Event()
+    reclaimed = asyncio.Event()
     release = threading.Event()
-    preprocessed = PreprocessedInputs(prompt_token_ids=[1, 2, 3])
+    params = MultimodalParams()
+    preprocessed = PreprocessedInputs(prompt_token_ids=[1, 2, 3], multimodal_params=params)
+    export_paths = []
+    release_handles = params.release_handles
+
+    def reclaim():
+        release_handles()
+        loop.call_soon_threadsafe(reclaimed.set)
+
+    monkeypatch.setattr(params, "release_handles", reclaim)
     preprocess_calls = []
     submitted = []
 
@@ -908,20 +1101,38 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
             return cls()
 
         async def async_load_bytes(self, data):
-            return np.zeros((1, 1, 3), dtype=np.uint8)
+            from tensorrt_llm.inputs.media_io import BaseMediaIO
+
+            def decode():
+                assert threading.current_thread().name.startswith("test_media")
+                return np.zeros((1, 1, 3), dtype=np.uint8)
+
+            return await BaseMediaIO._run_in_executor(decode)
 
     def preprocess(inputs, sampling_params, disaggregated_params):
         assert threading.get_ident() != serving_thread
+        assert threading.current_thread().name.startswith("test_input")
+        assert request_context.get() == "image-request"
         preprocess_calls.append(inputs)
         loop.call_soon_threadsafe(started.set)
         try:
             assert release.wait(timeout=5), "test must release the preprocessing thread"
+            import torch
+
+            params.multimodal_data = {"image": {"pixel_values": torch.ones(1024 * 1024)}}
+            params.to_handle("multimodal_data")
+            handle = params.multimodal_data["image"]["pixel_values"]
+            export_paths.append(
+                Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+            )
             return preprocessed
         finally:
             loop.call_soon_threadsafe(finished.set)
 
     def generate_async(**kwargs):
         assert threading.get_ident() == serving_thread
+        if isinstance(kwargs["inputs"], PreprocessedInputs):
+            kwargs["inputs"].multimodal_params.to_tensor("multimodal_data")
         submitted.append(kwargs["inputs"])
         return llm.result_handle
 
@@ -929,7 +1140,13 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
     monkeypatch.setattr(llm, "preprocess", preprocess)
     monkeypatch.setattr(llm, "generate_async", generate_async)
     frontend = _Frontend()
-    servicer = OpenEngineInferenceServicer(llm, model="image-model", frontend=frontend)
+    servicer = OpenEngineInferenceServicer(
+        llm,
+        model="image-model",
+        frontend=frontend,
+        input_executor=media_pools[0],
+        media_executor=media_pools[1],
+    )
     request = generation_pb2.GenerateRequest(
         request_id="preprocessing",
         model="image-model",
@@ -941,7 +1158,11 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
     context = FakeServicerContext()
 
     async def collect():
-        return [response async for response in servicer.Generate(request, context)]
+        token = request_context.set("image-request")
+        try:
+            return [response async for response in servicer.Generate(request, context)]
+        finally:
+            request_context.reset(token)
 
     task = asyncio.create_task(collect())
     try:
@@ -982,6 +1203,10 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    if outcome != "complete":
+        await asyncio.wait_for(reclaimed.wait(), timeout=2)
+        gc.collect()
+        assert export_paths and not any(path.exists() for path in export_paths)
     assert len(preprocess_calls) == 1
     assert len(submitted) == (2 if outcome == "complete" else 1)
     assert servicer.active_request_count() == 0

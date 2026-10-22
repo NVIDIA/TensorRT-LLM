@@ -4,13 +4,18 @@
 """OpenEngine Inference service adapter for the TensorRT-LLM LLM API."""
 
 import asyncio
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import Executor
 from contextlib import aclosing
+from contextvars import copy_context
+from functools import partial
 from typing import Any
 
 import grpc
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scheduling_params import SchedulingParams
@@ -46,6 +51,43 @@ from .streaming import (
 )
 
 
+class _PreprocessingWork:
+    """Own exports until submission, including results from abandoned worker threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._result = None
+
+    @staticmethod
+    def _release(result: Any) -> None:
+        params = getattr(result, "multimodal_params", None)
+        if params is not None:
+            try:
+                params.release_handles()
+            except Exception as error:
+                logger.error(f"Failed to reclaim abandoned preprocessing exports: {error}")
+
+    def run(self, preprocess: Callable[[], Any]) -> Any:
+        result = preprocess()
+        with self._lock:
+            if not self._abandoned:
+                self._result = result
+                return result
+        self._release(result)
+        return None
+
+    def transfer(self) -> None:
+        with self._lock:
+            self._result = None
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+            result, self._result = self._result, None
+        self._release(result)
+
+
 class _LocalRequest:
     """Abort-aware local request state spanning mapping and generation."""
 
@@ -53,6 +95,7 @@ class _LocalRequest:
         self.mapping_task: asyncio.Task[Any] | None = None
         self.engine_handle: Any = None
         self.aborted = False
+        self.preprocessing: _PreprocessingWork | None = None
 
     def bind_mapping(self, task: asyncio.Task[Any]) -> None:
         self.mapping_task = task
@@ -65,6 +108,8 @@ class _LocalRequest:
 
     def bind_engine(self, handle: Any) -> None:
         self.engine_handle = handle
+        if self.preprocessing is not None:
+            self.preprocessing.transfer()
         if self.aborted:
             handle.abort()
 
@@ -86,8 +131,12 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         kv_transfer_backend: str = "",
         frontend: FrontendClient | None = None,
         subagent_affinity_auth_key: str | None = None,
+        input_executor: Executor | None = None,
+        media_executor: Executor | None = None,
     ) -> None:
         self._frontend = frontend
+        self._input_executor = input_executor
+        self._media_executor = media_executor
         self._llm = llm
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so
@@ -189,6 +238,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         except CoordinationError as error:
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
         finally:
+            if local_request is not None and local_request.preprocessing is not None:
+                local_request.preprocessing.abandon()
             if registration is not None:
                 registration.release()
             if reservation is not None:
@@ -278,12 +329,26 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             )
 
             async def prepare_inputs() -> Any:
+                loop = asyncio.get_running_loop()
                 if prepared_input.media:
-                    await asyncio.to_thread(_validate_media_placeholders, prepared_input, self._llm)
-                inputs = await _load_prepared_input(prepared_input, self._llm)
+                    await loop.run_in_executor(
+                        self._input_executor,
+                        copy_context().run,
+                        _validate_media_placeholders,
+                        prepared_input,
+                        self._llm,
+                    )
+                with BaseMediaIO.use_executor(self._media_executor):
+                    inputs = await _load_prepared_input(prepared_input, self._llm)
                 if prepared_input.media:
-                    return await asyncio.to_thread(
-                        self._llm.preprocess, inputs, sampling_params, disaggregated_params
+                    work = local_request.preprocessing = _PreprocessingWork()
+                    return await loop.run_in_executor(
+                        self._input_executor,
+                        copy_context().run,
+                        work.run,
+                        partial(
+                            self._llm.preprocess, inputs, sampling_params, disaggregated_params
+                        ),
                     )
                 return inputs
 

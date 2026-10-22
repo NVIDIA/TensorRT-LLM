@@ -5,7 +5,7 @@
 
 import asyncio
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -433,9 +433,37 @@ def _prepare_input_from_request(
     return _PreparedInput(inputs, media, capabilities)
 
 
+def _count_token_sequences(
+    prompt_ids: Sequence[int], sequences: Iterable[tuple[int, ...]]
+) -> Counter[tuple[int, ...]]:
+    """Count overlapping markers in one traversal, sharing common prefixes."""
+    trie: dict = {}
+    for sequence in sequences:
+        node = trie
+        for token_id in sequence:
+            node = node.setdefault(token_id, {})
+        node[None] = sequence
+    counts: Counter[tuple[int, ...]] = Counter()
+    for start, token_id in enumerate(prompt_ids):
+        node = trie.get(token_id)
+        index = start + 1
+        while node is not None:
+            sequence = node.get(None)
+            if sequence is not None:
+                counts[sequence] += 1
+            if index == len(prompt_ids):
+                break
+            node = node.get(prompt_ids[index])
+            index += 1
+    return counts
+
+
 def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
     """Reject placeholder mismatches before probing the stateful MM processor."""
     if not prepared.media or prepared.capabilities is None:
+        return
+    processor = llm.input_processor
+    if not processor.requires_input_placeholders(tokenized=not isinstance(prepared.inputs, str)):
         return
     tokenizer = llm.tokenizer
     prompt_ids = (
@@ -453,19 +481,15 @@ def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
             raise ValueError(f"{handler.name} placeholder must encode to at least one token")
         expected_sequences[sequence] += 1
 
+    actual_sequences = _count_token_sequences(prompt_ids, expected_sequences)
     for sequence, expected in expected_sequences.items():
-        width = len(sequence)
-        actual = sum(
-            tuple(prompt_ids[index : index + width]) == sequence
-            for index in range(len(prompt_ids) - width + 1)
-        )
+        actual = actual_sequences[sequence]
         if actual != expected:
             raise ValueError(
                 f"media placeholder count does not match media items: expected {expected}, "
                 f"got {actual} for placeholder token IDs {list(sequence)}"
             )
 
-    processor = llm.input_processor
     mm_ids = processor.get_mm_token_ids()
     if mm_ids is not None:
         special_ids = processor.get_mm_special_token_ids()
