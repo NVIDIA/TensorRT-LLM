@@ -43,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.q35_env import fast_paths_enabled
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
@@ -1394,6 +1395,9 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """
 
     _supports_additional_snapshot_offsets = False
+    # Dummy flags the device mask holds when the last upload is known to be
+    # current (Qwen3.5 fast paths); None forces the next refresh to upload.
+    _steady_dummy_mask_key: Optional[Tuple[bool, ...]] = None
 
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size: int) -> None:
@@ -1489,6 +1493,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
         if self._dummy_request_mask is None:
             return
+
+        if fast_paths_enabled():
+            # The device mask is written only here; a steady decode batch
+            # (same flags, all-zero tail included) has nothing to upload.
+            key = tuple(is_dummy)
+            if key == self._steady_dummy_mask_key:
+                return
+            self._steady_dummy_mask_key = key
+        else:
+            self._steady_dummy_mask_key = None
 
         n = len(is_dummy)
         assert n <= self._dummy_request_mask_host.shape[0]
@@ -3008,6 +3022,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # (request ids, SSM base blocks, dummy flags) of the last state-index
+    # upload while it is known to be current (Qwen3.5 fast paths).
+    _steady_state_index_key: Optional[Tuple[Tuple[int, ...], Tuple[int, ...],
+                                            Tuple[bool, ...]]] = None
     # Recurrent-state snapshots use a specialized commit/history protocol, so
     # keep main-like reuse endpoints and the existing unpaired draft path.
     _supports_reuse_match_backoff = False
@@ -4505,6 +4523,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        # A freed request ends any steady decode run.
+        self._steady_state_index_key = None
         self._kda_replay_suspended.discard(request.py_request_id)
         self._kda_replay_acceptance_pending.discard(request.py_request_id)
         self._kda_replay_unseeded.discard(request.py_request_id)
@@ -4551,6 +4571,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert n <= self._host_state_indices.shape[0], (
             f"State-index batch size {n} exceeds max_batch_size "
             f"{self._host_state_indices.shape[0]}")
+        if (n > 0 and fast_paths_enabled() and not self.use_kda_replay_update):
+            if self._is_steady_state_index_batch(requests):
+                return
+        else:
+            self._steady_state_index_key = None
         self._host_state_indices.zero_()
         if n > 0:
             for i, req in enumerate(requests):
@@ -4606,6 +4631,40 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     self._seed_kda_replay_slots(
                         resumed_indices.to(self.prev_num_accepted_tokens.device,
                                            non_blocking=True))
+
+    def _is_steady_state_index_batch(self, requests: List[LlmRequest]) -> bool:
+        """Whether the state-index buffers already hold this batch's values.
+
+        True for a steady decode batch: the same requests on the same SSM base
+        blocks with the same dummy flags as the last upload, so the host
+        staging buffer, the device indices, the dummy mask and the
+        per-request maps hold exactly what a full setup would write. Records
+        the batch as the new reference otherwise.
+        """
+        base_indices = []
+        for req in requests:
+            kv_cache = self.kv_cache_map.get(req.py_request_id)
+            if kv_cache is None:
+                self._steady_state_index_key = None
+                return False
+            base_indices.append(
+                kv_cache.get_ssm_block_base_index(self.ssm_layer_group_id))
+        if min(base_indices) < 0:
+            self._steady_state_index_key = None
+            return False
+        key = (tuple(req.py_request_id for req in requests),
+               tuple(base_indices), tuple(req.is_dummy for req in requests))
+        # Request ids recur (warmup and CUDA-graph dummies are freed and
+        # re-added under the same id), so the per-request maps, which
+        # free_resources() prunes, are checked as well.
+        if key == self._steady_state_index_key and all(
+                self._request_id_to_state_index.get(req.py_request_id) == base
+                and self._request_id_to_is_dummy.get(
+                    req.py_request_id) == req.is_dummy
+                for req, base in zip(requests, base_indices)):
+            return True
+        self._steady_state_index_key = key
+        return False
 
     def _record_kda_replay_acceptance(
         self,

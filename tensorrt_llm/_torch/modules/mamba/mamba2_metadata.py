@@ -24,6 +24,7 @@ import triton.language as tl
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.q35_env import fast_paths_enabled
 from tensorrt_llm._utils import prefer_pinned
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
@@ -378,6 +379,9 @@ class Mamba2Metadata:
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
+        # Host indices of the last upload to ``state_indices`` while it is
+        # known to be current (Qwen3.5 fast paths); None forces an upload.
+        self._steady_state_indices_key: Optional[Tuple[int, ...]] = None
 
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
@@ -490,11 +494,13 @@ class Mamba2Metadata:
                         "are used; got a different address than the first "
                         "call.")
                 self.state_indices = indices
+                self._steady_state_indices_key = None
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._steady_state_indices_key = None
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -502,11 +508,16 @@ class Mamba2Metadata:
                 assert len(indices) == batch_size, (
                     f"get_state_indices() returned {len(indices)} entries for "
                     f"a batch of {batch_size} requests.")
-                self.state_indices_cpu[:batch_size].copy_(
-                    torch.as_tensor(indices,
-                                    dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                key = tuple(indices) if fast_paths_enabled() else None
+                # The device indices are written only here, so a steady decode
+                # batch that maps to the last upload's indices skips it.
+                if key is None or key != self._steady_state_indices_key:
+                    self.state_indices_cpu[:batch_size].copy_(
+                        torch.as_tensor(indices,
+                                        dtype=self.state_indices_cpu.dtype))
+                    self.state_indices[:batch_size].copy_(
+                        self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._steady_state_indices_key = key
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
