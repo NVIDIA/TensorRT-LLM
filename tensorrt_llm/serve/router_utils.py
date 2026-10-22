@@ -18,7 +18,6 @@ implementation of block hashing without importing the whole router module.
 """
 
 import os
-from collections import OrderedDict
 from typing import Iterable, List, Optional, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
@@ -31,6 +30,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     sequence_to_blockchain_keys,
 )
 from tensorrt_llm.serve.chat_tokenization import (
+    IncrementalTokenizationCache,
+    OffsetTokenizer,
     resolve_model_type_from_config,
     tokenize_chat_request_for_serving,
     uses_harmony_tokenization,
@@ -204,6 +205,7 @@ class BlockHashMixin:
         self._tokenizer_dir = tokenizer_dir
         self._model_path = model_path
         self._use_harmony = use_harmony
+        self._incremental_tokenizer = IncrementalTokenizationCache.from_environment("router")
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
@@ -211,6 +213,8 @@ class BlockHashMixin:
             f", model_path={self._model_path}"
             f", use_harmony={self._use_harmony}"
         )
+        if self._incremental_tokenizer.enabled:
+            logger.info("Incremental router tokenization enabled")
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
@@ -235,22 +239,11 @@ class BlockHashMixin:
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
-    def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
-        cache = getattr(self, "_tok_prefix_cache", None)
-        if cache is None:
-            cache = self._tok_prefix_cache = OrderedDict()
-        entry = cache.get(key)
-        if entry is not None and rendered == entry[0]:
-            ids = entry[1]
-        else:
-            # Tokenizing a suffix independently is not generally composable:
-            # BPE/SentencePiece merges can cross the cached string boundary.
-            ids = tokenizer.encode(rendered, add_special_tokens=False)
-        cache[key] = (rendered, ids)
-        cache.move_to_end(key)
-        while len(cache) > 1024:
-            cache.popitem(last=False)
-        return ids
+    def _encode_with_prefix_cache(
+        self, rendered: str, key: int, tokenizer: OffsetTokenizer
+    ) -> list[int]:
+        """Tokenize a rendered prompt while reusing a stable cached prefix."""
+        return self._incremental_tokenizer.encode(rendered, key, tokenizer)
 
     def _get_model_type(self) -> Optional[str]:
         model_path = self._model_path or self._tokenizer_dir
@@ -270,7 +263,7 @@ class BlockHashMixin:
         return self._model_types[model_path]
 
     def _make_encode_rendered(self, request: ChatCompletionRequest):
-        """Router-side tokenization with the exact-match prompt cache."""
+        """Router-side tokenization through the per-conversation prompt token cache."""
 
         def encode_rendered(rendered: str, tokenizer: object) -> list[int]:
             key = hash(
