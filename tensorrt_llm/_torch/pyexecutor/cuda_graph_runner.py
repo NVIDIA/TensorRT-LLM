@@ -201,6 +201,9 @@ class CUDAGraphRunner:
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
             self._create_shared_static_tensors()
+        # Token count of the next replay whose static input ids and position
+        # ids are already written (see set_static_inputs_staged).
+        self._static_inputs_staged_num_tokens: Optional[int] = None
         self.cuda_graph_meta_buffers = get_memory_buffers()
 
         # On-the-fly capture is disabled by default to prevent workspace
@@ -775,6 +778,16 @@ class CUDAGraphRunner:
         self.memory_pool = graph.pool()
         return graph_output
 
+    def set_static_inputs_staged(self, num_tokens: Optional[int]) -> None:
+        """Mark the static input ids / positions as written for the next replay.
+
+        The steady one-model MTP decode prepare (q35_steady_prepare.py) writes
+        them in its staging kernel. The next replay skips its two copies when
+        it runs ``num_tokens`` tokens; every replay clears the mark, and None
+        clears it without a replay.
+        """
+        self._static_inputs_staged_num_tokens = num_tokens
+
     def replay(
         self,
         key: KeyType,
@@ -804,7 +817,10 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        staged = self._static_inputs_staged_num_tokens == seqlen
+        self._static_inputs_staged_num_tokens = None
+        if not staged:
+            static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -815,7 +831,9 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+            if not staged:
+                static_tensors["position_ids"][:, :, :seqlen].copy_(
+                    position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
             num_slots = key.batch_size * self.max_beam_width
@@ -851,7 +869,8 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            if not staged:
+                static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -1324,6 +1343,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self._pre_replay_position_ids = None
+        self._static_inputs_staged_num_tokens = None
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

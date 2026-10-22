@@ -198,6 +198,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
         self._inputs.breakable_cuda_graph_runner = self._graphs.breakable_cuda_graph_runner
+        self._inputs.cuda_graph_runner = self._graphs.cuda_graph_runner
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
