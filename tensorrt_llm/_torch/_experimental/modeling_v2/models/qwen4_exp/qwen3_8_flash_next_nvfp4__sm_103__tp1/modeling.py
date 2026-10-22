@@ -109,6 +109,7 @@ import functools
 import math
 import os
 import re
+import types
 from typing import NamedTuple
 
 import torch
@@ -587,10 +588,12 @@ def _mtp_draft_head_mode() -> str:
 
 
 #: Set to N > 0 to let the FP8 draft head propose only the first N token ids (the tokenizer's
-#: most frequent merges come first): a vocabulary-row slice of the head, so its id is the
-#: token's and the worker needs no draft-to-target map. A draft can only miss more often --
-#: the verify step's full head decides what is emitted -- so outputs are unchanged and the
-#: acceptance length is the cost to watch. 0 (default): the whole vocabulary.
+#: most frequent merges come first) and the vocabulary's tail from the added tokens on
+#: (end-of-text, the chat and thinking markers), rounded to whole 128-row blocks: a row
+#: subset of the head's FP8 copies, its draft ids mapped back through the worker's `d2t`
+#: offsets. A draft can only miss more often -- the verify step's full head decides what is
+#: emitted -- so outputs are unchanged and the acceptance length is the cost to watch.
+#: 0 (default): the whole vocabulary.
 _MTP_DRAFT_VOCAB_ENV = "TRTLLM_MODELING_V2_MTP_DRAFT_VOCAB"
 
 
@@ -7683,10 +7686,30 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         # FP8 mode, the target's own head's.
         if draft_fp8 or _dense_fp8_enabled():
             self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
-        vocab = _mtp_draft_vocab()
-        if draft_fp8 and 0 < vocab < self.lm_head.weight.shape[0]:
-            codes, scale = rowwise
-            self.model._mtp_head_fp8 = (codes[:vocab], scale[:, :vocab].contiguous())
-            self.model._mtp_head_g = pack_from_bf16(self.lm_head.weight.data[:vocab])
         if _dense_fp8_enabled():
             self.logits_processor.fp8_head = (rowwise, self.model._lm_head_g)
+        vocab = _mtp_draft_vocab()
+        if draft_fp8 and vocab > 0:
+            self._slice_draft_vocab(rowwise, vocab)
+
+    def _slice_draft_vocab(self, rowwise: tuple, vocab: int) -> None:
+        """The draft head over token ids `[0, vocab)` and the vocabulary's tail from the
+        added tokens on (`_MTP_DRAFT_VOCAB_ENV`); the worker maps a draft id `i` back to
+        `i + d2t[i]`."""
+        weight = self.lm_head.weight.data
+        full = weight.shape[0]
+        tail = full - -(-(full - self.model.eos_token_id) // 128) * 128
+        assert vocab % 128 == 0 and vocab <= tail, (
+            f"{_MTP_DRAFT_VOCAB_ENV}={vocab}: a multiple of 128 below the added tokens' "
+            f"block at {tail}"
+        )
+        if vocab == tail:
+            return
+        rows = torch.cat([torch.arange(vocab), torch.arange(tail, full)]).to(weight.device)
+        codes, scale = rowwise
+        self.model._mtp_head_fp8 = (codes[rows], scale[:, rows].contiguous())
+        self.model._mtp_head_g = pack_from_bf16(weight[rows])
+        d2t = torch.zeros(rows.numel(), dtype=torch.long, device=weight.device)
+        d2t[vocab:] = tail - vocab
+        self.draft_model.model = types.SimpleNamespace(d2t=d2t)
+        self.spec_worker.set_draft_model(self.draft_model)
