@@ -1851,22 +1851,32 @@ class MiniMaxM3VLInputProcessor:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            processor = AutoProcessor.from_pretrained(
-                self._model_path,
-                use_fast=self._use_fast,
-                trust_remote_code=self._trust_remote_code,
-            )
-            if getattr(processor, "image_processor", None) is None:
-                raise ValueError(
-                    "MiniMax-M3 image and video inputs need an HF processor with an "
-                    f"image processor, but AutoProcessor.from_pretrained({self._model_path!r}) "
-                    f"returned {type(processor).__name__}, which has none: the checkpoint "
-                    "ships no processor this transformers version can load. Text-only "
-                    "requests are unaffected. For image or video requests, serve a model "
-                    "directory whose processor loads with AutoProcessor (for example, "
-                    "processor code registered through an auto_map entry)."
-                )
-            self._processor = processor
+            from tensorrt_llm._torch.model_config import hf_remote_code_lock
+
+            # The first load publishes the checkpoint's remote-code files into
+            # the shared HF module cache; the lock serializes that publication
+            # across ranks and request threads (``create_input_processor``
+            # holds the same lock around construction), and the re-check keeps
+            # concurrent first requests from building two processors.
+            with hf_remote_code_lock():
+                if self._processor is None:
+                    processor = AutoProcessor.from_pretrained(
+                        self._model_path,
+                        use_fast=self._use_fast,
+                        trust_remote_code=self._trust_remote_code,
+                    )
+                    if getattr(processor, "image_processor", None) is None:
+                        raise ValueError(
+                            "MiniMax-M3 image and video inputs need an HF processor with an "
+                            "image processor, but "
+                            f"AutoProcessor.from_pretrained({self._model_path!r}) returned "
+                            f"{type(processor).__name__}, which has none: the checkpoint ships "
+                            "no processor this transformers version can load. Text-only "
+                            "requests are unaffected. For image or video requests, serve a "
+                            "model directory whose processor loads with AutoProcessor (for "
+                            "example, processor code registered through an auto_map entry)."
+                        )
+                    self._processor = processor
         return self._processor
 
     @property
