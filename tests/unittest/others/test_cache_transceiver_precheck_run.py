@@ -1563,7 +1563,7 @@ class TestInternalApiContract:
                         "transceiver_runtime": None,
                         "enable_pipelined_transfer": True,
                     },
-                    "kv_cache_config": {"use_kv_cache_manager_v2": False},
+                    "kv_cache_config": {"use_kv_cache_manager_v2": True},
                 }
                 for role in ("ctx", "gen")
             },
@@ -1757,7 +1757,10 @@ def test_resolved_contract_preserves_role_asymmetry(
         "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
         "worker_config": {
             side: {
-                "cache_transceiver_config": {"backend": "DEFAULT", "transceiver_runtime": "PYTHON"},
+                "cache_transceiver_config": {
+                    "backend": "DEFAULT",
+                    "transceiver_runtime": "CPP" if side == "ctx" else "PYTHON",
+                },
                 "kv_cache_config": {
                     "use_kv_cache_manager_v2": side == "gen",
                     "dtype": "half" if side == "ctx" else "fp16",
@@ -1786,8 +1789,78 @@ def test_resolved_contract_preserves_role_asymmetry(
     shape = dict(pcfg.FALLBACK_KV_SHAPE, source="different local path")
     resolved = runner._resolve_transfer_config(shape)
     assert runner.use_v2 is (role == "gen")
-    assert resolved.transceiver_runtime == "PYTHON"
-    expected = {"runtime": "PYTHON", "backend": "NIXL", "kv_dtype": "fp16"}
-    assert runner.transfer_contract["ctx"] == dict(expected, use_v2=False)
-    assert runner.transfer_contract["gen"] == dict(expected, use_v2=True)
+    assert resolved.transceiver_runtime == ("CPP" if role == "ctx" else "PYTHON")
+    expected = {"backend": "NIXL", "kv_dtype": "fp16"}
+    assert runner.transfer_contract["ctx"] == dict(expected, use_v2=False, runtime="CPP")
+    assert runner.transfer_contract["gen"] == dict(expected, use_v2=True, runtime="PYTHON")
     assert "source" not in runner.transfer_contract["kv_shape"]
+
+
+@pytest.mark.parametrize("invalid_role", ["ctx", "gen"])
+@pytest.mark.parametrize(
+    "use_v2,runtime,pipelined,error",
+    [
+        (False, "PYTHON", False, "Python transceiver requires KVCacheManagerV2"),
+        (False, None, True, "Python transceiver requires KVCacheManagerV2"),
+        (True, "CPP", False, "KVCacheManagerV2 requires"),
+    ],
+)
+def test_setup_rejects_invalid_manager_runtime_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_role: str,
+    use_v2: bool,
+    runtime: str | None,
+    pipelined: bool,
+    error: str,
+) -> None:
+    """Reject either peer's invalid resolved pairing before GPU construction."""
+    cfg = {
+        "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+        "worker_config": {
+            role: {
+                "cache_transceiver_config": {
+                    "backend": "NIXL",
+                    "transceiver_runtime": runtime if role == invalid_role else "CPP",
+                    "enable_pipelined_transfer": pipelined if role == invalid_role else False,
+                },
+                "kv_cache_config": {
+                    "use_kv_cache_manager_v2": use_v2 if role == invalid_role else False,
+                },
+            }
+            for role in ("ctx", "gen")
+        },
+    }
+
+    def make_cache_config(**kwargs: object) -> types.SimpleNamespace:
+        return types.SimpleNamespace(**kwargs, _resolve_default_backend=lambda: ("NIXL", None))
+
+    def resolve_cache_config(cache_cfg: types.SimpleNamespace) -> None:
+        if cache_cfg.enable_pipelined_transfer:
+            cache_cfg.transceiver_runtime = "PYTHON"
+
+    def forbid_construction(**kwargs: object) -> None:
+        pytest.fail("Invalid configuration reached GPU/distributed resource construction")
+
+    monkeypatch.setattr(
+        rp,
+        "load_internal_apis",
+        lambda: types.SimpleNamespace(
+            CacheTransceiverConfig=make_cache_config,
+            resolve_cache_transceiver_config=resolve_cache_config,
+            Mapping=forbid_construction,
+        ),
+    )
+    runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+    runner.plan = rp.pcfg.resolve_plan(cfg)
+    runner.role, runner.is_leader = "ctx", False
+    errors: list[str] = []
+
+    def allgather(value: str) -> list[str]:
+        errors.append(value)
+        return [value]
+
+    runner.comm = types.SimpleNamespace(allgather=allgather)
+    with pytest.raises(RuntimeError, match=error):
+        runner.setup(dict(rp.pcfg.FALLBACK_KV_SHAPE), 32)
+    assert len(errors) == 1
+    assert error in errors[0]

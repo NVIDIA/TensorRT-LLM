@@ -238,10 +238,7 @@ def load_internal_apis():
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
-    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
-        create_kv_cache_transceiver,
-        maybe_enable_fabric_memory_for_python_transceiver,
-    )
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import create_kv_cache_transceiver
     from tensorrt_llm._torch.distributed import Distributed
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
     from tensorrt_llm._torch.pyexecutor.config_utils import resolve_cache_transceiver_config
@@ -280,9 +277,6 @@ def load_internal_apis():
         KVCacheManager=KVCacheManager,
         KVCacheManagerV2=KVCacheManagerV2,
         create_kv_cache_transceiver=create_kv_cache_transceiver,
-        maybe_enable_fabric_memory_for_python_transceiver=(
-            maybe_enable_fabric_memory_for_python_transceiver
-        ),
         LlmRequest=LlmRequest,
         LlmRequestState=LlmRequestState,
         LlmRequestType=LlmRequestType,
@@ -1004,7 +998,7 @@ class PrecheckRunner:
             The resolved CacheTransceiverConfig consumed by setup.
 
         Raises:
-            RuntimeError: If preferences cannot be resolved or V2 requires Python.
+            RuntimeError: If preferences cannot be resolved or the manager/runtime pairing is invalid.
         """
         api = load_internal_apis()
         role_configs = {}
@@ -1021,6 +1015,11 @@ class PrecheckRunner:
                 raise RuntimeError(
                     "KVCacheManagerV2 requires cache_transceiver_config."
                     f"transceiver_runtime: PYTHON, got {runtime!r}"
+                )
+            if not use_v2 and runtime == "PYTHON":
+                raise RuntimeError(
+                    "The Python transceiver requires KVCacheManagerV2; "
+                    "set use_kv_cache_manager_v2: true or transceiver_runtime: CPP."
                 )
             role_configs[role] = cache_cfg
             contracts[role] = {
@@ -1081,8 +1080,6 @@ class PrecheckRunner:
         # side).
         os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = self.csv_dir
 
-        manager_cls = api.KVCacheManagerV2 if self.use_v2 else api.KVCacheManager
-        api.maybe_enable_fabric_memory_for_python_transceiver(cache_cfg, manager_cls)
         self.kvm = build_kv_cache_manager(
             kv_shape, self.plan, self.side, self.mapping, max_req_len, self.use_v2
         )

@@ -127,7 +127,6 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 |-----------------|-------|
 | `config_and_checkpoint_loader_initialization_seconds` | Initialize the model config and checkpoint loader. |
 | `model_engine_creation_seconds` | Construct the main model engine, which includes loading model weights. |
-| `draft_model_engine_creation_seconds` | Construct the separate draft model engine in the deprecated two-model MTP setting. |
 | `guided_decoder_creation_seconds` | Construct guided-decoding resources. |
 | `sampler_creation_seconds` | Construct the sampler. |
 | `initial_kv_cache_creation_seconds` | Construct the temporary KV cache used to estimate final capacity. |
@@ -145,8 +144,6 @@ The two model-engine properties contain times for various `PyTorchModelEngine` w
 `py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
 Likewise, `final_model_engine` measures the timings for the final model engine creation as part of
 the `py_executor.final_py_executor_creation_seconds` timing.
-The deprecated two-model speculative decoding setting may produce the additional properties
-`initial_draft_model_engine` and `final_draft_model_engine`.
 
 Each model-engine property contains the warmup scopes below. Which scopes appear depends on the model
 and configuration; for example, encoder-decoder and context-parallel configurations can skip some
@@ -174,7 +171,7 @@ The `model_loader` property contains timings for loading the main LLM weights, i
 `checkpoint_finalization_seconds` for checkpoint-session synchronization and cleanup after weight population.
 If a draft model is used, additional fields `draft_checkpoint_preparation_seconds`,
 `draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds` will appear.
-A `draft_model_loader` property can also appear in the deprecated two-model MTP setting.
+A `draft_model_loader` property appears when a user-provided drafter exposes a `draft_model_engine`.
 The `py_executor.model_engine_creation_seconds` timing includes the total `model_loader` timing.
 
 | Metric | Description |
