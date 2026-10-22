@@ -595,24 +595,6 @@ class DecoderCudaGraphs:
                 (graph_bs, draft_len)
                 for graph_bs, draft_len in self._dynamic_draft_len_mapping.items()
             ]
-            # Workaround for dynamic draft length:
-            # capture the maximum speculative graph shape up front. Dynamic draft length
-            # breaks the previous assumption that attention workspace demand can be safely
-            # ordered by batch size alone; a later graph shape may require a larger shared
-            # graph workspace, and resizing that workspace can change its data_ptr and
-            # invalidate pointers captured by earlier graphs, causing illegal memory access
-            # on replay.
-            #
-            # This adds the overhead of one extra captured graph, and that graph is not
-            # expected to be used by the normal schedule-driven dynamic draft-length path.
-            #
-            # Follow-up first-principles fix:
-            # query or precompute the exact attention workspace requirement for all
-            # reachable graph shapes, pre-size the shared graph workspace once without
-            # capturing an extra graph, and avoid resizing it in graph mode afterward.
-            max_spec_graph = (max(cuda_graph_batch_sizes), self._config.original_max_draft_len)
-            if max_spec_graph not in graphs:
-                graphs.append(max_spec_graph)
             logger.info(
                 f"Dynamic draft length enabled for one-model path. "
                 f"Capturing {len(graphs)} graphs: {graphs}"

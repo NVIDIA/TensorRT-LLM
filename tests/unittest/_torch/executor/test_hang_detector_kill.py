@@ -35,6 +35,8 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import (
     start_rank_crash_kill_watchdog,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_detector_fires_after_timeout():
     fired = []

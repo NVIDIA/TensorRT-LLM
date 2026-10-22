@@ -1035,14 +1035,15 @@ def _create_py_executor(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
 
-        # VSWA allocates one pool per window size, which only
-        # `register_kv_cache_layout` can describe.
+        # V1 registers a single pool. V2 checks its resolved layer groups
+        # during executor initialization.
         max_attention_window = kv_cache_config.max_attention_window
         if (uses_vswa_kv_cache_layout(max_attention_window)
                 and v2_selection is False):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
-                "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
+                "in this configuration. Use KVCacheManagerV2 with a connector "
+                "that implements the per-layer-group APIs, or use a single attention window."
             )
 
         if mapping.enable_attention_dp:

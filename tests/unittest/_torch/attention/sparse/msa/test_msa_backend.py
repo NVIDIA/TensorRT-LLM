@@ -806,7 +806,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
         _msa_prefill_identity = None
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
-        msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
@@ -927,7 +927,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
-        msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
+        msa_prefill_proxy_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
@@ -986,6 +986,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
     )
 
     assert result.shape == (num_tokens, 1, 16)
+    assert captured["kv_indices"] is metadata.msa_prefill_proxy_kv_indices
     assert captured["gen_token_first"] == expected_gen_first
     assert captured["ctx_rows"] == expected_ctx_rows
     # Set together with the rest of the scorer's inputs, so it says whether the
