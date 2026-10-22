@@ -35,7 +35,7 @@ def test_pre_comm_wrapper_built_once(monkeypatch, compile_embedding):
         emb.weight.copy_(torch.arange(32, dtype=torch.float32).reshape(8, 4))
     # Single-process stand-in for the TP reduction (a registered submodule otherwise).
     emb._modules.pop("all_reduce", None)
-    object.__setattr__(emb, "all_reduce", lambda output: output)
+    object.__setattr__(emb, "all_reduce", lambda output, all_reduce_params=None: output)
     tokens = torch.tensor([0, 7, 8, 15])
 
     outputs = [emb(tokens) for _ in range(3)]
