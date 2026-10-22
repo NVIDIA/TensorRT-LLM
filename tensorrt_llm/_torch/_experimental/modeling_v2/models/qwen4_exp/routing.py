@@ -5,7 +5,7 @@
 `route` compares the facts that fix which code runs against the one deployment the
 target was written for, and raises `NoTarget` stating them otherwise (`auto` falls
 back to the built-in implementation; `require` raises). The checkpoint's published
-architecture name is kept by `load_pretrained_config`, so `_router_index` keys on it.
+architecture name is kept by `load_pretrained_config`, so `route` registers under it.
 All criteria are read off `text_config` / `vision_config`; the composite parent's
 mirrored fields are unreliable.
 """
@@ -19,7 +19,7 @@ import torch
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget
+from ..._router_index import NoTarget, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -134,6 +134,9 @@ def _check_engine(
         )
 
 
+# Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
+# config loader's composite branch writes the same name back.
+@routes("Qwen4ExpForConditionalGeneration")
 def route(
     pretrained_config: Any,
     mapping: Any,
