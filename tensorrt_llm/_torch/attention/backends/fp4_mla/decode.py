@@ -14,9 +14,6 @@ from tensorrt_llm._utils import get_sm_version
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
-    _FP4_MLA_PACKED_MAX_SPLITS,
-    _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT,
-    _FP4_MLA_SPLIT_KV_ENV,
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_K_RESIDUAL_DIM,
@@ -24,7 +21,6 @@ from .config import (
     FP4_MLA_Q_LOGICAL_DIM,
     FP4_MLA_Q_PACKED_DIM,
     FP4_MLA_Q_RESIDUAL_DIM,
-    FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
     _ceil_div,
     _cutedsl_backend_available,
@@ -52,6 +48,12 @@ from .metadata import (
     _infer_assume_full_pages,
     _materialize_fp4_mla_device_page_table_for_forward,
     _max_generation_pages,
+)
+from .packed_plan import (
+    _fp4_mla_packed_plan_geometry,
+    _get_sm_count,
+    _launch_fp4_mla_packed_plan,
+    _PackedPlanGeometry,
 )
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
@@ -126,19 +128,6 @@ def _cutedsl_pad_q_and_sf_kernel(
         sf_values,
         mask=sf_col_mask[None, :],
     )
-
-
-_SM_COUNT_CACHE: dict[int, int] = {}
-
-
-def _get_sm_count(device: torch.device) -> int:
-    """Return the SM (multiprocessor) count for ``device``, cached per index."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    count = _SM_COUNT_CACHE.get(index)
-    if count is None:
-        count = torch.cuda.get_device_properties(index).multi_processor_count
-        _SM_COUNT_CACHE[index] = count
-    return count
 
 
 def _run_triton_attention_decode(
@@ -770,33 +759,6 @@ def _run_triton_attention_decode(
             )
 
 
-def _select_packed_split_count(
-    num_requests: int,
-    m_tiles: int,
-    device: torch.device,
-    *,
-    max_kv_len: int,
-    is_cuda_graph: bool,
-) -> int:
-    """KV splits per request tile: fill one wave of 2-CTA clusters.
-
-    The count depends only on the request count and tile count, so a CUDA
-    graph bucket always replays the same geometry. Eager calls know the real
-    longest KV and keep at least _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT KV tiles
-    per split. ``TRTLLM_FP4_MLA_SPLIT_KV`` overrides the count for testing.
-    """
-    override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
-    if override != "auto":
-        return max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
-    clusters_per_wave = max(1, _get_sm_count(device) // 2)
-    splits = clusters_per_wave // max(1, num_requests * m_tiles)
-    splits = max(1, min(_FP4_MLA_PACKED_MAX_SPLITS, splits))
-    if not is_cuda_graph:
-        kv_tiles = _ceil_div(max(max_kv_len, 1), 256)
-        splits = max(1, min(splits, _ceil_div(kv_tiles, _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT)))
-    return splits
-
-
 def _run_cutedsl_packed_decode(
     module: Any,
     metadata: Any,
@@ -817,11 +779,11 @@ def _run_cutedsl_packed_decode(
     query_len: int,
     num_requests: int,
     rows_per_seq: int,
-    max_kv_len: int,
     sm_scale: float,
     v_page_offset: int,
     helix_kv_bounds: torch.Tensor | None,
     softmax_stats_tensor: torch.Tensor | None,
+    plan_geometry: _PackedPlanGeometry | None = None,
 ) -> None:
     """Packed CuTe DSL decode: one kernel over (split, request) tasks.
 
@@ -841,22 +803,24 @@ def _run_cutedsl_packed_decode(
             "FP4 MLA packed decode requires a contiguous [tokens, heads, 512] output."
         )
     device = output.device
-    is_cuda_graph = bool(getattr(metadata, "is_cuda_graph", False))
-    splits = _select_packed_split_count(
-        num_requests,
-        physical_m // FP4_MLA_SCALE_ROW_GROUP,
-        device,
-        max_kv_len=max_kv_len,
-        is_cuda_graph=is_cuda_graph,
-    )
-    # The runtime KV profile only has to cover one split.
-    split_kv_len = max(_ceil_div(_ceil_div(max(max_kv_len, 1), 256), splits) * 256, 256)
+    if plan_geometry is None:
+        plan_geometry = _fp4_mla_packed_plan_geometry(
+            metadata,
+            num_heads=num_heads,
+            query_len=query_len,
+            num_requests=num_requests,
+            device=device,
+            helix_kv_bounds=helix_kv_bounds,
+        )
+        if plan_geometry is None:
+            raise RuntimeError("FP4 MLA packed decode requires generation cache pages.")
+    splits = plan_geometry.splits
     output_rows = output.view(num_requests * valid_m, 512)
     stats_rows = None
     if softmax_stats_tensor is not None:
         stats_rows = softmax_stats_tensor.view(num_requests * valid_m, 2)
     common = dict(
-        max_kv_len=split_kv_len,
+        max_kv_len=plan_geometry.split_kv_len,
         sm_scale=sm_scale,
         num_heads=num_heads,
         query_len=query_len,
@@ -886,8 +850,12 @@ def _run_cutedsl_packed_decode(
     from .fp4_mla_packed_reduce import reduce_packed_splits
 
     tasks = splits * num_requests
-    # Graph buckets hold exactly their tasks; eager metadata grows on demand.
-    task_capacity = tasks if is_cuda_graph else max(tasks, 32)
+    task_capacity = plan_geometry.task_capacity
+    plan = plan_geometry.plan
+    # The first FP4 MLA kernel of the step wrote the plan fused with the
+    # generation lengths; a stale key means this call plans on other bounds.
+    if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
+        _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
     partial = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_split_partial",
@@ -922,6 +890,7 @@ def _run_cutedsl_packed_decode(
         kv_lens,
         output_rows,
         split_kv_buffers=(partial, maxima, sums),
+        plan=plan,
         **common,
     )
     reduce_packed_splits(
@@ -936,6 +905,7 @@ def _run_cutedsl_packed_decode(
         valid_m=valid_m,
         physical_m=physical_m,
         sm_scale=sm_scale,
+        plan=plan,
         output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
         stats=stats_rows,
         sm_count=_get_sm_count(device),
@@ -1127,7 +1097,17 @@ def run_fp4_mla_attention_decode(
     # CUDA graph / one-engine MTP; recover the true total per sequence so the
     # per-query causal masking sees the full 1 + draft_len window (no-op when the
     # alias already matches).
-    kv_lens, _ = _fp4_mla_uniform_generation_lengths(metadata, num_queries, num_gen_seqs)
+    plan_geometry = _fp4_mla_packed_plan_geometry(
+        metadata,
+        num_heads=num_heads,
+        query_len=query_len_per_seq,
+        num_requests=num_gen_seqs,
+        device=q.device,
+        helix_kv_bounds=helix_kv_bounds,
+    )
+    kv_lens, _ = _fp4_mla_uniform_generation_lengths(
+        metadata, num_queries, num_gen_seqs, plan_geometry=plan_geometry
+    )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens)
     src_page_ids = _fp4_mla_generation_page_ids(metadata, num_gen_seqs)
     max_pages = _max_generation_pages(metadata)
@@ -1307,11 +1287,11 @@ def run_fp4_mla_attention_decode(
                 query_len=query_len_per_seq,
                 num_requests=num_gen_seqs,
                 rows_per_seq=packed_rows_per_seq,
-                max_kv_len=max_pages * metadata.page_size,
                 sm_scale=float(sm_scale),
                 v_page_offset=v_page_offset,
                 helix_kv_bounds=helix_kv_bounds,
                 softmax_stats_tensor=softmax_stats_tensor,
+                plan_geometry=plan_geometry,
             )
             return
 

@@ -55,6 +55,7 @@ from .metadata import (
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
 )
+from .packed_plan import _fp4_mla_helix_plan_bounds, _fp4_mla_packed_plan_geometry
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
@@ -466,8 +467,25 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     # (seq_lens == 1) under CUDA graph / one-engine MTP while each generation
     # sequence really appends num_tokens // num_gen tokens this step. Recover the
     # true per-sequence lengths for the no-dequant kernel below (a no-op when the
-    # aliases already match).
-    kv_lens_gen, gen_lens_gen = _fp4_mla_uniform_generation_lengths(metadata, num_tokens, num_gen)
+    # aliases already match). As the first FP4 MLA kernel of the step, the same
+    # launch also writes the packed split plan the decode layers reuse.
+    plan_geometry = None
+    if q_pe.ndim == 3 and q_pe.shape[1] > 0:
+        plan_geometry = _fp4_mla_packed_plan_geometry(
+            metadata,
+            num_heads=q_pe.shape[1],
+            query_len=num_tokens // num_gen,
+            num_requests=num_gen,
+            device=latent_cache.device,
+            helix_kv_bounds=_fp4_mla_helix_plan_bounds(
+                metadata,
+                num_tokens,
+                use_helix=helix_position_offsets is not None or helix_is_inactive_rank is not None,
+            ),
+        )
+    kv_lens_gen, gen_lens_gen = _fp4_mla_uniform_generation_lengths(
+        metadata, num_tokens, num_gen, plan_geometry=plan_geometry
+    )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens_gen)
 
     pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
