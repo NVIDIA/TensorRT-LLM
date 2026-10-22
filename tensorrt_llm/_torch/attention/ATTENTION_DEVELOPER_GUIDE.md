@@ -557,12 +557,9 @@ The FMHA package is split by role:
   kernel as device tensors (element 0 of each), so the scales need no host
   read and stay valid under CUDA graph replay.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
-  PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen).
-  It consumes the dual-pool storage-row indices from `sparse_attn_predict` and
-  the per-step live lengths from the DeepSeek-V4 metadata, views the SWA and
-  compress pools from their base pointers, keeps its plans in
-  `fmha_plan_caches` with one shared kernel workspace per metadata object, and
-  writes the fused DSv4 epilogue (E4M3 output plus FP32 block scales) in place.
+  PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
+  it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
+  removes it.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
