@@ -600,6 +600,35 @@ def test_mhc_fused_hc_single_wave_target_mma_ks():
             assert ((m + 63) // 64) * ks <= sm_count * 5, (hidden_size, m, ks)
 
 
+def test_mhc_fused_hc_split_dg_tactics_without_mma(monkeypatch):
+    """Without tcgen05, M > 32 also offers the unfused DeepGEMM boundary."""
+    from tensorrt_llm._torch.autotuner import OptimizationProfile
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: False)
+    monkeypatch.setattr(mhc_cuda, "_get_dg_fn", lambda: object())
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=4,
+        hidden_size=4096,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+    )
+
+    def backends(num_tokens, **kwargs):
+        inputs = [torch.empty((num_tokens, 4096), dtype=torch.bfloat16)]
+        return {t[0] for t in runner.get_valid_tactics(inputs, OptimizationProfile(), **kwargs)}
+
+    assert "split_dg" not in backends(32)
+    assert "split_dg" in backends(64)
+    assert "split_dg" in backends(64, pre_mix_ext=torch.empty(64, 4))
+    # Token counts above the tuned buckets fall back to split_dg as well.
+    assert mhc_cuda._get_fused_hc_fallback_tactic(4096, 32)[0] == "fused_half_fma"
+    assert mhc_cuda._get_fused_hc_fallback_tactic(4096, 13312)[0] == "split_dg"
+
+
 def test_mhc_fused_hc_uneven_splits_unreachable_off_sm107():
     """The uneven split counts must stay unselectable on non-SM107 devices."""
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
@@ -864,15 +893,19 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
         ("fused_half_fma", 2, 1, 256, 1),
         pytest.param(("fused_all_mma", 0, 1, 0, 1), marks=skip_pre_blackwell),
         ("fused_all_fma", 2, 1, 0, 1),
+        ("split_dg", 0, 1, 256, 1),
+        ("split_dg", 0, 16, 256, 1),
     ],
 )
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
     """Real-scale mHC data catches fused_hc RMS normalization regressions."""
-    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner, _get_dg_fn
 
     if tactic[0].endswith("_mma") and not _mhc_fused_hc_mma_available():
         pytest.skip("mHC fused-HC MMA kernels require SM100 and BUILD_DEEP_GEMM=ON")
+    if tactic[0] == "split_dg" and _get_dg_fn() is None:
+        pytest.skip("split_dg needs DeepGEMM's TF32 hc_prenorm GEMM")
 
     n = 16
     hc_mult = 4
@@ -932,6 +965,84 @@ def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
         comb_mix_ref, comb_mix_cur.view(n, hc_mult, hc_mult), rtol=3e-3, atol=5e-3
     )
     torch.testing.assert_close(layer_input_ref, layer_input_cur, rtol=1e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("num_splits", [1, 16])
+@pytest.mark.parametrize("num_tokens", [64, 1024])
+def test_mhc_split_dg_lagged_matches_fma(num_tokens: int, num_splits: int):
+    """With a lagged pre-mix, the DeepGEMM boundaries match the FMA ones."""
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
+        MhcFusedHcRunner,
+        MhcPreMappingRunner,
+        _get_dg_fn,
+    )
+
+    if _get_dg_fn() is None:
+        pytest.skip("split_dg needs DeepGEMM's TF32 hc_prenorm GEMM")
+
+    hidden_size, hc_mult = 4096, 4
+    pre_data = generate_realistic_pre_data(n=num_tokens, hc_mult=hc_mult, hidden_size=hidden_size)
+    consts = dict(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+    torch.random.manual_seed(23)
+    device = "cuda"
+    x_prev = torch.randn((num_tokens, hidden_size), device=device).bfloat16()
+    residual_prev = torch.randn((num_tokens, hc_mult, hidden_size), device=device).bfloat16()
+    post_mix_prev = torch.randn((num_tokens, hc_mult), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = (
+        torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+    )
+    pre_mix = torch.rand((num_tokens, hc_mult), dtype=torch.float32, device=device)
+    w_t = pre_data["fn"].reshape(-1, hc_mult * hidden_size).contiguous()
+    norm_weight = (torch.rand(hidden_size, device=device) + 0.5).bfloat16()
+    kwargs = dict(pre_mix_ext=pre_mix, norm_weight=norm_weight, norm_eps=1e-6)
+    names = ("post_mix", "comb_mix", "layer_input", "pre_mix_out")
+    tols = (
+        dict(rtol=3e-3, atol=5e-3),
+        dict(rtol=3e-3, atol=5e-3),
+        dict(rtol=1e-2, atol=2e-2),
+        dict(rtol=3e-3, atol=5e-3),
+    )
+
+    fused = MhcFusedHcRunner(**consts)
+    inputs = [
+        x_prev,
+        residual_prev,
+        post_mix_prev,
+        comb_mix_prev,
+        w_t,
+        pre_data["hc_scale"],
+        pre_data["hc_base"],
+    ]
+    ref = fused(inputs=inputs, tactic=("fused_half_fma", 2, 1, 256, 1), **kwargs)
+    out = fused(inputs=inputs, tactic=("split_dg", 0, num_splits, 256, 1), **kwargs)
+    assert len(out) == len(ref) == 5
+    torch.testing.assert_close(out[0], ref[0], rtol=1e-2, atol=2e-2)
+    for name, tol, o, r in zip(names, tols, out[1:], ref[1:]):
+        torch.testing.assert_close(o, r, **tol, msg=f"fused_hc {name} mismatch")
+
+    pre_mapping = MhcPreMappingRunner(**consts)
+    residual = ref[0]
+    pre_inputs = [
+        residual.view(num_tokens, hc_mult * hidden_size),
+        w_t,
+        residual,
+        pre_data["hc_scale"],
+        pre_data["hc_base"],
+    ]
+    dg_backend = "dg_splitk" if num_splits > 1 else "dg_nosplit"
+    ref = pre_mapping(inputs=pre_inputs, tactic=("fma", 8, 1, 256), **kwargs)
+    out = pre_mapping(inputs=pre_inputs, tactic=(dg_backend, 0, 0, 256), **kwargs)
+    assert len(out) == len(ref) == 4
+    for name, tol, o, r in zip(names, tols, out, ref):
+        torch.testing.assert_close(o, r, **tol, msg=f"pre_mapping {name} mismatch")
 
 
 @pytest.mark.parametrize(
