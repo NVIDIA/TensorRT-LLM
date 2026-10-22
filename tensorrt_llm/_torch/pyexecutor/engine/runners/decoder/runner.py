@@ -32,6 +32,11 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
@@ -123,6 +128,9 @@ class PrefillCompiledModel(torch.nn.Module):
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -195,6 +203,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
+        self.runtime_hooks = runtime_hooks_of(self.model)
+        self._inputs.decode_prologue = self.runtime_hooks.decode_prologue
         self._graphs = self._make_cuda_graphs()
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
@@ -612,34 +622,100 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            with self._cuda_graph_metadata_prepare_scope(
-                attn_metadata,
-                key,
-                execution_requests,
-                execution_promoted_context_ids,
-                enable_spec_decode=enable_spec_decode,
-            ):
-                prepared = self._inputs.prepare_inputs(
+            # ==== Step-input window opens here ====
+            # When the model declares a step-input stager and begin_if_eligible
+            # returns it, every device write that prepare_inputs (and the
+            # metadata and KV-cache-manager code it calls) routes through
+            # ``step_input_stager`` (call sites marked "Staged write") is only
+            # recorded; close_input_window below, right before the graph
+            # replay, issues them all. Until then, do not read or write those
+            # buffers with any other device op: a read sees stale bytes and a
+            # write is overwritten. Route new writes through the stager or
+            # call stager.flush() first. Exception: input_ids_cuda and
+            # position_ids_cuda are also staged into the graph's static
+            # inputs, which the replay then does not refresh from them; to
+            # change them here, call stager.flush() and then write them
+            # natively. Nothing checks this contract in a production run.
+            # Contract: StepInputStager in pyexecutor/runtime_hooks.py.
+            stager = None
+            stager_source = self.runtime_hooks.step_input_stager
+            if stager_source is not None:
+                graph_replay = (
+                    can_run_graph
+                    and not self.cuda_graph_runner.needs_capture(key)
+                    and not self.cuda_graph_runner.is_warmup_only
+                )
+                stager = stager_source.begin_if_eligible(
+                    self._inputs,
                     execution_requests,
-                    kv_cache_manager,
                     attn_metadata,
                     spec_metadata,
                     new_tensors_device,
-                    cache_indirection_buffer,
-                    resource_manager,
-                    can_run_graph,
-                    execution_promoted_context_ids,
-                    use_lora_graph=use_lora_graph,
-                    enable_spec_decode=enable_spec_decode,
-                    runtime_draft_len=runtime_draft_len,
+                    graph_replay=graph_replay,
+                    static_inputs=(
+                        self.cuda_graph_runner.shared_static_tensors if graph_replay else None
+                    ),
                     is_dummy=is_dummy,
-                    gather_context_logits=gather_context_logits,
+                    enable_spec_decode=enable_spec_decode,
+                    promoted=bool(execution_promoted_context_ids),
                 )
+            try:
+                # The window spans the scope: the scope is a no-op whenever
+                # speculative decoding is on, which every stager requires.
+                with self._cuda_graph_metadata_prepare_scope(
+                    attn_metadata,
+                    key,
+                    execution_requests,
+                    execution_promoted_context_ids,
+                    enable_spec_decode=enable_spec_decode,
+                ):
+                    prepared = self._inputs.prepare_inputs(
+                        execution_requests,
+                        kv_cache_manager,
+                        attn_metadata,
+                        spec_metadata,
+                        new_tensors_device,
+                        cache_indirection_buffer,
+                        resource_manager,
+                        can_run_graph,
+                        execution_promoted_context_ids,
+                        use_lora_graph=use_lora_graph,
+                        enable_spec_decode=enable_spec_decode,
+                        runtime_draft_len=runtime_draft_len,
+                        is_dummy=is_dummy,
+                        gather_context_logits=gather_context_logits,
+                    )
+            except BaseException:
+                if stager is not None:
+                    stager.discard()
+                raise
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
-            self._inputs.record_input_copy()
+            close_input_window = None
+            window_open = stager is not None
+            if stager is None:
+                self._inputs.record_input_copy()
+            else:
+
+                def close_input_window() -> None:
+                    nonlocal window_open
+                    window_open = False
+                    # ==== Step-input window closes here ====
+                    # end() issues every staged write; nothing between
+                    # begin_if_eligible above and this call may have touched
+                    # the staged buffers with other device ops. The input-copy
+                    # event must follow the launch (host page-table reads
+                    # happen at execution time). A nonzero
+                    # static_inputs_tokens() makes the replay skip its
+                    # input_ids / position_ids copy.
+                    stager.end(record_event=False)
+                    self._inputs.record_input_copy()
+                    stager.set_completion_event(self._inputs.input_copy_event)
+                    self.cuda_graph_runner.staged_static_input_tokens = (
+                        stager.static_inputs_tokens()
+                    )
 
             def run_model(model_inputs: dict[str, Any]) -> Any:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -661,24 +737,30 @@ class DecoderRunner(ScheduledModelRunner):
 
             graph_key = key if can_run_graph else None
             captures_model_body = self._graphs.captures_model_body(graph_key)
-            outputs = self._graphs.run(
-                graph_key,
-                inputs,
-                run_model,
-                postprocess_inputs,
-                attn_metadata=attn_metadata,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-                moe_load_balancer=moe_load_balancer,
-                enable_spec_decode=enable_spec_decode,
-                gather_context_logits=gather_context_logits,
-                position_id_offsets=(
-                    self._buffers.previous_pos_id_offsets_cuda
-                    if enable_spec_decode
-                    and not self._config.disable_overlap_scheduler
-                    and attn_metadata.kv_cache_manager is not None
-                    else None
-                ),
-            )
+            try:
+                outputs = self._graphs.run(
+                    graph_key,
+                    inputs,
+                    run_model,
+                    postprocess_inputs,
+                    attn_metadata=attn_metadata,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                    moe_load_balancer=moe_load_balancer,
+                    enable_spec_decode=enable_spec_decode,
+                    gather_context_logits=gather_context_logits,
+                    position_id_offsets=(
+                        self._buffers.previous_pos_id_offsets_cuda
+                        if enable_spec_decode
+                        and not self._config.disable_overlap_scheduler
+                        and attn_metadata.kv_cache_manager is not None
+                        else None
+                    ),
+                    before_replay=close_input_window,
+                )
+            except BaseException:
+                if window_open:
+                    stager.discard()
+                raise
             if captures_model_body:
                 return outputs
 
