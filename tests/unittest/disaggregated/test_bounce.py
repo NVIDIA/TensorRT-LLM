@@ -550,6 +550,45 @@ class TestFanInReserve:
         assert [list(t[1]) for t in descs] == [[10], [20]]  # dst_ptrs
         assert [list(t[2]) for t in descs] == [[8], [8]]  # sizes
 
+    def test_fanin_scatter_is_one_batched_copy(self, monkeypatch):
+        # The batched copy reuses one pinned metadata buffer per stream and needs a sync between
+        # calls; one call per writer before a single sync let a writer's kernel run with the next
+        # writer's fragment table. All writers must go into one call, each from its own source.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        for rank, dst, src_base in ((7, 20, 200), (3, 10, 100)):
+            t.record_result(
+                rid_slice,
+                rank,
+                np.array([dst], dtype=np.int64),
+                np.array([8], dtype=np.int64),
+                src_base=src_base,
+            )
+        calls = []
+
+        def fake_scatter(src_base, dst_ptrs, sizes, offsets, *, stream):
+            calls.append(("scatter", src_base, list(dst_ptrs), list(sizes), list(offsets)))
+
+        monkeypatch.setattr(btr, "scatter_contiguous", fake_scatter)
+        monkeypatch.setattr(
+            btr,
+            "cudart",
+            SimpleNamespace(
+                cudaSetDevice=lambda dev: (0,),
+                cudaStreamSynchronize=lambda stream: calls.append(("sync", stream)) or (0,),
+            ),
+        )
+        monkeypatch.setattr(btr, "CUASSERT", lambda ret: ret)
+        t._scatter_stream = 0
+        t._stop = SimpleNamespace(is_set=lambda: False)
+        t._scatter_q.put(None)  # poison pill behind the queued region
+        t._scatter_loop()
+        # one copy: both writers' destinations, each read from its own src_base (+ offset 0)
+        assert calls == [("scatter", 0, [10, 20], [8, 8], [100, 200]), ("sync", 0)]
+        assert t._recv_alloc.released  # region settled after the scatter
+
     def test_fanin_fallback_writer_leaves_survivor_at_its_own_base(self, monkeypatch):
         # Regression: if one fan-in writer falls back to in-place (SUCCESS, empty tail) while a
         # sibling bounces, the survivor must be scattered from ITS OWN src_base, not packed to 0.

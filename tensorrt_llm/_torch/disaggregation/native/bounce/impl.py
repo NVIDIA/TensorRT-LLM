@@ -475,12 +475,23 @@ class VmmBounceTransport(BounceTransport):
             ok = True
             try:
                 # Scatter each writer's fragments from its own source, never one global offset, so a
-                # missing or fallback writer cannot shift where the others are read from.
+                # missing or fallback writer cannot shift where the others are read from. All writers
+                # go into ONE batched copy: the copy helper reuses one pinned metadata buffer per
+                # stream and needs a sync between calls, and one call costs one host round trip
+                # instead of one per writer.
+                srcs, dsts, frag_sizes = [], [], []
                 for src_base, dst_ptrs, sizes in descs:
                     p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
-                    scatter_contiguous(
-                        src_base, p.dst_ptrs, p.sizes, p.offsets, stream=self._scatter_stream
-                    )
+                    srcs.append(np.int64(src_base) + p.offsets)
+                    dsts.append(p.dst_ptrs)
+                    frag_sizes.append(p.sizes)
+                scatter_contiguous(
+                    0,
+                    np.concatenate(dsts),
+                    np.concatenate(frag_sizes),
+                    np.concatenate(srcs),
+                    stream=self._scatter_stream,
+                )
                 CUASSERT(cudart.cudaStreamSynchronize(self._scatter_stream))
             except Exception as e:
                 # a scatter failure must not kill the worker nor be reported as success
