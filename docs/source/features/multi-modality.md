@@ -56,6 +56,14 @@ coupled target semantics. A nonpositive value disables that target when both
 are supplied. Explicit `do_sample_frames=False` disables this
 resampling. Fully decoded videos and decoded frame prefixes, which may result
 from a decoding failure, retain Hugging Face's default sampling and frame cap.
+VideoIO records whether it intentionally selected fewer source frames in
+`VideoData.is_sampled`. Full decoding with interior retrieve failures therefore
+also uses default sampling, even below the frame cap. This provenance is kept
+separate from HF metadata and participates in cache identity and token counting.
+For externally constructed videos without provenance, non-prefix indices remain
+compatible with pre-sampled inputs; they cannot reliably identify decode failures.
+Explicit frame-count targets never repeat frames to reach a count above the
+available decoded frames (HF may still pad a final temporal pair).
 Without an explicit frame target, indexed inputs above the video processor's
 `max_frames` also use its default sampling, with selected frames mapped back
 to source timestamps. Explicitly disabled sampling remains respected.
