@@ -27,6 +27,8 @@ from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    CustomAttentionMask,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
@@ -134,6 +136,9 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
 
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize(
+    "attention_mask", [PredefinedAttentionMask.CAUSAL, CustomAttentionMask.CUSTOM]
+)
+@pytest.mark.parametrize(
     "dtype,sm_version",
     [(torch.bfloat16, 100), (torch.float16, 103)],
     ids=["small_bf16_batch", "sm103_fp16"],
@@ -143,6 +148,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     kv_cache_dtype: DataType,
     dtype: torch.dtype,
     sm_version: int,
+    attention_mask: PredefinedAttentionMask | CustomAttentionMask,
 ) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
@@ -180,6 +186,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
         attention_input_type=AttentionInputType.context_only,
         is_fused_qkv=True,
         update_kv_cache=True,
+        attention_mask=attention_mask,
     )
 
     for phase in (None, FmhaPhase.CONTEXT):
@@ -193,8 +200,12 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
             phase=phase,
         )
 
-        assert supported, reason
-        assert reason == ""
+        if attention_mask == CustomAttentionMask.CUSTOM:
+            assert not supported
+            assert "unsupported attention mask" in reason
+        else:
+            assert supported, reason
+            assert reason == ""
 
 
 @pytest.mark.parametrize(

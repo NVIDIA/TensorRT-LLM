@@ -29,6 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
@@ -340,7 +341,7 @@ class EncoderMixin:
         *,
         cache_indirection: torch.Tensor | None = None,
         enable_context_mla_with_cached_kv: bool | None = None,
-        num_heads_per_kv: int | None = None,
+        max_num_heads_per_kv: int | None = None,
     ) -> AttentionMetadata:
         metadata = build_attention_metadata(
             self._model.model_config,
@@ -353,7 +354,7 @@ class EncoderMixin:
             cache_indirection=cache_indirection,
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=max_num_heads_per_kv,
         )
         metadata.block_ids_per_seq = None
         metadata.kv_block_ids_per_seq = None
@@ -524,7 +525,13 @@ class EncoderMixin:
                 prepared = prepare_tokens(sequence_lengths)
             if prepared is None:
                 continue
-            execute(prepared)
+            if runner.is_warmup_only:
+                with discard_nccl_window_tensor_outputs(
+                    (runner.shared_static_tensors, prepared.kwargs)
+                ):
+                    execute(prepared)
+            else:
+                execute(prepared)
             torch.cuda.synchronize()
             num_processed += 1
         logger.info(f"Completed encoder CUDA graph {operation} for {num_processed} graph shape(s).")
@@ -553,8 +560,8 @@ class EncoderMixin:
         with MoeLoadBalancerIterContext(moe_load_balancer):
             return runner.replay(key, prepared.kwargs)
 
-    def release_graphs(self) -> None:
-        self._encoder_cuda_graph_runner.clear()
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        self._encoder_cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
 
 
 class EncoderRunner(EncoderMixin, PackedModelRunner):
@@ -987,7 +994,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
                         f"bs={batch_size}, nt={num_tokens}, sl={max_seq_len}"
                     )
                     prepared = self._prepare_capture_inputs(sequence_lengths)
-                    self._execute_prepared(prepared)
+                    with discard_nccl_window_tensor_outputs(
+                        (self._buffers.input_ids_cuda, prepared.kwargs)
+                    ):
+                        self._execute_prepared(prepared)
                     torch.cuda.synchronize()
                 except torch.OutOfMemoryError:
                     if self._is_distributed_forward():
@@ -1014,7 +1024,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             )
             if sequence_lengths is not None:
                 prepared = self._prepare_capture_inputs(sequence_lengths)
-                self._execute_prepared(prepared)
+                with discard_nccl_window_tensor_outputs(
+                    (self._buffers.input_ids_cuda, prepared.kwargs)
+                ):
+                    self._execute_prepared(prepared)
                 torch.cuda.synchronize()
 
         logger.info(

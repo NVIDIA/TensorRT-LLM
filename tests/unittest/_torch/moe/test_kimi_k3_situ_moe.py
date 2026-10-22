@@ -10,7 +10,7 @@ Covers the SiTU cubin integration behavior:
   ``siTuGlu``, and from the expected cubin family -- ``MxE4m3_MxE2m1`` for
   the MXFP4 drop, ``E2m1_E2m1E2m1`` for the NVFP4 one (tactic availability
   for both families is pinned at the op level in
-  tests/unittest/_torch/thop/serial/test_moe.py);
+  tests/unittest/_torch/moe/kernels/serial/test_moe.py);
 * fused output matches the Python ``SituAndMul`` reference within
   MXFP8/MXFP4 quantization tolerance, for the default AND asymmetric
   non-default ``activation_situ_beta`` / ``activation_situ_linear_beta``;
@@ -143,7 +143,7 @@ def test_cutedsl_kernel_rejects_unusable_situ_betas(situ_beta, situ_linear_beta)
     against NaN is false, and an infinity is positive.
     """
     pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+    from tensorrt_llm._torch.moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
         BlockScaledContiguousGatherGroupedGemmKernel,
     )
     from tensorrt_llm._torch.utils import ActivationType
@@ -1851,7 +1851,7 @@ def _dequantize_expert_bank(bank):
     meaningful.
 
     This mirrors ``e2m1_and_ufp8_scale_batches`` in
-    ``tests/unittest/_torch/thop/serial/test_moe.py``; the layout arguments
+    ``tests/unittest/_torch/moe/kernels/serial/test_moe.py``; the layout arguments
     follow ``_quantize_expert_to_nvfp4``, which stores UE4M3 block scales
     (``sfUseUE8M0=False`` -> ``sfType=1``) already de-swizzled by
     ``block_scale_interleave_reverse`` (-> ``isSfSwizzledLayout=False``).

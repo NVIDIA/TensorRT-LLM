@@ -216,8 +216,8 @@ def BOLT_CONSUME = "bolt_consume"
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = false
-// Version-controlled rollout switch for post-merge BOLT, same idiom as above.
+def ENABLE_BOLT_PREMERGE_CONSUME = true
+// Version-controlled rollout switch for post-merge and nightly release BOLT.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
 // canonical tarball: that tarball is BoltProfileGen's input and must stay
@@ -326,6 +326,8 @@ def BOLT_PRODUCER_TRIPLE = "aarch64-linux-gnu"
 def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 @Field
 def RELEASE_TARGET = "release_target"
+@Field
+def JOB_TYPE = "job_type"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -338,19 +340,16 @@ def globalVars = [
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
     (BOLT_PROFILE_REF): "",
-    (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
+    (BOLT_PUBLISH_VARIANT): isBoltReleasePipeline() && ENABLE_BOLT_POSTMERGE_VARIANT,
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
+    (JOB_TYPE): env.JOB_BASE_NAME,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
-// globalVars[BOLT_PUBLISH_VARIANT], not the raw ENABLE_BOLT_POSTMERGE_VARIANT:
-// the raw flag carries no job scope, so ORing it into `requested` would make
-// every PRE-merge job targeting main pass resolveBoltConsume and start
-// consuming in the replace-canonical shape. That silently takes over what
-// ENABLE_BOLT_PREMERGE_CONSUME governs, and pre-merge behaviour is supposed to
-// be untouched by this work. The globalVars value is already PostMerge-scoped.
+// Scope variant publication to post-merge and nightly releases so pre-merge
+// consumption remains governed by its own rollout switch and explicit opt-in.
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
     ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
         gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
@@ -1343,33 +1342,48 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def multiGpuLabelGateOpen = multiGpuRequired &&
             _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
         def coverageShadow = result.scope == "coverage" && !coveragePilotEligible
-        if (coverageShadow) {
-            pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
-                          "stages=${result.affected_stages.size()}; baseline remains active")
-            _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
-                                multiGpuRequired, multiGpuLabelGateOpen, false,
-                                coveragePilotEligible)
-            return null
-        }
-        // Upload the generated cbts_test_db/ to Artifactory so each L0_Test
-        // stage agent can download it directly instead of re-running main.py
-        // with the raw PR diff. This avoids passing large payloads as Jenkins
-        // parameters (env vars), which caused "Argument list too long" failures
-        // when diffs were large. Agents fall back to the source test-db if the
-        // download fails.
-        if (result.test_db_dir_override) {
+        // Applied decisions pass the uploaded test DB to L0_Test. Shadow
+        // decisions save the same artifact but return null below, so L0_Test
+        // keeps using the baseline test DB.
+        if (result.test_db_dir_override || coverageShadow) {
             try {
+                def archiveFiles = []
+                if (result.test_db_dir_override) {
+                    archiveFiles.add(result.test_db_dir_override)
+                }
+                if (coverageShadow) {
+                    writeFile file: "${LLM_ROOT}/cbts_shadow_decision.json", text: output
+                    archiveFiles.add("cbts_shadow_decision.json")
+                }
                 // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
-                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
+                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${archiveFiles.join(' ')}"
                 trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                pipeline.echo("CBTS Layer 3: artifact upload failed (${e.message}); " +
-                              "agents will fall back to source test-db")
+                pipeline.echo("CBTS Layer 3: artifact upload failed (non-fatal): ${e.message}")
             }
+        }
+        if (coverageShadow) {
+            if (result.cbts_test_db_artifact_path) {
+                try {
+                    def reportedDecision = new groovy.json.JsonSlurper().parseText(output)
+                    reportedDecision.shadow_selection_artifact_path = result.cbts_test_db_artifact_path
+                    output = groovy.json.JsonOutput.toJson(reportedDecision)
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    pipeline.echo("CBTS: shadow artifact path annotation failed (non-fatal): ${e.message}")
+                }
+            }
+            pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
+                          "stages=${result.affected_stages.size()}; baseline remains active")
+            _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                                multiGpuRequired, multiGpuLabelGateOpen, false,
+                                coveragePilotEligible)
+            return null
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
@@ -1763,6 +1777,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
         "tensorrt_llm/functional.py",
+        "tensorrt_llm/inputs/registry.py",
+        "tensorrt_llm/inputs/tokenization.py",
         "tensorrt_llm/llmapi/disagg_utils.py",
         "tensorrt_llm/llmapi/mgmn_leader_node.py",
         "tensorrt_llm/llmapi/mgmn_worker_node.py",
@@ -1771,14 +1787,23 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/mapping.py",
         "tensorrt_llm/models/llama/",
         "tensorrt_llm/parameter.py",
+        "tensorrt_llm/serve/__init__.py",
         "tensorrt_llm/serve/cluster_storage.py",
         "tensorrt_llm/serve/disagg_auto_scaling.py",
+        "tensorrt_llm/serve/extensions/",
         "tensorrt_llm/serve/metadata_server.py",
         "tensorrt_llm/serve/openai_client.py",
         "tensorrt_llm/serve/openai_disagg_server.py",
         "tensorrt_llm/serve/openai_disagg_service.py",
         "tensorrt_llm/serve/openai_server.py",
+        // The shared prompt-preparation core and its callers (chat, completions,
+        // multimodal-encoder routes, count_tokens, KV-cache governor, Responses, router).
+        "tensorrt_llm/serve/render/",
+        "tensorrt_llm/serve/resource_governor.py",
+        "tensorrt_llm/serve/responses_utils.py",
         "tensorrt_llm/serve/router.py",
+        "tensorrt_llm/serve/router_utils.py",
+        "tensorrt_llm/serve/serving_extensions.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/defs/model_express/",
         "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
@@ -1793,9 +1818,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300.yml",
@@ -1805,8 +1827,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
@@ -2075,7 +2095,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
                             --glob 'cov/.cbtscov.*.sqlite' \
                             --out-sqlite cov/cbts_touchmap.sqlite \
                             --out-dir cov/cbts_report \
-                            --source-root llm/tensorrt_llm
+                            --source-root llm
                     """
                     // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
                     sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
@@ -2201,26 +2221,12 @@ def resolveBuildBranch(globalVars)
     return env.gitlabBranch ? env.gitlabBranch : "main"
 }
 
-// Decide whether the build helper jobs should re-BOLT their packed tarball with
-// the target branch's promoted profile bundle (Build.groovy's `boltConsume`).
-// Two restrictions narrow this well below the raw opt-in:
-//
-//  1. Pre-merge only. Post-merge builds the SBSA tarball that the
-//     BOLT-Profile-Gen stage below profiles later in the same run, so BOLTing it
-//     would feed already-BOLTed binaries back into profile generation and yield
-//     circular, meaningless profiles. Post-merge consumers are served instead by
-//     the container overlay (boltOverlayEnabled on the image build) and by
-//     BoltProfileGen applying its own freshly generated bundle in-run.
-//  2. `main` only. scripts/bolt/internal/apply_latest.sh resolves exactly one
-//     branch with no fallback and exits non-zero when that branch has nothing
-//     promoted, so pointing consume at a branch that has never promoted a bundle
-//     hard-fails the build on its first run. `main` is the only branch the
-//     post-merge producer keeps fresh, so stay there until apply_latest.sh grows
-//     a documented fallback.
-//
-// Skips are announced rather than silent: a run that asked for BOLTed binaries
-// and did not get them should say so in the log.
-// (Everything above documents resolveBoltConsume, defined further down.)
+// Release consumers need an unoptimized canonical tarball and a separate
+// optimized variant. Pin their profiles once so tests and images agree.
+def isBoltReleasePipeline()
+{
+    return (env.JOB_NAME ==~ /.*PostMerge.*/) || runMode == "nightly_release"
+}
 
 // Pick the single BOLT profile bundle this pipeline will use, and pin it.
 //
@@ -2231,7 +2237,7 @@ def resolveBuildBranch(globalVars)
 // invisible: each consumer succeeds, and the run is green having tested
 // something other than what it shipped.
 //
-// Pinning is post-merge only. Pre-merge keeps reading `latest` (requirement: its
+// Pinning applies to post-merge and nightly releases. Pre-merge reads `latest` (its
 // drift is acceptable and its behaviour must not change), and returning "" leaves
 // every consumer on exactly today's path.
 //
@@ -2241,7 +2247,7 @@ def resolveBuildBranch(globalVars)
 // build.
 def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
 {
-    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+    if (!isBoltReleasePipeline()) {
         return ""
     }
     def ref = ""
@@ -2273,13 +2279,10 @@ def resolveBoltConsume(boolean requested, String targetBranch, boolean postMerge
     if (!requested) {
         return false
     }
-    // Post-merge is allowed only in the publish-both shape. The exclusion exists
-    // to protect BoltProfileGen's input, and publishing the optimized build under
-    // a second name protects it just as well as not building one -- canonical is
-    // still the un-BOLTed tarball the producer profiles. Without that shape the
-    // build would replace canonical, which is what the exclusion forbids.
-    if ((env.JOB_NAME ==~ /.*PostMerge.*/) && !postMergeVariant) {
-        echo "BOLT consume requested but disabled: the post-merge build is the un-BOLTed input BoltProfileGen profiles."
+    // Post-merge and nightly release consumers require the canonical tarball
+    // to remain unoptimized for profile generation and image-side BOLT.
+    if (isBoltReleasePipeline() && !postMergeVariant) {
+        echo "BOLT consume requested but disabled: post-merge and nightly releases require an un-BOLTed canonical tarball."
         return false
     }
     if (targetBranch != "main") {
@@ -2415,6 +2418,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def releaseTargets = globalVars[RELEASE_TARGET] ?: []
     def wheelSelected = releaseTargets.contains("wheel")
     def containerSelected = releaseTargets.contains("container")
+    def buildAllDockerImages = false
+    def runContainerScanning = false
     stages = [
         "Release-Check": {
             script {
@@ -2912,6 +2917,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def dockerBuildJob = [
         "Build-Docker-Images": {
             script {
+                def imageBuildStatus
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
@@ -2929,9 +2935,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'triggerType': runMode == "nightly_release" ?
                                 "nightly-release" :
                                 (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
-                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
+                            'register_images': runMode == "nightly_release" || (env.JOB_NAME ==~ /.*PostMerge.*/),
                             'defaultTag': defaultTag,
-                            'program_version_name': env.NSPECT_RELEASE_VERSION,
                             // Canonical images carry BOLT profiles: the raw build is
                             // published as <tag>-noprofiles and <tag> is produced by the
                             // overlay. Both unconditional -- the contract is a property of
@@ -2955,18 +2960,33 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
+                                'runSanityCheck': true,
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
-                                'useWheelFromBuildStage': false,
+                                'artifactPath': ARTIFACT_PATH,
+                                'useWheelFromBuildStage': wheelSelected,
                                 'wait_success_seconds': "",
+                                'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            ]
+                        } else if (buildAllDockerImages) {
+                            additionalParameters += [
+                                'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
+                                'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            ]
+                        } else {
+                            additionalParameters += [
+                                'runSanityCheck': false,
+                                'buildInternalRelease': false,
+                                'buildCiImage': false,
+                                'artifactPath': ARTIFACT_PATH,
+                                'nspect_id': "",
                             ]
                         }
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
-
-                        launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -2981,69 +3001,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
-            }
-        }
-    ]
-
-    def plcContainerScanningJob = [
-        "PLC Container Scanning": {
-            script {
-                stage("[Build-Release-Docker-Images] Remote Run") {
-                    try {
-                        def branch = globalVars[BUILD_BRANCH]
-
-                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
-                        // instead of the BuildDockerImages helper job's own counter.
-                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
-                        def branchTag = branch.replaceAll('/', '_')
-                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
-
-                        def additionalParameters = [
-                            'branch': branch,
-                            'action': "push",
-                            'triggerType': runMode == "nightly_release" ?
-                                "nightly-release" : "post-merge",
-                            'runSanityCheck': runMode == "nightly_release",
-                            'defaultTag': defaultTag,
-                            'buildInternalRelease': false,
-                            'buildCiImage': false,
-                            'artifactPath': ARTIFACT_PATH,
-                            'uploadPath': UPLOAD_PATH,
-                            // Must match Build-Docker-Images above: this path pushes the
-                            // same tags, so the scanned+registered image has to be the
-                            // BOLTed canonical one rather than a plain build, built on
-                            // the BOLT-optimized wheel rather than the first tarball to
-                            // appear.
-                            'boltOverlayEnabled': true,
-                            'boltProfilesRequired': true,
-                            'boltOptimizeWheel': true,
-                        ]
-                        if (runMode == "nightly_release") {
-                            additionalParameters += [
-                                'buildNgcRelease': true,
-                                'wait_success_seconds': "",
-                            ]
-                            additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
-                        } else {
-                            additionalParameters['nspect_id'] = ""
-                        }
-                        if (params.release_type_id) {
-                            additionalParameters['release_type_id'] = params.release_type_id
-                        }
-                        launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
-                            catchError(
-                                buildResult: 'SUCCESS',
-                                stageResult: 'FAILURE') {
-                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
-                            }
-                        } else {
-                            throw e
-                        }
-                    }
+                if (!runContainerScanning || imageBuildStatus != "SUCCESS") {
+                    return
                 }
                 stage("[NGC-Container-Compliance-Check] Run") {
                     def repoUrlKey = getPLCRepoUrlKey()
@@ -3099,17 +3058,17 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             stages.remove("SBSA-Linux")
         }
         if (containerSelected) {
-            stages += plcContainerScanningJob
+            runContainerScanning = true
         }
     } else {
         if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
             !GEN_POST_MERGE_BUILDS_ONLY) {
-            stages += dockerBuildJob
+            buildAllDockerImages = true
         }
         if (!GEN_POST_MERGE_BUILDS_ONLY &&
             (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") ||
              testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
-            stages += dockerBuildJob
+            buildAllDockerImages = true
             testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
             testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
             echo "Will run Build-Docker-Images job"
@@ -3118,10 +3077,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
         }
         if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
-            stages += plcContainerScanningJob
+            runContainerScanning = true
             testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
             echo "Will run job to build ngc containers and running in-pipeline scanning for them"
         }
+    }
+
+    if (buildAllDockerImages || runContainerScanning) {
+        stages += dockerBuildJob
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
