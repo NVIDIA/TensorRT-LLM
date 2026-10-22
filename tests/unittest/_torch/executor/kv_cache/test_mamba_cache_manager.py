@@ -37,8 +37,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _KDA_BETA_CACHE_ALIGNMENT_BYTES,
+    INFORWARD_SNAPSHOT_ENV,
+    INFORWARD_SNAPSHOT_ROWS_ENV,
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
+    InforwardSnapshotEntry,
     MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -2566,6 +2569,7 @@ def _build_v2_hybrid_with_mamba_layer(
     host_cache_size=None,
     is_disagg=False,
     enable_stats=False,
+    supports_inforward_snapshot=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2626,6 +2630,7 @@ def _build_v2_hybrid_with_mamba_layer(
         kda_draft_records=kda_draft_records,
         is_disagg=is_disagg,
         enable_stats=enable_stats,
+        supports_inforward_snapshot=supports_inforward_snapshot,
     )
 
 
@@ -2676,6 +2681,123 @@ def _run_v2_hybrid_context(
     request.context_current_position = request.prompt_len
     assert request.context_remaining_length == 0
     manager.update_context_resources(batch)
+
+
+def _build_v2_inforward_snapshot_manager(monkeypatch, **kwargs):
+    monkeypatch.setenv(INFORWARD_SNAPSHOT_ENV, "1")
+    monkeypatch.setenv(INFORWARD_SNAPSHOT_ROWS_ENV, "2")
+    params = dict(
+        max_batch_size=2,
+        num_mamba_layers=2,
+        enable_block_reuse=True,
+        block_reuse_policy="per_request",
+        additional_snapshot_offsets_from_end=[2],
+        conv_state_layout="q_k_v",
+        supports_inforward_snapshot=True,
+    )
+    params.update(kwargs)
+    return _build_v2_hybrid_with_mamba_layer(**params)
+
+
+def _make_v2_prompt_request(request_id: int, tokens: list[int]) -> LlmRequest:
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"supports_inforward_snapshot": False},
+        {"enable_block_reuse": False},
+        {"conv_state_layout": "x_b_c"},
+    ],
+    ids=["model_without_split", "no_block_reuse", "mamba2_layout"],
+)
+def test_v2_inforward_snapshot_needs_gdn_with_block_reuse(monkeypatch, kwargs):
+    mgr = _build_v2_inforward_snapshot_manager(monkeypatch, **kwargs)
+    try:
+        assert mgr.inforward_snapshot_rows == 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state(monkeypatch):
+    """After the forward the snapshot at P = prompt_len - 2 holds the live state the GDN
+    layers left (the state at P), and the live slot gets the staged prompt-end state."""
+    mgr = _build_v2_inforward_snapshot_manager(monkeypatch)
+    try:
+        assert mgr.inforward_snapshot_rows == 2
+        assert mgr.inforward_snapshot_min_main == 3
+        request = _make_v2_prompt_request(1, list(range(1, 67)))
+        mgr.prepare_expect_snapshot_points([request])
+        assert request.expect_snapshot_points == [64]
+        assert mgr.prepare_context(request)
+        assert mgr.resize_context(request, num_tokens=66)
+        request.context_chunk_size = 66
+        request.py_mamba_inforward_snapshot_point = 64
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        mgr.prepare_resources(batch)
+        assert mgr.inforward_snapshot_plan == {1: InforwardSnapshotEntry(0, 64, 64, 2)}
+        assert request.py_mamba_inforward_snapshot_point is None
+
+        # The forward: live slot = state at P, staging row 0 = state at the prompt end.
+        slot = mgr.state_index(1)
+        for layer in range(2):
+            mgr.get_ssm_states(layer)[slot].fill_(1.0)
+            mgr.get_conv_states(layer)[slot].fill_(1.0)
+            stage_ssm, stage_conv = mgr.inforward_snapshot_stage_views(layer)
+            stage_ssm[0].fill_(2.0)
+            stage_conv[0].fill_(2.0)
+        request.context_current_position = 66
+        mgr.update_context_resources(batch)
+        assert mgr.inforward_snapshot_plan == {}
+        assert request.py_mamba_restore_event is not None
+        request.py_mamba_restore_event.synchronize()
+        assert mgr.kv_cache_map[1].num_committed_tokens == 64
+        for layer in range(2):
+            assert torch.all(mgr.get_ssm_states(layer)[slot] == 2.0)
+            assert torch.all(mgr.get_conv_states(layer)[slot] == 2.0)
+
+        # A sibling that shares the first 64 tokens resumes from the snapshot at P.
+        sibling = _make_v2_prompt_request(2, list(range(1, 65)) + [500, 501, 502, 503])
+        mgr.prepare_expect_snapshot_points([sibling])
+        assert mgr.prepare_context(sibling)
+        assert sibling.context_current_position == 64
+        batch = ScheduledRequests()
+        batch.append_context_request(sibling)
+        mgr.prepare_resources(batch)
+        torch.cuda.synchronize()
+        sibling_slot = mgr.state_index(2)
+        assert sibling_slot != slot
+        for layer in range(2):
+            assert torch.all(mgr.get_ssm_states(layer)[sibling_slot] == 1.0)
+            assert torch.all(mgr.get_conv_states(layer)[sibling_slot] == 1.0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch(monkeypatch):
+    mgr = _build_v2_inforward_snapshot_manager(monkeypatch)
+    try:
+        request = _make_v2_prompt_request(1, list(range(1, 67)))
+        request.expect_snapshot_points = [64]
+        request.context_chunk_size = 66
+        request.py_mamba_inforward_snapshot_point = 64
+        batch = SimpleNamespace(context_requests=[request], generation_requests=[object()])
+        mgr._plan_inforward_snapshots(batch)
+        assert mgr.inforward_snapshot_plan == {}
+        assert request.py_mamba_inforward_snapshot_point is None
+    finally:
+        mgr.shutdown()
 
 
 def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):

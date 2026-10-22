@@ -1001,6 +1001,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        # In-forward Mamba snapshot point P the scheduler let this context
+        # chunk run past (MambaHybridCacheManagerV2 consumes it), and the event
+        # after which the request's live recurrent state is restored.
+        self.py_mamba_inforward_snapshot_point: Optional[int] = None
+        self.py_mamba_restore_event: Optional[torch.cuda.Event] = None
 
         self.py_num_connector_matched_tokens = 0
 

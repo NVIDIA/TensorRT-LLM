@@ -326,6 +326,31 @@ def _host_slots_to_device(slots: List[int],
                         and prefer_pinned()).to(device, non_blocking=True)
 
 
+# In-forward Mamba snapshots (GDN models with hybrid block reuse; default off).
+# With additional_snapshot_offsets_from_end the last reusable snapshot point P
+# lies a few tokens before the prompt end L, and FORCE_CHUNK would run the tail
+# [P, L) as an extra context iteration. TRTLLM_MAMBA_INFORWARD_SNAPSHOT=1 runs
+# the prompt through L in one chunk instead: the GDN layers leave the state at P
+# in the live slot and stage the state at L, the manager commits the snapshot at
+# P after the forward and copies the staged state back.
+INFORWARD_SNAPSHOT_ENV = "TRTLLM_MAMBA_INFORWARD_SNAPSHOT"
+# Staging rows, i.e. requests per batch that can take the path; 0 sizes them
+# from INFORWARD_SNAPSHOT_MIB_ENV (at most 8 rows).
+INFORWARD_SNAPSHOT_ROWS_ENV = "TRTLLM_MAMBA_INFORWARD_SNAPSHOT_ROWS"
+INFORWARD_SNAPSHOT_MIB_ENV = "TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MIB"
+# Longest tail [P, L), in tokens.
+INFORWARD_SNAPSHOT_MAX_TAIL_ENV = "TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MAX_TAIL"
+_INFORWARD_SNAPSHOT_MAX_AUTO_ROWS = 8
+
+
+class InforwardSnapshotEntry(NamedTuple):
+    """One request's in-forward snapshot in this step's context chunk."""
+    row: int  # staging row
+    point: int  # snapshot point P
+    num_before: int  # chunk tokens before P
+    num_after: int  # chunk tokens from P to the prompt end
+
+
 def _mamba_rank_offset(mapping: Mapping) -> int:
     """Distinct seed offset per (tp_rank, pp_rank) so independent ranks
     don't draw identical streams when not coordinated."""
@@ -3129,6 +3154,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # In-forward Mamba snapshots: staging rows (0 = off), longest tail, and the
+    # fewest chunk tokens before P (the convolution window at P must lie inside
+    # the chunk). See INFORWARD_SNAPSHOT_ENV.
+    inforward_snapshot_rows = 0
+    inforward_snapshot_max_tail = 0
+    inforward_snapshot_min_main = 0
+    # This step's plan {request id: entry}; replaced, never mutated in place.
+    inforward_snapshot_plan: Dict[int, InforwardSnapshotEntry] = {}
+    _inforward_stage_ssm: Optional[torch.Tensor] = None
+    _inforward_stage_conv: Optional[torch.Tensor] = None
     # (request ids, SSM base blocks, dummy flags) of the last state-index
     # upload while it is known to be current (Qwen3.5 fast paths).
     _steady_state_index_key: Optional[Tuple[Tuple[int, ...], Tuple[int, ...],
@@ -3191,8 +3226,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         kda_replay_num_spec: Optional[int] = None,
         qwen4_exp_ple_cache_params: Optional["Qwen4ExpPLECacheParams"] = None,
         kda_draft_records: bool = False,
+        supports_inforward_snapshot: bool = False,
         **kwargs,
     ) -> None:
+        """See the class docstring.
+
+        Args:
+            supports_inforward_snapshot: Whether the model's recurrent layers
+                implement the in-forward snapshot split (GDN); the path also
+                needs TRTLLM_MAMBA_INFORWARD_SNAPSHOT=1.
+        """
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(
                 f"Unsupported convolution state layout: {conv_state_layout!r}")
@@ -3456,6 +3499,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # PLE pools use exactly the state-slot capacity resolved above.
             self._setup_ple_states(num_ssm_slots)
             self._setup_replay_buffers(spec_config)
+            self._setup_inforward_snapshot(supports_inforward_snapshot
+                                           and conv_state_layout == "q_k_v")
             if self._use_gdn_cached_replay_all_layer_commit:
                 state_layout = ("affine"
                                 if self._gdn_cached_replay_state_strides
@@ -3631,6 +3676,159 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @property
     def keeps_kda_draft_records(self) -> bool:
         return self.kda_state_tok is not None
+
+    def _setup_inforward_snapshot(self, model_supports_it: bool) -> None:
+        """Allocate the in-forward snapshot staging rows when the path applies.
+
+        Args:
+            model_supports_it: Whether the recurrent layers implement the
+                in-forward split (GDN with the q_k_v convolution layout).
+        """
+        if os.environ.get(INFORWARD_SNAPSHOT_ENV, "0") != "1":
+            return
+        # Every rank of a server must schedule the same chunks, so PP stages
+        # without local GDN layers rule the path out.
+        if not (model_supports_it and self.enable_block_reuse
+                and not self.is_draft and self.mapping.pp_size == 1
+                and not self._ple_layer_ids and not self.use_kda_replay_update):
+            logger.warning(
+                f"{INFORWARD_SNAPSHOT_ENV}=1 ignored: it needs a GDN model with "
+                "block reuse, no pipeline parallelism and no draft cache")
+            return
+        rows = int(os.environ.get(INFORWARD_SNAPSHOT_ROWS_ENV, "0"))
+        mib = int(os.environ.get(INFORWARD_SNAPSHOT_MIB_ENV, "512"))
+        max_tail = int(os.environ.get(INFORWARD_SNAPSHOT_MAX_TAIL_ENV, "16"))
+        if rows < 0 or mib <= 0 or max_tail <= 0:
+            raise ValueError(
+                f"{INFORWARD_SNAPSHOT_ROWS_ENV} must be >= 0 and "
+                f"{INFORWARD_SNAPSHOT_MIB_ENV} / {INFORWARD_SNAPSHOT_MAX_TAIL_ENV} "
+                f"> 0, got {rows} / {mib} / {max_tail}")
+        layers = self.local_num_mamba_layers
+        row_bytes = layers * (self.ssm_bytes + self.conv_bytes)
+        if rows == 0:
+            rows = max(
+                1,
+                min(_INFORWARD_SNAPSHOT_MAX_AUTO_ROWS,
+                    (mib << 20) // max(1, row_bytes)))
+        device = self.all_ssm_states[0].device
+        # [layer, row, ...]: one dense tensor per layer, written by the GDN
+        # layer with index_copy_.
+        self._inforward_stage_ssm = torch.empty([layers, rows] +
+                                                self.ssm_state_shape,
+                                                dtype=self.ssm_state_dtype,
+                                                device=device)
+        self._inforward_stage_conv = torch.empty([layers, rows] +
+                                                 self.conv_state_shape,
+                                                 dtype=self.conv_state_dtype,
+                                                 device=device)
+        self.inforward_snapshot_rows = rows
+        self.inforward_snapshot_max_tail = max_tail
+        self.inforward_snapshot_min_main = max(1, self.conv_state_shape[-1])
+        logger.info(
+            f"{INFORWARD_SNAPSHOT_ENV}: in-forward Mamba snapshots with {rows} "
+            f"staging rows ({rows * row_bytes / 2**20:.0f} MiB), tail <= "
+            f"{max_tail} tokens")
+
+    def inforward_snapshot_stage_views(
+            self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A layer's staging rows: SSM ``[rows, H, V, K]`` and conv ``[rows, conv_dim, d_conv - 1]``."""
+        offset = self.mamba_layer_offsets[layer_idx]
+        return (self._inforward_stage_ssm[offset],
+                self._inforward_stage_conv[offset])
+
+    def state_index(self, request_id: int) -> int:
+        """The live state slot of a request scheduled in this step."""
+        return self._request_id_to_state_index[request_id]
+
+    def _plan_inforward_snapshots(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Turn the scheduler's in-forward snapshot marks into this step's plan."""
+        plan: Dict[int, InforwardSnapshotEntry] = {}
+        context_only = not scheduled_batch.generation_requests
+        for req in scheduled_batch.context_requests:
+            point = req.py_mamba_inforward_snapshot_point
+            if point is None:
+                continue
+            req.py_mamba_inforward_snapshot_point = None
+            pos = req.context_current_position
+            end = pos + req.context_chunk_size
+            if (context_only and self.inforward_snapshot_rows > len(plan)
+                    and not req.is_dummy_request
+                    and pos + self.inforward_snapshot_min_main <= point < end
+                    and end == req.prompt_len
+                    and end - point <= self.inforward_snapshot_max_tail
+                    and req.expect_snapshot_points
+                    and point == req.expect_snapshot_points[-1]):
+                plan[req.py_request_id] = InforwardSnapshotEntry(
+                    len(plan), point, point - pos, end - point)
+            else:
+                # The scheduler checks the same conditions, so this is not
+                # expected. The chunk still runs through the prompt end, so no
+                # snapshot at P is recorded for this request.
+                logger.warning(
+                    f"{INFORWARD_SNAPSHOT_ENV}: request {req.py_request_id} "
+                    f"dropped from the in-forward snapshot plan (P={point}, "
+                    f"chunk [{pos}, {end}), prompt {req.prompt_len}, "
+                    f"context-only batch {context_only})")
+        self.inforward_snapshot_plan = plan
+
+    def _finish_inforward_snapshots(
+            self, scheduled_batch: ScheduledRequests,
+            plan: Dict[int, InforwardSnapshotEntry]) -> None:
+        """Record the snapshots at P and restore the prompt-end states.
+
+        After a forward with in-forward snapshots the GDN layers left each
+        planned request's live state at its snapshot point P and staged the
+        state at the prompt end. Commit the prompt up to P (the commit copies
+        the live recurrent page into the radix tree), then copy the staged
+        state back into the live slot. Both run on the execution stream before
+        the next forward; a disaggregated KV send of these requests waits for
+        the event recorded after the copies (``py_mamba_restore_event``).
+        """
+        dst, src, done = [], [], []
+        for request in scheduled_batch.context_requests:
+            entry = plan.get(request.py_request_id)
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+            if entry is None or kv_cache is None or not kv_cache.is_active:
+                continue
+            point = entry.point
+            if (not request.is_dummy_request
+                    and kv_cache.num_committed_tokens < point
+                    and kv_cache.history_length <= point):
+                if kv_cache.history_length < point and not kv_cache.resize(
+                        None, point):
+                    raise ValueError(
+                        "Failed to resize history length of V2 Mamba cache "
+                        f"for request {request.py_request_id} to the in-forward "
+                        f"snapshot point {point}")
+                kv_cache.commit(
+                    self._augment_tokens_for_block_reuse(
+                        self._reuse_token_source(request),
+                        request,
+                        start=kv_cache.num_committed_tokens,
+                        end=point,
+                    ))
+                if self._branch_snapshot_points.get(
+                        request.py_request_id) == point:
+                    self._branch_snapshots_taken_total += 1
+            slot = kv_cache.get_ssm_block_base_index(self.ssm_layer_group_id)
+            if slot < 0:
+                raise RuntimeError(
+                    "In-forward Mamba snapshot: request "
+                    f"{request.py_request_id} lost its live SSM slot")
+            dst += [state[slot] for state in self.all_ssm_states]
+            dst += [state[slot] for state in self.all_conv_states]
+            src += list(self._inforward_stage_ssm[:, entry.row].unbind(0))
+            src += list(self._inforward_stage_conv[:, entry.row].unbind(0))
+            done.append(request)
+        if not done:
+            return
+        with torch.cuda.stream(self._stream):
+            torch._foreach_copy_(dst, src, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self._stream)
+        for request in done:
+            request.py_mamba_restore_event = event
 
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size: int) -> None:
@@ -4693,6 +4891,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
+        if self.inforward_snapshot_rows > 0:
+            self._plan_inforward_snapshots(scheduled_batch)
         if self.local_num_mamba_layers == 0:
             return
         requests = (scheduled_batch.context_requests +
@@ -5164,6 +5364,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def update_context_resources(self,
                                  scheduled_batch: ScheduledRequests) -> None:
+        plan = self.inforward_snapshot_plan
+        if plan:
+            self.inforward_snapshot_plan = {}
+            self._finish_inforward_snapshots(scheduled_batch, plan)
         for request in scheduled_batch.context_requests:
             kv_cache = self.kv_cache_map.get(request.py_request_id)
             if kv_cache is None or not kv_cache.is_active:
@@ -5204,6 +5408,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.all_conv_states = []
         self._stacked_ssm_states = None
         self._stacked_conv_states = None
+        self.inforward_snapshot_rows = 0
+        self.inforward_snapshot_plan = {}
+        self._inforward_stage_ssm = None
+        self._inforward_stage_conv = None
         self._ple_ngram_contexts = {}
         self._ple_conv_states = {}
         self.intermediate_ssm_states = None

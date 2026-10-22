@@ -272,33 +272,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
 
-        # Opt-in (default off): schedule context requests with the fewest
-        # uncached prompt tokens first instead of in arrival order. Under FCFS
-        # chunking a long prefill takes the whole token budget for several
-        # iterations and every context request behind it waits, although most
-        # multi-turn requests need only a few new tokens after prefix reuse.
-        # With it, TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS=N caps an iteration's
-        # token budget at N while a short request (at most
-        # TRTLLM_CTX_SCHED_SRPT_SHORT_TOKENS uncached, default 4096) is among
-        # several pending ones, so it does not ride along with a full-budget
-        # chunk of a long prefill; a long prefill alone keeps the full budget.
-        # See _order_ctx_shortest_first.
+        # Shortest-first (opt-in): context requests with the fewest uncached prompt
+        # tokens go first. LATENCY_TOKENS caps the iteration's budget while a short
+        # request (<= SHORT_TOKENS uncached) is pending among others.
         self._ctx_shortest_first = os.environ.get("TRTLLM_CTX_SCHED_SRPT", "0") == "1"
         self._ctx_latency_tokens = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS", "0"))
         self._ctx_short_tokens = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_SHORT_TOKENS", "4096"))
-        # Opt-in (default off) starvation guard for shortest-first: a context
-        # request that has waited longer than TRTLLM_CTX_SCHED_SRPT_AGE_S
-        # seconds, or TRTLLM_CTX_SCHED_SRPT_AGE_ITERS scheduler iterations,
-        # since this scheduler first saw it is aged. Aged requests go in
-        # arrival order and first take at most TRTLLM_CTX_SCHED_SRPT_AGE_CAP
-        # tokens each (default 2048); the shortest-first fill takes the rest of
-        # the budget, and what it leaves goes back to the aged requests. Without
-        # the cap an aged long prefill would take the whole budget again, which
-        # is the head-of-line blocking shortest-first removes. See _split_aged_ctx.
-        # Seconds are this rank's own clock, so they are only usable where each
-        # rank schedules alone (attention DP, or a single rank); TP / CP ranks
-        # without attention DP run the same schedule and must reach identical
-        # decisions, which an iteration count gives them.
+        # Starvation guard (opt-in): a request waiting longer than AGE_S / AGE_ITERS
+        # first takes up to AGE_CAP tokens, oldest first (see _split_aged_ctx).
+        # Seconds are rank-local, so TP / CP ranks without attention DP need ITERS.
         self._ctx_age_s = float(os.environ.get("TRTLLM_CTX_SCHED_SRPT_AGE_S", "0"))
         self._ctx_age_iters = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_AGE_ITERS", "0"))
         self._ctx_age_cap = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_AGE_CAP", "2048"))
@@ -345,6 +327,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._ctx_aged_count = 0
         self._sched_iter = 0
         self._clock = time.monotonic
+        # In-forward Mamba snapshots (MambaHybridCacheManagerV2,
+        # TRTLLM_MAMBA_INFORWARD_SNAPSHOT): staging rows per batch, and those
+        # left in the batch being scheduled.
+        rows = getattr(kv_cache_manager, "inforward_snapshot_rows", 0)
+        self._inforward_snapshot_rows = rows if isinstance(rows, int) else 0
+        self._inforward_snapshot_rows_left = 0
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
@@ -665,6 +653,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+        # Only context-only batches take Mamba snapshots inside the forward.
+        self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
 
         if self._ctx_shortest_first and len(pending_ctx) > 1:
             pending_ctx, first_uncached = self._order_ctx_shortest_first(pending_ctx)
@@ -863,16 +853,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         return [req for _, _, req in keyed], keyed[0][0]
 
     def _split_aged_ctx(self, pending_ctx: RequestList) -> tuple[RequestList, RequestList]:
-        """Starvation guard for shortest-first (TRTLLM_CTX_SCHED_SRPT_AGE_S / _AGE_ITERS).
+        """Split off requests waiting longer than the age limit: ``(others, aged)``, aged oldest first.
 
-        Stamps each pending request with the time (seconds) or the scheduler
-        iteration (iterations) at which this scheduler first saw it and returns
-        ``(others, aged)``: ``aged`` holds the requests that have waited longer
-        than the age limit, oldest first, and ``others`` keeps the
-        shortest-first order of the rest. Nothing is split off while only one
-        request is pending or the list holds encoder requests (no shortest-first
-        order then). With iterations every input is the same on all TP ranks,
-        so they all age the same requests in the same iteration.
+        Stamps each request with the time or scheduler iteration it was first seen. Nothing is
+        split off with a single pending request or with encoder requests in the list.
         """
         if self._ctx_age_iters > 0:
             attr, now, limit, kind = (
@@ -1216,6 +1200,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         remaining_budget = budget.remaining_tokens
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+        inforward_point = None
+        if self._inforward_snapshot_rows:
+            # A mark from an earlier pass whose batch did not run this request
+            # must not outlive that pass.
+            req.py_mamba_inforward_snapshot_point = None
 
         if not self._has_context_chunk_budget(budget):
             return ScheduleAction.SKIP, 0, False
@@ -1259,6 +1248,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             # With no remaining state to snapshot, avoid artificial boundaries.
             chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
+            if self._inforward_snapshot_rows_left > 0 and not has_recovery:
+                inforward_point = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
+                if inforward_point is not None:
+                    chunk_size = context_remaining
         else:
             budget_context_remaining = (
                 context_remaining
@@ -1329,7 +1322,43 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
+        if inforward_point is not None and req.context_chunk_size == context_remaining:
+            req.py_mamba_inforward_snapshot_point = inforward_point
+            self._inforward_snapshot_rows_left -= 1
+
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _inforward_snapshot_point(
+        self, req: LlmRequest, chunk_size: int, remaining_budget: Optional[int]
+    ) -> Optional[int]:
+        """The snapshot point P a forced chunk ends at, if the chunk can run through the prompt end instead.
+
+        The GDN layers then record the state at P inside the forward
+        (MambaHybridCacheManagerV2 in-forward snapshots), which saves the extra
+        context iteration of the short tail [P, prompt end).
+        """
+        manager = self.kv_cache_manager
+        pos = req.context_current_position
+        point = pos + chunk_size
+        end = req.prompt_len
+        points = req.expect_snapshot_points
+        if not points or point != points[-1] or not point < end:
+            return None
+        if pos + req.context_remaining_length != end:
+            return None
+        if (
+            end - point > manager.inforward_snapshot_max_tail
+            or point - pos < manager.inforward_snapshot_min_main
+        ):
+            return None
+        if remaining_budget is not None and end - pos > remaining_budget:
+            return None
+        if self.max_context_length is not None and end - pos > self.max_context_length:
+            return None
+        mm_data = getattr(req, "py_multimodal_data", None)
+        if isinstance(mm_data, dict) and mm_data.get("mm_bidirectional_blocks", False):
+            return None
+        return point
 
     def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Pair the two pools on one depth before either claims.
