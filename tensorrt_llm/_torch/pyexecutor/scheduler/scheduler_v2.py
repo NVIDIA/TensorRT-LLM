@@ -301,6 +301,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._async_transfer_manager = mgr
 
     @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Effective long-prefill demotion threshold; 0 when off or unchunked."""
+        return self._ctx_demote_uncached_tokens
+
+    @property
     def scheduling_state_range(
         self,
     ) -> tuple[LlmRequestState, LlmRequestState]:

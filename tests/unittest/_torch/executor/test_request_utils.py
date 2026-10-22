@@ -155,6 +155,23 @@ def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
     assert llm_request.child_requests[0].py_end_id == 7
 
 
+def test_executor_request_to_llm_request_copies_uncached_prefill_estimate() -> None:
+    """The ADP router's estimate survives conversion; without one it stays None."""
+    with_estimate = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+    with_estimate.py_uncached_prefill_tokens = 5000
+    without_estimate = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+
+    converted = [
+        executor_request_to_llm_request(
+            42, request, child_req_ids=[], exclude_last_generation_logits=False
+        )
+        for request in (with_estimate, without_estimate)
+    ]
+
+    assert converted[0].py_uncached_prefill_tokens == 5000
+    assert converted[1].py_uncached_prefill_tokens is None
+
+
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
     position_ids = [4, 7, 9]
     executor_request = trtllm.Request(

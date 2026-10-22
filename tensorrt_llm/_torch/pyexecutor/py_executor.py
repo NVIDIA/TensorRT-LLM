@@ -816,6 +816,11 @@ class PyExecutor:
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
         )
+        # The router publishes the uncached-prefill estimate only when the
+        # scheduler's long-prefill demotion consumes it.
+        if hasattr(self.adp_router, "set_publish_uncached_estimate"):
+            self.adp_router.set_publish_uncached_estimate(
+                getattr(self.scheduler, "ctx_demote_uncached_tokens", 0) > 0)
 
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
