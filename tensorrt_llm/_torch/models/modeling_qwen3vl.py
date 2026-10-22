@@ -446,6 +446,15 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 frames = vd.frames
                 duration = _get_video_sampling_duration(m, n_decoded)
                 per_video_kwargs = dict(sampling_kwargs)
+                # Non-prefix indices can also result from dropped frames. Do
+                # not preserve oversized inputs by default; use HF sampling
+                # below so selected pixels still map to source timestamps.
+                if (
+                    per_video_kwargs.get("num_frames") is None
+                    and per_video_kwargs.get("fps") is None
+                    and n_decoded > video_processor.max_frames
+                ):
+                    per_video_kwargs.setdefault("do_sample_frames", True)
                 sample_num_frames, sample_fps = num_frames, fps
                 if num_frames is not None and fps is not None:
                     sample_num_frames = n_decoded
