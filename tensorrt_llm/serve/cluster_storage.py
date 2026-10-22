@@ -111,10 +111,11 @@ class WatchEventQueue:
         events = []
         event = await self.events.get()
         events.append(event)
+        self.events.task_done()
         while not self.events.empty():
             event = self.events.get_nowait()
             events.append(event)
-        self.events.task_done()
+            self.events.task_done()
         return events
 
     async def add_events(self, events: List[WatchEvent]):
