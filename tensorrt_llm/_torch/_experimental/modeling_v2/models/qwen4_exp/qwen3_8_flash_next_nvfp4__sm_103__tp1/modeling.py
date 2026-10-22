@@ -586,6 +586,20 @@ def _mtp_draft_head_mode() -> str:
     return mode
 
 
+#: Set to N > 0 to let the FP8 draft head propose only the first N token ids (the tokenizer's
+#: most frequent merges come first): a vocabulary-row slice of the head, so its id is the
+#: token's and the worker needs no draft-to-target map. A draft can only miss more often --
+#: the verify step's full head decides what is emitted -- so outputs are unchanged and the
+#: acceptance length is the cost to watch. 0 (default): the whole vocabulary.
+_MTP_DRAFT_VOCAB_ENV = "TRTLLM_MODELING_V2_MTP_DRAFT_VOCAB"
+
+
+def _mtp_draft_vocab() -> int:
+    vocab = int(os.environ.get(_MTP_DRAFT_VOCAB_ENV, "0"))
+    assert vocab >= 0, f"{_MTP_DRAFT_VOCAB_ENV}={vocab}: expected a non-negative row count"
+    return vocab
+
+
 #: Set to 1 to run the GDN input / output and attention input / output projections in FP8
 #: (`fp8_per_tensor_mm`: e4m3 weights with a per-tensor scale, the activation quantized per
 #: call with a dynamic per-tensor scale) wherever a call reaches `_DENSE_FP8_MIN_ROWS` rows. A
@@ -1628,6 +1642,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # A packed block-scaled e4m3 copy of lm_head for decode rows (`fp8_gemv`): the draft
         # head's when it reads FP8, and the target head's under the dense FP8 mode.
         self._lm_head_g = None
+        # The draft head's own packed copy when it reads a vocabulary slice
+        # (`_MTP_DRAFT_VOCAB_ENV`); else the draft head shares `_lm_head_g`.
+        self._mtp_head_g = None
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
@@ -6866,7 +6883,8 @@ class MTPLayer:
             )
             final, _ = qwen4_exp_gated_residual(normed, M.fhc_down, M.fhc_up, None, core.hc_count)
         if core._mtp_head_fp8 is not None:
-            lm_head = _Fp8DraftHead(*core._mtp_head_fp8, core._lm_head_g)
+            packed = core._mtp_head_g if core._mtp_head_g is not None else core._lm_head_g
+            lm_head = _Fp8DraftHead(*core._mtp_head_fp8, packed)
         return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
 
     def forward(
@@ -7665,5 +7683,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         # FP8 mode, the target's own head's.
         if draft_fp8 or _dense_fp8_enabled():
             self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
+        vocab = _mtp_draft_vocab()
+        if draft_fp8 and 0 < vocab < self.lm_head.weight.shape[0]:
+            codes, scale = rowwise
+            self.model._mtp_head_fp8 = (codes[:vocab], scale[:, :vocab].contiguous())
+            self.model._mtp_head_g = pack_from_bf16(self.lm_head.weight.data[:vocab])
         if _dense_fp8_enabled():
             self.logits_processor.fp8_head = (rowwise, self.model._lm_head_g)
