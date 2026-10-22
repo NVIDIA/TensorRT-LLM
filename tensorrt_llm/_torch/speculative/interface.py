@@ -48,6 +48,36 @@ from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
+# _scan_one_model_sampling (run twice per step) reuses its last result for the
+# same requests, states, slots, draft length and group override; a request's
+# sampling config is fixed for its lifetime.
+SAMPLING_SCAN_CACHE_ENV = "TRTLLM_Q35_SAMPLING_SCAN_CACHE"
+
+
+def _sampling_scan_cache_key(spec_metadata, requests: list["LlmRequest"]):
+    """Key under which ``SpecMetadata._scan_one_model_sampling`` may reuse its
+    last result, or None to scan.
+
+    Ragged verification is never cached (a request's row count can change
+    between steps), nor are batches holding warmup / attention-DP dummy
+    requests: those reuse request ids across CUDA graph capture passes with
+    different sampling params. The CUDA graph padding request keeps its id and
+    its greedy params, so it does not prevent caching.
+    """
+    if spec_metadata.is_ragged_verify:
+        return None
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+    entries = []
+    for request in requests:
+        if (getattr(request, "is_dummy_request", False)
+                and not getattr(request, "is_cuda_graph_dummy", False)):
+            return None
+        entries.append((request.py_request_id,
+                        request.state == LlmRequestState.GENERATION_IN_PROGRESS,
+                        request.py_seq_slot))
+    return (tuple(entries), spec_metadata.runtime_draft_len,
+            spec_metadata.group_all_greedy_sample, spec_metadata.dummy_slot_row)
+
 
 def rejection_sampling_one_model(
     draft_probs: torch.Tensor,
@@ -571,6 +601,10 @@ class SpecMetadata:
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Whether this step's target logits are this rank's vocabulary shard
+    # (TRTLLM_Q35_SHARDED_TARGET_SAMPLING; set by the one-model forward), so
+    # the worker samples the greedy target tokens with a cross-rank argmax.
+    sharded_target_logits: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -629,6 +663,9 @@ class SpecMetadata:
     # answer and let one skip a fill another view invalidated.
     _sampling_params_signature: list = field(
         default_factory=lambda: [None, None], repr=False)
+    # Last result of _scan_one_model_sampling with its key
+    # (TRTLLM_Q35_SAMPLING_SCAN_CACHE; see _sampling_scan_cache_key).
+    _sampling_scan_cache: Optional[tuple] = field(default=None, repr=False)
     # Per-row Philox state for user-specified ``SamplingParams.seed``, laid out
     # to match the logits rows the sampling kernels consume.
     #
@@ -1246,6 +1283,15 @@ class SpecMetadata:
             )
 
         # Phase 1: collect per-request flags and normalized values.
+        scan_key = (_sampling_scan_cache_key(self, requests) if os.environ.get(
+            SAMPLING_SCAN_CACHE_ENV, "0") == "1" else None)
+        if scan_key is not None:
+            cached = getattr(self, "_sampling_scan_cache", None)
+            if cached is not None and cached[0] == scan_key:
+                (_, per_request_normalized, per_request_slot_ids,
+                 self.is_all_greedy_sample) = cached
+                return per_request_normalized, per_request_slot_ids
+
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
@@ -1308,6 +1354,10 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+        if scan_key is not None:
+            self._sampling_scan_cache = (scan_key, per_request_normalized,
+                                         per_request_slot_ids,
+                                         self.is_all_greedy_sample)
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1958,6 +2008,31 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return num_accepted_tokens
 
+    def _fused_force_params(self, runtime_draft_len: int, spec_metadata,
+                            device: torch.device):
+        """The decisions of :meth:`_apply_force_accepted_tokens` as the
+        ``force`` argument of ``q35_fused_accept.fused_strict_accept``: None for
+        natural acceptance (no forcing, or eager CUDA-graph warmup)."""
+        if self.force_num_accepted_tokens == 0.0:
+            return None
+        if spec_metadata is not None and (
+                spec_metadata.is_cuda_graph
+                and not torch.cuda.is_current_stream_capturing()):
+            return None
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+        if frac_part > 0.0 and base_total < max_total:
+            self._ensure_force_accept_rng_state(device)
+            return (base_total, max_total, frac_part,
+                    self._force_accept_rng_pool, self._force_accept_rng_counter,
+                    _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+                    _FORCE_ACCEPT_RNG_SLOT_STRIDE, _FORCE_ACCEPT_RNG_POOL_SIZE)
+        return (base_total, max_total, 0.0, None, None,
+                _FORCE_ACCEPT_RNG_COUNTER_STRIDE, _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+                _FORCE_ACCEPT_RNG_POOL_SIZE)
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -1992,6 +2067,20 @@ class SpecWorkerBase(nn.Module, ABC):
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
+
+        from .q35_fused_accept import (MAX_DRAFT_LEN, fused_accept_enabled,
+                                       fused_strict_accept)
+        if (fused_accept_enabled() and runtime_draft_len <= MAX_DRAFT_LEN
+                and not (spec_metadata is not None
+                         and spec_metadata.is_ragged_verify)):
+            # TRTLLM_Q35_FUSED_ACCEPT: everything after the target sampling in
+            # one launch (same outputs, same forced-acceptance draws).
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+            return fused_strict_accept(
+                target_tokens, draft_tokens, num_contexts, batch_size,
+                self._fused_force_params(runtime_draft_len, spec_metadata,
+                                         logits.device))
 
         # Allocate return buffers
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
@@ -2854,6 +2943,21 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
+            from ..distributed import ll_exchange
+            if ll_exchange.ll_argmax_exchange_enabled():
+                # TRTLLM_Q35_LL_ARGMAX_EXCHANGE: local row max + one-launch LL
+                # exchange of packed (value, index) keys over peer memory
+                # instead of the NCCL all-gather; same tokens (global argmax,
+                # lowest index on ties).
+                exchange = ll_exchange.get_tp_key_exchange(mapping)
+                if exchange is not None and 1 <= logits.shape[
+                        0] <= exchange.MAX_ROWS:
+                    local_max, local_argmax = torch.max(logits, dim=-1)
+                    return exchange.argmax_tokens(local_max,
+                                                  local_argmax,
+                                                  mapping.tp_rank *
+                                                  logits.shape[-1],
+                                                  channel=0)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
@@ -3241,6 +3345,16 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
+        elif getattr(spec_metadata, "sharded_target_logits", False):
+            # TRTLLM_Q35_SHARDED_TARGET_SAMPLING: logits are this rank's
+            # vocabulary shard; global greedy tokens from one launch (local
+            # first maximum + LL key exchange; same tokens as torch.argmax).
+            from ..distributed import ll_exchange
+            exchange = ll_exchange.get_tp_key_exchange(self.mapping)
+            sampled_tokens = exchange.argmax_logits(
+                logits,
+                vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+                channel=1)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
