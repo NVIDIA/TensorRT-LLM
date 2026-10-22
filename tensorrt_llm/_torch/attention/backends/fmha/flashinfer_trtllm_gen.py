@@ -426,6 +426,32 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         return get_sm_version() in cls.EXTRA_PAGE_SIZES_ONLY_SMS
 
     @classmethod
+    def require_extra_page_size_route(cls, tokens_per_block: int) -> None:
+        """Raise at setup when a KV manager's extra page size has no FMHA on this device.
+
+        On SM107 this library is the only one with paged-context kernels for the
+        extra page sizes, so without it the first prefill would fail. Call this
+        where a KV cache manager opts in to ``tokens_per_block``.
+        """
+        if not cls.serves_only_extra_page_sizes():
+            return
+        from .registry import get_enabled_fmha_lib_classes
+
+        where = f"SM{get_sm_version()} with {tokens_per_block}-token KV pages"
+        if cls not in get_enabled_fmha_lib_classes():
+            raise RuntimeError(
+                f"{where} needs the flashinfer_trtllm_gen FMHA library, the only one with "
+                "paged-context kernels for this page size here, but TLLM_FMHA_LIBS excludes it. "
+                "Keep flashinfer_trtllm_gen in TLLM_FMHA_LIBS (or unset it)."
+            )
+        if not cls.is_environment_available():
+            raise RuntimeError(
+                f"{where} needs the flashinfer_trtllm_gen FMHA library, but it is unavailable: "
+                "install flashinfer-python with its fused nanobind ops (see the debug log for "
+                "the missing piece)."
+            )
+
+    @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not cls.is_environment_available():
             return False

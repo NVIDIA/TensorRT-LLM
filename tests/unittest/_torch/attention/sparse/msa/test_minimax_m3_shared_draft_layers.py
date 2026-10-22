@@ -417,6 +417,68 @@ def test_draft_kv_cache_view_accessor_respects_local_layers(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,fmha_libs,env_ok,error",
+    [
+        (107, None, True, None),
+        (107, "-flashinfer_trtllm_gen", True, "TLLM_FMHA_LIBS excludes it"),
+        (107, "fallback", True, "TLLM_FMHA_LIBS excludes it"),
+        (107, None, False, "install flashinfer-python"),
+        # Elsewhere the fallback has P128 paged-context kernels, so nothing is required.
+        (103, "-flashinfer_trtllm_gen", False, None),
+    ],
+)
+@pytest.mark.parametrize("site", ["separate_draft_manager", "nvfp4_draft_view"])
+def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
+    monkeypatch, sm, fmha_libs, env_ok, error, site
+):
+    """On SM107 the P128 opt-in is checked when the KV manager is set up, not at the
+    first prefill: a missing FlashInfer route raises an error that names the fix."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
+        lambda: sm,
+    )
+    monkeypatch.setattr(
+        FlashInferTrtllmGenFmha, "is_environment_available", classmethod(lambda cls: env_ok)
+    )
+    if fmha_libs is None:
+        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FMHA_LIBS", fmha_libs)
+
+    if site == "separate_draft_manager":
+        monkeypatch.setattr(
+            KVCacheManagerV2,
+            "_prepare_page_table_tensor",
+            lambda self, capacity: setattr(self, "_use_per_layer_page_tables", False),
+        )
+        manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+        manager.dtype = DataType.FP8
+        manager._shared_draft_layer_ids = []
+        manager.layer_offsets = {0: 0}
+        manager.is_draft = True
+        manager.enable_swa_scratch_reuse = False
+        manager.tokens_per_block = 128
+        setup = lambda: manager._prepare_page_table_tensor(8)  # noqa: E731
+    else:
+        # Stop right after the check: the rest of the view needs real pools.
+        manager = SimpleNamespace(tokens_per_block=128, layer_offsets={})
+        setup = lambda: MiniMaxM3DraftKVCacheView(manager, [DRAFT_LOCAL_LAYER])  # noqa: E731
+
+    if error is not None:
+        with pytest.raises(RuntimeError, match=error) as excinfo:
+            setup()
+        assert "128-token KV pages" in str(excinfo.value)
+    elif site == "separate_draft_manager":
+        setup()
+        assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
+    else:
+        # The check passed; the view then fails on the stub's missing layer.
+        with pytest.raises(KeyError):
+            setup()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("via_accessor", [False, True])
 def test_draft_kv_cache_view_rejects_multiple_local_layers(via_accessor: bool) -> None:
     """The single-pool view must reject a second layer before publishing wrong pointers."""

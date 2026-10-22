@@ -233,6 +233,15 @@ def extend_attention_op_pools_for_shared_draft_layers(
 _KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
 
 
+def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
+    """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107)."""
+    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+        FlashInferTrtllmGenFmha,
+    )
+
+    FlashInferTrtllmGenFmha.require_extra_page_size_route(tokens_per_block)
+
+
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
@@ -565,6 +574,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             # opt-in but no virtual pools. (MiniMax-M3 Eagle3 shares the target
             # manager today; this keeps a separate one on the trtllm-gen route.)
             if self.tokens_per_block == 128 and self.dtype != DataType.NVFP4:
+                _require_trtllm_gen_extra_page_route(128)
                 self.trtllm_gen_extra_tokens_per_block = frozenset({128})
             return
         if not native_layers:
@@ -582,6 +592,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # here rather than in the global allowlist. On SM107 this opt-in is the
         # only route for these layers: FallbackFmha has no P128 paged-context kernels.
         if self.tokens_per_block == 128:
+            _require_trtllm_gen_extra_page_route(128)
             self.trtllm_gen_extra_tokens_per_block = frozenset({128})
         if self._use_per_layer_page_tables:
             # Per-layer page tables already give every layer its own pool.
@@ -1059,6 +1070,8 @@ class MiniMaxM3DraftKVCacheView:
                 "MiniMax-M3 draft KV cache views support exactly one local shared draft layer; "
                 f"got {len(draft_layer_ids)}. Multiple layers require separate pool roots."
             )
+        if manager.tokens_per_block in self.trtllm_gen_extra_tokens_per_block:
+            _require_trtllm_gen_extra_page_route(manager.tokens_per_block)
         self._manager = manager
         layer_id = draft_layer_ids[0]
         local = int(manager.layer_offsets[layer_id])
