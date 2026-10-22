@@ -2055,7 +2055,12 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         if not kv_cache.resume(self._stream.cuda_stream):
             logger.warning("KVCacheManagerV2: could not reserve a guard page")
-            self._remove_kv_cache(_GUARD_PAGE_REQUEST_ID)
+            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
+            kv_cache.close()
+            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            # The dummy create marked this id stats-excluded; free_resources
+            # clears that on the normal teardown, so the bail-outs must too.
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Never committed, so the reuse tree can never hand this page to a
@@ -2063,7 +2068,12 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.stop_committing()
         if not kv_cache.resize(1 + self.num_extra_kv_tokens):
             logger.warning("KVCacheManagerV2: could not size the guard page")
-            self._remove_kv_cache(_GUARD_PAGE_REQUEST_ID)
+            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
+            kv_cache.close()
+            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            # The dummy create marked this id stats-excluded; free_resources
+            # clears that on the normal teardown, so the bail-outs must too.
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         unfillable_dtype = False
@@ -2088,7 +2098,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 else "no layer resolved it"
             )
             logger.warning(f"KVCacheManagerV2: guard page reserved but {reason}")
-            self._remove_kv_cache(_GUARD_PAGE_REQUEST_ID)
+            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
+            kv_cache.close()
+            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            # The dummy create marked this id stats-excluded; free_resources
+            # clears that on the normal teardown, so the bail-outs must too.
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Warning, not info: this is the only proof a run has that the switch
