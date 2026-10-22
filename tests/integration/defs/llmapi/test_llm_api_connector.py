@@ -1161,13 +1161,14 @@ def test_capacity_only_connector_accepts_multigroup_retention(
 def _disagg_transceiver_config(use_kv_cache_manager_v2):
     """Keep the explicit V2-manager route and exercise defaults for V1.
 
-    Both managers can use the Python transceiver. Normal model loading
-    resolves the V1 case's DEFAULT/auto configuration before creation.
+    V1 uses the C++ transceiver. V2 uses the Python transceiver with NIXL.
+    Select each runtime explicitly so the default Python runtime does not
+    change the V1 test's manager/runtime pairing.
     """
     if use_kv_cache_manager_v2:
         return CacheTransceiverConfig(backend="NIXL",
                                       transceiver_runtime="PYTHON")
-    return CacheTransceiverConfig(backend="DEFAULT")
+    return CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
 
 
 @pytest.mark.threadleak(enabled=False)

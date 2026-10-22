@@ -460,7 +460,7 @@ says only what the engine then does with the pool.
 | `both` | yes | yes | An aggregated server, or a context server in a disaggregated deployment |
 | `producer` | no | yes | A server that fills the pool for others |
 | `consumer` | yes | no | A server that only replays what others stored |
-| `capacity` | no | no | A generation server: it lends memory and moves no KV |
+| `capacity` | no | no | A generation server: it lends memory and needs no GPUDirect RDMA |
 
 `capacity` is the right role for a disaggregated generation server. Generated tokens are rarely a
 reused prefix, and prompt KV reaches decode over the cache transceiver rather than through the
@@ -498,9 +498,48 @@ sliding-window attention, and `sparse_attention_config` with an index-V cache un
 `sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
 multimodal content without hashes, leaving the rest of the deployment served.
 
-### How pages reach the pool
+### GPUDirect RDMA
 
-Every page passes through a pinned host buffer. `stage_through_host` defaults to `true` and is the
-only supported value today, so `false` is ignored with a warning; registering the KV pools with
-Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
-GPUDirect RDMA. A `capacity` server stages nothing, holding no KV in the pool.
+By default the connector registers the KV pools with Mooncake so the NIC reads and writes pages in
+GPU memory directly. A KV cache manager V2 pool is many `cuMemCreate` allocations mapped back to back,
+and no registration may cross two of them, so the connector registers one allocation at a time.
+Which registration path Mooncake then takes is decided by `WITH_NVIDIA_PEERMEM`, and each path has
+its own preconditions:
+
+| `WITH_NVIDIA_PEERMEM` | Mooncake calls | Requires | Typical failure |
+|---|---|---|---|
+| unset or nonzero (default) | `ibv_reg_mr` | the `nvidia_peermem` kernel module, and KV pools allocated with `gpuDirectRDMACapable=1` | `EFAULT` ("Bad address") |
+| `0` | `ibv_reg_dmabuf_mr` | dma-buf support in the driver and NIC stack | `EINVAL` |
+
+Under `ibv_reg_mr`, a missing module and memory without `gpuDirectRDMACapable` both fail with the
+same `EFAULT` as a range crossing two allocations, so the error code alone does not say which. The
+cache manager asks for `gpuDirectRDMACapable` and logs a warning when the platform refuses it and it
+falls back to memory without it; `nvidia_peermem` cannot register such memory, while dma-buf can.
+
+Hosts with the open kernel modules and no `nvidia_peermem`, common on GB200 and GB300, need the
+dma-buf path. When the protocol is `rdma`, `WITH_NVIDIA_PEERMEM` is unset, neither `nvidia_peermem`
+nor the legacy `nv_peer_mem` module is loaded, and every visible device reports dma-buf support, the
+connector sets `WITH_NVIDIA_PEERMEM=0` itself and logs a warning saying so. A value the deployment
+sets is never overridden.
+
+Mooncake reads `WITH_NVIDIA_PEERMEM` once per process, when the first Mooncake client starts, so the
+connector only chooses for that first client. A later client that registers the KV pools over RDMA
+fails at startup when the path Mooncake already read is not the one it needs, for example after a
+TCP client started first on a host without `nvidia_peermem`. In a process that starts more than one
+Mooncake client, export the variable before the first one.
+
+A failed registration fails startup with a report of what the driver says about each range. At
+debug log level (`TLLM_LOG_LEVEL=debug`) the same report is logged before registering.
+
+The pools are registered once, at startup, and stay registered until shutdown. That is only valid
+while the memory behind them stays mapped, which is why `enable_kv_pool_rebalance` is
+[ignored under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector): a rebalance remaps
+pool memory, and every range would have to be unregistered before it is unmapped and registered
+again afterwards.
+
+### Without GPUDirect RDMA
+
+A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, which the connector
+selects on its own where it can. When neither path is available, set `stage_through_host: true` to
+copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
+needs neither, since it registers no pages.

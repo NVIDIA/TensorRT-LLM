@@ -533,7 +533,6 @@ class FinishReasonsHandler:
     def write_finish_reasons(
         self,
         seq_slots_host: torch.Tensor,
-        is_draft_batch: bool,
         seq_slots_cuda: torch.Tensor,
         seq_lens_cuda: torch.Tensor,
         new_tokens_cuda: torch.Tensor,
@@ -551,7 +550,6 @@ class FinishReasonsHandler:
             seq_slots_host: The sequence slots of the processed requests. Used to determine which
             requests need stop word processing on the host.
               Shape: [len(requests)]
-            is_draft_batch: Whether the batch consists of draft requests.
             seq_slots_cuda: The sequence slots of the processed requests. Used for accessing device buffers.
               Shape: [len(requests)]
             seq_lens_cuda: The sequence lengths of the processed requests.
@@ -565,10 +563,7 @@ class FinishReasonsHandler:
               Shape: [max_tokens, max_batch_size, max_beam_width]
         """
         num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only = (
-            self._prepare_stop_word_handling_for_finish_reasons(
-                seq_slots_host,
-                is_draft_batch,
-            )
+            self._prepare_stop_word_handling_for_finish_reasons(seq_slots_host)
         )
         self._write_finish_reasons(
             seq_slots=seq_slots_cuda,
@@ -585,14 +580,12 @@ class FinishReasonsHandler:
     def _prepare_stop_word_handling_for_finish_reasons(
         self,
         seq_slots_host: torch.Tensor,
-        is_draft_batch: bool,
     ) -> tuple[torch.Tensor | int | None, torch.Tensor | None, bool]:
         """Prepare stop word handling for finish reasons.
 
         Args:
             seq_slots_host: The sequence slots of the processed requests. Used for accessing host buffers.
               Shape: [len(requests)]
-            is_draft_batch: Whether the batch consists of draft requests.
         Returns:
             num_accepted_tokens_cuda: The number of accepted draft tokens +1 for each request.
               Shape: [len(requests)] if torch.Tensor
@@ -605,18 +598,6 @@ class FinishReasonsHandler:
         num_accepted_tokens_cuda: torch.Tensor | int | None = None
         stop_word_indices_cuda: torch.Tensor | None = None
         single_token_stop_words_only: bool = False
-
-        # NB: is_draft_batch is a workaround
-        # as draft requests can be in the sampler
-        # without having setup a slot in the FinishReasonsHandler.
-        # These can be removed once this can be avoided.
-        if is_draft_batch:
-            # Do not process stop words for draft requests
-            return (
-                num_accepted_tokens_cuda,
-                stop_word_indices_cuda,
-                single_token_stop_words_only,
-            )
 
         stop_word_mask = store.max_stop_word_lengths_host[seq_slots_host] > 0
         batch_has_stop_words = stop_word_mask.any()

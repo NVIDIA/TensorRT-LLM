@@ -924,8 +924,7 @@ class DFlashWorker(SpecWorkerBase):
         if draft_kv_cache_manager is None:
             # No separate draft KV cache. Attention DP alone does NOT disable
             # it: _util.py skips that bail for an external drafter, which is
-            # what DSpark is, so this drafter does get a manager under DP. The
-            # reachable cases are the two-model paths, which never build one.
+            # what DSpark is, so this drafter does get a manager under DP.
             return None
         layers = [draft_kv_cache_manager.get_buffers(i, kv_layout="HND") for i in range(L)]
         base = layers[0]
