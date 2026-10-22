@@ -2632,7 +2632,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    // TEMPORARY: also keep multi-GPU running for `/bot run --post-merge`. Revert before merge.
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || testFilter[(IS_POST_MERGE)]) {
                         echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
@@ -2648,7 +2649,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
                 // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    // TEMPORARY: also keep multi-GPU running for `/bot run --post-merge`. Revert before merge.
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || testFilter[(IS_POST_MERGE)]) {
                         echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
@@ -2854,7 +2856,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    // TEMPORARY: also keep multi-GPU running for `/bot run --post-merge`. Revert before merge.
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || testFilter[(IS_POST_MERGE)]) {
                         echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
@@ -2870,7 +2873,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
                 // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    // TEMPORARY: also keep multi-GPU running for `/bot run --post-merge`. Revert before merge.
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || testFilter[(IS_POST_MERGE)]) {
                         echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
