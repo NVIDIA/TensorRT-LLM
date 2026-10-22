@@ -30,6 +30,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+from ..q35_env import register as _q35_register
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
@@ -129,6 +130,25 @@ def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
     if position_ids is None:
         return None
     return position_ids[..., :num_tokens]
+
+
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_POSITIONS_HOIST
+    # One contiguous copy of the strided position view up front, instead of
+    # one copy per attention call in the Qwen3.5 fused qk-norm/RoPE prologue.
+    _Q35_POSITIONS_HOIST = os.environ.get("TRTLLM_Q35_POSITIONS_HOIST",
+                                          "0") == "1"
+
+
+def _q35_hoist_positions(
+        position_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """A contiguous copy of a strided position view (the same tensor when it
+    is already contiguous)."""
+    if position_ids is None or position_ids.is_contiguous():
+        return position_ids
+    return position_ids.contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -1867,6 +1887,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        if _Q35_POSITIONS_HOIST and self.spec_worker is not None:
+            position_ids = _q35_hoist_positions(position_ids)
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1895,14 +1917,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_worker is not None:
             # The target logits, in the layout the worker's acceptance reads.
-            logits = self.spec_worker.target_logits(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                self.logits_processor,
-                attn_metadata,
-                spec_metadata,
-                self.draft_model,
-            )
+            logits = self._sharded_target_logits(
+                hidden_states[spec_metadata.gather_ids], spec_metadata)
+            if logits is None:
+                logits = self.spec_worker.target_logits(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    self.logits_processor,
+                    attn_metadata,
+                    spec_metadata,
+                    self.draft_model,
+                )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs
@@ -1918,6 +1943,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
+                    if _Q35_POSITIONS_HOIST:
+                        # The padded batch's slice is strided again.
+                        spec_position_ids = _q35_hoist_positions(
+                            spec_position_ids)
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,
@@ -1936,6 +1965,46 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 return_context_logits,
             )
 
+        return logits
+
+    def _sharded_target_logits(self, hidden_states: torch.Tensor,
+                               spec_metadata) -> Optional[torch.Tensor]:
+        """Vocabulary-sharded target logits for an all-greedy one-model
+        MTP-Eagle batch (TRTLLM_Q35_SHARDED_TARGET_SAMPLING=1), or None for the
+        gathered full-vocabulary logits.
+
+        The sharded logits ([tokens, V / tp] in the LM head dtype) skip the
+        all-gather and the fp32 cast; the worker then takes the global argmax
+        with one local-argmax + LL key exchange launch. Sets
+        ``spec_metadata.sharded_target_logits`` accordingly.
+        """
+        spec_metadata.sharded_target_logits = False
+        if os.environ.get("TRTLLM_Q35_SHARDED_TARGET_SAMPLING", "0") != "1":
+            return None
+        mapping = self.model_config.mapping
+        head = self.lm_head
+        if (not spec_metadata.is_all_greedy_sample
+                or spec_metadata.enable_penalty
+                or not self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                or getattr(self.spec_config,
+                           "use_relaxed_acceptance_for_thinking", False)
+                or mapping.tp_size <= 1 or mapping.enable_attention_dp
+                or getattr(head, "tp_mode", None) != TensorParallelMode.COLUMN
+                or not head.gather_output or head.padding_size != 0
+                or getattr(self.spec_worker, "guided_decoder", None) is not None
+                or getattr(self.spec_worker, "_d2t", None) is not None):
+            return None
+        from ..distributed import ll_exchange
+        exchange = ll_exchange.get_tp_key_exchange(mapping)
+        if exchange is None or not 1 <= hidden_states.shape[
+                0] <= exchange.MAX_ROWS:
+            return None
+        head.gather_output = False
+        try:
+            logits = head(hidden_states)
+        finally:
+            head.gather_output = True
+        spec_metadata.sharded_target_logits = True
         return logits
 
     def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:

@@ -22,6 +22,7 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,6 +38,7 @@ from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
     AsyncWorkerMixin,
     Sampler,
+    SamplerEvent,
     SampleState,
     SampleStateTensors,
     TorchSampler,
@@ -47,6 +49,19 @@ from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
+from .spec_store_scatter import fused_store_enabled, spec_store_scatter
+
+# TRTLLM_Q35_SAMPLER_HOST_RING=1: the fused store's D2H snapshot goes to a ring of
+# pinned buffers allocated once (SpecSampler._q35_host_ring_copy).
+SAMPLER_HOST_RING_ENV = "TRTLLM_Q35_SAMPLER_HOST_RING"
+# TRTLLM_Q35_SAMPLER_ZEROCOPY=1 (with the host ring): the store scatter kernel writes the sampled
+# slots into the ring's pinned buffer itself instead of a D2H snapshot copy. Sound because the host
+# reads only the sampled requests' slots.
+SAMPLER_ZEROCOPY_ENV = "TRTLLM_Q35_SAMPLER_ZEROCOPY"
+# TRTLLM_Q35_SAMPLER_EVENT_RING=1: re-record one of four events per step instead of creating one.
+# A sampler event is synchronized one iteration after its record, long before it comes up again.
+SAMPLER_EVENT_RING_ENV = "TRTLLM_Q35_SAMPLER_EVENT_RING"
+_EVENT_RING = 4
 
 # Rejection messages for the sampling features the one-model speculative path
 # cannot honor. They are module constants because two places raise them: the
@@ -318,13 +333,36 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
+        draft_tokens_size = args.max_total_draft_tokens
+        # With TRTLLM_SPEC_SAMPLER_FUSED_STORE=1 the three host-read store
+        # tensors are int32 views of one buffer that a single D2H copy
+        # snapshots, and one kernel writes the four store tensors (see
+        # spec_store_scatter).
+        self._store_flat = None
+        self._device_slots: dict[tuple[int, ...], torch.Tensor] = {}
+        if fused_store_enabled():
+            new_numel = self.max_accepted_path_len * seq_slots * self.max_beam_width
+            draft_numel = seq_slots * draft_tokens_size
+            self._store_flat = int_tensor((new_numel + seq_slots + draft_numel,))
+            self._store_views = (new_numel, new_numel + seq_slots)
+            new_tokens = self._store_flat[:new_numel].view(
+                self.max_accepted_path_len, seq_slots, self.max_beam_width
+            )
+            new_tokens_lens = self._store_flat[new_numel : new_numel + seq_slots]
+            next_draft_tokens = self._store_flat[new_numel + seq_slots :].view(
+                seq_slots, draft_tokens_size
+            )
+        else:
+            new_tokens = int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width))
+            new_tokens_lens = int_tensor((seq_slots,))
+            next_draft_tokens = int_tensor((seq_slots, draft_tokens_size))
         self.store = self.Store(
-            new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
+            new_tokens=new_tokens,
             next_new_tokens=int_tensor(
                 (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
             ),
-            next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
-            new_tokens_lens=int_tensor((seq_slots,)),
+            next_draft_tokens=next_draft_tokens,
+            new_tokens_lens=new_tokens_lens,
         )
 
     def _request_common_handling(
@@ -410,14 +448,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
-    def _scatter_to_stores(
-        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
-    ) -> None:
-        """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
-        num_sampling_requests = len(slots)
-        slots_device = torch.as_tensor(slots, dtype=torch.long)
-        slots_device = slots_device.to(device="cuda", non_blocking=True)
+    def _store_rows(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, num_sampling_requests: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Rows ``num_skip`` onward of the forward's outputs, padded or cut to the store widths.
 
+        Returns ``(new_tokens, next_new_tokens, new_tokens_lens, next_draft_tokens)``.
+        """
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
         o_next_draft_tokens = outputs["next_draft_tokens"][
@@ -449,12 +486,117 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
+        return o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
+
+    def _scatter_to_stores(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
+    ) -> None:
+        """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
+        slots_device = torch.as_tensor(slots, dtype=torch.long)
+        slots_device = slots_device.to(device="cuda", non_blocking=True)
+        o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens = self._store_rows(
+            outputs, num_skip, len(slots)
+        )
 
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)
         self.store.new_tokens_lens.index_copy_(0, slots_device, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots_device, o_next_draft_tokens)
+
+    def _fused_scatter_to_stores(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
+    ) -> Optional[torch.Tensor]:
+        """``_scatter_to_stores`` as one launch into the fused store.
+
+        Returns the pinned host snapshot the kernel also wrote (zero-copy), or
+        None when the caller must copy the store to the host.
+        """
+        slot_ids = tuple(slots)
+        slots_device = self._device_slots.get(slot_ids)
+        if slots_device is None:
+            slots_device = torch.as_tensor(slot_ids, dtype=torch.long)
+            slots_device = slots_device.to(device="cuda", non_blocking=True)
+            # Read-only index tensors, reused while a batch keeps its slots.
+            if len(self._device_slots) >= 64:
+                self._device_slots.clear()
+            self._device_slots[slot_ids] = slots_device
+
+        host_flat = host_out = None
+        if self._q35_zero_copy_enabled():
+            host_flat = self._q35_host_ring_next(self._store_flat)
+            lens_start, draft_start = self._store_views
+            host_out = (
+                host_flat[:lens_start].view(self.store.new_tokens.shape).squeeze(-1),
+                host_flat[lens_start:draft_start],
+                host_flat[draft_start:].view(self.store.next_draft_tokens.shape),
+            )
+        o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens = self._store_rows(
+            outputs, num_skip, len(slots)
+        )
+        spec_store_scatter(
+            slots_device,
+            o_new_tokens,
+            o_next_new_tokens,
+            o_new_tokens_lens,
+            o_next_draft_tokens,
+            self.store.new_tokens.squeeze(-1),
+            self.store.next_new_tokens.squeeze(-1),
+            self.store.new_tokens_lens,
+            self.store.next_draft_tokens,
+            host_out=host_out,
+        )
+        return host_flat
+
+    def _q35_host_ring_next(self, src: torch.Tensor) -> torch.Tensor:
+        """The next pinned ring buffer shaped like ``src`` (see _q35_host_ring_copy), not filled."""
+        ring = getattr(self, "_q35_host_ring", None)
+        if ring is None or ring[0].shape != src.shape or ring[0].dtype != src.dtype:
+            ring = self._q35_host_ring = [
+                torch.empty_like(src, device="cpu", pin_memory=prefer_pinned()) for _ in range(3)
+            ]
+            self._q35_host_ring_pos = 0
+        dst = ring[self._q35_host_ring_pos]
+        self._q35_host_ring_pos = (self._q35_host_ring_pos + 1) % len(ring)
+        return dst
+
+    def _record_sampler_event(
+        self, side_stream_event: Optional[torch.cuda.Event] = None
+    ) -> SamplerEvent:
+        if os.environ.get(SAMPLER_EVENT_RING_ENV, "0") != "1" or self._async_worker_active():
+            return super()._record_sampler_event(side_stream_event)
+        ring = getattr(self, "_q35_event_ring", None)
+        if ring is None:
+            ring = self._q35_event_ring = [torch.cuda.Event() for _ in range(_EVENT_RING)]
+            self._q35_event_pos = 0
+        event = ring[self._q35_event_pos]
+        self._q35_event_pos = (self._q35_event_pos + 1) % len(ring)
+        event.record()
+        return SamplerEvent(cuda_event=event, side_stream_event=side_stream_event)
+
+    def _q35_zero_copy_enabled(self) -> bool:
+        return (
+            os.environ.get(SAMPLER_ZEROCOPY_ENV, "0") == "1"
+            and os.environ.get(SAMPLER_HOST_RING_ENV, "0") == "1"
+            and prefer_pinned()
+            and not self._async_worker_active()
+        )
+
+    def _q35_host_ring_copy(self, src: torch.Tensor) -> torch.Tensor:
+        """D2H snapshot of the fused store.
+
+        With TRTLLM_Q35_SAMPLER_HOST_RING=1 (and no async worker) the snapshot
+        lands in a ring of three pinned buffers allocated once instead of a
+        fresh pinned allocation per step. A slot is rewritten three steps after
+        it was filled; its host values are read only by update_requests of its
+        own step, which the overlap loop runs (after syncing on that step's
+        sampler event) in the very next iteration.
+        """
+        if os.environ.get(SAMPLER_HOST_RING_ENV, "0") != "1" or self._async_worker_active():
+            return self._copy_to_host(src)
+        dst = self._q35_host_ring_next(src)
+        dst.copy_(src, non_blocking=True)
+        return dst
 
     def sample_async(
         self,
@@ -544,7 +686,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
         scattered = False
-        if self._store_scatter is not None:
+        host_flat = None
+        store_flat = getattr(self, "_store_flat", None)
+        if store_flat is not None:
+            host_flat = self._fused_scatter_to_stores(outputs, num_skip, slots)
+            scattered = True
+        elif self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
             self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
             scattered = self._store_scatter.scatter(
@@ -567,7 +714,22 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        if self._async_worker_active():
+        if store_flat is not None:
+            # The fused store is copied to the host in one snapshot on this
+            # stream, or was written there by the scatter itself (zero-copy).
+            if host_flat is None:
+                host_flat = self._q35_host_ring_copy(store_flat)
+            lens_start, draft_start = self._store_views
+            host_tensors = SampleStateTensorsSpec(
+                new_tokens=host_flat[:lens_start].view(self.store.new_tokens.shape),
+                new_tokens_lens=host_flat[lens_start:draft_start],
+                next_draft_tokens=host_flat[draft_start:].view(self.store.next_draft_tokens.shape),
+                verify_lens=(
+                    self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+                ),
+            )
+            sampler_event = self._record_sampler_event()
+        elif self._async_worker_active():
             host_tensors = SampleStateTensorsSpec(
                 new_tokens=self._copy_to_host(self.store.new_tokens),
                 new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
