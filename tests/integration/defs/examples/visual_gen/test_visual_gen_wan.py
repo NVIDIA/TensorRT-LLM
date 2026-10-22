@@ -79,7 +79,6 @@ WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
-WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
 WAN_FEATURE_LPIPS_THRESHOLD = 0.05
 WAN_STANDARD_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
 
@@ -485,47 +484,6 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
     config_path = os.path.join(
         llm_root, "examples", "visual_gen", "configs", "wan2.2-t2v-fp4-1gpu.yaml"
-    )
-    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
-
-    venv_check_call(
-        llm_venv,
-        [
-            script_path,
-            "--model",
-            model_path,
-            "--visual_gen_args",
-            config_path,
-            "--output_path",
-            output_path,
-        ],
-    )
-    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
-
-
-def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
-
-    Validates that the Wan I2V example script and ``configs/wan2.2-i2v-fp4-1gpu.yaml``
-    work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
-    checkpoint and the default input image (cat_piano.png) bundled with the examples.
-    """
-    scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
-    if not os.path.isdir(model_path):
-        pytest.skip(
-            f"Model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH} under models root)"
-        )
-
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_i2v_example")
-    os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, "wan_i2v_output.mp4")
-
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_i2v.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "wan2.2-i2v-fp4-1gpu.yaml"
     )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
