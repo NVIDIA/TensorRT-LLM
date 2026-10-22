@@ -76,6 +76,17 @@ _RUNTIME_MEMORY_TYPES = tuple(
     if memory_type not in (ExecutorMemoryType.INIT_KV_CACHE,
                            ExecutorMemoryType.INIT_EXTRA_RESOURCES))
 
+_PROCESS_RANK_INFO_AUTH_KEY = secrets.token_bytes(32)
+
+
+def _resolve_rank_info_auth_key(internal_request_auth_key: Optional[str],
+                                rank_info_auth_key: Optional[bytes]) -> bytes:
+    if rank_info_auth_key is not None:
+        return rank_info_auth_key
+    if internal_request_auth_key is not None:
+        return internal_request_auth_key.encode("utf-8")
+    return _PROCESS_RANK_INFO_AUTH_KEY
+
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
@@ -96,17 +107,6 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
             f"{self.__class__.__name__} is designed to be instantiated using {self.__class__.__name__}._from_generation_result by GenerationExecutor. "
             f"Users are not expected to create {self.__class__.__name__} directly."
         )
-_PROCESS_RANK_INFO_AUTH_KEY = secrets.token_bytes(32)
-
-
-def _resolve_rank_info_auth_key(
-    internal_request_auth_key: Optional[str], rank_info_auth_key: Optional[bytes]
-) -> bytes:
-    if rank_info_auth_key is not None:
-        return rank_info_auth_key
-    if internal_request_auth_key is not None:
-        return internal_request_auth_key.encode("utf-8")
-    return _PROCESS_RANK_INFO_AUTH_KEY
 
     @classmethod
     def _from_generation_result(
@@ -1869,8 +1869,7 @@ class _TorchLLM(BaseLLM):
         internal_request_auth_key = validate_internal_request_auth_key(
             kwargs.pop("internal_request_auth_key", None))
         rank_info_auth_key = _resolve_rank_info_auth_key(
-            internal_request_auth_key, kwargs.pop("_rank_info_auth_key", None)
-        )
+            internal_request_auth_key, kwargs.pop("_rank_info_auth_key", None))
         self._usage_lifecycle_active = False
         self._usage_lifecycle_lock = threading.Lock()
         telemetry_config = kwargs.get("telemetry_config")
