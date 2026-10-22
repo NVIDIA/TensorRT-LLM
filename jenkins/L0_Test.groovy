@@ -1170,7 +1170,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
-                slurmSubmitCommand = SlurmConfig.withGpuBudget(partition.clusterName, slurmSubmitCommand, gpuCount)
+                slurmSubmitCommand = SlurmConfig.withGpuBudget(pipeline, partition.clusterName, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -2402,7 +2402,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         # multi-line sbatch output in every traced command.
                         { set +x; } 2>/dev/null
                         sbatch_rc=0
-                        sbatch_output=\$(${SlurmConfig.withGpuBudget(partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
+                        sbatch_output=\$(${SlurmConfig.withGpuBudget(pipeline, partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
                         printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
                         { set -x; } 2>/dev/null
                         if [ "\${sbatch_rc}" -eq 0 ]; then
