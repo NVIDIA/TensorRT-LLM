@@ -198,15 +198,19 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
         manager.shutdown()
 
 
-def _k3_mla_test_config(gate: bool) -> KimiLinearConfig:
+def _k3_mla_test_config(gate: bool, num_mla_layers: int = 1) -> KimiLinearConfig:
     config = KimiLinearConfig(
         vocab_size=128,
         hidden_size=256,
         intermediate_size=256,
-        num_hidden_layers=1,
+        num_hidden_layers=num_mla_layers,
         attn_res_block_size=1,
         torch_dtype=torch.bfloat16,
-        linear_attn_config={"kda_layers": [], "full_attn_layers": [1], "num_heads": 32},
+        linear_attn_config={
+            "kda_layers": [],
+            "full_attn_layers": list(range(1, num_mla_layers + 1)),
+            "num_heads": 32,
+        },
         num_attention_heads=32,
         num_key_value_heads=32,
         q_lora_rank=1536,
@@ -230,11 +234,47 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     ).item()
 
 
-def _k3_mla_nvfp4_kv_errors(gate: bool, fp8: bool) -> tuple[float, float]:
-    """Run one K3 MLA layer on an NVFP4 KV cache; return (context, generation) errors."""
+def _load_mla_checkpoint_every_layer(
+    model: KimiLinearForCausalLM, projections: dict[str, torch.Tensor], num_layers: int
+) -> None:
+    """Load the same synthetic MLA projections into every layer, zeros elsewhere."""
+    name_map, _, _ = model.checkpoint_name_plan("")
+    config = model.model_config.pretrained_config
+    params = dict(model.named_parameters())
+    weights = {}
+    for name, key in name_map.items():
+        param = params[name]
+        if name.endswith("gate_up_proj.weight"):
+            for source in ("gate_proj", "up_proj"):
+                weights[key.replace("gate_up_proj", source)] = torch.zeros(
+                    config.intermediate_size, config.hidden_size, dtype=param.dtype
+                )
+        else:
+            shape = param.shape
+            if name == "lm_head.weight":
+                shape = (config.vocab_size, config.hidden_size)
+            elif name.endswith(".mlp.down_proj.weight"):
+                shape = (config.hidden_size, config.intermediate_size)
+            weights[key] = torch.zeros(shape, dtype=param.dtype)
+    for layer_idx in range(num_layers):
+        weights.update(
+            {
+                f"model.layers.{layer_idx}.self_attn.{name}": value
+                for name, value in projections.items()
+            }
+        )
+    model.load_weights(weights)
+
+
+def _k3_mla_nvfp4_kv_errors(gate: bool, fp8: bool, num_mla_layers: int = 1) -> tuple[float, float]:
+    """Run K3 MLA layer 0 on an NVFP4-KV cache manager; return (context, generation) errors.
+
+    With ``num_mla_layers`` > 1 the cache manager holds every MLA layer, so an
+    FP8-fallback selection can put layer 0 in the FP8 pool of the FP4 MLA cache.
+    """
     torch.manual_seed(42)
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
-    config = _k3_mla_test_config(gate)
+    config = _k3_mla_test_config(gate, num_mla_layers)
     reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
     weights = _checkpoint_weights(reference, fp8)
     projection_algo = QuantAlgo.FP8_BLOCK_SCALES if fp8 else None
@@ -261,7 +301,10 @@ def _k3_mla_nvfp4_kv_errors(gate: bool, fp8: bool) -> tuple[float, float]:
     projections.update(
         {name: value for name, value in reference.named_parameters() if value.ndim == 1}
     )
-    load_mla_checkpoint(model, projections, "")
+    if num_mla_layers == 1:
+        load_mla_checkpoint(model, projections, "")
+    else:
+        _load_mla_checkpoint_every_layer(model, projections, num_mla_layers)
     runtime = model.model.layers[0].self_attn
     expected_absorption_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
     assert runtime.mixer.k_b_proj_trans.dtype == expected_absorption_dtype
@@ -292,7 +335,7 @@ def _k3_mla_nvfp4_kv_errors(gate: bool, fp8: bool) -> tuple[float, float]:
             max_tokens=max_tokens, dtype="nvfp4", enable_block_reuse=False, host_cache_size=0
         ),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
-        num_layers=1,
+        num_layers=num_mla_layers,
         num_kv_heads=1,
         head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
         tokens_per_block=page,
@@ -390,3 +433,28 @@ def test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface(
     # not add materially to the NVFP4 quantization error of the BF16 layer.
     assert bf16_generation < 0.2, errors
     assert fp8_generation < bf16_generation + 0.02, errors
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (10, 7)
+    or not _cutedsl_backend_available(),
+    reason="FP4 MLA requires Rubin SM107 and the CuTe DSL runtime",
+)
+def test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An FP8-fallback MLA layer runs context and generation on the FP4 MLA cache.
+
+    The FP4 MLA cache publishes NVFP4-shaped pool pointers for every pool, so
+    the FP8 layer's attention and RoPE ops must read its pool from them.
+    """
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "0")
+    context_error, generation_error = _k3_mla_nvfp4_kv_errors(
+        gate=False, fp8=True, num_mla_layers=2
+    )
+    errors = f"relative L2: context {context_error:.4f}, generation {generation_error:.4f}"
+    # FP8 KV keeps generation well inside the NVFP4 no-dequant decode error
+    # (about 0.15 on this fixture), so the bound also shows the layer ran on FP8.
+    assert context_error < 0.1, errors
+    assert generation_error < 0.1, errors
