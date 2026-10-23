@@ -25,6 +25,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
 )
+from tensorrt_llm._torch.models.multimodal import SupportsMultimodal, is_multimodal_model
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -34,6 +35,58 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+
+
+@pytest.mark.cpu_only
+def test_model_contract_detection_does_not_evaluate_encoder_properties() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    # The default embedding properties raise: capability detection must not read them.
+    assert is_multimodal_model(model)
+    text_model = torch.nn.Module()
+    text_model.supports_encoder_cache = True
+    assert not is_multimodal_model(text_model)
+
+
+@pytest.mark.cpu_only
+def test_model_contract_defaults_do_not_enable_optional_features() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    assert not model.supports_encoder_cache
+    assert not model.supports_mm_encoder_item_scheduling
+    assert model.supported_encoder_attention_backends == {}
+    assert not model.support_mm_disagg
+    assert not model.supports_vision_gpu_normalize
+
+
+@pytest.mark.cpu_only
+def test_model_contract_cache_preserves_existing_implementation_hook() -> None:
+    model = MultimodalModelMixin()
+    model.model_config = ModelConfig(multimodal_config=MultimodalConfig())
+    contract: SupportsMultimodal = model
+    with patch.object(
+        model,
+        "_initialize_multimodal_encoder_cache",
+        wraps=model._initialize_multimodal_encoder_cache,
+    ) as initialize:
+        cache = contract.initialize_multimodal_encoder_cache(1024)
+    initialize.assert_called_once_with(1024)
+    assert contract.multimodal_encoder_cache is cache
+    assert model._multimodal_encoder_cache is cache
+    assert contract.initialize_multimodal_encoder_cache(1024) is cache
+
+
+@pytest.mark.cpu_only
+def test_mixin_defines_every_model_contract_member() -> None:
+    # CI type checking does not compare the mixin with the Protocol, so compare the names.
+    members = set(SupportsMultimodal.__annotations__) | {
+        name for name in vars(SupportsMultimodal) if not name.startswith("_")
+    }
+    missing = [
+        name
+        for name in sorted(members)
+        if not hasattr(MultimodalModelMixin, name)
+        and name not in MultimodalModelMixin.__annotations__
+    ]
+    assert not missing
 
 
 def make_embedding(
