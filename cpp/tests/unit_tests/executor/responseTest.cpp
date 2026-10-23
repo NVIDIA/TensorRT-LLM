@@ -61,8 +61,7 @@ TEST(ResponseTest, responseWithResult)
     auto cumLogProbs = VecLogProbs{1.};
     auto logProbs = std::vector<VecLogProbs>{{1.}};
     auto finishReasons = std::vector<FinishReason>{FinishReason::kEND_ID};
-    auto result = Result{
-        true, {{1}}, cumLogProbs, logProbs, std::nullopt, std::nullopt, std::nullopt, std::nullopt, finishReasons};
+    auto result = Result{true, {{1}}, cumLogProbs, logProbs, finishReasons};
     auto response = Response(requestId, result);
     EXPECT_EQ(response.getRequestId(), requestId);
     auto resp_result = response.getResult();
