@@ -463,6 +463,7 @@ class Endpoint:
         workers: int = 1,
         rows_per_batch: int | None = 64,
         bytes_per_batch: int | None = 128 << 20,
+        max_queued_batches: int = 256,
         on_wake: Callable[[], None] | None = None,
         others: Sequence[CpuRegion] = (),
     ) -> None:
@@ -479,6 +480,7 @@ class Endpoint:
             workers=workers,
             rows_per_batch=rows_per_batch,
             bytes_per_batch=bytes_per_batch,
+            max_queued_batches=max_queued_batches,
         )
         before = set(threading.enumerate())
         self.backend = BlobBackend(self.binding, self.wake, config)

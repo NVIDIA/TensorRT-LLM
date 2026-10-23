@@ -123,19 +123,28 @@ class BlobConfig:
             backend's own; a call always carries at least one row, however large its slot. A call
             holds its submission's slots until it returns, or for good when it can never prove its
             access ended (``BlobBackend.batch_size``).
+        max_queued_batches: Most batches waiting for a worker, over every attempt. A submission is
+            refused (``SubmissionRejected``) while that many are queued, so a holder that submits
+            faster than the store drains meets back-pressure instead of an unbounded backlog. A
+            submission accepted below the limit may push the count past it, so no view is too
+            large to submit; the batches of a stopped attempt leave the queues at once.
     """
 
     key_prefix: str = "trtllm-kv"
     workers: int = 1
     rows_per_batch: int | None = None
     bytes_per_batch: int | None = None
+    max_queued_batches: int = 256
 
     def __post_init__(self) -> None:
         if not isinstance(self.key_prefix, str):
             raise ValueError(f"key_prefix must be a str, got {self.key_prefix!r}")
         key_stem(self.key_prefix)
-        if not _is_count(self.workers):
-            raise ValueError(f"workers must be an int of at least 1, got {self.workers!r}")
+        for name in ("workers", "max_queued_batches"):
+            if not _is_count(getattr(self, name)):
+                raise ValueError(
+                    f"{name} must be an int of at least 1, got {getattr(self, name)!r}"
+                )
         for name in ("rows_per_batch", "bytes_per_batch"):
             value = getattr(self, name)
             if value is not None and not _is_count(value):
@@ -377,6 +386,7 @@ class _Batch:
     results_recorded: bool = False  # set once, under the backend's lock
     access_recorded: bool = False  # set once, under the backend's lock
     unprovable: bool = False  # the driver can never prove its access ended
+    cancel_forwarded: bool = False  # the driver's cancel was called for op; at most once
 
     def __len__(self) -> int:
         return self.stop - self.start
@@ -396,8 +406,9 @@ class BlobAttempt:
 
     Three counters track its batches:
 
-    - ``_queued_batches``: still in a queue. A stop zeroes it at once; the queue keeps the
-      batches and ``BlobBackend._take`` drops them when it reaches them.
+    - ``_queued_batches``: still in a queue. A stop zeroes it at once and takes the batches out
+      of the queues (``BlobBackend._drop_queued``), so nothing of a stopped attempt is left for a
+      worker.
     - ``_results_pending``: started, row results not recorded yet.
     - ``_access_open``: started, access end not recorded yet. An unprovable batch never leaves it.
 
@@ -428,6 +439,7 @@ class BlobAttempt:
         self._fault: str | None = None  # the first fault; _record_results says when it stops
         # Set by a cancel, a stopping fault, a driver protocol violation or a shutdown.
         self._stopped = False
+        self._cancel_requested = False  # set by a cancel only; forwarded to started batches
         self._outcome: Outcome | None = None
         self._quiesced = False
 
@@ -438,10 +450,12 @@ class BlobAttempt:
         return self._quiesced
 
     def cancel(self) -> None:
-        """Stops dispatching the attempt's queued batches; started ones run on.
+        """Stops dispatching the attempt's queued batches and, when the driver declares
+        ``cancel``, forwards the cancel once to every started batch without a result yet, a
+        batch whose handle arrives later included. Started batches otherwise run on.
 
-        Never forwarded to the driver, even one that declares ``cancel``: the contract's cancel is
-        advisory.
+        Advisory either way: a cancel is no access-end evidence, and the attempt quiesces only
+        once every started batch proved its access ended.
         """
         self._backend._cancel(self)
 
@@ -531,6 +545,7 @@ class BlobBackend:
         driver_capabilities = self._driver.capabilities
         self._max_rows_per_op = driver_capabilities.max_rows_per_op
         self._driver_reads_hints = driver_capabilities.hints
+        self._driver_cancels = driver_capabilities.cancel
         self._capabilities = Capabilities(
             fetch=driver_capabilities.get, publish=driver_capabilities.put, cancel=True
         )
@@ -609,6 +624,7 @@ class BlobBackend:
             return {
                 "attempts_active": len(self._attempts),
                 "batches_queued": sum(a._queued_batches for a in self._attempts),
+                "batches_in_queues": len(self._fetch_queue) + len(self._publish_queue),
                 "batches_access_open": sum(a._access_open for a in self._attempts),
                 "batches_unprovable": self._unprovable_batches,
                 "oldest_driver_call_ms": int(
@@ -637,6 +653,12 @@ class BlobBackend:
             if self._protocol_violation is not None:
                 raise SubmissionRejected(
                     f"the store driver broke its protocol: {self._protocol_violation}"
+                )
+            queued = sum(a._queued_batches for a in self._attempts)
+            if queued >= self._config.max_queued_batches:
+                raise SubmissionRejected(
+                    f"{queued} batches are waiting for a worker (max_queued_batches="
+                    f"{self._config.max_queued_batches})"
                 )
             self._attempts.add(attempt)
             attempt._queued_batches = len(batches)
@@ -702,10 +724,51 @@ class BlobBackend:
         with self._lock:
             if attempt._outcome is not None:
                 return
+            attempt._cancel_requested = True
             attempt._stop()
+            self._drop_queued(attempt)
+            # Started batches whose handle is back and whose result is not: the driver may still
+            # spare their rows. They sit in _driver_call_started until their worker finishes the
+            # call, then in _watched; a batch whose handle is not back yet gets its cancel when it
+            # lands.
+            started = [
+                batch.op
+                for batch in itertools.chain(self._watched, self._driver_call_started)
+                if batch.attempt is attempt and self._take_cancel(batch)
+            ]
             wake_due = self._conclude_or_quiesce(attempt)
+        for op in started:
+            self._forward_cancel(op)
         if wake_due:
             self._call_wake()
+
+    def _take_cancel(self, batch: _Batch) -> bool:
+        """Under the lock: whether this call forwards the cancel for ``batch``, once per batch and
+        only to a driver that declares cancel, for a batch with a handle and no result yet."""
+        if not self._driver_cancels or batch.op is None:
+            return False
+        if batch.results_recorded or batch.cancel_forwarded:
+            return False
+        batch.cancel_forwarded = True
+        return True
+
+    def _forward_cancel(self, op: OpHandle) -> None:
+        try:
+            self._driver.cancel(op)
+        except Exception as error:  # noqa: BLE001 - advisory: a failed cancel changes nothing
+            logger.warning_once(
+                f"blob backend: cancelling a store operation raised {error!r}",
+                key=(self._name, "cancel", type(error)),
+            )
+
+    def _drop_queued(self, attempt: BlobAttempt) -> None:
+        """Under the lock: takes a stopped attempt's batches out of the queues, so submitting and
+        cancelling over and over cannot pile up entries the workers would only skip."""
+        for queue in (self._fetch_queue, self._publish_queue):
+            if any(batch.attempt is attempt for batch in queue):
+                kept = [batch for batch in queue if batch.attempt is not attempt]
+                queue.clear()
+                queue.extend(kept)
 
     # Workers: up to ``config.workers`` driver calls at once, each on a thread of its own.
 
@@ -728,8 +791,7 @@ class BlobBackend:
                     self._work_ready.wait()
                     continue
                 attempt = batch.attempt
-                if attempt._stopped:  # its queued count was cleared when it stopped
-                    continue
+                # A stopped attempt has no batch left here: the stop dropped them under this lock.
                 if not attempt.is_fetch:
                     self._publishes_running += 1
                 # Counts only the fetches a waiting publish let go first.
@@ -761,7 +823,7 @@ class BlobBackend:
             self._finish(batch, _refused(batch, f"refused: {error}"))
             return
         try:
-            batch.op = self._call_driver(batch.attempt, row_ios)
+            op = self._call_driver(batch.attempt, row_ios)
         except DriverRejected as error:  # certifies that nothing escaped
             self._finish(batch, _refused(batch, f"refused: {error}"))
             return
@@ -778,6 +840,13 @@ class BlobBackend:
                 ),
             )
             return
+        with self._lock:
+            # The handle lands under the lock, so a cancel from now on finds it in
+            # _driver_call_started; a cancel that came while the call was out is forwarded here.
+            batch.op = op
+            forward = batch.attempt._cancel_requested and self._take_cancel(batch)
+        if forward:
+            self._forward_cancel(op)
         self._finish(batch, self._observe(batch))
 
     def _call_driver(self, attempt: BlobAttempt, row_ios: list[RowIO]) -> OpHandle:
@@ -844,7 +913,10 @@ class BlobBackend:
             batch.results_recorded = True
             attempt._results_pending -= 1
             whole_call_failed = observed.whole_call_fault is not None
+            stopped_before = attempt._stopped
             attempt._record_results(batch, observed.results, whole_call_failed=whole_call_failed)
+            if attempt._stopped and not stopped_before:  # a stopping fault: its queue goes too
+                self._drop_queued(attempt)
         # An unprovable batch is held for good, whatever the driver says of it later: its attempt
         # never quiesces, which is what lets a shutdown answer before its budget runs out.
         if observed.ended and not batch.access_recorded and not batch.unprovable:
@@ -882,6 +954,7 @@ class BlobBackend:
             if attempt._queued_batches:
                 attempt._fault = attempt._fault or fault
                 attempt._stop()
+                self._drop_queued(attempt)
                 changed = self._conclude_or_quiesce(attempt) or changed
         return changed
 
@@ -976,6 +1049,8 @@ class BlobBackend:
             for attempt in forced:
                 attempt._force_outcome(SHUTDOWN_FAULT)
                 self._conclude_or_quiesce(attempt)
+            self._fetch_queue.clear()  # every attempt is stopped: nothing queued will run
+            self._publish_queue.clear()
             self._work_ready.notify_all()
             self._poke_progress()
         return bool(forced)

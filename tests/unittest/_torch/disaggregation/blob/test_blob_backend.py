@@ -195,6 +195,8 @@ def test_blob_config_refuses_bad_values() -> None:
     for workers in (None, 0, True):
         with pytest.raises(ValueError, match="workers must be an int of at least 1"):
             BlobConfig(workers=workers)
+    with pytest.raises(ValueError, match="max_queued_batches must be an int of at least 1"):
+        BlobConfig(max_queued_batches=0)
     with pytest.raises(TypeError, match="rows_per_bach"):
         BlobConfig(rows_per_bach=1)
 
@@ -464,7 +466,8 @@ def test_cancel_racing_completion_gives_one_outcome_and_never_reaches_the_driver
     store: MemoryStore, first: str
 ) -> None:
     published(store, {"A": b"aaaaaaaa"})
-    driver = MemoryDriver(store, controlled=True)
+    no_cancel = replace(DEFAULT_CAPABILITIES, cancel=False)
+    driver = MemoryDriver(store, controlled=True, capabilities=no_cancel)
     reader = Endpoint(driver, ["A"])
     attempt = reader.backend.fetch(reader.view("A"), None)
     op = reader.op("A")
@@ -487,7 +490,7 @@ def test_cancel_racing_completion_gives_one_outcome_and_never_reaches_the_driver
     assert attempt.poll() is outcome
     assert masks(outcome) == [[True]] and outcome.fault is None
     assert 1 <= reader.wake.count <= 2  # the outcome and the quiescing, together or apart
-    assert reader.driver.calls_to("cancel") == []  # advisory: never forwarded
+    assert reader.driver.calls_to("cancel") == []  # no cancel declared: nothing to forward
     reader.close()
 
 
@@ -1279,3 +1282,208 @@ def test_a_busy_region_keeps_the_whole_batch_registered(store: MemoryStore) -> N
     endpoint.wait_quiesced(attempt)
     endpoint.close()
     assert driver.live_batches() == []
+
+
+# Hints.
+
+
+@pytest.mark.parametrize("case", ["driver_reads_no_hints", "publish"])
+def test_a_hint_is_refused_before_the_driver_unless_a_fetch_can_use_it(
+    store: MemoryStore, case: str
+) -> None:
+    reads = replace(DEFAULT_CAPABILITIES, hints=case == "publish")
+    endpoint = Endpoint(MemoryDriver(store, capabilities=reads), ["A"])
+    submit = endpoint.backend.publish if case == "publish" else endpoint.backend.fetch
+    with pytest.raises(InvalidSubmission, match="hint|destination"):
+        submit(endpoint.view("A"), "peer-0")
+    assert store_calls(endpoint) == [] and endpoint.backend.stats()["attempts_active"] == 0
+    endpoint.close()
+
+
+def test_a_fetch_hint_reaches_every_batch_and_a_fetch_without_one_stays_hint_free(
+    store: MemoryStore,
+) -> None:
+    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    driver = MemoryDriver(store, capabilities=replace(DEFAULT_CAPABILITIES, hints=True))
+    reader = Endpoint(driver, ["A", "B", "C"], rows_per_batch=1)
+    hint = ("peer-0", 3)
+    attempt = reader.backend.fetch(reader.view("A", "B", "C"), hint)
+    assert masks(reader.wait_outcome(attempt)) == [[True, True, True]]
+    reader.wait_quiesced(attempt)
+    assert len(driver.hints_seen) == 3 and all(seen is hint for seen in driver.hints_seen)
+    plain = reader.backend.fetch(reader.view("A"), None)
+    assert masks(reader.wait_outcome(plain)) == [[True]]
+    reader.wait_quiesced(plain)
+    assert len(driver.hints_seen) == 3  # the hint-free fetch carried none
+    reader.close()
+
+
+# Cancel forwarding.
+
+
+def test_cancel_is_forwarded_once_to_each_started_batch_without_a_result(
+    store: MemoryStore,
+) -> None:
+    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    driver = MemoryDriver(store, controlled=True)
+    reader = Endpoint(driver, ["A", "B", "C"], rows_per_batch=1)
+    attempt = reader.backend.fetch(reader.view("A", "B", "C"), None)
+    ops = [reader.op(name) for name in "ABC"]  # three handles back, no result yet
+    driver.complete(ops[0])
+    driver.end_access(ops[0])
+    wait_until(lambda: reader.backend.stats()["batches_access_open"] == 2, "A to be recorded")
+    attempt.cancel()
+    # B's cancel goes from this thread; C's may go from its worker, whose call was still out.
+    reader.driver.wait_for(lambda: len(reader.driver.calls_to("cancel")) == 2, "two cancels")
+    forwarded = [call.op for call in reader.driver.calls_to("cancel")]
+    assert all(any(op is seen for seen in forwarded) for op in ops[1:])  # not A: it is in
+    outcome = reader.wait_outcome(attempt)  # the driver's cancel concludes B and C CANCELLED
+    reader.wait_quiesced(attempt)
+    assert masks(outcome) == [[True, False, False]] and outcome.fault is None
+    attempt.cancel()  # after the outcome: nothing more to forward
+    assert len(reader.driver.calls_to("cancel")) == 2
+    reader.close()
+
+
+def test_a_cancel_that_arrives_while_the_call_is_out_is_forwarded_when_the_handle_returns(
+    store: MemoryStore,
+) -> None:
+    published(store, {"A": b"aaaaaaaa"})
+    driver = MemoryDriver(store, controlled=True)
+    reader = Endpoint(driver, ["A"])
+    gate = reader.driver.hold("get")
+    attempt = reader.backend.fetch(reader.view("A"), None)
+    reader.driver.wait_for(lambda: bool(reader.driver.calls_to("get")), "the get call")
+    attempt.cancel()  # the worker is inside the call: no handle to cancel yet
+    assert reader.driver.calls_to("cancel") == [] and attempt.poll() is None
+    gate.set()
+    op = reader.op("A")
+    reader.driver.wait_for(lambda: len(reader.driver.calls_to("cancel", op)) == 1, "the cancel")
+    outcome = reader.wait_outcome(attempt)
+    reader.wait_quiesced(attempt)
+    assert masks(outcome) == [[False]] and outcome.fault is None
+    assert len(reader.driver.calls_to("cancel")) == 1
+    reader.close()
+
+
+@pytest.mark.parametrize("driver_kind", ["declares_no_cancel", "ignores_the_cancel"])
+def test_cancel_forwarding_follows_the_capability_and_is_no_access_end_evidence(
+    store: MemoryStore, driver_kind: str
+) -> None:
+    published(store, {"A": b"aaaaaaaa"})
+    ignores = driver_kind == "ignores_the_cancel"
+    driver = MemoryDriver(
+        store, controlled=True, capabilities=replace(DEFAULT_CAPABILITIES, cancel=ignores)
+    )
+    driver.set_cancel_effective(False)
+    reader = Endpoint(driver, ["A"])
+    attempt = reader.backend.fetch(reader.view("A"), None)
+    op = reader.op("A")
+    attempt.cancel()
+    if ignores:  # forwarded from this thread, or from the worker if its call was still out
+        reader.driver.wait_for(lambda: bool(reader.driver.calls_to("cancel", op)), "the cancel")
+    assert attempt.poll() is None and not attempt.quiesced()  # the row is still the store's
+    driver.complete(op)
+    driver.end_access(op)
+    outcome = reader.wait_outcome(attempt)
+    reader.wait_quiesced(attempt)
+    assert masks(outcome) == [[True]] and outcome.fault is None
+    assert len(reader.driver.calls_to("cancel", op)) == (1 if ignores else 0)
+    reader.close()
+
+
+def test_a_cancel_during_the_handoff_between_the_call_and_its_observation_is_forwarded(
+    store: MemoryStore,
+) -> None:
+    """The handle is back and the batch is not watched yet: the worker is about to observe it."""
+    published(store, {"A": b"aaaaaaaa"})
+    driver = MemoryDriver(store, controlled=True)
+    reader = Endpoint(driver, ["A"])
+    gate = reader.driver.hold("poll")  # pauses the worker right after the handle came back
+    attempt = reader.backend.fetch(reader.view("A"), None)
+    reader.driver.wait_for(lambda: bool(reader.driver.calls_to("poll")), "the worker's poll")
+    op = reader.op("A")
+    attempt.cancel()
+    assert len(reader.driver.calls_to("cancel", op)) == 1  # forwarded from this thread, at once
+    gate.set()
+    outcome = reader.wait_outcome(attempt)
+    reader.wait_quiesced(attempt)
+    assert masks(outcome) == [[False]] and outcome.fault is None
+    assert len(reader.driver.calls_to("cancel")) == 1
+    reader.close()
+
+
+# The queue bound.
+
+
+def test_submissions_are_refused_while_the_queue_is_full_and_cancelled_work_leaves_it() -> None:
+    store = KeyGatedStore(gets=True, keys=[store_key("A")])
+    published(store, {name: name.encode() * SLOT_BYTES for name in "ABCDEF"})
+    endpoint = Endpoint(
+        MemoryDriver(store), list("ABCDEF"), workers=1, rows_per_batch=1, max_queued_batches=2
+    )
+    first = endpoint.backend.fetch(endpoint.view("A"), None)
+    try:
+        store.wait_for_waiting(1)  # the only worker is inside the store with A
+        queued = endpoint.backend.fetch(endpoint.view("B", "C"), None)  # fills the queue
+        assert endpoint.backend.stats()["batches_queued"] == 2
+        with pytest.raises(SubmissionRejected, match="max_queued_batches"):
+            endpoint.backend.fetch(endpoint.view("D"), None)
+        assert endpoint.backend.stats()["attempts_active"] == 2
+        assert store_calls(endpoint) == ["get"]
+        queued.cancel()  # its batches leave the count at once; the worker is still blocked
+        assert endpoint.backend.stats()["batches_queued"] == 0
+        assert endpoint.backend.stats()["batches_in_queues"] == 0  # and the queues themselves
+        later = endpoint.backend.fetch(endpoint.view("D", "E"), None)
+        with pytest.raises(SubmissionRejected):
+            endpoint.backend.fetch(endpoint.view("F"), None)
+    finally:
+        store.gate.set()
+    for attempt in (first, queued, later):
+        endpoint.wait_outcome(attempt)
+        endpoint.wait_quiesced(attempt)
+    assert masks(queued.poll()) == [[False, False]] and queued.poll().fault is None
+    assert masks(later.poll()) == [[True, True]] and endpoint.read("E") == b"EEEEEEEE"
+    endpoint.close()
+
+
+def test_repeated_submit_and_cancel_leaves_nothing_in_the_queues() -> None:
+    store = KeyGatedStore(gets=True, keys=[store_key("A")])
+    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    endpoint = Endpoint(
+        MemoryDriver(store), ["A", "B", "C"], workers=1, rows_per_batch=1, max_queued_batches=2
+    )
+    first = endpoint.backend.fetch(endpoint.view("A"), None)
+    try:
+        store.wait_for_waiting(1)  # the only worker is inside the store with A for the duration
+        for _ in range(50):
+            endpoint.backend.fetch(endpoint.view("B", "C"), None).cancel()
+        assert endpoint.backend.stats()["batches_in_queues"] == 0
+        last = endpoint.backend.fetch(endpoint.view("B", "C"), None)
+        assert endpoint.backend.stats()["batches_in_queues"] == 2
+    finally:
+        store.gate.set()
+    for attempt in (first, last):
+        endpoint.wait_outcome(attempt)
+        endpoint.wait_quiesced(attempt)
+    assert masks(last.poll()) == [[True, True]]
+    endpoint.close()
+
+
+def test_the_first_fault_drops_the_attempts_queued_batches() -> None:
+    store = KeyGatedStore(gets=True, keys=[store_key("A")])
+    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    store.corrupt(store_key("A"), 3)
+    reader = Endpoint(MemoryDriver(store), ["A", "B", "C"], rows_per_batch=1)
+    attempt = reader.backend.fetch(reader.view("A", "B", "C"), None)
+    try:
+        store.wait_for_waiting(1)  # the worker is inside the store with A; B and C wait
+        assert reader.backend.stats()["batches_in_queues"] == 2
+    finally:
+        store.gate.set()
+    outcome = reader.wait_outcome(attempt)
+    reader.wait_quiesced(attempt)
+    assert "checksum" in outcome.fault and masks(outcome) == [[False, False, False]]
+    assert reader.backend.stats()["batches_in_queues"] == 0
+    assert store_calls(reader) == ["get"]  # B and C never reached the driver
+    reader.close()
