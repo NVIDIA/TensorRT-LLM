@@ -38,9 +38,9 @@ AUTOTUNER_BENIGN_TEXTS = [
     "out of memory",
 ]
 ENDPOINT_RETRY_MARKER = "is not ready, with exception:"
-PIP_READ_TIMEOUT_RETRY = re.compile(
+PIP_TIMEOUT_RETRY = re.compile(
     r"\s*WARNING: Retrying \(Retry\([^)]*\)\) after connection broken by "
-    r"'ReadTimeoutError\(.*\)': \S+\s*"
+    r"'(?:Read|Connect)TimeoutError\(.*\)': \S+\s*"
 )
 
 
@@ -50,7 +50,7 @@ def is_benign_line(line: str) -> bool:
         return True
     # pip has scheduled another download attempt. Terminal exceptions and
     # warning lines containing another error keyword must still fail the scan.
-    if PIP_READ_TIMEOUT_RETRY.fullmatch(line):
+    if PIP_TIMEOUT_RETRY.fullmatch(line):
         return not any(keyword in line for keyword in ERROR_KEYWORDS if keyword != "TimeoutError")
     return AUTOTUNER_MARKER in line and any(text in line for text in AUTOTUNER_BENIGN_TEXTS)
 

@@ -159,8 +159,21 @@ PIP_READ_TIMEOUT_RETRY = (
 )
 
 
-def test_pip_download_retry_does_not_fail_the_server_log_scan(tmp_path: Path) -> None:
-    log = _server_log(tmp_path, PIP_READ_TIMEOUT_RETRY + "Application startup complete.\n")
+PIP_CONNECT_TIMEOUT_RETRY = (
+    "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) "
+    "after connection broken by 'ConnectTimeoutError(<pip._vendor.urllib3.connection."
+    "HTTPSConnection object at 0x7f3a2c1d5e50>, 'Connection to pypi.nvidia.com timed out. "
+    "(connect timeout=15)')': /nvidia-cuda-cupti/\n"
+)
+
+
+@pytest.mark.parametrize(
+    "retry",
+    [PIP_READ_TIMEOUT_RETRY, PIP_CONNECT_TIMEOUT_RETRY],
+    ids=["read-timeout", "connect-timeout"],
+)
+def test_pip_download_retry_does_not_fail_the_server_log_scan(tmp_path: Path, retry: str) -> None:
+    log = _server_log(tmp_path, retry + "Application startup complete.\n")
     assert check_error(log) == []
 
 
