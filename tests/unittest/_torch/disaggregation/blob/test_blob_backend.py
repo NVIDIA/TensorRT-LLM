@@ -31,12 +31,14 @@ from cpu_fixtures import (
     KeyGatedStore,
     RollbackFailsDriver,
     Rows,
+    TogetherDriverSpy,
     commit_object,
     masks,
     object_key,
     store_key,
     wait_until,
 )
+from together_driver import TogetherDriver
 
 from tensorrt_llm._torch.disaggregation.base.backend import (
     Capabilities,
@@ -1189,3 +1191,91 @@ def test_rows_in_a_region_the_backend_did_not_register_are_rejected(store: Memor
         reader.backend.batch_size(1)
     assert store_calls(reader) == []
     reader.close()
+
+
+# Regions registered together.
+
+
+def registration_calls(endpoint: Endpoint) -> list[str]:
+    calls = [call.method for call in endpoint.driver.calls]
+    return [method for method in calls if method.startswith(("register", "unregister"))]
+
+
+def test_a_together_driver_gets_every_region_in_one_batch_and_gives_them_back_in_one(
+    store: MemoryStore,
+) -> None:
+    driver = TogetherDriver(store)
+    others = [CpuRegion(SLOT_BYTES, 0), CpuRegion(SLOT_BYTES, 2)]
+    endpoint = Endpoint(driver, ["A", "B"], others=others)
+    assert registration_calls(endpoint) == ["register_regions"]
+    assert endpoint.binding.live_labels() == frozenset({"region:0", "region:2"})
+    (batch,) = driver.live_batches()
+    addresses = [registration.span.address for registration in batch.registrations]
+    assert addresses == [endpoint.region.address, others[1].address]  # in region order
+    published(store, {"A": b"aaaaaaaa"})
+    outcome = endpoint.wait_outcome(endpoint.backend.fetch(endpoint.view("A", "B"), None))
+    assert masks(outcome) == [[True, False]] and endpoint.read("A") == b"aaaaaaaa"
+    endpoint.close()
+    assert registration_calls(endpoint) == ["register_regions", "unregister_regions"]
+    assert driver.live_batches() == [] and driver.live_registrations() == []
+
+
+@pytest.mark.parametrize(
+    "failure", ["rejected", "nothing_registered", "revocable", "revocation_fails", "no_handle"]
+)
+def test_a_failed_batch_registration_releases_the_hold_only_once_nothing_is_registered(
+    failure: str,
+) -> None:
+    regions = (CpuRegion(SLOT_BYTES, 2), CpuRegion(SLOT_BYTES, 2))
+    driver = TogetherDriver(MemoryStore())
+    spy = TogetherDriverSpy(driver)
+    if failure == "rejected":
+        spy.fail("register_regions", DriverRejected("no memlock"))
+    elif failure == "no_handle":
+        spy.fail("register_regions", RuntimeError("the client crashed"))
+    else:
+        driver.fail_next_register_regions("no memlock", escaped=failure != "nothing_registered")
+        if failure == "revocation_fails":
+            driver.fail_next_unregister_regions("device busy")
+    hold = FakeHold()
+    binding = RegionBinding(regions, spy, hold)
+    with pytest.raises(RuntimeError) as raised:
+        binding.register()
+    revocations = len(spy.calls_to("unregister_regions"))
+    if failure in ("rejected", "nothing_registered", "revocable"):
+        assert isinstance(raised.value, ConstructionRejected)
+        assert hold.released and driver.live_registrations() == []
+        assert binding.live_labels() == frozenset()
+        assert revocations == (1 if failure == "revocable" else 0)
+        return
+    # Something may be registered: the regions keep their owner and the hold stays.
+    assert not isinstance(raised.value, ConstructionRejected)
+    assert not hold.released
+    assert binding.live_labels() == frozenset({"region:0", "region:1"})
+    with pytest.raises(RuntimeError, match="region:0"):
+        binding.release_hold()
+    if failure == "revocation_fails":  # a handle: a later revocation succeeds and frees the hold
+        assert revocations == 1 and driver.live_registrations()
+        assert binding.unregister() and driver.live_registrations() == []
+        binding.release_hold()
+        assert hold.released
+    else:  # nothing to revoke by: the hold is kept for good
+        assert revocations == 0 and not binding.unregister()
+        assert not hold.released
+
+
+def test_a_busy_region_keeps_the_whole_batch_registered(store: MemoryStore) -> None:
+    driver = TogetherDriver(store, controlled=True)
+    endpoint = Endpoint(driver, ["A"], others=[CpuRegion(SLOT_BYTES, 1)])
+    endpoint.write("A", b"aaaaaaaa")
+    attempt = endpoint.backend.publish(endpoint.view("A"), None)
+    op = endpoint.op("A")
+    assert not endpoint.binding.unregister()  # refused by the driver: the put may still read A
+    assert endpoint.binding.live_labels() == frozenset({"region:0", "region:1"})
+    assert driver.live_batches()
+    driver.transfer(op)
+    driver.publish_results(op)
+    driver.end_access(op)
+    endpoint.wait_quiesced(attempt)
+    endpoint.close()
+    assert driver.live_batches() == []

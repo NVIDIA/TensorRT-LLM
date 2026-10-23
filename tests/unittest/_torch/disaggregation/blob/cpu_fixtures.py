@@ -33,6 +33,8 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     OpHandle,
     RegionHandle,
     RegionLayout,
+    RegionSpec,
+    RegistersRegionsTogether,
     RegistrationError,
     RowIO,
     RowResult,
@@ -421,6 +423,25 @@ class DriverSpy:
             raise failure[0]
 
 
+class TogetherDriverSpy(DriverSpy):
+    """A ``DriverSpy`` over a driver that registers regions together. The spy implements the
+    protocol too, so a binding over it takes the batch path; ``hold`` and ``fail`` work on
+    ``register_regions`` and ``unregister_regions`` as on any other method."""
+
+    def __init__(self, inner: StoreDriver) -> None:
+        assert isinstance(inner, RegistersRegionsTogether)
+        super().__init__(inner)
+        self.together = inner
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> RegionHandle:
+        self._enter("register_regions")
+        return self.together.register_regions(specs)
+
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        self._enter("unregister_regions")
+        self.together.unregister_regions(handle)
+
+
 class Endpoint:
     """One side of a transfer: host slots in one registered region, a driver, a backend, waits.
 
@@ -447,7 +468,8 @@ class Endpoint:
     ) -> None:
         self.names = list(names)
         self.region = CpuRegion(slot_bytes, len(self.names), fill)
-        self.driver = DriverSpy(driver)
+        spy = TogetherDriverSpy if isinstance(driver, RegistersRegionsTogether) else DriverSpy
+        self.driver = spy(driver)
         self.hold = FakeHold()
         self.binding = RegionBinding((self.region, *others), self.driver, self.hold)
         self.binding.register()

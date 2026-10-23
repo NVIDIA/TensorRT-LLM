@@ -53,6 +53,8 @@ from .store import (
     OpHandle,
     RegionHandle,
     RegionLayout,
+    RegionSpec,
+    RegistersRegionsTogether,
     RegistrationError,
     RowIO,
     RowResult,
@@ -165,6 +167,10 @@ class RegionBinding:
     every registration is confirmed revoked, on the manager's thread. The driver is never called
     under the binding's lock, so reading the live registrations never waits on a revocation.
 
+    A driver that implements ``RegistersRegionsTogether`` gets every region in one
+    ``register_regions`` call and gives them back in one ``unregister_regions``. The regions count
+    as live, and the hold stays, from before that call until the batch is confirmed revoked.
+
     Args:
         regions: The lender's regions, in its order; region ``i`` is labelled ``region:<i>``.
         driver: The store driver that registers them.
@@ -176,6 +182,7 @@ class RegionBinding:
     ) -> None:
         self.regions = tuple(regions)
         self.driver = driver
+        self._together = driver if isinstance(driver, RegistersRegionsTogether) else None
         device_memory = driver.capabilities.device_memory
         # The regions register() registers, by index: those with slots in memory the driver can
         # access. A row in any other region is one the backend does not recognize.
@@ -191,17 +198,23 @@ class RegionBinding:
         self._live: dict[int, RegionHandle | None] = {}
 
     def register(self) -> None:
-        """Registers the regions in ``served_regions``.
+        """Registers the regions in ``served_regions``: one ``register`` per region, or one
+        ``register_regions`` for all of them when the driver registers regions together.
 
         Raises:
             ConstructionRejected: Nothing is registered and the hold is released: there is no region
-                to register, or a registration failed with nothing escaping and the earlier ones
-                were revoked.
-            RuntimeError: A registration may be live; the hold is kept.
+                to register, or a registration failed with nothing escaping and whatever was
+                registered before it was revoked.
+            RuntimeError: A registration may be live; the hold is kept. ``live_labels`` names the
+                regions, ``unregister`` may be called again to revoke them, and ``release_hold``
+                gives the hold back once none is left.
         """
         if not self.served_regions:  # a backend that could serve no row
             self._hold.release()
             raise ConstructionRejected("no region has slots in memory the store driver can access")
+        if self._together is not None:
+            self._register_together(self._together)
+            return
         for index in sorted(self.served_regions):
             region = self.regions[index]
             layout = RegionLayout(
@@ -216,6 +229,8 @@ class RegionBinding:
     def unregister(self) -> bool:
         """Revokes every live registration it can. True when none is left; a revocation that failed
         stays live for the next call."""
+        if self._together is not None:
+            return self._unregister_together(self._together)
         with self._lock:
             revocable = [(i, handle) for i, handle in self._live.items() if handle is not None]
         for index, handle in revocable:
@@ -268,6 +283,78 @@ class RegionBinding:
     def _keep(self, index: int, handle: RegionHandle | None) -> None:
         with self._lock:
             self._live[index] = handle
+
+    # The batch path, for a driver that registers regions together.
+
+    def _register_together(self, driver: RegistersRegionsTogether) -> None:
+        indices = sorted(self.served_regions)
+        try:
+            specs = [self._spec(index) for index in indices]
+        except ValueError as error:  # a region the boundary cannot describe; the store not asked
+            self._hold.release()
+            raise ConstructionRejected(f"bad region geometry: {error}") from error
+        owned: dict[int, RegionHandle | None] = dict.fromkeys(indices)
+        with self._lock:  # every region has an owner before the store is asked
+            self._live = owned
+        try:
+            handle = driver.register_regions(specs)
+        except Exception as error:
+            self._raise_for_failed_batch(error)
+        self._keep_all(handle)
+
+    def _unregister_together(self, driver: RegistersRegionsTogether) -> bool:
+        with self._lock:
+            handles: list[RegionHandle] = []
+            for handle in self._live.values():
+                if handle is not None and not any(handle is seen for seen in handles):
+                    handles.append(handle)
+        for handle in handles:  # the one batch handle every region shares
+            try:
+                driver.unregister_regions(handle)
+            except Exception as error:
+                logger.warning_once(
+                    f"blob backend: revoking the regions together failed, will retry: {error!r}",
+                    key=(self._name, "unregister_regions"),
+                )
+                continue
+            with self._lock:
+                self._live = {i: h for i, h in self._live.items() if h is not handle}
+        with self._lock:
+            return not self._live
+
+    def _raise_for_failed_batch(self, error: Exception) -> NoReturn:
+        handle = error.handle if isinstance(error, RegistrationError) else None
+        nothing_escaped = isinstance(error, DriverRejected) or (
+            isinstance(error, RegistrationError) and handle is None
+        )
+        if nothing_escaped:
+            with self._lock:
+                self._live.clear()
+            self._hold.release()
+            raise ConstructionRejected(
+                f"registering the regions together failed: {error}"
+            ) from error
+        if handle is None:  # some may be registered, with nothing to revoke them by
+            raise RuntimeError(f"the regions may be registered after {error!r}") from error
+        self._keep_all(handle)
+        if not self.unregister():
+            raise RuntimeError(
+                f"registering the regions together failed and some may stay registered: {error}"
+            ) from error
+        self._hold.release()
+        raise ConstructionRejected(f"registering the regions together failed: {error}") from error
+
+    def _spec(self, index: int) -> RegionSpec:
+        region = self.regions[index]
+        layout = RegionLayout(
+            region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
+        )
+        return RegionSpec(region.address, region.nbytes, layout)
+
+    def _keep_all(self, handle: RegionHandle) -> None:
+        with self._lock:
+            for index in self._live:
+                self._live[index] = handle
 
 
 class _GroupRows(NamedTuple):
