@@ -178,6 +178,22 @@ def test_pip_download_retry_does_not_fail_the_server_log_scan(tmp_path: Path, re
 
 
 @pytest.mark.parametrize(
+    "retry",
+    [PIP_READ_TIMEOUT_RETRY, PIP_CONNECT_TIMEOUT_RETRY],
+    ids=["read-timeout", "connect-timeout"],
+)
+def test_pip_download_retry_does_not_fail_the_readiness_wait(tmp_path: Path, retry: str) -> None:
+    log = _server_log(tmp_path, retry)
+    with pytest.raises(RuntimeError) as exc_info:
+        # The log is scanned on every poll, so a retry warning taken for an
+        # error would end the wait early instead of at its timeout.
+        wait_for_endpoint_ready(DEAD_URL, timeout=2, check_files=[log], check_interval=0.0)
+    msg = str(exc_info.value)
+    assert "did not become ready within" in msg
+    assert "Found error in server file" not in msg
+
+
+@pytest.mark.parametrize(
     "failure",
     [
         "pip._vendor.urllib3.exceptions.ReadTimeoutError: download retries exhausted\n",
