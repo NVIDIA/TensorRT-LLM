@@ -2282,13 +2282,14 @@
         },
         "kv_cache_dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'int8', 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'int8' requires the legacy TRTLLM decode path and is rejected on devices using TRTLLM-Gen decode kernels. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
               "float16",
               "bfloat16",
               "float32",
+              "int8",
               "fp8",
               "fp8_ds_mla",
               "nvfp4"
@@ -4387,13 +4388,14 @@
         },
         "dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'int8', 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'int8' requires the legacy TRTLLM decode path and is rejected on devices using TRTLLM-Gen decode kernels. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
               "float16",
               "bfloat16",
               "float32",
+              "int8",
               "fp8",
               "fp8_ds_mla",
               "nvfp4"
@@ -5682,7 +5684,7 @@
         },
         "role": {
           "default": "both",
-          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without moving any KV, so they pin no staging buffers and pay no per-request cost.",
+          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without registering any KV cache, so it needs no GPUDirect RDMA.",
           "enum": [
             "both",
             "producer",
@@ -5722,8 +5724,8 @@
           "title": "Segment Size"
         },
         "stage_through_host": {
-          "default": true,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. The only transfer path supported today, so 'false' is ignored with a warning. Costs a copy each way and needs no GPUDirect RDMA.",
+          "default": false,
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
           "telemetry": {
             "exclude": true
           },
@@ -8583,13 +8585,14 @@
     },
     "kv_cache_dtype": {
       "default": "auto",
-      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'int8', 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'int8' requires the legacy TRTLLM decode path and is rejected on devices using TRTLLM-Gen decode kernels. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
       "telemetry": {
         "allowed_values": [
           "auto",
           "float16",
           "bfloat16",
           "float32",
+          "int8",
           "fp8",
           "fp8_ds_mla",
           "nvfp4"

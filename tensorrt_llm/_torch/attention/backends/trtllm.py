@@ -60,6 +60,28 @@ from .utils import log_attention_failure_context
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
 
+def _validate_int8_kv_scale_values(orig_quant: torch.Tensor,
+                                   quant_orig: torch.Tensor) -> None:
+    """Validate positive finite reciprocal float32 scales, including graph replay.
+
+    Both inputs must be scalar tensors on the current CUDA device. Eager calls
+    raise ValueError before attention runs. Captured calls record a device-side
+    assertion so replay checks the live buffers without host synchronization.
+    """
+    scales = torch.stack((orig_quant.reshape(()), quant_orig.reshape(())))
+    error = "INT8 KV cache requires finite, positive, reciprocal KV scales."
+    if not torch.cuda.is_current_stream_capturing():
+        scale, inverse = scales.tolist()
+        if not (math.isfinite(scale) and math.isfinite(inverse) and scale > 0
+                and inverse > 0
+                and math.isclose(scale * inverse, 1.0, rel_tol=1e-5)):
+            raise ValueError(error)
+        return
+    valid = (torch.isfinite(scales).all() & (scales > 0).all()
+             & ((scales[0] * scales[1] - 1.0).abs() <= 1e-5))
+    torch._assert_async(valid, error)
+
+
 def _resolve_skip_correction_threshold(threshold: float,
                                        sm_version: int,
                                        *,
@@ -1783,8 +1805,31 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and self.sparse_params is None)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        self._int8_kv_validation_key: Optional[tuple] = None
+        self._int8_kv_validation_scales: tuple[Optional[torch.Tensor],
+                                               Optional[torch.Tensor]] = (None,
+                                                                          None)
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = int(self.quant_config.layer_quant_mode)
+        self.has_int8_kv_cache = self.quant_config.layer_quant_mode.has_int8_kv_cache(
+        )
+        if (self.has_int8_kv_cache
+                and self.quant_config.layer_quant_mode.has_any_quant(
+                    exclude_kv_cache=True)):
+            raise ValueError(
+                "INT8 KV cache currently requires unquantized FP16/BF16 projections."
+            )
+        if self.has_int8_kv_cache and (self.is_mla_enable
+                                       or self.sparse_params is not None):
+            raise ValueError(
+                "INT8 KV cache does not support MLA or sparse attention.")
+
+        if self.has_int8_kv_cache:
+            sm = get_sm_version()
+            if self.is_sm_version_trtllm_gen_kernel(sm):
+                raise ValueError(
+                    f"INT8 KV cache is not supported by TRTLLM-Gen decode kernels on SM{sm}. "
+                    "Use FP8 KV cache with FP8-calibrated scales instead.")
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
@@ -2194,6 +2239,65 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
 
+    def _validate_int8_kv_cache_inputs(
+        self,
+        q: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        """Reuse invariant checks until inputs or versioned scale buffers change."""
+        orig_quant = forward_args.kv_scale_orig_quant
+        quant_orig = forward_args.kv_scale_quant_orig
+        use_cache = (metadata.kv_cache_params is not None
+                     and metadata.kv_cache_params.use_cache)
+        key = None
+        if (orig_quant is not None and quant_orig is not None
+                and not orig_quant.is_inference()
+                and not quant_orig.is_inference()):
+            key = (q.dtype, q.device, use_cache, metadata.is_cross,
+                   metadata.enable_helix, orig_quant.dtype, orig_quant.device,
+                   orig_quant.numel(), orig_quant.data_ptr(),
+                   orig_quant._version, quant_orig.dtype, quant_orig.device,
+                   quant_orig.numel(), quant_orig.data_ptr(),
+                   quant_orig._version)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if (key is None or key != self._int8_kv_validation_key
+                or orig_quant is not self._int8_kv_validation_scales[0]
+                or quant_orig is not self._int8_kv_validation_scales[1]):
+            if q.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "INT8 KV cache requires FP16 or BF16 attention inputs.")
+            if not use_cache:
+                raise ValueError("INT8 KV cache requires an active KV cache.")
+            if metadata.is_cross or metadata.enable_helix:
+                raise ValueError(
+                    "INT8 KV cache does not support cross-attention or context parallelism."
+                )
+            for scale in (orig_quant, quant_orig):
+                if (scale is None or scale.dtype != torch.float32
+                        or scale.device != q.device or scale.numel() != 1):
+                    raise ValueError(
+                        "INT8 KV cache requires scalar float32 KV scales "
+                        "on the attention input device.")
+            if not capturing:
+                _validate_int8_kv_scale_values(orig_quant, quant_orig)
+                self._int8_kv_validation_key = key
+                self._int8_kv_validation_scales = (orig_quant, quant_orig)
+        if capturing:
+            # Replay can update buffers without advancing host version counters.
+            # Every captured invocation must check the live scale values.
+            self._int8_kv_validation_key = None
+            _validate_int8_kv_scale_values(orig_quant, quant_orig)
+
+        # Context prefixes and paged-context selection vary with each batch.
+        if metadata.use_paged_context_fmha or (
+                metadata.num_contexts > 0
+                and any(n > 0 for n in metadata.kv_cache_params.
+                        num_cached_tokens_per_seq[:metadata.num_contexts])):
+            raise ValueError(
+                "INT8 KV cache does not support paged context attention or cached prefill."
+            )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -2209,6 +2313,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
+        if self.has_int8_kv_cache:
+            self._validate_int8_kv_cache_inputs(q, metadata, forward_args)
         token_major_view = (metadata.token_major_gen_view()
                             if forward_args.attention_input_type
                             == AttentionInputType.generation_only else None)
