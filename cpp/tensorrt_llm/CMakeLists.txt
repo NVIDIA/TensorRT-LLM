@@ -339,15 +339,32 @@ endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
-target_link_libraries(
-  ${SHARED_TARGET}
-  PRIVATE
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed,tllm_runtime_topology>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+foreach(
+  component
+  tllm_common_error
+  tllm_common_logging
+  tllm_common_cuda
+  tllm_executor_types
+  tllm_executor_serialization
+  tllm_runtime_memory
+  tllm_runtime_buffers
+  tllm_runtime_distributed
+  tllm_runtime_topology
+  tllm_common_environment
+  tllm_executor_values
+  tllm_executor_transfer_agent
+  tllm_kv_cache_host_memory
+  tllm_kv_cache
+  tllm_kv_cache_legacy
+  tllm_batch_scheduler
+  tllm_kernel_kv_cache_copy
+  ${BATCH_MANAGER_TARGET}
+  ${EXECUTOR_TARGET}
+  fp8_blockscale_gemm_src
+  ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  target_link_libraries(${SHARED_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
+endforeach()
 
 foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
   target_link_libraries(${SHARED_TARGET}
