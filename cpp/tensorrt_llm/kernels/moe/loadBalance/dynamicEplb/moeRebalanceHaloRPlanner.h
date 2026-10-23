@@ -19,8 +19,9 @@
 //
 // The planner runs as one warp with one lane per EP rank. Every rank computes the same plan from the same global
 // routed-token histogram. Each overloaded rank offers its hottest home experts; on every step the planner moves rows of
-// one expert from its owner to the eligible rank with the most room below the balanced target load, and records which
-// helper slot of that rank receives the expert.
+// one expert from its owner to the lowest-indexed eligible rank with room for them, and records which helper slot of
+// that rank receives the expert. A step moves at most the largest room below the balanced target load among the
+// eligible ranks other than the owner.
 //
 // The planner is written against a warp policy so that the same text runs on the GPU (one warp of the scheduler
 // kernel) and in host unit tests (32 threads in lockstep). A policy provides static functions lane(), sync(),
@@ -162,6 +163,13 @@ TLLM_HALO_R_HOST_DEVICE inline bool validPlannerConfig(PlannerConfig const& cfg)
 TLLM_HALO_R_HOST_DEVICE inline int helperIndex(unsigned lowMask, unsigned highMask, int rank)
 {
     return static_cast<int>((((highMask >> rank) & 1U) << 1) | ((lowMask >> rank) & 1U));
+}
+
+//! Resident slot of `expert` on its owner, where a route goes when it is not rebalanced.
+TLLM_HALO_R_HOST_DEVICE inline int homeSlot(int expert, int homeExperts, int localSlots)
+{
+    int const owner = expert / homeExperts;
+    return owner * localSlots + expert - owner * homeExperts;
 }
 
 //! Physical slot of a selected route of `expert` that the route prefix assigned to `destination`: the owner's home

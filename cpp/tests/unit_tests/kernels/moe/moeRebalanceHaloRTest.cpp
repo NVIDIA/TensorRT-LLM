@@ -342,6 +342,23 @@ TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
     EXPECT_EQ(halo_r::helperIndex(1U << 5, 1U << 5, 5), 3);
 }
 
+TEST(MoeRebalanceHaloRSlotTest, TimeoutFallbackUsesTheOwnerResidentSlot)
+{
+    int const ep = 4;
+    int const home = 4;
+    int const localSlots = home + 2;
+    // A scheduler worker that times out routes every expert to the slot its owner keeps when nothing is rebalanced.
+    EXPECT_EQ(halo_r::homeSlot(0, home, localSlots), 0);
+    EXPECT_EQ(halo_r::homeSlot(9, home, localSlots), 2 * localSlots + 1);
+    EXPECT_EQ(halo_r::homeSlot(ep * home - 1, home, localSlots), (ep - 1) * localSlots + home - 1);
+    for (int expert = 0; expert < ep * home; ++expert)
+    {
+        int const owner = expert / home;
+        EXPECT_EQ(halo_r::homeSlot(expert, home, localSlots),
+            halo_r::selectedRouteSlot(expert, owner, owner, 0U, 0U, 0U, home, localSlots));
+    }
+}
+
 TEST(MoeRebalanceRelayWorkTest, DestinationsPartitionEverySlice)
 {
     unsigned long long const planeBytes[] = {3 * halo_r::kRelaySliceBytes + 100, 4, halo_r::kRelaySliceBytes};
