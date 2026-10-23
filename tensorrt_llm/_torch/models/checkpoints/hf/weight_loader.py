@@ -25,7 +25,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Callable, List
 
-import psutil
 import safetensors
 import torch
 import tqdm
@@ -307,14 +306,17 @@ class HfWeightLoader(BaseWeightLoader):
         """Determine the minimum available memory observed on the local node
         and distribute it to all local ranks
 
-        Because psutil.virtual_memory().available is just a snapshot in time,
+        Because effective_available_host_memory() is just a snapshot in time,
         it is possible for the local ranks to get different numbers due to
         timing differences. This can lead to disagreement among the local ranks
         as to whether prefetch should be enabled, which causes a deadlock,
         because the ranks that think prefetch is enabled will wait at a local
         mpi barrier indefinitely for the ranks that do not.
+
+        Uses cgroup-aware availability, consistent with rank-striped
+        read-ahead admission.
         """
-        available_host_memory = psutil.virtual_memory().available
+        available_host_memory = effective_available_host_memory()
         if ENABLE_MULTI_DEVICE:
             communicator = (local_mpi_comm() if local_communicator is None else
                             local_communicator)
@@ -964,6 +966,13 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files: List[str],
             local_communicator=None,
             allow_prefetch: bool = True) -> ConsumableWeightsDict:
+        """Prefetch checkpoint files to the host page cache when they fit in
+        cgroup-aware available host memory, then load weights in parallel.
+
+        Prefetch is skipped (while normal loading continues) unless the
+        files total less than 90% of ``_get_local_available_host_memory()``
+        and no layer override is set.
+        """
         # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
         # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
         prefetch_size = sum(os.path.getsize(file) for file in weight_files)
@@ -988,7 +997,7 @@ class HfWeightLoader(BaseWeightLoader):
             else:
                 self.prefetch_files(weight_files, local_communicator)
         # Sync all local ranks unconditionally. `enable_prefetch` depends on
-        # `psutil.virtual_memory().available`, a per-rank volatile value, so
+        # `effective_available_host_memory()`, a per-rank volatile value, so
         # different ranks may take different branches; gating the barrier on
         # it would deadlock between ranks that prefetched and ranks that
         # skipped. Ranks that didn't prefetch reach the barrier immediately.
