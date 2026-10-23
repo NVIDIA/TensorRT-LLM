@@ -50,11 +50,13 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from ..checkpoint_layout_bf16__sm_103__tp4.model import (
+    MAX_TOKENS,
     BeamCheckpointLayoutBf16Sm103Tp4,
     LoadError,
     _attr,
     _check_mapping,
     _rec,
+    check_max_tokens,
 )
 from ..moe_dispatch_combine_bf16__sm_103__tp1 import dispatch_combine
 from . import expert as nvfp4_expert
@@ -99,8 +101,9 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
     ``config`` is the checkpoint's config.json (a mapping); ``mapping`` this rank's
     ``tensorrt_llm.mapping.Mapping`` with world size 4, TP4, PP1, MoE TP4/EP1; ``layers`` the
     logical layers to hold (default all 52; the embedding, final norm and head are always
-    held). Construction allocates uninitialized rank-local storage on the current CUDA device
-    and validates the configuration and layout; it reads no checkpoint data.
+    held); ``max_tokens`` the most tokens one call accepts (default ``MAX_TOKENS``).
+    Construction allocates uninitialized rank-local storage on the current CUDA device and
+    validates the configuration and layout; it reads no checkpoint data.
     """
 
     def __init__(
@@ -109,8 +112,11 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         mapping: ParallelMapping,
         layers: Optional[Sequence[int]] = None,
         device: Optional[torch.device] = None,
+        *,
+        max_tokens: int = MAX_TOKENS,
     ):
         nn.Module.__init__(self)
+        self.max_tokens = check_max_tokens(max_tokens)
         self.schedule = check_config(config)
         _check_mapping(mapping)
         device = (

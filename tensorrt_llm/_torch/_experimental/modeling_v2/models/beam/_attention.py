@@ -19,9 +19,9 @@ before the block's post-attention norm::
 A full-attention layer has no position embedding: neither q nor k is rotated, and its
 only position dependence is the per-token query scale above.
 
-One call is one step of one request: a context call (``num_contexts == 1``) appends its
-T new tokens after the ``past`` tokens the cache already holds for the request -- none for
-a fresh context, a reused or earlier-computed prefix otherwise -- and a generation call
+A step of one request: a context call (``num_contexts == 1``) appends its T new tokens
+after the ``past`` tokens the cache already holds for the request -- none for a fresh
+context, a reused or earlier-computed prefix otherwise -- and a generation call
 (``num_contexts == 0``) appends exactly one token. Every position is absolute: the new
 tokens sit at ``past .. past + T - 1``, where ``past + T`` is the request's KV length in
 the metadata, and the positions the block receives must be exactly those. A context call
@@ -29,6 +29,11 @@ over a cached prefix must use paged-context FMHA, the path that reads the prefix
 values from the pool; without it the context kernel would attend to the new rows only.
 The keys and values the op appends are the transformed k (normalized, rotated on a sliding
 layer) and the projected v of the new tokens, written to the request's own pages.
+
+A step of several requests (``check_batch_metadata``) is the native runtime's batch: its
+context requests first, then its generation requests, each with its own ``past``, KV length
+and pages, their new tokens concatenated in that order. Every operation but the attention
+op is per token; the op reads each request's own metadata row.
 
 Logical layer and cache slot. A block's ``layer_idx`` is its depth in the model: it fixes
 the block's semantics (its residual coefficients, its attention and feed-forward kind).
@@ -40,9 +45,9 @@ such as ``get_buffers`` take the logical one and translate it. The slot is resol
 each call's metadata, never stored, and a manager that does not hold the block's logical
 layer is rejected before any kernel runs.
 
-Host synchronization: the position check compares the positions with
-``arange(past, past + T)`` on the device and reads the answer back, once per call. The
-metadata checks read host tensors only.
+Host synchronization: the one-request position check (``check_step``) compares the
+positions with ``arange(past, past + T)`` on the device and reads the answer back, once per
+call. The metadata checks read host tensors only.
 """
 
 from __future__ import annotations
@@ -228,18 +233,45 @@ def check_metadata(
 ) -> int:
     """Raise ValueError unless ``md`` is one prepared step of one request; return ``past``.
 
-    Accepted on a BF16 ``KVCacheManagerV2`` holding logical layer ``layer_idx`` with
+    ``check_batch_metadata`` restricted to a batch of exactly one request: a context step of
+    ``num_tokens`` new tokens after ``past`` cached ones, or a generation step of one token.
+    ``past`` is the absolute position of the step's first new token. Reads host-side state
+    only.
+    """
+    spans = check_batch_metadata(
+        md, num_tokens, layer_idx=layer_idx, num_kv_heads=num_kv_heads, head_dim=head_dim
+    )
+    if len(spans) != 1:
+        raise ValueError(f"one request per call is supported; metadata has {len(spans)}")
+    return spans[0][0]
+
+
+def check_batch_metadata(
+    md: TrtllmAttentionMetadata,
+    num_tokens: int,
+    *,
+    layer_idx: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> list:
+    """Raise ValueError unless ``md`` is one prepared step of its requests; return their spans.
+
+    The native runtime orders a step's ``num_seqs`` requests with its ``num_contexts``
+    context requests first, and their new tokens fill the call's ``num_tokens`` rows in that
+    order. Accepted on a BF16 ``KVCacheManagerV2`` holding logical layer ``layer_idx`` with
     ``num_kv_heads`` kv heads of ``head_dim``, beam width 1, no cross attention or
-    speculative decoding, one sequence whose KV length L fits the manager's
-    ``max_seq_len``, and either
+    speculative decoding, where each request ``i`` with KV length ``L_i`` (at most the
+    manager's ``max_seq_len``) is
 
-    * a context step of ``num_tokens`` new tokens: ``num_contexts == 1``, context length
-      ``num_tokens``, ``past = L - num_tokens >= 0`` tokens already cached, and
-      paged-context FMHA whenever ``past > 0``; or
-    * a generation step: ``num_contexts == 0``, one new token after ``past = L - 1 >= 1``.
+    * a context request of ``n_i >= 1`` new tokens: context length ``n_i``,
+      ``past_i = L_i - n_i >= 0`` tokens already cached, and paged-context FMHA whenever
+      ``past_i > 0``; or
+    * a generation request: one new token after ``past_i = L_i - 1 >= 0`` cached tokens
+      (the native runtime's warmup issues generation steps over a cache that holds only the
+      new token).
 
-    ``past`` is the absolute position of the step's first new token. Reads host-side
-    state only.
+    Returns ``[(past_i, n_i), ...]`` in row order: request ``i``'s new tokens sit at the
+    absolute positions ``past_i .. past_i + n_i - 1``. Reads host-side state only.
     """
     if not isinstance(md, TrtllmAttentionMetadata):
         raise ValueError(f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}")
@@ -248,50 +280,60 @@ def check_metadata(
         raise ValueError("attn_metadata needs a KV cache manager for the paged append")
     if md.is_cross or md.is_spec_decoding_enabled or md.beam_width != 1:
         raise ValueError("cross attention, speculative decoding and beams are not supported")
-    if md.num_seqs != 1:
-        raise ValueError(f"one request per call is supported; metadata has {md.num_seqs}")
+    num_seqs, num_contexts = md.num_seqs, md.num_contexts
+    if num_seqs < 1 or not 0 <= num_contexts <= num_seqs:
+        raise ValueError(
+            f"the metadata holds {num_seqs} requests of which {num_contexts} are contexts"
+        )
     if md.kv_cache_params is None or md.kv_cache_params.num_extra_kv_tokens:
         raise ValueError("the metadata must use the KV cache without extra KV tokens")
     if num_tokens > md.max_num_tokens:
         raise ValueError(
             f"the call has {num_tokens} tokens; the metadata holds {md.max_num_tokens} per call"
         )
-    kv_len = int(md.kv_lens_runtime[0])
-    request_type = int(md.host_request_types_runtime[0])
-    past = kv_len - num_tokens
-    if md.num_contexts == 1:
-        if (
-            md.num_ctx_tokens != num_tokens
-            or int(md.prompt_lens_cpu_runtime[0]) != num_tokens
-            or request_type != 0
-        ):
-            raise ValueError(
-                f"a context step of {num_tokens} tokens needs {num_tokens} context tokens and "
-                f"context length {num_tokens}; metadata has {md.num_ctx_tokens} context tokens "
-                f"and context length {int(md.prompt_lens_cpu_runtime[0])}"
-            )
-        if past < 0:
-            raise ValueError(
-                f"the KV length {kv_len} is shorter than the call's {num_tokens} tokens"
-            )
-        if past and not md.use_paged_context_fmha:
-            raise ValueError(
-                f"a context step after {past} cached tokens must read them from the pool: "
-                "paged-context FMHA is required"
-            )
-    elif md.num_contexts == 0:
-        if num_tokens != 1 or md.num_ctx_tokens != 0 or request_type != 1:
-            raise ValueError(f"a generation step appends exactly one token, got {num_tokens}")
-        if past < 1:
-            raise ValueError("a generation step needs the request's earlier tokens in the cache")
-    else:
+    new_tokens = [int(n) for n in md.seq_lens[:num_seqs]]
+    kv_lens = [int(n) for n in md.kv_lens_runtime[:num_seqs]]
+    request_types = [int(t) for t in md.host_request_types_runtime[:num_seqs]]
+    context_lens = [int(n) for n in md.prompt_lens_cpu_runtime[:num_contexts]]
+    if sum(new_tokens) != num_tokens or md.num_ctx_tokens != sum(new_tokens[:num_contexts]):
         raise ValueError(
-            f"one request per call is supported; metadata has {md.num_contexts} contexts"
+            f"the requests' new tokens {new_tokens} ({md.num_ctx_tokens} in contexts) do not "
+            f"fill the call's {num_tokens} tokens"
         )
-    if kv_len > mgr.max_seq_len or md.max_seq_len != mgr.max_seq_len:
+    spans = []
+    for i, (n, kv_len, request_type) in enumerate(zip(new_tokens, kv_lens, request_types)):
+        past = kv_len - n
+        if i < num_contexts:
+            if n < 1 or context_lens[i] != n or request_type != 0:
+                raise ValueError(
+                    f"context request {i} of {n} new tokens needs context length {n}; "
+                    f"metadata has context length {context_lens[i]} and request type "
+                    f"{request_type}"
+                )
+            if past < 0:
+                raise ValueError(
+                    f"request {i}'s KV length {kv_len} is shorter than its {n} new tokens"
+                )
+            if past and not md.use_paged_context_fmha:
+                raise ValueError(
+                    f"a context step after {past} cached tokens must read them from the pool: "
+                    "paged-context FMHA is required"
+                )
+        else:
+            if n != 1 or request_type != 1:
+                raise ValueError(
+                    f"generation request {i} appends exactly one token, got {n} (request type "
+                    f"{request_type})"
+                )
+            if past < 0:
+                raise ValueError(
+                    f"request {i}'s KV length {kv_len} is shorter than its generation token"
+                )
+        spans.append((past, n))
+    if max(kv_lens) > mgr.max_seq_len or md.max_seq_len != mgr.max_seq_len:
         raise ValueError(
-            f"the request reaches {kv_len} tokens; the cache holds {mgr.max_seq_len} per sequence "
-            f"and the metadata states {md.max_seq_len}"
+            f"a request reaches {max(kv_lens)} tokens; the cache holds {mgr.max_seq_len} per "
+            f"sequence and the metadata states {md.max_seq_len}"
         )
     local = local_layer_index(md, layer_idx)
     heads = getattr(mgr, "num_kv_heads_per_layer", None) or []
@@ -301,7 +343,7 @@ def check_metadata(
             f"the KV cache must be BF16 with {num_kv_heads} kv heads of {head_dim}; "
             f"got {mgr.dtype}, {heads}, head_dim {mgr.head_dim}"
         )
-    return past
+    return spans
 
 
 def step_args(md: TrtllmAttentionMetadata, layer_idx: int) -> dict:

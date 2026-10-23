@@ -49,6 +49,7 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 
 # architectures[0] -> routing module, relative to this package.
 MODELING_V2_ROUTERS = {
+    "BeamForCausalLM": "models.beam.routing",
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
     # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the

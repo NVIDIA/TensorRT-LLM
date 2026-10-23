@@ -92,12 +92,20 @@ from .ops.norm.beam_rmsnorm_fp32 import beam_rmsnorm_fp32
 
 _SM = (10, 3)
 ROUTER_EPS = 1e-20
-#: Tokens per call; the representative cases use at most 129.
+#: Default tokens per call; the representative cases use at most 129. A caller that runs longer
+#: calls (a full-model prefill) passes its own ``max_tokens`` at construction.
 MAX_TOKENS = 1024
 
 
 class LoadError(RuntimeError):
     """A load failed on at least one rank; the component is not usable on any rank."""
+
+
+def check_max_tokens(max_tokens: int) -> int:
+    """Return ``max_tokens`` if it is a positive int (the most tokens one call accepts)."""
+    if type(max_tokens) is not int or max_tokens < 1:
+        raise ValueError(f"max_tokens must be a positive int, got {max_tokens!r}")
+    return max_tokens
 
 
 def _check_mapping(mapping: ParallelMapping) -> None:
@@ -131,8 +139,9 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     ``config`` is the checkpoint's config.json (a mapping); ``mapping`` this rank's
     ``tensorrt_llm.mapping.Mapping`` with world size 4, TP4, PP1, MoE TP4/EP1; ``layers``
     the logical layers to hold (default all 52; the embedding, final norm and head are
-    always held). Construction allocates uninitialized rank-local storage on the current
-    CUDA device and validates the configuration and layout; it reads no checkpoint data.
+    always held); ``max_tokens`` the most tokens one call accepts (default ``MAX_TOKENS``).
+    Construction allocates uninitialized rank-local storage on the current CUDA device and
+    validates the configuration and layout; it reads no checkpoint data.
     """
 
     def __init__(
@@ -141,8 +150,11 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         mapping: ParallelMapping,
         layers: Optional[Sequence[int]] = None,
         device: Optional[torch.device] = None,
+        *,
+        max_tokens: int = MAX_TOKENS,
     ):
         super().__init__()
+        self.max_tokens = check_max_tokens(max_tokens)
         self.schedule = check_config(config)
         _check_mapping(mapping)
         device = (
@@ -360,7 +372,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     def embed(self, token_ids: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
         """Global token ids ``[T]`` int64 -> replicated embeddings ``[T, hidden]`` bf16."""
         self._check_usable()
-        _check_ids(token_ids, self.config["vocab_size"], self.device)
+        _check_ids(token_ids, self.config["vocab_size"], self.device, self.max_tokens)
         lo, hi = self.vocab_interval
         inside = (token_ids >= lo) & (token_ids < hi)
         local = nn.functional.embedding(
@@ -380,11 +392,16 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         md: TrtllmAttentionMetadata,
         capture: Optional[dict] = None,
     ) -> torch.Tensor:
-        """Normalized input ``[T, hidden]`` -> attention output after the one o_proj all-reduce."""
+        """Normalized input ``[T, hidden]`` -> attention output after the one o_proj all-reduce.
+
+        ``md`` is one prepared step of one or more requests (``_attention.check_batch_metadata``)
+        whose new tokens are the T rows, contexts first; ``positions`` are their absolute
+        positions.
+        """
         self._check_usable(layer)
-        _check_hidden(h, self.hidden, self.device)
+        _check_hidden(h, self.hidden, self.device, self.max_tokens)
         T = h.shape[0]
-        _attention.check_metadata(
+        _attention.check_batch_metadata(
             md, T, layer_idx=layer, num_kv_heads=self.local_kv_heads, head_dim=self.head_dim
         )
         step = _attention.step_args(md, layer)
@@ -466,7 +483,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     ) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> dense SwiGLU output after the one down all-reduce."""
         self._check_usable(layer)
-        _check_hidden(h, self.hidden, self.device)
+        _check_hidden(h, self.hidden, self.device, self.max_tokens)
         if self.schedule.is_sparse(layer):
             raise ValueError(f"layer {layer} has a sparse feed-forward")
         gate = cublas_mm(h, self._layer(layer, "mlp.gate_proj.weight").t())
@@ -492,7 +509,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     def route(self, layer: int, h: torch.Tensor) -> dict:
         """The replicated FP32 router on ``h`` ``[T, hidden]``: every routing intermediate."""
         self._check_usable(layer)
-        _check_hidden(h, self.hidden, self.device)
+        _check_hidden(h, self.hidden, self.device, self.max_tokens)
         if not self.schedule.is_sparse(layer):
             raise ValueError(f"layer {layer} has a dense feed-forward")
         return beam_grouped_topk_router(
@@ -569,7 +586,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         md: TrtllmAttentionMetadata,
         capture: Optional[dict] = None,
     ) -> torch.Tensor:
-        """One decoder block of logical layer ``layer`` on ``x`` ``[T, hidden]``, one request step.
+        """One decoder block of logical layer ``layer`` on ``x`` ``[T, hidden]``, one engine step.
 
         The input norm runs the source model's torch op order (``beam_rmsnorm_fp32``), so the
         q/k/v/gate projections read the source's normalized bytes for the same block input.
@@ -606,7 +623,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     @torch.no_grad()
     def final_norm(self, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
         self._check_usable()
-        _check_hidden(h, self.hidden, self.device)
+        _check_hidden(h, self.hidden, self.device, self.max_tokens)
         out = flashinfer_rmsnorm(h, self.tensor(FINAL_NORM), self.eps)
         _rec(capture, {"final_norm": out})
         return out
@@ -619,7 +636,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         axis restores global order (rank 0's rows first), and the softcap is applied once.
         """
         self._check_usable()
-        _check_hidden(n, self.hidden, self.device)
+        _check_hidden(n, self.hidden, self.device, self.max_tokens)
         local = cublas_mm(n, self.tensor(HEAD).t())
         gathered = allgather(local, self.mapping, dim=-1)
         logits = beam_logit_softcap(gathered, self.softcap)
@@ -638,22 +655,26 @@ def _rec(capture: Optional[dict], items: dict) -> None:
         capture[name] = tensor.detach().clone()
 
 
-def _check_hidden(h: torch.Tensor, hidden: int, device: torch.device) -> None:
+def _check_hidden(
+    h: torch.Tensor, hidden: int, device: torch.device, max_tokens: int = MAX_TOKENS
+) -> None:
     if not isinstance(h, torch.Tensor) or h.dtype != torch.bfloat16:
         raise ValueError("hidden states must be a torch.bfloat16 tensor")
-    if h.dim() != 2 or h.shape[1] != hidden or not 1 <= h.shape[0] <= MAX_TOKENS:
+    if h.dim() != 2 or h.shape[1] != hidden or not 1 <= h.shape[0] <= max_tokens:
         raise ValueError(
-            f"hidden states must be [T, {hidden}] with 1 <= T <= {MAX_TOKENS}, got {list(h.shape)}"
+            f"hidden states must be [T, {hidden}] with 1 <= T <= {max_tokens}, got {list(h.shape)}"
         )
     if h.device != device or not h.is_contiguous():
         raise ValueError("hidden states must be contiguous on the component's device")
 
 
-def _check_ids(ids: torch.Tensor, vocab: int, device: torch.device) -> None:
+def _check_ids(
+    ids: torch.Tensor, vocab: int, device: torch.device, max_tokens: int = MAX_TOKENS
+) -> None:
     if not isinstance(ids, torch.Tensor) or ids.dtype != torch.int64 or ids.dim() != 1:
         raise ValueError("token ids must be a 1-D torch.int64 tensor")
-    if ids.device != device or not 1 <= ids.shape[0] <= MAX_TOKENS:
-        raise ValueError("token ids must hold 1..MAX_TOKENS ids on the component's device")
+    if ids.device != device or not 1 <= ids.shape[0] <= max_tokens:
+        raise ValueError(f"token ids must hold 1..{max_tokens} ids on the component's device")
     if bool(((ids < 0) | (ids >= vocab)).any()):
         raise ValueError(f"token ids must be in [0, {vocab})")
 
@@ -661,5 +682,7 @@ def _check_ids(ids: torch.Tensor, vocab: int, device: torch.device) -> None:
 __all__ = [
     "BeamCheckpointLayoutBf16Sm103Tp4",
     "LoadError",
+    "MAX_TOKENS",
+    "check_max_tokens",
     "TensorSpec",
 ]
