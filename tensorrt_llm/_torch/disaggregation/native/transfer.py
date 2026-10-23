@@ -3384,14 +3384,15 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
-            # The sender-side check (PeerRegistrar.register) runs in the
-            # sender's listener thread, where exceptions are only logged, so
-            # reject here — before REGISTER_RANK_INFO is even sent, so no
-            # dealers are connected and no partial registration happens for
-            # the bad peer. The failure is converted to PeerIncompatibleError
-            # (handled in dispatch_task) so only requests targeting this peer
-            # fail, and cached so later requests fail fast.
+            # Recurrent-state (Mamba/KDA), replicated-role and draft-layer layout
+            # gates on the receiver side. The sender-side check
+            # (PeerRegistrar.register) runs in the sender's listener thread,
+            # where exceptions are only logged, so reject here — before
+            # REGISTER_RANK_INFO is even sent, so no dealers are connected and
+            # no partial registration happens for the bad peer. The failure is
+            # converted to PeerIncompatibleError (handled in dispatch_task) so
+            # only requests targeting this peer fail, and cached so later
+            # requests fail fast.
             try:
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
@@ -3403,6 +3404,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                PeerRegistrar.validate_draft_layers(self._registrar.self_rank_info, sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
