@@ -1108,5 +1108,9 @@ async def reframe_openai_stream(
             yield frame
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
+        if done:
+            # message_stop has already closed the message, so a failure while
+            # reading the rest of the upstream is logged but adds no event.
+            return
         for frame in reframer.error("Internal server error"):
             yield frame

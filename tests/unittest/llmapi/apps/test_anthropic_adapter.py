@@ -1178,6 +1178,46 @@ def test_stream_reframer_drops_anything_after_done():
     assert "".join(text_deltas) == "hello"
 
 
+def test_stream_reframer_adds_no_event_when_the_upstream_fails_after_done():
+    """message_stop stays the last event when reading past [DONE] fails."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        raise RuntimeError("failed after the last frame")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert "error" not in [name for name, _ in events]
+
+
+def test_stream_reframer_reads_a_byte_stream_to_its_end_when_done_is_split():
+    """A relayed byte stream is read to its EOF however [DONE] is chunked."""
+    body = (
+        f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        "data: [DONE]\n\n"
+    ).encode()
+    split = body.index(b"[DONE]") + len(b"[DO")
+    after_last_chunk = []
+
+    async def source():
+        yield body[:split]
+        yield body[split:]
+        after_last_chunk.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_last_chunk == ["ran"]
+
+
 def test_stream_reframer_splits_multibyte_characters():
     """A chunk boundary landing inside a UTF-8 sequence must not corrupt output.
 
