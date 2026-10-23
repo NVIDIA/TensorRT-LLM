@@ -27,8 +27,9 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
 import tensorrt_llm._torch.disaggregation.transceiver as python_transceiver_module
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation import diagnostics
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     Receiver,
@@ -186,19 +187,20 @@ def test_gen_ingress_uses_full_cp_prompt_length(monkeypatch: pytest.MonkeyPatch)
     assert event.kwargs["cp_rank"] == 3
 
 
-def test_scheduler_emits_admitted_and_deferred_kv_admission_results(
+def test_scheduler_reports_only_first_failed_kv_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     admitted = _disagg_request(11, 1011)
     admitted.total_input_len_cp = 257
     deferred = _disagg_request(12, 1012)
-    results = iter((True, False))
+    results = iter((True, False, False))
     manager = SimpleNamespace(
         prepare_disagg_gen_init=lambda _request: next(results),
         kv_cache_map={
             admitted.py_request_id: SimpleNamespace(capacity=65, history_length=64),
         },
         mapping=SimpleNamespace(rank=3),
+        tokens_per_block=32,
     )
     scheduler = object.__new__(KVCacheV2Scheduler)
     scheduler.kv_cache_manager = manager
@@ -210,32 +212,12 @@ def test_scheduler_emits_admitted_and_deferred_kv_admission_results(
 
     admitted_result = scheduler._try_schedule_disagg_gen_init(admitted, None)
     deferred_result = scheduler._try_schedule_disagg_gen_init(deferred, None)
+    assert scheduler._try_schedule_disagg_gen_init(deferred, None) == (ScheduleAction.SKIP, 0)
 
     assert admitted_result == (ScheduleAction.SCHEDULED, 0)
     assert deferred_result == (ScheduleAction.SKIP, 0)
-    assert emit_event.call_count == 2
-
-    admitted_event = emit_event.call_args_list[0]
-    assert admitted_event.args == ("gen_kv_admission_result",)
-    assert admitted_event.kwargs == {
-        "side": "gen",
-        "request_id": 1011,
-        "request_id_scope": "run",
-        "local_request_id": 11,
-        "rank": 3,
-        "rank_info": None,
-        "timestamp": None,
-        "outcome": "admitted",
-        "reason": None,
-        "prompt_tokens": 257,
-        "tokens_per_block": 32,
-        "cache_present": True,
-        "capacity_tokens": 65,
-        "history_tokens": 64,
-        "capacity_block_equivalent": 3,
-    }
-
-    deferred_event = emit_event.call_args_list[1]
+    emit_event.assert_called_once()
+    deferred_event = emit_event.call_args
     assert deferred_event.args == ("gen_kv_admission_result",)
     assert deferred_event.kwargs["request_id"] == 1012
     assert deferred_event.kwargs["local_request_id"] == 12
@@ -245,6 +227,189 @@ def test_scheduler_emits_admitted_and_deferred_kv_admission_results(
     assert deferred_event.kwargs["cache_present"] is False
     assert deferred_event.kwargs["capacity_tokens"] is None
     assert deferred_event.kwargs["capacity_block_equivalent"] is None
+    assert deferred_event.kwargs["kv_deferral_count"] == 1
+    assert deferred._disagg_diagnostics_kv_deferral_count == 2
+
+
+def _gen_admission_setup(
+    request: SimpleNamespace,
+) -> tuple[KVCacheV2Scheduler, DisaggTransferCoordinator]:
+    """Use real admission paths with fake external KV and receive operations."""
+    manager = SimpleNamespace(
+        prepare_disagg_gen_init=Mock(return_value=True),
+        kv_cache_map={request.py_request_id: SimpleNamespace(capacity=65, history_length=64)},
+        mapping=SimpleNamespace(rank=4),
+        tokens_per_block=32,
+    )
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.tokens_per_block = 32
+    coordinator = _coordinator()
+    coordinator._kv_cache_manager = manager
+    coordinator._effects.prepare_gen_resources = Mock()
+    coordinator._transceiver.kv_transfer_timeout_ms = None
+    coordinator._transceiver.request_and_receive_async = Mock(
+        side_effect=lambda req: setattr(
+            req, "state", LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        )
+    )
+    coordinator.reap_gen_receives = Mock()
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    return scheduler, coordinator
+
+
+@pytest.mark.parametrize("selection", ["transfer_window", "pp_reconciliation", "bypass"])
+def test_gen_admission_is_reported_once_after_final_selection(
+    monkeypatch: pytest.MonkeyPatch, selection: str
+) -> None:
+    """Tentative scheduler success and repeated rollback are not admission."""
+    request = _disagg_request(13, 1013, prompt_len=32)
+    request.total_input_len_cp = 257
+    scheduler, coordinator = _gen_admission_setup(request)
+    active = _disagg_request(14, 1014, prompt_len=32)
+    active.is_disagg_generation_transmission_in_progress = True
+    active_requests = [active]
+    coordinator._registry.active_requests = lambda: active_requests
+    coordinator._admission_controller = DisaggTransferAdmissionController(32, 32)
+    if selection != "bypass":
+        coordinator._dist.pp_size = 2
+        coordinator._dist.pp_rank = 1
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+    for _ in range(3 if selection != "bypass" else 0):
+        assert scheduler._try_schedule_disagg_gen_init(request, None) == (
+            ScheduleAction.SCHEDULED,
+            0,
+        )
+        if selection == "transfer_window":
+            admitted, blocked = coordinator.admit([request])
+            assert admitted == []
+            assert blocked
+        else:
+            coordinator.revert_deferred_gen_init([request], [])
+            admitted = []
+        coordinator.receive_gen_init(admitted)
+    assert not any(call.kwargs.get("outcome") == "admitted" for call in emit_event.call_args_list)
+    coordinator._effects.prepare_gen_resources.assert_not_called()
+    if selection != "bypass":
+        emit_event.assert_called_once()
+        assert emit_event.call_args.args == ("gen_kv_rollback",)
+        assert emit_event.call_args.kwargs["reason"] == selection
+        assert emit_event.call_args.kwargs["rollback_count"] == 1
+        assert coordinator._effects.revert_ctx_alloc.call_count == 3
+        active_requests.clear()
+
+    assert scheduler._try_schedule_disagg_gen_init(request, None) == (ScheduleAction.SCHEDULED, 0)
+    if selection == "pp_reconciliation":
+        coordinator.revert_deferred_gen_init([request], [request])
+    admitted, blocked = coordinator.admit([request])
+    assert admitted == [request]
+    assert not blocked
+    coordinator.receive_gen_init(admitted)
+
+    event = emit_event.call_args
+    assert event.args == ("gen_kv_admission_result",)
+    assert event.kwargs["outcome"] == "admitted"
+    assert event.kwargs["request_id"] == 1013
+    assert event.kwargs["prompt_tokens"] == 257
+    assert event.kwargs["capacity_tokens"] == 65
+    assert event.kwargs["capacity_block_equivalent"] == 3
+    assert event.kwargs["kv_deferral_count"] == 0
+    assert event.kwargs["transfer_window_rollback_count"] == (
+        3 if selection == "transfer_window" else 0
+    )
+    assert event.kwargs["pp_reconciliation_rollback_count"] == (
+        3 if selection == "pp_reconciliation" else 0
+    )
+    assert emit_event.call_count == (1 if selection == "bypass" else 2)
+    coordinator._effects.prepare_gen_resources.assert_called_once_with([request])
+    coordinator._transceiver.request_and_receive_async.assert_called_once_with(request)
+
+
+def test_gen_admission_precedes_readiness_wait_and_receive_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admitted request may still wait for the destination readiness fence."""
+    request = _disagg_request(15, 1015)
+    _, coordinator = _gen_admission_setup(request)
+    ready = SimpleNamespace(query=Mock(return_value=False))
+    coordinator._defer_unready_gen_receives = True
+    coordinator._kv_cache_manager.take_disagg_receive_ready = Mock(return_value=ready)
+    operations = []
+    coordinator._effects.prepare_gen_resources.side_effect = lambda _requests: operations.append(
+        "prepare"
+    )
+    coordinator._transceiver.request_and_receive_async.side_effect = lambda _request: (
+        operations.append("receive")
+    )
+    emit_event = Mock(side_effect=lambda event, **_fields: operations.append(event))
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+    coordinator.receive_gen_init([request])
+
+    assert operations == ["prepare", "gen_kv_admission_result"]
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert request.py_request_id in coordinator._unpublished_gen_receives
+    coordinator._transceiver.request_and_receive_async.assert_not_called()
+    ready.query.return_value = True
+    coordinator._publish_ready_gen_receives()
+    assert operations == ["prepare", "gen_kv_admission_result", "receive"]
+    assert not coordinator._unpublished_gen_receives
+    emit_event.assert_called_once()
+
+
+@pytest.mark.parametrize("is_kv_manager_v2", [False, True])
+@pytest.mark.parametrize("diagnostic_mode", ["disabled", "enabled", "failing"])
+def test_gen_admission_diagnostics_preserve_preparation_and_receive_behavior(
+    monkeypatch: pytest.MonkeyPatch, is_kv_manager_v2: bool, diagnostic_mode: str
+) -> None:
+    """Final admission is V2-only and optional reporting never stops receiving."""
+    request = _disagg_request(16, 1016)
+    _, coordinator = _gen_admission_setup(request)
+    coordinator._is_kv_manager_v2 = is_kv_manager_v2
+    emit_event = Mock(
+        side_effect=RuntimeError("diagnostics failed") if diagnostic_mode == "failing" else None
+    )
+    monkeypatch.setattr(
+        diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", diagnostic_mode != "disabled"
+    )
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+    coordinator.receive_gen_init([request])
+
+    coordinator._effects.prepare_gen_resources.assert_called_once_with([request])
+    coordinator._transceiver.request_and_receive_async.assert_called_once_with(request)
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert emit_event.call_count == int(is_kv_manager_v2 and diagnostic_mode != "disabled")
+
+
+def test_gen_resource_preparation_failure_is_not_reported_as_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A throwing resource preparation cannot complete the admission interval."""
+    request = _disagg_request(17, 1017)
+    scheduler, coordinator = _gen_admission_setup(request)
+    coordinator._effects.prepare_gen_resources.side_effect = RuntimeError("preparation failed")
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+
+    assert scheduler._try_schedule_disagg_gen_init(request, None) == (ScheduleAction.SCHEDULED, 0)
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        coordinator.receive_gen_init([request])
+
+    emit_event.assert_not_called()
+    coordinator._transceiver.request_and_receive_async.assert_not_called()
+    assert not coordinator._unpublished_gen_receives
 
 
 def test_gen_timeout_start_and_observation_share_request_identity(
@@ -339,7 +504,8 @@ def test_gen_decode_ready_requires_successful_handoff_and_uses_full_cp_prompt_le
             request.is_disagg_generation_transmission_complete = False
 
     executor._setup_sampler_step = Mock(side_effect=prepare_sampler)
-    executor.model_engine = SimpleNamespace(enable_spec_decode=False)
+    executor.enable_spec_decode = False
+    executor.model_engine = SimpleNamespace()
     executor.draft_model_engine = None
     executor.kv_cache_transceiver = SimpleNamespace(commit_blocks_for_reuse=Mock())
     executor._update_sampler_state_for_disagg_gen_request = Mock(return_value=True)
@@ -646,7 +812,8 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     assert receive_start["transfer_bytes"] == 128
     assert receive_start["timeout_expected"] is False
     assert settlement["outcome"] == outcome
-    assert settlement["resources_drained"] is True
+    assert settlement["session_retired"] is True
+    assert "resources_drained" not in settlement
     assert request.state == request_state
     assert transceiver._recv_sessions == {}
     assert transceiver._recv_reqs == {}
@@ -775,6 +942,7 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
         prepare_disagg_gen_init=Mock(return_value=True),
         kv_cache_map={41: SimpleNamespace(capacity=65, history_length=64)},
         mapping=SimpleNamespace(rank=4),
+        tokens_per_block=32,
     )
     scheduler = object.__new__(KVCacheV2Scheduler)
     scheduler.kv_cache_manager = manager
@@ -804,18 +972,23 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
     transceiver._create_cache_extent = Mock(return_value=_extent(41))
     transceiver._chunk_num_bytes = Mock(return_value=64)
     transceiver._kv_size_rank_factor = 2
-    transceiver.kv_transfer_timeout_ms = 100
+    transceiver.kv_transfer_timeout_ms = None
+    coordinator._transceiver = transceiver
+    coordinator._kv_cache_manager = manager
+    coordinator._effects.prepare_gen_resources = Mock()
+    coordinator.reap_gen_receives = Mock()
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
     monkeypatch.setattr(diagnostics, "emit_event", emit_event)
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(
         python_transceiver_module.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0
     )
 
     assert scheduler._try_schedule_disagg_gen_init(request, None) == (ScheduleAction.SCHEDULED, 0)
     assert coordinator.admit([request]) == ([request], False)
-    transceiver.request_and_receive_async(request)
+    coordinator.receive_gen_init([request])
 
     manager.prepare_disagg_gen_init.assert_called_once_with(request)
     transceiver._create_cache_extent.assert_called_once_with(request)
@@ -837,15 +1010,17 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
         assert call.kwargs["local_request_id"] == 41
         assert call.kwargs["request_id_scope"] == "process"
     assert emit_event.call_args_list[0].kwargs["capacity_tokens"] == 65
-    assert emit_event.call_args_list[-1].kwargs["resources_drained"] is True
+    assert emit_event.call_args_list[-1].kwargs["session_retired"] is True
 
 
+@pytest.mark.parametrize("enforce_physical_ownership", [False, True])
 @pytest.mark.parametrize(
     ("disagg_request_id", "ctx_request_id", "expected_id", "expected_scope"),
     [(7007, 7, 7007, "run"), (None, 7, 7, "process")],
 )
 def test_session_only_settlement_uses_session_identity_and_scope(
     monkeypatch: pytest.MonkeyPatch,
+    enforce_physical_ownership: bool,
     disagg_request_id: int | None,
     ctx_request_id: int,
     expected_id: int,
@@ -853,6 +1028,8 @@ def test_session_only_settlement_uses_session_identity_and_scope(
 ) -> None:
     session = SimpleNamespace(
         disagg_request_id=expected_id,
+        _enforce_physical_ownership=enforce_physical_ownership,
+        resources_drained=Mock(side_effect=AssertionError("diagnostics polled physical drain")),
         _base_args=SimpleNamespace(
             params=DisaggregatedParams(
                 disagg_request_id=disagg_request_id, ctx_request_id=ctx_request_id
@@ -873,7 +1050,9 @@ def test_session_only_settlement_uses_session_identity_and_scope(
     assert fields["request_id"] == expected_id
     assert fields["request_id_scope"] == expected_scope
     assert fields["local_request_id"] is None
-    assert fields["resources_drained"] is True
+    assert fields["session_retired"] is True
+    assert "resources_drained" not in fields
+    session.resources_drained.assert_not_called()
 
 
 def test_settlement_without_request_or_session_reports_unknown_identity_scope(
@@ -950,7 +1129,8 @@ def test_cancel_diagnostics_do_not_poll_session_status(
         session.close.assert_called_once_with()
         settlement = emit.call_args_list[-1].kwargs
         assert settlement["outcome"] == "cancelled"
-        assert settlement["resources_drained"] is True
+        assert settlement["session_retired"] is True
+        assert "resources_drained" not in settlement
         assert not transceiver._send_sessions
         assert not transceiver._recv_sessions
         if side == "ctx":
@@ -1247,6 +1427,7 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
         state=SimpleNamespace(name="DISAGG_CONTEXT_COMPLETE"),
     )
     executor = object.__new__(PyExecutor)
+    executor.sampler = SimpleNamespace(release_request=Mock())
     executor.resource_manager = SimpleNamespace(free_resources=Mock())
     executor._prefetched_request_ids = {request.py_request_id}
     executor._disagg_coordinator = SimpleNamespace(forget_request=Mock())
@@ -1263,6 +1444,7 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor._free_request_resources(request)
 
     failing_emit.assert_called_once()
+    executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
     executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)

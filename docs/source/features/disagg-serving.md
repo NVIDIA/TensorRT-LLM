@@ -431,6 +431,18 @@ processes. Submission-to-completion measures backend residence, not necessarily
 on-wire service. CTX handoff-to-release starts at the final chunk's handoff and
 excludes earlier prefill KV retention. Executor timeouts and native blocking-wait
 deadlines are separate observations; neither proves that memory is reusable.
+Transceiver settlement records confirm session retirement, not physical resource
+drain; diagnostics do not add lifecycle polling to establish that stronger claim.
+KV-capacity deferral is recorded only on the first failed preparation per local
+request. `kv_deferral_count` counts failed KV preparation attempts, not every
+scheduler pass. Successful KV preparation is tentative: `outcome=admitted` is
+recorded only after transfer-window selection, PP reconciliation, and executor
+resource preparation succeed. This admission boundary precedes receive
+publication, which can still wait for destination readiness.
+Rollback records are emitted once per request and reason. Final admission carries
+the cumulative `transfer_window_rollback_count` and `pp_reconciliation_rollback_count`,
+along with `kv_deferral_count`; tentative successes do not reset these counts.
+Requests cancelled before admission have no completed admission-wait interval.
 
 Buffering is bounded; output is asynchronous and best-effort. Overflow, broken stdout, or
 process exit can lose records. The report exposes malformed, unmatched, and

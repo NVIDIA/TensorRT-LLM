@@ -353,17 +353,75 @@ def test_native_wait_uses_authoritative_anchor_and_retains_absolute_deadline() -
     )
 
 
-def test_gen_admission_retries_do_not_count_failed_allocation_as_admission() -> None:
-    """The report measures a unique successful GEN allocation only."""
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_gen_admission_retries_require_final_admission(admitted: bool, cancelled: bool) -> None:
+    """Deferrals and rollbacks never satisfy the final-admission boundary."""
+    lines = [
+        _profile(),
+        _event("gen_ingress", side="gen"),
+        _event("gen_kv_admission_result", 2_000_000, side="gen", outcome="deferred"),
+        _event("gen_kv_rollback", 3_000_000, side="gen", reason="transfer_window"),
+        _event("gen_kv_rollback", 4_000_000, side="gen", reason="pp_reconciliation"),
+    ]
+    if admitted:
+        lines.append(
+            _event(
+                "gen_kv_admission_result",
+                7_000_000,
+                side="gen",
+                outcome="admitted",
+                kv_deferral_count=2,
+                transfer_window_rollback_count=3,
+                pp_reconciliation_rollback_count=1,
+            )
+        )
+    if cancelled:
+        lines.append(_event("transfer_cancel_requested", 8_000_000, side="gen"))
+
+    result = analyze_lines(lines)
+
+    participant = result["requests"][0]["participants"][0]
+    if admitted:
+        assert [item["phase"] for item in _timings(result)] == ["gen_admission_wait"]
+        assert [item["duration_ms"] for item in _timings(result)] == [6.0]
+        final_event = next(
+            event for event in participant["events"] if event.get("outcome") == "admitted"
+        )
+        assert final_event["kv_deferral_count"] == 2
+        assert final_event["transfer_window_rollback_count"] == 3
+        assert final_event["pp_reconciliation_rollback_count"] == 1
+    else:
+        assert not _timings(result)
+        assert participant["unmeasured"] == [
+            {
+                "phase": "gen_admission_wait",
+                "correlation": {},
+                "reason": "unmatched_observed_boundary",
+                "start_count": 1,
+                "end_count": 0,
+            }
+        ]
+
+
+def test_repeated_admission_records_remain_explicitly_ambiguous() -> None:
+    """Old or invalid duplicate successes must not silently pick an endpoint."""
     result = analyze_lines(
         [
             _profile(),
             _event("gen_ingress", side="gen"),
-            _event("gen_kv_admission_result", 2_000_000, side="gen", outcome="deferred"),
+            _event("gen_kv_admission_result", 2_000_000, side="gen", outcome="admitted"),
             _event("gen_kv_admission_result", 4_000_000, side="gen", outcome="admitted"),
         ]
     )
-    assert [item["duration_ms"] for item in _timings(result)] == [3.0]
+    assert not _timings(result)
+    assert result["requests"][0]["participants"][0]["unmeasured"][0] == {
+        "phase": "gen_admission_wait",
+        "correlation": {},
+        "reason": "ambiguous_repeated_boundary",
+        "start_count": 1,
+        "end_count": 2,
+    }
 
 
 @pytest.mark.parametrize(

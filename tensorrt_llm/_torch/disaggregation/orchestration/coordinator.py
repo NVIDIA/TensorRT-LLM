@@ -345,13 +345,7 @@ class DisaggTransferCoordinator:
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                 with disagg_diagnostics.suppress_diagnostic_errors():
                     for request in deferred_requests:
-                        disagg_diagnostics.emit_request_event(
-                            "gen_kv_rollback",
-                            request,
-                            side="gen",
-                            dist=self._dist,
-                            reason=reason,
-                        )
+                        disagg_diagnostics.emit_kv_rollback(request, dist=self._dist, reason=reason)
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
@@ -374,6 +368,13 @@ class DisaggTransferCoordinator:
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
         self._effects.prepare_gen_resources(admitted)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
+            # Selection and resource preparation are committed; receive
+            # publication may still wait for destination readiness below.
+            for req in admitted:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self._kv_cache_manager, admitted=True, dist=self._dist
+                )
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.

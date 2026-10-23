@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from tensorrt_llm import DisaggregatedParams
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
     from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.mapping import Mapping
 
@@ -136,6 +137,82 @@ def emit_request_event(
             timestamp=timestamp,
             **details,
         )
+
+
+def emit_kv_admission_result(
+    request: LlmRequest,
+    kv_cache_manager: KVCacheManagerV2,
+    *,
+    admitted: bool,
+    dist: Distributed | None = None,
+) -> None:
+    """Record the first KV deferral or the final, resource-prepared admission.
+
+    Args:
+        request: Local request whose failed preparation attempts are counted.
+        kv_cache_manager: Owner of the request's destination KV allocation.
+        admitted: True only after transfer-window and PP selection, and resource preparation.
+        dist: Coordinator rank metadata; the scheduler uses the manager's rank.
+    """
+    if not DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        return
+    with suppress_diagnostic_errors():
+        deferral_count = getattr(request, "_disagg_diagnostics_kv_deferral_count", 0)
+        if not admitted:
+            deferral_count += 1
+            request._disagg_diagnostics_kv_deferral_count = deferral_count
+            if deferral_count > 1:
+                return
+        rollback_counts = getattr(request, "_disagg_diagnostics_kv_rollback_counts", {})
+        kv_cache = kv_cache_manager.kv_cache_map.get(request.py_request_id)
+        capacity_tokens = getattr(kv_cache, "capacity", None)
+        tokens_per_block = kv_cache_manager.tokens_per_block
+        prompt_tokens = getattr(request, "total_input_len_cp", None)
+        if prompt_tokens is None:
+            prompt_tokens = request.prompt_len
+        emit_request_event(
+            "gen_kv_admission_result",
+            request,
+            side="gen",
+            dist=dist,
+            rank=kv_cache_manager.mapping.rank,
+            outcome="admitted" if admitted else "deferred",
+            reason=None if admitted else "kv_or_index_capacity",
+            kv_deferral_count=deferral_count,
+            transfer_window_rollback_count=rollback_counts.get("transfer_window", 0),
+            pp_reconciliation_rollback_count=rollback_counts.get("pp_reconciliation", 0),
+            prompt_tokens=prompt_tokens,
+            tokens_per_block=tokens_per_block,
+            cache_present=kv_cache is not None,
+            capacity_tokens=capacity_tokens,
+            history_tokens=getattr(kv_cache, "history_length", None),
+            capacity_block_equivalent=(
+                (capacity_tokens + tokens_per_block - 1) // tokens_per_block
+                if capacity_tokens is not None and tokens_per_block > 0
+                else None
+            ),
+        )
+
+
+def emit_kv_rollback(request: LlmRequest, *, reason: str, dist: Distributed) -> None:
+    """Count completed rollbacks, recording only the first per local request and reason.
+
+    Args:
+        request: Request whose tentative destination allocation was released.
+        reason: Transfer-window deferral or PP canonical-schedule reconciliation.
+        dist: Coordinator rank metadata.
+    """
+    if not DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        return
+    with suppress_diagnostic_errors():
+        counts = getattr(request, "_disagg_diagnostics_kv_rollback_counts", None)
+        if counts is None:
+            counts = request._disagg_diagnostics_kv_rollback_counts = {}
+        counts[reason] = counts.get(reason, 0) + 1
+        if counts[reason] == 1:
+            emit_request_event(
+                "gen_kv_rollback", request, side="gen", dist=dist, reason=reason, rollback_count=1
+            )
 
 
 def emit_transfer_timeout(

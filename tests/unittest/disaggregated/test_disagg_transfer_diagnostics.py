@@ -800,8 +800,10 @@ def test_full_diagnostic_queue_reports_dropped_events(
         assert record["run_uuid_status"] == "unset"
 
 
+@pytest.mark.parametrize("prepared", [False, True])
 def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
     monkeypatch: pytest.MonkeyPatch,
+    prepared: bool,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
         KVCacheV2Scheduler,
@@ -811,9 +813,11 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
     inspection = MagicMock(side_effect=AssertionError("disabled diagnostics inspected state"))
 
     class _OpaqueRequest:
+        py_request_id = 17
+
         @property
-        def py_request_id(self) -> int:
-            return inspection("py_request_id")
+        def _disagg_diagnostics_kv_deferral_count(self) -> int:
+            return inspection("deferral_count")
 
         @property
         def prompt_len(self) -> int:
@@ -821,7 +825,7 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
 
     class _KVCacheManager:
         def prepare_disagg_gen_init(self, _request: _OpaqueRequest) -> bool:
-            return True
+            return prepared
 
         @property
         def kv_cache_map(self) -> dict[int, object]:
@@ -832,11 +836,140 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
     scheduler.kv_cache_manager = _KVCacheManager()
     scheduler.tokens_per_block = 32
 
-    action, tokens = scheduler._try_schedule_disagg_gen_init(_OpaqueRequest(), None)
+    request = _OpaqueRequest()
+    action, tokens = scheduler._try_schedule_disagg_gen_init(request, None)
 
-    assert action is ScheduleAction.SCHEDULED
+    assert action is (ScheduleAction.SCHEDULED if prepared else ScheduleAction.SKIP)
     assert tokens == 0
+    assert vars(request) == {}
     inspection.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "prepared_results, expected_records, sink_fails",
+    [
+        pytest.param([True], [("admitted", 0)], False, id="immediate"),
+        pytest.param([False, True], [("deferred", 1), ("admitted", 1)], False, id="one-retry"),
+        pytest.param(
+            [False] * 100 + [True], [("deferred", 1), ("admitted", 100)], False, id="many-retries"
+        ),
+        pytest.param(
+            [False] * 100 + [True], [("deferred", 1), ("admitted", 100)], True, id="sink-failure"
+        ),
+        pytest.param(
+            [False, True, False, True],
+            [("deferred", 1), ("admitted", 2)],
+            False,
+            id="tentative-success-does-not-reset",
+        ),
+    ],
+)
+def test_scheduler_kv_admission_bounds_deferral_events(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_results: list[bool],
+    expected_records: list[tuple[str, int]],
+    sink_fails: bool,
+) -> None:
+    """Count retries without recording tentative allocation as final admission.
+
+    Args:
+        monkeypatch: Fixture for enabling diagnostics and replacing the sink.
+        prepared_results: Results supplied by the external KV manager boundary.
+        expected_records: Expected outcome/count pairs reaching the sink.
+        sink_fails: Whether the sink raises on its first invocation.
+    """
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+        KVCacheV2Scheduler,
+        ScheduleAction,
+    )
+
+    request = SimpleNamespace(py_request_id=17, py_disaggregated_params=None, prompt_len=65)
+    cache_lookup = MagicMock(return_value=None)
+    prepare = MagicMock(side_effect=prepared_results)
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        prepare_disagg_gen_init=prepare,
+        kv_cache_map=SimpleNamespace(get=cache_lookup),
+        mapping=SimpleNamespace(rank=0),
+        tokens_per_block=32,
+    )
+    scheduler.tokens_per_block = 32
+    emit = MagicMock(
+        side_effect=[
+            RuntimeError("diagnostic sink failed"),
+            *([None] * (len(expected_records) - 1)),
+        ]
+        if sink_fails
+        else None
+    )
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+
+    for prepared in prepared_results:
+        action, tokens = scheduler._try_schedule_disagg_gen_init(request, None)
+        assert action is (ScheduleAction.SCHEDULED if prepared else ScheduleAction.SKIP)
+        assert tokens == 0
+
+    assert all(call.kwargs["outcome"] == "deferred" for call in emit.call_args_list)
+    diagnostics.emit_kv_admission_result(request, scheduler.kv_cache_manager, admitted=True)
+    assert prepare.call_count == len(prepared_results)
+    assert cache_lookup.call_count == len(expected_records)
+    assert [
+        (call.kwargs["outcome"], call.kwargs["kv_deferral_count"]) for call in emit.call_args_list
+    ] == expected_records
+
+
+@pytest.mark.parametrize("second_rank", [0, 1], ids=["reused-id", "rank-local-replica"])
+def test_scheduler_kv_deferral_count_is_request_local(
+    monkeypatch: pytest.MonkeyPatch,
+    second_rank: int,
+) -> None:
+    """Keep distinct request objects independent even when their IDs match.
+
+    Args:
+        monkeypatch: Fixture for enabling diagnostics and replacing the sink.
+        second_rank: Rank observing the second request object.
+    """
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    first, second = (
+        SimpleNamespace(py_request_id=17, py_disaggregated_params=None, prompt_len=65)
+        for _ in range(2)
+    )
+    prepare = MagicMock(return_value=False)
+    mapping = SimpleNamespace(rank=0)
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        prepare_disagg_gen_init=prepare,
+        kv_cache_map={},
+        mapping=mapping,
+        tokens_per_block=32,
+    )
+    scheduler.tokens_per_block = 32
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+
+    scheduler._try_schedule_disagg_gen_init(first, None)
+    scheduler._try_schedule_disagg_gen_init(first, None)
+    mapping.rank = second_rank
+    scheduler._try_schedule_disagg_gen_init(second, None)
+    prepare.return_value = True
+    scheduler._try_schedule_disagg_gen_init(second, None)
+    diagnostics.emit_kv_admission_result(second, scheduler.kv_cache_manager, admitted=True)
+    mapping.rank = 0
+    scheduler._try_schedule_disagg_gen_init(first, None)
+    diagnostics.emit_kv_admission_result(first, scheduler.kv_cache_manager, admitted=True)
+
+    assert [
+        (call.kwargs["rank"], call.kwargs["outcome"], call.kwargs["kv_deferral_count"])
+        for call in emit.call_args_list
+    ] == [
+        (0, "deferred", 1),
+        (second_rank, "deferred", 1),
+        (second_rank, "admitted", 1),
+        (0, "admitted", 2),
+    ]
 
 
 def test_scheduler_kv_admission_continues_when_diagnostic_inspection_fails(
@@ -847,13 +980,15 @@ def test_scheduler_kv_admission_continues_when_diagnostic_inspection_fails(
         ScheduleAction,
     )
 
+    inspection = MagicMock(side_effect=RuntimeError("diagnostic KV inspection failed"))
+
     class _KVCacheManager:
         def prepare_disagg_gen_init(self, _request) -> bool:
-            return True
+            return False
 
         @property
         def kv_cache_map(self):
-            raise RuntimeError("diagnostic KV inspection failed")
+            return inspection()
 
     request = SimpleNamespace(py_request_id=17)
     scheduler = object.__new__(KVCacheV2Scheduler)
@@ -863,5 +998,68 @@ def test_scheduler_kv_admission_continues_when_diagnostic_inspection_fails(
 
     action, tokens = scheduler._try_schedule_disagg_gen_init(request, None)
 
-    assert action is ScheduleAction.SCHEDULED
+    assert action is ScheduleAction.SKIP
     assert tokens == 0
+    inspection.assert_called_once_with()
+
+
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_kv_rollback_coalesces_each_reason_and_preserves_final_counts(
+    monkeypatch: pytest.MonkeyPatch, sink_fails: bool
+) -> None:
+    """Retain counts across repeated rollbacks and a failed diagnostic sink.
+
+    Args:
+        monkeypatch: Fixture for enabling diagnostics and replacing the sink.
+        sink_fails: Whether emission raises instead of accepting records.
+    """
+    request = SimpleNamespace(py_request_id=17, py_disaggregated_params=None, prompt_len=65)
+    dist = SimpleNamespace(rank=0, tp_rank=0, pp_rank=0, cp_rank=0)
+    manager = SimpleNamespace(kv_cache_map={}, tokens_per_block=32, mapping=dist)
+    emit = MagicMock(side_effect=RuntimeError("sink failed") if sink_fails else None)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+
+    for _ in range(100):
+        diagnostics.emit_kv_rollback(request, reason="transfer_window", dist=dist)
+    for _ in range(2):
+        diagnostics.emit_kv_rollback(request, reason="pp_reconciliation", dist=dist)
+    diagnostics.emit_kv_admission_result(request, manager, admitted=True, dist=dist)
+
+    assert [call.args[0] for call in emit.call_args_list] == [
+        "gen_kv_rollback",
+        "gen_kv_rollback",
+        "gen_kv_admission_result",
+    ]
+    assert [call.kwargs["reason"] for call in emit.call_args_list[:2]] == [
+        "transfer_window",
+        "pp_reconciliation",
+    ]
+    assert all(call.kwargs["rollback_count"] == 1 for call in emit.call_args_list[:2])
+    assert emit.call_args.kwargs["transfer_window_rollback_count"] == 100
+    assert emit.call_args.kwargs["pp_reconciliation_rollback_count"] == 2
+    assert emit.call_args.kwargs["kv_deferral_count"] == 0
+
+    other_request = SimpleNamespace(py_request_id=17, py_disaggregated_params=None, prompt_len=65)
+    diagnostics.emit_kv_rollback(other_request, reason="transfer_window", dist=dist)
+    assert emit.call_count == 4
+    assert other_request._disagg_diagnostics_kv_rollback_counts == {"transfer_window": 1}
+
+
+def test_disabled_admission_helpers_do_not_inspect_or_mutate_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared helpers remain inert even when called without an outer guard.
+
+    Args:
+        monkeypatch: Fixture for disabling diagnostics and replacing the sink.
+    """
+    request = SimpleNamespace()
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    diagnostics.emit_kv_admission_result(request, None, admitted=False)
+    diagnostics.emit_kv_admission_result(request, None, admitted=True)
+    diagnostics.emit_kv_rollback(request, reason="transfer_window", dist=None)
+    assert vars(request) == {}
+    emit.assert_not_called()

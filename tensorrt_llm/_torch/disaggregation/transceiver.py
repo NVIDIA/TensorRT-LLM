@@ -947,7 +947,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session: Optional[object],
         outcome: str,
     ) -> None:
-        """Report the caller-proven retirement without polling lifecycle state."""
+        """Report session retirement, not physical drain, without polling state."""
         with disagg_diagnostics.suppress_diagnostic_errors():
             request_id_scope = "unknown"
             if req is not None:
@@ -969,7 +969,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 rank=self._mapping.rank,
                 instance=self._instance_name,
                 outcome=outcome,
-                resources_drained=True,
+                session_retired=True,
                 tp_rank=self._mapping.tp_rank,
                 pp_rank=self._mapping.pp_rank,
                 cp_rank=self._mapping.cp_rank,
