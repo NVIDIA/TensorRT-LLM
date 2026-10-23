@@ -14,8 +14,12 @@ Functional tests only; perf runs are selected by their own configuration.
 ## Usage
 
 ```bash
-pytest --collect-only -q -p qa_selection.plugin --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
+cd tests/integration/defs
+pytest --collect-only -q --test-list=<list> --machine=B200 --selection-out-dir=out/
 ```
+
+The integration suite's `pytest.ini` loads the plugin (`-p qa_selection.plugin`), and without
+`--machine` it changes nothing.
 
 The ladder chooses the question:
 
@@ -28,9 +32,8 @@ The ladder chooses the question:
 Without `--ladder`, the machine's profile answers: its `ladder` (`1,4,8` for B200), or one rung of
 its GPUs per node when it has none. Without `--selection-out-dir` nothing is written.
 
-`pytest -p qa_selection.plugin --help` documents the three options. `-p` needs `tests/`
-importable: the integration suite's ini `pythonpath` provides it, elsewhere set
-`PYTHONPATH=tests`.
+`pytest --help` in `tests/integration/defs` documents the three options. Elsewhere, load it with
+`-p qa_selection.plugin` and `PYTHONPATH=tests`.
 
 ## Layout
 
