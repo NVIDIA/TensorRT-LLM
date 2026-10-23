@@ -16,9 +16,6 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     maybe_create_moe_load_balancer,
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
-from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
-    RebalanceSlotSchedulerGroup,
-)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -79,21 +76,16 @@ class _Group:
     helper_slots = 2
 
     def __init__(self):
-        self.has_submission_owner = False
         self.wait_calls = 0
         self.finish_calls = []
-        self.handoff_calls = []
-        self.release_calls = []
         self.events = []
 
     def plan(self, routes, *, defer_wait):
         assert defer_wait
-        self.has_submission_owner = True
         self.events.append("plan")
         return routes + 4, 7
 
     def plan_schedule(self, routes):
-        self.has_submission_owner = True
         self.events.append("schedule")
         return routes
 
@@ -110,14 +102,6 @@ class _Group:
 
     def finish(self, completion_event=None):
         self.finish_calls.append(completion_event)
-
-    def release_warmup_owner_after_sync(self, stream_handle):
-        self.handoff_calls.append(stream_handle)
-        self.has_submission_owner = False
-
-    def release_quiesced_submission_owner(self, stream_handle):
-        self.release_calls.append(stream_handle)
-        self.has_submission_owner = False
 
     def close(self):
         pass
@@ -159,6 +143,20 @@ def test_layer_produces_and_finishes_replica_plan():
     assert group.wait_calls == 1
 
     layer.finish_replica_plan(plan)
+    assert group.finish_calls == [None]
+    assert layer.replica_plan is None
+
+
+def test_post_moe_hook_releases_the_chunk_plan():
+    manager = _manager()
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
+    group = _Group()
+    layer.bind_runtime(arena=_Arena(), scheduler_group=group)
+
+    layer.route(torch.tensor([[0, 1]], dtype=torch.int32))
+    layer.start_set_cpu_stage()
+
+    assert group.wait_calls == 1
     assert group.finish_calls == [None]
     assert layer.replica_plan is None
 
@@ -315,7 +313,24 @@ def test_iteration_context_reuses_common_lifecycle():
     assert get_moe_load_balancer() is None
 
 
-def test_public_warmup_handoff_and_model_owned_shutdown():
+def test_iteration_context_releases_the_plan_of_a_failed_forward():
+    manager = _manager()
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
+    group = _Group()
+    layer.bind_runtime(arena=_Arena(), scheduler_group=group)
+
+    with pytest.raises(RuntimeError, match="MoE kernel failed"):
+        with MoeLoadBalancerIterContext(manager, True, True):
+            layer.route(torch.tensor([[0, 1]], dtype=torch.int32))
+            raise RuntimeError("MoE kernel failed")
+
+    assert group.finish_calls == [None]
+    assert layer.replica_plan is None
+    assert not manager.in_iter
+    assert manager.iter_id == 1
+
+
+def test_model_owned_shutdown():
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     arena = _Arena()
@@ -324,46 +339,11 @@ def test_public_warmup_handoff_and_model_owned_shutdown():
     arena.provider.pool = pool
     manager._rebalance_shared_slot_pools[("test",)] = pool
     manager._rebalance_shared_slot_pool_order.append(pool)
-    group = _Group()
-    group.has_submission_owner = True
-    layer.bind_runtime(arena=arena, scheduler_group=group)
+    layer.bind_runtime(arena=arena, scheduler_group=_Group())
 
-    assert manager.has_submission_owner
-    manager.handoff_submission_owner(1234)
-    assert group.handoff_calls == [1234]
-    manager.release_quiesced_submission_owner(1234)
-    assert group.release_calls == [1234]
     assert manager.shutdown()
     pool.close_collectively.assert_called_once_with(local_safe=True)
     assert manager.is_shutdown
-
-
-def _scheduler_group_for_owner_release(*, finished=True):
-    group = RebalanceSlotSchedulerGroup.__new__(RebalanceSlotSchedulerGroup)
-    group._closed = False
-    group._plan_part = None
-    group._generation = 3
-    group._finished_generation = 3 if finished else 2
-    group.plan_calls = 3
-    group._owner_thread_id = 99
-    group._execution_stream_handle = 1234
-    return group
-
-
-def test_quiesced_owner_release_clears_worker_and_stream_binding():
-    group = _scheduler_group_for_owner_release()
-
-    group.release_quiesced_submission_owner(1234)
-
-    assert group._owner_thread_id is None
-    assert group._execution_stream_handle is None
-
-
-def test_quiesced_owner_release_rejects_unfinished_generation():
-    group = _scheduler_group_for_owner_release(finished=False)
-
-    with pytest.raises(RuntimeError, match="all plans to be finished"):
-        group.release_quiesced_submission_owner(1234)
 
 
 def test_ep_communicator_is_model_owned(monkeypatch):

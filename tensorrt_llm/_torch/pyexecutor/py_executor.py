@@ -1122,8 +1122,6 @@ class PyExecutor:
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
-        self._handoff_rebalance_warmup_owners()
-
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
@@ -1401,38 +1399,6 @@ class PyExecutor:
         """
         connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
-
-    def _handoff_rebalance_warmup_owners(self) -> None:
-        """Transfer model-level EPLB submitters from warmup to serving."""
-        managers = {}
-        for engine in (self.model_engine, self.draft_model_engine):
-            manager = getattr(engine, "moe_load_balancer", None)
-            handoff = getattr(manager, "handoff_submission_owner", None)
-            if callable(handoff):
-                managers[id(manager)] = manager
-        if not managers:
-            return
-
-        # Target, draft, and encoder warmup have all completed. One device
-        # drain covers every manager's compute and copy streams before the
-        # serving worker binds submission ownership.
-        torch.cuda.synchronize(self.execution_stream.device)
-        execution_stream_handle = int(self.execution_stream.cuda_stream)
-        for manager in managers.values():
-            manager.handoff_submission_owner(execution_stream_handle)
-
-    def _release_quiesced_rebalance_submission_owners(self) -> None:
-        """Release EPLB submitters after the worker exits and device drains."""
-        execution_stream_handle = int(self.execution_stream.cuda_stream)
-        managers = {}
-        for engine in (self.model_engine, self.draft_model_engine):
-            manager = getattr(engine, "moe_load_balancer", None)
-            release = getattr(manager, "release_quiesced_submission_owner",
-                              None)
-            if callable(release):
-                managers[id(manager)] = manager
-        for manager in managers.values():
-            manager.release_quiesced_submission_owner(execution_stream_handle)
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:

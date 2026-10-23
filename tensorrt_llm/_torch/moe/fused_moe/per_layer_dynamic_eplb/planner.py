@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Single-main-thread HALO-Q and in-switch TMA weight-copy integration.
+"""HALO-Q and in-switch TMA weight-copy integration on one MAIN stream.
 
 One highest-priority stream is shared across layers. plan_schedule() enqueues
 one kernel that runs HALO-Q and then the TMA copy of its plan on the auxiliary
@@ -20,7 +20,6 @@ collective or auxiliary copy submitter is needed in the serving path.
 
 from __future__ import annotations
 
-import threading
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -167,7 +166,6 @@ class RebalanceSlotSchedulerGroup:
         self._route_wait_generation = 0
         # Routes of the latest launch, held until MAIN waits for its route epoch.
         self._routes_in_flight: Optional[torch.Tensor] = None
-        self._owner_thread_id: Optional[int] = None
         self._execution_stream_handle: Optional[int] = None
         self._closed = False
         self.scheduler = None
@@ -288,7 +286,6 @@ class RebalanceSlotSchedulerGroup:
             if self.symmetric is not None:
                 self.symmetric.close()
         self._closed = True
-        self._owner_thread_id = None
         self._execution_stream_handle = None
         self._plan_part = None
         self._pending_release = None
@@ -299,73 +296,25 @@ class RebalanceSlotSchedulerGroup:
         self.symmetric = None
         self.arena = None
 
-    @property
-    def has_submission_owner(self) -> bool:
-        """Whether a CPU thread currently owns MAIN submissions."""
-        return self._owner_thread_id is not None
-
     def _check_owner(self) -> None:
         if self._closed:
             raise RuntimeError("Rebalance scheduler group is closed")
-        thread_id = threading.get_ident()
         # Runs several times per layer: read the raw device and stream instead
-        # of building a torch.cuda.Stream, and return early for the bound owner.
+        # of building a torch.cuda.Stream, and return early for the bound MAIN.
         if torch._C._cuda_getDevice() != self.device:
             raise RuntimeError("Rebalance submission requires its bound CUDA device")
         handle = torch._C._cuda_getCurrentRawStream(self.device)
-        if thread_id == self._owner_thread_id and handle == self._execution_stream_handle:
+        if handle == self._execution_stream_handle:
             return
-        if self._owner_thread_id is not None:
-            raise RuntimeError("Rebalance must be submitted by one MAIN thread and stream")
-        if self._execution_stream_handle is not None and handle != self._execution_stream_handle:
-            raise RuntimeError("Rebalance MAIN stream cannot change during owner handoff")
+        if self._execution_stream_handle is not None:
+            raise RuntimeError(
+                "Rebalance MAIN stream cannot change; every executor of a model "
+                "engine must submit on its one execution stream"
+            )
         stream = torch.cuda.current_stream(self.device)
         if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
             raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
-        self._owner_thread_id = thread_id
         self._execution_stream_handle = handle
-
-    def release_warmup_owner_after_sync(self, execution_stream_handle: int) -> None:
-        """Release the startup CPU owner after the caller drains this device.
-
-        Keep the fixed MAIN stream, generation counters, and pending lease
-        release. The first serving submission binds its CPU owner normally.
-        """
-        if self._closed:
-            raise RuntimeError("Rebalance scheduler group is closed")
-        if self._owner_thread_id != threading.get_ident():
-            raise RuntimeError("Only the warmup submitter may release its owner")
-        if self._execution_stream_handle != int(execution_stream_handle):
-            raise RuntimeError("Warmup owner handoff requires the bound MAIN stream")
-        if (
-            self._plan_part is not None
-            or self._generation != self._finished_generation
-            or self._generation != self.plan_calls
-        ):
-            raise RuntimeError("Warmup owner handoff requires all plans to be finished")
-        self._owner_thread_id = None
-
-    def release_quiesced_submission_owner(self, execution_stream_handle: int) -> None:
-        """Release a stopped executor's MAIN owner after a device drain.
-
-        Unlike the warmup handoff, this is called by the shutdown thread after
-        the serving worker has exited. The caller must synchronize the device
-        first, so neither the old CPU thread nor its MAIN stream can still be
-        submitting work.
-        """
-        if self._closed:
-            raise RuntimeError("Rebalance scheduler group is closed")
-        handle = int(execution_stream_handle)
-        if (
-            self._plan_part is not None
-            or self._generation != self._finished_generation
-            or self._generation != self.plan_calls
-        ):
-            raise RuntimeError("Quiesced owner release requires all plans to be finished")
-        if self._execution_stream_handle is not None and self._execution_stream_handle != handle:
-            raise RuntimeError("Quiesced owner release requires the bound MAIN stream")
-        self._owner_thread_id = None
-        self._execution_stream_handle = None
 
     def _record_event(self, event_handle: int, stream_handle: int) -> None:
         (error,) = self._driver.cuEventRecord(event_handle, stream_handle)

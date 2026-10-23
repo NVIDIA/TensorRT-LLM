@@ -9,7 +9,7 @@ from typing import Any, Optional
 import torch
 
 from ..moe_load_balancer import BaseMoeLoadBalancer
-from .layer import PerLayerDynamicMoeLayerLoadBalancer
+from .layer import PerLayerDynamicMoeLayerLoadBalancer, _append_note
 
 
 class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
@@ -203,6 +203,28 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         self.in_iter = False
         self.iter_id += 1
 
+    def abort_iter(self, error: BaseException) -> None:
+        """End a failed iteration after releasing the plans it left unfinished.
+
+        A forward that raises between a layer's route and its post-``run_moe``
+        hook leaves that layer's plan pending.
+        """
+        try:
+            for layer in self.single_layer_load_balancers:
+                if layer.replica_plan is None:
+                    continue
+                try:
+                    layer.finish_replica_plan()
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    _append_note(
+                        error,
+                        "per-layer dynamic EPLB could not release the plan of layer "
+                        f"{layer.layer_idx}: {cleanup_error!r}",
+                    )
+        finally:
+            self.in_iter = False
+            self.iter_id += 1
+
     def register_weight_slots_after_to_cuda(self) -> None:
         # Live aliases are registered by the per-layer dynamic arena binder.
         pass
@@ -214,32 +236,21 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
     def set_warm_up_iter_count(self, iter_count: int) -> None:
         del iter_count
 
-    @property
-    def has_submission_owner(self) -> bool:
-        return any(layer.has_submission_owner for layer in self.single_layer_load_balancers)
-
-    def handoff_submission_owner(self, execution_stream_handle: int) -> None:
-        """Transfer all warmup-owned submitters after one caller device drain."""
-        for layer in self.single_layer_load_balancers:
-            layer.handoff_submission_owner(execution_stream_handle)
-
-    def release_quiesced_submission_owner(self, execution_stream_handle: int) -> None:
-        """Release executor ownership after the caller drains the device."""
-        for layer in self.single_layer_load_balancers:
-            group = layer._scheduler_group
-            if group is not None:
-                group.release_quiesced_submission_owner(int(execution_stream_handle))
-
     def shutdown(self, local_safe: bool = True) -> bool:
         """Collectively close this model's pools in deterministic layer order."""
         if self.is_shutdown:
             return True
 
-        # Agree on local readiness before any rank starts destructive teardown.
-        # Every MoE layer resolves the EP communicator in create_weights, and a
-        # rank whose model load failed never owns an engine that reaches this
-        # method, so the communicator exists on every EP rank or on none.
-        local_safe = bool(local_safe and not self.in_iter)
+        # Agree on local readiness before any rank starts destructive teardown;
+        # a rank is unsafe while any plan is pending. Every MoE layer resolves
+        # the EP communicator in create_weights, and a rank whose model load
+        # failed never owns an engine that reaches this method, so the
+        # communicator exists on every EP rank or on none.
+        local_safe = bool(
+            local_safe
+            and not self.in_iter
+            and all(layer.replica_plan is None for layer in self.single_layer_load_balancers)
+        )
         comm = self._ep_comm
         if comm is not None:
             states = comm.allgather(
