@@ -472,10 +472,21 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
         post_quant_comm: bool = True,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Always a pass-through: b12x consumes bf16 / fp16 and produces its
-        own scale factors."""
+        """Keeps the activation high precision -- b12x consumes bf16 / fp16 and
+        produces its own scale factors -- and only applies an AWQ pre-quant
+        scale to it.
+
+        A pre-quant scale is not part of the activation quantization this leaf
+        does not do: an AWQ-style checkpoint stores ``W / s`` and
+        ``load_quant_scales`` fills ``fc31_act_scale`` from its
+        ``*.pre_quant_scale`` keys regardless of ``quant_algo``, so the weights
+        the kernel dequantizes expect the scaled activation ``x * s``. Same as
+        the NVFP4 sibling's decode path above and the CUTLASS W4A16 leaf.
+        """
         del post_quant_comm, kwargs
         self._reject_fp4_input(x)
+        if self.fc31_act_scale is not None:
+            x = x * self.fc31_act_scale
         return x, None
 
     @nvtx_range("[b12x] run_moe")

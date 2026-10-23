@@ -232,6 +232,27 @@ def test_nvfp4_decode_applies_the_awq_pre_quant_scale():
     assert out_sf is None
 
 
+def test_w4a16_applies_the_awq_pre_quant_scale():
+    """This leaf never quantizes the activation, but an AWQ checkpoint still
+    needs its pre-quant scale: it stores ``W / s``, so the weights the b12x
+    W4A16 kernel dequantizes expect ``x * s``. ``load_quant_scales`` fills
+    ``fc31_act_scale`` from the ``*.pre_quant_scale`` keys without consulting
+    ``quant_algo``, so a plain NVFP4 checkpoint leaves it None and the input is
+    handed over untouched, exactly as before."""
+    moe = object.__new__(CuteDslB12xW4a16Nvfp4FusedMoE)
+    x = torch.ones(3, 4)
+
+    moe.fc31_act_scale = None
+    out, out_sf = moe.quantize_input(x)
+    assert out is x
+    assert out_sf is None
+
+    moe.fc31_act_scale = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    out, out_sf = moe.quantize_input(x)
+    assert torch.equal(out, x * moe.fc31_act_scale)
+    assert out_sf is None
+
+
 def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     class _RoutingMethod:
         experts_per_token = 4
