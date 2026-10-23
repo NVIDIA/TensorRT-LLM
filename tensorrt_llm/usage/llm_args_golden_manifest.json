@@ -689,11 +689,6 @@
       "path": "kv_cache_config.event_buffer_max_size"
     },
     {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "kv_cache_config.first_n"
-    },
-    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
@@ -784,11 +779,6 @@
       "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
     },
     {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "kv_cache_config.last_n"
-    },
-    {
       "allowed_values": [
         "auto",
         "float16",
@@ -838,6 +828,16 @@
       "capture_policy": "float",
       "kind": "value",
       "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_first_n"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_last_n"
     },
     {
       "capture_policy": "list[float]|none",

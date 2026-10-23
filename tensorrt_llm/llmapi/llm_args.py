@@ -4946,8 +4946,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
         "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
-        "keeps the first_n/last_n tokens of every sequence in <dtype> "
-        "('fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. "
+        "keeps the first and last N tokens of every sequence in <dtype> "
+        "('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "
+        "mixed_precision_last_n; requires KV cache manager V2. "
         "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
@@ -4956,14 +4957,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                                              "nvfp4",
                                              *_MIXED_PRECISION_KV_DTYPES))
 
-    first_n: NonNegativeInt = Field(
+    mixed_precision_first_n: NonNegativeInt = Field(
         default=256,
         status="prototype",
         description=
         "Mixed-precision KV only: number of leading tokens per sequence kept at the "
         "retained dtype. Retention follows the cache page granularity.")
 
-    last_n: NonNegativeInt = Field(
+    mixed_precision_last_n: NonNegativeInt = Field(
         default=256,
         status="prototype",
         description=
@@ -5201,8 +5202,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
         if match is None:
             return None
-        return MixedPrecisionKV(match["low"], match["high"], self.first_n,
-                                self.last_n)
+        return MixedPrecisionKV(match["low"], match["high"],
+                                self.mixed_precision_first_n,
+                                self.mixed_precision_last_n)
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5327,11 +5329,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @model_validator(mode='after')
     def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
         """A mixed-precision cache must retain at least one token per sequence."""
-        if (self.mixed_precision_kv is not None
-                and self.first_n == self.last_n == 0):
+        if (self.mixed_precision_kv is not None and self.mixed_precision_first_n
+                == self.mixed_precision_last_n == 0):
             raise ValueError(
-                "Mixed-precision KV requires first_n or last_n to be greater than zero."
-            )
+                "Mixed-precision KV requires mixed_precision_first_n or "
+                "mixed_precision_last_n to be greater than zero.")
         return self
 
     @field_validator('pool_ratio')

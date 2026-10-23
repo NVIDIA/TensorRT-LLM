@@ -125,15 +125,16 @@ For the native V2 cold-storage representation and codec extension contract, see
 ### Mixed-Precision KV Cache (Prototype)
 
 The V2 manager can store the full KV history of every full-attention layer in
-NVFP4 while keeping the first `first_n` and the most recent `last_n` tokens of
-each sequence in the regular KV dtype. Select it through `dtype`:
+NVFP4 while keeping the first `mixed_precision_first_n` and the most recent
+`mixed_precision_last_n` tokens of each sequence in the regular KV dtype.
+Select it through `dtype`:
 
 ```yaml
 kv_cache_config:
   use_kv_cache_manager_v2: true
   dtype: mixed_nvfp4_bfloat16   # or mixed_nvfp4_fp8, mixed_nvfp4_float16
-  first_n: 256
-  last_n: 256
+  mixed_precision_first_n: 256
+  mixed_precision_last_n: 256
   pool_ratio: [0.75, 0.25]      # optional, see below
 ```
 
@@ -142,8 +143,8 @@ FP8 scale per 16 elements); the second part is the dtype attention computes
 in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
 checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
 select the unquantized model dtype. Retention follows the
-cache page granularity, and at least one of `first_n` and `last_n` must be
-positive.
+cache page granularity, and at least one of `mixed_precision_first_n` and
+`mixed_precision_last_n` must be positive.
 
 Each mixed-precision layer owns two pools: its original pool holds the NVFP4
 history, and a second layer group, appended after the model's own layer

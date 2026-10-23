@@ -73,8 +73,8 @@ def test_optimized_two_pool_prefill_and_decode(
             max_tokens=65536,
             enable_block_reuse=True,
             dtype="mixed_nvfp4_fp8" if high_dtype == DataType.FP8 else "mixed_nvfp4_bfloat16",
-            first_n=block,
-            last_n=block,
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
             # Full-history (low) group, then the retained-token (high) group.
             pool_ratio=[0.75, 0.25],
         ),
@@ -442,8 +442,8 @@ def test_mla_cached_context_and_decode(backend):
             max_tokens=65536,
             enable_block_reuse=True,
             dtype="mixed_nvfp4_bfloat16",
-            first_n=block,
-            last_n=block,
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
             pool_ratio=[0.75, 0.25],
         ),
         CacheType.SELFKONLY,
@@ -635,7 +635,7 @@ def test_mixed_precision_public_options():
     assert KvCacheConfig().mixed_precision_kv is None
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
     assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256)
-    assert config.first_n == config.last_n == 256
+    assert config.mixed_precision_first_n == config.mixed_precision_last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
         assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").mixed_precision_kv.high == high
@@ -643,16 +643,18 @@ def test_mixed_precision_public_options():
         {"dtype": "mixed_int4_fp8"},
         {"dtype": "mixed_nvfp4_nvfp4"},
         {"dtype": "mixed_nvfp4_auto"},
-        {"dtype": "mixed_nvfp4_fp8", "first_n": -1},
-        {"dtype": "mixed_nvfp4_fp8", "last_n": -1},
-        {"dtype": "mixed_nvfp4_fp8", "first_n": 0, "last_n": 0},
-        {"mixed_precision_config": {"first_n": 1}},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_first_n": -1},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_last_n": -1},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_first_n": 0, "mixed_precision_last_n": 0},
+        {"mixed_precision_config": {"mixed_precision_first_n": 1}},
     ):
         with pytest.raises(ValidationError):
             KvCacheConfig(**invalid)
     for first_n, last_n in ((0, 1), (1, 0)):
-        KvCacheConfig(dtype="mixed_nvfp4_fp8", first_n=first_n, last_n=last_n)
-    KvCacheConfig(first_n=0, last_n=0)
+        KvCacheConfig(
+            dtype="mixed_nvfp4_fp8", mixed_precision_first_n=first_n, mixed_precision_last_n=last_n
+        )
+    KvCacheConfig(mixed_precision_first_n=0, mixed_precision_last_n=0)
 
 
 @pytest.mark.parametrize(
@@ -769,8 +771,8 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
                 host_cache_size=0,
                 enable_block_reuse=True,
                 dtype="mixed_nvfp4_bfloat16",
-                first_n=block,
-                last_n=block,
+                mixed_precision_first_n=block,
+                mixed_precision_last_n=block,
                 pool_ratio=[0.75, 0.25],
             ),
             CacheType.SELF,

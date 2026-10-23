@@ -85,16 +85,28 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
         (
             generator.SERVE_SCHEMA,
-            {"kv_cache_config": {"dtype": "mixed_nvfp4_fp8", "first_n": 1, "last_n": 65}},
+            {
+                "kv_cache_config": {
+                    "dtype": "mixed_nvfp4_fp8",
+                    "mixed_precision_first_n": 1,
+                    "mixed_precision_last_n": 65,
+                }
+            },
             True,
         ),
         (
             generator.SERVE_SCHEMA,
-            {"kv_cache_config": {"dtype": "mixed_nvfp4_bfloat16", "first_n": 255, "last_n": 0}},
+            {
+                "kv_cache_config": {
+                    "dtype": "mixed_nvfp4_bfloat16",
+                    "mixed_precision_first_n": 255,
+                    "mixed_precision_last_n": 0,
+                }
+            },
             True,
         ),
-        (generator.SERVE_SCHEMA, {"kv_cache_config": {"first_n": -1}}, False),
-        (generator.SERVE_SCHEMA, {"kv_cache_config": {"last_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_first_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_last_n": -1}}, False),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_config": {}}}, False),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
