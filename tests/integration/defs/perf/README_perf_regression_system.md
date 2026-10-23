@@ -58,6 +58,20 @@ builds.
 2. Apply trailing rolling mean (window=3) to smooth noise
 3. Take P95 for maximize-metrics (throughput) and P5 for minimize-metrics (latency)
 
+A caller can pass `metric_history_floors_ms` (metric -> epoch-ms `ts_created`) to
+compute a metric's baseline only from records created at or after its floor. Use it
+when a metric's *definition* changes: rows recorded under the old definition are still
+valid records of what was measured then, but they are not comparable to new rows, and
+the P5/P95 baseline is pulled by the most extreme of them. Rows with no numeric
+`ts_created` are excluded under a floor. A metric with no history left above its floor
+gets no baseline, so it is not gated until new rows accrue.
+
+A stored `d_baseline_*` pin is still honoured for a floored metric when the record it
+came from was created at or after the floor. A pin from before the floor (or of unknown
+age) is ignored for gating and is not copied onto new post-merge records (Step 7); its
+`d_threshold_*` fields are kept. Remove a floor once `QUERY_LOOKBACK_DAYS` have passed,
+since the history window then no longer reaches back past it.
+
 **Regression detection** (`prepare_regressive_test_cases`):
 - A metric is regressive if the new value breaches `baseline * (1 +/- threshold)`
 - Default thresholds: **5%** for post-merge, **10%** for pre-merge (can be overridden per-metric via embedded `d_threshold_*` fields from history)
@@ -198,6 +212,7 @@ process_and_upload_test_results(
 | `extra_fields` | `dict` or `None` | Additional fields merged into every entry |
 | `upload_to_db` | `bool` | Whether to actually post to OpenSearch |
 | `fail_on_regression` | `bool` or `None` | `None` = auto (fail pre-merge, warn post-merge) |
+| `metric_history_floors_ms` | `dict` or `None` | Metric -> epoch-ms `ts_created` floor; older history is ignored for that metric's baseline |
 
 ### What the Pipeline Handles for You
 

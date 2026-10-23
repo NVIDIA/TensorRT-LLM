@@ -267,12 +267,9 @@ Disaggregated serving separates the context (prefill) and generation (decode) ph
 
 #### Step 1: Set Environment Variables
 
-Configure the parallelism and buffer settings:
+Configure model parallelism:
 
 ```bash
-# Buffer size for KV cache transfer between context and generation servers
-export MAX_TOKENS_IN_BUFFER=8192
-
 # Model parallelism configuration
 export TP_SIZE=4
 export MOE_EP_SIZE=4
@@ -296,8 +293,8 @@ pipeline_parallel_size: 1
 enable_attention_dp: $ENABLE_ATTENTION_DP
 
 cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: $MAX_TOKENS_IN_BUFFER
+  backend: NIXL
+  transceiver_runtime: PYTHON
 EOF
 ```
 
@@ -316,8 +313,8 @@ pipeline_parallel_size: 1
 enable_attention_dp: $ENABLE_ATTENTION_DP
 
 cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: $MAX_TOKENS_IN_BUFFER
+  backend: NIXL
+  transceiver_runtime: PYTHON
 EOF
 ```
 

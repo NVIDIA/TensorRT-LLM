@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget, routing_module
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.serving import (  # noqa: E501
     PARSER_KEY,
@@ -99,6 +100,7 @@ def test_registered_under_its_key():
 
 def _beam_config(**overrides):
     fields = dict(
+        architectures=["BeamForCausalLM"],
         num_hidden_layers=52,
         hidden_size=5120,
         num_experts=256,
@@ -118,17 +120,46 @@ def _mapping(**overrides):
 
 def test_route_claims_only_the_supported_deployment():
     route = routing_module("BeamForCausalLM").route
-    target = route(_beam_config(), _mapping(), (10, 3), None)
+    target = route(_beam_config(), _mapping(), (10, 3), None, None)
     assert target.__name__ == "ModelingV2BeamFullModelNvfp4Sm103Tp4"
     declined = [
-        (_beam_config(), _mapping(), (10, 0), None),
-        (_beam_config(num_hidden_layers=6), _mapping(), (10, 3), None),
-        (_beam_config(quantization_config=None), _mapping(), (10, 3), None),
-        (_beam_config(), _mapping(tp_size=2, pp_size=2, moe_tp_size=2), (10, 3), None),
-        (_beam_config(), _mapping(moe_tp_size=1, moe_ep_size=4), (10, 3), None),
-        (_beam_config(), _mapping(enable_attention_dp=True), (10, 3), None),
-        (_beam_config(), _mapping(), (10, 3), object()),
+        (_beam_config(), _mapping(), (10, 0), None, None),
+        (_beam_config(num_hidden_layers=6), _mapping(), (10, 3), None, None),
+        (_beam_config(quantization_config=None), _mapping(), (10, 3), None, None),
+        (_beam_config(), _mapping(tp_size=2, pp_size=2, moe_tp_size=2), (10, 3), None, None),
+        (_beam_config(), _mapping(moe_tp_size=1, moe_ep_size=4), (10, 3), None, None),
+        (_beam_config(), _mapping(enable_attention_dp=True), (10, 3), None, None),
+        (_beam_config(), _mapping(), (10, 3), object(), None),
+        (_beam_config(), _mapping(), (10, 3), None, "FP8"),
+        (_beam_config(), _mapping(), (10, 3), None, "NVFP4"),
     ]
     for args in declined:
         with pytest.raises(NoTarget):
             route(*args)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "checkpoint_kv,runtime_kv,supported",
+    [(None, "auto", True), (None, "fp8", False), (None, "nvfp4", False), ("FP8", "auto", False)],
+)
+def test_engine_resolver_honors_effective_kv_format(
+    monkeypatch, mode, checkpoint_kv, runtime_kv, supported
+):
+    """The engine's complete routing call accepts BF16 KV and refuses quantized KV."""
+    monkeypatch.setattr(_router_index, "_device_compute_capability", lambda: (10, 3))
+    config = SimpleNamespace(
+        pretrained_config=_beam_config(),
+        mapping=_mapping(),
+        spec_config=None,
+        quant_config=SimpleNamespace(kv_cache_quant_algo=checkpoint_kv),
+    )
+    args = SimpleNamespace(modeling_v2=mode, kv_cache_config=SimpleNamespace(dtype=runtime_kv))
+    if supported:
+        target = _router_index.modeling_v2_resolve(config, args)
+        assert target.__name__ == "ModelingV2BeamFullModelNvfp4Sm103Tp4"
+    elif mode == "auto":
+        assert _router_index.modeling_v2_resolve(config, args) is None
+    else:
+        with pytest.raises(ValueError, match="KV cache"):
+            _router_index.modeling_v2_resolve(config, args)

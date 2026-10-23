@@ -33,7 +33,7 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 
 # isort: off
 from tensorrt_llm.llmapi import (
-    AttentionDpConfig, CudaGraphConfig, DFlashDecodingConfig,
+    AttentionDpConfig, BlockReuseConfig, CudaGraphConfig, DFlashDecodingConfig,
     DSparkDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
     MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
     PrefillCudaGraphBackend, QSASparseAttentionConfig, SamplingParams,
@@ -3773,7 +3773,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_guided_decoding(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto",
-                                        use_kv_cache_manager_v2=False)
+                                        use_kv_cache_manager_v2=True)
         with self._create_1gpu_llm(
                 kv_cache_config=kv_cache_config,
                 moe_backend="CUTLASS",
@@ -5307,9 +5307,10 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             free_gpu_memory_fraction=0.75,
             enable_block_reuse=True,
             avg_seq_len=2048,
-            mamba_state_config=MambaStateConfig(
-                additional_snapshot_offsets_from_end=[0],
+            block_reuse_config=BlockReuseConfig(
                 enable_branch_snapshot=enable_branch_snapshot),
+            mamba_state_config=MambaStateConfig(
+                additional_snapshot_offsets_from_end=[0]),
         )
         # Mirrors test_bf16: TRTLLM MoE is SM100/103 only, so use CUTLASS, which
         # is supported everywhere this test can run.

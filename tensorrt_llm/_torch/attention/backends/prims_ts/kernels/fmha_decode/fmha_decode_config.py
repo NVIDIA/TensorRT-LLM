@@ -35,8 +35,12 @@ from ..._block_sparse.common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
+from ...sage import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
 from ...split_kv_mode_policy import select_split_kv_modes
+from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
+    E4M3_MAX,
+    SOFTMAX_RESCALE_THRESHOLD_LOG2,
     AUTO_LAUNCH_TILE_SIZE_KV,
     BITS_PER_BYTE,
     BYTES_PER_KIB,
@@ -781,6 +785,16 @@ class FmhaDecodeConfig:
         return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
 
     @property
+    def uses_page_offsets_task(self) -> bool:
+        """Whether a page-table producer task stages page IDs for the load warp.
+
+        Every paged plan that is not block-sparse takes it, the
+        QToken-KvBlock-Sparse paged routes included; a block-sparse paged plan
+        reads each atom's physical page from its prepared route instead.
+        """
+        return self.use_paged_kv and not self.use_block_sparse
+
+    @property
     def shares_sparse_pattern(self) -> bool:
         """Q-block routes default to per-head patterns; token routes share."""
         if self.share_pattern_across_kv_heads is None:
@@ -1379,6 +1393,10 @@ class FmhaDecodeConfig:
     sage_k_block_size: int = 0
     sage_k_summary_block_size: int = 0
     sage_v_mean: bool = False
+    # Binades a deferred exponent anchor may lag the row maximum, at most
+    # ``SOFTMAX_RESCALE_THRESHOLD_LOG2``; 0 keeps exact anchors and None the
+    # P dtype's default. See ``softmax_anchor_headroom_log2``.
+    softmax_rescale_threshold_log2: float | None = None
     # Nonzero means each K/V stage covers only this many head-dim columns.
     # H256 SwapsMmaAb uses 128-column stages to keep TMA and TMEM layouts valid.
     head_dim_per_stage_kv: int = 0
@@ -1390,6 +1408,13 @@ class FmhaDecodeConfig:
     softmax_order_barrier_id: int = 8
     # Both softmax task groups participate: 8 warps * 32 lanes.
     softmax_order_barrier_threads: int = 256
+    # Score pairs per streamed K32 fragment whose exponentials run as FMA
+    # polynomials instead of MUFU. The best value depends on the GPU's MUFU
+    # rate; ``arch_config_args`` supplies it for the launch device.
+    ex2_emulated_pairs: int = 4
+    # Reduce streamed score-fragment maxima inside the TMEM load
+    # (tcgen05.ld.red); ``arch_config_args`` supplies it.
+    uses_ldtm_stat: bool = False
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
     # Compile-time attention-mask selection. Public APIs normalize the string
@@ -1953,6 +1978,9 @@ class FmhaDecodeConfig:
                 "Sage attention requires a two-instance Keeps profile: "
                 "Q64/KV256 or Q128/KV128"
             )
+        if not self.groups_tokens_heads_q:
+            # The prepared ``sfQ`` rows follow the grouped Q tile rows.
+            raise ValueError("Sage attention requires groups_tokens_heads_q=True")
         if self.use_paged_kv or self.headdim != 128:
             raise ValueError("Sage attention requires contiguous K/V with headdim=128")
         # Only the direct output store applies the V channel scales and means;
@@ -2410,18 +2438,48 @@ class FmhaDecodeConfig:
 
         Keeps correction skips the in-place O rescale whenever the anchor is
         unchanged, so keeping the prior anchor within
-        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
-        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
-        where that trade was measured to pay: KV256 tiles and block-sparse
-        routes, whose row maximum moves often but rarely by much. FP8 P uses
-        the static 448 scale, which needs ``p <= 1``, so it always anchors on
+        ``softmax_anchor_headroom_log2`` binades trades a bounded P range for
+        fewer TMEM rescales. The profiles listed here are the ones where that
+        trade was measured to pay: KV256 tiles and block-sparse routes, whose
+        row maximum moves often but rarely by much. A zero headroom anchors on
         the exact row maximum.
         """
         return (
             self.use_keeps_mma_ab
-            and not self.use_fp8_pv
             and (self.tile_size_kv == 256 or self.use_block_sparse)
+            and self.softmax_anchor_headroom_log2 > 0
         )
+
+    @property
+    def softmax_anchor_headroom_log2(self) -> float:
+        """Binades a deferred exponent anchor may lag the row maximum.
+
+        A probability is ``2**(s - anchor)`` times its scale with ``s - anchor``
+        at most this headroom. ``softmax_rescale_threshold_log2`` sets it.
+        Otherwise 16-bit P allows ``SOFTMAX_RESCALE_THRESHOLD_LOG2``, far
+        inside its range, and FP8 P keeps exact anchors: FP8 headroom lowers
+        the E4M3 scale by the same number of binades (``fp8_p_quant_scale``).
+        """
+        if self.softmax_rescale_threshold_log2 is not None:
+            return self.softmax_rescale_threshold_log2
+        return 0.0 if self.use_fp8_pv else SOFTMAX_RESCALE_THRESHOLD_LOG2
+
+    @property
+    def fp8_p_quant_scale(self) -> float:
+        """Scale ``c`` of FP8 probabilities, which are quantized to E4M3 as ``c * p``.
+
+        A deferred anchor lets ``p`` reach ``2**softmax_anchor_headroom_log2``,
+        so ``c`` is the E4M3 maximum divided by that bound; an exact anchor
+        keeps ``p <= 1`` and uses the whole range.
+        """
+        if self.defers_softmax_anchor_updates:
+            return E4M3_MAX * 2.0**-self.softmax_anchor_headroom_log2
+        return E4M3_MAX
+
+    @property
+    def fp8_p_quant_log2_scale(self) -> float:
+        """``log2(fp8_p_quant_scale)``, the exponent addend of FP8 probabilities."""
+        return math.log2(self.fp8_p_quant_scale)
 
     @property
     def use_sage_attention(self) -> bool:
@@ -2437,60 +2495,86 @@ class FmhaDecodeConfig:
         """Return the warps of one softmax instance."""
         return self.softmax0_num_warps if inst_id == 0 else self.softmax1_num_warps
 
-    def sage_k_groups_for_block(self, k_block_size: int) -> int:
-        """Return the K scale groups inside one streamed K32 score fragment."""
-        return max(1, self.softmax_score_fragment_regs // k_block_size)
+    def sage_k_scale_block_size(self, proxy: bool = False) -> int:
+        """Return the K block size of the ``sfK`` words one route kind reads.
 
-    @property
-    def sage_k_groups_per_fragment(self) -> int:
-        """Return the scale groups per fragment of an exact route or dense tile."""
-        if not self.use_sage_attention:
-            return 1
-        return self.sage_k_groups_for_block(self.sage_k_block_size)
-
-    @property
-    def sage_summary_k_groups_per_fragment(self) -> int:
-        """Return the scale groups per fragment of a proxy route's summaries."""
-        if not self.use_sage_attention:
-            return 1
-        return self.sage_k_groups_for_block(self.sage_k_summary_block_size)
-
-    def sage_k_groups_per_fragment_for(self, proxy: bool) -> int:
-        """Return the scale groups per fragment of one route kind."""
-        if proxy:
-            return self.sage_summary_k_groups_per_fragment
-        return self.sage_k_groups_per_fragment
+        A plan's route kinds read one geometry wherever both read words in
+        the P pass: the finer of the K and summary block sizes, and the
+        prepared scales repeat the coarser kind's (``_SageScaleLayout``). A
+        P loop per kind would cost more than the repeated words: its second
+        copy of the loop spills the softmax warps' registers. One-token
+        summary scales are the exception: the max pass dequantizes a proxy
+        route's scores, so the P pass reads exact words only and each kind
+        keeps its own block size.
+        """
+        if not self.use_block_sparse_proxy_routes:
+            return self.sage_k_block_size
+        if self.sage_k_summary_block_size == 1:
+            return 1 if proxy else self.sage_k_block_size
+        return min(self.sage_k_block_size, self.sage_k_summary_block_size)
 
     @property
     def sage_mixed_k_geometry(self) -> bool:
-        """Whether exact and proxy routes use different scale-group geometries."""
-        return (
-            self.use_sage_attention
-            and self.sage_summary_k_groups_per_fragment
-            != self.sage_k_groups_per_fragment
+        """Whether exact and proxy routes read different ``sfK`` geometries."""
+        return self.use_sage_attention and (
+            self.sage_k_scale_block_size(proxy=True) != self.sage_k_scale_block_size()
         )
 
-    def sage_scores_dequantized_for(self, proxy: bool) -> bool:
-        """Whether the max pass writes one route kind's scores back dequantized.
+    def sage_scale_layout(self, seq_len_kv: int) -> _SageScaleLayout:
+        """Return the layout of the Sage scales a plan prepares before attention.
 
-        With one scale per score (the one-token K block), the P pass then
-        reads neither ``sfK`` nor the INT32 bias. Coarser geometries keep the
-        scores quantized to avoid a TMEM round trip per tile.
+        Its K atoms are the plan's Keeps atoms, 64 K tokens of two K32 score
+        fragments, and its Q tiles the plan's grouped Q CTAs, so the softmax
+        reads a work tile's rows at ``q_group_idx * tile_size_q``. Every Sage
+        profile streams such fragments (``validate_sage_profile``).
+        """
+        assert self.use_sage_attention and self.groups_tokens_heads_q
+        assert self.keeps_atom_tokens == _SAGE_ATOM_TOKENS
+        assert self.keeps_fragments_per_atom == _SAGE_ATOM_MIN_WORDS
+        num_summaries = 0
+        if self.use_block_sparse_proxy_routes:
+            num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                seq_len_kv, self.kv_block_size
+            )
+        layout = _SageScaleLayout(
+            seq_len_kv=seq_len_kv,
+            k_block_size=self.sage_k_block_size,
+            num_summaries=num_summaries,
+            k_summary_block_size=self.sage_k_summary_block_size,
+            k_tokens_block_size=self.sage_k_scale_block_size(),
+            summaries_block_size=self.sage_k_scale_block_size(proxy=True),
+            seq_len_q=self.max_seq_len_q,
+            q_block_size=self.sage_q_block_size,
+            heads_q_per_kv=self.heads_q_per_kv,
+            tile_size_q=self.tile_size_q,
+            headdim=self.headdim,
+            v_mean=self.sage_v_mean,
+        )
+        q_rows = layout.q_rows
+        assert q_rows.tokens_per_tile == self.q_tokens_per_cta
+        assert q_rows.tiles == self.num_q_ctas
+        return layout
+
+    def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
+        """Return the ``sfK`` groups of one streamed K32 score fragment of a route kind."""
+        if not self.use_sage_attention:
+            return 1
+        return max(
+            1, self.softmax_score_fragment_regs // self.sage_k_scale_block_size(proxy)
+        )
+
+    def sage_scores_dequantized(self, proxy: bool = False) -> bool:
+        """Whether the max pass writes a route kind's scores back dequantized.
+
+        A kind with one scale per score (the one-token K block) does, so the P
+        pass reads neither its ``sfK`` nor the INT32 bias; other geometries
+        stay quantized to avoid a TMEM round trip per tile.
         """
         return (
             self.use_sage_attention
-            and self.sage_k_groups_per_fragment_for(proxy)
+            and self.sage_k_groups_per_fragment(proxy)
             == self.softmax_score_fragment_regs
         )
-
-    def sage_k_scales_in_smem_for(self, groups: int) -> bool:
-        """Whether a tile with ``groups`` scale groups per fragment keeps ``sfK`` in SMEM.
-
-        Four or more groups per K32 fragment (K blocks of 4 or 1 token) would
-        need 16 or more registers per lane, so those tiles read ``sfK`` from
-        SMEM; larger blocks keep a rotating register array.
-        """
-        return self.use_sage_attention and groups >= 4
 
     @property
     def matches_kv256_task_topology(self) -> bool:
@@ -3381,7 +3465,7 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
             )
         )
 
-    if cfg.use_paged_kv and not cfg.use_block_sparse:
+    if cfg.uses_page_offsets_task:
         roles.append(
             _WarpRole(
                 "page_offsets",
@@ -4637,7 +4721,7 @@ def _validate_profile_support(
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
-    if cfg.use_paged_kv and not cfg.use_block_sparse:
+    if cfg.uses_page_offsets_task:
         cfg.validate_paged_kv_staging_config()
     if num_heads_q % num_heads_kv != 0:
         raise ValueError("fmha_decode requires num_heads_q divisible by num_heads_kv")
@@ -4647,6 +4731,12 @@ def _validate_profile_support(
             "heads_q_per_kv metadata must equal num_heads_q / num_heads_kv"
         )
     cfg.validate_sage_profile()
+    threshold = cfg.softmax_rescale_threshold_log2
+    if threshold is not None and not 0.0 <= threshold <= SOFTMAX_RESCALE_THRESHOLD_LOG2:
+        raise ValueError(
+            "softmax_rescale_threshold_log2 must lie in "
+            f"[0, {SOFTMAX_RESCALE_THRESHOLD_LOG2:g}], got {threshold}"
+        )
     cfg.validate_block_sparse_profile(heads_q_per_kv=heads_q_per_kv)
     if use_groups_tokens_heads_q:
         make_q_tile_geometry(
@@ -5041,6 +5131,25 @@ def validate_storage_page_size(
         raise ValueError(
             "storage_tokens_per_page must be divisible by num_tokens_per_page"
         )
+
+
+def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+    """Return the config fields whose value depends on the GPU architecture.
+
+    SM100 runs a quarter of the streamed exponentials as FMA polynomials
+    because the MUFU issue rate bounds its P pass while the FMA pipe is nearly
+    idle; larger shares grow the fragment body until the softmax warps become
+    instruction-fetch bound. SM103 doubles the MUFU ex2 rate (32 results per
+    SM clock), so the polynomials only add instructions there and every
+    exponential stays on MUFU. GPUs whose TMEM loads return score maxima
+    (LDTM.STAT) take them from the load, which replaces the max pass's
+    register reduction; the context kernel shares that gate.
+    """
+    is_sm103 = tuple(compute_capability) == (10, 3)
+    return {
+        "ex2_emulated_pairs": 0 if is_sm103 else 4,
+        "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
+    }
 
 
 def make_decode_config(

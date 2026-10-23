@@ -175,7 +175,8 @@ exercised:
    within-block mask read out one-hot at P = 2, 3, 4 over a bf16 pool at
    24/2/256 and 24/4/256 and an fp8 one at 24/4/256 (bottom-right causal,
    later siblings bitwise zero, mask_type inert, a page-crossing block,
-   consecutive steps), with the full-block model as the measured rival.
+   consecutive steps), with the full-block model as the measured rival; the
+   entry's cells gate P up to 8 (the target's max_draft_len 7) against `reference`.
 12. qwen4_exp's full-attention cell, GQA 24/2/256 over a bf16 pool on the
    paged-context path: the cached-prefix rival, the sparse / skip-softmax
    group measured bitwise inert, and local_layer_idx over its 48-row mapping
@@ -183,11 +184,16 @@ exercised:
    real 48-layer manager's identity rows, and a bitwise A/B of a single-layer
    pool against mapping row 47.
 13. The no-KV-cache (encoder-only) mode qwen4_exp's vision tower runs: all
-   three cache-addressing tensors None, one context sequence per frame, MHA
-   16/16 at head_size 72 and 128, the merged-segment rival, the cache
+   three cache-addressing tensors None, one context sequence per frame (an
+   image, or one frame group of a video), MHA 16/16 at head_size 72 and 128,
+   the merged-segment rival, the cache
    arguments that are inert there, the workspace high-water mark over the
    mmmu serving shapes, and the two boundaries (update_kv_cache=False is
    rejected; head_size 72 has no generation phase).
+14. The same full-attention cell over an NVFP4 pool (e2m1 data and e4m3 block
+   scales in a second pool, unit fp32 [3] second-level scales, bf16 output):
+   the pool and its block scales bitwise as the append writes them, and the
+   output against `reference` over the NVFP4 values (the cells).
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
@@ -241,6 +247,7 @@ MASK_CAUSAL = 1  # AttentionMaskType.causal
 MASK_PADDING = 0  # AttentionMaskType.padding: no mask (bidirectional)
 
 QUANT_MODE_FP8_KV_CACHE = 128  # QuantMode.FP8_KV_CACHE (sole bit set)
+QUANT_MODE_NVFP4_KV_CACHE = 8192  # QuantMode.NVFP4_KV_CACHE (sole bit set)
 
 # fp8-e4m3 KV-pool decode tolerance. The reference dequantizes the mirrored
 # e4m3 pool content and puts q through the same e4m3 round-trip the kernel
@@ -291,6 +298,88 @@ FP8_MLA_ATOL = 2**-3
 FP8_MLA_RTOL = 2**-4
 
 
+# NVFP4: one e4m3 block scale per this many values; e2m1 magnitudes by code
+# and the round-to-nearest-even steps between them (inclusive where the upper
+# neighbour is the even code).
+NVFP4_BLOCK = 16
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_STEPS = ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False))
+E2M1_STEPS += ((3.5, True), (5.0, False))
+
+
+def _nvfp4_quantize(rows: torch.Tensor, global_scale: torch.Tensor):
+    """[n, D] rows -> (packed e2m1 bytes [n, D/2], e4m3 scale bytes [n, D/16]):
+    the attention op's append, in torch (`cvt_warp_fp16_to_fp4`)."""
+    n, d = rows.shape
+    x = rows.float().reshape(n, d // NVFP4_BLOCK, NVFP4_BLOCK)
+    block_max = x.abs().amax(-1)
+    sixth = torch.tensor(6.0, dtype=torch.float32, device=rows.device).reciprocal()
+    code = (global_scale * (block_max * sixth)).to(torch.float8_e4m3fn)
+    out_scale = torch.where(
+        block_max != 0,
+        (code.float() * global_scale.reciprocal()).reciprocal(),
+        torch.zeros_like(block_max),
+    )
+    scaled = x * out_scale[..., None]
+    magnitude = scaled.abs()
+    codes = torch.zeros(scaled.shape, dtype=torch.int32, device=rows.device)
+    for threshold, inclusive in E2M1_STEPS:
+        codes += (magnitude >= threshold if inclusive else magnitude > threshold).to(torch.int32)
+    codes |= torch.signbit(scaled).to(torch.int32) << 3
+    # 0 x inf, in a block whose scale underflows to zero: the conversion makes +6.
+    codes = torch.where(torch.isnan(scaled), torch.full_like(codes, 0x7), codes)
+    codes = codes.reshape(n, d // 2, 2)
+    return (codes[..., 0] | (codes[..., 1] << 4)).to(torch.uint8), code.view(torch.uint8)
+
+
+def _nvfp4_dequantize(packed: torch.Tensor, scales: torch.Tensor, global_scale) -> torch.Tensor:
+    """Inverse of `_nvfp4_quantize`: fp32 [n, D]."""
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    lut = torch.cat([lut, -lut])
+    raw = packed.long()
+    values = torch.stack([lut[raw & 0xF], lut[raw >> 4]], -1).flatten(-2)
+    scale = scales.view(torch.float8_e4m3fn).float().repeat_interleave(NVFP4_BLOCK, -1)
+    return values * scale / global_scale
+
+
+def _nvfp4_roundtrip(kv: torch.Tensor, global_scale) -> torch.Tensor:
+    """[T, Hkv, D] bf16 -> the bf16 values an NVFP4 pool returns for them."""
+    t, h, d = kv.shape
+    packed, scales = _nvfp4_quantize(kv.reshape(t * h, d), global_scale)
+    return _nvfp4_dequantize(packed, scales, global_scale).reshape(t, h, d).to(kv.dtype)
+
+
+def _check_nvfp4_cache(env, request_id: int) -> None:
+    """An NVFP4 pool holds each token's e2m1 bytes and its block scales -- K's
+    token-major, V's in four-token groups -- bitwise as the append writes them."""
+    tpb, hkv, d = env.tokens_per_block, env.num_kv_heads, env.head_dim
+    groups = d // NVFP4_BLOCK
+    for role, history in ((0, env.k_history[request_id]), (1, env.v_history[request_id])):
+        seq = torch.cat(history)
+        total = seq.shape[0]
+        packed, scales = _nvfp4_quantize(
+            seq.reshape(total * hkv, d), env.kv_scale_orig_quant[1 + role]
+        )
+        packed = packed.reshape(total, hkv, d // 2)
+        scales = scales.reshape(total, hkv, groups)
+        for j, page in enumerate(env.pages[request_id]):
+            n = min(tpb, total - j * tpb)
+            if n <= 0:
+                break
+            rows = slice(j * tpb, j * tpb + n)
+            got = env.kv_cache[page, role, :, :n].permute(1, 0, 2)
+            assert torch.equal(got, packed[rows]), f"request {request_id} role {role} page {j}"
+            sf_page = env.kv_block_scales[page, role]
+            if role == 0:
+                got_sf = sf_page[:, :n].permute(1, 0, 2)
+            else:
+                grouped = sf_page.reshape(hkv, tpb // 4, groups, 4).permute(0, 1, 3, 2)
+                got_sf = grouped.reshape(hkv, tpb, groups)[:, :n].permute(1, 0, 2)
+            assert torch.equal(got_sf, scales[rows]), (
+                f"request {request_id} role {role} page {j}: block scales"
+            )
+
+
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     """A softmax chain, so the band is the longest in this catalog.
 
@@ -310,6 +399,32 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     one; the fp8 200-token decode, whose KV range spans tiles, 0.58 of both.
     """
     assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
+
+
+def _compare_fp8_mla(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """The MLA context cells' band: the fp8 MLA band per element, and
+    `_compare`'s 4 ulp of relative RMS in aggregate.
+
+    `_compare`'s 8-ulp element gate states an accumulation-order difference
+    and nothing else. Over the fp8 pool the kernel also rounds the softmax
+    probabilities to e4m3 before the value product -- an MMA operand that
+    `reference(e4m3_inputs=True)` does not round -- and that error does not
+    shrink with the output's own scale (see FP8_MLA_ATOL above). Gated
+    against the row maximum it also depends on the head count: a row holds
+    `num_heads * v_head_dim` outputs, so at 16 heads the yardstick is the
+    largest of 2048 values instead of 16384, smaller and noisier, while the
+    per-element error is unchanged. The 16-head cell crossed the 8-ulp gate
+    by 1%, on one element of 135168 (0.0316 of the row scale against
+    0.03125); the 128-head cell passing it is one input that happened to,
+    not a derivation. So the element gate is the one this file derives for
+    the fp8 MLA FMHA and applies to every other fp8 context case, and the
+    aggregate keeps `_compare`'s RMS bound, which a row's width does not
+    move.
+    """
+    torch.testing.assert_close(out, ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+    err = (out.float() - ref.float()).pow(2).mean().sqrt()
+    rel_rms = (err / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)).item()
+    assert rel_rms <= 4.0 * ULP[torch.bfloat16], f"relative RMS {rel_rms:.3e} exceeds 4 bf16 ulp"
 
 
 class _PagedAttnEnv:
@@ -352,26 +467,46 @@ class _PagedAttnEnv:
         self.page_ring = page_ring
         self.rings: dict[int, List[int]] = {}
 
-        # Single-layer, single-pool paged KV cache (HND layout).
+        # Single-layer, single-pool paged KV cache (HND layout). An NVFP4 pool
+        # holds e2m1 pairs, and its e4m3 block scales live in a second pool
+        # whose pointer is the third axis of the pool pointers.
+        self.nvfp4 = bool(quant_mode & QUANT_MODE_NVFP4_KV_CACHE)
         self.kv_cache = torch.zeros(
             num_blocks,
             2,
             num_kv_heads,
             tokens_per_block,
-            head_dim,
-            dtype=pool_dtype,
+            head_dim // 2 if self.nvfp4 else head_dim,
+            dtype=torch.uint8 if self.nvfp4 else pool_dtype,
             device="cuda",
         )
-        self.pool_pointers = torch.zeros(1, 2, dtype=torch.int64, device="cpu")
-        self.pool_pointers[0, 0] = self.kv_cache.data_ptr()
+        if self.nvfp4:
+            self.kv_block_scales = torch.zeros(
+                num_blocks,
+                2,
+                num_kv_heads,
+                tokens_per_block,
+                head_dim // NVFP4_BLOCK,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            self.pool_pointers = torch.zeros(1, 2, 2, dtype=torch.int64, device="cpu")
+            self.pool_pointers[0, 0, 0] = self.kv_cache.data_ptr()
+            self.pool_pointers[0, 0, 1] = self.kv_block_scales.data_ptr()
+        else:
+            self.pool_pointers = torch.zeros(1, 2, dtype=torch.int64, device="cpu")
+            self.pool_pointers[0, 0] = self.kv_cache.data_ptr()
         # KV-cache scaling factor s: dequant = quantized * s. Mirrors the
         # production construction (quant_orig = s, orig_quant = 1/s, both
-        # fp32 [1] CUDA); None = unquantized pool, scale args passed as None.
+        # fp32 [1] CUDA, [3] -- q, K, V -- over an NVFP4 pool); None =
+        # unquantized pool, scale args passed as None.
         if kv_scaling_factor is None:
             self.kv_scale_quant_orig: Optional[torch.Tensor] = None
             self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         else:
-            factor = torch.full((1,), kv_scaling_factor, dtype=torch.float32, device="cuda")
+            factor = torch.full(
+                (3 if self.nvfp4 else 1,), kv_scaling_factor, dtype=torch.float32, device="cuda"
+            )
             self.kv_scale_quant_orig = factor
             self.kv_scale_orig_quant = 1.0 / factor
         self.pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu")
@@ -676,7 +811,11 @@ class _PagedAttnEnv:
 
     def check_cache(self, request_id: int) -> None:
         """The paged cache must hold exactly the expected rows, bitwise (the
-        bf16 K/V fed so far, or their scaled e4m3 casts for an fp8 pool)."""
+        bf16 K/V fed so far, or their scaled e4m3 casts for an fp8 pool, or
+        their NVFP4 bytes and block scales for an NVFP4 pool)."""
+        if self.nvfp4:
+            _check_nvfp4_cache(self, request_id)
+            return
         got_k, got_v, exp_k, exp_v = self.cache_pages_content(request_id)
         assert torch.equal(got_k.view(torch.uint8), exp_k.view(torch.uint8)), (
             f"K cache mismatch: request {request_id}"
@@ -1276,16 +1415,16 @@ def test_bf16_two_pool_layer_routing_gqa_d64() -> None:
 SINK_HQ, SINK_HKV, SINK_D = 64, 8, 64
 
 
-def _sink_env(**kwargs) -> _PagedAttnEnv:
-    return _PagedAttnEnv(num_heads=SINK_HQ, num_kv_heads=SINK_HKV, head_dim=SINK_D, **kwargs)
+def _sink_env(num_heads: int = SINK_HQ, num_kv_heads: int = SINK_HKV, **kwargs) -> _PagedAttnEnv:
+    return _PagedAttnEnv(num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=SINK_D, **kwargs)
 
 
-def _sinks(low: float, high: float, seed: int) -> torch.Tensor:
+def _sinks(low: float, high: float, seed: int, num_heads: int = SINK_HQ) -> torch.Tensor:
     """One fp32 sink logit per q head, spread over [low, high] so every head
     carries a different value (a kernel indexing sinks by kv head, or by a
     shifted head index, cannot match the reference)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    return torch.empty(SINK_HQ, dtype=torch.float32, device="cuda").uniform_(
+    return torch.empty(num_heads, dtype=torch.float32, device="cuda").uniform_(
         low, high, generator=gen
     )
 
@@ -4273,8 +4412,11 @@ def test_fp8_mla_r1_cell_context_prefill_h128() -> None:
     _assert_table_pins_the_append(env, rival, 0, pre[3], lens[0])
 
 
-def test_fp8_mla_r1_cell_generation_decode_h128() -> None:
-    """Latent-MQA decode at the complete R1 cell over the fp8-e4m3 pool.
+def _fp8_mla_r1_generation_decode(num_heads: int, p: int = 1) -> None:
+    """Latent-MQA decode at the complete R1 cell over the fp8-e4m3 pool, at
+    `num_heads` (128 at attention DP; the deepseek default target splits them
+    over attention TP) and `p` query rows per sequence (`max_draft_len + 1`
+    under MTP). Every MLA generation cell runs it from `test_certified_cells`.
 
     Nothing is rotated in this phase, so of the cell's three axes only
     q_scaling has an effect here — it reaches the kernel through the caller's
@@ -4282,33 +4424,40 @@ def test_fp8_mla_r1_cell_generation_decode_h128() -> None:
     scale. Histories of 64 (two exact pages, first decode token opens page 2)
     and 31 (first decode token takes page 0's last slot, second opens page 1),
     two steps. Gated against a reference at q_scaling = 1.0 (observed 4.2x the
-    fp8 band, where the matching reference uses 0.20).
+    fp8 band at P = 1, where the matching reference uses 0.20).
     """
-    env = _fp8_r1_env()
+    env = _fp8_r1_env(num_heads=num_heads)
     prefill = [64, 31]
     _fp8_mla_prefill(env, prefill, 951)
     for rid in (0, 1):
         env.check_cache(rid)
     for _ in range(2):
         for rid in (0, 1):
-            env.append_decode_latent(
-                rid,
-                torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
-            )
+            for _ in range(p):
+                env.append_decode_latent(
+                    rid,
+                    torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                )
         pool_before = env.pool.clone()
         fused_q = (
-            torch.randn(2, env.num_heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.3
+            torch.randn(2 * p, env.num_heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+            * 0.3
         )
-        out = env.call_generation([0, 1], fused_q)
+        out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
         torch.testing.assert_close(
             out,
-            env.generation_reference([0, 1], fused_q),
+            env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p),
             rtol=FP8_MLA_RTOL,
             atol=FP8_MLA_ATOL,
         )
         _assert_far_outside_band(
             out,
-            env.generation_reference([0, 1], fused_q, softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM)),
+            env.generation_reference(
+                [0, 1],
+                fused_q,
+                softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM),
+                predicted_tokens_per_seq=p,
+            ),
             2.0,
             "fp8 R1-cell MLA decode against a q_scaling = 1.0 reference",
             FP8_MLA_ATOL,
@@ -5391,8 +5540,12 @@ def _op_reference(
     e4m3: bool = False,
     layer: Optional[int] = None,
     window: Optional[int] = None,
+    nvfp4: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
+
+    nvfp4=True reads K and V as an NVFP4 pool returns them (the history
+    through `_nvfp4_roundtrip`) before the e4m3 arithmetic `e4m3` selects.
 
     Call it after the op call, so each history ends with this call's K/V:
     `reference`'s bottom-right alignment then puts this call's q rows at the
@@ -5403,6 +5556,9 @@ def _op_reference(
     """
     hq, hkv, d = env.num_heads, env.num_kv_heads, env.head_dim
     ks, vs = zip(*(_history(env, rid, layer) for rid in request_ids))
+    if nvfp4:
+        ks = tuple(_nvfp4_roundtrip(k, env.kv_scale_orig_quant[1]) for k in ks)
+        vs = tuple(_nvfp4_roundtrip(v, env.kv_scale_orig_quant[2]) for v in vs)
     return op.reference(
         qkv[:, : hq * d],
         torch.cat(ks).reshape(-1, hkv * d),
@@ -5896,8 +6052,8 @@ def test_fp8_std_append_race_control() -> None:
 # (its draft chain), token-major. On sm_103 a linear draft leaves every
 # spec_decoding_* tensor None and is_spec_decoding_enabled False, so the
 # within-block mask has to come from predicted_tokens_per_seq alone. The cells
-# gate P = 1..4 against `op.reference`; these read the mask out directly and
-# measure the rival.
+# gate P = 1..8 against `op.reference`; these read the mask out directly and
+# measure the rival at P = 2..4.
 
 # One configuration per pool the cells certify P over: qwen4_exp's 24/2/256
 # over bf16, and 24/4/256 over bf16 and over fp8 at s = 1.0. The weight
@@ -5908,6 +6064,7 @@ _DRAFT_POOLS = [
     ("bf16 24/2/256", 2, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
     ("bf16 24/4/256", 4, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
     ("fp8 24/4/256", 4, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+    ("fp8 24/2/256", 2, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
 ]
 
 
@@ -6227,7 +6384,11 @@ QWEN_ATTN_LAYERS = list(range(3, QWEN_NUM_LAYERS, 4))
 
 
 def _qwen_layer_pools(
-    attn_blocks: int = 48, other_blocks: int = 32, max_seq_len: int = 256, max_batch: int = 4
+    attn_blocks: int = 48,
+    other_blocks: int = 32,
+    max_seq_len: int = 256,
+    max_batch: int = 4,
+    **pool_kw,
 ) -> Tuple[_MultiLayerPagedAttnEnv, _MultiLayerPagedAttnEnv]:
     """The two pools of the hybrid mapping, at the full-attention cell.
 
@@ -6235,7 +6396,8 @@ def _qwen_layer_pools(
     rows name a real, distinct pool base and the untouched assertion has
     somewhere to look. Both managers take the same max_seq_len and max_batch,
     which makes their block-offset tables concatenable into the per-pool table
-    the op indexes by the mapping's pool column.
+    the op indexes by the mapping's pool column. `pool_kw` (dtype, quant_mode,
+    kv_scaling_factor) goes to both.
     """
     kw = dict(
         num_heads=QWEN_HQ,
@@ -6244,6 +6406,7 @@ def _qwen_layer_pools(
         tokens_per_block=QWEN_TPB,
         max_seq_len=max_seq_len,
         max_batch=max_batch,
+        **pool_kw,
     )
     attn = _MultiLayerPagedAttnEnv(num_layers=len(QWEN_ATTN_LAYERS), num_blocks=attn_blocks, **kw)
     other = _MultiLayerPagedAttnEnv(
@@ -6831,13 +6994,15 @@ def _cell_standard(cell) -> None:
     spec = cell.spec
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     window = spec["window"]
+    heads = dict(num_heads=spec["num_heads"], num_kv_heads=spec["num_kv_heads"])
+    assert spec["head_size"] == SINK_D, spec["head_size"]
     env = (
-        _sink_env(attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
+        _sink_env(**heads, attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
         if window
-        else _sink_env()
+        else _sink_env(**heads)
     )
     n_tokens = 200 if window else 48
-    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000)
+    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000, num_heads=spec["num_heads"])
     env.add_request(0, n_tokens)
     qkv = env.random_qkv(n_tokens)
     out = _paged_ctx_call(env, qkv, [n_tokens], 1, [0], attention_sinks=sink)
@@ -6884,8 +7049,11 @@ def _cell_mla_context(cell) -> None:
     The two scale factors under quant_mode 128 -- `s**2` inside the softmax
     scale and `s` on the output -- default to 1.0 on this flavour, which is why
     only `e4m3_inputs` is set here.
+
+    Gated by `_compare_fp8_mla`, not `_compare`: see its docstring for why
+    the fp8 pool needs the fp8 MLA element band.
     """
-    env = _fp8_r1_env()
+    env = _fp8_r1_env(num_heads=cell.spec["num_heads"])
     cached_lens, new_lens = [96, 31, 0], [32, 9, 25]
     kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
@@ -6918,7 +7086,7 @@ def _cell_mla_context(cell) -> None:
         atol=FP8_MLA_ATOL,
         msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
     )
-    _compare(out, ref)
+    _compare_fp8_mla(out, ref)
 
 
 def _seed(cell) -> None:
@@ -6932,13 +7100,14 @@ def _cell_paged(cell, arm) -> None:
     A first, uncertified context call fills each sequence's `cached` tokens;
     the certified call then appends `new` rows per sequence (P for a generation
     row) and is gated against `op.reference` over the history it should have
-    attended. Over an fp8 pool every operand that call reads went through
+    attended. Over an fp8 or NVFP4 pool every operand that call reads went through
     e4m3, except on the packed context path, which never reads the pool.
     """
     spec = cell.spec
     arm(op)
     _seed(cell)
     fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    nvfp4 = bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
     env = _PagedAttnEnv(
         num_heads=spec["num_heads"],
         num_kv_heads=spec["num_kv_heads"],
@@ -6949,7 +7118,7 @@ def _cell_paged(cell, arm) -> None:
         max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
-        kv_scaling_factor=spec["kv_scale"] if fp8 else None,
+        kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
         attention_window_size=spec["window"],
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
@@ -6985,9 +7154,12 @@ def _cell_paged(cell, arm) -> None:
     # One e4m3 flag covers the whole call: the packed path's context rows read
     # bf16, its generation rows e4m3, so a cell never mixes the two there.
     assert not (fp8 and not paged and 0 < nc < len(rids))
-    e4m3 = fp8 and (paged or nc == 0)
+    assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
+    e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    ref = _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, window=spec["window"])
+    ref = _op_reference(
+        env, qkv, list(new), rids, causal=causal, e4m3=e4m3, window=spec["window"], nvfp4=nvfp4
+    )
     _compare(out, ref)
     for rid in rids:
         env.check_cache(rid)
@@ -7009,8 +7181,14 @@ def _cell_layered(cell, arm) -> None:
     row, p = spec["local_layer_idx"], spec["predicted_tokens_per_seq"]
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     assert all(cached), "the history call drives every sequence of the cell"
+    fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    pool_kw = (
+        dict(dtype=DataType.FP8, quant_mode=spec["quant_mode"], kv_scaling_factor=spec["kv_scale"])
+        if fp8
+        else {}
+    )
     if spec["pool_layout"] == "hybrid48":
-        env, other = _qwen_layer_pools(max_batch=spec["max_num_requests"])
+        env, other = _qwen_layer_pools(max_batch=spec["max_num_requests"], **pool_kw)
         layer = QWEN_ATTN_LAYERS.index(row)
     else:
         env = _MultiLayerPagedAttnEnv(
@@ -7022,6 +7200,7 @@ def _cell_layered(cell, arm) -> None:
             num_blocks=24,
             max_batch=spec["max_num_requests"],
             max_seq_len=128,
+            **pool_kw,
         )
         other, layer = None, row
 
@@ -7067,7 +7246,7 @@ def _cell_layered(cell, arm) -> None:
         predicted_tokens_per_seq=p,
         **tables(),
     )
-    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer))
+    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer, e4m3=fp8))
     env.check_caches(rids, layers=[layer])
     _assert_only_this_layer_moved(env, snapshot, layer, cell.why)
     for before, after in zip(other_before, [] if other is None else other.layer_views):
@@ -7095,12 +7274,11 @@ def _cell_encoder(cell, arm) -> None:
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     """Drive every configuration the entry claims.
 
-    The MLA generation cell is driven by the tests above rather than here: its
-    output lives in latent space, reconstructed from the paged cache, and the
-    entry's `reference` takes explicit K/V. The cell stays in the list because
-    it is a configuration a shipped target runs and `is_valid` is checked
-    against it; what this file does not do is compare it to `reference`, and
-    saying so is better than a cell that quietly proves less than its siblings.
+    An MLA generation cell is not compared to `reference`: its output lives in
+    latent space, reconstructed from the paged cache, and the entry's
+    `reference` takes explicit K/V. It runs the latent-space decode check
+    `_fp8_mla_r1_generation_decode` at the cell's head count instead, after
+    `is_valid`.
 
     The cells that state their batch as `cached`/`new` (or `seg_lens`, with no
     KV cache) arm `certifying`, so their run is also proof that the entry's
@@ -7121,4 +7299,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     else:
         with validating(op):
             op.is_valid(num_heads=cell.spec["num_heads"], num_kv_heads=cell.spec["num_kv_heads"])
-        pytest.skip("MLA generation is covered by test_fp8_mla_r1_cell_generation_decode_h128")
+        _fp8_mla_r1_generation_decode(
+            cell.spec["num_heads"], cell.spec.get("predicted_tokens_per_seq", 1)
+        )

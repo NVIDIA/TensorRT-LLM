@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from ..._router_index import NoTarget
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 def _quant_algo(pretrained_config: Any) -> Optional[str]:
@@ -21,11 +25,17 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    kv_cache_quant_algo: Optional[Any],
+    model_config: Optional[ModelConfig] = None,
+    llm_args: Optional[TorchLlmArgs] = None,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     The one target is the 52-layer NVFP4-expert checkpoint on four sm_103 ranks: attention
-    TP4, MoE TP4/EP1, PP1, no attention data parallelism, no speculative decoding.
+    TP4, MoE TP4/EP1, PP1, BF16 KV cache, no attention data parallelism, no speculative
+    decoding. ``kv_cache_quant_algo`` is the effective engine setting, including runtime
+    overrides. No additional engine choice in ``model_config`` or ``llm_args`` selects a
+    different target.
     """
     shape = (
         pretrained_config.num_hidden_layers,
@@ -47,6 +57,7 @@ def route(
         and layout == (4, 4, 1, 4, 1, False)
         and quant_algo == "NVFP4"
         and spec_config is None
+        and kv_cache_quant_algo is None
     ):
         from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
 
@@ -56,6 +67,7 @@ def route(
         f"compute capability {compute_capability}, config shape {shape}, quantization "
         f"{quant_algo}, layout (world, tp, pp, moe_tp, moe_ep, attention_dp) {layout}, "
         f"speculative decoding {type(spec_config).__name__ if spec_config is not None else 'off'}; "
+        f"KV cache {kv_cache_quant_algo or 'bf16'}; "
         "the one Beam target is the 52-layer NVFP4 checkpoint on sm103, attention TP4, MoE "
-        "TP4/EP1, PP1, without attention DP or speculative decoding"
+        "TP4/EP1, PP1, with BF16 KV cache and without attention DP or speculative decoding"
     )

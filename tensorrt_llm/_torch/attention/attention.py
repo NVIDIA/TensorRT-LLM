@@ -985,27 +985,30 @@ class Attention(nn.Module):
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
 
-        attn_output = self.attn.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            forward_args=AttentionForwardArgs(
-                out_scale=out_scale,
-                out_scale_sf=out_scale_sf,
-                kv_scale_orig_quant=kv_scale_orig_quant,
-                kv_scale_quant_orig=kv_scale_quant_orig,
-                attention_mask=attention_mask,
-                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-                mrope_position_deltas=mrope_position_deltas,
-                attention_window_size=attention_window_size,
-                attention_mask_data=attention_mask_data,
-                output=output[:num_tokens, :] if output is not None else None,
-                output_sf=output_sf,
-                attention_sinks=attention_sinks,
-                relative_attention_bias=relative_attention_bias,
-                relative_attention_max_distance=relative_attention_max_distance,
-            ))
+        with attn_metadata.mixed_precision_kv_staging(self.attn.layer_idx):
+            attn_output = self.attn.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                forward_args=AttentionForwardArgs(
+                    out_scale=out_scale,
+                    out_scale_sf=out_scale_sf,
+                    kv_scale_orig_quant=kv_scale_orig_quant,
+                    kv_scale_quant_orig=kv_scale_quant_orig,
+                    attention_mask=attention_mask,
+                    mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+                    mrope_position_deltas=mrope_position_deltas,
+                    attention_window_size=attention_window_size,
+                    attention_mask_data=attention_mask_data,
+                    output=output[:num_tokens, :]
+                    if output is not None else None,
+                    output_sf=output_sf,
+                    attention_sinks=attention_sinks,
+                    relative_attention_bias=relative_attention_bias,
+                    relative_attention_max_distance=
+                    relative_attention_max_distance,
+                ))
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
