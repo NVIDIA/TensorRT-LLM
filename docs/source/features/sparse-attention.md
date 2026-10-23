@@ -408,7 +408,6 @@ For NVFP4 KV cache, select MSA explicitly:
 ```yaml
 kv_cache_config:
   dtype: nvfp4
-  enable_block_reuse: false
 sparse_attention_config:
   algorithm: minimax_m3
   implementation: msa
@@ -422,9 +421,10 @@ within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
 caches with an FP8 indexer.
 
-The sparse path has no dense fallback and does not support KV-cache reuse.
-Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
-configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not
+The sparse path has no dense fallback; KV-cache block reuse is supported.
+Eagle3 supports one shared draft layer and linear drafting, and a standalone
+DSpark drafter is supported; MTP and tree configurations are unsupported.
+NVFP4 KV with piecewise CUDA graphs is not
 qualified by the existing FP8-KV PCG tests. See the
 [MiniMax-M3 deployment guide](../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md)
 for supported checkpoints and parallel deployment settings.
