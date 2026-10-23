@@ -1148,10 +1148,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
-        # Per-step host planning of the opt-in wide-beam generation library.
+        # Per-step host planning of the opt-in shared-prefix generation library.
         # It must run here, ahead of every forward of the step, so that under
         # CUDA graphs it precedes both capture and replay.
-        if self.beam_width > 1 and is_fmha_lib_enabled(BEAM_SHARED_PREFIX_LIB):
+        if is_fmha_lib_enabled(BEAM_SHARED_PREFIX_LIB):
             beam_shared_prefix_plan_step(self)
 
     def prepare_encoder_decoder_from_precomputed_lengths(

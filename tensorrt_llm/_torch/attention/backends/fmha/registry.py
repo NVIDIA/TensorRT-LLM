@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import os
 from typing import TypeAlias
 
@@ -52,10 +53,12 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "prims_ts": PrimsTSFmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
-        "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
-        # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
-        # takes generation-only beam-search batches ahead of the fallback.
+        # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+beam_shared_prefix).
+        # It must precede flashinfer_trtllm_gen, which takes every generation
+        # batch it supports. It declines eager batches without a shared prefix
+        # but serves every n-sample batch a CUDA graph is captured for.
         "beam_shared_prefix": BeamSharedPrefixFmha,
+        "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }
 
@@ -71,7 +74,12 @@ DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:
-    value = os.environ.get("TLLM_FMHA_LIBS")
+    return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS"))
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_fmha_libs_value(value: str | None) -> tuple[str, ...]:
+    """Parse a ``TLLM_FMHA_LIBS`` value; cached because per-step host code queries it."""
     if value is None or not value.strip():
         return DEFAULT_FMHA_LIBS
 
