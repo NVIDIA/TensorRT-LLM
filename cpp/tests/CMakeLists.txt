@@ -42,7 +42,9 @@ endforeach()
 
 function(tllm_assert_test_is_component_local target)
   get_target_property(link_libraries ${target} LINK_LIBRARIES)
-  if("${SHARED_TARGET}" IN_LIST link_libraries)
+  # Reject expressions mentioning the full target in any configuration branch.
+  string(REGEX REPLACE "[$<>:,]" ";" link_tokens "${link_libraries}")
+  if("${SHARED_TARGET}" IN_LIST link_tokens)
     message(
       FATAL_ERROR
         "${target} links the full TensorRT-LLM library; use FULL_STACK explicitly"
@@ -53,8 +55,8 @@ function(tllm_assert_test_is_component_local target)
       continue()
     endif()
     get_target_property(dep_interface ${dep} INTERFACE_LINK_LIBRARIES)
-    if("${SHARED_TARGET}" IN_LIST dep_interface
-       OR "$<LINK_ONLY:${SHARED_TARGET}>" IN_LIST dep_interface)
+    string(REGEX REPLACE "[$<>:,]" ";" dep_interface_tokens "${dep_interface}")
+    if("${SHARED_TARGET}" IN_LIST dep_interface_tokens)
       message(
         FATAL_ERROR
           "${target} links ${dep}, which interface-links the full TensorRT-LLM library; use FULL_STACK explicitly"
