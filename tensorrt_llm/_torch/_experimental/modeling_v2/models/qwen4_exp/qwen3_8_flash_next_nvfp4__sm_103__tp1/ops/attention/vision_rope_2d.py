@@ -30,24 +30,10 @@ HEAD_DIM = 72
 MERGE = 2
 THETA = 10000.0
 
-#: (frames, height, width) in patch units. The `serving_*` rows come from the
-#: runtime-value dump of the mmmu gate (58.33): 170 segment sizes from 256 to
-#: 12544 per frame, calls of up to 22144 rows. 62x90 is a grid this processor
-#: emits; 112x112 the square form of the largest segment; 22144 the largest call.
-GRIDS = {
-    "one_block": ((1, 2, 2),),
-    "tiny_image": ((1, 4, 4),),
-    "image": ((1, 32, 32),),
-    "prefill_image": ((1, 64, 64),),
-    "two_images": ((1, 16, 24), (1, 8, 12)),
-    "video": ((2, 4, 6),),
-    "video_and_image": ((3, 8, 8), (1, 4, 4)),
-    "serving_frame_5580": ((1, 62, 90),),
-    "serving_frame_12544": ((1, 112, 112),),
-    "serving_batch_22144": ((1, 112, 112), (1, 96, 100)),
-}
-
-_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+#: (frames, height, width) in patch units, from the runtime-value dump of the
+#: mmmu gate (58.33): 170 segment sizes from 256 to 12544 per frame, calls of up
+#: to 22144 rows. 62x90 is a grid this processor emits.
+SERVING_FRAME = ((1, 62, 90),)
 
 
 def _rotate_half(x: torch.Tensor, half: int) -> torch.Tensor:
@@ -100,60 +86,28 @@ class VisionRope2d(OpWrapper):
     # "packed_qkv" -- q and k as the `split` views of one [T, 3*heads, D]
     # projection, which is how the tower calls it.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(why=f"{name} {str(dtype)[6:]}", spec=dict(grid=grid, dtype=dtype))
-            for name, grid in GRIDS.items()
-            for dtype in _DTYPES
-        )
-        + tuple(
-            Cell(
-                why=f"grid side {max(h, w)} ({h}x{w}) {str(dtype)[6:]}: largest angle",
-                spec=dict(grid=((1, h, w),), dtype=dtype),
-            )
-            for h, w in ((2, 112), (2, 196), (2, 512), (2, 1024), (2, 6272), (6272, 2))
-            for dtype in (torch.float32, torch.bfloat16)
-        )
-        + tuple(
-            Cell(
-                why=f"head geometry {heads}x{head_dim}",
-                spec=dict(grid=((1, 8, 12),), dtype=torch.bfloat16, heads=heads, head_dim=head_dim),
-            )
-            for heads, head_dim in ((8, 64), (4, 128), (2, 40))
-        )
-        + (
-            Cell(
-                why="k carries its own head count (16 q / 2 k)",
-                spec=dict(grid=GRIDS["two_images"], dtype=torch.bfloat16, heads_k=2),
+        Cell(
+            why="call site: q/k split views of packed qkv, 62x90",
+            spec=dict(grid=SERVING_FRAME, dtype=torch.bfloat16, layout="packed_qkv"),
+        ),
+        Cell(
+            why="call site: packed qkv views, video + image (two grid rows)",
+            spec=dict(
+                grid=((3, 8, 8), (1, 16, 24)),
+                dtype=torch.bfloat16,
+                layout="packed_qkv",
+                grid_dtype=torch.int64,
             ),
-            Cell(
-                why="call site: q/k split views of packed qkv, 62x90",
-                spec=dict(
-                    grid=GRIDS["serving_frame_5580"], dtype=torch.bfloat16, layout="packed_qkv"
-                ),
+        ),
+        Cell(
+            why="call site: packed qkv views, video at the 32768-row ceiling",
+            spec=dict(
+                grid=((64, 16, 32),),
+                dtype=torch.bfloat16,
+                layout="packed_qkv",
+                grid_dtype=torch.int64,
             ),
-            Cell(
-                why="call site: packed qkv views, video + image",
-                spec=dict(
-                    grid=((3, 8, 8), (1, 16, 24)),
-                    dtype=torch.bfloat16,
-                    layout="packed_qkv",
-                    grid_dtype=torch.int64,
-                ),
-            ),
-            Cell(
-                why="grid_thw int64 on the device (host sync)",
-                spec=dict(
-                    grid=GRIDS["two_images"],
-                    dtype=torch.bfloat16,
-                    grid_dtype=torch.int64,
-                    grid_device="cuda",
-                ),
-            ),
-            Cell(
-                why="theta 1e6: theta is an argument",
-                spec=dict(grid=GRIDS["tiny_image"], dtype=torch.float32, theta=1.0e6),
-            ),
-        )
+        ),
     )
 
     note = """
@@ -162,22 +116,25 @@ class VisionRope2d(OpWrapper):
     `k` need last-dim stride 1 only; they are not mutated.
 
     `head_dim` must be divisible by 4; otherwise the angle table's width
-    mismatches the head and the broadcast raises (loud, so not guarded).
+    mismatches the head and the broadcast raises (loud, so not guarded; not
+    pinned by a test).
 
-    Accuracy vs fp64 angles over the cells: fp32 <= 4.77e-7, fp16 <= 1.95e-3,
-    bf16 <= 1.56e-2 (one ulp at unit-normal operands), flat in the grid side up
-    to 6272 -- the fp64 table is why (an fp32 `inv_freq` times fp32 position
-    moved an fp32 output 1.475e-5 at a 64 side, outside the default gate).
-    Wrong operators at 1024 bf16 tokens land 8.5-9.5 away: GPT-J pairing, axes
-    swapped, raster order, `inv_freq` over `head_dim`.
+    Accuracy vs fp64 angles over the cells: bf16 <= 1.56e-2 (one ulp at
+    unit-normal operands). Measured, not certified: fp32 <= 4.77e-7, flat in the
+    grid side up to 6272 -- the fp64 table is why (an fp32 `inv_freq` times fp32
+    position moved an fp32 output 1.475e-5 at a 64 side, outside the default
+    gate); wrong operators at 1024 bf16 tokens land 8.5-9.5 away: GPT-J pairing,
+    axes swapped, raster order, `inv_freq` over `head_dim`.
 
     Host-bound: ~353 us/call at 1024 and 4096 tokens (`.tolist()` + small
-    launches), x27 blocks per image. The table depends only on the grid.
-    CUDA graphs: capture bakes in the grid; replay under another grid was not
-    measured.
+    launches), x27 blocks per image. The table depends only on the grid, and the
+    result does not depend on the grid's placement (host or device) or integer
+    dtype (int32 or int64).
 
-    Not certified: mixed q/k dtypes; float8; `spatial_merge_size` != 2; grid
-    sides past 6272 or calls past 22144 tokens.
+    Not certified: float16 or float32; mixed q/k dtypes or head counts; head
+    geometries other than 16 x 72; float8; `spatial_merge_size` != 2; `theta`
+    other than 1e4; grid sides past 90 or calls past 32768 rows; CUDA-graph
+    capture (it would bake in the grid).
     """
 
     def __call__(

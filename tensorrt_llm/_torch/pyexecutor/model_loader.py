@@ -20,6 +20,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
@@ -134,16 +135,22 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
         kv_cache_config.enable_block_reuse = False
 
 
+def effective_mamba_ssm_cache_dtype(config: ModelConfig,
+                                    mamba_ssm_cache_dtype: str) -> torch.dtype:
+    """The recurrent-state cache dtype the engine runs with."""
+    if mamba_ssm_cache_dtype == "auto":
+        return resolve_auto_ssm_cache_dtype(config.pretrained_config,
+                                            config.torch_dtype)
+    return str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+
 def validate_and_set_mamba_ssm_cache_dtype(
         config: ModelConfig,
         mamba_ssm_cache_dtype: str,
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
-    if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
-            config.pretrained_config, config.torch_dtype)
-    else:
-        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
+        config, mamba_ssm_cache_dtype)
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)
@@ -736,6 +743,18 @@ class ModelLoader:
             transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="phi3-for-causal-lm-bf16-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_phi3", "Phi3ForCausalLM"),
+            architecture="Phi3ForCausalLM",
+            model_type="phi3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
     ))
 
