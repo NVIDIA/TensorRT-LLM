@@ -23,6 +23,10 @@ from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
+_USE_KV_NORM_PACK = os.environ.get("TRTLLM_DSA_KV_NORM_PACK", "0") == "1"
+if _USE_KV_NORM_PACK:
+    from .kv_norm_pack import is_kv_norm_pack_supported, kv_norm_pack
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.mla import MLA
 
@@ -259,15 +263,31 @@ def forward_dsa_proj(
         [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
     )
 
-    q_pair, compressed_kv = maybe_execute_in_parallel(
-        lambda: self._q_a_layernorm_maybe_fused(q, return_norm_out=True),
-        lambda: self.kv_a_layernorm(compressed_kv),
-        self.ln_events[0],
-        self.ln_events[1],
-        self.aux_stream,
-    )
-    q, qr = q_pair
-    latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+    if _USE_KV_NORM_PACK and is_kv_norm_pack_supported(compressed_kv, k_pe, self.kv_a_layernorm):
+        q_pair, kv_pair = maybe_execute_in_parallel(
+            lambda: self._q_a_layernorm_maybe_fused(q, return_norm_out=True),
+            lambda: kv_norm_pack(
+                compressed_kv,
+                k_pe,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+            ),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        compressed_kv, latent_cache = kv_pair
+        q, qr = q_pair
+    else:
+        q_pair, compressed_kv = maybe_execute_in_parallel(
+            lambda: self._q_a_layernorm_maybe_fused(q, return_norm_out=True),
+            lambda: self.kv_a_layernorm(compressed_kv),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        q, qr = q_pair
+        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
     q = self.q_b_proj(q)
 
