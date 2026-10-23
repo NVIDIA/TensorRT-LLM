@@ -134,6 +134,8 @@ l0_b200:
   - unittest/_torch/kv_cache_compression
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
+  # Locality domains via mock localization: per-domain KV pools on one GPU.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_locality_domains
   - unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
