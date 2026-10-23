@@ -69,11 +69,23 @@ from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+    CUTLASS_LEAVES,
+    TrtllmCutlassFp8Impl,
+    TrtllmCutlassNvfp4Impl,
+    TrtllmCutlassUnquantizedImpl,
+    TrtllmCutlassW4a16Mxfp4Impl,
+    TrtllmCutlassW4a16Nvfp4Impl,
+    TrtllmTritonFp8BlockScalesImpl,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     CuteDslFusedMoENvfp4Runner,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     CuteDslFc12FusedMoE,
     CuteDslFc12FusedMoENvfp4Runner,
@@ -103,13 +115,13 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoECuteDsl,
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    IMPL_PRIORITY,
     _reject_unsupported_activation,
     build_moe_deployment,
     impl_class_for,
@@ -651,7 +663,7 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
 
 
 def test_other_backend_rejects_deep_ep_direct_metadata() -> None:
-    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    backend = TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl)
     assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
@@ -840,13 +852,15 @@ def test_no_hook_skips_the_hook_validation_entirely():
     moe.validate_backend(_HookRefusingBackend())  # does not raise
 
 
+@pytest.mark.cpu_only
 def test_the_capability_declarations_match_the_kernels():
     """The leaves that plumb ``do_finalize`` through say so; the default does not."""
     assert TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl).supports_unfinalized_output()
     assert not TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(
         TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
     ).supports_unfinalized_output()
-    assert not CutlassFusedMoE.__new__(CutlassFusedMoE).supports_unfinalized_output()
+    for leaf in CUTLASS_LEAVES:
+        assert not leaf.__new__(leaf).supports_unfinalized_output(), leaf.__name__
     assert not DeepEPLowLatency.__new__(DeepEPLowLatency).supports_finalize_before_combine()
 
 
@@ -1520,38 +1534,25 @@ def _marlin_environment(sm: int = 90) -> MoEEnvironment:
     return MoEEnvironment(sm=sm)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "quant_algo, expected_leaf",
+    "quant_algo, expected",
     [
-        pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
-        pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+        pytest.param(None, TrtllmCutlassUnquantizedImpl, id="unquantized"),
+        pytest.param(QuantAlgo.FP8, TrtllmCutlassFp8Impl, id="fp8"),
     ],
 )
-def test_marlin_selects_the_leaf_that_publishes_the_format(quant_algo, expected_leaf):
-    """``moe_backend: MARLIN`` names the family; the quant picks which leaf."""
+def test_marlin_degrades_to_cutlass_on_non_nvfp4(quant_algo, expected):
     with override_moe_environment(_marlin_environment()):
         report = resolve_moe_impl(_marlin_model_config(quant_algo))
-    assert impl_class_for(report) is expected_leaf
-    assert issubclass(impl_class_for(report), MarlinFusedMoE)
-    assert report.selected_by == "pinned"
-    assert not report.degraded
-
-
-@pytest.mark.parametrize(
-    "quant_algo",
-    [
-        pytest.param(None, id="unquantized"),
-        pytest.param(QuantAlgo.FP8, id="fp8"),
-    ],
-)
-def test_marlin_degrades_to_cutlass_on_non_nvfp4(quant_algo):
-    with override_moe_environment(_marlin_environment()):
-        report = resolve_moe_impl(_marlin_model_config(quant_algo))
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is expected
     assert report.degraded
+    # The cause is Marlin's own rejection, not a fallback leaf's.
+    assert issubclass(_class_named(report.degraded_from.legacy_backend), MarlinFusedMoE)
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
+@pytest.mark.cpu_only
 def test_marlin_override_quant_config_degrades_per_layer():
     cfg = _marlin_model_config()
     with override_moe_environment(_marlin_environment()):
@@ -1560,8 +1561,13 @@ def test_marlin_override_quant_config_degrades_per_layer():
             override_quant_config=QuantConfig(quant_algo=None),
             layer_idx=52,
         )
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is TrtllmCutlassUnquantizedImpl
+    assert issubclass(_class_named(report.degraded_from.legacy_backend), MarlinFusedMoE)
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+def _class_named(legacy_backend: str) -> type:
+    return next(impl for impl in IMPL_PRIORITY if impl.__name__ == legacy_backend)
 
 
 # =====================================================================
@@ -2168,13 +2174,14 @@ def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration(
 
 
 def test_apply_router_weight_on_input_support_is_not_inherited():
-    """``CuteDslB12xFusedMoE`` is the one impl that keeps its ``CutlassFusedMoE``
-    parent, and this is a field where the two disagree: only the NVFP4 prefill
-    chunk reaches the parent's ``run_moe``, while the decode path hands
-    ``token_final_scales`` to the flashinfer wrapper."""
-    assert CutlassFusedMoE.capabilities.supports_apply_router_weight_on_input
+    """The NVFP4 B12x leaf has a CUTLASS parent, and this is a field where the
+    two disagree: only the NVFP4 prefill chunk reaches the Cutlass ``run_moe``,
+    while the decode path hands ``token_final_scales`` to the flashinfer
+    wrapper."""
+    assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
-    assert not CuteDslB12xFusedMoE.capabilities.supports_apply_router_weight_on_input
+    for b12x_leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE):
+        assert not b12x_leaf.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
 
 
@@ -4391,8 +4398,9 @@ def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "backend_cls", [CutlassFusedMoE, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+    "backend_cls", [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
 )
 @pytest.mark.parametrize(
     "intermediate_size,activation,moe_tp_size,rejected",
@@ -4428,9 +4436,22 @@ def test_nvfp4_fc1_row_alignment_gate(
         assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("moe_tp_size, rejected", [(4, False), (8, True)], ids=["tp4", "tp8"])
+def test_w4a16_nvfp4_fc1_row_alignment_gate(moe_tp_size, rejected):
+    """W4A16 NVFP4 weights go through the same padded CUTLASS NVFP4 loader, and
+    the op splits the dequantized FC1 the same way. Qwen3-30B-A3B shape: 768
+    shards to 192 FC1 rows at moe_tp_size=8."""
+    problem = dataclasses.replace(_nvfp4_problem(768, "Swiglu"), quant=QuantAlgo.W4A16_NVFP4.value)
+    verdict = TrtllmCutlassW4a16Nvfp4Impl.can_implement(problem, _deployment_at_moe_tp(moe_tp_size))
+    assert verdict.eligible is not rejected
+    if rejected:
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+
+
 @pytest.mark.parametrize(
     "backend_cls",
-    [CutlassFusedMoE, CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE, CuteDslFc12FusedMoE],
     ids=["cutlass", "cutedsl", "cutedsl_fc12"],
 )
 def test_situ_survives_resolution_not_just_construction(backend_cls):
@@ -4526,3 +4547,251 @@ def test_unresolvable_layer_error_carries_rejection_details():
     )
     with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
         impl_class_for(report)
+
+
+# ============================================================================
+# CUTLASS leaves: what run_moe hands the op, on CPU
+# ============================================================================
+# ``torch.ops.trtllm.fused_moe`` is replaced by a recorder, so a leaf reaching
+# for state it does not carry fails here without a GPU, and the kernel flags,
+# the weight view and the LoRA operands each leaf passes must follow its own
+# declarations, which ``test_moe_impl.test_cutlass_leaf_declarations`` pins.
+
+_CUTLASS_FUSED_MOE_OP_LEAVES = tuple(
+    leaf
+    for leaf in CUTLASS_LEAVES
+    # The W4A16 NVFP4 leaf hands the op dequantized weights instead of its
+    # buffers, and the Triton leaf runs another kernel; each has its own test.
+    if leaf not in (TrtllmCutlassW4a16Nvfp4Impl, TrtllmTritonFp8BlockScalesImpl)
+)
+
+_LORA_SENTINEL = {"fc1_lora_ranks": "fc1-ranks"}
+
+
+def _cutlass_leaf_on_cpu(leaf_cls):
+    """A leaf carrying only the state its ``run_moe`` reads; no ``__init__``."""
+    leaf = leaf_cls.__new__(leaf_cls)
+    # Mock weights: the op is replaced, and a mock records the per-format
+    # ``.view(dtype)`` reinterpretation that a real CPU tensor may refuse.
+    leaf.w3_w1_weight = MagicMock(dtype=torch.bfloat16)
+    leaf.w2_weight = MagicMock(dtype=torch.bfloat16)
+    leaf.w3_w1_bias = None
+    leaf.w2_bias = None
+    leaf.quant_scales = ()
+    leaf.act_alpha = None
+    leaf.act_beta = None
+    leaf.act_clamp = None
+    leaf.act_clamp_after_silu = False
+    leaf.tp_size, leaf.tp_rank, leaf.ep_size, leaf.ep_rank = 1, 0, 1, 0
+    leaf.cluster_size, leaf.cluster_rank = 1, 0
+    leaf.use_fused_finalize = True
+    leaf.tune_max_num_tokens = 16
+    leaf.activation_type = ActivationType.Swiglu
+    leaf.hidden_size = 8
+    leaf.unpadded_hidden_size = 8
+    leaf.force_dynamic_quantization = False
+    # Stubbed on every leaf, so only whether run_moe calls it decides.
+    leaf._extract_moe_lora_tensors = lambda lora_params: dict(_LORA_SENTINEL)
+    return leaf
+
+
+def _cpu_run_context(num_tokens: int = 2, lora_params: Optional[dict] = None) -> MoERunContext:
+    return MoERunContext(
+        token_selected_experts=torch.zeros((num_tokens, 1), dtype=torch.int32),
+        token_final_scales=torch.ones((num_tokens, 1), dtype=torch.float32),
+        x=torch.zeros((num_tokens, 8), dtype=torch.bfloat16),
+        x_sf=None,
+        output_dtype=torch.bfloat16,
+        lora_params=lora_params,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+
+
+def _record_fused_moe(monkeypatch) -> list:
+    """Replace the op with a recorder; returns the keyword sets it saw, each
+    with the positional operands under ``"args"``."""
+    calls = []
+
+    def fused_moe(*args, **kwargs):
+        calls.append(dict(kwargs, args=args))
+        return [torch.zeros_like(args[0])]
+
+    monkeypatch.setattr(torch.ops.trtllm, "fused_moe", fused_moe, raising=False)
+    return calls
+
+
+# The op's keyword names, spelled out so that renaming a flag fails here.
+_FLAG_KWARGS = (
+    "use_deepseek_fp8_block_scale",
+    "use_w4_group_scaling",
+    "use_int8_woq_per_channel",
+    "use_mxfp8_act_scaling",
+    "use_mxfp8_weight_scaling",
+)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("leaf_cls", _CUTLASS_FUSED_MOE_OP_LEAVES, ids=lambda cls: cls.__name__)
+def test_cutlass_leaf_run_moe_hands_the_op_its_declarations(leaf_cls, monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(leaf_cls)
+    out = leaf.run_moe(_cpu_run_context(lora_params={"num_seqs": 1}))
+
+    assert len(calls) == 1
+    assert out.shape == (2, 8)
+    flags = leaf_cls.FUSED_MOE_OP_FLAGS
+    assert flags.op_kwargs() == {name: calls[0][name] for name in _FLAG_KWARGS}
+    leaf.w3_w1_weight.view.assert_called_once_with(flags.weight_dtype or torch.bfloat16)
+    leaf.w2_weight.view.assert_called_once_with(flags.weight_dtype or torch.bfloat16)
+    # Only the leaves that fuse LoRA hand lora_params to the op.
+    fuses_lora = leaf_cls.capabilities.supports_moe_lora
+    assert (calls[0].get("fc1_lora_ranks") == "fc1-ranks") is fuses_lora
+
+
+@pytest.mark.cpu_only
+def test_cutlass_w4a16_nvfp4_runs_the_op_unquantized_on_dequantized_weights(monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmCutlassW4a16Nvfp4Impl)
+    leaf.expert_size_per_partition = 4
+    leaf.slot_start = 4  # this rank owns slots 4..7
+    w3_w1_hp, w2_hp = torch.zeros(4, 16, 8), torch.zeros(4, 8, 8)
+    seen = {}
+
+    def dequant_active_experts_to_hp(module, ids, out_dtype):
+        seen["ids"], seen["out_dtype"] = ids, out_dtype
+        return w3_w1_hp, w2_hp
+
+    leaf.quant_method = SimpleNamespace(dequant_active_experts_to_hp=dequant_active_experts_to_hp)
+    leaf.quant_scales = ("fc31-scale",)
+    ctx = dataclasses.replace(
+        _cpu_run_context(num_tokens=2),
+        token_selected_experts=torch.tensor([[5], [9]], dtype=torch.int32),
+        x_sf=torch.ones(1),
+        output_dtype=None,
+    )
+    leaf.run_moe(ctx)
+
+    # The dequant scatter indexes local experts; the op filters on global ids.
+    assert seen["ids"].tolist() == [[1], [3]]
+    assert seen["out_dtype"] is torch.bfloat16
+    args = calls[0]["args"]
+    assert args[1] is ctx.token_selected_experts
+    assert args[3] is w3_w1_hp and args[5] is w2_hp
+    assert calls[0]["quant_scales"] == []
+    assert calls[0]["input_sf"] is None
+    assert not any(calls[0][name] for name in _FLAG_KWARGS)
+    leaf.w3_w1_weight.view.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_cutlass_nvfp4_dynamic_fc2_scale_reaches_the_op(monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmCutlassNvfp4Impl)
+    leaf.force_dynamic_quantization = True
+    leaf.fc2_weight_scale_2 = torch.ones(1)
+    leaf.run_moe(_cpu_run_context())
+
+    assert calls[0]["use_dynamic_fc2_scale"] is True
+    assert calls[0]["quant_scales"][-1] is leaf.fc2_weight_scale_2
+
+
+@pytest.mark.cpu_only
+def test_cutlass_w4a16_mxfp4_pads_the_activation_to_its_hidden_size(monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmCutlassW4a16Mxfp4Impl)
+    leaf.hidden_size = 16  # padded at construction; the activation stays 8 wide
+    leaf.run_moe(_cpu_run_context())
+
+    x = calls[0]["args"][0]
+    assert x.shape == (2, 16)
+    assert not x[:, 8:].any()
+
+
+# Spelled out, so that moving the threshold is a deliberate test change.
+_B12X_PREFILL_THRESHOLD = 64
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf_cls, num_tokens, reaches_cutlass",
+    [
+        pytest.param(CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
+        pytest.param(
+            CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
+        ),
+        pytest.param(
+            CuteDslB12xW4a16Nvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
+        ),
+    ],
+)
+def test_b12x_reaches_the_cutlass_op_only_for_an_nvfp4_prefill_chunk(
+    leaf_cls, num_tokens, reaches_cutlass, monkeypatch
+):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(leaf_cls)
+    leaf._run_b12x_decode = MagicMock(return_value=torch.zeros(num_tokens, 8))
+    out = leaf.run_moe(_cpu_run_context(num_tokens=num_tokens))
+
+    assert len(calls) == int(reaches_cutlass)
+    assert leaf._run_b12x_decode.called is not reaches_cutlass
+    assert out.shape == (num_tokens, 8)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_alltoall", [False, True], ids=["allgather", "alltoall"])
+def test_triton_fp8_block_scales_leaf_localizes_global_slot_ids(enable_alltoall, monkeypatch):
+    """Dispatch keeps the global slot numbering with or without alltoall, and
+    marks padding with -1 (num_slots under DeepEP low latency); the Triton
+    kernel indexes this rank's experts, so every slot outside them weighs 0."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import fp8_block_scales_triton
+
+    seen = {}
+
+    def run_triton(x, ids, scales, *args, **kwargs):
+        seen["ids"], seen["scales"] = ids, scales
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(fp8_block_scales_triton, "run_triton_fp8_block_scale_moe", run_triton)
+    leaf = TrtllmTritonFp8BlockScalesImpl.__new__(TrtllmTritonFp8BlockScalesImpl)
+    leaf.expert_size_per_partition = 4
+    leaf.slot_start = 4  # this rank owns slots 4..7
+    leaf.w3_w1_weight = leaf.w2_weight = None
+    leaf.quant_scales = SimpleNamespace(fc_weight_scales=None, proj_weight_scales=None)
+    leaf.activation_type = ActivationType.Swiglu
+    leaf.act_clamp = None
+    ctx = dataclasses.replace(
+        _cpu_run_context(num_tokens=2),
+        # 1 is below this rank's slots, 8 (num_slots) above them.
+        token_selected_experts=torch.tensor([[5, 1], [-1, 8]], dtype=torch.int32),
+        token_final_scales=torch.full((2, 2), 0.5),
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=enable_alltoall,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+    leaf.run_moe(ctx)
+
+    assert seen["ids"].tolist() == [[1, 0], [0, 3]]
+    assert seen["scales"].tolist() == [[0.5, 0.0], [0.0, 0.0]]
+    # The kernel returns its own tensor, so the scheduler must not hand it the
+    # alltoall workspace to fill.
+    assert not leaf.supports_moe_output_in_alltoall_workspace()
+
+
+@pytest.mark.cpu_only
+def test_configurable_moe_exposes_the_backend_lora_state():
+    """``MoE.forward``'s torch.compile guard reads the layer, so the wrapper has
+    to answer for the backend that holds the state."""
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(moe)
+    moe.backend = SimpleNamespace(_moe_lora_enabled=True)
+    assert getattr(moe, "_moe_lora_enabled", False) is True
+    moe.backend = SimpleNamespace()
+    assert getattr(moe, "_moe_lora_enabled", False) is False

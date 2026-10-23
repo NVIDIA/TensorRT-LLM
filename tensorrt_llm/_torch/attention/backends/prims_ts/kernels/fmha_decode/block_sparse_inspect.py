@@ -15,7 +15,7 @@
 """Validate paged request metadata and canonical BSR for one-shot planning.
 
 A BSR Q-block row is one ``block_indptr`` row keyed by
-``(batch, kv_head, q_block)``. The maximum row width gives the one-shot API the
+``(batch, pattern head, q_block)``. The maximum row width gives the one-shot API the
 same semantic ``max_blocks_per_row`` bound that reusable plans receive from
 their caller. Token-mask contents belong to the run-time prepare kernel and
 are not read here.
@@ -92,7 +92,7 @@ def _inspect_bsr_row(
     block_indptr: cute.Tensor,
     block_indices: cute.Tensor,
     batch_idx: cutlass.Int32,
-    kv_head_idx: cutlass.Int32,
+    pattern_head_idx: cutlass.Int32,
     q_block_row_idx: cutlass.Int32,
     lane_idx: cutlass.Int32,
     bsr_row_is_valid: cutlass.Boolean,
@@ -105,10 +105,10 @@ def _inspect_bsr_row(
     row_range_is_valid = cutlass.Int32(0)
     if lane_idx == cutlass.Int32(0) and bsr_row_is_valid:
         bsr_row_begin = cutlass.Int32(
-            block_indptr[batch_idx, kv_head_idx, q_block_row_idx]
+            block_indptr[batch_idx, pattern_head_idx, q_block_row_idx]
         )
         bsr_row_end = cutlass.Int32(
-            block_indptr[batch_idx, kv_head_idx, q_block_row_idx + 1]
+            block_indptr[batch_idx, pattern_head_idx, q_block_row_idx + 1]
         )
         row_range_is_valid = cutlass.Int32(
             bsr_row_begin >= cutlass.Int32(0)
@@ -141,7 +141,7 @@ def _inspect_live_paged_bsr_row(
     block_indices: cute.Tensor,
     seq_lens_kv: cute.Tensor,
     batch_idx: cutlass.Int32,
-    kv_head_idx: cutlass.Int32,
+    pattern_head_idx: cutlass.Int32,
     q_block_row_idx: cutlass.Int32,
     lane_idx: cutlass.Int32,
     bsr_row_is_valid: cutlass.Boolean,
@@ -162,7 +162,7 @@ def _inspect_live_paged_bsr_row(
         block_indptr,
         block_indices,
         batch_idx,
-        kv_head_idx,
+        pattern_head_idx,
         q_block_row_idx,
         lane_idx,
         bsr_row_is_valid,
@@ -178,13 +178,13 @@ class _InspectBlockSparseBsr:
         self,
         *,
         batch_size: int,
-        num_kv_heads: int,
+        num_pattern_heads: int,
         seq_len_q: int,
         seq_len_kv: int | None,
         q_block_size: int,
         kv_block_size: int,
     ) -> None:
-        self.num_kv_heads = num_kv_heads
+        self.num_pattern_heads = num_pattern_heads
         self.num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
         self.num_kv_blocks = (
             0
@@ -192,7 +192,9 @@ class _InspectBlockSparseBsr:
             else (seq_len_kv + kv_block_size - 1) // kv_block_size
         )
         self.kv_block_size = kv_block_size
-        self.total_bsr_row_count = batch_size * num_kv_heads * self.num_q_block_rows
+        self.total_bsr_row_count = (
+            batch_size * num_pattern_heads * self.num_q_block_rows
+        )
 
     @cute.jit
     def _launch(
@@ -238,15 +240,15 @@ class _InspectBlockSparseBsr:
         )
         q_block_row_idx = safe_linear_bsr_row_idx % self.num_q_block_rows
         linear_batch_head_idx = safe_linear_bsr_row_idx // self.num_q_block_rows
-        kv_head_idx = linear_batch_head_idx % self.num_kv_heads
-        batch_idx = linear_batch_head_idx // self.num_kv_heads
+        pattern_head_idx = linear_batch_head_idx % self.num_pattern_heads
+        batch_idx = linear_batch_head_idx // self.num_pattern_heads
 
         if cutlass.const_expr(seq_lens_kv is None):
             error_code, selected_kv_block_count = _inspect_bsr_row(
                 block_indptr,
                 block_indices,
                 batch_idx,
-                kv_head_idx,
+                pattern_head_idx,
                 q_block_row_idx,
                 lane_idx,
                 bsr_row_is_valid,
@@ -258,7 +260,7 @@ class _InspectBlockSparseBsr:
                 block_indices,
                 seq_lens_kv,
                 batch_idx,
-                kv_head_idx,
+                pattern_head_idx,
                 q_block_row_idx,
                 lane_idx,
                 bsr_row_is_valid,
@@ -454,7 +456,7 @@ def compile_block_sparse_inspection(
     *,
     device_index: int,
     batch_size: int,
-    num_kv_heads: int,
+    num_pattern_heads: int,
     seq_len_q: int,
     seq_len_kv: int,
     q_block_size: int,
@@ -472,7 +474,7 @@ def compile_block_sparse_inspection(
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = _InspectBlockSparseBsr(
         batch_size=batch_size,
-        num_kv_heads=num_kv_heads,
+        num_pattern_heads=num_pattern_heads,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
         q_block_size=q_block_size,
@@ -483,7 +485,7 @@ def compile_block_sparse_inspection(
             kernel,
             _fake_compact(
                 cutlass.Int32,
-                (batch_size, num_kv_heads, num_q_block_rows + 1),
+                (batch_size, num_pattern_heads, num_q_block_rows + 1),
                 alignment=4,
             ),
             _fake_compact(cutlass.Int32, (logical_nnz,), alignment=4),
@@ -499,7 +501,7 @@ def compile_paged_block_sparse_metadata_inspection(
     *,
     device_index: int,
     batch_size: int,
-    num_kv_heads: int,
+    num_pattern_heads: int,
     seq_len_q: int,
     minimum_seq_len_kv: int,
     max_seq_len_kv: int,
@@ -523,7 +525,7 @@ def compile_paged_block_sparse_metadata_inspection(
     )
     inspect_bsr = _InspectBlockSparseBsr(
         batch_size=batch_size,
-        num_kv_heads=num_kv_heads,
+        num_pattern_heads=num_pattern_heads,
         seq_len_q=seq_len_q,
         seq_len_kv=None,
         q_block_size=q_block_size,
@@ -539,7 +541,7 @@ def compile_paged_block_sparse_metadata_inspection(
             inspect_paged_block_sparse_metadata,
             _fake_compact(
                 cutlass.Int32,
-                (batch_size, num_kv_heads, num_q_block_rows + 1),
+                (batch_size, num_pattern_heads, num_q_block_rows + 1),
                 alignment=4,
             ),
             _fake_compact(cutlass.Int32, (logical_nnz,), alignment=4),

@@ -18,8 +18,10 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, global_mpi_rank
+from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager, ResourceManagerType)
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -54,6 +56,7 @@ from .dwdp import DwdpManager, get_global_dwdp_manager
 from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -303,6 +306,40 @@ def _enforce_overlap_spec_kv_correction(attn_backend: str,
         logger.warning_once(message, key="uncorrected_overlap_spec")
         return
     raise ValueError(message)
+
+
+def _branch_snapshot_ctx_chunk_config(
+    ctx_chunk_config: Optional[tuple],
+    kv_cache_manager: Optional[BaseResourceManager],
+    tokens_per_block: int,
+    configured_policy: Optional[ContextChunkingPolicy] = None
+) -> Optional[tuple]:
+    """Force chunk boundaries at SWA branch points if the manager records them.
+
+    Decided on the built manager, which alone knows whether branch points apply
+    (SWA layers present, no joint target/draft reuse). Otherwise the configured
+    chunking is kept unchanged.
+    """
+    if not (isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.records_branch_snapshots):
+        return ctx_chunk_config
+    if ctx_chunk_config is None:
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot turns on chunked "
+            "prefill with the FORCE_CHUNK policy, although "
+            "enable_chunked_prefill is False.",
+            key="branch_snapshot_enables_chunking")
+    elif (configured_policy is not None
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot replaces "
+            f"scheduler_config.context_chunking_policy={configured_policy} "
+            "with FORCE_CHUNK.",
+            key="branch_snapshot_replaces_chunking_policy")
+    # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
+    chunk_unit_size = (ctx_chunk_config[1]
+                       if ctx_chunk_config is not None else tokens_per_block)
+    return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -618,14 +655,16 @@ def _create_py_executor(
     # about dwdp_size/dwdp_rank, so inject them here (before anything reads
     # mapping.dwdp_enabled / moe_ep_rank).
     #
-    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # dwdp_rank MUST be derived from the global DWDP rank (the global MPI
+    # rank, or TRTLLM_DWDP_RANK when context workers are launched
+    # independently -- see modules.dwdp.rendezvous), not mapping.rank:
     # in disaggregated serving each context worker is its own TP=1 instance
     # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
     # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
     # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
         dwdp_size = llm_args.dwdp_config.dwdp_size
-        dwdp_rank = global_mpi_rank() % dwdp_size
+        dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
             "dwdp_rank": dwdp_rank
@@ -686,8 +725,8 @@ def _create_py_executor(
 
     # Initialize DWDP Manager.
     #
-    # DWDP needs every global MPI rank to be a complete, unsharded model replica
-    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # DWDP needs every global DWDP rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is
     # only meaningful under that bijection. Disaggregated context workers satisfy
     # this with TP=1, aggregated serving with full attention DP; everything that
     # shards a replica across ranks is rejected. Pipeline and context parallelism
@@ -1163,7 +1202,10 @@ def _create_py_executor(
             resources=resources,
             mapping=mapping,
             llm_args=llm_args,
-            ctx_chunk_config=ctx_chunk_config,
+            ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                ctx_chunk_config,
+                resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                tokens_per_block, scheduler_config.context_chunking_policy),
             model_engine=model_engine,
             start_worker=False,
             sampler=sampler,
@@ -1239,7 +1281,10 @@ def _create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 llm_args=llm_args,
-                ctx_chunk_config=ctx_chunk_config,
+                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config,
+                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                    tokens_per_block, scheduler_config.context_chunking_policy),
                 model_engine=model_engine,
                 start_worker=False,
                 sampler=sampler,
