@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -261,6 +262,27 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
+    def _is_nvfp4_manager_fallback_layer(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+    ) -> bool:
+        """Whether an NVFP4 KV cache manager stores this layer in its FP8 fallback pool.
+
+        The pool uses the FP4 MLA 128-token pages, which only this library
+        consumes for FP8 MLA generation, in decode-only and in mixed batches.
+        """
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is None or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4:
+            return False
+        layer_offsets = getattr(kv_cache_manager, "layer_offsets", {})
+        get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+        return (
+            callable(get_kv_cache_dtype)
+            and attn.layer_idx in layer_offsets
+            and get_kv_cache_dtype(attn.layer_idx) == DataType.FP8
+        )
+
+    @staticmethod
     def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
         if getattr(attn, "has_fp8_kv_cache", False):
             return torch.float8_e4m3fn
@@ -446,8 +468,11 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # overhead is reduced, except for an NVFP4 manager's FP8 fallback
+        # layer: no other library consumes its pages, and this path already
+        # slices the generation inputs and page tables past num_contexts.
+        nvfp4_fallback_layer = self._is_nvfp4_manager_fallback_layer(attn, meta)
+        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not nvfp4_fallback_layer):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -516,7 +541,7 @@ class CuteDslMlaFmha(PhasedFmha):
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group):
+        if not (helix_h96_verify_group or fp8_wide_head_verify_group or nvfp4_fallback_layer):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
@@ -641,6 +666,12 @@ class CuteDslMlaFmha(PhasedFmha):
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        if cache_seqs_base.data_ptr() % 16 != 0:
+            # Mixed context/generation batches can expose an aligned buffer
+            # through an int32 slice whose storage offset is not 16-byte
+            # aligned. CuTe DSL requires the runtime pointer itself to keep
+            # the alignment assumed when compiling the kernel.
+            cache_seqs_base = cache_seqs_base.clone()
         # The page-table batch dimension determines the kernel launch batch.
         page_table = (
             page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
