@@ -48,7 +48,7 @@ pydantic-settings[yaml]
 msgspec
 omegaconf
 pillow
-PyNvVideoCodec~=2.1.0
+PyNvVideoCodec>=2.2.0
 optimum
 datasets
 evaluate
@@ -88,8 +88,8 @@ triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_trito
 tiktoken
 blobfile
 openai-harmony==0.0.4
-# 4.8.0.dev0 is the first release exposing Rubin/SM107.
-nvidia-cutlass-dsl[cu13]==4.8.0.dev0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
+# 4.8.0 is the first final release exposing Rubin/SM107 (replaces the 4.8.0.dev0 pre-release pin).
+nvidia-cutlass-dsl[cu13]==4.8.0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
 quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA, FlashAttention 4 and the opt-in GatedMLP SwiGLU GEMM epilogue; only published release compatible with CUTLASS DSL >= 4.7
 jinja2 # required for MinimaxM3 MSA

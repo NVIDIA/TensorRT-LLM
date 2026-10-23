@@ -52,6 +52,7 @@ def test_generation_admits_decode_before_capacity_growth(
     manager._ensure_generation_beam_width = Mock(return_value=beam_admitted)
     manager._generation_draft_slots = Mock(return_value=0)
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._has_cp_helix = False
     manager._fill_fresh_kv_pages = Mock()
     manager._log_window_crossing = Mock()
@@ -92,6 +93,7 @@ def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> N
 @pytest.mark.parametrize("is_draft", [False, True])
 def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock()
     order = Mock()
     manager._disagg_receive_ready = {}
     manager.is_draft = is_draft
@@ -117,10 +119,11 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     manager.kv_connector_manager = Mock()
     manager._connector_reservations_enabled = Mock(return_value=True)
     manager._accept_connector_prefix_reservations = order.accept
+    manager._on_allocation_stream = set()
     order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
     order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
-    scheduled = Mock()
+    scheduled = Mock(context_requests=[])
     manager.report_batch_to_connector(scheduled)
     assert order.mock_calls == [
         call.accept(scheduled),
@@ -2839,6 +2842,26 @@ class TestEncoder:
         )
         cross_mgr.kv_cache_map[ctx_req.py_request_id].resize.assert_called_once_with(80)
 
+    def test_cross_pool_reuse_is_scoped_by_cache_salt(self):
+        """Cross-KV blocks share the self pool's per-request salt namespace."""
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager(enable_block_reuse=True)
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+        ctx_req = make_ctx_request(0, context_remaining_length=50, encoder_output_len=80)
+        ctx_req.cache_salt = "tenant-a"
+
+        out = sched.schedule_request([ctx_req], set())
+
+        assert ids(out.context_requests) == [0]
+        cross_mgr._create_kv_cache.assert_called_once_with(
+            ctx_req.py_request_id,
+            ctx_req.lora_task_id,
+            ctx_req.get_encoder_unique_tokens.return_value,
+            cache_salt="tenant-a",
+        )
+
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
         self_mgr = make_kv_cache_manager()
@@ -2944,7 +2967,9 @@ class TestCrossKVAllocationFailures:
         ]
         retry_cache = cross_mgr.kv_cache_map[0]
         assert retry_cache is not failed_cache
-        cross_mgr._create_kv_cache.assert_any_call(0, blocked.lora_task_id, None)
+        cross_mgr._create_kv_cache.assert_any_call(
+            0, blocked.lora_task_id, None, cache_salt=blocked.cache_salt
+        )
         cross_mgr._resume_and_restore.assert_called_with(0, retry_cache)
         retry_cache.resize.assert_called_once_with(82)
         for manager in (self_mgr, cross_mgr):
@@ -4981,3 +5006,37 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
     resumed = scheduler.schedule_request([decoding], set())
     assert ids(resumed.generation_requests) == [0]
     manager.try_allocate_generation.assert_called_with(decoding)
+
+
+@pytest.mark.parametrize("prompt_len", [0, 8])
+def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
+    prompt_len: int,
+) -> None:
+    """A Helix CP rank can hold none of the prompt (promptLen 0); the
+    prepopulated-length setter rejects any value there, so rewinding must not
+    call it, while the context cursor is still reset."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
+
+    def set_prepopulated_prompt_len(value: int, tokens_per_block: int) -> None:
+        if not value < prompt_len:
+            raise RuntimeError("prepopulatedPromptLen >= promptLen")
+
+    request = Mock(
+        prompt_len=prompt_len,
+        context_current_position=4,
+        context_chunk_size=2,
+        estimated_reusable_tokens=4,
+        py_ctx_pre_resize_cap=16,
+    )
+    request.set_prepopulated_prompt_len = Mock(side_effect=set_prepopulated_prompt_len)
+
+    rewind_context_after_cache_drop(request, 32)
+
+    if prompt_len > 0:
+        request.set_prepopulated_prompt_len.assert_called_once_with(0, 32)
+    else:
+        request.set_prepopulated_prompt_len.assert_not_called()
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == prompt_len
+    assert request.estimated_reusable_tokens == 0
+    assert request.py_ctx_pre_resize_cap is None

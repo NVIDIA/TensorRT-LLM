@@ -15,7 +15,7 @@
 """Step-pairing tests for speculative-decoding acceptance stats.
 
 py_draft_tokens is not a valid acceptance-rate denominator at response time:
-it is padded to the static max for CUDA graphs (two-model flow), and in the
+it is padded to the static max for CUDA graphs (drafter flow), and in the
 one-model flow SpecSampler.update_requests replaces it with the NEXT
 step's buffer before responses are handled. The samplers therefore write
 py_num_draft_tokens_verified — the real proposal count of the same step the
@@ -105,8 +105,7 @@ class TestAccumulator:
     def test_tree_drafting_clamps_totals_to_max_path_len(self):
         # Tree drafting verifies up to max_total_draft_tokens nodes but can
         # accept at most max_draft_len (the max path length) per step; the
-        # cumulative denominator counts paths, mirroring the C++
-        # updateNumTokensPerIteration clamp. Per-pos arrays keep the
+        # cumulative denominator counts paths. Per-pos arrays keep the
         # unclamped node count.
         request = _fake_request(verified=12, accepted=3, draft_buffer_len=12)
         _accumulate([request], max_draft_len=3)

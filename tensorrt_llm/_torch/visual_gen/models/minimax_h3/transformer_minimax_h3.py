@@ -130,11 +130,16 @@ class MiniMaxH3Attention(Attention):
         layer_idx: int,
         module_name: str,
     ) -> None:
+        vgm = model_config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
+        # each one is pushed to the peers while the next is computed (forward_async).
+        use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=QKVMode.SEPARATE_QKV if use_async_ulysses else QKVMode.FUSE_QKV,
             qk_norm=True,
             qk_norm_mode="per_head",
             eps=qk_norm_eps,
@@ -146,7 +151,10 @@ class MiniMaxH3Attention(Attention):
             config=model_config,
             layer_idx=layer_idx,
             module_name=module_name,
+            async_ulysses=use_async_ulysses,
+            separate_qkv_is_self_attention=True,
         )
+        self.use_async_ulysses = use_async_ulysses
 
     def forward(
         self,
@@ -155,6 +163,10 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_async_ulysses:
+            return self.forward_async(
+                hidden_states, rotary_emb, key_padding_mask=key_padding_mask, timestep=timestep
+            )
         batch_size, sequence_length = hidden_states.shape[:2]
         query, key, value = self.get_qkv(hidden_states)
         query = query.view(
@@ -177,6 +189,47 @@ class MiniMaxH3Attention(Attention):
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
+
+    def forward_async(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``forward`` with each projection pushed to the peers as soon as it is
+        computed: V, then Q and K with their per-head norm and RoPE, run on the
+        compute stream while the previous tensor's push runs on the side stream
+        (``UlyssesAttention.forward_async``)."""
+        batch_size, sequence_length = hidden_states.shape[:2]
+        head_dim = self.head_dim
+
+        def project(linear: Linear, heads: int, norm: RMSNorm) -> torch.Tensor:
+            states = norm(linear(hidden_states).view(batch_size, sequence_length, heads, head_dim))
+            if rotary_emb is not None:
+                states = apply_minimax_h3_rotary_emb(states, *rotary_emb)
+            return states
+
+        def compute_q() -> torch.Tensor:
+            return project(self.to_q, self.local_num_attention_heads, self.norm_q)
+
+        def compute_k() -> torch.Tensor:
+            return project(self.to_k, self.local_num_key_value_heads, self.norm_k)
+
+        def compute_v() -> torch.Tensor:
+            return self.to_v(hidden_states).view(
+                batch_size, sequence_length, self.local_num_key_value_heads, head_dim
+            )
+
+        out_4d = self.attn.forward_async(
+            compute_q,
+            compute_k,
+            compute_v,
+            key_padding_mask=key_padding_mask,
+            timestep=timestep,
+        )
+        batch_size, local_seq_len = out_4d.shape[:2]
+        return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
 
 
 def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:

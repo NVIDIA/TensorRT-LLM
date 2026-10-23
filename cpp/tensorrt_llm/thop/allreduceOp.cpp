@@ -516,6 +516,7 @@ private:
 
         torch::Tensor inputTensor = input;
         void* inputPtr = input.data_ptr();
+        bool ownsSymmetricInput = false;
 
         // If buffer is not registered, decide whether to register based on size
         if (!windowBuffer0.isValid())
@@ -552,6 +553,7 @@ private:
                     windowBuffer0 = symmetricBuffer0;
                     inputTensor = symmetricInput; // Swap to window-backed tensor
                     inputPtr = windowBuffer0.ptr;
+                    ownsSymmetricInput = true;
                 }
             }
         }
@@ -577,13 +579,29 @@ private:
         // Perform allreduce
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
+        // This operation owns only the temporary used to copy an unregistered input. The collective
+        // is its final consumer, and same-stream release makes it reusable without synchronizing.
+        // A window-backed input is borrowed from the caller and remains owned by its outer scope.
+        if (ownsSymmetricInput)
+        {
+            TLLM_CHECK(allocator.releaseTensorBuffer(comm, inputTensor.storage().unsafeGetStorageImpl(), stream));
+        }
+
         if (mOp == AllReduceFusionOp::NONE)
         {
             return {outputTensor};
         }
 
         // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        auto outputs = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+
+        // RMS_NORM does not return the all-reduce output, so its internal window is complete after
+        // the fused fallback is enqueued. Other fusion modes return it as their residual output.
+        if (mOp == AllReduceFusionOp::RMS_NORM && windowBuffer1.isValid())
+        {
+            TLLM_CHECK(allocator.releaseTensorBuffer(comm, outputTensor.storage().unsafeGetStorageImpl(), stream));
+        }
+        return outputs;
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
@@ -1591,6 +1609,87 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
 #endif
 }
 
+#if ENABLE_MULTI_DEVICE
+namespace
+{
+using TensorScopeInputs = std::pair<std::vector<c10::StorageImpl const*>, int>;
+
+TensorScopeInputs getTensorScopeInputs(torch::List<torch::Tensor> const& tensors)
+{
+    std::vector<c10::StorageImpl const*> storages;
+    storages.reserve(tensors.size());
+    std::optional<int> device;
+    for (torch::Tensor const& tensor : tensors)
+    {
+        if (tensor.is_cuda())
+        {
+            storages.push_back(tensor.storage().unsafeGetStorageImpl());
+            if (!device.has_value())
+            {
+                device = tensor.get_device();
+            }
+        }
+    }
+    TLLM_CHECK_WITH_INFO(device.has_value(), "NCCL window tensor scope requires at least one CUDA tensor");
+    return {std::move(storages), *device};
+}
+
+std::vector<c10::StorageImpl const*> getTensorStorages(torch::List<torch::Tensor> const& tensors)
+{
+    std::vector<c10::StorageImpl const*> storages;
+    storages.reserve(tensors.size());
+    for (torch::Tensor const& tensor : tensors)
+    {
+        if (tensor.is_cuda())
+        {
+            storages.push_back(tensor.storage().unsafeGetStorageImpl());
+        }
+    }
+    return storages;
+}
+} // namespace
+#endif // ENABLE_MULTI_DEVICE
+
+int64_t beginTrackedNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+{
+#if ENABLE_MULTI_DEVICE
+    auto [storages, device] = getTensorScopeInputs(inputs);
+    return static_cast<int64_t>(
+        tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().beginTensorLeaseScope(storages, device));
+#else
+    (void) inputs;
+    return 0;
+#endif
+}
+
+void beginNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+{
+    static_cast<void>(beginTrackedNCCLWindowTensorScope(inputs));
+}
+
+void endTrackedNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs,
+    torch::List<torch::Tensor> const& outputs, bool failed, int64_t entryDepth)
+{
+#if ENABLE_MULTI_DEVICE
+    auto const device = getTensorScopeInputs(inputs).second;
+    auto outputStorages = getTensorStorages(outputs);
+    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().endTensorLeaseScope(outputStorages, device,
+        at::cuda::getCurrentCUDAStream(device), failed,
+        entryDepth < 0 ? std::nullopt : std::optional<size_t>{static_cast<size_t>(entryDepth)});
+#else
+    (void) inputs;
+    (void) outputs;
+    (void) failed;
+    (void) entryDepth;
+#endif
+}
+
+void endNCCLWindowTensorScope(
+    torch::List<torch::Tensor> const& inputs, torch::List<torch::Tensor> const& outputs, bool failed)
+{
+    endTrackedNCCLWindowTensorScope(inputs, outputs, failed, -1);
+}
+
 namespace
 {
 
@@ -2024,6 +2123,7 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     switch (fusionOp)
     {
     case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
+    case AllReduceFusionOp::RMS_NORM: return MnnvlFusionPattern::kARRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
@@ -2052,7 +2152,7 @@ bool isMnnvlNvfp4FusionOp(AllReduceFusionOp fusionOp)
 
 bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 {
-    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
+    return fusionOp == AllReduceFusionOp::RMS_NORM || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
 }
@@ -2096,12 +2196,21 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     if (hasRmsNormFusion)
     {
-        TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
-            "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for RMSNorm fusion");
-        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        // kARRMSNorm has no residual operand (kHasResidual/kHasResidualOut
+        // are both false), so residual_in is optional for it alone.
+        bool const needsResidual = fusionOp != AllReduceFusionOp::RMS_NORM;
+        TORCH_CHECK(gamma.has_value() && epsilon.has_value(),
+            "[mnnvlFusionAllReduce] gamma and epsilon must be provided for RMSNorm fusion");
+        TORCH_CHECK(!needsResidual || residual_in.has_value(),
+            "[mnnvlFusionAllReduce] residual_in must be provided for residual RMSNorm fusion");
+        TORCH_CHECK(!residual_in.has_value() || residual_in.value().is_contiguous(),
+            "[mnnvlFusionAllReduce] residual_in must be contiguous");
         TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
 
-        residualOut = torch::empty_like(residual_in.value());
+        if (needsResidual)
+        {
+            residualOut = torch::empty_like(residual_in.value());
+        }
         if (hasMnnvlNormOutput(fusionOp))
         {
             normOut = torch::empty_like(input);
@@ -2169,12 +2278,12 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         allreduce_params.output = normOut.defined() ? normOut.mutable_data_ptr() : nullptr;
 
-        allreduce_params.residualIn = residual_in.value().const_data_ptr();
+        allreduce_params.residualIn = residual_in.has_value() ? residual_in.value().const_data_ptr() : nullptr;
         allreduce_params.gamma = gamma.value().const_data_ptr();
         allreduce_params.epsilon = static_cast<float>(epsilon.value());
         allreduce_params.rmsNormFusion = true;
 
-        allreduce_params.residualOut = residualOut.mutable_data_ptr();
+        allreduce_params.residualOut = residualOut.defined() ? residualOut.mutable_data_ptr() : nullptr;
     }
 
     if (isMnnvlQuantFusionOp(fusionOp))
@@ -2203,6 +2312,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     switch (fusionOp)
     {
     case AllReduceFusionOp::NONE: return {reduceOut};
+    case AllReduceFusionOp::RMS_NORM: return {normOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};
@@ -2389,6 +2499,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
+    // Scope boundaries modify host-side allocator ownership but do not mutate their tensors.
+    // Python registers them as ordered effects so AOT preserves their runtime order.
+    m.def("begin_nccl_window_tensor_scope(Tensor[] inputs) -> ()");
+    m.def("end_nccl_window_tensor_scope(Tensor[] inputs, Tensor[] outputs, bool failed) -> ()");
+    // Eager boundaries track depth to unwind compiled scopes interrupted by an exception.
+    m.def("begin_nccl_window_tensor_scope.tracked(Tensor[] inputs) -> int");
+    m.def(
+        "end_nccl_window_tensor_scope.tracked(Tensor[] inputs, Tensor[] outputs, bool failed, int entry_depth) -> ()");
+    m.def("set_nccl_window_graph_owner(int owner) -> ()");
+    m.def("release_nccl_window_graph_owner(int owner) -> ()");
+    m.def("get_nccl_window_buffer_release_epoch() -> int");
+    m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
         "minimax_allreduce_rms("
         "Tensor input,"
@@ -2421,6 +2543,10 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("begin_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::beginNCCLWindowTensorScope);
+    m.impl("end_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::endNCCLWindowTensorScope);
+    m.impl("begin_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::beginTrackedNCCLWindowTensorScope);
+    m.impl("end_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::endTrackedNCCLWindowTensorScope);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
@@ -2430,6 +2556,38 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("validate_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::validateAllReduceTuningBuckets);
     m.impl("clear_allreduce_tactic_cache", &tensorrt_llm::torch_ext::clearAllReduceTacticCache);
+}
+
+// Graph-owner and synchronization bookkeeping has no Tensor argument, so it cannot select CPU
+// or CUDA dispatch. CatchAll is required for these host-side operations.
+TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
+{
+#if ENABLE_MULTI_DEVICE
+    m.impl("set_nccl_window_graph_owner",
+        [](int64_t owner)
+        { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().setGraphPoolOwner(owner); });
+    m.impl("release_nccl_window_graph_owner",
+        [](int64_t owner)
+        { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseGraphPoolOwner(owner); });
+    m.impl("get_nccl_window_buffer_release_epoch",
+        []()
+        {
+            return static_cast<int64_t>(
+                tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().getBufferReleaseEpoch());
+        });
+    m.impl("promote_nccl_window_buffer_releases",
+        [](int64_t device, int64_t releaseEpoch)
+        {
+            TLLM_CHECK_WITH_INFO(releaseEpoch >= 0, "NCCL window release epoch must be non-negative");
+            tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().promoteBufferReleases(
+                static_cast<int>(device), static_cast<uint64_t>(releaseEpoch));
+        });
+#else
+    m.impl("set_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("release_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("get_nccl_window_buffer_release_epoch", []() { return int64_t{0}; });
+    m.impl("promote_nccl_window_buffer_releases", [](int64_t, int64_t) {});
+#endif
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
@@ -2443,4 +2601,10 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
         });
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
     m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
+    m.impl("begin_nccl_window_tensor_scope", [](torch::List<torch::Tensor> const&) { return; });
+    m.impl("begin_nccl_window_tensor_scope.tracked", [](torch::List<torch::Tensor> const&) { return int64_t{0}; });
+    m.impl("end_nccl_window_tensor_scope.tracked",
+        [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool, int64_t) { return; });
+    m.impl("end_nccl_window_tensor_scope",
+        [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool) { return; });
 }

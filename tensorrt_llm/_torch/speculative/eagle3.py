@@ -40,9 +40,8 @@ def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
 
 class Eagle3ResourceManager(BaseResourceManager):
     """
-    Eagle3 needs to save the hidden states for the draft model. When using
-    Eagle3TwoModel, there will be two model engines, one for the target model
-    and one for the draft model. Use this class to manage the hidden states.
+    Eagle3 needs to save the hidden states for the draft model. Use this class
+    to manage the hidden states.
     """
 
     def __init__(self,
@@ -101,8 +100,6 @@ class Eagle3ResourceManager(BaseResourceManager):
                                                   device='cuda')
         # start indices of each slot
         self.start_indices = {i: 0 for i in range(slot_size)}
-        # whether the next draft forward is the first
-        self.is_first_draft = True
         self.spec_tree_manager = None
 
         if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
@@ -130,8 +127,6 @@ class Eagle3ResourceManager(BaseResourceManager):
                 self.slot_ids.append(slot_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.relaxed_delta_pool[slot_id].fill_(0)
-        # reset the flag before model forward
-        self.is_first_draft = True
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -148,11 +143,10 @@ class Eagle3ResourceManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            # In two-model speculation the target and draft engines share this
-            # resource manager, and each registers its own padding dummy under
-            # the same draft-length-derived request ID. Reserve the slot once
-            # and share it between them; dummy outputs are discarded, so the
-            # slot contents never matter (mirrors SuffixAutomatonManager).
+            # A padding dummy can be registered more than once under the same
+            # draft-length-derived request ID. Reserve the slot once and share
+            # it; dummy outputs are discarded, so the slot contents never
+            # matter (mirrors SuffixAutomatonManager).
             if self.slot_manager.get_slot(rid) is None:
                 self.slot_manager.add_slot(rid)
         if self.sa_manager is not None:

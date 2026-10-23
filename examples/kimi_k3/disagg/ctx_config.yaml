@@ -14,8 +14,9 @@
 # end-to-end.
 #
 # Hard K3 constraints baked in: no chunked prefill, no KV block reuse
-# (KDA state), tokens_per_block=64 (MLA latent layout), and
-# disable_overlap_scheduler=true (mandatory for any disagg ctx server).
+# (KDA state), and disable_overlap_scheduler=true (mandatory for any
+# disagg ctx server). tokens_per_block=64 is kept for historical reasons
+# (older TRTLLM-Gen MLA kernels required it).
 # K3 ships a custom (trust-remote-code) tokenizer; without this the
 # server starts tokenizer-less and 400s every string prompt with
 # "tokenizer is required to tokenize string prompt".
@@ -35,7 +36,7 @@ max_seq_len: 8212
 kv_cache_config:
   # Mandatory for K3 (per-request KDA recurrent state).
   enable_block_reuse: false
-  # Mandatory for K3 MLA (576, 512) trtllm-gen kernels.
+  # Historical: older TRTLLM-Gen MLA (576, 512) kernels required 64.
   tokens_per_block: 64
   # Conservative starting point proven by the aggregated DEP16 evals; the
   # ctx server only holds in-flight prefills (MLA latent KV is small:
@@ -44,12 +45,9 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.25
 cache_transceiver_config:
   backend: NIXL
-  # K3 requires the Python V2 transceiver: `auto` resolves to the C++
-  # runtime, which throws at construction for K3's
-  # MixedMambaHybridCacheManager (LinearAttentionMetadata not found).
+  # K3's model preference selects Python during standard auto resolution.
+  # Keep this recipe explicit for MixedMambaHybridCacheManager.
   transceiver_runtime: PYTHON
-  # Must be >= the target max ISL (8192 here).
-  max_tokens_in_buffer: 8448
   # Fabric-VMM bounce buffer, needed for cross-node transfers on NVLink
   # domains: V2 sends pool-to-pool by default, but the KV pool is a
   # plain (non-fabric) allocation, so inter-node cuda_ipc/MNNVL is

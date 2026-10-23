@@ -18,7 +18,7 @@ class CublasMm(OpWrapper):
     is -- the targets pass `weight.t()` and no transpose kernel runs.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Both targets use this for every dense projection, so the cells are the
     # three argument shapes that differ in kind rather than in size: fused bias
@@ -43,6 +43,37 @@ class CublasMm(OpWrapper):
         Cell(
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek default q_b at attention TP4: q_lora 1536 -> 32 heads x 192",
+            spec=dict(m=16, k=1536, n=6144, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek default kv_b at attention TP8: kv_lora 512 -> 16 heads x 256",
+            spec=dict(m=64, k=512, n=4096, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek default o_proj at attention TP8: 16 heads x 128 -> hidden 7168",
+            spec=dict(m=16, k=2048, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        # The MTP layer's own GEMMs. Its eh_proj is replicated on every rank; its
+        # shared expert is bf16 (the NVFP4 export skips layer 61), so it runs here
+        # rather than in nvfp4_gemm, split over attention TP like the trunk's.
+        Cell(
+            why="deepseek MTP eh_proj: [enorm(e) | hnorm(h)] 2 x 7168 -> hidden 7168",
+            spec=dict(m=16, k=14336, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek MTP shared expert gate_up, whole under attention DP: 7168 -> 2 x 2048",
+            spec=dict(m=16, k=7168, n=4096, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek MTP shared expert gate_up at attention TP8: 7168 -> 2 x 256",
+            spec=dict(m=16, k=7168, n=512, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek MTP shared expert down at attention TP8: 256 -> hidden 7168",
+            spec=dict(m=16, k=256, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
     )
 

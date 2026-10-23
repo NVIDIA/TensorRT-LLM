@@ -26,6 +26,9 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 )
 
 from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
+from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
+from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
@@ -35,7 +38,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -1481,3 +1484,133 @@ def test_fa4_rejects_interior_padding() -> None:
     inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
     with torch.inference_mode(), pytest.raises(NotImplementedError, match="trailing"):
         model(**inputs)
+
+
+class _RecordingAsyncUlysses:
+    """Stands in for an async UlyssesAttention: runs the three closures and returns Q."""
+
+    preferred_layout = AttentionTensorLayout.NHD
+
+    def __init__(self) -> None:
+        self.captured: dict[str, object] = {}
+
+    def forward_async(self, compute_q, compute_k, compute_v, **kwargs: object) -> torch.Tensor:
+        self.captured.update(q=compute_q(), k=compute_k(), v=compute_v(), kwargs=kwargs)
+        return self.captured["q"]
+
+
+def _make_ulysses_config(async_ulysses: bool) -> DiffusionModelConfig:
+    config = _make_model_config()
+    config.visual_gen_mapping = SimpleNamespace(ulysses_size=2, cp_size=1, ring_size=1, cfg_size=1)
+    config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=async_ulysses)
+    return config
+
+
+def test_attention_keeps_fused_qkv_without_async_ulysses() -> None:
+    attention = h3.MiniMaxH3Attention(
+        hidden_size=12,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        qk_norm_eps=1e-5,
+        model_config=_make_model_config(),
+        layer_idx=0,
+        module_name="test.attn",
+    )
+    assert attention.qkv_mode is QKVMode.FUSE_QKV
+    assert not attention.use_async_ulysses
+
+
+def test_async_ulysses_projections_match_the_sync_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The async closures apply the per-head norm and partial RoPE to Q and K only, like forward."""
+    recorder = _RecordingAsyncUlysses()
+    monkeypatch.setattr(
+        attention_module,
+        "wrap_parallel_attention",
+        lambda attn, **kwargs: recorder if kwargs["async_ulysses"] else attn,
+    )
+    kwargs = dict(
+        hidden_size=12, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5, layer_idx=0
+    )
+    asynchronous = h3.MiniMaxH3Attention(
+        model_config=_make_ulysses_config(async_ulysses=True), module_name="async.attn", **kwargs
+    )
+    synchronous = h3.MiniMaxH3Attention(
+        model_config=_make_ulysses_config(async_ulysses=False), module_name="sync.attn", **kwargs
+    )
+    assert asynchronous.qkv_mode is QKVMode.SEPARATE_QKV and asynchronous.use_async_ulysses
+    assert synchronous.qkv_mode is QKVMode.FUSE_QKV and not synchronous.use_async_ulysses
+    _initialize_weights(asynchronous)
+    _initialize_weights(synchronous)
+    with torch.no_grad():
+        synchronous.qkv_proj.weight.copy_(
+            torch.cat(
+                [asynchronous.to_q.weight, asynchronous.to_k.weight, asynchronous.to_v.weight]
+            )
+        )
+        synchronous.to_out[0].weight.copy_(asynchronous.to_out[0].weight)
+    sync_inputs: dict[str, torch.Tensor] = {}
+
+    def _identity_attention(query, key, value, **attn_kwargs):
+        sync_inputs.update(q=query, k=key, v=value, kwargs=attn_kwargs)
+        return query
+
+    synchronous._attn_impl = _identity_attention
+    hidden_states = torch.randn(1, 3, 12, dtype=torch.bfloat16)
+    rotary_emb = h3.MiniMaxH3RotaryPosEmbed(rope_freq_dim=1)(
+        torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0]])
+    )
+    mask = torch.tensor([[True, True, False]])
+
+    async_out = asynchronous(hidden_states, rotary_emb, key_padding_mask=mask)
+    sync_out = synchronous(hidden_states, rotary_emb, key_padding_mask=mask)
+
+    for name in ("q", "k", "v"):
+        torch.testing.assert_close(
+            recorder.captured[name].flatten(2), sync_inputs[name], rtol=0, atol=0
+        )
+    assert recorder.captured["kwargs"]["key_padding_mask"] is mask
+    torch.testing.assert_close(async_out, sync_out, rtol=0, atol=0)
+
+
+def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The separate to_q / to_k / to_v modules load straight from the checkpoint's keys."""
+    monkeypatch.setattr(attention_module, "wrap_parallel_attention", lambda attn, **kwargs: attn)
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2,
+        cp_size=1,
+        ring_size=1,
+        cfg_size=1,
+        seq_size=2,
+        seq_rank=0,
+        seq_group=lambda: object(),
+    )
+    config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=True)
+    model = h3.MiniMaxH3Transformer3DModel(config)
+    attention_modules = [m for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
+    assert attention_modules and all(m.use_async_ulysses for m in attention_modules)
+
+    # The released Diffusers layout: to_q / to_k / to_v (no qkv_proj) and ff.net.{0.proj,2}
+    # with SwiGLU stored as [up, gate].
+    checkpoint: dict[str, torch.Tensor] = {}
+    expected: dict[str, torch.Tensor] = {}
+    for name, value in model.state_dict().items():
+        value = torch.randn_like(value) if value.is_floating_point() else value.clone()
+        expected[name] = value
+        if ".ff.gate_up_proj." in name:
+            gate, up = value.chunk(2, dim=0)
+            checkpoint[name.replace(".ff.gate_up_proj.", ".ff.net.0.proj.")] = torch.cat((up, gate))
+        elif ".ff.down_proj." in name:
+            checkpoint[name.replace(".ff.down_proj.", ".ff.net.2.")] = value
+        else:
+            checkpoint[name] = value
+    assert not any("qkv_proj" in key for key in checkpoint)
+    assert any(key.endswith("attn.to_k.weight") for key in checkpoint)
+
+    model.load_weights(checkpoint)
+
+    # Every parameter, including the re-ordered gate_up_proj and the renamed down_proj.
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, expected[name].to(parameter.dtype), rtol=0, atol=0)
