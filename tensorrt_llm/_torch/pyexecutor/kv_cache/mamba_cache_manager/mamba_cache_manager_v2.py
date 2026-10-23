@@ -339,6 +339,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_section_dims=tuple(self.conv_section_dims),
             conv_state_layout=conv_state_layout,
         )
+        kv_cache_config = kv_cache_config.model_copy(deep=True)
+        self.kv_cache_config = kv_cache_config
         self._speculative_state: MambaState | None = self._initialize_spec_state()
 
         if isinstance(num_kv_heads, int):
@@ -354,7 +356,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if is_mamba:
                 per_layer_kv_heads[i] = 0
 
-        kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
             block_reuse_config = kv_cache_config.block_reuse_config
             block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)

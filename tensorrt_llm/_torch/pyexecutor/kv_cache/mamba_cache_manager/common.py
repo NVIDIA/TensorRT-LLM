@@ -318,13 +318,15 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
 
 
-def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
+def _host_slots_to_device(
+    slots: list[int], device: torch.device, *, dtype: torch.dtype = torch.long
+) -> torch.Tensor:
     """Copy host slot IDs without synchronizing queued GPU work.
 
     Each copy uses fresh pinned storage so later host writes cannot race it.
     """
     return torch.tensor(
-        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
+        slots, dtype=dtype, pin_memory=device.type == "cuda" and prefer_pinned()
     ).to(device, non_blocking=True)
 
 
@@ -633,7 +635,13 @@ def _estimate_mamba_hybrid_cache_cost(
             if local_attention_layers > 0
             else 0
         )
-    state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
+    state_config = kv_cache_config.mamba_state_config
+    state_bytes = (
+        params.get_states_bytes_per_layer(mapping, kda_2fp4=True)
+        if state_config.kda_2fp4_replay
+        else params.get_states_bytes_per_layer(mapping)
+    )
+    state_bytes_per_rank = local_mamba_layers * state_bytes
     state_bytes_per_rank += extra_state_bytes_per_rank
     max_resident_sequences = max_batch_size * mapping.pp_size
 
@@ -664,6 +672,10 @@ def _estimate_mamba_hybrid_cache_cost(
     intercept = fixed_state_slots * state_bytes_per_rank + partial_attention_slots * (
         attention_block_bytes + attention_page_bytes_override
     )
+    if state_config.kda_2fp4_replay and not state_config.kda_2fp4_prefill_only:
+        live_rows = max_resident_sequences + num_reserved_dummy_slots
+        heads = params.num_heads // _mamba_effective_tp_size(mapping)
+        intercept += local_mamba_layers * live_rows * (heads * 16 * 128 * 8 + 4)
 
     if interval is None:
         regular_slope = 0
