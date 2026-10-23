@@ -38,10 +38,23 @@ template <typename Derived, AttentionFeature... Features>
 class TrtllmAttention : public AttentionBase, private Features...
 {
 public:
-    explicit TrtllmAttention(AttentionConfig const& cfg)
-        : AttentionBase(cfg)
-        , Features(cfg)...
+    /// Derives the device constants and the plain layer geometry. Does no CUDA work:
+    /// runners and the cuBLAS handle are created on the first call of each phase, which
+    /// keeps construction legal while a stream is capturing.
+    explicit TrtllmAttention(AttentionBase const& key)
+        : AttentionBase(key)
+        , Features(key)...
     {
+        mSM = tensorrt_llm::common::getSMVersion();
+        mUseTllmGen = (mSM >= 100) && (mSM != 120) && (mSM != 121);
+        mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+        mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
+        mNumKVHeads = static_cast<int>(num_kv_heads);
+        mHeadSize = static_cast<int>(head_size);
+        // One rank per attention op: neither tensor nor context parallelism applies here.
+        mNumAttnHeads = static_cast<int>(num_heads);
+        mNumAttnKVHeads = mNumKVHeads;
+        mFMHAForceFP32Acc = type == tensorrt_llm::DataType::kBF16;
     }
 
     void runContext(FmhaParams& p) final
@@ -174,7 +187,7 @@ class MHA : public TrtllmAttention<MHA, PagedKVCacheFeature, CustomMaskFeature, 
                 RopeFeature, RelativePositionFeature, CrossAttentionFeature, SpecDecodingFeature, SparseAttnFeature>
 {
 public:
-    explicit MHA(AttentionConfig const& cfg);
+    explicit MHA(AttentionBase const& key);
 
     using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;
     using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
@@ -235,7 +248,7 @@ public:
 
     // ---------------------------------------------------------------------------
     // Predicates over the runners chosen at initialization, and over the per-call
-    // state, which is passed explicitly. Config-only predicates are on AttentionConfig.
+    // state, which is passed explicitly. Config-only predicates are on AttentionBase.
     // ---------------------------------------------------------------------------
     [[nodiscard]] bool isUnfusedCrossAttention(FmhaParams const& p) const
     {
@@ -326,7 +339,7 @@ class MLA : public TrtllmAttention<MLA, PagedKVCacheFeature, OutputQuantFeature,
                 SparseMlaFeature>
 {
 public:
-    explicit MLA(AttentionConfig const& cfg);
+    explicit MLA(AttentionBase const& key);
 
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 

@@ -159,8 +159,7 @@ void runContext(nb::handle source)
 {
     torch_ext::FmhaParams params{};
     prepare(params, source);
-    torch_ext::AttentionConfig key{};
-    torch_ext::fillAttentionConfig(key, params);
+    auto const key = torch_ext::AttentionBase::getCacheKey(params);
 
     nb::gil_scoped_release const gil;
     c10::cuda::CUDAGuard const device(params.getQueryInput().device());
@@ -171,8 +170,7 @@ void runGeneration(nb::handle source)
 {
     torch_ext::FmhaParams params{};
     prepare(params, source);
-    torch_ext::AttentionConfig key{};
-    torch_ext::fillAttentionConfig(key, params);
+    auto const key = torch_ext::AttentionBase::getCacheKey(params);
 
     nb::gil_scoped_release const gil;
     c10::cuda::CUDAGuard const device(params.getQueryInput().device());

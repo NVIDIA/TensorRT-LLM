@@ -755,12 +755,6 @@ INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 #endif
 #undef INSTANTIATE_MMHA_DISPATCH
 
-int AttentionBase::getHeadSize() const
-{
-    TLLM_CHECK_WITH_INFO(mHeadSize > 0, "Trying to read mHeadSize before it's been initialized");
-    return mHeadSize;
-}
-
 size_t MHA::getFmhaMultiCtasKvScratchSize(FmhaParams const& p) const noexcept
 {
     static constexpr size_t kMultiCtasKvRowsPerCta = 256;
@@ -2088,19 +2082,29 @@ void MHA::runGenerationImpl(FmhaParams& p)
     sync_check_cuda_error(stream);
 }
 
-AttentionBase::AttentionBase(AttentionConfig const& cfg)
-    : AttentionConfig(cfg)
+bool AttentionBase::operator==(AttentionBase const& other) const
 {
-    mNumKVHeads = static_cast<int>(num_kv_heads);
-    mHeadSize = static_cast<int>(head_size);
-    // One rank per attention op: neither tensor nor context parallelism applies here.
-    mNumAttnHeads = static_cast<int>(num_heads);
-    mNumAttnKVHeads = mNumKVHeads;
-    mFMHAForceFP32Acc = type == tensorrt_llm::DataType::kBF16;
+    return keyFields(*this) == keyFields(other);
 }
 
-MHA::MHA(AttentionConfig const& cfg)
-    : TrtllmAttention(cfg)
+int AttentionBase::getHeadSize() const
+{
+    TLLM_CHECK_WITH_INFO(mHeadSize > 0, "Trying to read mHeadSize before it's been initialized");
+    return mHeadSize;
+}
+
+void AttentionBase::runContext(FmhaParams& /*p*/)
+{
+    TLLM_THROW("An attention cache key cannot run; look the op up with AttentionBase::getCached().");
+}
+
+void AttentionBase::runGeneration(FmhaParams& /*p*/)
+{
+    TLLM_THROW("An attention cache key cannot run; look the op up with AttentionBase::getCached().");
+}
+
+MHA::MHA(AttentionBase const& key)
+    : TrtllmAttention(key)
 {
     // Derived op state.
     mPagedKVCache = use_kv_cache;
@@ -2479,8 +2483,8 @@ void MHA::enqueueGeneration(FmhaParams& p)
 // MLA
 // ---------------------------------------------------------------------------
 
-MLA::MLA(AttentionConfig const& cfg)
-    : TrtllmAttention(cfg)
+MLA::MLA(AttentionBase const& key)
+    : TrtllmAttention(key)
 {
     TLLM_CHECK_WITH_INFO(type == tensorrt_llm::DataType::kHALF || type == tensorrt_llm::DataType::kBF16,
         "MLA(Deepseek v2) only support fmha, which needs fp16 or bf16 activations.");
@@ -3897,11 +3901,11 @@ std::string MLA::toString() const
     return ss.str();
 }
 
-AttentionBase* AttentionBase::getCached(AttentionConfig const& key)
+AttentionBase* AttentionBase::getCached(AttentionBase const& key)
 {
     // Per thread, like the Python-side parameter cache: no lock, and each thread builds
     // its own runners. Entries live until the thread exits.
-    static thread_local std::unordered_map<AttentionConfig, std::unique_ptr<AttentionBase>> cache;
+    static thread_local std::unordered_map<AttentionBase, std::unique_ptr<AttentionBase>> cache;
 
     if (auto const it = cache.find(key); it != cache.end())
     {
@@ -3916,8 +3920,9 @@ AttentionBase* AttentionBase::getCached(AttentionConfig const& key)
     return result;
 }
 
-void fillAttentionConfig(AttentionConfig& c, FmhaParams const& p)
+AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
 {
+    AttentionBase c;
     auto const& attn = p.attn;
     auto const& meta = p.meta;
     auto const& fwd = p.fwd;
@@ -3935,7 +3940,7 @@ void fillAttentionConfig(AttentionConfig& c, FmhaParams const& p)
     c.use_kv_cache = p.hasKvCache();
     c.cross_attention = p.is_cross;
     c.tokens_per_block = p.tokens_per_block;
-    c.mask_type = static_cast<AttentionConfig::AttentionMaskType>(fwd.mask_type);
+    c.mask_type = static_cast<AttentionMaskType>(fwd.mask_type);
     c.position_embedding_type = attn.position_embedding_type;
     c.num_heads = attn.num_heads;
     c.num_kv_heads = attn.num_kv_heads;
@@ -3973,9 +3978,10 @@ void fillAttentionConfig(AttentionConfig& c, FmhaParams const& p)
     c.sage_attn_qk_int8 = fwd.sage_attn_qk_int8;
     c.sage_attn_smooth_k = fwd.sage_attn_smooth_k;
     c.skip_correction_threshold = attn.skip_correction_threshold;
+    return c;
 }
 
-std::string AttentionConfig::toString() const
+std::string AttentionBase::toString() const
 {
     std::stringstream ss;
     ss << std::boolalpha;
@@ -4049,7 +4055,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
         return it->second;
     }
 
-    AttentionConfig cfg{};
+    AttentionBase cfg;
     cfg.device = device;
     cfg.num_heads = num_heads;
     cfg.num_kv_heads = num_kv_heads;
@@ -4252,8 +4258,8 @@ std::size_t hashCombine(std::size_t seed, T const& value)
 }
 } // namespace
 
-std::size_t std::hash<tensorrt_llm::torch_ext::AttentionConfig>::operator()(
-    tensorrt_llm::torch_ext::AttentionConfig const& c) const noexcept
+std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
+    tensorrt_llm::torch_ext::AttentionBase const& c) const noexcept
 {
     std::size_t h = 0;
     for (auto const v : {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type),

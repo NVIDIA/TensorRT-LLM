@@ -36,7 +36,7 @@ namespace torch_ext
 /// declares for the structs it affects.
 template <typename F>
 concept AttentionFeature
-    = std::constructible_from<F, AttentionConfig const&> && requires(F f, F const cf, FmhaParams const& p)
+    = std::constructible_from<F, AttentionBase const&> && requires(F f, F const cf, FmhaParams const& p)
 {
     {
         f.prepare(p, bool{})
@@ -67,7 +67,7 @@ struct FusedQKVMaskedAttentionDispatchParams;
 class PagedKVCacheFeature
 {
 public:
-    explicit PagedKVCacheFeature(AttentionConfig const& c)
+    explicit PagedKVCacheFeature(AttentionBase const& c)
         : mEnabled(c.use_kv_cache)
         , mPagedContextFmha(c.paged_context_fmha)
         , mTokensPerBlock(static_cast<int32_t>(c.tokens_per_block))
@@ -224,7 +224,7 @@ private:
             "kv_scale_quant_orig must have shape [1] for MLA with FP4 KV cache");
     }
 
-    [[nodiscard]] static int kvElemBits(AttentionConfig const& c)
+    [[nodiscard]] static int kvElemBits(AttentionBase const& c)
     {
         if (c.quant_mode.hasInt8KvCache() || c.quant_mode.hasFp8KvCache())
         {
@@ -260,7 +260,7 @@ static_assert(AttentionFeature<PagedKVCacheFeature>);
 class CustomMaskFeature
 {
 public:
-    explicit CustomMaskFeature(AttentionConfig const& c)
+    explicit CustomMaskFeature(AttentionBase const& c)
         : mEnabled(c.useCustomMask())
     {
     }
@@ -303,7 +303,7 @@ static_assert(AttentionFeature<CustomMaskFeature>);
 class SageAttnFeature
 {
 public:
-    explicit SageAttnFeature(AttentionConfig const& c)
+    explicit SageAttnFeature(AttentionBase const& c)
         : mEnabled(c.sageAttnRequested() && !c.is_mla_enable && !c.use_kv_cache)
         , mCross(c.cross_attention)
         , mMaskType(c.mask_type)
@@ -389,7 +389,7 @@ static_assert(AttentionFeature<SageAttnFeature>);
 class OutputQuantFeature
 {
 public:
-    explicit OutputQuantFeature(AttentionConfig const& c)
+    explicit OutputQuantFeature(AttentionBase const& c)
         : mFp8Out(c.is_fp8_out)
         , mFp4Out(c.is_fp4_out)
     {
@@ -466,7 +466,7 @@ static_assert(AttentionFeature<OutputQuantFeature>);
 class RopeFeature
 {
 public:
-    explicit RopeFeature(AttentionConfig const& c)
+    explicit RopeFeature(AttentionBase const& c)
         : mEnabled(c.isRoPE())
         , mDim(static_cast<int>(c.rotary_embedding_dim))
         , mType(c.position_embedding_type)
@@ -569,7 +569,7 @@ static_assert(AttentionFeature<RopeFeature>);
 class RelativePositionFeature
 {
 public:
-    explicit RelativePositionFeature(AttentionConfig const& c)
+    explicit RelativePositionFeature(AttentionBase const& c)
         : mRelative(c.isRelativePosition())
         , mAlibi(c.isALiBi())
         , mAlibiScale(c.isAliBiWithScale())
@@ -658,7 +658,7 @@ static_assert(AttentionFeature<RelativePositionFeature>);
 class CrossAttentionFeature
 {
 public:
-    explicit CrossAttentionFeature(AttentionConfig const& c)
+    explicit CrossAttentionFeature(AttentionBase const& c)
         : mEnabled(c.cross_attention)
         , mKvCache(c.use_kv_cache)
     {
@@ -790,7 +790,7 @@ static_assert(AttentionFeature<CrossAttentionFeature>);
 class SpecDecodingFeature
 {
 public:
-    explicit SpecDecodingFeature(AttentionConfig const& c)
+    explicit SpecDecodingFeature(AttentionBase const& c)
         : mEnabled(c.is_spec_decoding_enabled)
         , mTargetMaxGenLen(static_cast<int>(c.spec_decoding_target_max_gen_len))
     {
@@ -915,7 +915,7 @@ static_assert(AttentionFeature<SpecDecodingFeature>);
 class SparseAttnFeature
 {
 public:
-    explicit SparseAttnFeature(AttentionConfig const& c)
+    explicit SparseAttnFeature(AttentionBase const& c)
         : mRequested(c.use_sparse_attention)
         , mEnabled(c.use_sparse_attention)
         , mTllmGen(mEnabled && c.use_tllm_gen_sparse_attention && isTllmGenDevice())
@@ -984,7 +984,7 @@ static_assert(AttentionFeature<SparseAttnFeature>);
 class SparseMlaFeature
 {
 public:
-    explicit SparseMlaFeature(AttentionConfig const& c)
+    explicit SparseMlaFeature(AttentionBase const& c)
         : mRequested(c.use_sparse_attention)
         , mEnabled(c.use_sparse_attention && isTllmGenDevice())
     {

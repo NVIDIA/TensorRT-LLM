@@ -43,7 +43,6 @@
 #include <set>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
@@ -136,119 +135,6 @@ struct AttentionForwardArgs
         return softmax_stats_tensor.has_value() ? static_cast<float2*>(softmax_stats_tensor.value().data_ptr())
                                                 : nullptr;
     }
-};
-
-class AttentionBase;
-
-/// Everything that selects and configures a layer's kernel runners, and the key of the
-/// per-thread op cache. Plain struct: copying a key is memberwise and `operator==` is
-/// defaulted over every member; `std::hash<AttentionConfig>` below reads the same set.
-/// Values derived from these members live on AttentionBase, not here.
-struct AttentionConfig
-{
-    using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;
-    using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
-    using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
-
-    int device = 0;
-    tensorrt_llm::DataType type = tensorrt_llm::DataType::kHALF;
-    bool is_fp8_out = false;
-    bool is_fp4_out = false;
-    bool use_kv_cache = false;
-    bool cross_attention = false;
-    std::int64_t tokens_per_block = 0;
-    AttentionMaskType mask_type = AttentionMaskType::CAUSAL;
-    PositionEmbeddingType position_embedding_type = PositionEmbeddingType::kLEARNED_ABSOLUTE;
-    std::int64_t num_heads = 0;
-    std::int64_t num_kv_heads = 0;
-    std::int64_t head_size = 0;
-    double q_scaling = 1.0;
-    std::int64_t rotary_embedding_dim = 0;
-    tensorrt_llm::common::QuantMode quant_mode{};
-    bool uses_spcompress = false;
-    bool paged_context_fmha = false;
-    bool is_spec_decoding_enabled = false;
-    std::int64_t spec_decoding_target_max_gen_len = 0;
-    bool fuses_dsv4_inv_rope_fp8_quant = false;
-    bool use_sparse_attention = false;
-    bool use_tllm_gen_sparse_attention = false;
-    bool use_nvfp4_mla_kv_cache = false;
-    bool is_mla_enable = false;
-    std::int64_t q_lora_rank = 0;
-    std::int64_t kv_lora_rank = 0;
-    std::int64_t qk_nope_head_dim = 0;
-    std::int64_t qk_rope_head_dim = 0;
-    std::int64_t v_head_dim = 0;
-    std::int64_t predicted_tokens_per_seq = 1;
-    std::int64_t mla_layer_num = 0;
-    bool rope_append = true;
-    std::int64_t sage_attn_num_elts_per_blk_q = 0;
-    std::int64_t sage_attn_num_elts_per_blk_k = 0;
-    std::int64_t sage_attn_num_elts_per_blk_v = 0;
-    bool sage_attn_qk_int8 = false;
-    bool sage_attn_smooth_k = false;
-    double skip_correction_threshold = 0.0;
-
-    // Fixed for the phased path: inputs are never padded, the dense context FMHA is never
-    // selected, and logit soft-capping is not exposed.
-    static constexpr bool remove_padding = true;
-    static constexpr bool dense_context_fmha = false;
-    static constexpr double attn_logit_softcapping_scale = 0.0;
-
-    bool operator==(AttentionConfig const&) const = default;
-
-    [[nodiscard]] bool isRelativePosition() const
-    {
-        return position_embedding_type == PositionEmbeddingType::kRELATIVE;
-    }
-
-    [[nodiscard]] bool isALiBi() const
-    {
-        return position_embedding_type == PositionEmbeddingType::kALIBI
-            || position_embedding_type == PositionEmbeddingType::kALIBI_WITH_SCALE;
-    }
-
-    [[nodiscard]] bool isAliBiWithScale() const
-    {
-        return position_embedding_type == PositionEmbeddingType::kALIBI_WITH_SCALE;
-    }
-
-    [[nodiscard]] bool isRoPE() const
-    {
-        return position_embedding_type == PositionEmbeddingType::kROPE_GPTJ
-            || position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
-            || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
-            || position_embedding_type == PositionEmbeddingType::kYARN
-            || position_embedding_type == PositionEmbeddingType::kROPE_M;
-    }
-
-    [[nodiscard]] bool isLongRoPE() const
-    {
-        return position_embedding_type == PositionEmbeddingType::kLONG_ROPE;
-    }
-
-    [[nodiscard]] bool isMRoPE() const
-    {
-        return position_embedding_type == PositionEmbeddingType::kROPE_M;
-    }
-
-    [[nodiscard]] bool useCustomMask() const
-    {
-        return mask_type == AttentionMaskType::CUSTOM_MASK;
-    }
-
-    [[nodiscard]] bool isMLAEnabled() const
-    {
-        return is_mla_enable;
-    }
-
-    [[nodiscard]] bool sageAttnRequested() const
-    {
-        return sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
-    }
-
-    /// The key fields, for the cache-miss log and for diffing two keys.
-    [[nodiscard]] std::string toString() const;
 };
 
 /// Parameters for phased attention, generated from fmha/phased.py.
@@ -641,31 +527,73 @@ struct FmhaParams
 [[nodiscard]] size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
     int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
 
-/// Fill the key from live parameters. Reads tensor metadata (dtype, device, presence and
-/// sizes), so it runs in the binding while the tensors are still attached.
-void fillAttentionConfig(AttentionConfig& config, FmhaParams const& p);
+/// Defined in attentionFeature.h; named here for the friend list of AttentionBase.
+class PagedKVCacheFeature;
+class CustomMaskFeature;
+class SageAttnFeature;
+class OutputQuantFeature;
+class RopeFeature;
+class RelativePositionFeature;
+class CrossAttentionFeature;
+class SpecDecodingFeature;
+class SparseAttnFeature;
+class SparseMlaFeature;
 
-/// Abstract attention op: the key plus every value derived from it, and the entry points
-/// the binding calls. The per-thread op cache stores these; the miss path chooses the
-/// concrete class.
-class AttentionBase : public AttentionConfig
+/// Base class of the native attention ops, and the key of the per-thread op cache.
+///
+/// An AttentionBase holds two kinds of state:
+/// - Key members: the layer configuration that selects and configures the kernel runners
+///   (data type, head geometry, mask, position embedding, quantization, MLA dimensions,
+///   and so on). `operator==` and `std::hash<AttentionBase>` cover exactly these members.
+/// - Op state: values derived from the device and the key members, such as the SM version
+///   and the head counts the kernels use. A derived op sets it on construction; it is not part
+///   of the key.
+///
+/// For every phase call, the binding builds a key from the call's parameters, looks up
+/// the op for it, and runs the phase:
+///
+///     auto const key = AttentionBase::getCacheKey(params);
+///     AttentionBase::getCached(key)->runContext(params);
+///
+/// On a cache miss, `getCached()` constructs the concrete op (`MHA` or `MLA`, both built on
+/// `TrtllmAttention`) from the key. New objects are created only by `getCacheKey()` and by
+/// derived op constructors. A key built by `getCacheKey()` has no op state and cannot run.
+class AttentionBase
 {
 public:
-    /// Derives the device constants and the plain layer geometry. Does no CUDA work:
-    /// runners and the cuBLAS handle are created on the first call of each phase, which
-    /// keeps construction legal while a stream is capturing.
-    explicit AttentionBase(AttentionConfig const& cfg);
+    using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;
+    using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
+    using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
+
+    // Fixed for the phased path: inputs are never padded, the dense context FMHA is never
+    // selected, and logit soft-capping is not exposed.
+    static constexpr bool remove_padding = true;
+    static constexpr bool dense_context_fmha = false;
+    static constexpr double attn_logit_softcapping_scale = 0.0;
+
     // No CUDA calls in destructors: the thread_local cache is destroyed at thread exit,
     // possibly after the CUDA context.
     virtual ~AttentionBase() = default;
-    AttentionBase(AttentionBase const&) = delete;
+    /// Copies the key members and the op state. The cache stores its keys by value.
+    AttentionBase(AttentionBase const&) = default;
+    AttentionBase(AttentionBase&&) = default;
     AttentionBase& operator=(AttentionBase const&) = delete;
+    AttentionBase& operator=(AttentionBase&&) = delete;
 
-    virtual void runContext(FmhaParams& p) = 0;
-    virtual void runGeneration(FmhaParams& p) = 0;
+    [[nodiscard]] bool operator==(AttentionBase const& other) const;
 
-    /// The op for `key`, built on first use and owned by the calling thread's cache.
-    static AttentionBase* getCached(AttentionConfig const& key);
+    /// Runs the context or generation phase of one call. Derived ops override both; on a
+    /// key built by `getCacheKey()` they throw.
+    virtual void runContext(FmhaParams& p);
+    virtual void runGeneration(FmhaParams& p);
+
+    /// Builds the cache key of one call from its parameters. Reads tensor metadata (data
+    /// type, device, presence and sizes), so call it while the tensors are still attached.
+    [[nodiscard]] static AttentionBase getCacheKey(FmhaParams const& p);
+
+    /// Returns the op for `key` from the calling thread's cache, constructing it on first
+    /// use. The cache owns the op, which lives until the thread exits.
+    static AttentionBase* getCached(AttentionBase const& key);
 
     [[nodiscard]] int getHeadSize() const;
 
@@ -679,20 +607,150 @@ public:
         return mMultiProcessorCount;
     }
 
+    [[nodiscard]] bool isRelativePosition() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kRELATIVE;
+    }
+
+    [[nodiscard]] bool isALiBi() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kALIBI
+            || position_embedding_type == PositionEmbeddingType::kALIBI_WITH_SCALE;
+    }
+
+    [[nodiscard]] bool isAliBiWithScale() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kALIBI_WITH_SCALE;
+    }
+
+    [[nodiscard]] bool isRoPE() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kROPE_GPTJ
+            || position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+            || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            || position_embedding_type == PositionEmbeddingType::kYARN
+            || position_embedding_type == PositionEmbeddingType::kROPE_M;
+    }
+
+    [[nodiscard]] bool isLongRoPE() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kLONG_ROPE;
+    }
+
+    [[nodiscard]] bool isMRoPE() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kROPE_M;
+    }
+
+    [[nodiscard]] bool useCustomMask() const
+    {
+        return mask_type == AttentionMaskType::CUSTOM_MASK;
+    }
+
+    [[nodiscard]] bool isMLAEnabled() const
+    {
+        return is_mla_enable;
+    }
+
+    [[nodiscard]] bool sageAttnRequested() const
+    {
+        return sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
+    }
+
+    /// Prints the key members, for the cache-miss log and for comparing two keys.
+    [[nodiscard]] std::string toString() const;
+
 protected:
-    // Derived from the device.
-    int mSM = tensorrt_llm::common::getSMVersion();
-    bool mUseTllmGen = (mSM >= 100) && (mSM != 120) && (mSM != 121);
-    int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-    int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
-    // Plain layer geometry from the key. An op whose KV layout differs (MLA) overrides
-    // these in its own constructor; nothing MLA-specific lives here.
+    /// Creates a key with default key members and unset op state; used by `getCacheKey()`.
+    AttentionBase() = default;
+
+    /// References to every key member. `operator==` compares this list, and
+    /// `std::hash<AttentionBase>` must hash the same set.
+    template <typename Self>
+    [[nodiscard]] static auto keyFields(Self& self)
+    {
+        return std::tie(self.device, self.type, self.is_fp8_out, self.is_fp4_out, self.use_kv_cache,
+            self.cross_attention, self.tokens_per_block, self.mask_type, self.position_embedding_type, self.num_heads,
+            self.num_kv_heads, self.head_size, self.q_scaling, self.rotary_embedding_dim, self.quant_mode,
+            self.uses_spcompress, self.paged_context_fmha, self.is_spec_decoding_enabled,
+            self.spec_decoding_target_max_gen_len, self.fuses_dsv4_inv_rope_fp8_quant, self.use_sparse_attention,
+            self.use_tllm_gen_sparse_attention, self.use_nvfp4_mla_kv_cache, self.is_mla_enable, self.q_lora_rank,
+            self.kv_lora_rank, self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim,
+            self.predicted_tokens_per_seq, self.mla_layer_num, self.rope_append, self.sage_attn_num_elts_per_blk_q,
+            self.sage_attn_num_elts_per_blk_k, self.sage_attn_num_elts_per_blk_v, self.sage_attn_qk_int8,
+            self.sage_attn_smooth_k, self.skip_correction_threshold);
+    }
+
+    int device = 0;
+    tensorrt_llm::DataType type = tensorrt_llm::DataType::kHALF;
+    bool is_fp8_out = false;
+    bool is_fp4_out = false;
+    bool use_kv_cache = false;
+    bool cross_attention = false;
+    std::int64_t tokens_per_block = 0;
+    AttentionMaskType mask_type = AttentionMaskType::CAUSAL;
+    PositionEmbeddingType position_embedding_type = PositionEmbeddingType::kLEARNED_ABSOLUTE;
+    std::int64_t num_heads = 0;
+    std::int64_t num_kv_heads = 0;
+    std::int64_t head_size = 0;
+    double q_scaling = 1.0;
+    std::int64_t rotary_embedding_dim = 0;
+    tensorrt_llm::common::QuantMode quant_mode{};
+    bool uses_spcompress = false;
+    bool paged_context_fmha = false;
+    bool is_spec_decoding_enabled = false;
+    std::int64_t spec_decoding_target_max_gen_len = 0;
+    bool fuses_dsv4_inv_rope_fp8_quant = false;
+    bool use_sparse_attention = false;
+    bool use_tllm_gen_sparse_attention = false;
+    bool use_nvfp4_mla_kv_cache = false;
+    bool is_mla_enable = false;
+    std::int64_t q_lora_rank = 0;
+    std::int64_t kv_lora_rank = 0;
+    std::int64_t qk_nope_head_dim = 0;
+    std::int64_t qk_rope_head_dim = 0;
+    std::int64_t v_head_dim = 0;
+    std::int64_t predicted_tokens_per_seq = 1;
+    std::int64_t mla_layer_num = 0;
+    bool rope_append = true;
+    std::int64_t sage_attn_num_elts_per_blk_q = 0;
+    std::int64_t sage_attn_num_elts_per_blk_k = 0;
+    std::int64_t sage_attn_num_elts_per_blk_v = 0;
+    bool sage_attn_qk_int8 = false;
+    bool sage_attn_smooth_k = false;
+    double skip_correction_threshold = 0.0;
+
+    // Op state, derived from the device and the key members; not part of the key. Set by
+    // the `TrtllmAttention` constructor. MLA overrides the head geometry for its latent KV
+    // layout.
+    int mSM = 0;
+    bool mUseTllmGen = false;
+    int mMultiProcessorCount = 0;
+    int mMaxSharedMemoryPerBlockOptin = 0;
     int mNumKVHeads = -1;
     int mHeadSize = -1;
     // Equal to the full head counts: this op always runs on a single rank.
     int mNumAttnHeads = -1;
     int mNumAttnKVHeads = -1;
     bool mFMHAForceFP32Acc = false;
+
+private:
+    // These read the key members directly: the hash reads all of them, the features read
+    // the ones that configure them, and the NVFP4 support probe builds a key from scalars.
+    friend struct std::hash<AttentionBase>;
+    friend class PagedKVCacheFeature;
+    friend class CustomMaskFeature;
+    friend class SageAttnFeature;
+    friend class OutputQuantFeature;
+    friend class RopeFeature;
+    friend class RelativePositionFeature;
+    friend class CrossAttentionFeature;
+    friend class SpecDecodingFeature;
+    friend class SparseAttnFeature;
+    friend class SparseMlaFeature;
+    friend bool attention_supports_nvfp4_output(std::int64_t num_heads, std::int64_t num_kv_heads,
+        std::int64_t head_size, std::optional<std::int64_t> tokens_per_block, std::int64_t mask_type,
+        std::int64_t quant_mode, bool use_paged_context_fmha, bool is_mla_enable);
 };
 
 struct KvCachePoolMapping
@@ -866,9 +924,9 @@ void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_schedul
 
 TRTLLM_NAMESPACE_END
 
-/// Hashes exactly the members `AttentionConfig::operator==` compares.
+/// Hashes exactly the members `AttentionBase::keyFields()` names.
 template <>
-struct std::hash<tensorrt_llm::torch_ext::AttentionConfig>
+struct std::hash<tensorrt_llm::torch_ext::AttentionBase>
 {
-    std::size_t operator()(tensorrt_llm::torch_ext::AttentionConfig const& c) const noexcept;
+    std::size_t operator()(tensorrt_llm::torch_ext::AttentionBase const& c) const noexcept;
 };
