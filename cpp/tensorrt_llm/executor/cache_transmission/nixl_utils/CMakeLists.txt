@@ -37,7 +37,10 @@ if(NIXL_ROOT)
                              PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
   # Link against all NIXL libraries
-  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_link_libraries(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE NIXL::nixl tllm::common_environment tllm::executor_transfer_agent
+            tllm::kv_cache_legacy tllm::runtime_distributed)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)

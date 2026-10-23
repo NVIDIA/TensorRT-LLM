@@ -23,11 +23,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 #: `merger.linear_fc1` is `[4608, 4608]`: spatial merge 2 over a 1152-wide tower.
 MERGER_WIDTH = 4608
 
-#: Rows the merger is asked for, `sum(t*h*w) / 4`: 64 is a 224x224 image
-#: (grid [1, 16, 16]), 140 a 336x448 one ([1, 20, 28]) -- not a multiple of
-#: any MoE tile size.
-MERGER_ROW_COUNTS = (1, 7, 64, 65, 140, 1024, 4096)
-
 _SQRT_2 = math.sqrt(2.0)
 
 
@@ -45,91 +40,43 @@ class GeluErf(OpWrapper):
 
     # spec: shape, dtype; `dist` "uniform" over [lo, hi] (default) or "merger"
     # (a tower hidden state scaled by the merger norm's measured gamma, grouped
-    # 4-to-1, through an fc1 at the checkpoint's measured weight/bias scale);
-    # `layout` "contiguous" (default), "column_slice" or "transposed".
+    # 4-to-1, through an fc1 at the checkpoint's measured weight/bias scale).
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"merger activand, {rows} merged rows x 4608 bf16",
-                spec=dict(shape=(rows, MERGER_WIDTH), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            )
-            for rows in MERGER_ROW_COUNTS
-        )
-        + (
-            Cell(
-                why="activand built the way the merger builds it",
-                spec=dict(shape=(512, MERGER_WIDTH), dtype=torch.bfloat16, dist="merger"),
-            ),
-            Cell(
-                why="fp16 over [-16, 16]",
-                spec=dict(shape=(256, MERGER_WIDTH), dtype=torch.float16, lo=-16.0, hi=16.0),
-            ),
-            Cell(
-                why="fp32 over [-16, 16]",
-                spec=dict(shape=(256, MERGER_WIDTH), dtype=torch.float32, lo=-16.0, hi=16.0),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"{str(dtype)[6:]} over [-3, 3], the erf/tanh divergence peak",
-                spec=dict(shape=(256, MERGER_WIDTH), dtype=dtype, lo=-3.0, hi=3.0),
-            )
-            for dtype in (torch.bfloat16, torch.float16, torch.float32)
-        )
-        + (
-            Cell(
-                why="column slice of a wider buffer: row stride free",
-                spec=dict(
-                    shape=(64, MERGER_WIDTH),
-                    dtype=torch.bfloat16,
-                    lo=-16.0,
-                    hi=16.0,
-                    layout="column_slice",
-                ),
-            ),
-            Cell(
-                why="transposed buffer: output keeps the input's strides",
-                spec=dict(
-                    shape=(64, MERGER_WIDTH),
-                    dtype=torch.bfloat16,
-                    lo=-16.0,
-                    hi=16.0,
-                    layout="transposed",
-                ),
-            ),
-            Cell(
-                why="1-D input",
-                spec=dict(shape=(MERGER_WIDTH,), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            ),
-            Cell(
-                why="3-D input",
-                spec=dict(shape=(2, 37, MERGER_WIDTH), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            ),
-            Cell(
-                why="zero-row batch",
-                spec=dict(shape=(0, MERGER_WIDTH), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            ),
-        )
+        Cell(
+            why="activand built the way the merger builds it",
+            spec=dict(shape=(512, MERGER_WIDTH), dtype=torch.bfloat16, dist="merger"),
+        ),
+        Cell(
+            why="merger activand, 8192 merged rows x 4608 bf16: the most one tower call carries",
+            spec=dict(shape=(8192, MERGER_WIDTH), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
+        ),
+        Cell(
+            why="merger activand, 1 merged row x 4608 bf16",
+            spec=dict(shape=(1, MERGER_WIDTH), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
+        ),
     )
 
     note = """
     Metadata consumed: none. Out-of-place; `x` is not mutated.
 
-    The output inherits `x`'s memory format: a transposed `x` returns a
-    non-contiguous result (bitwise equal to the call on a contiguous copy).
+    Certified on contiguous bf16 `[rows, 4608]` activands (what the merger's fc1
+    returns) at 1, 512 and 8192 rows (8192, from 32768 patch rows, the most one
+    tower call carries).
 
-    Identity is pinned by the fp32 cells only. Max |erf GELU - tanh GELU| is
-    4.73e-4 at x = -2.699; in fp32 the tanh form lands ~1400x the correct path's
-    deviation away, 31x outside the default gate. In bf16 one ulp at the output
-    scale exceeds that gap (tanh variant 8.24e-3 vs correct 7.77e-3 max abs), so
-    a bf16 match does not say which GELU was computed.
+    Identity is pinned by fp32 only (the identity test).
+    Max |erf GELU - tanh GELU| is 4.73e-4 at x = -2.699; in fp32 the tanh form
+    lands ~1400x the correct path's deviation away, 31x outside the default
+    gate. In bf16 one ulp at the output scale exceeds that gap (tanh variant
+    8.24e-3 vs correct 7.77e-3 max abs), so a bf16 match does not say which GELU
+    was computed.
 
-    Values: `-inf -> nan` (the closed form does the same); `+inf -> +inf`;
-    large negatives give `-0.0`; `finfo.max` comes back unchanged.
-    CUDA-graph capturable; the output is a fresh allocation.
+    Measured, not certified: `-inf -> nan` (the closed form does the same);
+    `+inf -> +inf`; large negatives give `-0.0`; `finfo.max` comes back
+    unchanged; CUDA-graph capturable; the output is a fresh allocation.
 
-    Not certified: float8 operands. No index-typed argument; numel past 2^31
-    not probed.
+    Not certified: fp32 beyond the identity test, non-contiguous inputs, fp16,
+    other widths, float8 operands. No index-typed argument;
+    numel past 2^31 not probed.
     """
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
