@@ -2663,9 +2663,14 @@ def _make_cutedsl_sibling_for_quantize_input_test(
     backend = backend_cls.__new__(backend_cls)
     torch.nn.Module.__init__(backend)
     # ``has_nvfp4`` asserts weights exist and reads the layer quant mode;
-    # NVFP4_AWQ folds onto the NVFP4 quant mode (quantization/mode.py).
+    # NVFP4_AWQ folds onto the NVFP4 quant mode (quantization/mode.py), so
+    # either recipe clears that gate. Declare plain NVFP4 when no scale is
+    # given, so that case exercises a non-AWQ layer rather than an AWQ one
+    # whose checkpoint happened to carry no ``pre_quant_scale``.
     backend._weights_created = True
-    backend.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ)
+    backend.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4_AWQ if pre_quant_scale is not None else QuantAlgo.NVFP4
+    )
     backend.hidden_size = hidden_size
     backend.scaling_vector_size = 16
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
