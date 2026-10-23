@@ -35,11 +35,22 @@ class SlurmKind:
 
 
 class LocalKind:
-    """Local handle-kind: cancel via ``SIGTERM`` to the recorded pid."""
+    """Local handle-kind: cancel via ``SIGTERM`` to the recorded pid.
+
+    A detached job's pid leads its own session, so the signal goes to its
+    whole process group and reaches the commands it started; a pid that leads
+    no group gets the signal alone.
+    """
 
     def cancel(self, handle: dict) -> None:
+        pid = int(handle["pid"])
         try:
-            os.kill(int(handle["pid"]), signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
+            return
+        except OSError:
+            pass
+        try:
+            os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
 

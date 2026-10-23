@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import shutil
@@ -29,19 +30,50 @@ from .codex_transport import CodexTransport
 
 
 def _resolve_codex_bin() -> str:
+    """The ``codex`` binary a Codex backend launches.
+
+    ``$CODEX_BIN`` names one outright. Otherwise the pinned runtime, unless
+    the ``codex`` on ``PATH`` is newer: a login offers a new model only to a
+    client that knows it, and the operator's own CLI is the one kept current.
+    """
     override = os.environ.get("CODEX_BIN")
     if override:
         if not Path(override).is_file():
             raise FileNotFoundError(f"CODEX_BIN={override!r} does not point to a file.")
         return override
+    system_bin = shutil.which("codex")
     try:
         from codex_cli_bin import bundled_codex_path
     except ImportError:
-        system_bin = shutil.which("codex")
         if system_bin:
             return system_bin
         raise FileNotFoundError("Install the pinned Codex CLI runtime or set CODEX_BIN.") from None
-    return str(bundled_codex_path())
+    bundled = str(bundled_codex_path())
+    if system_bin and _newer(system_bin, bundled):
+        return system_bin
+    return bundled
+
+
+@functools.lru_cache(maxsize=None)
+def _newer(candidate: str, than: str) -> bool:
+    """Whether ``candidate``'s ``codex --version`` is newer than ``than``'s; False when unreadable."""
+    mine = _version_tuple(candidate)
+    return bool(mine) and mine > _version_tuple(than)
+
+
+def _version_tuple(cli_path: str) -> tuple[int, ...]:
+    """``codex-cli 0.162.1`` as ``(0, 162, 1)``; empty when it cannot be read."""
+    try:
+        out = subprocess.run(
+            [cli_path, "--version"], capture_output=True, text=True, timeout=_CLI_VERSION_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    words = out.stdout.split() if out.returncode == 0 else []
+    try:
+        return tuple(int(part) for part in words[-1].split("-")[0].split(".")) if words else ()
+    except ValueError:
+        return ()
 
 
 def _dynamic_tool_spec(tool: Any) -> dict[str, Any]:
@@ -191,7 +223,10 @@ class CodexBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
+        if fork_from is not None:
+            raise NotImplementedError("the codex backend cannot fork a session")
         if self._transport is None:
             raise RuntimeError("CodexBackend must be entered before creating clients.")
         session_cwd = (cwd or Path.cwd()).resolve()
@@ -245,7 +280,8 @@ class CodexBackend(Backend):
             model_context_window=1000000,
         )
         params = ThreadStartParams(
-            model=model,
+            # An empty model leaves the choice to Codex's own configuration.
+            model=model or None,
             developer_instructions=system_prompt or None,
             config=config,
             cwd=str(session_cwd),
