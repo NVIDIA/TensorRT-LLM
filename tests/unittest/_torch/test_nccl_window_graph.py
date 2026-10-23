@@ -585,7 +585,7 @@ def test_eager_decoder_layer_hook_propagates_forward_failure(tensor_scope_events
 
 def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
-    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
 
     @dataclass
     class Metadata:
@@ -601,6 +601,8 @@ def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
         residual = torch.empty(1, device="cuda")
         fp4_tensor = torch.empty(1, device="cuda")
         scaling_factor = torch.empty(1, device="cuda")
+        fp8_tensor = torch.empty(1, device="cuda")
+        mxfp8_scaling_factor = torch.empty(1, device="cuda")
         seq_lens_cuda = torch.empty(1, device="cuda")
 
     # Per-request lists make the metadata walk O(batch size) per layer.
@@ -625,6 +627,7 @@ def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
             (residual,),
             attn_metadata=metadata,
             quantized=Fp4QuantizedTensor(fp4_tensor, scaling_factor),
+            mxfp8=MxFp8QuantizedTensor(fp8_tensor, mxfp8_scaling_factor),
             # Metadata nested inside containers is skipped at every depth.
             nested_tuple=(metadata,),
             nested_dict={"metadata": metadata},
@@ -639,7 +642,17 @@ def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
     assert [event[0] for event in events] == ["begin", "end"]
     # Direct tensors, containers, and quantized wrappers are adopted; metadata is not,
     # whether passed directly or inside a container.
-    assert same_tensors(events[0][1], [hidden_states, residual, fp4_tensor, scaling_factor])
+    assert same_tensors(
+        events[0][1],
+        [
+            hidden_states,
+            residual,
+            fp4_tensor,
+            scaling_factor,
+            fp8_tensor,
+            mxfp8_scaling_factor,
+        ],
+    )
     assert same_tensors(events[1][2], [hidden_states, residual])
     assert events[1][3] is False
 
