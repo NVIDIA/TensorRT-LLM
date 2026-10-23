@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Python transceiver marathon: V1 KV cache + Python transceiver + NIXL, DeepSeek-class MLA.
+# Python transceiver marathon: V2 KV cache + Python transceiver + NIXL, DeepSeek-class MLA.
 #
 # Preserves the cancellation/lifetime regression scenarios from NVBug 6104831
 # while exercising the Python transceiver. Schema documentation is in ../README.md.
@@ -21,7 +21,7 @@ context_servers:
     enable_block_reuse: true        # block reuse ON
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    use_kv_cache_manager_v2: false  # V1 KV cache (default)
+    use_kv_cache_manager_v2: true
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
@@ -39,7 +39,7 @@ generation_servers:
     enable_block_reuse: true
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    use_kv_cache_manager_v2: false
+    use_kv_cache_manager_v2: true
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
@@ -63,8 +63,8 @@ stress_config:
 
   # Backend-knob axis selectors. Must match
   # context_servers / generation_servers above.
-  kv_cache_manager: v1               # V1 (C++) KV cache manager
-  transceiver: python                # Python transceiver with V1 KV cache manager
+  kv_cache_manager: v2
+  transceiver: python
 
   log_only_probe:
     interval_s: 30

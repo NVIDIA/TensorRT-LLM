@@ -209,7 +209,8 @@ def test_workspace_reclaimer_keeps_source_identity():
     assert old_workspace() is None
 
 
-def test_graph_runner_captures_widths_and_replays_updated_rows(monkeypatch):
+@pytest.mark.parametrize("shared_inputs", [False, True])
+def test_graph_runner_captures_widths_and_replays_updated_rows(monkeypatch, shared_inputs):
     from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as graph_module
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
         CUDAGraphRunner,
@@ -219,6 +220,7 @@ def test_graph_runner_captures_widths_and_replays_updated_rows(monkeypatch):
     from tensorrt_llm.mapping import Mapping
 
     monkeypatch.setattr(graph_module, "_STRICT_BUFFER_CHECK", True)
+    inputs = make_inputs(2, 5)
     config = CUDAGraphRunnerConfig(
         use_cuda_graph=True,
         cuda_graph_padding_enabled=True,
@@ -237,9 +239,14 @@ def test_graph_runner_captures_widths_and_replays_updated_rows(monkeypatch):
         dist=None,
         kv_cache_manager_key=None,
         compact_beam_widths=(2, 4),
+        static_input_ids=inputs["input_ids"] if shared_inputs else None,
+        static_position_ids=inputs["position_ids"][0] if shared_inputs else None,
     )
     runner = CUDAGraphRunner(config)
-    inputs = make_inputs(2, 5)
+    for name in ("input_ids", "position_ids"):
+        assert (runner.shared_static_tensors[name].data_ptr() == inputs[name].data_ptr()) == (
+            shared_inputs
+        )
     inputs["attn_metadata"].is_cuda_graph = True
     key = KeyType(batch_size=2, draft_len=0)
     runner.is_warmup_only = True

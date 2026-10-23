@@ -440,6 +440,7 @@ def _warmup_runner(*, world_size: int) -> EncoderRunner:
     runner = object.__new__(EncoderRunner)
     runner._dist = SimpleNamespace(world_size=world_size)
     runner._mapping = SimpleNamespace(dwdp_enabled=False)
+    runner._buffers = SimpleNamespace(input_ids_cuda=torch.empty(0, dtype=torch.int32))
     runner._encoder_cuda_graph_runner = SimpleNamespace(
         enabled=True,
         build_capture_sequence_lengths=Mock(return_value=[1]),
@@ -518,10 +519,13 @@ def test_capture_inputs_without_declared_extra_inputs_pass_no_model_inputs() -> 
     assert runner._prepare_encoder_batch.call_args.kwargs["model_inputs"] is None
 
 
-def test_encoder_release_clears_owned_graph_backend() -> None:
+@pytest.mark.parametrize("release_nccl_window_owners", [True, False])
+def test_encoder_release_clears_owned_graph_backend(release_nccl_window_owners: bool) -> None:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = Mock()
 
-    runner.release_graphs()
+    runner.release_graphs(release_nccl_window_owners=release_nccl_window_owners)
 
-    runner._encoder_cuda_graph_runner.clear.assert_called_once_with()
+    runner._encoder_cuda_graph_runner.clear.assert_called_once_with(
+        release_nccl_window_owners=release_nccl_window_owners
+    )

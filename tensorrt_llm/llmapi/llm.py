@@ -1596,8 +1596,8 @@ class BaseLLM:
         spec_dec_mode = getattr(self.args.speculative_config, "spec_dec_mode",
                                 None)
         # use_one_engine() is exactly the set of modes get_spec_decoder hands to
-        # SpecSampler; the two-model modes keep TorchSampler, which implements
-        # all of these.
+        # SpecSampler; the drafter-based modes keep TorchSampler, which
+        # implements all of these.
         if spec_dec_mode is None or not spec_dec_mode.use_one_engine():
             return
         # The module rather than the symbol: the fully-qualified import runs to

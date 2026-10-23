@@ -2324,6 +2324,17 @@
           "$ref": "#/$defs/LayerwiseBenchmarksConfig",
           "status": "prototype"
         },
+        "lm_head_output_dtype": {
+          "default": "auto",
+          "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+          "enum": [
+            "auto",
+            "float32"
+          ],
+          "status": "prototype",
+          "title": "Lm Head Output Dtype",
+          "type": "string"
+        },
         "load_format": {
           "anyOf": [
             {
@@ -8634,6 +8645,17 @@
     "layer_wise_benchmarks_config": {
       "$ref": "#/$defs/LayerwiseBenchmarksConfig",
       "status": "prototype"
+    },
+    "lm_head_output_dtype": {
+      "default": "auto",
+      "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+      "enum": [
+        "auto",
+        "float32"
+      ],
+      "status": "prototype",
+      "title": "Lm Head Output Dtype",
+      "type": "string"
     },
     "load_format": {
       "anyOf": [

@@ -7,6 +7,7 @@
 # first VR200 run is directly comparable to its GB300 counterpart.
 # Runs on the trtllm-ci VR200-HECATE multi-node chain (partition batch-xdr).
 metadata:
+  architecture: DeepseekV4ForCausalLM
   model_name: deepseek_v4_pro_fp4
   precision: fp4
   model_dir_name: DeepSeek-V4-Pro
