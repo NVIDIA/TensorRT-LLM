@@ -1135,9 +1135,10 @@ using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
 static std::shared_ptr<AttentionOp> get_attention_op(
-    RunnerPtr const& runner, std::shared_ptr<AttentionOp>& op, int64_t local_layer_idx)
+    RunnerPtr const& runner, std::shared_ptr<AttentionOp>& op, int64_t local_layer_idx, int64_t locality_domain_id)
 {
-    auto cache_key = std::make_tuple(op->data(), runner->data());
+    // Each locality domain runs on its own stream and must not share an op.
+    auto cache_key = std::make_tuple(op->data(), runner->data(), locality_domain_id);
     using CacheKey = decltype(cache_key);
     static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, OpCustomHash<CacheKey>> op_cache;
     static std::shared_mutex op_cache_mutex;
@@ -1237,10 +1238,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool trtllm_gen_jit_warmup, std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross,
     std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias,
     int64_t relative_attention_max_distance, std::optional<int64_t> spec_decoding_target_max_draft_tokens,
-    std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
-    bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
-    std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
-    double skip_correction_threshold, std::optional<bool> uses_spcompress)
+    int64_t locality_domain_id, std::optional<torch::Tensor> quant_scale_qkv,
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold,
+    std::optional<bool> uses_spcompress)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1485,7 +1487,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             op->mFP8ContextFMHA || op->mFP8ContextMLA, "uses_spcompress requires FP8 context FMHA or FP8 context MLA.");
     }
 
-    op = get_attention_op(runner, op, local_layer_idx);
+    op = get_attention_op(runner, op, local_layer_idx, locality_domain_id);
 
     int32_t const num_seqs = host_context_lengths.size(0);
     RequestType const* request_types = static_cast<RequestType const*>(host_request_types.data_ptr());
