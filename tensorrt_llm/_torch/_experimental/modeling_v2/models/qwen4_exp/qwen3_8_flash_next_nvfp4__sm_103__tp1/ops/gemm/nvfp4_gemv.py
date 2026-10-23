@@ -33,6 +33,11 @@ is static). After `griddepcontrol.wait` the consumer warps convert the activatio
 f16 into shared memory in MMA-fragment order; consumer warp w then takes tiles w, w + warps,
 ... of every slot, its accumulators in registers for the chunk, and stores its tiles through a
 per-warp staging buffer.
+
+Split entries (`nvfp4_split_gemv*`, `SplitNvfp4Weight`): the same NVFP4 weight packed in
+`fp8_gemv`'s fragment order (`pack_split`) and streamed by that kernel, which splits K across
+warps and carries the GDN conv epilogues; for projections with few 16-row tiles a
+multiprocessor (the GDN in_proj), where one warp per tile over all of K is latency-bound.
 """
 
 from __future__ import annotations
@@ -44,7 +49,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import const_expr
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -56,10 +60,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 )
 
 from .fp8_gemv import (
+    TILE_MAJOR_MAX_TILES,
     _asm,
     _bar_sync,
+    _bf16x2_to_f16x2,
     _bulk_g2s,
     _bulk_prefetch_l2,
+    _dq_step,
     _env_pdl,
     _ir,
     _ldg4p,
@@ -69,9 +76,17 @@ from .fp8_gemv import (
     _mbar_init,
     _mbar_init_fence,
     _mbar_wait,
+    _mma_f16,
+    _scales4,
     _sms,
-    _unpack,
+    fp8_gemv,
+    fp8_gemv_conv1d,
+    fp8_gemv_conv1d_verify,
+    fp8_gemv_conv1d_verify_op,
+    verify_reference,
 )
+from .fp8_gemv import _compiled as _split_compiled
+from .fp8_gemv import default_plan as _split_plan
 
 TILE_N = 16
 BLOCK_K = 128
@@ -187,82 +202,6 @@ def _sts_bf16_scaled(saddr, v, s, *, loc=None, ip=None):
         ip,
         side=True,
     )
-
-
-@dsl_user_op
-def _scales4(sw, *, loc=None, ip=None):
-    """A unit's scale word `(s_g(2t), s_g8(2t), s_g(2t+1), s_g8(2t+1))` (e4m3) -> four f16x2
-    registers with each scale in both halves: (row g, steps 0..3), (row g + 8, steps 0..3),
-    (row g, steps 4..7), (row g + 8, steps 4..7)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_ir(sw, cutlass.Int32, loc, ip)],
-        "{ .reg .b16 lo, hi, p0, p1, q0, q1; .reg .b32 p, q; "
-        "mov.b32 {lo, hi}, $4; "
-        "cvt.rn.f16x2.e4m3x2 p, lo; cvt.rn.f16x2.e4m3x2 q, hi; "
-        "mov.b32 {p0, p1}, p; mov.b32 {q0, q1}, q; "
-        "mov.b32 $0, {p0, p0}; mov.b32 $1, {p1, p1}; mov.b32 $2, {q0, q0}; "
-        "mov.b32 $3, {q1, q1}; }",
-        "=r,=r,=r,=r,r",
-        loc,
-        ip,
-    )
-    return _unpack(res, 4, cutlass.Int32, loc, ip)
-
-
-@dsl_user_op
-def _dq_step(w, sg, sg8, *, loc=None, ip=None):
-    """One step's code word (bytes: row g k0|k1, row g+8 k0|k1, row g k2|k3, row g+8 k2|k3)
-    -> the four f16x2 A registers, each times its row's block scale (exact)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_ir(v, cutlass.Int32, loc, ip) for v in (w, sg, sg8)],
-        "{ .reg .b8 b0, b1, b2, b3; .reg .b32 h0, h1, h2, h3; "
-        "mov.b32 {b0, b1, b2, b3}, $4; "
-        "cvt.rn.f16x2.e2m1x2 h0, b0; cvt.rn.f16x2.e2m1x2 h1, b1; "
-        "cvt.rn.f16x2.e2m1x2 h2, b2; cvt.rn.f16x2.e2m1x2 h3, b3; "
-        "mul.rn.f16x2 $0, h0, $5; mul.rn.f16x2 $1, h1, $6; "
-        "mul.rn.f16x2 $2, h2, $5; mul.rn.f16x2 $3, h3, $6; }",
-        "=r,=r,=r,=r,r,r,r",
-        loc,
-        ip,
-    )
-    return _unpack(res, 4, cutlass.Int32, loc, ip)
-
-
-@dsl_user_op
-def _bf16x2_to_f16x2(v, *, loc=None, ip=None):
-    """bf16x2 -> f16x2 (round to nearest, saturating at +-65504)."""
-    return cutlass.Int32(
-        _asm(
-            T.i32(),
-            [_ir(v, cutlass.Int32, loc, ip)],
-            "{ .reg .b32 lo, hi; .reg .f32 flo, fhi; "
-            "shl.b32 lo, $1, 16; and.b32 hi, $1, 0xFFFF0000; "
-            "mov.b32 flo, lo; mov.b32 fhi, hi; "
-            "cvt.rn.satfinite.f16x2.f32 $0, fhi, flo; }",
-            "=r,r",
-            loc,
-            ip,
-        )
-    )
-
-
-@dsl_user_op
-def _mma_f16(a, b, c, *, loc=None, ip=None):
-    """D = A B + C on m16n8k16, f16 A/B, fp32 C/D; a: 4 regs, b: 2 regs, c: 4 f32."""
-    res = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [_ir(v, cutlass.Int32, loc, ip) for v in a]
-        + [_ir(v, cutlass.Int32, loc, ip) for v in b]
-        + [_ir(v, cutlass.Float32, loc, ip) for v in c],
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        loc,
-        ip,
-    )
-    return _unpack(res, 4, cutlass.Float32, loc, ip)
 
 
 # ------------------------------------------------------------------------------------------
@@ -633,6 +572,65 @@ def pack_from_bf16(w: torch.Tensor, rows_per_chunk: int = 16384) -> PackedNvfp4W
     return PackedNvfp4Weight(out, float(gscale), n, k)
 
 
+@dataclass
+class SplitNvfp4Weight:
+    """NVFP4 units in `fp8_gemv`'s fragment order, which that kernel (k split across warps, the
+    GDN conv epilogues) streams in place of FP8 ones: `data` uint8 `[K/128, ceil(N/16), 1152]`
+    (k-block-major) or `[ceil(N/16), K/128, 1152]` (`tile_major`), see `pack_split`; `scale` the
+    fp32 global scale as a one-element device tensor (the kernel reads it), also
+    `global_scale`; logical shape `[n, k]`."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    global_scale: float
+    n: int
+    k: int
+    tile_major: bool = False
+    w4: bool = True
+
+
+def pack_split(
+    codes: torch.Tensor, scales: torch.Tensor, gscale: float, tile_major: bool | None = None
+) -> SplitNvfp4Weight:
+    """(codes `[N, K]`, e4m3 scales `[N, K/16]`, global scale) -> `fp8_gemv`'s NVFP4 units.
+
+    A unit (k-block kb, 16-row tile T) is 1152 bytes. Codes, 1024 bytes `[h (2)][lane (32)][4
+    words]`, lane = 4 g + t: word 2 cc + st of half h is k16 step st of chunk c = 2 h + cc,
+    covering k = 128 kb + 32 c + 8 t + 4 st + 0..3 (`fp8_gemv`'s k order), its bytes `(row g,
+    k0 | k1 << 4), (row g + 8, same k), (row g, k2 | k3 << 4), (row g + 8, same k)`. Scales,
+    128 bytes `[g (8)][t // 2 (2)][c (4)][row g, row g + 8]`: the block 2 c + t // 2 of the
+    k-block. Rows past N are zero. Default `tile_major` as `fp8_gemv.pack_weight`'s."""
+    n, k = codes.shape
+    assert k % BLOCK_K == 0 and scales.shape == (n, k // SF_VEC)
+    n_tiles = -(-n // TILE_N)
+    nkb = k // BLOCK_K
+    if tile_major is None:
+        tile_major = n_tiles <= TILE_MAJOR_MAX_TILES
+    c = torch.zeros(n_tiles * TILE_N, k, dtype=torch.uint8, device=codes.device)
+    c[:n] = codes
+    # (tile, rh, g, kb, h, cc, t, st, e2, e1): row 8 rh + g, k = 128 kb + 32 (2 h + cc) + 8 t
+    # + 4 st + 2 e2 + e1
+    c = c.reshape(n_tiles, 2, 8, nkb, 2, 2, 4, 2, 2, 2)
+    byte = c[..., 0] | (c[..., 1] << 4)
+    # unit byte order [h][g][t][cc][st][e2][rh]
+    perm = (4, 2, 6, 5, 7, 8, 1)
+    body = (0, 3) if tile_major else (3, 0)
+    data = torch.empty(*(byte.shape[i] for i in body), UNIT, dtype=torch.uint8, device=codes.device)
+    data[..., :DATA] = byte.permute(*body, *perm).reshape(*data.shape[:2], DATA)
+    s = torch.zeros(n_tiles * TILE_N, k // SF_VEC, dtype=torch.uint8, device=codes.device)
+    s[:n] = scales.view(torch.uint8)
+    # (tile, rh, g, kb, c, th): block 8 kb + 2 c + th; unit order [g][th][c][rh]
+    s = s.reshape(n_tiles, 2, 8, nkb, 4, 2)
+    data[..., DATA:] = s.permute(*body, 2, 5, 4, 1).reshape(*data.shape[:2], SCALES)
+    scale = torch.tensor([gscale], dtype=torch.float32, device=codes.device)
+    return SplitNvfp4Weight(data, scale, float(gscale), n, k, tile_major)
+
+
+def pack_split_from_bf16(w: torch.Tensor, rows_per_chunk: int = 16384) -> SplitNvfp4Weight:
+    """Converter from a bf16 `[N, K]` weight (`quantize_nvfp4`, then `pack_split`)."""
+    return pack_split(*quantize_nvfp4(w, rows_per_chunk))
+
+
 #: Measured plans (GB300, 152 SMs, CUDA graph of back-to-back calls over weights rotated past
 #: L2), keyed (N, K, row octets): `ctas` resident CTAs per multiprocessor (two small ones let
 #: a launch's ramp overlap its neighbour's tail), tiles a chunk, consumer warps, ring slots,
@@ -767,4 +765,228 @@ class Nvfp4Gemv(OpWrapper):
         )
 
 
+def precompile_split(
+    w: SplitNvfp4Weight,
+    max_rows: int,
+    conv_dim: int,
+    pad_slot_id: int,
+    verify_p: tuple[int, ...] = (),
+    pdl: bool = True,
+) -> None:
+    """Compile now every `fp8_gemv` variant over `w`'s shape a decode step can reach: the
+    projection and the single-token conv entry at 1..max_rows rows, and the verify entry at
+    each p of `verify_p` for every whole number of requests within max_rows. The kernel is
+    compiled per row count; a first call mid-serving would stall on the compile."""
+    pdl = bool(pdl and _env_pdl())
+    sms = _sms()
+    for m in range(1, max_rows + 1):
+        plan = _split_plan(w.n, w.k, m, sms, True)
+        _split_compiled(w.n, w.k, m, plan, pdl, w.tile_major, w4=True)
+        _split_compiled(w.n, w.k, m, plan, pdl, w.tile_major, conv_dim, pad_slot_id, w4=True)
+        for p in verify_p:
+            if m % p == 0 and m >= 2:
+                _split_compiled(
+                    w.n, w.k, m, plan, pdl, w.tile_major, conv_dim, pad_slot_id, p, w4=True
+                )
+
+
+def _split_cell(why: str, n: int, k: int, m: int) -> Cell:
+    return Cell(why=why, spec=dict(n=n, k=k, m=m))
+
+
+class Nvfp4SplitGemv(OpWrapper):
+    """`nvfp4_split_gemv(x, w)` (`fp8_gemv` over a `SplitNvfp4Weight`): `y[M, N] = x[M, K] @
+    dequant(w)^T` in bf16 for 1..32 rows, the weight NVFP4 (e2m1 codes, one e4m3 scale per 16 k
+    of a row, an fp32 global scale; `pack_split_from_bf16` / `pack_split`). The dequantized
+    weight is exact in f16; the activation is rounded once to f16 on chip (exact for |x| in
+    [2^-14, 65504]); fp32 accumulation, the global scale applied in fp32, one bf16 rounding.
+
+    Fusion boundary: the projection; `Nvfp4SplitGemvConv1d` / `Nvfp4SplitGemvConv1dVerify`
+    also fuse the GDN conv step."""
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    # spec keys: n, k, m (rows). Every cell: x a column slice of a wider bf16 row; the weight
+    # `quantize_nvfp4` of a random bf16 matrix with an outlier column and near-zero blocks.
+    CELLS: tuple[Cell, ...] = (
+        _split_cell("GDN in_proj, one decode row", 16480, 2560, 1),
+        _split_cell("GDN in_proj, 3 rows", 16480, 2560, 3),
+        _split_cell("GDN in_proj, 9 rows (two n8 tiles)", 16480, 2560, 9),
+        _split_cell("GDN in_proj, 16 rows", 16480, 2560, 16),
+        _split_cell("small N, tile-major units, 3 k-blocks", 1001, 384, 5),
+    )
+
+    note = """
+    Metadata consumed: none. Call site: the decode target's GDN in_proj at up to
+    `_INPROJ_NVFP4_MAX_ROWS` rows of an eager step under `TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4=1`.
+    Preconditions: x bf16 `[M, K]`, unit column stride, row stride a multiple of 8 elements and
+    a 16-byte aligned base; K a multiple of 128. One PDL launch (the weight streamed before the
+    wait); CUDA-graph capturable; compiled per (N, K, M, plan) (`precompile_split`).
+    """
+
+    def __call__(self, x: torch.Tensor, w: SplitNvfp4Weight) -> torch.Tensor:
+        return fp8_gemv(x, w)
+
+    def reference(
+        self, x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, global_scale: float
+    ) -> torch.Tensor:
+        """fp32 `[M, N]` over the dequantized weight (a true fp32 matmul); takes the unpacked
+        NVFP4 weight (`quantize_nvfp4`'s outputs) in place of the packed `w`."""
+        with true_fp32_matmul():
+            return x.float() @ dequantize_nvfp4(codes, scales, global_scale).t()
+
+    def is_valid(self, x: torch.Tensor, w: SplitNvfp4Weight, **kwargs) -> None:
+        assert x.float().abs().amax().item() <= 65504.0, (
+            "an activation beyond f16's range saturates at 65504 in the kernel"
+        )
+
+
+class Nvfp4SplitGemvConv1d(OpWrapper):
+    """`nvfp4_split_gemv_conv1d` (`fp8_gemv_conv1d` over a `SplitNvfp4Weight`): the GDN input
+    projection of decode rows over the NVFP4 copy, then for the conv columns of a live row the
+    causal conv step against its paged state (SiLU; the state advanced in place). Returns the
+    `[M, N]` projection with the conv columns replaced by the conv output."""
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    # spec keys: slots (one per row; -1 the pad sentinel). Every cell: the GDN in_proj (16480 x
+    # 2560, conv_dim 10240), a strided 64-slot pool, width 4, SiLU.
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="STP decode: one row, live slot", spec=dict(slots=(37,))),
+        Cell(why="two rows, one padding slot", spec=dict(slots=(17, -1))),
+        Cell(why="four rows", spec=dict(slots=(0, 5, 63, 9))),
+        Cell(why="sixteen rows (two n8 tiles)", spec=dict(slots=tuple(range(2, 50, 3)))),
+    )
+
+    note = """
+    Call site: the decode target's GDN in_proj + conv step of a captured single-token step at
+    up to `_INPROJ_NVFP4_MAX_ROWS` rows under `TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4=1`.
+    `conv_state` `[slots, conv_dim, 3]` bf16 (any strides), `conv_weight` `[conv_dim, 4]` bf16
+    contiguous, int32 slots; a `pad_slot_id` row gets the plain projection. Slots, taps and the
+    window are read before the PDL wait (nothing in a captured step writes this layer's pool
+    ahead of it).
+    """
+
+    def __call__(self, x, w, conv_state, conv_weight, conv_state_indices, conv_dim, pad_slot_id):
+        return fp8_gemv_conv1d(
+            x, w, conv_state, conv_weight, conv_state_indices, conv_dim, pad_slot_id
+        )
+
+    def reference(self, *args, **kwargs):
+        raise NotImplementedError("the test builds the fp32 reference from the dequantized weight")
+
+    def is_valid(self, x, w, **kwargs) -> None:
+        assert x.float().abs().amax().item() <= 65504.0, (
+            "an activation beyond f16's range saturates at 65504 in the kernel"
+        )
+
+
+class Nvfp4SplitGemvConv1dVerify(OpWrapper):
+    """`nvfp4_split_gemv_conv1d_verify` (`fp8_gemv_conv1d_verify` over a `SplitNvfp4Weight`):
+    the GDN input projection of a speculative verify step over the NVFP4 copy with
+    `causal_conv1d_triton_update`'s multi-token conv step as its epilogue. Returns `(conv [M,
+    conv_dim], projection columns conv_dim.. [M, N - conv_dim])`.
+
+    Fusion boundary: projection, conv, SiLU, snapshots and the pool advance."""
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    # spec keys as `Fp8GemvConv1dVerify`'s.
+    CELLS: tuple[Cell, ...] = fp8_gemv_conv1d_verify_op.CELLS
+
+    note = """
+    Call site: the decode target's GDN in_proj of an MTP verify step in a captured graph, 2..16
+    rows, under `TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4=1`; otherwise as `Fp8GemvConv1dVerify`
+    (bitwise the projection + `causal_conv1d_triton_update` over the same NVFP4 projection).
+    """
+
+    def __call__(
+        self,
+        x,
+        w,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        conv_dim,
+        rows_per_seq,
+        pad_slot_id,
+    ):
+        return fp8_gemv_conv1d_verify(
+            x,
+            w,
+            conv_state,
+            conv_weight,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            conv_dim,
+            rows_per_seq,
+            pad_slot_id,
+        )
+
+    def reference(
+        self,
+        x,
+        codes,
+        scales,
+        global_scale,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        conv_dim,
+        rows_per_seq,
+        pad_slot_id,
+    ):
+        """As `Fp8GemvConv1dVerify.reference`, over the dequantized NVFP4 weight."""
+        return verify_reference(
+            x,
+            dequantize_nvfp4(codes, scales, global_scale),
+            conv_state,
+            conv_weight,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            conv_dim,
+            rows_per_seq,
+            pad_slot_id,
+        )
+
+    def is_valid(
+        self,
+        x,
+        w,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        conv_dim,
+        rows_per_seq,
+        pad_slot_id,
+        **kwargs,
+    ) -> None:
+        assert x.float().abs().amax().item() <= 65504.0, (
+            "an activation beyond f16's range saturates at 65504 in the kernel"
+        )
+        fp8_gemv_conv1d_verify_op.is_valid(
+            x,
+            w,
+            conv_state,
+            conv_weight,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            conv_dim,
+            rows_per_seq,
+            pad_slot_id,
+        )
+
+
 nvfp4_gemv_op = Nvfp4Gemv()
+nvfp4_split_gemv_op = Nvfp4SplitGemv()
+nvfp4_split_gemv_conv1d_op = Nvfp4SplitGemvConv1d()
+nvfp4_split_gemv_conv1d_verify_op = Nvfp4SplitGemvConv1dVerify()

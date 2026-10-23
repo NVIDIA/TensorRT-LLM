@@ -192,8 +192,15 @@ from .ops.gemm.fp8_per_tensor_mm import amax_partials, fp8_per_tensor_mm, fp8_pe
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from .ops.gemm.mid_rows_mm import MidWeight, mid_rows_mm_op
 from .ops.gemm.mid_rows_mm import precompile as mid_rows_precompile
-from .ops.gemm.nvfp4_gemv import nvfp4_gemv_op
+from .ops.gemm.nvfp4_gemv import (
+    nvfp4_gemv_op,
+    nvfp4_split_gemv_conv1d_op,
+    nvfp4_split_gemv_conv1d_verify_op,
+    nvfp4_split_gemv_op,
+    precompile_split,
+)
 from .ops.gemm.nvfp4_gemv import pack_from_bf16 as nvfp4_pack_from_bf16
+from .ops.gemm.nvfp4_gemv import pack_split_from_bf16 as nvfp4_pack_split_from_bf16
 from .ops.gemm.nvfp4_gemv import precompile as nvfp4_gemv_precompile
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
@@ -642,6 +649,26 @@ _MTP_HEAD_NVFP4_ENV = "TRTLLM_MODELING_V2_MTP_HEAD_NVFP4"
 def _mtp_head_nvfp4_enabled() -> bool:
     mode = os.environ.get(_MTP_HEAD_NVFP4_ENV, "0")
     assert mode in ("0", "1"), f"{_MTP_HEAD_NVFP4_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
+
+
+#: Set to 1 to give each GDN layer an NVFP4 copy of its input projection (e2m1 values, one e4m3
+#: scale per 16 hidden elements of a row, an fp32 global scale; `nvfp4_gemv.pack_split`, 23.7 MB
+#: a layer, built at load from the bf16 weight) and run its decode rows -- up to
+#: `_INPROJ_NVFP4_MAX_ROWS` -- on `fp8_gemv`'s kernel over it, the conv step as the GEMV's
+#: epilogue in a captured step (single-token and verify). Prefill, mixed steps and larger
+#: batches keep their entries. Lossy (gsm8k-gated); 0 (default): off.
+_GDN_INPROJ_NVFP4_ENV = "TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4"
+
+#: Rows up to which a decode step's GDN in_proj reads the NVFP4 copy (`_GDN_INPROJ_NVFP4_ENV`).
+#: GB300 micro (us, conv included, behind a PDL predecessor): 6.4 / 6.1 at 1 / 4 rows against
+#: fp8_gemv_conv1d's 7.9 / 7.7; alone 7.1 against 7.9 at 8 rows, 9.1 against 8.6 at 16.
+_INPROJ_NVFP4_MAX_ROWS = 8  # capacity: fixed: a dispatch threshold, at most fp8_gemv's MAX_ROWS
+
+
+def _gdn_inproj_nvfp4_enabled() -> bool:
+    mode = os.environ.get(_GDN_INPROJ_NVFP4_ENV, "0")
+    assert mode in ("0", "1"), f"{_GDN_INPROJ_NVFP4_ENV}={mode!r}: expected 0 or 1"
     return mode == "1"
 
 
@@ -1294,6 +1321,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # asked for speculation.
         spec_config = getattr(model_config, "spec_config", None)
         self.mtp_enabled = spec_config is not None
+        # Rows per request of the widest verify step (`max_draft_len + 1`); 1 without MTP.
+        self.max_verify_rows = spec_config.max_draft_len + 1 if self.mtp_enabled else 1
         declared = getattr(cfg, "mtp_num_hidden_layers", None)
         assert declared in (None, _MTP_NUM_LAYERS), (
             f"this target implements the one-layer MTP module this checkpoint "
@@ -1997,6 +2026,21 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                     self._mid[name] = MidWeight(w[name])
             if device.type == "cuda":
                 _precompile_mid(self._mid)
+        # NVFP4 copies of the GDN input projections (`_GDN_INPROJ_NVFP4_ENV`) for decode rows,
+        # with every variant a decode step can reach compiled now.
+        self._gemv_nv = {}
+        if _gdn_inproj_nvfp4_enabled() and device.type == "cuda":
+            for name in w:
+                if re.fullmatch(r"l\d+_in_proj_w", name):
+                    self._gemv_nv[name] = nvfp4_pack_split_from_bf16(w[name])
+            if self._gemv_nv:
+                precompile_split(
+                    next(iter(self._gemv_nv.values())),
+                    _INPROJ_NVFP4_MAX_ROWS,
+                    self.conv_dim,
+                    _PAD_SLOT_ID,
+                    tuple(range(2, self.max_verify_rows + 1)),
+                )
 
         # The CPU-only load checks build the targets over host weights; they launch nothing.
         self._side_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -2510,6 +2554,8 @@ class _LayerWeights(NamedTuple):
     out_g: object | None = None
     sh_gu_g: object | None = None
     sh_dn_g: object | None = None
+    # The GDN in_proj's NVFP4 decode copy (`_GDN_INPROJ_NVFP4_ENV`, `nvfp4_gemv.SplitNvfp4Weight`).
+    in_proj_nv: object | None = None
     # `mid_rows_mm` views (`MidWeight`) under the same mode, for `_MID_MM_ROWS` decode rows.
     attn_in_m: object | None = None
     o_m: object | None = None
@@ -2629,6 +2675,7 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
                 out_g=getattr(core, "_gemv8", {}).get(f"l{i}_out_w"),
                 sh_gu_g=getattr(core, "_gemv8", {}).get(f"l{i}_sh_gu"),
                 sh_dn_g=getattr(core, "_gemv8", {}).get(f"l{i}_sh_dn"),
+                in_proj_nv=getattr(core, "_gemv_nv", {}).get(f"l{i}_in_proj_w"),
                 attn_in_m=getattr(core, "_mid", {}).get(f"l{i}_attn_in_w"),
                 o_m=getattr(core, "_mid", {}).get(f"l{i}_o_w"),
                 in_proj_m=getattr(core, "_mid", {}).get(f"l{i}_in_proj_w"),
@@ -5888,15 +5935,28 @@ class DecodeTarget:
         `_VERIFY_CONV_FUSED_MAX_ROWS` rows) runs the multi-token conv step -- window snapshots and
         the pool advance included -- as that GEMM's epilogue too (`fp8_gemv_conv1d_verify`,
         bitwise the projection + `causal_conv1d_triton_update` it replaces); the conv output
-        is its own contiguous buffer, and z, a and b are column views of the rest."""
+        is its own contiguous buffer, and z, a and b are column views of the rest.
+
+        With the in_proj's NVFP4 copy (`_GDN_INPROJ_NVFP4_ENV`) every step of up to
+        `_INPROJ_NVFP4_MAX_ROWS` rows reads it on the same kernel instead, a captured
+        single-token step at all of those rows with the conv step as the epilogue."""
         core = self.core
         si_all, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
         num_tokens = x.shape[0]
         ssm_states = core._bound.ssm[i]
 
         conv_fused = fused_conv and not is_verify and num_tokens <= _GDN_CONV_FUSED_MAX_ROWS
+        # The NVFP4 copy takes every decode row count within its range, the conv step fused
+        # at each of them in a captured step.
+        nv = (
+            L.in_proj_nv
+            if L.in_proj_nv is not None and num_tokens <= _INPROJ_NVFP4_MAX_ROWS and _gemv_ready(x)
+            else None
+        )
+        nv_conv = nv is not None and fused_conv and not is_verify
         fp8_conv = (
-            fused_conv
+            not nv_conv
+            and fused_conv
             and not is_verify
             and L.in_proj_g is not None
             and _gemv_ready(x)
@@ -5907,15 +5967,18 @@ class DecodeTarget:
         verify_fused = (
             fused_conv
             and is_verify
-            and L.in_proj_g is not None
+            and (L.in_proj_g is not None or nv is not None)
             and _gemv_ready(x)
             and num_tokens <= min(_FP8_GEMV_ROWS["in"][1], _VERIFY_CONV_FUSED_MAX_ROWS)
         )
         mq_out = None
         if verify_fused:
-            mq_out, zab = fp8_gemv_conv1d_verify_op(
+            verify_op = (
+                fp8_gemv_conv1d_verify_op if nv is None else nvfp4_split_gemv_conv1d_verify_op
+            )
+            mq_out, zab = verify_op(
                 x,
-                L.in_proj_g,
+                L.in_proj_g if nv is None else nv,
                 core._bound.conv[i],
                 L.conv_w,
                 si_all,
@@ -5924,6 +5987,10 @@ class DecodeTarget:
                 core.conv_dim,
                 gen_p,
                 _PAD_SLOT_ID,
+            )
+        elif nv_conv:
+            proj = nvfp4_split_gemv_conv1d_op(
+                x, nv, core._bound.conv[i], L.conv_w, si_all, core.conv_dim, _PAD_SLOT_ID
             )
         elif fp8_conv:
             proj = fp8_gemv_conv1d_op(
@@ -5946,6 +6013,8 @@ class DecodeTarget:
                 _PAD_SLOT_ID,
                 True,
             )
+        elif nv is not None:
+            proj = nvfp4_split_gemv_op(x, nv)
         else:
             proj = _dense_mm(x, L.in_proj, L.in_proj8, gemm, "in", L.in_proj_g, mid=L.in_proj_m)
         if verify_fused:
@@ -5993,7 +6062,7 @@ class DecodeTarget:
                 mq_out,
             )
             return self._gdn_epilogue(out, z, L, num_tokens, gemm)
-        if not (conv_fused or fp8_conv):
+        if not (conv_fused or fp8_conv or nv_conv):
             causal_conv1d_update(
                 x=mixed_qkv,
                 conv_state=core._bound.conv[i],

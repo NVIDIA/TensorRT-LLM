@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test: `DecodeTarget._gdn_block`'s verify dispatch under the dense FP8 mode.
+"""GPU test: `DecodeTarget._gdn_block`'s verify dispatch under the dense FP8 mode, and over the
+in_proj's NVFP4 copy (`TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4`, up to `_INPROJ_NVFP4_MAX_ROWS`).
 
 A captured verify step (`fused_conv=True`) runs the in_proj with the multi-token conv step as its
-epilogue (`fp8_gemv_conv1d_verify`); an eager one runs `fp8_gemv` and then
-`causal_conv1d_triton_update`. Both must hand the recurrence the same thing: the conv output
+epilogue (`fp8_gemv_conv1d_verify` / `nvfp4_split_gemv_conv1d_verify`); an eager one runs the
+projection and then `causal_conv1d_triton_update`. Both must hand the recurrence the same thing: the conv output
 (contiguous, as the cached replay reads it), `a`, `b` and `z` bitwise, and leave the conv pool
 and the per-step snapshot buffer bitwise the same. The recurrence is stubbed to record its
 inputs (it is the same call on both sides), the epilogue to record `z`. Over a bf16 pool (the
@@ -24,6 +25,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.fp8_gemv import (  # noqa: E501
     pack_from_bf16,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.nvfp4_gemv import (  # noqa: E501
+    pack_split_from_bf16,
+)
 
 assert torch.cuda.is_available(), "the Gated-DeltaNet block requires a CUDA device"
 
@@ -31,14 +35,17 @@ DEV, BF16 = "cuda", torch.bfloat16
 HIDDEN, HV, V, CONV, VD, SLOTS, ROWS = 2560, 48, 128, 10240, 6144, 461, 32
 
 
-@pytest.fixture(scope="module")
-def layer():
+@pytest.fixture(scope="module", params=["fp8", "nvfp4"])
+def layer(request):
     g = torch.Generator(device=DEV).manual_seed(0)
     w = (torch.randn(CONV + VD + 2 * HV, HIDDEN, generator=g, device=DEV) * HIDDEN**-0.5).to(BF16)
+    nv = request.param == "nvfp4"
     return types.SimpleNamespace(
         in_proj=w.t(),
         in_proj8=None,
-        in_proj_g=pack_from_bf16(w),
+        in_proj_m=None,
+        in_proj_g=None if nv else pack_from_bf16(w),
+        in_proj_nv=pack_split_from_bf16(w) if nv else None,
         conv_w=(torch.randn(CONV, 4, generator=g, device=DEV) * 0.5).to(BF16),
     )
 
@@ -77,6 +84,8 @@ def _block(layer, x, si, int_idx, conv0, win0, p, fused, monkeypatch):
 
 @pytest.mark.parametrize("n,p", [(1, 4), (2, 4), (4, 4), (8, 2), (2, 8), (5, 3)])
 def test_fused_verify_matches_two_launch(layer, n, p, monkeypatch) -> None:
+    if layer.in_proj_nv is not None and n * p > M._INPROJ_NVFP4_MAX_ROWS:
+        pytest.skip("past the NVFP4 copy's rows")
     g = torch.Generator(device=DEV).manual_seed(10 * n + p)
     conv0 = torch.randn(SLOTS, CONV, 3, generator=g, device=DEV).to(BF16)
     win0 = torch.randn(ROWS, p, CONV, 3, generator=g, device=DEV).to(BF16)

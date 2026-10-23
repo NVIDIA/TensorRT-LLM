@@ -52,6 +52,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 TILE_N = 16
 BLOCK_K = 128
 UNIT = TILE_N * BLOCK_K  # bytes of one (16-row, 128-k) unit
+#: Bytes of one NVFP4 (16-row, 128-k) unit: 1024 of e2m1 codes, then 128 of e4m3 scales.
+UNIT_W4 = TILE_N * BLOCK_K // 2 + TILE_N * BLOCK_K // 16
 FP8_MAX = 448.0
 MAX_ROWS = 32
 
@@ -98,6 +100,20 @@ def _lds4(saddr, *, loc=None, ip=None):
         side=True,
     )
     return _unpack(res, 4, cutlass.Int32, loc, ip)
+
+
+@dsl_user_op
+def _lds2(saddr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_ir(saddr, cutlass.Int32, loc, ip)],
+        "ld.shared.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        loc,
+        ip,
+        side=True,
+    )
+    return _unpack(res, 2, cutlass.Int32, loc, ip)
 
 
 @dsl_user_op
@@ -360,6 +376,82 @@ def _mma(a, b, c, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _scales4(sw, *, loc=None, ip=None):
+    """A unit's scale word `(s_g(2t), s_g8(2t), s_g(2t+1), s_g8(2t+1))` (e4m3) -> four f16x2
+    registers with each scale in both halves: (row g, steps 0..3), (row g + 8, steps 0..3),
+    (row g, steps 4..7), (row g + 8, steps 4..7)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_ir(sw, cutlass.Int32, loc, ip)],
+        "{ .reg .b16 lo, hi, p0, p1, q0, q1; .reg .b32 p, q; "
+        "mov.b32 {lo, hi}, $4; "
+        "cvt.rn.f16x2.e4m3x2 p, lo; cvt.rn.f16x2.e4m3x2 q, hi; "
+        "mov.b32 {p0, p1}, p; mov.b32 {q0, q1}, q; "
+        "mov.b32 $0, {p0, p0}; mov.b32 $1, {p1, p1}; mov.b32 $2, {q0, q0}; "
+        "mov.b32 $3, {q1, q1}; }",
+        "=r,=r,=r,=r,r",
+        loc,
+        ip,
+    )
+    return _unpack(res, 4, cutlass.Int32, loc, ip)
+
+
+@dsl_user_op
+def _dq_step(w, sg, sg8, *, loc=None, ip=None):
+    """One step's code word (bytes: row g k0|k1, row g+8 k0|k1, row g k2|k3, row g+8 k2|k3)
+    -> the four f16x2 A registers, each times its row's block scale (exact)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_ir(v, cutlass.Int32, loc, ip) for v in (w, sg, sg8)],
+        "{ .reg .b8 b0, b1, b2, b3; .reg .b32 h0, h1, h2, h3; "
+        "mov.b32 {b0, b1, b2, b3}, $4; "
+        "cvt.rn.f16x2.e2m1x2 h0, b0; cvt.rn.f16x2.e2m1x2 h1, b1; "
+        "cvt.rn.f16x2.e2m1x2 h2, b2; cvt.rn.f16x2.e2m1x2 h3, b3; "
+        "mul.rn.f16x2 $0, h0, $5; mul.rn.f16x2 $1, h1, $6; "
+        "mul.rn.f16x2 $2, h2, $5; mul.rn.f16x2 $3, h3, $6; }",
+        "=r,=r,=r,=r,r,r,r",
+        loc,
+        ip,
+    )
+    return _unpack(res, 4, cutlass.Int32, loc, ip)
+
+
+@dsl_user_op
+def _bf16x2_to_f16x2(v, *, loc=None, ip=None):
+    """bf16x2 -> f16x2 (round to nearest, saturating at +-65504)."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [_ir(v, cutlass.Int32, loc, ip)],
+            "{ .reg .b32 lo, hi; .reg .f32 flo, fhi; "
+            "shl.b32 lo, $1, 16; and.b32 hi, $1, 0xFFFF0000; "
+            "mov.b32 flo, lo; mov.b32 fhi, hi; "
+            "cvt.rn.satfinite.f16x2.f32 $0, fhi, flo; }",
+            "=r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _mma_f16(a, b, c, *, loc=None, ip=None):
+    """D = A B + C on m16n8k16, f16 A/B, fp32 C/D; a: 4 regs, b: 2 regs, c: 4 f32."""
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [_ir(v, cutlass.Int32, loc, ip) for v in a]
+        + [_ir(v, cutlass.Int32, loc, ip) for v in b]
+        + [_ir(v, cutlass.Float32, loc, ip) for v in c],
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        loc,
+        ip,
+    )
+    return _unpack(res, 4, cutlass.Float32, loc, ip)
+
+
+@dsl_user_op
 def _mbar_init(addr, count, *, loc=None, ip=None):
     _asm(
         T.i32(),
@@ -596,9 +688,15 @@ XRS = 320  # bytes of one activation row slice (128 bf16 + 64 B pad: conflict-fr
 
 
 class _Fp8Gemv:
-    def __init__(self, *, n, k, m, plan: Plan, pdl, tile_major, conv_dim=0, pad_slot=-1, conv_p=0):
+    def __init__(
+        self, *, n, k, m, plan: Plan, pdl, tile_major, conv_dim=0, pad_slot=-1, conv_p=0, w4=False
+    ):
         assert k % BLOCK_K == 0 and 1 <= m <= MAX_ROWS
         self.n, self.k, self.m, self.pdl = n, k, m, pdl
+        # NVFP4 units (`w4`, see `pack_weight_w4`) in place of FP8 ones: f16 MMA over the
+        # activation rounded to f16, the global scale applied to the fp32 partials.
+        self.w4 = w4
+        self.unit = UNIT_W4 if w4 else UNIT
         self.tile_major = tile_major
         # conv1d epilogue (`conv_dim` > 0): columns below conv_dim of a non-pad row get the
         # causal conv step (window of 3, 4 taps) + SiLU; see `fp8_gemv_conv1d`. With
@@ -633,14 +731,14 @@ class _Fp8Gemv:
         self.xdepth = min(self.xdepth, self.n_stages)
         # + weight producer warp (+ activation producer warp)
         self.threads = (self.cw + (1 if self.xreg else 2)) * 32
-        self.w_bytes = self.kw * self.rt * UNIT
+        self.w_bytes = self.kw * self.rt * self.unit
         self.x_bytes = 0 if self.xreg else self.kw * m * XRS
         self.slot_bytes = -(-(self.w_bytes + self.x_bytes) // 128) * 128
         self.np = self.nt8 * 8
         self.o_red = self.slots * self.slot_bytes
         red_bytes = self.kw * self.rt * self.np * TILE_N * 4
         # block scales of the (at most nsb) 128-row blocks the CTA's tiles touch
-        self.nsb = self.rt // 8 + 2
+        self.nsb = 0 if w4 else self.rt // 8 + 2
         self.o_sc = self.o_red + -(-red_bytes // 128) * 128
         self.o_bar = self.o_sc + -(-(self.nsb * self.nkb * 4) // 128) * 128
         self.o_cred = self.o_bar + 3 * self.slots * 8
@@ -711,21 +809,22 @@ class _Fp8Gemv:
         """Bulk copies of a stage's units (k-blocks kbs .. kbs + kw, tiles t0 .. t0 + nt)."""
         kw: cutlass.Constexpr = self.kw
         rt: cutlass.Constexpr = self.rt
+        unit: cutlass.Constexpr = self.unit
         if const_expr(self.tile_major):
             for tl in cutlass.range_constexpr(rt):
                 if tl < nt:
                     _bulk_g2s(
-                        dst + tl * (kw * UNIT),
-                        w_base + (cutlass.Int64(t0 + tl) * self.nkb + kbs) * UNIT,
-                        kw * UNIT,
+                        dst + tl * (kw * unit),
+                        w_base + (cutlass.Int64(t0 + tl) * self.nkb + kbs) * unit,
+                        kw * unit,
                         mbar,
                     )
         else:
             for j in cutlass.range_constexpr(kw):
                 _bulk_g2s(
-                    dst + j * (rt * UNIT),
-                    w_base + (cutlass.Int64(kbs + j) * self.n_tiles + t0) * UNIT,
-                    nt * UNIT,
+                    dst + j * (rt * unit),
+                    w_base + (cutlass.Int64(kbs + j) * self.n_tiles + t0) * unit,
+                    nt * unit,
                     mbar,
                 )
 
@@ -733,16 +832,17 @@ class _Fp8Gemv:
     def _prefetch_w(self, w_base, kbs, t0, nt):
         kw: cutlass.Constexpr = self.kw
         rt: cutlass.Constexpr = self.rt
+        unit: cutlass.Constexpr = self.unit
         if const_expr(self.tile_major):
             for tl in cutlass.range_constexpr(rt):
                 if tl < nt:
                     _bulk_prefetch_l2(
-                        w_base + (cutlass.Int64(t0 + tl) * self.nkb + kbs) * UNIT, kw * UNIT
+                        w_base + (cutlass.Int64(t0 + tl) * self.nkb + kbs) * unit, kw * unit
                     )
         else:
             for j in cutlass.range_constexpr(kw):
                 _bulk_prefetch_l2(
-                    w_base + (cutlass.Int64(kbs + j) * self.n_tiles + t0) * UNIT, nt * UNIT
+                    w_base + (cutlass.Int64(kbs + j) * self.n_tiles + t0) * unit, nt * unit
                 )
 
     @cute.jit
@@ -754,14 +854,18 @@ class _Fp8Gemv:
         rt: cutlass.Constexpr = self.rt
         nt8: cutlass.Constexpr = self.nt8
         nkb: cutlass.Constexpr = self.nkb
+        unit: cutlass.Constexpr = self.unit
         for i in cutlass.range_constexpr(self.rtw):
             tl = twi + i * tw
-            if tl < nt:
+            if const_expr(self.w4):
+                if tl < nt:
+                    self._compute_w4(acc, cur, slot, i, tl, kwi, lane)
+            elif tl < nt:
                 sc = _lds_f32(scs + (((t0 + tl) // 8 - b0) * nkb + kb) * 4)
                 if const_expr(self.tile_major):
-                    ua = slot + (tl * kw + kwi) * UNIT + lane * 16
+                    ua = slot + (tl * kw + kwi) * unit + lane * 16
                 else:
-                    ua = slot + (kwi * rt + tl) * UNIT + lane * 16
+                    ua = slot + (kwi * rt + tl) * unit + lane * 16
                 wv = [_lds4(ua + c * 512) for c in range(4)]
                 # one accumulator chain per 16-byte chunk (two k16 steps): 4-way ILP
                 zero = cutlass.Float32(0.0)
@@ -779,6 +883,36 @@ class _Fp8Gemv:
                     for e in cutlass.range_constexpr(4):
                         part = (ch[0][j][e] + ch[1][j][e]) + (ch[2][j][e] + ch[3][j][e])
                         acc[i, j, e] = acc[i, j, e] + part * sc
+
+    @cute.jit
+    def _compute_w4(self, acc, cur, slot, i, tl, kwi, lane):
+        """`_compute` of one tile over an NVFP4 unit (`pack_weight_w4`): each step's e2m1 codes
+        times their 16-k block scales in f16 (exact), four f16 MMA chains, `cur` f16."""
+        kw: cutlass.Constexpr = self.kw
+        rt: cutlass.Constexpr = self.rt
+        nt8: cutlass.Constexpr = self.nt8
+        unit: cutlass.Constexpr = self.unit
+        if const_expr(self.tile_major):
+            ua = slot + (tl * kw + kwi) * unit
+        else:
+            ua = slot + (kwi * rt + tl) * unit
+        wv = [_lds4(ua + h * 512 + lane * 16) for h in range(2)]
+        sw = _lds2(ua + 1024 + ((lane // 4) * 2 + (lane % 4) // 2) * 8)
+        # (row g, row g + 8) block scales of chunks 0..3, as f16x2 pairs
+        sc = _scales4(sw[0]) + _scales4(sw[1])
+        zero = cutlass.Float32(0.0)
+        ch = [[[zero] * 4 for _ in range(nt8)] for _ in range(4)]
+        for c in cutlass.range_constexpr(4):
+            for st in cutlass.range_constexpr(2):
+                a = _dq_step(wv[c // 2][2 * (c % 2) + st], sc[2 * c], sc[2 * c + 1])
+                for j in cutlass.range_constexpr(nt8):
+                    ch[c][j] = _mma_f16(
+                        a, [cur[j][4 * c + 2 * st], cur[j][4 * c + 2 * st + 1]], ch[c][j]
+                    )
+        for j in cutlass.range_constexpr(nt8):
+            for e in cutlass.range_constexpr(4):
+                part = (ch[0][j][e] + ch[1][j][e]) + (ch[2][j][e] + ch[3][j][e])
+                acc[i, j, e] = acc[i, j, e] + part
 
     @cute.jit
     def _issue_x(self, xs, src, xh, xc, x_stride):
@@ -862,6 +996,9 @@ class _Fp8Gemv:
         b0 = t0 // 8
         n_blocks: cutlass.Constexpr = -(-self.n // 128)
         n_sc: cutlass.Constexpr = self.nsb * nkb
+        if const_expr(self.w4):
+            # the NVFP4 global scale: `s_base` points at it
+            gsc = _ldg_f32(s_base)
         for q in cutlass.range_constexpr(-(-n_sc // self.threads)):
             qi = tidx + q * self.threads
             if qi < n_sc:
@@ -886,7 +1023,7 @@ class _Fp8Gemv:
 
         if warp == cw:
             # ---- weight producer (static data: no PDL wait). Slot layout: unit (j, tile) at
-            # (j * rt + tile) * UNIT for a k-block-major weight, (tile * kw + j) * UNIT for a
+            # (j * rt + tile) * unit for a k-block-major weight, (tile * kw + j) * unit for a
             # tile-major one; one bulk copy per k-block row resp. per tile. ----
             if lane == 0:
                 for ps in cutlass.range(n_stages):
@@ -902,7 +1039,7 @@ class _Fp8Gemv:
                         if ps >= slots:
                             if ps + l2a < n_stages:
                                 self._prefetch_w(w_base, kb0 + (ps + l2a) * kw, t0, nt)
-                    _mbar_expect_tx(bars + 8 * psl, kw * nt * UNIT)
+                    _mbar_expect_tx(bars + 8 * psl, kw * nt * self.unit)
                     self._issue_w(
                         ring + psl * slot_bytes, w_base, kb0 + ps * kw, t0, nt, bars + 8 * psl
                     )
@@ -1033,8 +1170,11 @@ class _Fp8Gemv:
                     sl = s % slots
                     slot = ring + sl * slot_bytes
                     _mbar_wait(bars + 8 * sl, (s // slots) & 1)
+                    cur = xbuf.pop(s)
+                    if const_expr(self.w4):
+                        cur = [[_bf16x2_to_f16x2(v) for v in r] for r in cur]
                     self._compute(
-                        acc, xbuf.pop(s), slot, kb0 + s * kw + kwi, kwi, twi, t0, nt, b0, scs, lane
+                        acc, cur, slot, kb0 + s * kw + kwi, kwi, twi, t0, nt, b0, scs, lane
                     )
                     cute.arch.sync_warp()
                     if lane == 0:
@@ -1053,6 +1193,8 @@ class _Fp8Gemv:
                         [v for c in range(4) for v in _lds4(xa + x_rows[j] + 64 * c)]
                         for j in range(nt8)
                     ]
+                    if const_expr(self.w4):
+                        cur = [[_bf16x2_to_f16x2(v) for v in r] for r in cur]
                     _mbar_wait(bars + 8 * sl, par)
                     self._compute(
                         acc, cur, slot, kb0 + s * kw + kwi, kwi, twi, t0, nt, b0, scs, lane
@@ -1068,10 +1210,13 @@ class _Fp8Gemv:
                     for j in cutlass.range_constexpr(nt8):
                         n0 = 8 * j + 2 * t
                         p = red + (((kwi * rt + wtl) * np_ + n0) * TILE_N + g) * 4
-                        _sts_f32(p, acc[i, j, 0])
-                        _sts_f32(p + TILE_N * 4, acc[i, j, 1])
-                        _sts_f32(p + 8 * 4, acc[i, j, 2])
-                        _sts_f32(p + TILE_N * 4 + 8 * 4, acc[i, j, 3])
+                        v = [acc[i, j, e] for e in range(4)]
+                        if const_expr(self.w4):
+                            v = [ve * gsc for ve in v]
+                        _sts_f32(p, v[0])
+                        _sts_f32(p + TILE_N * 4, v[1])
+                        _sts_f32(p + 8 * 4, v[2])
+                        _sts_f32(p + TILE_N * 4 + 8 * 4, v[3])
             _bar_sync(1, cw * 32)
             if const_expr(self.conv_p > 0):
                 # Item (tile, request s, row): column `orow` of the request's rows s p .. s p + p - 1.
@@ -1344,17 +1489,25 @@ _TABLE: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
     (248320, 2560): ((32, dict(grid=-7, kw=2, tw=4, slots=2, l2_ahead=1, xreg=2)),),
 }
 
+#: Measured plans of the NVFP4 units (`w4`), as `_TABLE`. GDN in_proj: four k-blocks a stage
+#: (5 stages), no L2 look-ahead: 6.1 / 6.6 / 7.1 us at 1 / 4 / 8 rows alone, 6.4 / 6.1 behind a
+#: PDL predecessor (1 / 4 rows); from 9 rows the heuristic plan, behind fp8_gemv there.
+_TABLE_W4: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
+    (16480, 2560): ((8, dict(grid=0, kw=4, tw=4, slots=3, xreg=2)),),
+}
+
 #: Most 16-row tiles a CTA takes in the heuristic plan: a ring slot holds `kw` k-blocks of each of
 #: them, so a larger N gets more CTAs (several per multiprocessor over the launch) instead.
 MAX_TILES_PER_CTA = 7
 
 
-def default_plan(n: int, k: int, m: int, sms: int) -> Plan:
-    """The plan `fp8_gemv` launches with: the measured table entry for (N, K, M), else a heuristic."""
+def default_plan(n: int, k: int, m: int, sms: int, w4: bool = False) -> Plan:
+    """The plan `fp8_gemv` launches with: the measured table entry for (N, K, M), else a heuristic
+    (`w4`: over NVFP4 units)."""
     n_tiles = -(-n // TILE_N)
     nkb = k // BLOCK_K
     auto_grid = n_tiles if n_tiles <= sms + sms // 8 else sms
-    for bound, fields in _TABLE.get((n, k), ()):
+    for bound, fields in (_TABLE_W4 if w4 else _TABLE).get((n, k), ()):
         if m <= bound:
             f = dict(fields)
             g = f.pop("grid")
@@ -1374,7 +1527,7 @@ def default_plan(n: int, k: int, m: int, sms: int) -> Plan:
         tw = rt
     nt8 = -(-m // 8)
     xreg = (nkb // kw) * nt8 * 16 <= XREG_MAX
-    slot = kw * rt * UNIT + (0 if xreg else kw * m * XRS)
+    slot = kw * rt * (UNIT_W4 if w4 else UNIT) + (0 if xreg else kw * m * XRS)
     slots = max(1, min(nkb // kw, SMEM_BUDGET // slot))
     return Plan(grid=grid, kw=kw, tw=tw, slots=slots, xreg=1 if xreg else 2)
 
@@ -1390,6 +1543,7 @@ def _compiled(
     conv_dim: int = 0,
     pad_slot: int = -1,
     conv_p: int = 0,
+    w4: bool = False,
 ):
     kern = _Fp8Gemv(
         n=n,
@@ -1401,6 +1555,7 @@ def _compiled(
         conv_dim=conv_dim,
         pad_slot=pad_slot,
         conv_p=conv_p,
+        w4=w4,
     )
     dev = "cuda"
     out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
@@ -1456,15 +1611,17 @@ def fp8_gemv(
     x: torch.Tensor, w: PackedFp8Weight, pdl: bool = True, plan: Plan | None = None
 ) -> torch.Tensor:
     """`x[M, K]` bf16 (row stride >= K, 16-byte aligned rows) @ dequant(w)^T -> fresh
-    `[M, N]` bf16. M = 1 .. MAX_ROWS."""
+    `[M, N]` bf16. M = 1 .. MAX_ROWS. `w` a `PackedFp8Weight`, or NVFP4 units in this kernel's
+    order (`nvfp4_gemv.SplitNvfp4Weight`, `w.w4`)."""
     m, k = x.shape
     assert k == w.k and x.dtype == torch.bfloat16 and x.stride(1) == 1
     assert 1 <= m <= MAX_ROWS
     assert x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0
+    w4 = getattr(w, "w4", False)
     out = torch.empty((m, w.n), dtype=torch.bfloat16, device=x.device)
     if plan is None:
-        plan = default_plan(w.n, k, m, _sms())
-    fn = _compiled(w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major)
+        plan = default_plan(w.n, k, m, _sms(), w4)
+    fn = _compiled(w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major, w4=w4)
     fn(
         out,
         x.data_ptr(),
@@ -1492,7 +1649,8 @@ def fp8_gemv_conv1d(
     `out[r, c] = round_bf16(silu(sum_j conv_weight[c, j] * [conv_state[s, c, :], p[r, c]][j]))` (fp32)
     and `conv_state[s, c, :] = [conv_state[s, c, 1:], p[r, c]]`; every other output is `p`.
     `conv_state` `[slots, conv_dim, 3]` bf16 (any strides), `conv_weight` `[conv_dim, 4]` bf16
-    contiguous, `conv_state_indices` int32 `[M]`. Returns the fresh `[M, N]` output."""
+    contiguous, `conv_state_indices` int32 `[M]`. Returns the fresh `[M, N]` output. `w` as
+    `fp8_gemv`'s."""
     m, k = x.shape
     assert k == w.k and x.dtype == torch.bfloat16 and x.stride(1) == 1 and 1 <= m <= MAX_ROWS
     assert x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0
@@ -1501,11 +1659,12 @@ def fp8_gemv_conv1d(
     assert conv_weight.is_contiguous() and conv_dim <= w.n
     assert conv_state_indices.dtype == torch.int32 and conv_state_indices.is_contiguous()
     assert conv_state_indices.numel() == m
+    w4 = getattr(w, "w4", False)
     out = torch.empty((m, w.n), dtype=torch.bfloat16, device=x.device)
     if plan is None:
-        plan = default_plan(w.n, k, m, _sms())
+        plan = default_plan(w.n, k, m, _sms(), w4)
     fn = _compiled(
-        w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major, conv_dim, int(pad_slot_id)
+        w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major, conv_dim, int(pad_slot_id), w4=w4
     )
     fn(
         out,
@@ -1552,7 +1711,7 @@ def fp8_gemv_conv1d_verify(
     `conv_state` `[slots, conv_dim, 3]` and `intermediate_conv_window` `[rows, >= p,
     conv_dim, 3]` bf16 (any strides), `conv_weight` `[conv_dim, 4]` bf16 contiguous, both
     index vectors int32 `[n]` contiguous. The slots, snapshot rows, taps and the windows are
-    read before the PDL wait (as `fp8_gemv_conv1d` does)."""
+    read before the PDL wait (as `fp8_gemv_conv1d` does). `w` as `fp8_gemv`'s."""
     m, k = x.shape
     p = int(rows_per_seq)
     assert k == w.k and x.dtype == torch.bfloat16 and x.stride(1) == 1 and 2 <= m <= MAX_ROWS
@@ -1567,11 +1726,21 @@ def fp8_gemv_conv1d_verify(
     assert tuple(iw.shape[2:]) == (conv_dim, 3)
     for v in (conv_state_indices, iidx):
         assert v.dtype == torch.int32 and v.is_contiguous() and v.numel() == nreq
+    w4 = getattr(w, "w4", False)
     buf = torch.empty(m * w.n, dtype=torch.bfloat16, device=x.device)
     if plan is None:
-        plan = default_plan(w.n, k, m, _sms())
+        plan = default_plan(w.n, k, m, _sms(), w4)
     fn = _compiled(
-        w.n, k, m, plan, bool(pdl and _env_pdl()), w.tile_major, conv_dim, int(pad_slot_id), p
+        w.n,
+        k,
+        m,
+        plan,
+        bool(pdl and _env_pdl()),
+        w.tile_major,
+        conv_dim,
+        int(pad_slot_id),
+        p,
+        w4=w4,
     )
     fn(
         buf.view(m, w.n),
@@ -1679,6 +1848,41 @@ def _verify_cell(why: str, p: int, slots: tuple, steps: int | None = None) -> Ce
     )
 
 
+def verify_reference(
+    x,
+    deq,
+    conv_state,
+    conv_weight,
+    conv_state_indices,
+    intermediate_conv_window,
+    intermediate_state_indices,
+    conv_dim,
+    rows_per_seq,
+    pad_slot_id,
+):
+    """`fp8_gemv_conv1d_verify`'s reference over a dequantized fp32 weight `deq` `[N, K]`; see
+    `Fp8GemvConv1dVerify.reference`."""
+    with true_fp32_matmul():
+        proj = (x.float() @ deq.t()).to(torch.bfloat16)
+    m, p = x.shape[0], rows_per_seq
+    conv = proj[:, :conv_dim].clone()
+    state, window = conv_state.clone(), intermediate_conv_window.clone()
+    slots = conv_state_indices.tolist()
+    rows = intermediate_state_indices.tolist()
+    for s in range(m // p):
+        if slots[s] == pad_slot_id:
+            continue
+        seq = torch.cat([conv_state[slots[s]], proj[s * p : (s + 1) * p, :conv_dim].t()], 1)
+        for t in range(p):
+            acc = torch.zeros(conv_dim, dtype=torch.float32, device=x.device)
+            for j in range(4):
+                acc = acc + (conv_weight[:, j] * seq[:, t + j]).float()
+            conv[s * p + t] = (acc / (1.0 + torch.exp(-acc))).to(torch.bfloat16)
+            window[rows[s], t] = seq[:, t + 1 : t + 4]
+        state[slots[s]] = seq[:, p : p + 3]
+    return conv, proj[:, conv_dim:].contiguous(), state, window
+
+
 class Fp8GemvConv1dVerify(OpWrapper):
     """`fp8_gemv_conv1d_verify`: the GDN input projection of a speculative verify step (n
     requests x p tokens) with `causal_conv1d_triton_update`'s multi-token conv step as its
@@ -1767,25 +1971,18 @@ class Fp8GemvConv1dVerify(OpWrapper):
         an fp32 matmul over the dequantized weight rounded once to bf16, then the Triton
         op's reference conv (products in bf16, fp32 sum, `acc / (1 + exp(-acc))`); mutates
         nothing. A pad request's conv rows are its projection."""
-        with true_fp32_matmul():
-            proj = (x.float() @ dequantize_fp8_block(codes, scale).t()).to(torch.bfloat16)
-        m, p = x.shape[0], rows_per_seq
-        conv = proj[:, :conv_dim].clone()
-        state, window = conv_state.clone(), intermediate_conv_window.clone()
-        slots = conv_state_indices.tolist()
-        rows = intermediate_state_indices.tolist()
-        for s in range(m // p):
-            if slots[s] == pad_slot_id:
-                continue
-            seq = torch.cat([conv_state[slots[s]], proj[s * p : (s + 1) * p, :conv_dim].t()], 1)
-            for t in range(p):
-                acc = torch.zeros(conv_dim, dtype=torch.float32, device=x.device)
-                for j in range(4):
-                    acc = acc + (conv_weight[:, j] * seq[:, t + j]).float()
-                conv[s * p + t] = (acc / (1.0 + torch.exp(-acc))).to(torch.bfloat16)
-                window[rows[s], t] = seq[:, t + 1 : t + 4]
-            state[slots[s]] = seq[:, p : p + 3]
-        return conv, proj[:, conv_dim:].contiguous(), state, window
+        return verify_reference(
+            x,
+            dequantize_fp8_block(codes, scale),
+            conv_state,
+            conv_weight,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            conv_dim,
+            rows_per_seq,
+            pad_slot_id,
+        )
 
     def is_valid(
         self,

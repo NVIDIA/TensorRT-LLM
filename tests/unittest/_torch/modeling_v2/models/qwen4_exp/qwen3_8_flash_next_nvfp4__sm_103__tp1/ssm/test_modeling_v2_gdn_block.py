@@ -119,6 +119,9 @@ def _layer(seed: int) -> types.SimpleNamespace:
         out8=None,
         in_proj_g=None,
         out_g=None,
+        in_proj_m=None,
+        out_m=None,
+        in_proj_nv=None,
     )
 
 
