@@ -8,6 +8,8 @@ be loaded, this loads the CUDA toolkit stub in its place so the renderer starts 
 script outside the package so that importing ``tensorrt_llm`` anywhere else is unchanged.
 """
 
+from __future__ import annotations
+
 import ctypes
 import glob
 import os
@@ -35,10 +37,11 @@ def _stub_candidates() -> list:
     return candidates
 
 
-def _load_cuda_stub_if_needed() -> None:
+def _load_cuda_stub_if_needed() -> str | None:
+    """Load a toolkit stub when ``libcuda.so.1`` is missing; return its path, or None if not needed."""
     try:
         ctypes.CDLL("libcuda.so.1")
-        return
+        return None
     except OSError:
         pass
     failures = []
@@ -49,12 +52,7 @@ def _load_cuda_stub_if_needed() -> None:
             failures.append(f"{stub}: {error}")
             continue
         warnings.filterwarnings("ignore", message="CUDA initialization:", category=UserWarning)
-        print(
-            f"trtllm-render: no GPU driver found; running CPU-only with the CUDA toolkit stub ({stub}).",
-            file=sys.stderr,
-            flush=True,
-        )
-        return
+        return stub
     sys.exit(
         "trtllm-render: libcuda.so.1 not found and no usable CUDA toolkit stub under $CUDA_HOME or "
         "/usr/local/cuda*; install the CUDA toolkit stubs or expose a GPU driver"
@@ -63,9 +61,14 @@ def _load_cuda_stub_if_needed() -> None:
 
 
 def main() -> None:
-    _load_cuda_stub_if_needed()
+    stub = _load_cuda_stub_if_needed()
+    from tensorrt_llm.logger import logger
     from tensorrt_llm.serve.render.__main__ import main as render_main
 
+    if stub:
+        logger.info(
+            f"trtllm-render: no GPU driver found; running CPU-only with the CUDA stub {stub}"
+        )
     render_main()
 
 
