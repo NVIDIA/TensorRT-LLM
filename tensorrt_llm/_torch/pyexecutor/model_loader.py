@@ -21,6 +21,7 @@ from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -49,6 +50,7 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
@@ -101,6 +103,14 @@ _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
 _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
+)
+# Qwen3.5 vision-language roots realize interleaved M-RoPE (`rope_type`
+# `mrope`), applied by the fused QK-norm/RoPE kernel rather than the
+# attention op.
+_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_types=frozenset({"mrope"}),
+    rope_fusion=frozenset({False}),
 )
 
 
@@ -736,6 +746,19 @@ class ModelLoader:
             transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3_5-for-conditional-generation-bf16-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5",
+                "Qwen3_5VLModel"),
+            architecture="Qwen3_5ForConditionalGeneration",
+            model_type="qwen3_5",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS,
         ),
     ))
 
@@ -1637,6 +1660,42 @@ class ModelLoader:
                 torch.cuda.synchronize()
 
     @classmethod
+    def _post_transform_transfer_scope(
+            cls, model: torch.nn.Module) -> PostTransformTransferScope:
+        """Return the model component that an MX transfer of `model` carries.
+
+        MX transfers every parameter of the constructed root. A text-only root
+        is the target model. A registered multimodal root is the complete model
+        when it owns parameters outside its language model (a local multimodal
+        encoder), and only the language model otherwise, as with
+        `disable_mm_encoder` or multimodal encoder/prefill disaggregation.
+        Roots without a registered profile keep the target-model scope without
+        querying `language_model`; qualification rejects them by root class.
+        """
+        if not isinstance(model, MultimodalModelMixin):
+            return PostTransformTransferScope.TARGET_MODEL
+        root_model_class = type(model)
+        if not any(
+                profile.root_model_class.matches(root_model_class)
+                for profile in cls._post_transform_profile_registry().profiles):
+            return PostTransformTransferScope.TARGET_MODEL
+        try:
+            language_model = getattr(model, "language_model", None)
+        except NotImplementedError:
+            language_model = None
+        if not isinstance(language_model, torch.nn.Module):
+            return PostTransformTransferScope.TARGET_MODEL
+        language_model_parameters = {
+            id(parameter)
+            for parameter in language_model.parameters()
+        }
+        if any(
+                id(parameter) not in language_model_parameters
+                for parameter in model.parameters()):
+            return PostTransformTransferScope.COMPLETE_MODEL
+        return PostTransformTransferScope.LANGUAGE_MODEL
+
+    @classmethod
     def _qualify_post_transform_profile(
             cls,
             model: DecoderModelForCausalLM,
@@ -1661,7 +1720,7 @@ class ModelLoader:
             model_type=config_identity.model_type,
             speculative_mode=speculative_mode,
             protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            transfer_scope=cls._post_transform_transfer_scope(model),
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
                 model.model_config, model=model),
