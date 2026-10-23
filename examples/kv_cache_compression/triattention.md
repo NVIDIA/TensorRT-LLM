@@ -31,6 +31,8 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 4. MHA, MLA, SSM/hybrid pools, and native sliding-eviction layouts such as Gemma 4 are not supported. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window.
 5. Speculative decoding is supported for one-model MTP and EAGLE3 with `eviction_mode="union"`. Tensor parallelism beyond TP1, attention DP, and disaggregated serving have not yet been validated end to end.
 
+6. The Blackwell TopK selector supports `budget` values up to 16384. Larger values are rejected when the compression manager is constructed, before calibration loading or GPU workspace initialization.
+
 ## Workspace lifetime
 
 TriAttention allocates its resident eviction buffers when it binds the KV cache

@@ -303,6 +303,19 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
         if compact:
             scratch = torch.empty(resident_scratch.numel() * 2, device="cuda")
             launch(2, scratch)
+            for count in (0, 3):
+                with pytest.raises(ValueError, match="request count"):
+                    launch(count, scratch)
+            invalid_workspaces = (
+                resident_scratch,
+                scratch.to(torch.float16),
+                torch.empty(scratch.numel(), device="cpu"),
+                torch.empty(scratch.numel() * 2, device="cuda")[::2],
+            )
+            for workspace in invalid_workspaces:
+                with pytest.raises(ValueError, match="score workspace"):
+                    launch(2, workspace)
+            del invalid_workspaces, workspace
         else:
             launch(2)
         reduce_per_head_scores(
@@ -326,6 +339,14 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
     assert scratch_sizes[1] * 20 < scratch_sizes[0]
     with mock.patch.object(torch.cuda, "mem_get_info", return_value=(0, 1)):
         assert tri._try_score_workspace(2) is None
+
+    with mock.patch.object(torch.cuda, "mem_get_info") as query:
+        assert tri._try_score_workspace(1) is None
+        with mock.patch.object(tri, "_union_tp_mapping", object()):
+            assert tri._try_score_workspace(2) is None
+        with pytest.raises(ValueError, match="batch capacity"):
+            tri._try_score_workspace(tri._request_capacity + 1)
+        query.assert_not_called()
 
     # Exercise allocation failure through the scheduling entry point, including
     # publication and resize, on the first eviction after initialization.
@@ -356,6 +377,7 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
     with mock.patch.object(tri, "_stage_block_offset_snapshot", side_effect=stage):
         for mode in ("union", "per_head", "per_layer_perhead"):
             tri.eviction_mode = mode
+            tri.budget = 32
             tri._selection_width_capacity = 256
             for pool, original in zip(layout["layer_pools"], original_pools):
                 pool.copy_(original)

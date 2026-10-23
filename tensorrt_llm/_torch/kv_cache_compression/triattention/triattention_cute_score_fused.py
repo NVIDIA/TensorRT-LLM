@@ -1586,6 +1586,7 @@ def build_score_pipeline(
             compiled_normalizers[request_count] = _get_or_compile(cache_key, build_normalizer)
 
     def launch_score(request_count: int, workspace: Optional[torch.Tensor] = None) -> None:
+        """Validate scratch storage and enqueue scoring on the current CUDA stream."""
         if not 1 <= request_count <= request_capacity:
             raise ValueError("request count exceeds compiled score capacity")
         scratch = score_scratch if workspace is None else workspace
