@@ -972,6 +972,78 @@ def match_nemotron_h_layer_types(model_config, layer_types):
     return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
 
 
+MINIMAX_DSPARK_DRAFT_ARCH = "DSparkMiniMaxDraftModel"
+
+# Keys of the standalone MiniMax DSpark drafter config.json that describe the
+# target checkpoint it was exported next to, not the drafter itself. The
+# drafter's MXFP8 linears are dequantized to the compute dtype at load, so the
+# quantization block is dropped and the backbone is built unquantized.
+_MINIMAX_DSPARK_DROPPED_KEYS = frozenset({
+    "text_config",
+    "vision_config",
+    "quantization_config",
+    "architectures",
+    "model_type",
+    "_name_or_path",
+})
+
+
+def build_minimax_dspark_draft_config(
+        config_dict: dict) -> transformers.PretrainedConfig:
+    """Flat drafter config for a standalone MiniMax-M3 DSpark checkpoint.
+
+    The drafter ships a MiniMax VL-shaped config.json: ``model_type``
+    ``minimax_m3_vl`` with the backbone geometry nested under ``text_config``,
+    no ``auto_map`` and no modeling code, so ``AutoConfig.from_pretrained``
+    cannot resolve it. The drafter's own fields (``dspark_*``,
+    ``dflash_config``, ``hidden_size``, ``vocab_size``, ...) are duplicated
+    at the top level and inside ``text_config``; the text side wins where both
+    are present. The result is a plain ``PretrainedConfig`` with every field as
+    an attribute, which is what ``DFlashForCausalLM`` and the registered
+    ``DSparkMiniMaxDraftModel`` backbone read.
+
+    ``dflash_config`` gets ``use_swa`` / ``swa_window_size`` when the drafter
+    declares ``sliding_attention`` layers with a ``sliding_window`` but not the
+    DFlash spelling: the block decode keys its per-layer window on the former,
+    and the HF reference these drafters are distilled with applies the window
+    on exactly those layers.
+    """
+    flat = {
+        k: v
+        for k, v in config_dict.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+    }
+    text = config_dict.get("text_config") or {}
+    flat.update({
+        k: v
+        for k, v in text.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+    })
+    dflash = dict(flat.get("dflash_config") or {})
+    layer_types = dflash.get("layer_types") or flat.get("layer_types") or []
+    sliding_window = dflash.get("sliding_window") or flat.get("sliding_window")
+    if ("use_swa" not in dflash and sliding_window
+            and "sliding_attention" in layer_types):
+        dflash["use_swa"] = True
+        dflash["swa_window_size"] = int(sliding_window)
+        dflash.setdefault("layer_types", list(layer_types))
+    flat["dflash_config"] = dflash
+    flat["architectures"] = [MINIMAX_DSPARK_DRAFT_ARCH]
+    # Not ``minimax_m3_vl``: that model_type selects the VL target's
+    # text_config unwrapping and input-processor registration, neither of
+    # which applies to the flattened drafter.
+    flat["model_type"] = "minimax_dspark_draft"
+    dtype = flat.pop("dtype", None) or flat.pop("torch_dtype",
+                                                None) or "bfloat16"
+    flat.pop("torch_dtype", None)
+    if isinstance(dtype, str):
+        dtype = str_dtype_to_torch(dtype)
+    config = transformers.PretrainedConfig()
+    for key, value in flat.items():
+        setattr(config, key, value)
+    config.dtype = dtype
+    config.torch_dtype = dtype
+    return config
+
+
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: Optional[str] = None,
@@ -1113,6 +1185,10 @@ def load_pretrained_config(model_name_or_path: str,
         vision_config = getattr(model_config, "vision_config", None)
         if getattr(vision_config, "num_hidden_layers", 0) > 0:
             model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
+    elif architectures and architectures[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        # Standalone MiniMax-M3 DSpark drafter: VL-shaped config.json with
+        # no auto_map, flattened here (see build_minimax_dspark_draft_config).
+        model_config = build_minimax_dspark_draft_config(config_dict)
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

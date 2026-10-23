@@ -83,20 +83,22 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import RopeEmbeddingUtils
+from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..attention.attention import Attention
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -106,7 +108,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import is_mla
+from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
 from ..speculative.interface import SpeculativeDecodingMode
 from ..utils import AuxStreamType
 from .modeling_deepseekv4 import (
@@ -125,7 +127,12 @@ from .modeling_speculative import (
     build_markov_head,
     dspark_markov_chain_logits,
 )
-from .modeling_utils import DecoderModel, register_auto_model, register_draft_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    register_auto_model,
+    register_draft_model,
+)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from ..custom_ops.dspark_attention_custom_op import (
@@ -3505,6 +3512,230 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self.lm_head = target_model.lm_head
 
 
+# ----------------------------------------------------------------------------
+# MiniMax-M3 standalone DSpark drafter (architecture ``DSparkMiniMaxDraftModel``).
+#
+# A GQA backbone (64 heads / 4 KV heads / head_dim 128 at hidden 6144), per-head
+# Gemma Q/K norm, NeoX RoPE over the first ``rotary_dim`` channels of each head,
+# a dense swiglu-oai MLP and Gemma boundary norms: the dense-layer block of the
+# MiniMax-M3 target. Weights ship MXFP8 (e4m3 + UE8M0 1x32 block scales) under
+# ``language_model.model.dspark.layers.<i>.decoder_layer.*``; the heads are
+# ``language_model.model.dspark.{fc,hidden_norm,final_norm,markov_head.*,
+# confidence_head.proj.*}``.
+# ----------------------------------------------------------------------------
+
+MINIMAX_DSPARK_WEIGHT_PREFIX = "language_model.model.dspark."
+_MINIMAX_DSPARK_DECODER_LAYER_INFIX = ".decoder_layer."
+_MINIMAX_DSPARK_RENAMES = {"final_norm.weight": "norm.weight"}
+# Every RMSNorm in this drafter is a Gemma norm, (1 + weight) * x. The backbone
+# and the wrapper-owned ``hidden_norm`` are plain norms, so the stored weights
+# are pre-incremented at load (the same fold the MiniMax-M3 target applies to
+# its layer-boundary norms).
+_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+    "hidden_norm.weight",
+)
+_MINIMAX_DSPARK_GEMMA_NORM_KEYS = ("norm.weight",)
+_MXFP8_BLOCK_SIZE = 32
+_MXFP8_SCALE_SUFFIX = ".weight_scale_inv"
+
+
+def remap_minimax_dspark_weight_name(name: str) -> str:
+    """Checkpoint tensor name -> the name the DFlash/DSpark loaders expect.
+
+    Strips the ``language_model.model.dspark.`` namespace and the
+    ``.decoder_layer.`` level, and renames ``final_norm`` to ``norm``. Names
+    outside the namespace are returned unchanged.
+    """
+    if not name.startswith(MINIMAX_DSPARK_WEIGHT_PREFIX):
+        return name
+    name = name[len(MINIMAX_DSPARK_WEIGHT_PREFIX) :]
+    name = name.replace(_MINIMAX_DSPARK_DECODER_LAYER_INFIX, ".")
+    return _MINIMAX_DSPARK_RENAMES.get(name, name)
+
+
+def dequantize_mxfp8_weight(
+    weight: torch.Tensor, scale_inv: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """``weight`` (e4m3, ``[out, in]``) times ``2 ** (scale_inv - 127)`` per
+    ``[1, 32]`` block (``scale_inv``: UE8M0 as uint8, ``[out, in / 32]``), in
+    ``dtype``."""
+    w = weight.to(torch.float32)
+    exponent = scale_inv.to(torch.int32) - 127
+    scale = torch.exp2(exponent.to(torch.float32))
+    scale = scale.repeat_interleave(_MXFP8_BLOCK_SIZE, dim=1)[:, : w.shape[1]]
+    return (w * scale).to(dtype)
+
+
+def prepare_minimax_dspark_weights(weights: Dict, dtype: torch.dtype) -> Dict:
+    """Rename, dequantize and norm-fold a MiniMax DSpark drafter checkpoint.
+
+    Returns a new dict keyed by the DFlash/DSpark loader names, with every
+    MXFP8 ``weight`` / ``weight_scale_inv`` pair replaced by one ``dtype``
+    tensor and every Gemma norm weight incremented by one.
+    """
+    renamed = {remap_minimax_dspark_weight_name(k): v for k, v in weights.items()}
+    out = {}
+    for name, value in renamed.items():
+        if name.endswith(_MXFP8_SCALE_SUFFIX):
+            continue
+        tensor = value[:] if hasattr(value, "__getitem__") else value
+        scale_name = name[: -len(".weight")] + _MXFP8_SCALE_SUFFIX
+        if name.endswith(".weight") and scale_name in renamed:
+            scale = renamed[scale_name]
+            scale = scale[:] if hasattr(scale, "__getitem__") else scale
+            tensor = dequantize_mxfp8_weight(tensor, scale, dtype)
+        elif name.endswith(_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES) or name in (
+            _MINIMAX_DSPARK_GEMMA_NORM_KEYS
+        ):
+            tensor = tensor + 1.0
+        out[name] = tensor
+    return out
+
+
+class MiniMaxDSparkAttention(Attention):
+    """GQA attention of the MiniMax DSpark drafter: fused ``qkv_proj`` +
+    ``o_proj`` with per-head ``q_norm`` / ``k_norm`` and partial NeoX RoPE.
+
+    Only the projections, norms and RoPE parameters are read; the block decode
+    is ``DFlashForCausalLM.dflash_forward``. ``self.pretrained_config`` is what
+    that decode reads ``partial_rotary_factor`` from.
+    """
+
+    def __init__(self, model_config: ModelConfig, layer_idx: int) -> None:
+        config = model_config.pretrained_config
+        self.pretrained_config = config
+        head_dim = int(
+            getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        )
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=False,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
+            rope_fusion=False,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=False,
+            config=model_config,
+            head_dim=head_dim,
+        )
+        self.q_norm = RMSNorm(
+            hidden_size=head_dim, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.k_norm = RMSNorm(
+            hidden_size=head_dim, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+
+class MiniMaxDSparkDecoderLayer(DecoderLayer):
+    """One drafter layer: GQA projections + dense swiglu-oai MLP + the two norms."""
+
+    def __init__(self, model_config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        config = model_config.pretrained_config
+        self.layer_idx = layer_idx
+        self.self_attn = MiniMaxDSparkAttention(model_config, layer_idx)
+        intermediate_size = int(
+            getattr(config, "dspark_ffn_hidden_size", None)
+            or getattr(config, "dense_intermediate_size", config.intermediate_size)
+        )
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            bias=False,
+            activation=torch.nn.functional.silu,
+            swiglu_alpha=float(getattr(config, "swiglu_alpha", 1.702)),
+            swiglu_beta=1.0,
+            swiglu_limit=float(getattr(config, "swiglu_limit", 7.0)),
+            dtype=config.torch_dtype,
+            config=model_config,
+            overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
+            layer_idx=layer_idx,
+        )
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        raise NotImplementedError(
+            "MiniMaxDSparkDecoderLayer is driven by DFlashForCausalLM.dflash_forward, "
+            "not by the generic decoder loop."
+        )
+
+
+class MiniMaxDSparkModel(DecoderModel):
+    """Weight container for the MiniMax DSpark block decode."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__(model_config)
+        config = model_config.pretrained_config
+        # Replaced by the target's embedding in load_weights_from_target_model;
+        # the checkpoint ships none.
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
+        )
+        self.layers = nn.ModuleList(
+            [
+                MiniMaxDSparkDecoderLayer(model_config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        raise NotImplementedError(
+            "MiniMaxDSparkModel is a weight container for the DSpark block decode; "
+            "see DFlashForCausalLM.dflash_forward."
+        )
+
+
+@register_auto_model("DSparkMiniMaxDraftModel")
+class MiniMaxDSparkBackbone(DecoderModelForCausalLM[MiniMaxDSparkModel, PretrainedConfig]):
+    """Registry entry for the MiniMax DSpark drafter checkpoint
+    (``config.architectures == ["DSparkMiniMaxDraftModel"]``)."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        config = model_config.pretrained_config
+        super().__init__(
+            MiniMaxDSparkModel(model_config),
+            config=model_config,
+            hidden_size=config.hidden_size,
+            vocab_size=config.vocab_size,
+        )
+
+
+class MiniMaxDSparkForCausalLM(GQADSparkForCausalLM):
+    """DSpark drafter on the MiniMax-M3 GQA backbone, from a standalone checkpoint.
+
+    The GQA block decode and head set are inherited; this class only translates
+    the checkpoint (namespace, MXFP8 dequantization, Gemma norm fold) before
+    the DFlash loader sees it. See :func:`prepare_minimax_dspark_weights`.
+    """
+
+    def load_weights(self, weights: Dict, weight_mapper: Any = None, **kwargs: Any) -> Any:
+        weights = prepare_minimax_dspark_weights(weights, self.config.torch_dtype)
+        return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+
+
 def draft_is_embedded_in_target(model_config) -> bool:
     """True when the DSpark draft weights live inside the target checkpoint.
 
@@ -3562,14 +3793,21 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     # what differs between the two wrappers, and everything below it
     # (``DFlashForCausalLM.__init__``) already resolves the backbone through the
     # model registry, so keying on model_type a second time would force a new
-    # entry for every GQA family that already works.
-    if is_mla(draft_config.pretrained_config):
+    # entry for every GQA family that already works. The MiniMax drafter is the
+    # one architecture-keyed exception: its checkpoint needs a translation step
+    # (namespace, MXFP8, Gemma norms) that the generic GQA loader has no hook for.
+    draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
+    if draft_arches and draft_arches[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        drafter_cls = MiniMaxDSparkForCausalLM
+    elif is_mla(draft_config.pretrained_config):
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
         )
+    else:
+        drafter_cls = GQADSparkForCausalLM
     # The drafter's own ModelConfig has no spec_config, so the worker's mask id is handed over here.
-    return GQADSparkForCausalLM(
+    return drafter_cls(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
         spec_mask_token_id=model_config.spec_config.mask_token_id,
@@ -3584,6 +3822,13 @@ __all__ = [
     # Standalone flavour.
     "GQADSparkForCausalLM",
     "MLADSparkForCausalLM",
+    # MiniMax-M3 GQA drafter and its checkpoint translation.
+    "MiniMaxDSparkForCausalLM",
+    "MiniMaxDSparkBackbone",
+    "MiniMaxDSparkModel",
+    "prepare_minimax_dspark_weights",
+    "remap_minimax_dspark_weight_name",
+    "dequantize_mxfp8_weight",
     # MLA drafter backbone (a weight container for the block decode).
     "K3DsparkForCausalLM",
     "K3DsparkModel",

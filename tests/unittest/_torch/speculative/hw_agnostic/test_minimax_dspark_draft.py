@@ -1,0 +1,242 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MiniMax-M3 standalone DSpark drafter: config flattening and checkpoint
+translation (CPU only; no drafter module is built here)."""
+
+import json
+import pathlib
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.models.modeling_dspark import (
+    GQADSparkForCausalLM,
+    MiniMaxDSparkBackbone,
+    MiniMaxDSparkForCausalLM,
+    dequantize_mxfp8_weight,
+    prepare_minimax_dspark_weights,
+    remap_minimax_dspark_weight_name,
+)
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    MINIMAX_DSPARK_DRAFT_ARCH,
+    build_minimax_dspark_draft_config,
+    load_pretrained_config,
+)
+
+# The shipped drafter config.json, reduced to the fields the loaders read. The
+# backbone geometry sits under text_config; the dspark_* / dflash_config knobs
+# are duplicated at both levels, as in the checkpoint.
+_TEXT = {
+    "architectures": ["DSparkMiniMaxDraftModel"],
+    "dtype": "bfloat16",
+    "hidden_size": 6144,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 5,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "vocab_size": 200064,
+    "max_position_embeddings": 1048576,
+    "rms_norm_eps": 1e-06,
+    "use_gemma_norm": True,
+    "rope_theta": 10000000,
+    "rotary_dim": 64,
+    "partial_rotary_factor": 0.5,
+    "hidden_act": "swigluoai",
+    "use_qk_norm": True,
+    "dense_intermediate_size": 12288,
+    "qk_norm_type": "per_head",
+    "swiglu_alpha": 1.702,
+    "swiglu_limit": 7.0,
+    "sparse_attention_config": None,
+    "dspark_block_size": 7,
+    "dspark_markov_rank": 256,
+    "dspark_markov_head_type": "vanilla",
+    "dspark_noise_token_id": 200058,
+    "dspark_use_dense_ffn": True,
+    "dspark_ffn_hidden_size": 12288,
+    "dspark_target_layer_ids": [3, 17, 31, 45, 59],
+    "dspark_config": {
+        "markov_rank": 256,
+        "markov_head_type": "vanilla",
+        "mask_token_id": 200058,
+        "use_dense_ffn": True,
+        "ffn_hidden_size": 12288,
+    },
+    "dflash_config": {
+        "num_hidden_layers": 5,
+        "num_target_layers": 60,
+        "block_size": 7,
+        "mask_token_id": 200058,
+        "target_layer_ids": [3, 17, 31, 45, 59],
+        "layer_types": ["sliding_attention"] * 5,
+        "sliding_window": 4096,
+    },
+    "enable_confidence_head": True,
+    "layer_types": ["sliding_attention"] * 5,
+    "sliding_window": 4096,
+    "model_type": "",
+}
+
+_CONFIG = {
+    "transformers_version": "5.12.1",
+    "architectures": ["DSparkMiniMaxDraftModel"],
+    "dtype": "bfloat16",
+    "model_type": "minimax_m3_vl",
+    "text_config": _TEXT,
+    "quantization_config": {
+        "quant_method": "mxfp8",
+        "weight_block_size": [1, 32],
+        "ignored_layers": ["lm_head"],
+    },
+    "tie_word_embeddings": False,
+    "dspark_block_size": 7,
+    "dspark_target_layer_ids": [3, 17, 31, 45, 59],
+    "dflash_config": dict(_TEXT["dflash_config"]),
+    "hidden_size": 6144,
+    "vocab_size": 200064,
+    "num_hidden_layers": 5,
+}
+
+
+def test_flattened_config_exposes_backbone_and_drafter_fields() -> None:
+    cfg = build_minimax_dspark_draft_config(_CONFIG)
+    assert cfg.architectures == [MINIMAX_DSPARK_DRAFT_ARCH]
+    assert cfg.model_type != "minimax_m3_vl"
+    assert cfg.num_attention_heads == 64
+    assert cfg.num_key_value_heads == 4
+    assert cfg.head_dim == 128
+    assert cfg.rotary_dim == 64 and cfg.partial_rotary_factor == 0.5
+    assert cfg.dspark_target_layer_ids == [3, 17, 31, 45, 59]
+    assert cfg.dspark_markov_rank == 256
+    assert cfg.dflash_config["mask_token_id"] == 200058
+    assert cfg.dflash_config["block_size"] == 7
+    # The HF sliding window on 'sliding_attention' layers is translated to the
+    # DFlash block-decode spelling.
+    assert cfg.dflash_config["use_swa"] is True
+    assert cfg.dflash_config["swa_window_size"] == 4096
+    # Dequantized at load: the backbone is built unquantized.
+    assert getattr(cfg, "quantization_config", None) is None
+    assert not hasattr(cfg, "text_config")
+    assert cfg.torch_dtype == torch.bfloat16
+
+
+def test_flattened_config_keeps_existing_dflash_window_spelling() -> None:
+    config = json.loads(json.dumps(_CONFIG))
+    config["text_config"]["dflash_config"]["use_swa"] = False
+    cfg = build_minimax_dspark_draft_config(config)
+    assert cfg.dflash_config["use_swa"] is False
+    assert "swa_window_size" not in cfg.dflash_config
+
+
+def test_load_pretrained_config_routes_by_architecture(tmp_path: pathlib.Path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_CONFIG))
+    cfg = load_pretrained_config(str(tmp_path), trust_remote_code=False)
+    assert cfg.architectures == [MINIMAX_DSPARK_DRAFT_ARCH]
+    assert cfg.hidden_size == 6144 and cfg.num_hidden_layers == 5
+
+
+def test_backbone_is_registered_under_the_checkpoint_architecture() -> None:
+    assert get_registered_model_class(MINIMAX_DSPARK_DRAFT_ARCH) is MiniMaxDSparkBackbone
+    assert issubclass(MiniMaxDSparkForCausalLM, GQADSparkForCausalLM)
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        (
+            "language_model.model.dspark.layers.3.decoder_layer.self_attn.q_proj.weight",
+            "layers.3.self_attn.q_proj.weight",
+        ),
+        (
+            "language_model.model.dspark.layers.0.decoder_layer.mlp.down_proj.weight_scale_inv",
+            "layers.0.mlp.down_proj.weight_scale_inv",
+        ),
+        ("language_model.model.dspark.fc.weight", "fc.weight"),
+        ("language_model.model.dspark.hidden_norm.weight", "hidden_norm.weight"),
+        ("language_model.model.dspark.final_norm.weight", "norm.weight"),
+        (
+            "language_model.model.dspark.markov_head.markov_w1.weight",
+            "markov_head.markov_w1.weight",
+        ),
+        (
+            "language_model.model.dspark.confidence_head.proj.bias",
+            "confidence_head.proj.bias",
+        ),
+        ("lm_head.weight", "lm_head.weight"),
+    ],
+)
+def test_weight_name_remap(name: str, expected: str) -> None:
+    assert remap_minimax_dspark_weight_name(name) == expected
+
+
+def test_mxfp8_dequantization_matches_per_block_reference() -> None:
+    torch.manual_seed(0)
+    out_features, in_features = 4, 96  # three 32-wide K blocks
+    # Build finite E4M3 codes directly: dividing bf16-range samples by block scales as small
+    # as 2**-13 would overflow E4M3 (max 448) into NaN and make the comparison meaningless.
+    quantized = (torch.randn(out_features, in_features) * 3).to(torch.float8_e4m3fn)
+    assert torch.isfinite(quantized.to(torch.float32)).all()
+    # UE8M0 exponents around 127 (2**0).
+    exponents = torch.randint(114, 131, (out_features, in_features // 32), dtype=torch.uint8)
+    scale = torch.exp2(exponents.to(torch.float32) - 127).repeat_interleave(32, dim=1)
+    expected = (quantized.to(torch.float32) * scale).to(torch.bfloat16)
+
+    got = dequantize_mxfp8_weight(quantized, exponents, torch.bfloat16)
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_prepare_weights_dequantizes_and_folds_gemma_norms() -> None:
+    prefix = "language_model.model.dspark."
+    quantized = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
+    scale = torch.full((2, 2), 128, dtype=torch.uint8)  # 2**1 per block
+    norm = torch.full((8,), 0.25, dtype=torch.bfloat16)
+    weights = {
+        prefix + "layers.0.decoder_layer.self_attn.k_proj.weight": quantized,
+        prefix + "layers.0.decoder_layer.self_attn.k_proj.weight_scale_inv": scale,
+        prefix + "layers.0.decoder_layer.self_attn.k_norm.weight": norm.clone(),
+        prefix + "layers.0.decoder_layer.input_layernorm.weight": norm.clone(),
+        prefix + "hidden_norm.weight": norm.clone(),
+        prefix + "final_norm.weight": norm.clone(),
+        prefix + "fc.weight": torch.zeros(8, 16, dtype=torch.bfloat16),
+        prefix + "markov_head.markov_w1.weight": norm.clone(),
+    }
+    out = prepare_minimax_dspark_weights(weights, torch.bfloat16)
+
+    assert set(out) == {
+        "layers.0.self_attn.k_proj.weight",
+        "layers.0.self_attn.k_norm.weight",
+        "layers.0.input_layernorm.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+        "fc.weight",
+        "markov_head.markov_w1.weight",
+    }
+    assert out["layers.0.self_attn.k_proj.weight"].dtype == torch.bfloat16
+    torch.testing.assert_close(
+        out["layers.0.self_attn.k_proj.weight"],
+        torch.full((2, 64), 2.0, dtype=torch.bfloat16),
+    )
+    for key in (
+        "layers.0.self_attn.k_norm.weight",
+        "layers.0.input_layernorm.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+    ):
+        torch.testing.assert_close(out[key], torch.full((8,), 1.25, dtype=torch.bfloat16))
+    # Head tensors are not norms and are passed through untouched.
+    torch.testing.assert_close(out["markov_head.markov_w1.weight"], norm)

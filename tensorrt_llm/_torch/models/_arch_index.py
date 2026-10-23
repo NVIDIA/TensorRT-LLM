@@ -43,6 +43,7 @@ MODEL_ARCH_TO_MODULE = {
     "Cohere2ForCausalLM": "modeling_cohere2",
     "Cosmos3ForConditionalGeneration": "modeling_cosmos3",
     "DeciLMForCausalLM": "modeling_nemotron_nas",
+    "DSparkMiniMaxDraftModel": "modeling_dspark",
     "DeepseekV32ForCausalLM": "modeling_deepseekv3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
     "DeepseekV41ForCausalLM": "modeling_deepseekv41",
