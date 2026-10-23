@@ -407,7 +407,9 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
                 first_frame.set()
 
         consumer = asyncio.create_task(consume())
-        await first_frame.wait()
+        # Bounded, so a stream that fails before its first frame fails the
+        # test instead of hanging it.
+        await asyncio.wait_for(first_frame.wait(), timeout=5.0)
         # The stream is now waiting on the generation for its next step.
         consumer.cancel()
         with pytest.raises(asyncio.CancelledError):
