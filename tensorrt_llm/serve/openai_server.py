@@ -43,6 +43,7 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
@@ -654,6 +655,19 @@ class OpenAIServer(_VideoRoutesMixin):
             thread_name_prefix="trtllm_media_load",
         )
         BaseMediaIO.set_executor(self._media_load_executor)
+        # /metrics reads iteration stats with a blocking call that waits up to
+        # 2 s. A dedicated thread keeps those waits off the default executor,
+        # which request handling also uses; get_iteration_stats runs at most
+        # one read on it at a time.
+        self._metrics_stats_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="trtllm_metrics_stats",
+        )
+        self._metrics_stats_read: Optional[asyncio.Future] = None
+        # Whether a scrape is awaiting the last read, and whether a scrape has
+        # returned its stats.
+        self._metrics_stats_read_waiting = False
+        self._metrics_stats_read_consumed = True
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -804,6 +818,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
+            # A stats read still in flight fails fast now that the executor is
+            # down; the /metrics handler already treats that as no stats.
+            self._metrics_stats_executor.shutdown(wait=False,
+                                                  cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.router.route_class = _MsgspecRoute
@@ -1755,6 +1773,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
+        # Without iteration stats the engine produces none, so there is
+        # nothing to wait for.
+        if not getattr(self.generator.args, "enable_iter_perf_stats", True):
+            return JSONResponse(content=[])
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
@@ -1767,9 +1790,43 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=stats)
 
         # Legacy path: no background collector -> read the queue directly.
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
+        # The read waits up to 2 s for stats inside a blocking executor call,
+        # so it runs on the metrics thread; on the event loop it would stall
+        # every response being streamed for as long as it waits.
+        # One read at a time: a scrape that arrives while a read is in flight
+        # returns no stats instead of queueing behind it, so scraping an idle
+        # server faster than one read per 2 s cannot build a backlog. A read
+        # drains the queue and hands everything to its own scrape, so when two
+        # scrapers poll at once, one of them regularly gets an empty list.
+        read = self._metrics_stats_read
+        if read is not None and (not read.done()
+                                 or self._metrics_stats_read_waiting):
+            # In flight, or finished with its scrape about to take the stats.
+            return JSONResponse(content=[])
+        if (read is None or self._metrics_stats_read_consumed
+                or read.cancelled()):
+            read = asyncio.get_running_loop().run_in_executor(
+                self._metrics_stats_executor, self.generator.get_stats, 2)
+            self._metrics_stats_read = read
+            self._metrics_stats_read_consumed = False
+        # Otherwise the last read finished after its scrape went away, and
+        # this scrape takes the stats it drained rather than losing them.
+        self._metrics_stats_read_waiting = True
+        try:
+            # Shielded so a scrape that goes away leaves the read running
+            # until its thread finishes, and its stats for the next scrape.
+            stats = await asyncio.shield(read)
+        except RPCError as e:
+            # The executor is unreachable, e.g. while it shuts down.
+            logger.debug(f"Failed to fetch iteration stats: {e}")
+            stats = []
+        except Exception:
+            # The read failed; the next scrape starts a new one.
+            self._metrics_stats_read_consumed = True
+            raise
+        finally:
+            self._metrics_stats_read_waiting = False
+        self._metrics_stats_read_consumed = True
         return JSONResponse(content=stats)
 
     async def get_energy_metrics(self) -> JSONResponse:
