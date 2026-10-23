@@ -4073,7 +4073,7 @@ def test_v2_gdn_ring_replay_update_advances_ring_start(monkeypatch):
     mgr.local_num_mamba_layers = 1
     mgr._request_id_to_state_index = {100: 0, 101: 1, 102: 2, 103: 3, 104: 4}
     mgr._request_id_to_is_dummy = {100: False, 101: False, 102: False, 103: True, 104: False}
-    mgr._dummy_request_mask = torch.zeros(5, dtype=torch.bool)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(5, dtype=torch.bool))
     mgr._dummy_request_mask_host = torch.zeros(5, dtype=torch.bool)
     mgr._use_replay_state_update = True
     mgr._use_gdn_flashinfer_ring_replay = True
@@ -4114,7 +4114,7 @@ def test_v2_gdn_ring_replay_update_advances_ring_start(monkeypatch):
 def test_v2_gdn_ring_replay_resets_context_slots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_replay_state_update = True
-    mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.tensor([2, 1], dtype=torch.int32))
     mgr.mamba_ssm_rand_seed = None
     mgr.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
     mgr.cache_buf_idx = torch.ones(3, dtype=torch.int32)
