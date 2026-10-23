@@ -17,7 +17,7 @@
 - A GPU bound at two levels: the class asks for more than any machine here
   has and the method for less, so a run that keeps the method read the
   closest marker only.
-- A memory demand at two levels: every catalogued machine has between 81 559
+- A memory demand at two levels: every catalogued machine has between 46 068
   and 284 208 MiB, so 1 000 never blocks and 1 000 000 always does.
 - Both GPU markers on one test, agreeing at 8 -- the shape at
   `tests/integration/defs/examples/test_deepseek_v4_pro.py:138,140` -- and

@@ -20,12 +20,14 @@
 
 A profile field holds what a run-time probe returns on that machine: `sm` for
 `get_sm_version()`, and `device_name`, `device_memory_mib`, `cpu_arch` likewise.
-`max_gpu_per_node` is read by no rule; it is the default ladder. A rule is keyed
-by a `skipif`'s `reason=`, and a reason with no rule keeps the test.
+`max_gpu_per_node` and `ladder` are read by no rule: `ladder` is the default
+`--ladder`, and `[max_gpu_per_node]` stands in for a profile without one. A rule
+is keyed by a `skipif`'s `reason=`, and a reason with no rule keeps the test.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import operator
 from collections.abc import Mapping
@@ -34,6 +36,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
+from .ladder import Ladder
 from .marks import CollectedTest, ResourceMarker, ResourceMarkers, default_markers
 
 
@@ -102,14 +105,34 @@ class MachineProfile:
     device_memory_mib: int
     max_gpu_per_node: int
     cpu_arch: str
+    # The allocation sizes the machine's fleet schedules by; None when it is held whole.
+    ladder: Optional[Tuple[int, ...]] = None
 
     @classmethod
     def from_mapping(cls, source: Path, name: str, values: object) -> MachineProfile:
-        """One catalogue entry, which must hold exactly the profile's fields."""
+        """One catalogue entry: the profile's fields, and an optional ladder ending at the node."""
+        where = f"{source}: profile {name!r}"
         try:
-            return cls(name=name, **values)
+            profile = cls(name=name, **values)
         except TypeError as error:
-            raise ProfileConfigError(f"{source}: profile {name!r}: {error}") from error
+            raise ProfileConfigError(f"{where}: {error}") from error
+        if profile.ladder is None:
+            return profile
+
+        try:
+            ladder = Ladder.of(profile.ladder)
+        except ValueError as error:
+            raise ProfileConfigError(f"{where}: ladder: {error}") from error
+        ProfileConfigError.check(
+            ladder.largest == profile.max_gpu_per_node,
+            f"{where}: ladder {ladder} must end at max_gpu_per_node {profile.max_gpu_per_node}",
+        )
+        return dataclasses.replace(profile, ladder=tuple(ladder))
+
+    @property
+    def default_ladder(self) -> Ladder:
+        """The ladder a run uses without `--ladder`: `ladder`, else one rung of the node."""
+        return Ladder.of(self.ladder or [self.max_gpu_per_node])
 
 
 class MachineCatalog(Mapping):

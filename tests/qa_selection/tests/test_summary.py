@@ -70,7 +70,7 @@ def test_counts_and_their_parts(selection):
 
 def test_one_rung_needs_no_breakdown(selection):
     """A one-rung ladder is already in the target line; nothing written, no `written` line."""
-    run = selection.run(DeviceCases.MODULE, "--machine=B200")
+    run = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=8")
 
     assert run.summary == [
         "target        B200, ladder 8",
