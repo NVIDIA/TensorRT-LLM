@@ -217,6 +217,9 @@ class GuidedDecoder:
         self.is_draft_terminated: List[bool] = [False] * self.max_num_sequences
 
         self.requests: Optional[GuidedRequests] = None
+        # (request_id, error_msg) of disagg gen requests whose grammar matcher
+        # failed to initialize; reported by the next build.
+        self.init_failed_requests: List[Tuple[int, str]] = []
 
         self.stream = torch.cuda.Stream()
         self.token_event = torch.cuda.Event()
@@ -239,7 +242,8 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
-        failed_requests = []
+        failed_requests = self.init_failed_requests
+        self.init_failed_requests = []
         self.token_mask_host[:requests.num_bitmask_tokens].fill_(0)
 
         for req, offset in requests.valid_requests_with_offsets():
@@ -481,12 +485,30 @@ class GuidedDecoder:
 
     def _init_disagg_gen_requests(self, requests: GuidedRequests) -> None:
         """Initialize the grammar matchers for disagg gen requests.
+
+        A request whose matcher cannot be created keeps no matcher and is
+        reported as failed by the next build, like a context request whose
+        matcher creation fails in build.
         """
+        self.init_failed_requests = []
         for req in requests.valid_requests():
-            if req.is_generation_only_first_iteration:
+            if not req.is_generation_only_first_iteration:
+                continue
+            slot = req.seq_slot
+            try:
                 self.grammar_matchers[
-                    req.seq_slot] = self.grammar_matcher_factory.create(
+                    slot] = self.grammar_matcher_factory.create(
                         req.guided_decoding_params)
+            except Exception as e:
+                self.grammar_matchers[slot] = None
+                # Keep the rollback passes away from the missing matcher.
+                self.num_advanced_tokens[slot] = 0
+                self.num_advanced_draft_tokens[slot] = 0
+                error_msg = f"Guided decoding error: {str(e)}"
+                self.init_failed_requests.append((req.request_id, error_msg))
+                logger.error(
+                    f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
+                )
 
     @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
     def init_disagg_gen_requests(self) -> None:
