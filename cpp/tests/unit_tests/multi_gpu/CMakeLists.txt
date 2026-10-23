@@ -37,8 +37,20 @@ target_include_directories(
 # Queries libnuma and get_mempolicy directly to see where pages landed.
 target_link_libraries(kvCacheManagerV2HostMemNumaTest PRIVATE numa)
 
-add_tllm_gtest(mpiUtilsTest SOURCES mpiUtilsTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
+add_tllm_gtest(
+  mpiUtilsTest
+  OWNER
+  runtime
+  SOURCES
+  mpiUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_distributed
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;host")
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(mpiUtilsTest PRIVATE ${NCCL_LIB})
+endif()
 add_tllm_gtest(userBufferTest SOURCES userBufferTest.cpp FULL_STACK LABELS
                "unit;full-stack")
 add_tllm_gtest(ncclUtilsTest SOURCES ncclUtilsTest.cpp FULL_STACK LABELS
