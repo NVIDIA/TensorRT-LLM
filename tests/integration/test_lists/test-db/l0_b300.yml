@@ -148,6 +148,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_bmm_out.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_nvfp4_gemm.py
+  - unittest/_torch/modeling_v2/graph/test_modeling_v2_eager_on_graph.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_block_scale_moe_runner.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py
