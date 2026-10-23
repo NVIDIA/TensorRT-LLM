@@ -327,6 +327,7 @@ def _capture_kimi_v2_manager_ctor(
     monkeypatch: pytest.MonkeyPatch,
     spec_config=None,
     model_engine=None,
+    kv_dtype: str = "auto",
 ) -> tuple[tuple, dict]:
     """Route a Kimi config through _create_kv_cache_manager with an explicit
     V2 manager and capture the constructor arguments."""
@@ -338,7 +339,13 @@ def _capture_kimi_v2_manager_ctor(
             captured["kwargs"] = kwargs
 
     model_config = _kimi_model_config()
-    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK if kv_dtype == "nvfp4" else 64
+    kv_cache_config = KvCacheConfig(
+        dtype=kv_dtype, tokens_per_block=tokens_per_block, use_kv_cache_manager_v2=True
+    )
+    if kv_dtype == "nvfp4":
+        model_config.quant_config = _fp4_kv_quant_config()
+        model_config.attn_backend = "TRTLLM"
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
@@ -349,7 +356,7 @@ def _capture_kimi_v2_manager_ctor(
         kv_cache_manager_cls=RecordingV2Manager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         kv_cache_config=kv_cache_config,
-        tokens_per_block=64,
+        tokens_per_block=tokens_per_block,
         max_seq_len=2048,
         max_batch_size=4,
         spec_config=spec_config,
@@ -459,8 +466,10 @@ def test_kimi_fp4_mla_manager_receives_model_config(monkeypatch: pytest.MonkeyPa
     assert kwargs["pretrained_config"].kv_lora_rank == 32
 
 
+@pytest.mark.parametrize("kv_dtype", ["auto", "nvfp4"])
 def test_kimi_explicit_v2_manager_enables_kda_replay(
     monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: str,
 ) -> None:
     spec_config = MTPDecodingConfig(max_draft_len=3)
     monkeypatch.setattr(
@@ -468,8 +477,12 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
         lambda: True,
     )
 
-    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
+    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config, kv_dtype=kv_dtype)
 
+    if kv_dtype == "nvfp4":
+        # The FP4 MLA layout must not cost KDA its fused-verify replay caches.
+        assert kwargs["dtype"] == DataType.NVFP4
+        assert kwargs["tokens_per_block"] == FP4_MLA_TOKENS_PER_BLOCK
     assert kwargs["kda_replay_num_spec"] == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
     assert "kda_draft_records" not in kwargs
