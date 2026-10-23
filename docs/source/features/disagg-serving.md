@@ -420,6 +420,8 @@ processes. Submission-to-completion measures backend residence, not necessarily
 on-wire service. CTX handoff-to-release starts at the final chunk's handoff and
 excludes earlier prefill KV retention. Executor timeouts and native blocking-wait
 deadlines are separate observations; neither proves that memory is reusable.
+Transceiver settlement records confirm session retirement, not physical resource
+drain; diagnostics do not add lifecycle polling to establish that stronger claim.
 
 Buffering is bounded; output is asynchronous and best-effort. Overflow, broken stdout, or
 process exit can lose records. The report exposes malformed, unmatched, and

@@ -27,8 +27,9 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
 import tensorrt_llm._torch.disaggregation.transceiver as python_transceiver_module
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation import diagnostics
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     Receiver,
@@ -646,7 +647,8 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     assert receive_start["transfer_bytes"] == 128
     assert receive_start["timeout_expected"] is False
     assert settlement["outcome"] == outcome
-    assert settlement["resources_drained"] is True
+    assert settlement["session_retired"] is True
+    assert "resources_drained" not in settlement
     assert request.state == request_state
     assert transceiver._recv_sessions == {}
     assert transceiver._recv_reqs == {}
@@ -837,15 +839,17 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
         assert call.kwargs["local_request_id"] == 41
         assert call.kwargs["request_id_scope"] == "process"
     assert emit_event.call_args_list[0].kwargs["capacity_tokens"] == 65
-    assert emit_event.call_args_list[-1].kwargs["resources_drained"] is True
+    assert emit_event.call_args_list[-1].kwargs["session_retired"] is True
 
 
+@pytest.mark.parametrize("enforce_physical_ownership", [False, True])
 @pytest.mark.parametrize(
     ("disagg_request_id", "ctx_request_id", "expected_id", "expected_scope"),
     [(7007, 7, 7007, "run"), (None, 7, 7, "process")],
 )
 def test_session_only_settlement_uses_session_identity_and_scope(
     monkeypatch: pytest.MonkeyPatch,
+    enforce_physical_ownership: bool,
     disagg_request_id: int | None,
     ctx_request_id: int,
     expected_id: int,
@@ -853,6 +857,8 @@ def test_session_only_settlement_uses_session_identity_and_scope(
 ) -> None:
     session = SimpleNamespace(
         disagg_request_id=expected_id,
+        _enforce_physical_ownership=enforce_physical_ownership,
+        resources_drained=Mock(side_effect=AssertionError("diagnostics polled physical drain")),
         _base_args=SimpleNamespace(
             params=DisaggregatedParams(
                 disagg_request_id=disagg_request_id, ctx_request_id=ctx_request_id
@@ -873,7 +879,9 @@ def test_session_only_settlement_uses_session_identity_and_scope(
     assert fields["request_id"] == expected_id
     assert fields["request_id_scope"] == expected_scope
     assert fields["local_request_id"] is None
-    assert fields["resources_drained"] is True
+    assert fields["session_retired"] is True
+    assert "resources_drained" not in fields
+    session.resources_drained.assert_not_called()
 
 
 def test_settlement_without_request_or_session_reports_unknown_identity_scope(
@@ -950,7 +958,8 @@ def test_cancel_diagnostics_do_not_poll_session_status(
         session.close.assert_called_once_with()
         settlement = emit.call_args_list[-1].kwargs
         assert settlement["outcome"] == "cancelled"
-        assert settlement["resources_drained"] is True
+        assert settlement["session_retired"] is True
+        assert "resources_drained" not in settlement
         assert not transceiver._send_sessions
         assert not transceiver._recv_sessions
         if side == "ctx":
