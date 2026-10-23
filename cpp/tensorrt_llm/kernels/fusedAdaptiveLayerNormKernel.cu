@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -107,7 +108,6 @@ __launch_bounds__(BLOCK_SIZE, 8)
 
     constexpr int ELEMS_PER_THREAD = D / BLOCK_SIZE;        // 40 for D=5120, BLOCK_SIZE=128
     constexpr int CHUNKS_PER_THREAD = ELEMS_PER_THREAD / 8; // 5
-    constexpr int NUM_WARPS = BLOCK_SIZE / 32;              // 4
     constexpr int SF_VEC_SIZE = 16;
     constexpr int SF_PER_ROW = D / SF_VEC_SIZE;             // 320
     constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / 8;     // 2
@@ -120,15 +120,11 @@ __launch_bounds__(BLOCK_SIZE, 8)
     constexpr bool USE_TMA = (D >= 4096);
 
     int const tid = threadIdx.x;
-    int const warpId = tid / 32;
-    int const laneId = tid % 32;
     int const row = blockIdx.x;
 
     int64_t const rowBase = static_cast<int64_t>(row) * D;
 
-    // Shared memory for cross-warp reductions and mean/rstd broadcast.
-    __shared__ float warpSums[NUM_WARPS];
-    __shared__ float warpSqSums[NUM_WARPS];
+    // Shared memory for the mean/rstd broadcast.
     __shared__ float meanRstd[2];
 
     // Static mbarrier for TMA (compiler elides on non-TMA paths).
@@ -286,54 +282,43 @@ __launch_bounds__(BLOCK_SIZE, 8)
         }
     }
 
-    // Phase 1: warp-reduce sum/sum-of-squares → mean and rstd (LayerNorm, not RMSNorm).
+    // Phase 1: mean and rstd (LayerNorm, not RMSNorm). The variance is reduced from the
+    // register-cached values centered on the mean: the one-pass E[x^2] - mean^2 form cancels
+    // catastrophically in FP32 when |mean| >> stddev and can go negative (NaN rstd).
+    constexpr float invD = 1.0f / static_cast<float>(D);
+
+    // Pass 1: mean.
     float localSum = 0.0f;
-    float localSqSum = 0.0f;
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i)
     {
         localSum += xVals[i];
-        localSqSum += xVals[i] * xVals[i];
     }
-
-    // Warp-level reduction.
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
+    // blockReduceSum leaves the total in warp 0 only; broadcast it through meanRstd.
+    localSum = tensorrt_llm::common::blockReduceSum(localSum);
+    if (tid == 0)
     {
-        localSum += __shfl_xor_sync(0xffffffff, localSum, offset);
-        localSqSum += __shfl_xor_sync(0xffffffff, localSqSum, offset);
-    }
-
-    if (laneId == 0)
-    {
-        warpSums[warpId] = localSum;
-        warpSqSums[warpId] = localSqSum;
-    }
-    __syncthreads();
-
-    // Cross-warp reduction in warp 0.
-    if (warpId == 0)
-    {
-        float s = (laneId < NUM_WARPS) ? warpSums[laneId] : 0.0f;
-        float s2 = (laneId < NUM_WARPS) ? warpSqSums[laneId] : 0.0f;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-        {
-            s += __shfl_xor_sync(0xffffffff, s, offset);
-            s2 += __shfl_xor_sync(0xffffffff, s2, offset);
-        }
-        if (laneId == 0)
-        {
-            float const invD = 1.0f / static_cast<float>(D);
-            float const mean = s * invD;
-            float const var = s2 * invD - mean * mean;
-            meanRstd[0] = mean;
-            meanRstd[1] = rsqrtf(var + p.eps);
-        }
+        meanRstd[0] = localSum * invD;
     }
     __syncthreads();
 
     float const mean = meanRstd[0];
+
+    // Pass 2: centered sum of squares → rstd.
+    float localSqSum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+    {
+        float const centered = xVals[i] - mean;
+        localSqSum += centered * centered;
+    }
+    localSqSum = tensorrt_llm::common::blockReduceSum(localSqSum);
+    if (tid == 0)
+    {
+        meanRstd[1] = rsqrtf(localSqSum * invD + p.eps);
+    }
+    __syncthreads();
+
     float const rstd = meanRstd[1];
 
     // Pre-read sf_scale scalar (HAS_QUANT only).
