@@ -423,6 +423,11 @@ class MLA(nn.Module):
             if self.mapping.has_cp_helix() and self.sparse_attn_hooks is None
             else self.num_heads_tp
         )
+        if self.num_context_heads != self.num_heads_tp and config.attn_backend.upper() != "TRTLLM":
+            raise NotImplementedError(
+                "Dense MLA with Helix context parallelism requires the TRTLLM attention backend; "
+                f"got {config.attn_backend}."
+            )
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size - 1) // tp_size
 
         if rms_norm_eps is None:
