@@ -2474,15 +2474,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
-<<<<<<< HEAD
         assert self._fmha_manager is not None
-=======
         # Sparse prediction has read the unquantized inputs; FMHA support checks
         # see the quantized ones.
         forward_args.sage_quantized = self._quantize_sage_inputs(
             q, k, v, metadata, forward_args)
 
->>>>>>> origin/main
         # On a ragged generation step the attention op is handed
         # one row per query token so its `num_tokens % num_seqs == 0` check
         # passes with seq_len == 1. Keep the presentation scoped around both

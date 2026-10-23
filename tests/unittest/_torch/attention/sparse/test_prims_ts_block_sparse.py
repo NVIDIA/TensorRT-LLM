@@ -36,11 +36,8 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
 )
-<<<<<<< HEAD
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-=======
 from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized
->>>>>>> origin/main
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
 

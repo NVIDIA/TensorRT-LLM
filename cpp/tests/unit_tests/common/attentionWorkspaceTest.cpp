@@ -86,12 +86,8 @@ TEST(AttentionWorkspaceManagerTest, ContextLayoutMatchesAttentionOpOrdering)
     sizes.sageQScale = 101;
     sizes.sageKScale = 103;
     sizes.sageVScale = 107;
-<<<<<<< HEAD
-=======
     sizes.sageKMean = 109;
     sizes.sageKMeanSum = 113;
-    sizes.cpWorkspace = 137;
->>>>>>> origin/main
 
     auto const layout = tcop::AttentionWorkspaceManager::buildContextLayout(sizes);
 
@@ -121,12 +117,8 @@ TEST(AttentionWorkspaceManagerTest, ContextLayoutMatchesAttentionOpOrdering)
     expectNextSlice("sageQScale", layout.sageQScale, sizes.sageQScale, expectedOffset);
     expectNextSlice("sageKScale", layout.sageKScale, sizes.sageKScale, expectedOffset);
     expectNextSlice("sageVScale", layout.sageVScale, sizes.sageVScale, expectedOffset);
-<<<<<<< HEAD
-=======
     expectNextSlice("sageKMean", layout.sageKMean, sizes.sageKMean, expectedOffset);
     expectNextSlice("sageKMeanSum", layout.sageKMeanSum, sizes.sageKMeanSum, expectedOffset);
-    expectNextSlice("cpWorkspace", layout.cpWorkspace, sizes.cpWorkspace, expectedOffset);
->>>>>>> origin/main
     EXPECT_EQ(layout.totalSize, expectedOffset);
 }
 

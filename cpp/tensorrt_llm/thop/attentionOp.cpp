@@ -939,6 +939,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(FmhaParams const& p, int32_t max_
     size_t const sage_k_sfs_buffer_size = sizeof(float) * mNumAttnKVHeads * static_cast<size_t>(k_max_n_blk);
     size_t const sage_v_sfs_buffer_size = sizeof(float) * static_cast<size_t>(v_max_n_blk);
     size_t const sage_k_mean_buffer_size = mCfg.sage_attn_smooth_k ? sizeof(float) * local_hidden_units_kv : 0;
+    size_t const sage_k_mean_sum_buffer_size = mCfg.sage_attn_smooth_k ? sizeof(int64_t) * local_hidden_units_kv : 0;
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_length;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * cross_kv_length;
@@ -976,6 +977,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(FmhaParams const& p, int32_t max_
     workspaceSizes.sageKScale = sage_k_sfs_buffer_size;
     workspaceSizes.sageVScale = sage_v_sfs_buffer_size;
     workspaceSizes.sageKMean = sage_k_mean_buffer_size;
+    workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     context_workspace_size = AttentionWorkspaceManager::buildContextLayout(workspaceSizes).totalSize;
 
@@ -1645,6 +1647,7 @@ int AttentionOp::enqueueContext(FmhaParams const& p, MlaParams<T>* mlaParam, cud
     size_t const sage_k_sfs_buffer_size = sizeof(float) * mNumAttnKVHeads * static_cast<size_t>(k_max_n_blk);
     size_t const sage_v_sfs_buffer_size = sizeof(float) * static_cast<size_t>(v_max_n_blk);
     size_t const sage_k_mean_buffer_size = mCfg.sage_attn_smooth_k ? sizeof(float) * local_hidden_units_kv : 0;
+    size_t const sage_k_mean_sum_buffer_size = mCfg.sage_attn_smooth_k ? sizeof(int64_t) * local_hidden_units_kv : 0;
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * p.num_seqs * p.input_seq_length;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * p.num_seqs * p.cross_kv_length;
@@ -1684,6 +1687,7 @@ int AttentionOp::enqueueContext(FmhaParams const& p, MlaParams<T>* mlaParam, cud
     workspaceSizes.sageKScale = sage_k_sfs_buffer_size;
     workspaceSizes.sageVScale = sage_v_sfs_buffer_size;
     workspaceSizes.sageKMean = sage_k_mean_buffer_size;
+    workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     auto const workspaceLayout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
     auto const workspaceViews = AttentionWorkspaceManager::materializeContext<T>(p.getWorkspace(), workspaceLayout);
@@ -1953,17 +1957,13 @@ int AttentionOp::enqueueContext(FmhaParams const& p, MlaParams<T>* mlaParam, cud
             // A zero stride means no quantizer kernel supports this block size.
             TLLM_CHECK_WITH_INFO(q_max_n_blk > 0 && k_max_n_blk > 0,
                 "No SageQuant kernel on sm_%d for block sizes (q, k, v) = (%d, %d, %d) with qk_int8=%s. SM90 "
-                "requires (2, 16, 1) together with INT8 Q/K; SM100 requires q/k block sizes of 1, 4 or 16.",
+                "requires (2, 16, 1) together with INT8 Q/K; other architectures require q/k block sizes of 1, 4, 16, "
+                "or 32.",
                 mSM, static_cast<int>(mCfg.sage_attn_num_elts_per_blk_q),
                 static_cast<int>(mCfg.sage_attn_num_elts_per_blk_k),
                 static_cast<int>(mCfg.sage_attn_num_elts_per_blk_v), mCfg.sage_attn_qk_int8 ? "true" : "false");
             TLLM_CHECK_WITH_INFO(!p.fwd.kv_scale_quant_orig,
                 "SageAttention disregards the configured p.fwd.kv_scale_quant_orig, invalidating the result.");
-            check_cuda_error(cudaMemsetAsync(workspaceViews.sageVScale, 0, sage_v_sfs_buffer_size, stream));
-            if (mCfg.sage_attn_smooth_k)
-            {
-                check_cuda_error(cudaMemsetAsync(workspaceViews.sageKMean, 0, sage_k_mean_buffer_size, stream));
-            }
 
             // Common p for sageQuant
             tc::SageQuantParams sageQuantParams{};
@@ -1978,6 +1978,7 @@ int AttentionOp::enqueueContext(FmhaParams const& p, MlaParams<T>* mlaParam, cud
             sageQuantParams.ptrVQuant = workspaceViews.fp8VBuf;
             sageQuantParams.ptrVScale = workspaceViews.sageVScale;
             sageQuantParams.ptrKForMean = p.getK<T>();
+            sageQuantParams.ptrKMeanSum = workspaceViews.sageKMeanSum;
             sageQuantParams.ptrKMean = workspaceViews.sageKMean;
             sageQuantParams.smCount = mMultiProcessorCount;
             sageQuantParams.stream = stream;
