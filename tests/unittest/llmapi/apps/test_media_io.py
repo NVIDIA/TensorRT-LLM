@@ -23,6 +23,15 @@ async def test_media_metrics_separate_download_decode_and_queue(media_cls, mime,
     media = media_cls()
     observer = MagicMock()
     token = _input_processing_observer.set(observer)
+    now = [1.0]
+
+    async def open_session():
+        now[0] += 5.0
+
+    async def download(*args, **kwargs):
+        now[0] += 2.0
+        return b"data"
+
     url, method = {
         "http": ("http://example.test/media", "load_bytes"),
         "data": (f"data:{mime};base64,AA==", "load_base64"),
@@ -33,11 +42,15 @@ async def test_media_metrics_separate_download_decode_and_queue(media_cls, mime,
             with (
                 patch.object(BaseMediaIO, "_executor", pool),
                 patch.object(media_cls, method, return_value="decoded"),
-                patch("tensorrt_llm.inputs.media_io._get_aiohttp_session", new_callable=AsyncMock),
+                patch(
+                    "tensorrt_llm.metrics.perf_utils.time.perf_counter", side_effect=lambda: now[0]
+                ),
+                patch(
+                    "tensorrt_llm.inputs.media_io._get_aiohttp_session", side_effect=open_session
+                ),
                 patch(
                     "tensorrt_llm.inputs.media_io._safe_aiohttp_get",
-                    new_callable=AsyncMock,
-                    return_value=b"data",
+                    side_effect=download,
                 ),
             ):
                 assert await media.async_load(url) == "decoded"
@@ -49,6 +62,8 @@ async def test_media_metrics_separate_download_decode_and_queue(media_cls, mime,
         "decode",
     ]
     assert all(seconds >= 0 and modality == mime.split("/")[0] for _, seconds, modality in samples)
+    if scheme == "http":
+        assert samples[0][1] == 2.0
 
 
 @pytest.mark.asyncio
