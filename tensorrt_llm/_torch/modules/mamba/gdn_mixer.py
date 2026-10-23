@@ -774,6 +774,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and not is_target_verify
             and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
         )
+        deterministic_prefill = (
+            not is_target_verify
+            and ssm_states.dtype == torch.float32
+            and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+        )
 
         conv_states_to_use = conv_states
 
@@ -835,6 +840,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     activation=self.activation,
                     conv_state_indices=state_indices_d,
                 )
+            if deterministic_prefill:
+                output_p = output[:, :num_prefill_tokens] if output is not None else None
+                prefill_out = self._recurrent_update(
+                    mixed_qkv_p_t.transpose(0, 1).contiguous(),
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    ssm_states,
+                    state_indices_p,
+                    _prefill_query_start_loc(query_start_loc_long, num_prefill),
+                    output_p,
+                )
+                output_d = output[:, num_prefill_tokens:] if output is not None else None
+                decode_out = self._recurrent_update(
+                    mixed_qkv_d,
+                    a[num_prefill_tokens:],
+                    b[num_prefill_tokens:],
+                    ssm_states,
+                    state_indices_d,
+                    query_start_loc_long[num_prefill:] - num_prefill_tokens,
+                    output_d,
+                )
+                return output if output is not None else torch.cat((prefill_out, decode_out), dim=1)
             if is_target_verify:
                 if num_prefill_tokens > 0:
                     query_p, key_p, value_p, g_p, beta_p = fused_gdn_post_conv(
@@ -887,6 +914,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
+            if deterministic_prefill:
+                # Keep Q/K normalization and state recurrence in FP32 with
+                # the same arithmetic at every prefill/decode boundary.
+                return self._recurrent_update(
+                    mixed_qkv_t.transpose(0, 1).contiguous(),
+                    a,
+                    b,
+                    ssm_states,
+                    cache_indices,
+                    query_start_loc_long,
+                    output,
+                )
             query, key, value, g, beta = fused_gdn_post_conv(
                 mixed_qkv_t,
                 None,

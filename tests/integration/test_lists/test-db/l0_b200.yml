@@ -33,6 +33,9 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/test_deterministic_linear.py
+  - unittest/_torch/models/test_qwen3_next_gate_determinism.py
+  - unittest/_torch/models/test_deepseek_gate_determinism.py
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[False]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[True]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_block_reuse_is_disabled_for_v2
@@ -130,6 +133,8 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
+  - unittest/llmapi/test_prefill_decode_consistency_gpu.py
+  - unittest/llmapi/test_prefill_decode_cache_consistency.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_multi_stream_utils.py
@@ -198,6 +203,8 @@ l0_b200:
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_bf16_deterministic_tactic_independent_of_token_count
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_runner_cache_preserves_finalize_policy
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain

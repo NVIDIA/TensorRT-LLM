@@ -34,6 +34,50 @@ The TRT-LLM backend, `TrtllmAttention`, serves as the default backend and suppor
 1. **Fused QKV Input**: It can accept a single QKV tensor as input, which is more efficient compared to using separate Q, K, and V tensors.
 2. **FP8 Output**: It supports outputting the attention result in FP8 format, fusing quantization into the attention computation process.
 
+## Deterministic prefill and generation arithmetic
+
+For BF16 causal self-attention on SM100/SM103, set
+`FORCE_ATTENTION_KERNEL_DETERMINISTIC=1` before constructing the engine to use
+the `deterministic` FMHA library. It uses the same FP32 reduction for each query
+in context and generation, independent of the number of queries or unrelated
+requests in the batch. It reuses the ordinary paged-KV preprocessing, RoPE and
+cache updates. The library participates in the default FMHA selection order;
+an explicit `TLLM_FMHA_LIBS` list must include `deterministic` to select it.
+
+This implementation supports BF16 Q/K/V and KV cache, head dimensions 64, 128
+and 256, 32- or 64-token KV pages, at most 32 query heads per KV head,
+a full causal attention window, and beam width 1.
+
+`FORCE_DETERMINISTIC=1` also selects this attention library. In the PyTorch
+backend it additionally uses a fixed K reduction for unquantized BF16 linear
+layers, including local tensor-parallel shards, and for `Qwen3NextGate` and
+`DeepseekV3Gate` router projections. The DeepSeek V3 gate, also used by
+Nemotron-H, retains FP32 router output. BF16 CUTLASS MoE on
+SM100/SM103 uses a common fallback GEMM tactic across token counts and disables
+fused finalize. This keeps the expert GEMM and activation arithmetic identical
+when an autotuning cache contains different tactics for prefill and decode.
+
+With `allreduce_strategy="NCCL"`, BF16, FP16 and FP32 tensor-parallel reductions
+gather rank contributions and add them in rank order using FP32 accumulators.
+Unquantized RMS normalization and residual RMS normalization use a fixed
+per-row reduction as well. The gather needs a temporary buffer with one input
+copy per rank and increases communication volume. Quantized fused epilogues
+and other collective strategies retain their existing implementations.
+
+GDN and Mamba2 use shared recurrent prefill/decode arithmetic with FP32 SSM
+state. Set `kv_cache_config.mamba_ssm_cache_dtype="float32"` to use those paths.
+Mamba2 also uses the same causal convolution implementation in both phases.
+Lower precision SSM state and speculative decoding retain their existing
+implementations. The attention-only flag does not change GEMM or recurrent
+arithmetic, so it cannot by itself make an entire model's logits invariant.
+
+The fixed reductions trade throughput for reproducibility, particularly for
+long prefills. Benchmark the intended sequence lengths before enabling them
+in a serving configuration. These paths do not establish whole-model
+equivalence for other quantized expert GEMMs, collective strategies outside the
+supported NCCL paths or recurrent architectures beyond GDN and Mamba2. Compare the same
+token sequence when checking prefill and generation logprobs.
+
 ## Implement a New Attention Backend
 
 You can implement a new attention backend to integrate other attention libraries.

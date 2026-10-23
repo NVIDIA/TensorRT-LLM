@@ -149,7 +149,7 @@ class MoERunner(TunableRunner):
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
                         use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                        use_mxfp8_weight_scaling)
+                        use_mxfp8_weight_scaling, use_fused_finalize)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
@@ -288,6 +288,14 @@ def fused_moe(
     token_to_slot: Optional[torch.Tensor] = None,
     swiglu_clamp_after_silu: bool = False,
 ) -> List[torch.Tensor]:
+    fixed_bf16_arithmetic = (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+                             and input.dtype == torch.bfloat16
+                             and fc1_expert_weights.dtype == torch.bfloat16
+                             and fc2_expert_weights.dtype == torch.bfloat16
+                             and get_sm_version() in (100, 103))
+    if fixed_bf16_arithmetic:
+        use_fused_finalize = False
+
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -326,27 +334,32 @@ def fused_moe(
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
 
-    _, gemm_tactic_1 = tuner.choose_one(
-        "trtllm::fused_moe::gemm1",
-        [moe_runner],
-        MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
-        gemm_idx=1,
-    )
+    if fixed_bf16_arithmetic:
+        # The same GEMM/activation arithmetic must apply to every token count,
+        # including shapes absent from the autotuning cache.
+        gemm_tactic_1 = gemm_tactic_2 = -1
+    else:
+        _, gemm_tactic_1 = tuner.choose_one(
+            "trtllm::fused_moe::gemm1",
+            [moe_runner],
+            MoERunner.tuning_config,
+            [
+                tuner_input, fc1_expert_weights, fc1_expert_biases,
+                fc2_expert_weights, fc2_expert_biases
+            ],
+            gemm_idx=1,
+        )
 
-    _, gemm_tactic_2 = tuner.choose_one(
-        "trtllm::fused_moe::gemm2",
-        [moe_runner],
-        MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
-        gemm_idx=2,
-    )
+        _, gemm_tactic_2 = tuner.choose_one(
+            "trtllm::fused_moe::gemm2",
+            [moe_runner],
+            MoERunner.tuning_config,
+            [
+                tuner_input, fc1_expert_weights, fc1_expert_biases,
+                fc2_expert_weights, fc2_expert_biases
+            ],
+            gemm_idx=2,
+        )
 
     gemm_tactic_1 = moe_runner._resolve_fallback_tactic(gemm_tactic_1, 1)
     gemm_tactic_2 = moe_runner._resolve_fallback_tactic(gemm_tactic_2, 2)

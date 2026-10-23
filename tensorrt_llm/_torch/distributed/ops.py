@@ -1208,6 +1208,29 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        if (os.getenv("FORCE_DETERMINISTIC") == "1"
+                and allreduce_strategy == AllReduceStrategy.NCCL
+                and all_reduce_params.fusion_op
+                in (AllReduceFusionOp.NONE, AllReduceFusionOp.RMS_NORM,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM) and input.is_cuda and
+                input.dtype in (torch.bfloat16, torch.float16, torch.float32)):
+            from .deterministic import (rms_norm_after_allreduce,
+                                        sum_rank_ordered)
+
+            gathered = allgather(input.reshape(1, -1), self.mapping, dim=0)
+            output = sum_rank_ordered(gathered).view(input.shape)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+                return output
+            residual = (all_reduce_params.residual
+                        if all_reduce_params.fusion_op
+                        == AllReduceFusionOp.RESIDUAL_RMS_NORM else None)
+            norm_output, residual_output = rms_norm_after_allreduce(
+                output, residual, all_reduce_params.norm_weight,
+                all_reduce_params.bias, all_reduce_params.eps)
+            return (norm_output if all_reduce_params.fusion_op
+                    == AllReduceFusionOp.RMS_NORM else
+                    (norm_output, residual_output))
+
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:

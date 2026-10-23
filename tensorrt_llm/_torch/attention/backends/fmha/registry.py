@@ -17,6 +17,7 @@ import os
 from typing import TypeAlias
 
 from .cute_dsl_mla import CuteDslMlaFmha
+from .deterministic import DeterministicFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
@@ -51,6 +52,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "prims_ts": PrimsTSFmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
+        "deterministic": DeterministicFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }

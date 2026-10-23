@@ -911,6 +911,16 @@ class DeepseekV3Gate(Linear):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+                and self._locality_domain_weight_shards is None
+                and hidden_states.dtype == torch.bfloat16
+                and self.weight.dtype == torch.bfloat16):
+            from ..modules.deterministic_linear import deterministic_linear
+
+            return deterministic_linear(hidden_states,
+                                        self.weight,
+                                        output_dtype=torch.float32)
+
         if self._locality_domain_weight_shards is not None:
             logits = self._run_bf16_linear_locality_domain(
                 hidden_states, None, output_dtype=torch.float32)

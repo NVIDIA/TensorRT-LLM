@@ -174,6 +174,14 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+                and hidden_states.dtype == torch.bfloat16
+                and self.weight.dtype == torch.bfloat16
+                and self.out_dtype == torch.bfloat16):
+            from ..modules.deterministic_linear import deterministic_linear
+
+            return deterministic_linear(hidden_states, self.weight)
+
         # The low-M kernels return the input dtype, so cublas_mm below still
         # owns any out_dtype promotion.
         if _should_apply_low_m_gemm(

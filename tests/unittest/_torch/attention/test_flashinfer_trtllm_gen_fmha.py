@@ -35,6 +35,41 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 
+@pytest.mark.parametrize("sm", [100, 103])
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        ({}, True),
+        ({"FORCE_DETERMINISTIC": "1"}, False),
+        ({"FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1"}, False),
+        ({"FORCE_DETERMINISTIC": "1", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0"}, False),
+        ({"FORCE_DETERMINISTIC": "0", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1"}, False),
+        ({"FORCE_DETERMINISTIC": "0", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0"}, True),
+        ({"FORCE_MOE_KERNEL_DETERMINISTIC": "1"}, True),
+    ],
+)
+def test_deterministic_attention_uses_supported_fmha(
+    monkeypatch: pytest.MonkeyPatch, sm: int, env: dict[str, str], expected: bool
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
+
+    for name in (
+        "FORCE_DETERMINISTIC",
+        "FORCE_ATTENTION_KERNEL_DETERMINISTIC",
+        "FORCE_MOE_KERNEL_DETERMINISTIC",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(flashinfer_trtllm_gen, "IS_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(flashinfer_trtllm_gen, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(FlashInferTrtllmGenFmha, "_missing_fused_nanobind_ops", lambda: [])
+    attn = FakeAttention()
+    attn.sparse_params = None
+
+    assert FlashInferTrtllmGenFmha.is_available(attn) is expected
+
+
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
     attn = FakeAttention()
     attn.quant_mode = int(QuantMode.from_description(use_fp8_kv_cache=True))

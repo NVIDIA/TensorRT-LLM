@@ -573,6 +573,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     BF16 GEMM dispatch (priority order, Blackwell SM100/SM103 and SM107)
     -------------------------------------------------------------------
+    ``FORCE_DETERMINISTIC=1`` selects a fixed K reduction first for BF16
+    inputs and local weight shards. The following are the ordinary fast paths.
+
     1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
        CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
        Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
@@ -616,6 +619,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        if (os.getenv("FORCE_DETERMINISTIC") == "1" and input.is_cuda
+                and input.dtype == torch.bfloat16
+                and module.weight.dtype == torch.bfloat16):
+            from .deterministic_linear import deterministic_linear
+
+            return deterministic_linear(input, module.weight, bias)
+
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output

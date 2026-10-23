@@ -4526,3 +4526,102 @@ def test_unresolvable_layer_error_carries_rejection_details():
     )
     with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
         impl_class_for(report)
+
+
+def _make_bf16_policy_runner(use_fused_finalize):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    return MoERunner(
+        x_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        top_k=8,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        cluster_size=1,
+        cluster_rank=0,
+        use_deepseek_fp8_block_scale=False,
+        use_w4_group_scaling=False,
+        use_int8_woq_per_channel=False,
+        use_mxfp8_act_scaling=False,
+        min_latency_mode=False,
+        use_fused_finalize=use_fused_finalize,
+        activation_type=ActivationType.Swiglu,
+    )
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Relu2])
+@pytest.mark.parametrize("top_k", [1, 8])
+def test_cutlass_bf16_deterministic_tactic_independent_of_token_count(
+    monkeypatch, activation, top_k
+):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("Fixed BF16 MoE arithmetic is supported on SM100/SM103")
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    monkeypatch.setattr(MoERunner, "runner_dict", {})
+    torch.manual_seed(17)
+    experts, hidden, intermediate, tokens = 16, 2048, 512, 65
+    fc1_rows = intermediate * (2 if activation == ActivationType.Swiglu else 1)
+    w1 = (torch.randn(experts, fc1_rows, hidden, device="cuda") * 0.02).bfloat16()
+    w2 = (torch.randn(experts, hidden, intermediate, device="cuda") * 0.02).bfloat16()
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.argsort(torch.randn(tokens, experts, device="cuda"), dim=1)
+    ids = ids[:, :top_k].int().contiguous()
+    scales = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    def cached_tactic(self, name, runners, config, inputs, *, gemm_idx):
+        # A warmed prefill shape and a decode cache miss can pick different
+        # valid GEMM/activation implementations. Keep the arithmetic real.
+        runner = runners[0]
+        tactic = runner.fused_moe_runner.get_tactic_num(gemm_idx) - 1
+        return runner, -1 if inputs[0].shape[0] == 1 else tactic
+
+    monkeypatch.setattr(AutoTuner, "choose_one", cached_tactic)
+
+    def run(n):
+        return torch.ops.trtllm.fused_moe(
+            x[:n],
+            ids[:n],
+            scales[:n],
+            w1,
+            None,
+            w2,
+            None,
+            torch.bfloat16,
+            quant_scales=[],
+            use_fused_finalize=False,
+            activation_type=int(activation),
+        )[0]
+
+    single = run(1)
+    for n in (7, tokens):
+        torch.testing.assert_close(run(n)[:1], single, atol=0, rtol=0)
+
+    # Replay must consume new inputs, including new expert assignments.
+    run(tokens)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(tokens)
+    x.add_(0.125)
+    ids.copy_(ids.roll(1, dims=0))
+    graph.replay()
+    torch.testing.assert_close(captured, run(tokens), atol=0, rtol=0)
+    torch.testing.assert_close(captured[:1], run(1), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("first_fused", [False, True])
+def test_cutlass_runner_cache_preserves_finalize_policy(monkeypatch, first_fused):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("The BF16 fused finalize tactic family requires Blackwell")
+    monkeypatch.setattr(MoERunner, "runner_dict", {})
+    first = _make_bf16_policy_runner(first_fused)
+    second = _make_bf16_policy_runner(not first_fused)
+    fused, unfused = (first, second) if first_fused else (second, first)
+    assert fused.fused_moe_runner.get_tactic_num(2) > unfused.fused_moe_runner.get_tactic_num(2)
