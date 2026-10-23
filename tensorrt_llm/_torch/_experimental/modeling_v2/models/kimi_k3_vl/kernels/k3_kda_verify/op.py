@@ -31,8 +31,9 @@ from typing import Dict, Optional
 
 import torch
 
+from ._pool_layout import replay_pools_supported, slots_view
+
 K = 128
-CONV_W = 4
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
@@ -59,13 +60,6 @@ def _flat(t: torch.Tensor) -> torch.Tensor:
     if swapped.is_contiguous():
         return swapped.reshape(-1)
     raise ValueError(f"expected a dense tensor, got shape {tuple(t.shape)} strides {t.stride()}")
-
-
-def _slots_view(t: torch.Tensor) -> torch.Tensor:
-    """A [slots, slot elements] view of a pool whose slots are dense but may be strided (the Mamba cache manager
-    coalesces each slot's per-layer states), never a copy. The kernels address it flat from the first slot at 64-bit
-    offsets; the view keeps every extent within the DSL's 32-bit sizes however far the last slot lies."""
-    return t.view(t.shape[0], -1)
 
 
 def _words(t: torch.Tensor) -> torch.Tensor:
@@ -103,14 +97,6 @@ def k3_kda_verify(
     eps: float,
     g_ext: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Gated-norm KDA core output [T, H, V] bf16 for T = N * (1 + num_spec) verify tokens.
-
-    ``proj`` bf16 [T, 4 H K + K + H + pad]: the fused projection rows [q | k | v | onorm gate | f_a | b | pad];
-    ``w_fb`` bf16 [H K, K], the f_b weight (out, in); ``w_q/w_k/w_v`` fp32 [H K, 4]; ``a_log`` fp32 [H];
-    ``dt_bias`` fp32 [H K]; ``onorm_w`` fp32 [V]; ``cs_*`` fp32 [pool, H K, 3 + num_spec] (dim-contiguous);
-    ``ssm`` fp32 [pool, H, V, K] (each slot dense, slots at any stride); ``state_tok`` fp32
-    [pool, 3, num_spec, H, K], the drafts' records (vn, beta * k, decay); ``slots`` int32 [N]; ``pending`` int32
-    [pool]. With ``g_ext`` (bf16 [T, H K], the unfused f_b output) the gate is read instead of computed from f_a."""
     import cuda.bindings.driver as cuda_driver
 
     from . import k3_kda_verify_kernel as kernel
@@ -131,21 +117,15 @@ def k3_kda_verify(
         or not w_fb.is_contiguous()
         or v_dim != K
         or tuple(ssm.shape[1:]) != (num_heads, K, K)
-        or tuple(state_tok.shape[1:]) != (3, num_spec, num_heads, K)
+        or not replay_pools_supported(cs_q, cs_k, cs_v, state_tok, pending, num_heads, num_spec)
         or ssm.stride()[1:] != (K * K, K, 1)
         or ssm.dtype != torch.float32
-        or not state_tok.is_contiguous()
-        or state_tok.dtype != torch.float32
-        or cs_q.shape[-1] != CONV_W - 1 + num_spec
         or slots.dtype != torch.int32
         or pending.dtype != torch.int32
-        or any(
-            t.dtype != torch.float32
-            for t in (w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v)
-        )
+        or any(t.dtype != torch.float32 for t in (w_q, w_k, w_v, a_log, dt_bias, onorm_w))
     ):
         raise ValueError(
-            f"k3_kda_verify: unsupported call (w_q/w_k/w_v/a_log/dt_bias/onorm_w/cs_* must be fp32: "
+            f"k3_kda_verify: unsupported call (weights must be fp32; conv caches bf16/fp32 with dense channels: "
             f"{[str(t.dtype) for t in (w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v)]}) "
             f"proj {tuple(proj.shape)} {proj.dtype} contiguous {proj.is_contiguous()}, "
             f"w_fb {tuple(w_fb.shape)} {w_fb.dtype} contiguous {w_fb.is_contiguous()}, onorm_w {tuple(onorm_w.shape)}, "
@@ -165,19 +145,38 @@ def k3_kda_verify(
         _arg(_flat(a_log)),
         _arg(_flat(dt_bias)),
         _arg(_flat(onorm_w)),
-        _arg(_flat(cs_q)),
-        _arg(_flat(cs_k)),
-        _arg(_flat(cs_v)),
-        _arg(_slots_view(ssm)),
-        _arg(_slots_view(state_tok)),
+        _arg(slots_view(cs_q.transpose(1, 2)), align=4 * cs_q.element_size()),
+        _arg(slots_view(cs_k.transpose(1, 2)), align=4 * cs_k.element_size()),
+        _arg(slots_view(cs_v.transpose(1, 2)), align=4 * cs_v.element_size()),
+        _arg(slots_view(ssm)),
+        _arg(slots_view(state_tok)),
         _index_arg(slots),
-        _index_arg(pending),
+        _index_arg(pending.unsqueeze(-1)),
         _arg(_flat(out)),
     )
-    runtime = (proj.shape[1] // 2, n_req, ssm.stride(0))
+    runtime = (
+        proj.shape[1] // 2,
+        n_req,
+        ssm.stride(0),
+        cs_q.stride(0),
+        cs_k.stride(0),
+        cs_v.stride(0),
+        state_tok.stride(0),
+        pending.stride(0),
+    )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
     pdl = use_pdl()
-    key = (num_heads, num_spec, float(lower_bound), float(scale), float(eps), fold_fb, pdl)
+    conv_bf16 = cs_q.dtype == torch.bfloat16
+    key = (
+        num_heads,
+        num_spec,
+        float(lower_bound),
+        float(scale),
+        float(eps),
+        fold_fb,
+        conv_bf16,
+        pdl,
+    )
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -192,7 +191,7 @@ def k3_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, pdl, stream,
+                    float(eps), fold_fb, conv_bf16, pdl, stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
     return out

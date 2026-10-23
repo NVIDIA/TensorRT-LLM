@@ -76,16 +76,6 @@ class K3KdaAttn(OpWrapper):
     Shared, per-layer, alternating and decode/verify-interleaved sets give
     identical bits; captured rounds replay identically to eager rounds.
 
-    Pools are separate, cache-manager-owned: with the V2 hybrid manager's
-    KDA replay caches and kda_draft_records, mamba_layer_cache(l).kda_conv_q/k/v
-    are cs_* fp32 [pool, 768, 3+num_spec], channel-contiguous;
-    get_ssm_states(l) is fp32 [pool, 6, 128, 128], V rows, contiguous K,
-    manager-coalesced slot stride; kda_state_tok is contiguous fp32
-    [pool, 3, num_spec, 6, 128]. A launch writes only that layer's slot.
-    pending is prev_num_accepted_tokens, one int32 record shared by every
-    layer and written by sampler acceptance between steps. It selects both
-    accepted-draft replay and the next conv window's starting column.
-
     Head CTAs read slots, pending, state, records and conv windows before
     their grid-dependency wait. Metadata must be written before graph replay,
     not by a kernel of the same step ahead of this launch. No concurrent
@@ -98,18 +88,6 @@ class K3KdaAttn(OpWrapper):
     history. Swapping rounds silently changes that history (sm_100 output
     and state relative differences 1.00 and 1.01); one call cannot detect order.
 
-    At least 128 resident SMs are needed for all 32 clusters: consumers spin
-    without timeout waiting for producer clusters. Compilation checks the
-    device's SM count and rejects fewer than 128, but MPS/green-context limits
-    must also leave 128 SMs. The kernel rejects unsupported x/w/w_fb,
-    num_spec, state/record layouts, conv width, dtypes, metadata counts,
-    non-dense conv caches and buffer sizes before launch. Tensor addresses
-    are 16-byte aligned except element-aligned slots/pending; the DSL checks
-    alignment. First use of each lower_bound/scale/eps/PDL configuration
-    compiles outside graph capture; capture raises RuntimeError. PDL reads
-    TRTLLM_ENABLE_PDL, default on, each call. slots/pending may start at any
-    element offset (0..3 certified). Pool addressing is 64-bit, including
-    pools beyond 2 GiB, covered by test_k3_kda_pools_past_2g.py.
 
     qkvg alone accepts T<=8: the pre-call epoch selects the published p1/part
     rows, and its consumer rounds the two K-half sums to bf16. Against a
@@ -254,7 +232,7 @@ class K3KdaAttn(OpWrapper):
                 assert cache.stride(-2) == 1, "conv caches must be channel-contiguous"
         for cache in (cs_k, cs_v):
             assert cache.shape[-1] == 3 + num_spec, "conv caches must cover every replay column"
-        assert pending.ndim == 1 and pending.is_contiguous(), "pending must be a contiguous vector"
+        assert pending.ndim == 1 and pending.stride(0) > 0, "pending must be a strided vector"
         slot = int(slots.item())
         pool_size = min(
             ssm.shape[0],

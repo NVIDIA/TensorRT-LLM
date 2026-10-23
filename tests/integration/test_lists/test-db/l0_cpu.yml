@@ -12,15 +12,6 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
-  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_resolution
-  - unittest/_torch/moe/test_moe_impl.py::test_b12x_lora_rejection_is_build_independent
-  - unittest/_torch/moe/test_moe_impl.py::test_b12x_cutlass_prefill_routing
-  - unittest/_torch/moe/test_moe_impl.py::test_b12x_cutlass_build_mode_resolution
-  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_dynamic_scale_resolution
-  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_validation
-  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_selection
-  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_probe
-  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_fingerprint
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -57,6 +48,7 @@ l0_cpu:
   # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
   - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
   - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_kda_pool_layout.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -72,16 +64,27 @@ l0_cpu:
   - unittest/_torch/modeling
   # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
   # compute capability, no device. The default targets' shard tests: small CPU
-  # tensors and the CPU block_scale_interleave. The rest of
-  # unittest/_torch/modeling_v2 needs a GPU.
+  # tensors and the CPU block_scale_interleave. The qwen4_exp entries are the target's
+  # tests that run on the source text, stubbed weights and meta tensors: its multimodal
+  # splice and admission check on a stub tower, the KV pool contract, its KV storage
+  # derivation and attention-call arguments, its routed-expert scalars and its weight table.
+  # The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py::test_k3_workspace_threshold_is_inclusive_and_two_shot_pads
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_multimodal_embeds.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_moe_scalars.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_validate_request.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_pool_contract.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_kv_quant.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_thop_attention_calls.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_weight_table.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler

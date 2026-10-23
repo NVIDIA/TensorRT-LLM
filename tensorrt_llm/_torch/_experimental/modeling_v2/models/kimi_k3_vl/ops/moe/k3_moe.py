@@ -187,8 +187,6 @@ class K3Moe(OpWrapper):
     public. out writes its first M rows, returns empty [0,3584], and leaves
     trailing rows untouched.
 
-    The fixed grouping gives deterministic bits; changing M or the build
-    can change FC2 combine slices by at most one bf16 ulp in the tests.
     Tests retain stock-runner gates, zero-local cases, re-arm checks,
     dip/regrow sequences, interleaved states, six graph replays with eager
     calls between them, head epoch wraps and stale-weight negative controls.

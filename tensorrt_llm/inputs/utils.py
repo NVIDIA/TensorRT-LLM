@@ -644,11 +644,15 @@ def resolve_hf_chat_template(
             return templates[chat_template]
         return chat_template
 
-    # 2. If tool is not provided, use the processor's default chat template
-    if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
+    # 2. Without tools, prefer the processor's chat template when it has one.
+    #    A processor without one (some keep the template on their tokenizer
+    #    only) falls through to the tokenizer below.
+    if not tools and processor:
+        processor_template = getattr(processor, "chat_template", None)
+        if processor_template is not None:
+            return processor_template
 
-    # 3. If tool is provided, use the tool
+    # 3. Use the tokenizer's chat template, which accounts for the tools
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:

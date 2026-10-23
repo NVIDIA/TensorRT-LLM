@@ -583,6 +583,14 @@ def k3_moe(
         raise ValueError(
             "k3_moe: c / cs / part / counters are not this build's scratch and layer counters"
         )
+    if mod.WIDE and num_tokens <= MAX_TOKENS:
+        config = _config(i_tp, num_ctas, num_local, MAX_TOKENS, use_pdl, False)
+        mod = _kernel_module(config)
+        g_cap = mod.G_CAP
+        c = c[:g_cap]
+        cs = cs[:g_cap]
+        part = part[: _part_rows(mod)]
+        counters = counters[: mod.NUM_STATE]
     if head and (
         head_ready.dtype != torch.int32
         or head_ready.numel() < 2 * MAX_TOKENS

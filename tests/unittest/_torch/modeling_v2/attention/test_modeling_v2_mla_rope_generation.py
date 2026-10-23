@@ -589,7 +589,8 @@ def _run_and_check_bf16(
     assert seq_lens[num_contexts:] == [1] * num_gen
     num_heads = env.num_heads
     for rid in gen_ids:
-        env.kv_cache_manager.impl.add_token(rid)
+        cache = env.kv_cache_manager.kv_cache_map[rid]
+        assert cache.resize(cache.capacity + 1)
     metadata = env.prepare_metadata(request_ids, seq_lens, num_contexts, cached_lens)
     kv_lens = [c + s for c, s in zip(cached_lens, seq_lens)]
     positions = _positions(kv_lens, num_contexts, num_gen, 1)

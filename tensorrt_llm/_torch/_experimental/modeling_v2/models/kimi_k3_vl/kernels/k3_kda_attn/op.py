@@ -166,7 +166,8 @@ def k3_kda_attn(
     stream: a kernel that waits (or a non-PDL one) in between, as the model's other layers are."""
     import cuda.bindings.driver as cuda_driver
 
-    from ..k3_kda_verify.op import _flat, _slots_view
+    from ..k3_kda_verify._pool_layout import replay_pools_supported, slots_view
+    from ..k3_kda_verify.op import _flat
     from . import k3_kda_attn_kernel as kernel
 
     if (
@@ -181,10 +182,8 @@ def k3_kda_attn(
         or not w_fb.is_contiguous()
         or num_spec != NT - 1
         or tuple(ssm.shape[1:]) != (6, 128, 128)
-        or tuple(state_tok.shape[1:]) != (3, num_spec, 6, 128)
+        or not replay_pools_supported(cs_q, cs_k, cs_v, state_tok, pending, 6, num_spec)
         or ssm.stride()[1:] != (128 * 128, 128, 1)
-        or not state_tok.is_contiguous()
-        or cs_q.shape[-1] != 3 + num_spec
         or slots.numel() != 1
         or slots.dtype != torch.int32
         or pending.dtype != torch.int32
@@ -193,10 +192,7 @@ def k3_kda_attn(
         or epoch.numel() != FUSED_CTAS
         or ssm.dtype != torch.float32
         or state_tok.dtype != torch.float32
-        or any(
-            t.dtype != torch.float32
-            for t in (w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v)
-        )
+        or any(t.dtype != torch.float32 for t in (w_q, w_k, w_v, a_log, dt_bias, onorm_w))
     ):
         raise ValueError(
             f"k3_kda_attn: unsupported call x {tuple(x.shape)} {x.dtype}, w {tuple(w.shape)}, "
@@ -208,13 +204,26 @@ def k3_kda_attn(
     args = (
         _arg(w), _arg(x), _arg(w_fb), _arg(p1.view(-1)), _arg(p1.view(torch.int32)), _arg(part.view(-1)),
         _arg(epoch.view(-1)), _arg(_flat(w_q)), _arg(_flat(w_k)), _arg(_flat(w_v)), _arg(_flat(a_log)),
-        _arg(_flat(dt_bias)), _arg(_flat(onorm_w)), _arg(_flat(cs_q)), _arg(_flat(cs_k)), _arg(_flat(cs_v)),
-        _arg(_slots_view(ssm)), _arg(_slots_view(state_tok)), _index_arg(slots), _index_arg(pending),
+        _arg(_flat(dt_bias)), _arg(_flat(onorm_w)),
+        _arg(slots_view(cs_q.transpose(1, 2)), align=4 * cs_q.element_size()),
+        _arg(slots_view(cs_k.transpose(1, 2)), align=4 * cs_k.element_size()),
+        _arg(slots_view(cs_v.transpose(1, 2)), align=4 * cs_v.element_size()),
+        _arg(slots_view(ssm)), _arg(slots_view(state_tok)), _index_arg(slots),
+        _index_arg(pending.unsqueeze(-1)),
         _arg(_flat(out)),
     )  # fmt: skip
+    runtime = (
+        ssm.stride(0),
+        cs_q.stride(0),
+        cs_k.stride(0),
+        cs_v.stride(0),
+        state_tok.stride(0),
+        pending.stride(0),
+    )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     pdl = use_pdl()
-    key = ("attn", float(lower_bound), float(scale), float(eps), pdl)
+    conv_bf16 = cs_q.dtype == torch.bfloat16
+    key = ("attn", float(lower_bound), float(scale), float(eps), conv_bf16, pdl)
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -236,10 +245,10 @@ def k3_kda_attn(
             fn = _compiled.get(key)
             if fn is None:
                 fn = _compiled[key] = cute.compile(
-                    kernel.k3_kda_attn, *args, ssm.stride(0), float(lower_bound), float(scale), float(eps), pdl,
-                    stream,
+                    kernel.k3_kda_attn, *args, *runtime, float(lower_bound), float(scale), float(eps),
+                    conv_bf16, pdl, stream,
                 )  # fmt: skip
-    fn(*args, ssm.stride(0), stream)
+    fn(*args, *runtime, stream)
     return out
 
 
@@ -286,7 +295,8 @@ def k3_kda_decode_attn(
     non-PDL one) in between, as the model's other layers are."""
     import cuda.bindings.driver as cuda_driver
 
-    from ..k3_kda_verify.op import _flat, _slots_view
+    from ..k3_kda_verify._pool_layout import slots_view
+    from ..k3_kda_verify.op import _flat
     from . import k3_kda_decode_kernel as kernel
 
     n_req = x.shape[0] if x.dim() == 2 else 0
@@ -331,7 +341,7 @@ def k3_kda_decode_attn(
     args = (
         _arg(w), _arg(x), _arg(w_fb), _arg(p1.view(-1)), _arg(p1.view(torch.int32)), _arg(part.view(-1)),
         _arg(epoch.view(-1)), _arg(_flat(w_q)), _arg(_flat(w_k)), _arg(_flat(w_v)), _arg(_flat(a_log)),
-        _arg(_flat(dt_bias)), _arg(_flat(onorm_w)), _arg(_slots_view(conv)), _arg(_slots_view(ssm)),
+        _arg(_flat(dt_bias)), _arg(_flat(onorm_w)), _arg(slots_view(conv)), _arg(slots_view(ssm)),
         _index_arg(slots), _arg(_flat(out)),
     )  # fmt: skip
     runtime = (n_req, ssm.stride(0), conv.stride(0))

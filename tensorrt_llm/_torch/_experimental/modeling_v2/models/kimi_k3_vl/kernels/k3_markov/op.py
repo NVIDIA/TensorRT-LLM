@@ -129,9 +129,11 @@ def markov_workspace(mapping, push_copies: int = 1) -> dict:
         with torch.inference_mode():
             uc.fill_(kern.EMPTY_WORD)
             flags = torch.zeros(kern.FLAG_WORDS, dtype=torch.int32, device=uc.device)
+            no_rewind = torch.empty(1, dtype=torch.int32, device=uc.device)
         torch.cuda.synchronize()
-        ws = dict(handle=handle, comm=comm, uc=uc, mc=mc, flags=flags, rank=mapping.tp_rank, world=world,
-                  slots=slots, push_copies=push_copies, buf_words=buf_words)  # fmt: skip
+        ws = dict(handle=handle, comm=comm, uc=uc, mc=mc, flags=flags, no_rewind=no_rewind,
+                  rank=mapping.tp_rank, world=world, slots=slots, push_copies=push_copies,
+                  buf_words=buf_words)  # fmt: skip
     except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
         error = exc
     # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has armed it.
@@ -147,7 +149,9 @@ def _arg(t: torch.Tensor, align: int = 16):
     return from_dlpack(t.detach(), assumed_align=align).mark_layout_dynamic(leading_dim=0)
 
 
-@torch.library.custom_op("trtllm::k3_markov", mutates_args=("kv_lens",))
+@torch.library.custom_op(
+    "trtllm::k3_markov", mutates_args=("ws_uc", "ws_mc", "ws_flags", "kv_lens")
+)
 def k3_markov(
     base: torch.Tensor,
     first_prev: torch.Tensor,
@@ -299,8 +303,7 @@ def markov_chain(
     KV-length rewind (see ``k3_markov``)."""
     ws = markov_workspace(mapping, push_copies)
     if kv_lens is None or rewind is None:
-        # No rewind: an empty rewind leaves the kernel's kv_lens argument (the flags words) untouched.
-        kv_lens, rewind = ws["flags"], ws["flags"][:0]
+        kv_lens, rewind = ws["no_rewind"], ws["flags"][:0]
     return torch.ops.trtllm.k3_markov(
         base, first_prev, markov_w1, markov_w2_shard, int(shard_offset), ws["uc"], ws["mc"], ws["flags"],
         ws["rank"], ws["slots"], ws["push_copies"], ws["buf_words"], accepted, num_accepted, accepted_rows, kv_lens,

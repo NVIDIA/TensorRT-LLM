@@ -37,10 +37,15 @@ exists to catch.
 
 The decision is one function, `route`, in the family's `routing.py`. It reads
 the facts that fix which code runs -- the checkpoint's config shape, the
-parallel mapping, the GPU's compute capability and the speculative-decoding
-config -- and either returns a target class or raises `NoTarget` with the
-reason in words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
-settings are not routing inputs: they do not change which code runs, so a
+parallel mapping, the GPU's compute capability, the speculative-decoding
+config, the KV cache algorithm the engine will run with, and the engine choices
+it derives from the `ModelConfig` and the LLM arguments it is also given
+(qwen4_exp: MoE backend, recurrent-state cache dtype, prefill CUDA graph
+backend) -- and either returns a target class or raises `NoTarget` with the
+reason in words. A target declines what its
+constructor would refuse, so that `auto` falls back instead of failing mid-build.
+Tuning knobs such as `max_batch_size`, `max_num_tokens` and the CUDA graph
+bucket lists are not routing inputs: they do not change which code runs, so a
 target claims a configuration regardless of them. `require` therefore promises
 that the target ran, not that a particular knob setting was measured. The model
 loader decides when it is about to build the model, after the built-in model's
@@ -68,7 +73,8 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
                     models/<x>/routing.py     +-- route(config, mapping, compute_capability,
-                                              |         spec_config, kv_cache_quant_algo)
+                                              |         spec_config, kv_cache_quant_algo,
+                                              |         model_config, llm_args)
                                               |         -> target class, or NoTarget
                                         |
                                      config.modeling_v2_target = class
@@ -172,6 +178,22 @@ and `tests/unittest/_torch/kernels/kimi_k3/` trees so CI selectors do not change
 Claims discovery covers both family-owned and target-owned entries, and import
 isolation rejects sibling-target and unrelated-family dependencies.
 
+The Markov chain declares its Lamport buffers, rotation flags and optional
+KV-length rewind as mutable custom-op inputs. Its no-rewind call uses a
+separate cached length buffer, allocated before CUDA-graph capture.
+
+Model-owned native fake implementations register with the standard native-op
+initialization, without importing a target. KDA verify consumes the cache
+manager's bf16 convolution pools and independent per-slot strides directly;
+standalone fp32 convolution pools remain supported. Pool views are never
+copied or cast on the call path.
+
+MLA launch admission queries the launch stream's owning context resources,
+including converted green contexts, without querying stream execution during
+graph capture. Invalid resources still reject the launch. Wide MoE states use
+the canonical decode build for up to eight tokens, sharing their preallocated
+scratch through prefix views; larger steps retain the wide build.
+
 
 The collectives' rank bodies sit in the tests tree with everything else
 that only tests run. Both halves are started by file path -- the launcher must
@@ -184,6 +206,15 @@ independent cases. CI runs them at 4 ranks on one node. A stateful entry's
 launcher also takes `--world-size N --launcher srun`, which runs the same
 body as one of N ranks started across nodes: that is how its multi-node
 receipt is recorded.
+
+Stateful matrices compare ordered per-tensor SHA-256 fingerprints of raw
+bytes together with shape and dtype across ranks. The large KDA-pool tests
+check free CUDA memory before allocating their full pools, including 1 GiB
+of headroom for weights, small reference pools and compilation.
+
+Routing and claims tests run on the CPU list; GPU lists exclude their
+`cpu_only` marker. KDA post-convolution cells exercise both channel-major and
+transposed token-major inputs accepted by the shared kernel.
 
 Identity is the directory name, and it carries all three segments:
 `gpt_oss_120b__sm_10x__default`. They were three nested directories once, which

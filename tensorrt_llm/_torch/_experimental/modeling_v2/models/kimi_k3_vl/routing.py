@@ -14,11 +14,15 @@ targets are text-only: they load no vision tower and refuse image input.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The one GPU architecture these targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target. The K3
@@ -95,6 +99,8 @@ def route(
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
     kv_cache_quant_algo: Optional[Any],
+    model_config: Optional[ModelConfig] = None,
+    llm_args: Optional[TorchLlmArgs] = None,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 

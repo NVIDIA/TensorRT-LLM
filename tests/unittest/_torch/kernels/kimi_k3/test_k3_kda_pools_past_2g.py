@@ -46,6 +46,11 @@ SLOTS = 3122
 SSM_LAYERS = 8
 CONV_LAYERS = 100
 TWO_G = 2**31
+SSM_POOL_BYTES = SLOTS * SSM_LAYERS * H * V * K * 4
+DECODE_POOL_BYTES = SSM_POOL_BYTES + SLOTS * CONV_LAYERS * 3 * HK * (W - 1) * 2
+VERIFY_POOL_BYTES = SSM_POOL_BYTES + SLOTS * (
+    3 * (W - 1 + NUM_SPEC) * HK * 4 + 3 * NUM_SPEC * H * K * 4 + 4
+)
 
 
 def _sm100() -> bool:
@@ -53,6 +58,16 @@ def _sm100() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not _sm100(), reason="needs SM100 (tcgen05, TMA, clusters)")
+
+
+def _require_pool_memory(pool_bytes: int) -> None:
+    required_bytes = pool_bytes + (1 << 30)
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes:
+        pytest.skip(
+            f"large KDA pools need {required_bytes / 1024**3:.1f} GiB free CUDA memory; "
+            f"{free_bytes / 1024**3:.1f} GiB available"
+        )
 
 
 def _ops():
@@ -134,6 +149,7 @@ def check_slots(p: dict, small: dict, used: list, names: tuple) -> None:
 
 
 def test_decode_attn():
+    _require_pool_memory(DECODE_POOL_BYTES)
     op = _ops()
     with torch.inference_mode():
         wt = make_weights(1)
@@ -166,6 +182,7 @@ def test_decode_attn():
 
 
 def test_attn():
+    _require_pool_memory(VERIFY_POOL_BYTES)
     op = _ops()
     with torch.inference_mode():
         wt = make_weights(3)
@@ -193,6 +210,7 @@ def test_attn():
 
 
 def test_verify():
+    _require_pool_memory(VERIFY_POOL_BYTES)
     _ops()
     with torch.inference_mode():
         wt = make_weights(6)

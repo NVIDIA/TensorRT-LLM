@@ -171,6 +171,18 @@ def _store8(dst, words, idx):
     )  # fmt: skip
 
 
+def _load_conv4(cache, idx, CONV_BF16: cutlass.Constexpr[bool]):
+    values = cache.load(idx=idx, vector_size=4, alignment=8 if CONV_BF16 else 16)
+    return tuple(cutlass.Float32(values[i]) for i in range(4))
+
+
+def _store_conv(cache, value, idx, CONV_BF16: cutlass.Constexpr[bool]):
+    if cutlass.const_expr(CONV_BF16):
+        cache.store(cutlass.BFloat16(value), idx=idx)
+    else:
+        cache.store(value, idx=idx)
+
+
 def _qk_pre(tk, lane, s_uq, s_wq, s_uk, s_wk, s_q, s_k, scale):
     """q and k of verify token ``tk`` from the conv history in shared memory: conv4 + SiLU, then the L2 norm (q also
     scaled), lane l keys 32 i + l (the arithmetic of kda_mtp_decode's pre-compute warps). Traced inline: its Python
@@ -226,7 +238,7 @@ def k3_kda_verify_kernel(
     a_log: cutlass.Array,  # fp32 [H]
     dt_bias: cutlass.Array,  # fp32 [H * K]
     onorm_w: cutlass.Array,  # fp32 [V]
-    cs_q: cutlass.Array,  # fp32 [pool][S][H * K]: raw conv inputs, column s = position s - 2 from the golden token
+    cs_q: cutlass.Array,
     cs_k: cutlass.Array,
     cs_v: cutlass.Array,
     ssm: cutlass.Array,  # fp32 [pool][H][V][K] at slot stride ssm_stride: the state after the last golden token
@@ -236,12 +248,18 @@ def k3_kda_verify_kernel(
     out: cutlass.Array,  # bf16 [T][H][V]
     proj_words: cutlass.Int32,
     ssm_stride: cutlass.Int64,  # fp32 elements between the pool's slots (the manager interleaves conv states)
+    cs_q_stride: cutlass.Int64,
+    cs_k_stride: cutlass.Int64,
+    cs_v_stride: cutlass.Int64,
+    state_tok_stride: cutlass.Int64,
+    pending_stride: cutlass.Int64,
     H: cutlass.Constexpr[int],
     NUM_SPEC: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     FOLD_FB: cutlass.Constexpr[bool],
+    CONV_BF16: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
@@ -346,7 +364,7 @@ def k3_kda_verify_kernel(
                 )
 
     slot = slots.load(idx=n)
-    pend = pending.load(idx=slot)
+    pend = pending.load(idx=cutlass.Int64(slot) * pending_stride)
     pend = cutlass.Int32(
         cutlass.select_(pend > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend)
     )
@@ -360,10 +378,9 @@ def k3_kda_verify_kernel(
     CT_VN = 0
     CT_WB = NUM_SPEC * H * V
     CT_WD = CT_WB + NUM_SPEC * H * K
-    CT_SLOT = CT_WD + NUM_SPEC * H * K  # a slot's records
     # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
     pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
-    tok = state_tok.subview(cutlass.Int64(slot) * CT_SLOT)
+    tok = state_tok.subview(cutlass.Int64(slot) * state_tok_stride)
     st_base = (h * V + row_a) * K
     for r in cutlass.range_constexpr(ROWS):
         for i in cutlass.range_constexpr(VEC):
@@ -403,18 +420,35 @@ def k3_kda_verify_kernel(
     if tidx < QH:
         m_q = tidx // (K // 4)
         c4_q = (tidx % (K // 4)) * 4
-        s_uq.store(cs_q.load(idx=(slot * S + pend + m_q) * HK + ch0 + c4_q, vector_size=4, alignment=16),
-                   idx=m_q * K + c4_q, alignment=16)  # fmt: skip
+        s_uq.store(
+            _load_conv4(
+                cs_q, cutlass.Int64(slot) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q, CONV_BF16
+            ),
+            idx=m_q * K + c4_q,
+            alignment=16,
+        )
     elif tidx < 2 * QH:
         m_k = (tidx - QH) // (K // 4)
         c4_k = ((tidx - QH) % (K // 4)) * 4
-        s_uk.store(cs_k.load(idx=(slot * S + pend + m_k) * HK + ch0 + c4_k, vector_size=4, alignment=16),
-                   idx=m_k * K + c4_k, alignment=16)  # fmt: skip
+        s_uk.store(
+            _load_conv4(
+                cs_k, cutlass.Int64(slot) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k, CONV_BF16
+            ),
+            idx=m_k * K + c4_k,
+            alignment=16,
+        )
     elif tidx < 2 * QH + VH:
         m_v = (tidx - 2 * QH) // (V_CTA // 4)
         c4_v = ((tidx - 2 * QH) % (V_CTA // 4)) * 4
-        s_uv.store(cs_v.load(idx=(slot * S + pend + m_v) * HK + ch0 + v0 + c4_v, vector_size=4, alignment=16),
-                   idx=m_v * V_CTA + c4_v, alignment=16)  # fmt: skip
+        s_uv.store(
+            _load_conv4(
+                cs_v,
+                cutlass.Int64(slot) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v,
+                CONV_BF16,
+            ),
+            idx=m_v * V_CTA + c4_v,
+            alignment=16,
+        )
     elif tidx < 2 * QH + VH + V_CTA:
         cv_w = tidx - (2 * QH + VH)
         wv4 = w_v.load(idx=(ch0 + v0 + cv_w) * CONV_W, vector_size=CONV_W, alignment=16)
@@ -751,19 +785,31 @@ def k3_kda_verify_kernel(
     if vs == 0:
         if tidx < K:
             for s in cutlass.range_constexpr(S):
-                cs_q.store(s_uq.load(idx=(s + 1) * K + tidx), idx=(slot * S + s) * HK + ch0 + tidx)
+                _store_conv(
+                    cs_q,
+                    s_uq.load(idx=(s + 1) * K + tidx),
+                    cutlass.Int64(slot) * cs_q_stride + s * HK + ch0 + tidx,
+                    CONV_BF16,
+                )
         else:
             ck_c = tidx - K
             for s in cutlass.range_constexpr(S):
-                cs_k.store(s_uk.load(idx=(s + 1) * K + ck_c), idx=(slot * S + s) * HK + ch0 + ck_c)
+                _store_conv(
+                    cs_k,
+                    s_uk.load(idx=(s + 1) * K + ck_c),
+                    cutlass.Int64(slot) * cs_k_stride + s * HK + ch0 + ck_c,
+                    CONV_BF16,
+                )
     for it in cutlass.range_constexpr((S * V_CTA + THREADS - 1) // THREADS):
         item = tidx + it * THREADS
         if item < S * V_CTA:
             s_col = item // V_CTA
             v_col = item % V_CTA
-            cs_v.store(
+            _store_conv(
+                cs_v,
                 s_uv.load(idx=(s_col + 1) * V_CTA + v_col),
-                idx=(slot * S + s_col) * HK + ch0 + v0 + v_col,
+                cutlass.Int64(slot) * cs_v_stride + s_col * HK + ch0 + v0 + v_col,
+                CONV_BF16,
             )
 
 
@@ -789,12 +835,18 @@ def k3_kda_verify(
     proj_words: cutlass.Int32,
     n_req: cutlass.Int32,
     ssm_stride: cutlass.Int64,
+    cs_q_stride: cutlass.Int64,
+    cs_k_stride: cutlass.Int64,
+    cs_v_stride: cutlass.Int64,
+    state_tok_stride: cutlass.Int64,
+    pending_stride: cutlass.Int64,
     H: cutlass.Constexpr[int],
     NUM_SPEC: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     FOLD_FB: cutlass.Constexpr[bool],
+    CONV_BF16: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -821,7 +873,8 @@ def k3_kda_verify(
     )
     k3_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots,
-        pending, out, proj_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB, USE_PDL,
+        pending, out, proj_words, ssm_stride, cs_q_stride, cs_k_stride, cs_v_stride, state_tok_stride,
+        pending_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB, CONV_BF16, USE_PDL,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip

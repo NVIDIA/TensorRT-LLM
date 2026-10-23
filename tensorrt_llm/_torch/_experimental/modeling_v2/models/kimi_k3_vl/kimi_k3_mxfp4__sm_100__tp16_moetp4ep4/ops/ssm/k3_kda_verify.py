@@ -51,18 +51,6 @@ class K3KdaVerify(OpWrapper):
     kda_mtp_decode on the same gate and accepted-draft records. The grid is
     (H, N, 8), with each CTA owning 16 V rows.
 
-    No buffer persists in the op. The cache manager owns all pools: with KDA
-    replay caches and kda_draft_records, mamba_layer_cache(l).kda_conv_q/k/v
-    are fp32 [pool, H K, 3 + num_spec], channel-contiguous; get_ssm_states(l)
-    is fp32 [pool, H, K, K], V rows and contiguous K, with manager-coalesced
-    slot strides; kda_state_tok is contiguous fp32 [pool, 3, num_spec, H, K].
-    A launch writes only the named slots of that layer. prev_num_accepted_tokens
-    is pending: one int32 record shared by every layer, written by the sampler
-    between rounds. One call per layer per round, in round order, replays the
-    accepted drafts from the previous golden state and records, then commits
-    the new golden state, draft records (vn, beta k, decay), and raw conv inputs
-    at positions -2..num_spec. The next window begins at pending[slot].
-
     slots and pending, the initial state and the conv window are read before
     the grid-dependency wait. Metadata must be written before a CUDA graph
     runs, never by a kernel of the same step ahead of this launch. Dependents
@@ -74,9 +62,6 @@ class K3KdaVerify(OpWrapper):
 
     First use of each H, num_spec, lower_bound, scale, eps, g_ext mode and PDL
     configuration compiles outside graph capture; capture raises RuntimeError.
-    PDL follows TRTLLM_ENABLE_PDL, default on, at each call. The kernel rejects
-    unsupported projection, f_b, state/record shapes, fp32 and int32 dtypes,
-    non-dense conv caches and noncontiguous projection/records before launch.
     slots and pending may start at any element offset (0..3 are certified).
     Pool offsets are 64-bit, including pools beyond 2 GiB, covered by
     test_k3_kda_pools_past_2g.py. Repeated schedules and graph replays are
@@ -246,7 +231,7 @@ class K3KdaVerify(OpWrapper):
         for cache in (cs_k, cs_v):
             assert cache.shape[-1] == 3 + num_spec, "conv caches must cover every replay column"
         assert slots.ndim == 1 and slots.is_contiguous(), "slots must be a contiguous vector"
-        assert pending.ndim == 1 and pending.is_contiguous(), "pending must be a contiguous vector"
+        assert pending.ndim == 1 and pending.stride(0) > 0, "pending must be a strided vector"
         indices = slots.long()
         assert indices.unique().numel() == indices.numel(), "a call must name each slot once"
         pool_size = min(

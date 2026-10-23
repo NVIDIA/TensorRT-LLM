@@ -89,18 +89,6 @@ class K3MlaAttnVbOut(OpWrapper):
     clusters launch in multiple waves. Both modes merge the same values in
     the same order, and request rows match their single-request calls.
 
-    Admission uses the actual launch stream's SM resource, never the physical
-    device count. CUDA 13.0 without cuStreamGetDevResource uses cuStreamGetCtx
-    then cuCtxGetDevResource on the converted context. Query failures,
-    invalid resource types and unknown counts raise before launch; there is
-    no device-wide fallback or stream-pointer capacity cache. Cluster mode
-    refuses green-context streams because SM counts do not establish cluster
-    feasibility. Co-residency bounds and compile-cache mode keys are unchanged.
-    CPU admission tests cover binding/resource decisions, not restricted-stream
-    numerical/progress/capture qualification or host-query overhead, which
-    remain pending. Historical receipts do not qualify this admission path;
-    graph replay must remain in its qualified resource domain.
-
     K3MlaAttnWorkspace is caller-owned, one per device and head-group count
     (heads/6: one at TP16, four at TP4), shared by all MLA layers of that shape.
     This call only reads the KV manager's pool. The workspace is one fp16

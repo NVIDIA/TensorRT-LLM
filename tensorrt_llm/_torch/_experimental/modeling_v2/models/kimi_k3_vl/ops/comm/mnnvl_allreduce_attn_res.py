@@ -13,12 +13,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from .mnnvl_workspace import MnnvlWorkspace
 
 
-@torch.library.register_fake("trtllm::mnnvl_allreduce_attn_res")
-def _(input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
-      comm_buffer, buffer_flags):  # fmt: skip
-    return [torch.empty_like(input), torch.empty_like(input)]
-
-
 class MnnvlAllreduceAttnRes(OpWrapper):
     """Return ``(normed, updated)``: ``updated = prefix_sum + allreduce(input)`` over ``workspace``'s TP group (the
     sum alone without ``prefix_sum``), ``normed`` = RMSNorm(attn_res(block_residual..., updated)). Advances

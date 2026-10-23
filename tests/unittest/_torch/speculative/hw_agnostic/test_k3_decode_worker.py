@@ -31,6 +31,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import (
     op as ctx_op,
 )
@@ -107,7 +108,7 @@ def _kda_manager(cls=MambaHybridCacheManagerV2):
     mgr = object.__new__(cls)
     mgr._use_kda_replay_update = True
     mgr.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
-    mgr._dummy_request_mask = torch.zeros(4, dtype=torch.bool)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.bool))
     return mgr
 
 
@@ -228,7 +229,7 @@ _ACCEPT_DECLINES = {
     ),
     "no KDA replay": _set("attn.kv_cache_manager._use_kda_replay_update", False),
     "no replay record": _set("attn.kv_cache_manager.prev_num_accepted_tokens", None),
-    "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask", None),
+    "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask_buffer", None),
     "no Mamba metadata": _set("attn.mamba_metadata", None),
     "int64 state indices": _set(
         "attn.mamba_metadata.state_indices", torch.zeros(4, dtype=torch.int64)

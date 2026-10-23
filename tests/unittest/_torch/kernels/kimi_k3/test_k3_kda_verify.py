@@ -150,7 +150,8 @@ class MainPath:
 
     def __init__(self, wt, pools, slots, num_spec):
         self.wt, self.p, self.slots, self.num_spec = wt, pools, slots, num_spec
-        self.p["qkg_cache"] = torch.zeros(POOL, num_spec, 3, HK, device="cuda")
+        self.p["k_cache"] = torch.zeros(POOL, num_spec, HK, device="cuda")
+        self.p["g_cache"] = torch.zeros(POOL, num_spec, HK, device="cuda")
         self.p["v_cache"] = torch.zeros(POOL, num_spec, HK, device="cuda")
         self.p["beta_cache"] = torch.zeros(POOL, num_spec, H, device="cuda")
 
@@ -166,7 +167,8 @@ class MainPath:
             x_q=x_q.view(1, t, H, K), x_k=x_k.view(1, t, H, K), x_v=x_v.view(1, t, H, V), w_q=self.wt["w_q"],
             w_k=self.wt["w_k"], w_v=self.wt["w_v"], cs_q=self.p["cs_q"], cs_k=self.p["cs_k"], cs_v=self.p["cs_v"],
             g=g.view(1, t, H, K), beta=beta.contiguous().view(1, t, H), A_log=self.wt["a_log"],
-            dt_bias=self.wt["dt_bias"], recurrent_state=self.p["state"], qkg_cache=self.p["qkg_cache"],
+            dt_bias=self.wt["dt_bias"], recurrent_state=self.p["state"], k_cache=self.p["k_cache"],
+            g_cache=self.p["g_cache"],
             v_cache=self.p["v_cache"], beta_cache=self.p["beta_cache"], ssm_state_indices=self.slots, cu_seqlens=cu,
             num_spec=self.num_spec, num_accepted_tokens=pending_req, lower_bound=LOWER_BOUND, scale=SCALE,
         )  # fmt: skip

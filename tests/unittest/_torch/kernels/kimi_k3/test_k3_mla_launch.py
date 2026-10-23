@@ -33,12 +33,19 @@ def stream_queries(monkeypatch):
     states = {11: (148, 0), 22: (64, 7)}
     monkeypatch.setattr(
         cuda_driver,
-        "cuStreamGetDevResource",
-        lambda stream, resource_type: (
+        "cuStreamGetCtx",
+        lambda stream: (
             cuda_driver.CUresult.CUDA_SUCCESS,
-            _resource(states[int(stream)][0]),
+            cuda_driver.CUcontext(int(stream) + 100),
         ),
-        raising=False,
+    )
+    monkeypatch.setattr(
+        cuda_driver,
+        "cuCtxGetDevResource",
+        lambda context, resource_type: (
+            cuda_driver.CUresult.CUDA_SUCCESS,
+            _resource(states[int(context) - 100][0]),
+        ),
     )
     monkeypatch.setattr(
         cuda_driver,
@@ -70,7 +77,7 @@ def test_small_grid_preserves_normal_cluster_without_sm_query(monkeypatch, strea
     def unexpected_sm_query(*args):
         raise AssertionError("small clustered calls must not query SM capacity")
 
-    monkeypatch.setattr(cuda_driver, "cuStreamGetDevResource", unexpected_sm_query, raising=False)
+    monkeypatch.setattr(cuda_driver, "cuCtxGetDevResource", unexpected_sm_query)
     assert launch._attn_no_cluster(cuda_driver.CUstream(11), 7, 16, 7) is False
     with pytest.raises(RuntimeError, match="16-CTA cluster fallback"):
         launch._attn_no_cluster(cuda_driver.CUstream(22), 1, 16, 7)
@@ -88,9 +95,8 @@ def test_unknown_resources_cannot_enable_spin_or_cluster(
 ):
     monkeypatch.setattr(
         cuda_driver,
-        "cuStreamGetDevResource",
+        "cuCtxGetDevResource",
         lambda *args: (cuda_driver.CUresult.CUDA_SUCCESS, _resource(sms, resource_type)),
-        raising=False,
     )
     with pytest.raises(RuntimeError, match="no valid SM resource count"):
         launch._attn_no_cluster(cuda_driver.CUstream(11), 8, 16, 7)
@@ -103,51 +109,14 @@ def test_unknown_resources_cannot_enable_spin_or_cluster(
 def test_driver_failure_is_not_capacity_or_missing_api(monkeypatch, stream_queries, status):
     monkeypatch.setattr(
         cuda_driver,
-        "cuStreamGetDevResource",
+        "cuCtxGetDevResource",
         lambda *args: (status, _resource(148)),
-        raising=False,
     )
     with pytest.raises(RuntimeError, match=status.name):
         launch._attn_no_cluster(cuda_driver.CUstream(11), 8, 16, 7)
 
 
-def test_driver_exception_does_not_use_context_compatibility(monkeypatch, stream_queries):
-    def failed_query(*args):
-        raise RuntimeError("driver symbol unavailable")
-
-    monkeypatch.setattr(cuda_driver, "cuStreamGetDevResource", failed_query, raising=False)
-    with pytest.raises(RuntimeError, match="driver symbol unavailable"):
-        launch._attn_no_cluster(cuda_driver.CUstream(11), 8, 16, 7)
-
-
-@pytest.mark.parametrize("sms", [64, 128])
-def test_missing_direct_api_uses_converted_stream_context(monkeypatch, stream_queries, sms):
-    monkeypatch.delattr(cuda_driver, "cuStreamGetDevResource", raising=False)
-    monkeypatch.setattr(
-        cuda_driver,
-        "cuStreamGetCtx",
-        lambda stream: (
-            cuda_driver.CUresult.CUDA_SUCCESS,
-            cuda_driver.CUcontext(int(stream) + 100),
-        ),
-    )
-    monkeypatch.setattr(
-        cuda_driver,
-        "cuCtxGetDevResource",
-        lambda context, resource_type: (
-            cuda_driver.CUresult.CUDA_SUCCESS,
-            _resource(sms if int(context) == 122 else 148),
-        ),
-    )
-    if sms < 128:
-        with pytest.raises(RuntimeError, match="16-CTA cluster fallback"):
-            launch._attn_no_cluster(cuda_driver.CUstream(22), 8, 16, 7)
-    else:
-        assert launch._attn_no_cluster(cuda_driver.CUstream(22), 8, 16, 7) is True
-
-
 def test_failed_context_compatibility_query_is_closed(monkeypatch, stream_queries):
-    monkeypatch.delattr(cuda_driver, "cuStreamGetDevResource", raising=False)
     monkeypatch.setattr(
         cuda_driver,
         "cuStreamGetCtx",
@@ -158,7 +127,6 @@ def test_failed_context_compatibility_query_is_closed(monkeypatch, stream_querie
 
 
 def test_failed_context_resource_query_is_closed(monkeypatch, stream_queries):
-    monkeypatch.delattr(cuda_driver, "cuStreamGetDevResource", raising=False)
     monkeypatch.setattr(
         cuda_driver,
         "cuStreamGetCtx",

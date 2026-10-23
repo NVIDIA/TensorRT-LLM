@@ -108,6 +108,7 @@ l0_b200:
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py TIMEOUT (90)
+  - unittest/_torch/executor/kv_cache/test_mixed_precision_kv_cache.py
   # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
@@ -132,6 +133,7 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
@@ -154,10 +156,6 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
   # Kimi K3's generic path (prefill, mixed and wide steps) in the modeling_v2 catalog: its own entries
   # and the sm_100 cells of the shared entries it calls.
-  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_causal_conv1d_fwd.py
-  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_chunk_kda.py
-  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_kda_post_conv.py
-  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_kda_prefill.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/activation/test_modeling_v2_situ_and_mul.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
@@ -182,10 +180,6 @@ l0_b200:
   - unittest/_torch/kernels/kimi_k3/test_k3_head_gemv.py
   - unittest/_torch/kernels/kimi_k3/test_k3_cluster_waits.py
   - unittest/_torch/kernels/kimi_k3/test_k3_tcgen05_fences.py
-  # The Kimi K3 targets' routing and the claims check of their stock imports. l0_b300's modeling_v2
-  # entry, the only other one that collects them, is waived (nvbugs/6853741).
-  - unittest/_torch/modeling_v2/test_modeling_v2_routing.py -k "kimi_k3"
-  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py::test_uncertified_generic_calls_name_every_stock_import
   # modeling_v2 catalog entries with sm_100 receipts (the K3 ones skip on
   # other architectures).
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_k3_embed_norm.py

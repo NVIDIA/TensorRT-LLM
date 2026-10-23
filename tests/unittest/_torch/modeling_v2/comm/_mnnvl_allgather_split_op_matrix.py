@@ -696,13 +696,13 @@ def _run_one_rank(args) -> int:
     global validating
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allgather_split as module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allreduce_attn_res as attn_res_module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_fusion_allreduce as reduce_module,
     )
 

@@ -80,3 +80,18 @@ def _(
     early_trigger: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(layer_residual), torch.empty_like(layer_residual)
+
+
+@torch.library.register_fake("trtllm::mnnvl_allgather_split")
+def _(input, bf16_columns, world_size, comm_buffer, buffer_flags):
+    num_tokens, columns = input.shape
+    return [
+        input.new_empty((num_tokens, world_size * bf16_columns), dtype=torch.bfloat16),
+        input.new_empty((num_tokens, world_size * (columns - bf16_columns))),
+    ]
+
+
+@torch.library.register_fake("trtllm::mnnvl_allreduce_attn_res")
+def _(input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
+      comm_buffer, buffer_flags):  # fmt: skip
+    return [torch.empty_like(input), torch.empty_like(input)]

@@ -38,7 +38,8 @@ def _check(packed: torch.Tensor, heads: int) -> None:
 
 
 @pytest.mark.parametrize("cell", kda_post_conv.CELLS, ids=[c.why[:40] for c in kda_post_conv.CELLS])
-def test_kimi_k3_prefill_shapes(cell) -> None:
+@pytest.mark.parametrize("token_major", [False, True])
+def test_kimi_k3_prefill_shapes(cell, token_major: bool) -> None:
     # Kimi K3's KDA prefill: 6 heads (TP16) and 24 (TP4), head_dim 128, bf16, decode- through
     # prefill-sized token counts (16-token blocks and a ragged tail).
     spec = cell.spec
@@ -56,6 +57,8 @@ def test_kimi_k3_prefill_shapes(cell) -> None:
     if spec["kind"] == "tiny":
         packed.zero_()
         packed[:, 1] = 1e-4
+    if token_major:
+        packed = packed.t().contiguous().t()
     _check(packed, spec["heads"])
 
 
@@ -81,7 +84,10 @@ def test_rejects_out_of_contract() -> None:
     bad = {
         "row count": (packed[:-1], 6),
         "heads": (packed, 5),
-        "transposed": (packed.t().contiguous().t(), 6),
+        "non-unit strides": (
+            torch.empty_strided(packed.shape, (128, 2), dtype=packed.dtype, device="cuda"),
+            6,
+        ),
         "3-D": (packed.unsqueeze(0), 6),
     }
     for name, (arg, heads) in bad.items():

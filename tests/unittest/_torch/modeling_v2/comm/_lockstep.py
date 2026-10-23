@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import hashlib
 import os
 import signal
 import subprocess
@@ -101,10 +102,18 @@ class Rank:
         return all(self.comm.allgather(bool(flag)))
 
     def same_on_ranks(self, *tensors: torch.Tensor) -> bool:
-        """Bitwise equality of the tensors across ranks (their int16 words summed per row, compared exactly)."""
-        mine = [t.contiguous().view(torch.int16).long().sum(dim=-1).cpu() for t in tensors]
+        mine = [
+            (
+                tuple(t.shape),
+                t.dtype,
+                hashlib.sha256(
+                    t.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy()
+                ).digest(),
+            )
+            for t in tensors
+        ]
         every = self.comm.allgather(mine)
-        return all(torch.equal(a, b) for other in every[1:] for a, b in zip(every[0], other))
+        return all(other == every[0] for other in every[1:])
 
     def late(self, which: Optional[int], seconds: float = 0.005) -> None:
         """Rank ``which`` (None: nobody) starts its next launch ``seconds`` late."""

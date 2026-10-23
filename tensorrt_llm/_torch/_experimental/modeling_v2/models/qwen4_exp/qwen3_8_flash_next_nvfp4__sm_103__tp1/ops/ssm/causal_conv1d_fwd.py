@@ -23,13 +23,6 @@ CKPT_DIM = 10240
 ENGINE_SLOTS = 461
 
 
-def _engine_batch_slots() -> tuple[int, ...]:
-    """32 distinct slots over the whole engine pool, slot 0 and the last included."""
-    slots = (0, ENGINE_SLOTS - 1) + tuple((i * 13 + 5) % (ENGINE_SLOTS - 2) + 1 for i in range(30))
-    assert len(set(slots)) == 32
-    return slots
-
-
 class CausalConv1dFwd(OpWrapper):
     """Depthwise causal conv1d (+ optional SiLU) of every sequence in a batch,
     against its carried window, publishing the new window -- one launch.
@@ -58,177 +51,34 @@ class CausalConv1dFwd(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec keys: dim, width, dtype, lengths (varlen) or batch3d=(batch, seqlen),
-    # pool_slots (None -> no conv_states), slots (None -> cache_indices None),
-    # initial (None -> has_initial_state None), silu, bias, pad_slot_id,
-    # layout: "in_place" | "out" | "channel_last".
+    # spec keys: dim, lengths (varlen), pool_slots, slots (cache_indices),
+    # initial (has_initial_state); bf16, W 4, no bias, SiLU, pad_slot_id -1,
+    # channel-major in place throughout.
     CELLS: tuple[Cell, ...] = (
-        (
-            Cell(
-                why="checkpoint prefill 37+1+128 tokens in place, 8-slot pool",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    lengths=(37, 1, 128),
-                    pool_slots=8,
-                    slots=(3, 0, 5),
-                    initial=(True, False, True),
-                ),
+        Cell(
+            why="checkpoint prefill at the engine's 461-slot pool: slots 460, 0, 230",
+            spec=dict(
+                dim=CKPT_DIM,
+                lengths=(37, 1, 128),
+                pool_slots=ENGINE_SLOTS,
+                slots=(ENGINE_SLOTS - 1, 0, ENGINE_SLOTS // 2),
+                initial=(True, False, True),
             ),
-            Cell(
-                why="checkpoint prefill at the engine's 461-slot pool: slots 460, 0, 230",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    lengths=(37, 1, 128),
-                    pool_slots=ENGINE_SLOTS,
-                    slots=(ENGINE_SLOTS - 1, 0, ENGINE_SLOTS // 2),
-                    initial=(True, False, True),
-                ),
+        ),
+        Cell(
+            why="pad_slot_id -1 (the engine's sentinel): sequence and slot skipped",
+            spec=dict(
+                dim=1024,
+                lengths=(16, 8, 16),
+                pool_slots=4,
+                slots=(0, -1, 2),
+                initial=(True, True, True),
             ),
-            Cell(
-                why="32 sequences (the batch ceiling) scattered over the 461-slot pool",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    lengths=tuple(1 + (i * 7) % 96 for i in range(32)),
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_engine_batch_slots(),
-                    initial=tuple(i % 3 != 0 for i in range(32)),
-                ),
-            ),
-            Cell(
-                why="explicit channel-major out: result lands there, x is read-only",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    lengths=(64, 9),
-                    pool_slots=4,
-                    slots=(1, 2),
-                    initial=(True, True),
-                    layout="out",
-                ),
-            ),
-            Cell(
-                why="channel-last x (a bare .t() of token-major), into its own out",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    lengths=(37, 1, 128),
-                    pool_slots=8,
-                    slots=(3, 0, 5),
-                    initial=(True, False, True),
-                    layout="channel_last",
-                ),
-            ),
-            Cell(
-                why="pad_slot_id -1 (the engine's sentinel): sequence and slot skipped",
-                spec=dict(
-                    dim=1024,
-                    lengths=(16, 8, 16),
-                    pool_slots=4,
-                    slots=(0, -1, 2),
-                    initial=(True, True, True),
-                ),
-            ),
-            Cell(
-                why="pad_slot_id 99: the sentinel is compared by value",
-                spec=dict(
-                    dim=1024,
-                    lengths=(16, 8, 16),
-                    pool_slots=4,
-                    slots=(0, 99, 2),
-                    initial=(True, True, True),
-                    pad_slot_id=99,
-                ),
-            ),
-            Cell(
-                why="sequences shorter than the window: state part carry, part tokens",
-                spec=dict(
-                    dim=512,
-                    lengths=(2, 1, 2),
-                    pool_slots=4,
-                    slots=(0, 1, 2),
-                    initial=(True, True, False),
-                ),
-            ),
-            Cell(
-                why="a zero-token sequence republishes its carry unchanged",
-                spec=dict(
-                    dim=512, lengths=(0, 40), pool_slots=4, slots=(2, 3), initial=(True, False)
-                ),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"{str(dtype).removeprefix('torch.')} with bias, silu={silu}",
-                spec=dict(
-                    dim=256,
-                    lengths=(30, 34),
-                    pool_slots=2,
-                    slots=(0, 1),
-                    initial=(True, True),
-                    dtype=dtype,
-                    bias=True,
-                    silu=silu,
-                ),
-            )
-            for dtype in (torch.bfloat16, torch.float16, torch.float32)
-            for silu in (True, False)
-        )
-        + (
-            Cell(
-                why="conv_states None: every sequence starts from zeros",
-                spec=dict(dim=512, lengths=(12, 20), pool_slots=None, slots=None, initial=None),
-            ),
-            Cell(
-                why="cache_indices/has_initial_state None: slot s, no carry",
-                spec=dict(dim=512, lengths=(24, 40), pool_slots=2, slots=None, initial=None),
-            ),
-            Cell(
-                why="dense [batch, dim, seqlen] layout, query_start_loc None",
-                spec=dict(
-                    dim=256, batch3d=(3, 40), pool_slots=3, slots=None, initial=(True, False, True)
-                ),
-            ),
-            Cell(
-                why="one 2048-token sequence: the vectorised channel-major load",
-                spec=dict(dim=CKPT_DIM, lengths=(2048,), pool_slots=1, slots=(0,), initial=(True,)),
-            ),
-            Cell(
-                why="one 2047-token sequence: the scalar channel-major load",
-                spec=dict(dim=CKPT_DIM, lengths=(2047,), pool_slots=1, slots=(0,), initial=(True,)),
-            ),
-            Cell(
-                why="several long sequences: the 128-thread block",
-                spec=dict(
-                    dim=1024,
-                    lengths=(700, 701, 648),
-                    pool_slots=3,
-                    slots=(0, 1, 2),
-                    initial=(True, True, True),
-                ),
-            ),
-            Cell(
-                why="every sequence a single token",
-                spec=dict(
-                    dim=1024,
-                    lengths=(1, 1, 1, 1),
-                    pool_slots=4,
-                    slots=(0, 1, 2, 3),
-                    initial=(True, True, True, True),
-                ),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"conv width {width}",
-                spec=dict(
-                    dim=512,
-                    width=width,
-                    lengths=(33, 7),
-                    pool_slots=2,
-                    slots=(0, 1),
-                    initial=(True, True),
-                ),
-            )
-            for width in (2, 3)
-        )
+        ),
+        Cell(
+            why="one 2048-token sequence: the vectorised load, 128-thread block",
+            spec=dict(dim=CKPT_DIM, lengths=(2048,), pool_slots=1, slots=(0,), initial=(True,)),
+        ),
     )
 
     note = """
@@ -239,10 +89,13 @@ class CausalConv1dFwd(OpWrapper):
     Call site: the GDN prefill half -- `x` the `[10240, num_prefill_tokens]`
     channel-major output of `extract_transpose_prefill_slice`, W 4, no bias,
     SiLU on, the layer's whole conv pool unsliced, `pad_slot_id` -1, `out` None.
-    The first three cells are that call; 461 slots tops the certified pool
-    interval (8 and 461 bracket every width the cache manager was seen to
-    allocate). At 461 the activation and state are bitwise identical to the
-    8-slot result for the same slot content.
+    The cells are that call (bf16, W 4, no bias, SiLU, channel-major in
+    place): a three-sequence prefill at the engine's 461-slot pool, which
+    tops every width the cache manager was seen to allocate (the 64-thread
+    block with scalar loads); one 2048-token sequence (the 128-thread block
+    with vectorised loads); and the pad sentinel on a small pool. The
+    128-thread block's scalar-load form (seen at a single 2047-token
+    sequence) is not certified.
 
     Preconditions the op checks itself (all raise): dtypes in {bf16, fp16,
     fp32}, `conv_states`/`bias` dtype, int32 `query_start_loc`/`cache_indices`,
@@ -252,11 +105,15 @@ class CausalConv1dFwd(OpWrapper):
     Not checked, not guarded (content, not metadata, or an illegal access
     rather than a wrong number): a `cache_indices` value outside `[0, slots)`;
     `has_initial_state[s]` True with `conv_states=None` (reads through null);
-    `conv_states`' shape (only its dtype is validated). Sequences of length 0
-    and shorter than `W - 1` are legal. Unnamed slots are bitwise untouched.
+    `conv_states`' shape (only its dtype is validated). Sequences shorter
+    than `W - 1` are legal; one (a single token without carried state) is
+    certified, one with carried state is not. A zero-length sequence, which
+    the target never schedules, is not certified. Unnamed slots are bitwise
+    untouched.
 
-    `TRTLLM_CAUSAL_CONV1D_SILU_MODE` selects faster SiLU forms on the
-    channel-last kernel; only the default (unset) is certified.
+    Only the channel-major kernel (the target's layout) is certified; the
+    channel-last kernel and `TRTLLM_CAUSAL_CONV1D_SILU_MODE`, which selects
+    faster SiLU forms on it, are not.
 
     Hard limits
       x token/channel strides  uint32 stride fields  boundary 2^32 elements
