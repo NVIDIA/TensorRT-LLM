@@ -518,6 +518,11 @@ class BlobBackend:
         wake: Called outside every lock whenever an attempt's outcome lands or it quiesces, once
             the change shows through ``poll`` or ``quiesced``.
         config: How submissions are cut into driver calls.
+
+    Raises:
+        RuntimeError: A backend thread could not start. Nothing of the backend runs afterwards:
+            the workers already started have left. The binding keeps its registrations and the
+            hold for whoever built it to revoke (``RegionBinding.unregister``) and release.
     """
 
     def __init__(self, binding: RegionBinding, wake: WakeFn, config: BlobConfig) -> None:
@@ -565,8 +570,25 @@ class BlobBackend:
         self._progress = threading.Thread(
             target=self._progress_loop, name=f"{name}-progress", daemon=True
         )
-        for thread in (*self._workers, self._progress):
-            thread.start()
+        started: list[threading.Thread] = []
+        try:
+            for thread in (*self._workers, self._progress):
+                thread.start()
+                started.append(thread)
+        except RuntimeError:  # the system refused a thread: the backend never runs
+            self._abandon(started)
+            raise
+
+    def _abandon(self, started: list[threading.Thread]) -> None:
+        """Ends the workers started before a later thread failed to start. The progress thread
+        starts last, so it is never among them: no teardown runs, and the binding stays with its
+        owner, registrations and hold included."""
+        with self._lock:
+            self._shutdown_requested = True
+            self._workers_alive = len(started)
+            self._work_ready.notify_all()
+        for thread in started:
+            thread.join()
 
     @property
     def capabilities(self) -> Capabilities:

@@ -51,6 +51,7 @@ from tensorrt_llm._torch.disaggregation.blob import backend as backend_module
 from tensorrt_llm._torch.disaggregation.blob.backend import (
     FETCH_BATCHES_PER_PUBLISH_BATCH,
     SHUTDOWN_FAULT,
+    BlobBackend,
     BlobConfig,
     ConstructionRejected,
     RegionBinding,
@@ -1522,3 +1523,38 @@ def test_a_protocol_break_seen_by_the_progress_thread_concludes_the_queue_at_onc
     reader.wait_quiesced(blocked)
     labels = reader.backend.shutdown(0)
     assert watched.label in labels and queued.label not in labels and blocked.label not in labels
+
+
+# Construction.
+
+
+@pytest.mark.parametrize("failing", ["second_worker", "progress_thread"])
+def test_a_thread_that_cannot_start_leaves_no_backend_thread_and_the_binding_to_its_owner(
+    store: MemoryStore, failing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second worker, or the progress thread, cannot be started: the worker already running
+    leaves, no backend thread survives, and the binding still holds the registrations and the
+    hold for the builder to revoke and release."""
+    region, hold = CpuRegion(SLOT_BYTES, 1), FakeHold()
+    binding = RegionBinding((region,), MemoryDriver(store), hold)
+    binding.register()
+    failing_call = 2 if failing == "second_worker" else 3  # workers first, the progress thread last
+    original_start = threading.Thread.start
+    starts = {"count": 0}
+
+    def start(thread: threading.Thread) -> None:
+        starts["count"] += 1
+        if starts["count"] == failing_call:
+            raise RuntimeError("can't start new thread")
+        original_start(thread)
+
+    before = set(threading.enumerate())
+    with monkeypatch.context() as patched:
+        patched.setattr(threading.Thread, "start", start)
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            BlobBackend(binding, lambda: None, BlobConfig(workers=2))
+    assert set(threading.enumerate()) == before  # the started worker left and was joined
+    assert binding.live_labels() == frozenset({"region:0"}) and not hold.released
+    assert binding.unregister()  # the builder revokes and releases, as after any failed build
+    binding.release_hold()
+    assert hold.released
