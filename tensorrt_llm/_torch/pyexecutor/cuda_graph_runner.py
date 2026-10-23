@@ -10,6 +10,7 @@ from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
 
 import torch
 
+from tensorrt_llm._profiler import MetadataValue, record_function_with_metadata
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
@@ -78,6 +79,80 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+
+
+def _decoder_graph_workflow_metadata(
+        runner: "CUDAGraphRunner", key: KeyType, inputs: dict[str, Any],
+        operation: str) -> dict[str, MetadataValue]:
+    """Observe graph specialization and physical rows, never live occupancy."""
+    key = KeyType(*key)
+    fields: dict[str, MetadataValue] = {
+        "workflow.graph.kind":
+        "decoder",
+        "workflow.graph.operation":
+        operation,
+        "workflow.graph.padding_enabled":
+        runner.padding_enabled,
+        "workflow.graph.warmup_steps":
+        runner.WARMUP_STEPS if operation != "replay" else 0,
+        "workflow.graph.batch_capacity":
+        key.batch_size,
+        "workflow.graph.token_capacity":
+        runner._get_num_tokens_for_key(key),
+        "workflow.graph.max_beam_width":
+        runner.max_beam_width,
+        "workflow.graph.key.batch_size":
+        key.batch_size,
+        "workflow.graph.key.draft_len":
+        key.draft_len,
+        "workflow.graph.key.short_seq_len_mode":
+        key.short_seq_len_mode,
+        "workflow.graph.key.is_all_greedy_sample":
+        key.is_all_greedy_sample,
+        "workflow.graph.key.sample_type":
+        key.sample_type.name,
+        "workflow.graph.key.num_contexts":
+        key.num_contexts,
+        "workflow.graph.key.context_query_len":
+        key.context_query_len,
+        "workflow.graph.key.num_encoder_tokens":
+        key.num_encoder_tokens,
+        "workflow.graph.key.peft_cache_data_type":
+        str(key.peft_cache_data_type)
+        if key.peft_cache_data_type is not None else None,
+        "workflow.graph.key.use_lora_graph":
+        key.use_lora_graph,
+    }
+    for name, field_name in (("input_ids", "input_token_rows"),
+                             ("encoder_hidden_states",
+                              "encoder_hidden_state_rows")):
+        tensor = inputs.get(name)
+        if isinstance(tensor, torch.Tensor):
+            fields[f"workflow.graph.{field_name}"] = tensor.shape[0]
+    return fields
+
+
+def _decoder_capture_workflow_metadata(
+        runner: "CUDAGraphRunner",
+        key: KeyType,
+        forward_fn: Callable,
+        initial_inputs: dict[str, Any],
+        enable_spec_decode: bool = False,
+        postprocess_fn: Callable | None = None) -> dict[str, MetadataValue]:
+    return _decoder_graph_workflow_metadata(
+        runner, key, initial_inputs,
+        "warmup_only" if runner.is_warmup_only else "capture")
+
+
+def _decoder_replay_workflow_metadata(
+    runner: "CUDAGraphRunner",
+    key: KeyType,
+    current_inputs: dict[str, Any],
+    *,
+    position_id_offsets: Optional[torch.Tensor] = None
+) -> dict[str, MetadataValue]:
+    return _decoder_graph_workflow_metadata(runner, key, current_inputs,
+                                            "replay")
 
 
 def _save_spec_decode_capture_state(
@@ -706,6 +781,9 @@ class CUDAGraphRunner:
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
                 token_per_generation)
 
+    @record_function_with_metadata(
+        "trtllm::cuda_graph_capture",
+        metadata_factory=_decoder_capture_workflow_metadata)
     def capture(self,
                 key: KeyType,
                 forward_fn: Callable,
@@ -812,6 +890,9 @@ class CUDAGraphRunner:
         self.memory_pool = graph.pool()
         return graph_output
 
+    @record_function_with_metadata(
+        "trtllm::cuda_graph_replay",
+        metadata_factory=_decoder_replay_workflow_metadata)
     def replay(
         self,
         key: KeyType,
@@ -1379,6 +1460,61 @@ class CUDAGraphRunner:
 EncoderKeyType: TypeAlias = Tuple[int, int, int]
 _ENCODER_SOURCE_SEQ_LENS = "_encoder_source_seq_lens"
 _ENCODER_SOURCE_TO_SLOT = "_encoder_source_to_slot"
+
+
+def _encoder_graph_workflow_metadata(
+        runner: "EncoderCUDAGraphRunner", key: EncoderKeyType,
+        inputs: dict[str, Any], operation: str) -> dict[str, MetadataValue]:
+    """Observe encoder buckets and retained unpadded host sequence lengths."""
+    fields: dict[str, MetadataValue] = {
+        "workflow.graph.kind":
+        "encoder",
+        "workflow.graph.operation":
+        operation,
+        "workflow.graph.padding_enabled":
+        runner.padding_enabled,
+        "workflow.graph.warmup_steps":
+        runner.WARMUP_STEPS if operation != "replay" else 0,
+        "workflow.graph.key.padded_batch_size":
+        key[0],
+        "workflow.graph.key.padded_total_tokens":
+        key[1],
+        "workflow.graph.key.max_seq_len_bucket":
+        key[2],
+        "workflow.graph.batch_capacity":
+        key[0],
+        "workflow.graph.token_capacity":
+        key[1],
+    }
+    input_ids = inputs.get("input_ids")
+    if isinstance(input_ids, torch.Tensor):
+        fields["workflow.graph.input_token_rows"] = input_ids.shape[0]
+    features = inputs.get("input_features")
+    if isinstance(features, torch.Tensor):
+        fields["workflow.graph.input_feature_shape"] = list(features.shape)
+    source_lengths = inputs.get(_ENCODER_SOURCE_SEQ_LENS)
+    if isinstance(source_lengths, list) and all(
+            type(length) is int for length in source_lengths):
+        fields["workflow.graph.source_requests"] = len(source_lengths)
+        fields["workflow.graph.source_tokens"] = sum(source_lengths)
+        fields["workflow.graph.padding_requests"] = key[0] - len(source_lengths)
+        fields["workflow.graph.padding_tokens"] = key[1] - sum(source_lengths)
+    return fields
+
+
+def _encoder_capture_workflow_metadata(
+        runner: "EncoderCUDAGraphRunner", key: EncoderKeyType,
+        forward_fn: Callable, inputs: dict[str,
+                                           Any]) -> dict[str, MetadataValue]:
+    return _encoder_graph_workflow_metadata(
+        runner, key, inputs,
+        "warmup_only" if runner.is_warmup_only else "capture")
+
+
+def _encoder_replay_workflow_metadata(
+        runner: "EncoderCUDAGraphRunner", key: EncoderKeyType,
+        inputs: dict[str, Any]) -> dict[str, MetadataValue]:
+    return _encoder_graph_workflow_metadata(runner, key, inputs, "replay")
 
 
 @dataclass
@@ -2345,6 +2481,9 @@ class EncoderCUDAGraphRunner:
                                         sequence_length])
         return torch.cat(output_slices, dim=0)
 
+    @record_function_with_metadata(
+        "trtllm::cuda_graph_capture",
+        metadata_factory=_encoder_capture_workflow_metadata)
     def capture(
         self,
         key: EncoderKeyType,
@@ -2550,6 +2689,9 @@ class EncoderCUDAGraphRunner:
         self.num_feature_replays += 1
         return self.graph_outputs[key]
 
+    @record_function_with_metadata(
+        "trtllm::cuda_graph_replay",
+        metadata_factory=_encoder_replay_workflow_metadata)
     def replay(
         self,
         key: EncoderKeyType,
