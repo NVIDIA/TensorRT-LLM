@@ -1405,6 +1405,48 @@ def test_unregister_layer_leaves_another_modules_slot_alone():
     assert model_config.extra_attrs["moe_layers"]["3"]() is kept
 
 
+@pytest.mark.cpu_only
+def test_unregister_layer_hands_the_canonical_key_along_a_replacement_chain():
+    """Llama4 min-latency builds *two* MoEs for one ``layer_idx`` before the
+    one that runs: ``Llama4MinLatencyDecoderLayer`` inherits a generic
+    ``Llama4MoE``, then ``Llama4MinLatencyMoE`` inherits another one and swaps
+    in ``Llama4MinLatencyFusedMoE``. Both predecessors are still alive when
+    the replacement registers -- a module is only dropped once the enclosing
+    assignment rebinds its attribute -- so each has to give the key back for
+    the live module to end up on the canonical one.
+    """
+    model_config = ModelConfig(skip_create_weights_in_init=True)
+
+    def _module():
+        module = torch.nn.Module()
+        module.layer_idx = 3
+        module.layer_idx_str = "3"
+        return module
+
+    # ``Llama4DecoderLayer.__init__`` -> generic ``Llama4MoE``'s experts.
+    base = _module()
+    MoE._register_layer(base, model_config)
+    MoE._unregister_layer(base, model_config)
+
+    # ``Llama4MinLatencyMoE.__init__`` -> ``super().__init__``'s experts.
+    inherited = _module()
+    MoE._register_layer(inherited, model_config)
+    assert inherited.layer_idx_str == "3"
+    MoE._unregister_layer(inherited, model_config)
+
+    # ``Llama4MinLatencyFusedMoE`` -- the module that actually runs.
+    live = _module()
+    MoE._register_layer(live, model_config)
+
+    # ``base`` and ``inherited`` are still referenced here, as they are in the
+    # real constructors: the keys came free from the unregister calls, not from
+    # their weakrefs dying.
+    assert base.register_to_config is False
+    assert inherited.register_to_config is False
+    assert list(model_config.extra_attrs["moe_layers"]) == ["3"]
+    assert model_config.extra_attrs["moe_layers"]["3"]() is live
+
+
 # =====================================================================
 # Staged post-load hook lifecycle tests
 # =====================================================================

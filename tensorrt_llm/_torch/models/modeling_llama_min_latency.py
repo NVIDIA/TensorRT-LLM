@@ -592,10 +592,14 @@ class Llama4MinLatencyMoE(Llama4MoE):
         # ``layer_idx`` and registered it in ``extra_attrs["moe_layers"]``, and
         # that module is dropped by the assignment below. Give its slot back
         # first, so the module that actually runs takes the canonical
-        # ``str(layer_idx)`` key instead of a deduplicated one -- otherwise
-        # ``extract_extra_attrs`` and the DWDP/LoRA lookups keyed on it would
-        # see a weakref to the discarded module. ``VANILLA`` resolves to an
-        # ``nn.ModuleList`` that is not a ``MoE`` and never registered, so
+        # ``str(layer_idx)`` key instead of a deduplicated one -- that key is
+        # what ``extract_extra_attrs`` resolves, and ``route_capture`` reads
+        # the registry's keys as layer indices (``int(k)``), where a
+        # deduplicated ``"N_0"`` silently parses as a different layer.
+        # ``Llama4MinLatencyDecoderLayer.__init__`` has to do the same for the
+        # base block's experts, which are still alive at this point and still
+        # hold that key unless it gave them back. A ``VanillaMoE`` backend is
+        # an ``nn.ModuleList`` rather than a ``MoE`` and never registered, so
         # there is nothing to give back.
         if isinstance(self.experts, MoE):
             self.experts._unregister_layer(model_config)
@@ -748,6 +752,17 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
         else:
+            # ``super().__init__`` above built a generic ``Llama4MoE`` whose
+            # experts hold ``str(layer_idx)`` in ``extra_attrs["moe_layers"]``.
+            # That module only dies once the assignment below rebinds
+            # ``self.feed_forward``, which is after the replacement has already
+            # registered -- so without this the replacement is pushed onto a
+            # deduplicated key and the canonical one keeps a weakref to the
+            # discarded module. Give the slot back first.
+            base_experts = getattr(self.feed_forward, "experts", None)
+            if isinstance(base_experts, MoE):
+                base_experts._unregister_layer(model_config)
+
             self.feed_forward = Llama4MinLatencyMoE(
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
