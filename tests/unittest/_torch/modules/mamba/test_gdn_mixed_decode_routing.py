@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 

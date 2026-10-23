@@ -137,6 +137,7 @@ class TestRetireInflightBatch:
         assert without.calls == ["enqueue_empty", "flush", "enqueue_empty"]
         assert without.gathers == with_batch.gathers == 3
 
+
 class _RecordingEvent(threading.Event):
     def __init__(self, log, name):
         super().__init__()
