@@ -33,6 +33,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -3643,7 +3644,11 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
 
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
+        // A locality-domain stream runs only on its Green Context's SMs, so size the KV split for those.
+        // GQA decode stays on the device count: at small batch its kernels run faster over-split.
+        auto const streamSmCount = static_cast<int>(tensorrt_llm::locality_domain::getLocalizedStreamSmCount(stream));
+        tllmRunnerParams.mMultiProcessorCount
+            = streamSmCount > 0 ? std::min(streamSmCount, mMultiProcessorCount) : mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = p.token_offset;
 
