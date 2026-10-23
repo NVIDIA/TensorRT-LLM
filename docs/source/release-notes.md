@@ -13,13 +13,20 @@ All published functionality in the Release Notes has been fully tested and verif
 ### API Changes
 
 - <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, all production `insertRequestInOrder` overloads, and the unused `requestUtils.h` and `orchestratorUtils.h` helpers have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available. Executor factory and worker constructors no longer accept the unused `engine` and `batched_logits_processor` arguments; callers should omit them and continue passing model configuration through `llm_args` and `hf_model_dir`. Unused decoder, request-cancellation, executor, legacy-model, orchestration, and speculative-decoding MPI tag names have also been removed; values 1–23, 127–129, and 1023–1025 are retired. The default, KV-cache event, and context-transfer tags retain their existing values. Internal `LogprobParams` and `LogProbsResult` tuples now contain only prompt-logprob fields; generation logprobs remain supplied by the sampler. The unused `TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT` environment variable has been removed.
-- Multimodal processor extensions now use `get_mm_item_metadata()` and
+- <span style="color: red">**[BREAKING CHANGE] Unified multimodal processor metadata.**</span>
+  Multimodal processor extensions now use `get_mm_item_metadata()` and
   `MultimodalItemMetadata`, replacing `get_mm_encoder_item_metadata()` and
   `MultimodalEncoderItemMetadata`. The removed `DisaggPrefillMultimodalInputs`
   result is replaced by `(prompt_token_ids, MultimodalParams)` from
   `build_disagg_prefill_multimodal_inputs()`, which also accepts the keyword-only
   `mm_hashes` argument. Custom processors must migrate these hooks; processors
-  defining the removed metadata hook now fail at wrapper creation. See the
+  defining the removed metadata hook now fail at wrapper creation.
+  Also removed: `MultimodalParams(mm_item_order=...)`, the
+  `multimodal_embedding_lengths` and `layout_metadata` keys in `multimodal_data`,
+  `registry.get_multimodal_encoder_item_metadata`, and `LlmRequest.py_mm_item_order`.
+  Read item order and output lengths through `MultimodalParams.item_metadata`.
+  Grouped encoders must also include item metadata with exact output row counts
+  in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
 
 ### Fixed Issues
