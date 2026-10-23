@@ -54,7 +54,16 @@ def test_store_accepted_from_json():
     assert req.stream is True
 
 
-def test_store_must_be_a_boolean():
+@pytest.mark.parametrize(
+    "value, expected", [("false", False), ("true", True), (0, False), (1, True)]
+)
+def test_store_coerces_boolean_like_values(value, expected):
+    # The request schema is not strict, so a boolean-like string or integer is
+    # coerced, as for every other boolean field of the request.
+    assert _request(store=value).store is expected
+
+
+def test_store_rejects_a_value_that_is_not_boolean_like():
     with pytest.raises(ValidationError):
         _request(store={"keep": True})
 
