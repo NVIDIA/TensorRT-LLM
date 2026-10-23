@@ -13,7 +13,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from concurrent.futures import Executor
+from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from io import BytesIO
@@ -1278,7 +1278,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         loop = asyncio.get_event_loop()
         executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
         queued = _start_input_processing()
-        if queued is None:
+        if queued is None or isinstance(executor, ProcessPoolExecutor):
             return await loop.run_in_executor(executor, fn, *args)
 
         def decode() -> _MediaT:

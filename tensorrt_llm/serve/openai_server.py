@@ -1405,6 +1405,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        if self.generator.args.return_perf_metrics:
+            self.mount_metrics()
 
     async def _require_rl_control_auth(self, raw_request: Request) -> None:
         body = await raw_request.body()
@@ -2988,6 +2990,7 @@ class OpenAIServer(_VideoRoutesMixin):
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
+            await self._extract_metrics(promise, raw_request)
             return JSONResponse(content=response.model_dump())
 
         except CppExecutorError:

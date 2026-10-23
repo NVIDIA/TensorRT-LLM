@@ -1014,12 +1014,7 @@ class PyExecutor:
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
         # Install only after warmup/capture so dummy encoder work is excluded.
-        # torch.compile delegates encoder methods with self bound to _orig_mod.
-        model = getattr(self.model_engine.model, "_orig_mod",
-                        self.model_engine.model)
-        if (self.enable_iter_perf_stats and self.dist.rank == 0
-                and isinstance(model, MultimodalModelMixin)):
-            model._encoder_forward_context = self.perf_manager.record_encoder_forward
+        self._setup_encoder_perf_metrics()
 
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
@@ -1267,6 +1262,15 @@ class PyExecutor:
 
         if start_worker:
             self.start_worker()
+
+    def _setup_encoder_perf_metrics(self) -> None:
+        """Install optional encoder timing on the module that owns encoder methods."""
+        # torch.compile delegates encoder methods with self bound to _orig_mod.
+        model = getattr(self.model_engine.model, "_orig_mod",
+                        self.model_engine.model)
+        if (self.enable_iter_perf_stats and self.dist.rank == 0
+                and isinstance(model, MultimodalModelMixin)):
+            model._encoder_forward_context = self.perf_manager.record_encoder_forward
 
     @property
     def metrics(self) -> dict[str, float | dict[str, float]]:

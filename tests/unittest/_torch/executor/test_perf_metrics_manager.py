@@ -7,10 +7,41 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.perf_metrics_manager import PerfMetricsManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "enabled,rank,compiled,multimodal",
+    [
+        (True, 0, False, True),
+        (False, 0, False, True),
+        (True, 1, False, True),
+        (True, 0, True, True),
+        (True, 0, False, False),
+    ],
+)
+def test_encoder_timing_callback_installation(enabled, rank, compiled, multimodal):
+    model = MultimodalModelMixin() if multimodal else SimpleNamespace(_encoder_forward_context=None)
+    model._encoder_forward_context = None
+    executor = SimpleNamespace(
+        model_engine=SimpleNamespace(model=SimpleNamespace(_orig_mod=model) if compiled else model),
+        enable_iter_perf_stats=enabled,
+        dist=SimpleNamespace(rank=rank),
+        perf_manager=MagicMock(),
+    )
+
+    PyExecutor._setup_encoder_perf_metrics(executor)
+
+    expected = (
+        executor.perf_manager.record_encoder_forward
+        if enabled and rank == 0 and multimodal
+        else None
+    )
+    assert model._encoder_forward_context == expected
 
 
 class _FakeEvent:
