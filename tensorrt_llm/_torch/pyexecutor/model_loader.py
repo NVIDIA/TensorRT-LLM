@@ -67,9 +67,17 @@ _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
-    "auto": "auto"
+    "auto": "auto",
+    # Mixed-precision KV: the retained tokens and attention use the second
+    # dtype. float16/bfloat16 leave the KV cache unquantized and must equal
+    # the model dtype (checked in validate_and_set_kv_cache_quant).
+    "mixed_nvfp4_fp8": QuantAlgo.FP8.value,
+    "mixed_nvfp4_float16": None,
+    "mixed_nvfp4_bfloat16": None,
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
+                          "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
+                          "mixed_nvfp4_bfloat16")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -205,6 +213,17 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             "Overriding KV cache quantization with an invalid type "
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
+
+    # An unquantized retained dtype has to be the model dtype; KVCacheManagerV2
+    # would otherwise reject it after the weights are loaded.
+    if mapped_pyt_quant is None:
+        retained_dtype = str_dtype_to_torch(
+            pyt_kv_cache_dtype.rsplit("_", 1)[1])
+        if model_config.torch_dtype != retained_dtype:
+            raise ValueError(
+                f'llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" keeps '
+                f"the retained tokens in {retained_dtype}, but the model dtype "
+                f"is {model_config.torch_dtype}.")
 
     # If we get to this point we have a valid explicit quantization setting.
     # Explicit kv_cache_dtype requests force override the checkpoint setting.
