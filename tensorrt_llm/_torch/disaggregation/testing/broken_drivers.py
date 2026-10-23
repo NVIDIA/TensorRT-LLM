@@ -39,6 +39,7 @@ from .memory_store import (
     MemoryDriver,
     MemoryOp,
     MemoryStore,
+    ObjectNotReady,
     _Registration,
     _scatter,
     _unstarted,
@@ -76,7 +77,10 @@ class MissTouchesTheDestination(MemoryDriver):
 
 class TruncatesLargerObjects(MemoryDriver):
     def _get_row(self, io: RowIO) -> RowResult:
-        stored = self.store.get(io.key)
+        try:
+            stored = self.store.get(io.key)
+        except ObjectNotReady:  # another writer's: a sound get answers that
+            return super()._get_row(io)
         if stored is not None and len(stored.payload) > io.nbytes:
             _scatter(io.spans, stored.payload[: io.nbytes])
             return _READY
@@ -85,7 +89,10 @@ class TruncatesLargerObjects(MemoryDriver):
 
 class TruncatesIntoMultiSpanRows(MemoryDriver):
     def _get_row(self, io: RowIO) -> RowResult:
-        stored = self.store.get(io.key)
+        try:
+            stored = self.store.get(io.key)
+        except ObjectNotReady:  # another writer's: a sound get answers that
+            return super()._get_row(io)
         if len(io.spans) > 1 and stored is not None and len(stored.payload) > io.nbytes:
             _scatter(io.spans, stored.payload[: io.nbytes])
             return _READY
@@ -115,18 +122,20 @@ class ClobbersItsSource(MemoryDriver):
 
 class OverwritesExistingObjects(MemoryDriver):
     def _put_row(self, io: RowIO) -> RowResult:
-        payload = b"".join(ctypes.string_at(span.address, span.nbytes) for span in io.spans)
-        self.store.overwrite(io.key, payload, self._trailer_for(io, payload))
+        if self.store.presence(io.key) is ProbeStatus.HIT:  # only an object that exists
+            payload = b"".join(ctypes.string_at(span.address, span.nbytes) for span in io.spans)
+            self.store.overwrite(io.key, payload, self._trailer_for(io, payload))
         return super()._put_row(io)
 
 
 class WritesTheWholeRegion(MemoryDriver):
+    """Clears the whole region a get row lies in, then delivers the row itself as it should."""
+
     def _get_row(self, io: RowIO) -> RowResult:
-        result = super()._get_row(io)
         for registration in self.live_registrations():
             if io.spans[0].within(registration.span):
                 ctypes.memset(registration.span.address, 0, registration.span.nbytes)
-        return result
+        return super()._get_row(io)
 
 
 class OrdersSpansByAddress(MemoryDriver):

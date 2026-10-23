@@ -46,10 +46,14 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT as CHECK_SLOT
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import DriverConformance
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("TRTLLM_MOONCAKE_REAL") != "1",
-    reason="needs a real Mooncake pool; set TRTLLM_MOONCAKE_REAL=1",
-)
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("TRTLLM_MOONCAKE_REAL") != "1",
+        reason="needs a real Mooncake pool; set TRTLLM_MOONCAKE_REAL=1",
+    ),
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
 DEVICES = os.environ.get("TRTLLM_MOONCAKE_DEVICES", "")

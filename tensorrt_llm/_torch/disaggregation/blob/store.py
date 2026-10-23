@@ -560,8 +560,9 @@ class StoreDriver(Protocol):
         access and for the driver's own background work, such as outstanding probes, to finish.
 
         One-way: after the first call the driver rejects new ``put``/``get`` for good, whatever
-        the result. Before it returns, every row no transfer has started concludes CANCELLED,
-        and an operation left with nothing running ends its access. Returns False at once when an operation that cannot
+        the result. Before it returns, every row the driver has not started working on (no
+        transfer or store call taken up) concludes CANCELLED, and an operation left with nothing
+        running ends its access. Returns False at once when an operation that cannot
         prove its end remains.
         True when nothing can still touch memory and nothing is left running; False means keep
         everything registered and try again. Never forces an end.

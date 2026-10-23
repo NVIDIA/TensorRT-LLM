@@ -63,7 +63,7 @@ from tensorrt_llm._torch.disaggregation.testing.host_memory import HostBuffer
 # The driver's workers run until it drains; ``driver_workers_return`` drains every driver a test
 # left open and waits for its workers, instead of the thread-leak check.
 # An exception that escapes a thread fails the test; a test that ends a thread on purpose
-# says so with its own mark.
+# requests the ``thread_escapes`` fixture.
 pytestmark = [
     pytest.mark.cpu_only,
     pytest.mark.threadleak(enabled=False),
@@ -597,18 +597,24 @@ def test_drain_waits_out_a_budget_of_any_size() -> None:
 
 
 @pytest.fixture
-def thread_escapes(monkeypatch: pytest.MonkeyPatch) -> list[BaseException]:
-    """The exceptions that end threads during a test that ends one on purpose. The test waits for
-    the escape it expects, so none reaches pytest's own hook, which would fail it."""
+def thread_escapes() -> Iterator[list[BaseException]]:
+    """Catches the exceptions that end threads while a test that ends one on purpose runs, and
+    checks afterwards that each was a ``SystemExit``. The hook is put back before the drivers are
+    drained, so an escape there still reaches pytest and fails the test."""
     escapes: list[BaseException] = []
-    monkeypatch.setattr(threading, "excepthook", lambda args: escapes.append(args.exc_value))
-    return escapes
+    pytest_hook = threading.excepthook
+    threading.excepthook = lambda args: escapes.append(args.exc_value)
+    try:
+        yield escapes
+    finally:
+        threading.excepthook = pytest_hook
+    assert all(isinstance(escape, SystemExit) for escape in escapes), escapes
 
 
-def escaped_by_system_exit(escapes: list[BaseException]) -> bool:
-    """Once a thread ended, whether every thread that ended did so by ``SystemExit``."""
+def wait_for_an_escape(escapes: list[BaseException]) -> None:
+    """Waits until a thread ended by an exception: a thread runs its excepthook only after the
+    driver saw it leave, so a test that ends a thread waits for this before it ends."""
     wait_until(lambda: escapes, "a thread to end by an exception")
-    return all(isinstance(escape, SystemExit) for escape in escapes)
 
 
 def test_a_part_whose_worker_thread_stops_faults_and_the_other_workers_go_on(
@@ -623,7 +629,7 @@ def test_a_part_whose_worker_thread_stops_faults_and_the_other_workers_go_on(
         ("ready", None),  # on the other worker
     ]
     assert not access_ended and bench.driver.access_unprovable(bench.last)
-    assert escaped_by_system_exit(thread_escapes)
+    wait_for_an_escape(thread_escapes)
 
 
 def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected(
@@ -642,7 +648,7 @@ def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected(
     assert bench.driver.access_unprovable(op)  # A's SDK call may still touch its slot
     with pytest.raises(DriverRejected, match="no worker thread is left"):
         bench.driver.get(bench.rows("A"))
-    assert escaped_by_system_exit(thread_escapes)
+    wait_for_an_escape(thread_escapes)
 
 
 def test_a_worker_that_cannot_start_stops_the_ones_already_started(
@@ -683,7 +689,7 @@ def test_drain_wakes_as_a_worker_thread_leaves_on_an_escape(
     started = time.monotonic()
     assert bench.driver.drain(WAIT_S) is True
     assert time.monotonic() - started < WAIT_S / 2  # woken as the thread left, not at the budget
-    assert escaped_by_system_exit(thread_escapes)
+    wait_for_an_escape(thread_escapes)
 
 
 # Answers to row results.
@@ -944,7 +950,7 @@ def test_the_sessions_of_a_put_its_worker_thread_left_stay_held(
     results, _ = bench.run("put", "A")  # the driver holds A's session: it starts no other
     assert summary(results) == [("not_ready", None)]
     assert bench.keys_of(PUT_START).count(key("A")) == 1
-    assert escaped_by_system_exit(thread_escapes)
+    wait_for_an_escape(thread_escapes)
 
 
 def test_a_key_another_put_of_this_driver_holds_is_not_ready_without_asking_the_sdk() -> None:

@@ -50,7 +50,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     attach_lender,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates KV cache pools")
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates KV cache pools"),
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 TPB = 32
 PROMPT = list(range(1000, 1097))  # three whole blocks and one token

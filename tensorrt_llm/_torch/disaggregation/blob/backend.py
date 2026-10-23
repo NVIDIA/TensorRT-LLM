@@ -174,8 +174,8 @@ class RegionBinding:
 
         Raises:
             ConstructionRejected: Nothing is registered and the hold is released: there is no region
-                to register, or a registration failed with nothing escaping and the earlier ones
-                were revoked.
+                to register, a region's layout is refused, or a registration failed with nothing
+                escaping and the earlier ones were revoked.
             RuntimeError: A registration may be live; the hold is kept.
         """
         if not self.served_region_indices:  # a backend that could serve no row

@@ -65,6 +65,7 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
     DEFAULT_CAPABILITIES,
     Commit,
     MemoryDriver,
+    MemoryOp,
     MemoryStore,
 )
 
@@ -868,6 +869,52 @@ def test_a_violation_told_during_the_hand_over_stops_the_rest_of_it(store: Memor
         writer.backend.publish(writer.view("A"), None)
 
 
+class BreaksItsProtocolDuringAPut(MemoryDriver):
+    """Controlled. A put of ``trigger_key`` first tells of the earlier operation ``victim`` on
+    another thread, with a poll one result short: a violation recorded while a submission is
+    being handed over."""
+
+    victim: MemoryOp | None = None
+    trigger_key: str | None = None
+    short = False
+
+    def poll(self, op):
+        results = super().poll(op)
+        return results[:-1] if self.short and op is self.victim else results
+
+    def put(self, rows, *, on_change=None):
+        op = super().put(rows, on_change=on_change)
+        if self.trigger_key in rows.keys():
+            self.short = True
+            teller = threading.Thread(target=self.victim.on_change, args=(self.victim,))
+            teller.start()
+            teller.join()
+        return op
+
+
+@keeps_backend_threads
+def test_calls_another_attempts_violation_cut_off_end_their_access(store: MemoryStore) -> None:
+    driver = BreaksItsProtocolDuringAPut(store, capabilities=ONE_ROW_PER_CALL, controlled=True)
+    writer = Endpoint(driver, ["X", "A", "B", "C"])
+    for name in "XABC":
+        writer.write(name, name.encode() * SLOT_BYTES)
+    first = writer.backend.publish(writer.view("X"), None)
+    driver.victim, driver.trigger_key = writer.op("X"), store_key("A")
+    second = writer.backend.publish(writer.view("A", "B", "C"), None)
+    assert store_calls(writer) == ["put", "put"]  # X, then A; B and C never reached the driver
+    op_a = writer.op("A")
+    driver.complete(op_a)
+    driver.end_access(op_a)
+    outcome = writer.wait_outcome(second)
+    assert masks(outcome) == [[True, False, False]]
+    assert "group 0 row 1: not handed over: the store driver broke its protocol" in outcome.fault
+    with pytest.raises(SubmissionRejected, match="broke its protocol"):
+        writer.backend.publish(writer.view("B"), None)
+    # B and C touched nothing, so the second attempt quiesces; only the first stays held.
+    writer.wait_quiesced(second)
+    assert writer.backend.shutdown(0) == frozenset({first.label, "region:0"})
+
+
 @keeps_backend_threads
 def test_a_log_line_that_blocks_never_holds_up_a_submission(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
@@ -901,6 +948,41 @@ def test_a_log_line_that_blocks_never_holds_up_a_submission(
     finally:
         let_the_log_go.set()
         marker.join(WAIT_S)
+
+
+@keeps_backend_threads
+def test_a_protocol_violation_is_logged_once_and_never_under_the_lock(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logged: list[str] = []
+    logging_now, let_the_log_go = threading.Event(), threading.Event()
+
+    def blocking_warning(message: str, *args, **kwargs) -> None:  # as a full log pipe would block
+        logged.append(message)
+        logging_now.set()
+        let_the_log_go.wait(10 * WAIT_S)  # outlasts the waits below
+
+    monkeypatch.setattr(backend_module.logger, "warning", blocking_warning)
+    writer = Endpoint(MemoryDriver(store), ["A", "B"])
+    writer.driver.fail("put", DriverRejected("busy"))
+    writer.wait_outcome(writer.backend.publish(writer.view("A"), None))
+    assert logged == []  # a refusal breaks no protocol
+    writer.driver.fail("put", RuntimeError("bug"))
+    violator = threading.Thread(
+        target=lambda: writer.backend.publish(writer.view("B"), None), daemon=True
+    )
+    violator.start()
+    try:
+        assert logging_now.wait(WAIT_S)
+        looked: list[object] = []
+        reader = threading.Thread(target=lambda: looked.append(writer.backend.stats()), daemon=True)
+        reader.start()
+        reader.join(WAIT_S)
+        assert looked, "the backend's lock was held while a violation was logged"
+    finally:
+        let_the_log_go.set()
+        violator.join(WAIT_S)
+    assert len(logged) == 1 and "broke its protocol" in logged[0]
 
 
 def test_a_wrong_row_count_after_the_access_end_was_recorded_leaves_the_call_provable(
