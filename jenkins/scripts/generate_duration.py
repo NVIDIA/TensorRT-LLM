@@ -36,6 +36,15 @@ _TURTLE_DIRECTIVE_RE = re.compile(r"(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_TEST_LIST_DIR = os.path.join(_REPO_ROOT, "tests", "integration", "test_lists", "test-db")
 
+# Per-cluster duration files live at <TEST_DURATIONS_DIR>/.<clusterKey>, relative
+# to the repo root. Keep in sync with TEST_DURATIONS_DIR in
+# jenkins/UpdateTestDurations.groovy.
+TEST_DURATIONS_DIR = "tests/integration/defs/test_durations"
+
+# A per-cluster file with fewer tests than this (after filtering) gives sharding
+# about as little timing data as no file at all, so it is not written.
+MIN_CLUSTER_TESTS = 10
+
 
 def normalize_test_spec(name):
     """Strip trailing turtle directives (TIMEOUT/ISOLATION), keep -k/-m flags."""
@@ -69,7 +78,7 @@ def load_test_list_specs(test_list_dir):
     return specs, yml_files
 
 
-def query_opensearch_durations(days):
+def query_opensearch_durations(days, cluster=None):
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,6 +93,16 @@ def query_opensearch_durations(days):
     after_key = None
     page = 0
 
+    # s_cluster records the full node-group host (e.g. "oci-hsg-cs-001"), which
+    # always starts with the short SlurmConfig clusterName (e.g. "oci-hsg").
+    # A prefix match on that clusterName scopes the query to a single cluster.
+    must_clauses = [
+        {"term": {"s_status": "PASSED"}},
+        {"range": {"ts_created": {"gte": since_ms}}},
+    ]
+    if cluster:
+        must_clauses.append({"prefix": {"s_cluster": cluster}})
+
     while True:
         composite_agg = {
             "size": 1000,
@@ -96,10 +115,7 @@ def query_opensearch_durations(days):
             "size": 0,
             "query": {
                 "bool": {
-                    "must": [
-                        {"term": {"s_status": "PASSED"}},
-                        {"range": {"ts_created": {"gte": since_ms}}},
-                    ],
+                    "must": must_clauses,
                     "must_not": [{"term": {"s_turtle_name": "Stage Failed"}}],
                 }
             },
@@ -152,16 +168,17 @@ def main():
     parser.add_argument(
         "--duration-file",
         type=str,
-        default="new_test_duration.json",
-        help="Path to the output duration file (default: new_test_duration.json)",
+        default=None,
+        help="Path to the output duration file. Defaults to "
+        f"{TEST_DURATIONS_DIR}/.<cluster> (relative to the "
+        "repo root) when --cluster is set, otherwise new_test_duration.json.",
     )
     parser.add_argument(
         "--cluster",
         type=str,
         default=None,
-        help="Cluster name (e.g. 'aws_dfw').  When set, writes "
-        "tests/integration/defs/.test_durations_<cluster> relative to the "
-        "repo root instead of --duration-file.",
+        help="SlurmConfig clusterName (e.g. 'oci-hsg') to scope the OpenSearch "
+        "query to, via a prefix match on s_cluster.",
     )
     parser.add_argument(
         "--days",
@@ -185,17 +202,30 @@ def main():
     )
     args = parser.parse_args()
 
-    # Resolve output path
-    if args.cluster:
-        NEW_TEST_DURATION = os.path.join(
-            _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{args.cluster}"
-        )
-    else:
+    # Resolve output path. clusterKey mirrors the sanitization L0_Test.groovy
+    # applies to SlurmPartition.clusterName when it names the per-cluster file
+    # (non-alphanumeric chars -> "_").
+    if args.duration_file:
         NEW_TEST_DURATION = args.duration_file
+    elif args.cluster:
+        cluster_key = re.sub(r"[^a-zA-Z0-9]", "_", args.cluster)
+        NEW_TEST_DURATION = os.path.join(_REPO_ROOT, TEST_DURATIONS_DIR, f".{cluster_key}")
+    else:
+        NEW_TEST_DURATION = "new_test_duration.json"
 
-    print(f"Querying OpenSearch for last {args.days} day(s)...")
-    test_durations = query_opensearch_durations(args.days)
+    print(
+        f"Querying OpenSearch for last {args.days} day(s)..."
+        + (f" (cluster: {args.cluster})" if args.cluster else "")
+    )
+    test_durations = query_opensearch_durations(args.days, cluster=args.cluster)
     raw_count = len(test_durations)
+
+    if args.cluster and raw_count == 0:
+        print(
+            f"No OpenSearch records for cluster '{args.cluster}'; "
+            f"cluster is not in use, skipping file generation."
+        )
+        return
 
     # Filter against the turtle test-db lists: an aggregated turtle name may be
     # a stale entry or a subtest that is no longer scheduled.  Keep only names
@@ -219,6 +249,17 @@ def main():
             }
             dropped = raw_count - len(filtered)
             test_durations = filtered
+
+    # Check what will actually reach disk: the filter above can empty (or nearly
+    # empty) a cluster whose raw OpenSearch records are all stale or unscheduled.
+    # Callers treat an existing file as a live cluster, so skip writing instead.
+    if args.cluster and len(test_durations) < MIN_CLUSTER_TESTS:
+        print(
+            f"Only {len(test_durations)} test(s) remain for cluster '{args.cluster}' "
+            f"after filtering ({raw_count} from query, {dropped} dropped); "
+            f"need at least {MIN_CLUSTER_TESTS}. Skipping file generation."
+        )
+        return
 
     with open(NEW_TEST_DURATION, "w") as file:
         json.dump(test_durations, file, indent=3)
