@@ -842,7 +842,6 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
         enable_attention_dp=False,
     )
 
-    cache_config._rank_info_auth_key = b"test-rank-info-auth-key"
     KvCacheTransceiverV2(
         mapping=mapping,
         dist=Mock(),

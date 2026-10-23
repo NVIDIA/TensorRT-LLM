@@ -106,13 +106,11 @@ _RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
 _RANK_INFO_CHALLENGE_TTL_S = 60.0
 
 
-def _require_rank_info_auth_key(key: Optional[bytes]) -> bytes:
-    if not isinstance(key, bytes) or not key:
+def _validate_rank_info_auth_key(key: Optional[bytes]) -> Optional[bytes]:
+    if key is not None and (not isinstance(key, bytes) or not key):
         raise ValueError(
-            "Native RankInfo authentication requires a shared key. Configure the same "
-            "internal_request_auth_key on all context, generation, and proxy servers; "
-            "programmatic callers must provision CacheTransceiverConfig._rank_info_auth_key "
-            "before creating their LLMs."
+            "RankInfo authentication keys must be nonempty bytes when configured; "
+            "use the same internal_request_auth_key on communicating peers"
         )
     return key
 
@@ -2626,7 +2624,7 @@ class Receiver(ReceiverBase):
         # Internal component gate only. Production wiring is added after the
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
-        self._rank_info_auth_key = _require_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -3053,35 +3051,46 @@ class Receiver(ReceiverBase):
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
-                challenge = messenger.receive()
-                if challenge == [MessageType.AUTHENTICATION_ERROR]:
-                    raise RankInfoAuthenticationError(
-                        "RankInfo authentication challenge unavailable: server is busy; retry the request"
-                    )
-                if (
-                    len(challenge) != 2
-                    or challenge[0] != MessageType.AUTHENTICATION_CHALLENGE
-                    or len(challenge[1]) != _RANK_INFO_NONCE_BYTES
-                ):
-                    raise RankInfoAuthenticationError(
-                        "Invalid RankInfo authentication challenge: context and generation "
-                        "workers must use compatible versions supporting RankInfo authentication"
-                    )
-                nonce = challenge[1]
-                messenger.send(
-                    [
-                        MessageType.REQUEST_INSTANCE_INFO,
-                        nonce,
-                        _rank_info_auth_tag(self._rank_info_auth_key, info_endpoint, nonce),
-                    ]
-                )
                 message = messenger.receive()
                 if message == [MessageType.AUTHENTICATION_ERROR]:
                     raise RankInfoAuthenticationError(
-                        "RankInfo authentication failed: challenge expired or proof rejected; retry the request "
-                        "and verify the same internal_request_auth_key is configured "
-                        "on all context, generation, and proxy servers"
+                        "RankInfo authentication challenge unavailable: server is busy; retry the request"
                     )
+                if self._rank_info_auth_key is None:
+                    if message and message[0] == MessageType.AUTHENTICATION_CHALLENGE:
+                        raise RankInfoAuthenticationError(
+                            "Context peer requires RankInfo authentication: configure the same "
+                            "internal_request_auth_key on communicating peers"
+                        )
+                    if len(message) != 1:
+                        raise RankInfoAuthenticationError(
+                            "Invalid unauthenticated RankInfo response"
+                        )
+                else:
+                    if (
+                        len(message) != 2
+                        or message[0] != MessageType.AUTHENTICATION_CHALLENGE
+                        or len(message[1]) != _RANK_INFO_NONCE_BYTES
+                    ):
+                        raise RankInfoAuthenticationError(
+                            "Invalid RankInfo authentication challenge: both peers must enable "
+                            "authentication with matching internal_request_auth_key values and "
+                            "use compatible versions"
+                        )
+                    nonce = message[1]
+                    messenger.send(
+                        [
+                            MessageType.REQUEST_INSTANCE_INFO,
+                            nonce,
+                            _rank_info_auth_tag(self._rank_info_auth_key, info_endpoint, nonce),
+                        ]
+                    )
+                    message = messenger.receive()
+                    if message == [MessageType.AUTHENTICATION_ERROR]:
+                        raise RankInfoAuthenticationError(
+                            "RankInfo authentication failed: challenge expired or proof rejected; "
+                            "retry the request and verify matching internal_request_auth_key values"
+                        )
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
@@ -4016,7 +4025,7 @@ class RankInfoServer:
         rank_info_auth_key: Optional[bytes] = None,
     ):
         self._rank_info = rank_info
-        self._rank_info_auth_key = _require_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
         self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
@@ -4024,6 +4033,11 @@ class RankInfoServer:
         else:
             endpoint = f"tcp://{addr}:{port}"
         self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint)
+        if self._rank_info_auth_key is None:
+            logger.warning(
+                "Native RankInfo authentication is disabled: internal_request_auth_key is not "
+                "configured, so REQUEST_INSTANCE_INFO returns transfer metadata without authentication"
+            )
         self._start_listener()
 
     @property
@@ -4056,6 +4070,15 @@ class RankInfoServer:
         self._messenger.start_listener(handle_message)
 
     def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
+        if self._rank_info_auth_key is None:
+            response = (
+                self._rank_info.to_bytes()
+                if len(message) == 1
+                else MessageType.AUTHENTICATION_ERROR
+            )
+            self._messenger.send([send_id, response])
+            return
+
         now = time.monotonic()
         # Entries stay in creation order; repeated requests do not extend their lifetime.
         while self._rank_info_auth_challenges:
@@ -4177,7 +4200,7 @@ class TransferWorkerConfig:
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
-        self._rank_info_auth_key = _require_rank_info_auth_key(config.rank_info_auth_key)
+        self._rank_info_auth_key = _validate_rank_info_auth_key(config.rank_info_auth_key)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len

@@ -41,8 +41,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 
-RANK_INFO_AUTH_KEY = b"test-rank-info-auth-key"
-
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
@@ -223,7 +221,6 @@ def worker_fn(
                 kv_cache_manager=kv_cache_manager,
                 device_id=device_id,
                 instance_name=ctx_instance_name,
-                rank_info_auth_key=RANK_INFO_AUTH_KEY,
                 max_concurrent_sessions=max_batch_size * 2,
             )
         )
@@ -286,7 +283,6 @@ def worker_fn(
                 kv_cache_manager=kv_cache_manager,
                 device_id=device_id,
                 instance_name=gen_instance_name,
-                rank_info_auth_key=RANK_INFO_AUTH_KEY,
                 max_concurrent_sessions=max_batch_size * 2,
             )
         )
