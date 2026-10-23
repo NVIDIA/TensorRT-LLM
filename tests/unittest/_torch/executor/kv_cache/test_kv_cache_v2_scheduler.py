@@ -5137,6 +5137,23 @@ class TestPregrownContextCapacity:
         assert req.context_chunk_size == 512  # not the full 1024 budget
         mgr.resize_context.assert_called_once_with(req, 512)
 
+    def test_mm_alignment_does_not_resize_the_pregrown_chunk(self):
+        import torch
+
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        # A bidirectional MM block across the pre-grown end would snap the chunk up to 640.
+        mask = torch.zeros(1_024 + 10_000, dtype=torch.int64)
+        mask[1_024 + 448 : 1_024 + 600] = 1
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": mask.cumsum(0, dtype=torch.int64),
+            "mm_bidirectional_blocks": True,
+        }
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 512
+        mgr.resize_context.assert_called_once_with(req, 512)
+
     def test_skipped_when_the_budget_cannot_cover_it(self):
         sched, mgr = self._make()
         first = self._req(mgr, 0, 10_000, kv_start=1_024, grown=768)

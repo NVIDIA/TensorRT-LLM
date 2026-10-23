@@ -1111,9 +1111,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             # suspended either, to avoid pathological suspend/resume cycles.
             return ScheduleAction.SKIP, 0, False
 
-        chunk_size = self._align_chunk_to_mm_block(
-            req, chunk_size, remaining_budget, context_remaining
-        )
+        # A pre-grown chunk was MM-aligned from this same position when it was
+        # first sized, and either snap direction would break the exact replay.
+        if pregrown == 0:
+            chunk_size = self._align_chunk_to_mm_block(
+                req, chunk_size, remaining_budget, context_remaining
+            )
         # Alignment returns 0 when neither snap-up nor snap-down can preserve
         # bidirectional MM attention this iteration — defer the request rather
         # than schedule a chunk that would corrupt attention. Next iteration

@@ -30,7 +30,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ConversationAwareADPRouter,
     RankState,
 )
-from tensorrt_llm._utils import get_steady_clock_now_in_seconds
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -999,7 +999,8 @@ async def test_gen_request_carries_orig_elapsed(monkeypatch, schedule_style):
         )
     )
     hooks = mock.Mock()
-    hooks.request_arrival_time = get_steady_clock_now_in_seconds() - 5.0
+    # ServerArrivalTimeMiddleware stamps arrivals on the global steady clock.
+    hooks.request_arrival_time = get_global_steady_clock_now_in_seconds() - 5.0
 
     await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"), hooks)
 
@@ -1024,7 +1025,7 @@ async def test_gen_request_carries_orig_elapsed(monkeypatch, schedule_style):
 
 
 def test_orig_elapsed_arrival_fallback():
-    before = get_steady_clock_now_in_seconds()
+    before = get_global_steady_clock_now_in_seconds()
     assert OpenAIDisaggregatedService._get_arrival_time(None) >= before
     assert OpenAIDisaggregatedService._get_arrival_time(mock.Mock()) >= before
     hooks = SimpleNamespace(request_arrival_time=12.5)

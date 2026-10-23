@@ -16,7 +16,7 @@ import asyncio
 import os
 from typing import Callable, Optional
 
-from tensorrt_llm._utils import get_steady_clock_now_in_seconds
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
@@ -224,11 +224,11 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     @staticmethod
     def _get_arrival_time(hooks: Optional[ResponseHooks]) -> float:
-        """The HTTP middleware's steady-clock arrival stamp, else now."""
+        """The HTTP middleware's arrival stamp, else now, on its global steady clock."""
         arrival_time = getattr(hooks, "request_arrival_time", None)
         if isinstance(arrival_time, (int, float)) and arrival_time > 0:
             return float(arrival_time)
-        return get_steady_clock_now_in_seconds()
+        return get_global_steady_clock_now_in_seconds()
 
     @staticmethod
     def _stamp_orig_elapsed(gen_req: UCompletionRequest, arrival_time: float) -> None:
@@ -236,7 +236,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         params = gen_req.disaggregated_params
         if params is None:
             return
-        params.orig_elapsed_s = max(0.0, get_steady_clock_now_in_seconds() - arrival_time)
+        params.orig_elapsed_s = max(0.0, get_global_steady_clock_now_in_seconds() - arrival_time)
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response:
