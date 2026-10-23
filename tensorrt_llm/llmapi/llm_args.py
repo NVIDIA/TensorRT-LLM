@@ -7075,12 +7075,13 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
             )
-        if self.attn_backend not in ("TRTLLM", "FLASHINFER"):
-            raise NotImplementedError(
+        # get_attention_backend matches the name case-insensitively.
+        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+            raise ValueError(
                 "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
                 f"backends; got attn_backend={self.attn_backend!r}.")
         if self.sparse_attention_config is not None:
-            raise NotImplementedError(
+            raise ValueError(
                 "Mixed-precision KV is not supported together with sparse attention."
             )
         if (self.speculative_config is not None

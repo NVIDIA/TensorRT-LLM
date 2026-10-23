@@ -676,8 +676,8 @@ def test_mixed_precision_public_options():
             ValueError,
             "use_kv_cache_manager_v2=True",
         ),
-        ({"attn_backend": "VANILLA"}, NotImplementedError, "TRTLLM and FLASHINFER"),
-        ({"sparse_attention_config": {"algorithm": "rocket"}}, NotImplementedError, "sparse"),
+        ({"attn_backend": "vanilla"}, ValueError, "TRTLLM and FLASHINFER"),
+        ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse"),
         (
             {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 2}},
             ValueError,
@@ -704,6 +704,20 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
     kwargs.update(overrides)
     with pytest.raises(error, match=match):
         TorchLlmArgs(**kwargs)
+
+
+@pytest.mark.parametrize("backend", ["flashinfer", "FLASHINFER", "trtllm"])
+@pytest.mark.cpu_only
+def test_mixed_precision_llm_args_backend_name_is_case_insensitive(backend):
+    """The dispatcher upper-cases the backend name, so the validator must too."""
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    args = TorchLlmArgs(
+        model="/tmp/mixed-precision-nonexistent-model",
+        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
+        attn_backend=backend,
+    )
+    assert args.attn_backend == backend
 
 
 @pytest.mark.parametrize(
