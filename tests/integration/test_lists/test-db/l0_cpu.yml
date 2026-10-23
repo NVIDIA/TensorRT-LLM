@@ -175,6 +175,9 @@ l0_cpu:
   - unittest/llmapi/test_mpi_session.py ISOLATION
   - unittest/llmapi/test_mpi_server_lifecycle.py
   - unittest/llmapi/test_mpi_launcher_shutdown.py
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_rank_info_key_is_carried_by_transceiver_config
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_rank_info_key_is_shared_with_mpi_ranks_and_spawned_client
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_grpc_cli_propagates_rank_info_key
   - unittest/llmapi/test_disagg_leader_lifecycle.py
   - unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or worker_system_exit-2 or mixed_collective-4 or all_hang-2 or reuse-2 or sync_recovery-2 or async_drain-2" ISOLATION
   - unittest/llmapi/test_reasoning_parser.py

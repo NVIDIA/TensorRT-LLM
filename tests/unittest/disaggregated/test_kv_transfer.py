@@ -627,6 +627,7 @@ def create_transfer_worker_setup(
         ctx_transfer_workers.append(
             TransferWorker(
                 TransferWorkerConfig(
+                    rank_info_auth_key=b"test-rank-info-auth-key",
                     kv_cache_manager=ctx_kv_cache_manager,
                     device_id=device_id,
                     instance_name=ctx_instance_name,
@@ -743,6 +744,7 @@ def create_transfer_worker_setup(
         gen_transfer_workers.append(
             TransferWorker(
                 TransferWorkerConfig(
+                    rank_info_auth_key=b"test-rank-info-auth-key",
                     kv_cache_manager=gen_kv_cache_manager,
                     device_id=device_id,
                     instance_name=gen_instance_name,

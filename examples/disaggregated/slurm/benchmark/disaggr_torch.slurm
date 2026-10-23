@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 # Parse named arguments
@@ -57,7 +59,7 @@ replace_placeholder() {
     file_path="$1"
     all_nodes_str="$2"
     new_file_path="$3"
-    cp "$file_path" "$new_file_path"
+    cp --remove-destination --preserve=mode "$file_path" "$new_file_path"
     IFS=',' read -r -a node_array <<< "$all_nodes_str"
     for i in "${!node_array[@]}"; do
         current_val="${node_array[$i]}"

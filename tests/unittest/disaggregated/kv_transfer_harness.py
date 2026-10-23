@@ -231,6 +231,8 @@ def run_concurrent(items, fn):
 
 def _create_transceiver_in_thread(rank, mapping, cache_manager, dist_mock, config, results, errors):
     """Thread target: create one KvCacheTransceiverV2."""
+    config = config.model_copy(deep=True)
+    config._rank_info_auth_key = b"test-rank-info-auth-key"
     try:
         tc = KvCacheTransceiverV2(
             mapping=mapping,
