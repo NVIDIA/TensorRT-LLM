@@ -17,11 +17,14 @@
 
 import itertools
 import json
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from diffusers import MiniMaxH3Scheduler
 from PIL import Image
 
@@ -781,6 +784,82 @@ def test_single_rank_keyframe_encoding_does_not_broadcast(monkeypatch: pytest.Mo
     monkeypatch.setattr(pipeline, "_broadcast_tensor_from_rank0", unexpected_broadcast)
     assert MiniMaxH3Pipeline._encode_prompt(pipeline, "test", keyframes) is expected
     assert calls == [("test", keyframes)]
+
+
+def _text_encoder_failure_worker(rank: int, init_method: str) -> None:
+    dist.init_process_group(
+        "gloo", init_method=init_method, rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    try:
+        pipeline = _SyntheticMiniMaxH3Pipeline()
+        pipeline.pipeline_config.torch_dtype = torch.float32
+        original_broadcast = pipeline._broadcast_tensor_from_rank0
+        expected = torch.full((1, 2, 4), 3.0)
+        tags = torch.zeros(2, dtype=torch.long)
+
+        for reference_path in (False, True):
+            for encoder_tp, failing_rank in ((1, 0), (2, 1)):
+                pipeline.text_encoder_tp_size = encoder_tp
+                local_error = ValueError("injected encoder failure")
+                failing = True
+                encode_calls = []
+                broadcast_calls = []
+
+                def encode(*args):
+                    encode_calls.append(rank)
+                    if failing and rank == failing_rank:
+                        raise local_error
+                    return expected if reference_path else (expected, tags)
+
+                def broadcast(tensor, *, dtype):
+                    broadcast_calls.append(dtype)
+                    return original_broadcast(tensor, dtype=dtype)
+
+                pipeline._encode_prompt_local = encode
+                pipeline._encode_text_tokens = encode
+                pipeline._broadcast_tensor_from_rank0 = broadcast
+
+                def run_encode():
+                    if reference_path:
+                        return pipeline._encode_reference_text_tokens([11, 12], {})
+                    return MiniMaxH3Pipeline._encode_prompt(pipeline, "test", [])[0]
+
+                with pytest.raises(
+                    RuntimeError, match=f"text encoding failed on rank {failing_rank}"
+                ) as error:
+                    run_encode()
+                assert error.value.__cause__ is (local_error if rank == failing_rank else None)
+                assert not broadcast_calls
+                assert encode_calls == ([rank] if rank < encoder_tp else [])
+
+                # Request handling catches the error and keeps workers alive.
+                # A second request must complete on the same process group.
+                failing = False
+                torch.testing.assert_close(run_encode(), expected)
+                assert broadcast_calls == (
+                    [torch.float32] if reference_path else [torch.float32, torch.long]
+                )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_text_encoder_failures_reach_all_ranks_and_allow_next_request(tmp_path: Path) -> None:
+    mp.spawn(
+        _text_encoder_failure_worker,
+        args=((tmp_path / "encoder-error-group").as_uri(),),
+        nprocs=4,
+        join=True,
+    )
+
+
+def test_single_rank_text_encoder_error_is_preserved() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    error = ValueError("injected tokenizer failure")
+    with pytest.raises(ValueError) as raised:
+        with pipeline._coordinate_text_encoder_errors():
+            raise error
+    assert raised.value is error
 
 
 def test_tensor_parallel_text_encoder_encode_does_not_require_hf_config() -> None:

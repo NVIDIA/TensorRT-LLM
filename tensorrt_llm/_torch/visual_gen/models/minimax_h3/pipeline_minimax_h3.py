@@ -752,8 +752,9 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         prompt_embeds: torch.Tensor | None = None
         text_token_tags: torch.Tensor | None = None
-        if self._loads_text_encoder_on_this_rank:
-            prompt_embeds, text_token_tags = self._encode_prompt_local(prompt, keyframes)
+        with self._coordinate_text_encoder_errors():
+            if self._loads_text_encoder_on_this_rank:
+                prompt_embeds, text_token_tags = self._encode_prompt_local(prompt, keyframes)
 
         prompt_embeds = self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
         text_token_tags = self._broadcast_tensor_from_rank0(text_token_tags, dtype=torch.long)
@@ -766,6 +767,32 @@ class MiniMaxH3Pipeline(BasePipeline):
     @property
     def _loads_text_encoder_on_this_rank(self) -> bool:
         return self.rank < self.text_encoder_tp_size
+
+    @contextmanager
+    def _coordinate_text_encoder_errors(self) -> Iterator[None]:
+        """Propagate caught encoding failures before peers enter payload broadcasts."""
+        if self.world_size == 1 or not dist.is_initialized():
+            yield
+            return
+
+        # Allocate before encoding so an encoder OOM does not prevent reporting it.
+        failed_rank = torch.zeros(1, dtype=torch.int32, device=self.device)
+        local_error: Exception | None = None
+        try:
+            yield
+        except Exception as error:
+            local_error = error
+            failed_rank.fill_(self.rank + 1)
+
+        # This coordinates Python failures only; failed TP collectives still
+        # require distributed worker teardown.
+        dist.all_reduce(failed_rank, op=dist.ReduceOp.MAX)
+        failed_rank_id = int(failed_rank.item()) - 1
+        if failed_rank_id >= 0:
+            message = f"MiniMax-H3 text encoding failed on rank {failed_rank_id}"
+            if local_error is not None:
+                message += f": {local_error}"
+            raise RuntimeError(message) from local_error
 
     def _broadcast_tensor_from_rank0(
         self,
@@ -864,8 +891,9 @@ class MiniMaxH3Pipeline(BasePipeline):
             return self._encode_text_tokens(token_ids, vision_inputs)
 
         prompt_embeds: torch.Tensor | None = None
-        if self._loads_text_encoder_on_this_rank:
-            prompt_embeds = self._encode_text_tokens(token_ids, vision_inputs)
+        with self._coordinate_text_encoder_errors():
+            if self._loads_text_encoder_on_this_rank:
+                prompt_embeds = self._encode_text_tokens(token_ids, vision_inputs)
         return self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
 
     def _encode_text_tokens(
