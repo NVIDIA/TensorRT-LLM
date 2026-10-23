@@ -73,9 +73,10 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, maybe_prefetch_mm_encoder_for_next_iter)
+from ..models.modeling_multimodal_mixin import \
+    maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
+from ..models.multimodal import is_multimodal_model
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..moe.expert_statistic import ExpertStatistic
@@ -1651,8 +1652,8 @@ class PyExecutor:
         model = getattr(self.model_engine.model, "_orig_mod",
                         self.model_engine.model)
         if (self.enable_iter_perf_stats and self.dist.rank == 0
-                and isinstance(model, MultimodalModelMixin)):
-            model._encoder_forward_context = self.perf_manager.record_encoder_forward
+                and is_multimodal_model(model)):
+            model.encoder_forward_context = self.perf_manager.record_encoder_forward
 
     @property
     def is_generation_model(self) -> bool:

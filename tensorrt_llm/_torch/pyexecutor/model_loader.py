@@ -56,9 +56,9 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
+from ..models.multimodal import is_multimodal_model
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
@@ -1981,7 +1981,7 @@ class ModelLoader:
         Roots without a registered profile keep the target-model scope without
         querying `language_model`; qualification rejects them by root class.
         """
-        if not isinstance(model, MultimodalModelMixin):
+        if not is_multimodal_model(model):
             return PostTransformTransferScope.TARGET_MODEL
         root_model_class = type(model)
         if not any(

@@ -25,8 +25,8 @@ pytestmark = pytest.mark.cpu_only
     ],
 )
 def test_encoder_timing_callback_installation(enabled, rank, compiled, multimodal):
-    model = MultimodalModelMixin() if multimodal else SimpleNamespace(_encoder_forward_context=None)
-    model._encoder_forward_context = None
+    model = MultimodalModelMixin() if multimodal else SimpleNamespace(encoder_forward_context=None)
+    model.encoder_forward_context = None
     executor = SimpleNamespace(
         model_engine=SimpleNamespace(model=SimpleNamespace(_orig_mod=model) if compiled else model),
         enable_iter_perf_stats=enabled,
@@ -41,7 +41,7 @@ def test_encoder_timing_callback_installation(enabled, rank, compiled, multimoda
         if enabled and rank == 0 and multimodal
         else None
     )
-    assert model._encoder_forward_context == expected
+    assert model.encoder_forward_context == expected
 
 
 class _FakeEvent:

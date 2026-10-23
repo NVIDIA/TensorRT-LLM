@@ -17,6 +17,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.models.multimodal import get_multimodal_data_device_paths
 from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -1392,7 +1393,7 @@ class DecoderInputPreparer:
                 "multimodal_data",
                 "cuda",
                 pin_memory=prefer_pinned(),
-                target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
+                target_keywords=get_multimodal_data_device_paths(self.model),
             )
             if _use_mrope:
                 # A request may carry multimodal content but no MRoPE
