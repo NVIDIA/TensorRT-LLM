@@ -17,6 +17,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -26,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import binding_to_str_dtype
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -45,6 +48,16 @@ LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
+
+
+def _text_lora_model_config(model_config: ModelConfigCpp) -> LoraModelConfig:
+    return LoraModelConfig(
+        lora_target_modules=[],
+        trtllm_modules_to_hf_modules={},
+        hidden_size=model_config.hidden_size,
+        dtype=binding_to_str_dtype(model_config.data_type),
+        owner=DecoderLoraOwner(),
+    )
 
 
 def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
@@ -495,6 +508,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         self.assertTrue(peft_cache_manager.impl.enabled)
@@ -509,6 +523,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=self.create_peft_cache_config(),
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
             initial_data_type=torch.float8_e4m3fn,
         )
 
@@ -522,6 +537,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 0
@@ -540,6 +556,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         empty_context = []
@@ -556,6 +573,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 3
@@ -590,6 +608,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 0
@@ -1231,6 +1250,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
             execution_stream=execution_stream,
         )
 
