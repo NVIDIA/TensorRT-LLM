@@ -2247,5 +2247,108 @@ def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
         _shutdown_transfer_worker_setup(healthy)
 
 
+def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, prompt_len, tpb):
+    """Run Sender._build_kv_write_meta for one Helix receiver; return (src, dst) block pairs.
+
+    Block ids stand in for region pointers, so each emitted fragment pair is the
+    (sender block, receiver block) the real routing selected.
+    """
+    peer_ri = SimpleNamespace(
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        dp_rank=0,
+        device_id=0,
+        instance_name="gen",
+        instance_rank=cp_rank,
+        self_endpoint="gen-endpoint",
+    )
+    self_ri = SimpleNamespace(cp_size=1, cp_rank=0)
+
+    class _BlockExtractor:
+        def __init__(self, kind):
+            self.page_table = SimpleNamespace(
+                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=kind)}
+            )
+
+        def extract(self, block_ids, layer_group, pool_idx):
+            return np.asarray(block_ids, dtype=np.int64)
+
+    class _IdentityMapper:
+        def map(self, src_region, dst_region):
+            return SimpleNamespace(
+                src=SimpleNamespace(memory=SimpleNamespace(ptrs=src_region, bytes_per_region=1)),
+                dst=SimpleNamespace(memory=SimpleNamespace(ptrs=dst_region)),
+            )
+
+    registrar = SimpleNamespace(
+        self_rank_info=self_ri,
+        self_extractor=_BlockExtractor(CacheKind.PAGED),
+        get_peer_rank_info=lambda name, rank: peer_ri,
+        get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
+        peer_extractor=lambda name, rank: _BlockExtractor(CacheKind.PAGED),
+        get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
+        should_send_pool=lambda targets, ri, lg, pi: True,
+        get_kv_map=lambda ri, src, dst: _IdentityMapper(),
+    )
+    task = SimpleNamespace(
+        _chunk=SimpleNamespace(
+            token_range=SimpleNamespace(start=0, end=prompt_len),
+            block_ids_per_layer_groups={0: np.asarray(src_table, dtype=np.int64)},
+            excluded_pool_views=(),
+            is_last=True,
+        ),
+        _prompt_len=prompt_len,
+        _perf_timer=None,
+        _unique_rid=1,
+        slice_id=0,
+    )
+    req_info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=cp_rank,
+        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
+        dst_start_token=None,
+        slice_id=0,
+        bounce_dst_base=None,
+    )
+    meta = transfer_mod.Sender._build_kv_write_meta(
+        SimpleNamespace(_registrar=registrar), task, req_info
+    )
+    return list(zip(meta.src_ptrs.tolist(), meta.dst_ptrs.tolist()))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("prompt_len", [863, 1030, 1401])
+def test_helix_windowed_hp_tail_routes_to_last_page_owner(prompt_len):
+    """A windowed (HP tail ring) block reaches only the Helix rank owning its ordinal.
+
+    The context side holds just the last pages of a windowed layer group, as a
+    positional table with -1 holes. Every Helix generation rank owns the global
+    block ordinals congruent to its CP rank; the last page must land on rank
+    ``(num_blocks - 1) % cp_size`` at local ordinal ``(num_blocks - 1) // cp_size``.
+    """
+    tpb, cp_size, window = 128, 8, 21
+    num_blocks = (prompt_len + tpb - 1) // tpb
+    first_held = max(0, (prompt_len - window) // tpb)
+    src_table = [1000 + o if o >= first_held else -1 for o in range(num_blocks)]
+    routed = {}
+    for cp_rank in range(cp_size):
+        num_local = len(range(cp_rank, num_blocks, cp_size))
+        dst_table = [5000 + cp_rank * 100 + local for local in range(num_local)]
+        routed[cp_rank] = _helix_kv_write_meta_block_pairs(
+            src_table, dst_table, cp_rank, cp_size, prompt_len, tpb
+        )
+
+    for cp_rank, pairs in routed.items():
+        expected = [
+            (1000 + o, 5000 + cp_rank * 100 + o // cp_size)
+            for o in range(first_held, num_blocks)
+            if o % cp_size == cp_rank
+        ]
+        assert pairs == expected
+    last = num_blocks - 1
+    owner = last % cp_size
+    assert (1000 + last, 5000 + owner * 100 + last // cp_size) in routed[owner]
+
+
 if __name__ == "__main__":
     test_transfer_worker_v2(1, 1, False, 1, 1, False, False)
