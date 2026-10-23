@@ -831,6 +831,8 @@ class ModelLoader:
             'trust_remote_code': llm_args.trust_remote_code,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
+        if llm_args.model_kwargs is not None:
+            config_kwargs['model_kwargs'] = llm_args.model_kwargs
         if llm_args.parallel_config:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
