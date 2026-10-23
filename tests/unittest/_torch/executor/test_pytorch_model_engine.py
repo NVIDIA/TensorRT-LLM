@@ -6,7 +6,7 @@ import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 import torch
@@ -2752,6 +2752,59 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 "cudagraph dummy leaked out of pad_batch's finally")
 
         kv_cache_manager.shutdown()
+
+    def _warmup_request_split(self, num_locality_domains):
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.side_effect = (
+            lambda key: kv_cache_manager
+            if key == model_engine.kv_cache_manager_key else None)
+
+        kv_cache_manager.get_num_free_blocks = Mock(return_value=8)
+        kv_cache_manager.max_seq_len = 2048
+        kv_cache_manager.get_num_available_tokens = Mock(return_value=100)
+
+        # update_draft_len() runs over the returned requests: it measures
+        # py_draft_tokens and or-assigns py_needs_onehot_draft_probs, so the
+        # stand-ins need real values rather than auto-created Mock attributes.
+        def _dummy_request():
+            return Mock(py_draft_tokens=[], py_needs_onehot_draft_probs=False)
+
+        num_long = min(num_locality_domains, 4)
+        kv_cache_manager.add_dummy_requests = Mock(side_effect=[
+            [_dummy_request() for _ in range(4 - num_long)],
+            [_dummy_request() for _ in range(num_long)],
+        ])
+        try:
+            with patch.object(KVCacheManagerV2,
+                              "num_locality_domains",
+                              new_callable=PropertyMock,
+                              return_value=num_locality_domains):
+                model_engine._runner._dummy_requests.create_cuda_graph_warmup_request(
+                    resource_manager,
+                    batch_size=4,
+                    draft_len=0,
+                    max_seq_len=512)
+            return kv_cache_manager.add_dummy_requests.call_args_list
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_cuda_graph_warmup_request_split(self):
+        short_call, long_call = self._warmup_request_split(1)
+        self.assertEqual(short_call.args[0], [0, 1, 2])
+        self.assertNotIn("locality_domain_ids", short_call.kwargs)
+        self.assertEqual(long_call.kwargs["request_ids"], [3])
+        self.assertEqual(long_call.kwargs["token_nums"], [100])
+        self.assertNotIn("locality_domain_ids", long_call.kwargs)
+
+    def test_cuda_graph_warmup_request_split_per_locality_domain(self):
+        # One longest request per domain, short requests dealt from domain 0.
+        short_call, long_call = self._warmup_request_split(2)
+        self.assertEqual(short_call.args[0], [0, 1])
+        self.assertEqual(short_call.kwargs["locality_domain_ids"], [0, 1])
+        self.assertEqual(long_call.kwargs["request_ids"], [2, 3])
+        self.assertEqual(long_call.kwargs["token_nums"], [100, 100])
+        self.assertEqual(long_call.kwargs["locality_domain_ids"], [0, 1])
 
     def test_pad_batch_strips_cudagraph_dummies_on_exception(self) -> None:
         # The strip must fire even when the body raises. This is the

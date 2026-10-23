@@ -78,6 +78,10 @@ private:
     Localization* mImpl;
 };
 
+//! SM count of a stream created by LocalizationHandle (a locality-domain or remainder stream), or 0 for any
+//! other stream. A table lookup with no CUDA call, so it is safe during CUDA graph capture.
+unsigned int getLocalizedStreamSmCount(CUstream stream) noexcept;
+
 bool deviceSupportsLocalization(int device) noexcept;
 
 } // namespace locality_domain

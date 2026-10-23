@@ -610,8 +610,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         throw std::invalid_argument("OPTIONAL reuse selection is only valid before the first resume");
     }
 
-    // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
+    // Check utilization against threshold. Allocation is per domain, so the guard is too.
+    auto const utilizations = mManager->storage().getUtilization(kHotLevel, localityDomainId());
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {
@@ -736,7 +736,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
                       CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
             DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
             { _recordDroppedPages(pages, cacheLevel); };
-            tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+            tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder, localityDomainId());
         }
         catch (OutOfPagesError const&)
         {
@@ -1024,7 +1024,7 @@ bool KvCache::prefetch(CacheLevel target)
             for (auto const& page : pagesByDestination[destination])
                 allPages.at(page->lifeCycle).at(page->cacheLevel).push_back(page);
 
-            int64_t const diskBlocksMigrated = storageMgr.prefetch(destination, allPages);
+            int64_t const diskBlocksMigrated = storageMgr.prefetch(destination, allPages, localityDomainId());
             if (diskBlocksMigrated > 0 && _shouldRecordManagerStats())
                 mManager->recordDiskPrefetchBlocks(diskBlocksMigrated);
         }
@@ -1409,7 +1409,7 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         Slot newSlot;
         try
         {
-            auto slots = storageMgr.newSlotsForPoolGroup(lvl, pgIdx, 1);
+            auto slots = storageMgr.newSlotsForPoolGroup(lvl, pgIdx, 1, {}, {}, localityDomainId());
             newSlot = std::move(slots[0]);
         }
         catch (OutOfPagesError const&)
@@ -1781,7 +1781,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 DropRecorder const dropRecorder
                     = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
                 { _recordDroppedPages(pages, cacheLevel); };
-                newSlots = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder);
+                newSlots
+                    = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder, localityDomainId());
             }
             catch (OutOfPagesError const&)
             {
@@ -2122,7 +2123,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
               CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { _recordDroppedPages(pages, cacheLevel); };
-    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder);
+    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder, localityDomainId());
 
     // Page-index rows must exist before locking the copied pages because lock()
     // immediately publishes the page index through updateBasePageIndex().

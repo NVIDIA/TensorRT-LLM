@@ -86,8 +86,9 @@ add_library(tllm::kv_cache ALIAS tllm_kv_cache)
 target_include_directories(
   tllm_kv_cache PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR} ${SHA256_DIR})
 target_link_libraries(
-  tllm_kv_cache PUBLIC tllm::kv_cache_host_memory tllm::common_cuda
-                       tllm::executor_types CUDA::cuda_driver)
+  tllm_kv_cache
+  PUBLIC tllm::kv_cache_host_memory tllm::common_cuda tllm::executor_types
+         tllm::runtime_locality_domain CUDA::cuda_driver)
 
 add_library(
   tllm_kv_cache_legacy STATIC

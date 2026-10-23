@@ -794,8 +794,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # TrtllmAttentionMetadata, and sparse metadata all derive from it.
                 draft_scope.callback(_reset_mtp_index_share, attn_metadata)
             draft_attn_metadata = draft_scope.enter_context(
-                self.draft_kv_cache_context(attn_metadata,
-                                            draft_kv_cache_manager))
+                self.draft_kv_cache_context(
+                    attn_metadata,
+                    draft_kv_cache_manager,
+                    enable_draft_locality_domain_forkjoin=True))
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
             if self.is_mtp_eagle and is_dsa_cache_manager(

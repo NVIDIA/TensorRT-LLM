@@ -74,7 +74,9 @@ def _make_creator(
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
-    c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
+    c._llm_args = SimpleNamespace(
+        kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+    )
     c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
@@ -369,6 +371,9 @@ class TestSplitGpuBudgetForDraft:
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
         creator._cache_transceiver_config = None
+        creator._llm_args = SimpleNamespace(
+            kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+        )
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
@@ -1078,7 +1083,9 @@ class TestExternalDrafterKvDtype:
         c._max_num_tokens = 8192
         c._max_beam_width = 1
         c._cache_transceiver_config = None
-        c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
+        c._llm_args = SimpleNamespace(
+            kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+        )
         c._mapping = Mock(enable_attention_dp=True, tp_size=1)
         c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
