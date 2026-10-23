@@ -10,6 +10,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     _RANK_INFO_CHALLENGE_TTL_S,
     MessageType,
@@ -98,6 +99,7 @@ def test_rank_info_server_rejects_wrong_key_and_consumes_challenge():
 @pytest.mark.parametrize("key", [None, _AUTH_KEY])
 def test_receiver_rank_info_exchange(key):
     receiver = Receiver.__new__(Receiver)
+    receiver._rank_info_timeout_s = 60.0
     receiver._rank_info_auth_key = key
     receiver._incompatible_peers = {}
     receiver._sender_ep_instance_map = {}
@@ -145,6 +147,7 @@ def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key)
 @pytest.mark.parametrize("ownership", [False, True])
 def test_authentication_failure_fails_only_affected_task(ownership):
     receiver = Receiver.__new__(Receiver)
+    receiver._rank_info_timeout_s = 60.0
     receiver._build_recv_req_info = Mock()
     receiver._get_sender_info = Mock(side_effect=RankInfoAuthenticationError("wrong key"))
     receiver._enforce_physical_ownership = ownership
@@ -230,6 +233,7 @@ def test_malformed_followup_consumes_challenge(extra_frames):
 
 def test_receiver_reports_full_cache_as_busy_not_version_mismatch():
     receiver = Receiver.__new__(Receiver)
+    receiver._rank_info_timeout_s = 60.0
     receiver._incompatible_peers = {}
     receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
     receiver._should_register_peer = Mock(return_value=True)
@@ -275,6 +279,7 @@ def test_server_without_key_returns_rank_info_without_challenge():
 )
 def test_receiver_rejects_mismatched_authentication_modes(key, reply):
     receiver = Receiver.__new__(Receiver)
+    receiver._rank_info_timeout_s = 60.0
     receiver._rank_info_auth_key = key
     receiver._incompatible_peers = {}
     receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
@@ -384,3 +389,45 @@ def test_cancel_pending_rank_info_admission_does_not_publish():
     assert tc.cancel_request(req)
     assert tc._poll_rank_info_admissions([]) == ([], [])
     tc._start_async_receive.assert_not_called()
+
+
+@pytest.mark.parametrize("after_challenge", [False, True])
+def test_rank_info_timeout_uses_one_deadline_and_closes_socket(after_challenge):
+    receiver = Receiver.__new__(Receiver)
+    receiver._rank_info_timeout_s = 1.0
+    receiver._rank_info_auth_key = _AUTH_KEY
+    receiver._incompatible_peers = {}
+    receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
+    receiver._should_register_peer = Mock(return_value=True)
+    messenger = Mock()
+    messenger.receive.side_effect = (
+        [[MessageType.AUTHENTICATION_CHALLENGE, b"n" * 32], TimeoutError()]
+        if after_challenge
+        else [TimeoutError()]
+    )
+    with (
+        patch(f"{_TRANSFER_MODULE}.ZMQMessenger", return_value=messenger),
+        patch(f"{_TRANSFER_MODULE}.time.monotonic", side_effect=[100.0, 100.0, 100.25]),
+        patch(f"{_TRANSFER_MODULE}.RankInfo.from_bytes") as decode,
+    ):
+        with pytest.raises(RankInfoAuthenticationError, match="timed out"):
+            receiver._get_sender_info(Mock())
+        decode.assert_not_called()
+    expected = [call(timeout_ms=1000)]
+    if after_challenge:
+        expected.append(call(timeout_ms=750))
+    assert messenger.receive.call_args_list == expected
+    messenger.stop.assert_called_once_with()
+    assert not receiver._incompatible_peers
+
+
+def test_messenger_receive_timeout_allows_subsequent_reply():
+    with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*") as server:
+        with ZMQMessenger("DEALER", server.endpoint) as client:
+            with pytest.raises(TimeoutError):
+                client.receive(timeout_ms=10)
+            client.send([b"request"])
+            identity, request = server.receive(timeout_ms=1000)
+            assert request == b"request"
+            server.send([identity, b"reply"])
+            assert client.receive(timeout_ms=1000) == [b"reply"]

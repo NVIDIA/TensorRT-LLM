@@ -271,6 +271,15 @@ on upgrade as well. Set the same key on all communicating context/generation
 workers, or leave it unset on all of them; mixed configurations fail KV transfers.
 Older generation workers cannot decode the authenticated challenge.
 
+For gRPC, `internal_request_auth_key` is now accepted and forwarded to native
+transfer workers; previously the serving command rejected this field in gRPC mode.
+The RankInfo exchange uses the configured KV transfer timeout as one deadline for
+both replies (60 seconds for direct callers without a transfer timeout).
+The server retains at most 4096 pending challenges, each valid for 10 seconds.
+An unauthenticated client can still exhaust this cache using fresh identities and
+cause legitimate requests to fail with "server busy"; the bound and expiry limit
+resource use but do not prevent sustained denial of service.
+
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
 server config and in each context/generation worker config. The proxy signs internal
