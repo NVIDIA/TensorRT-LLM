@@ -255,6 +255,11 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
 
+def locality_domain_free_slots(manager: Any) -> list[int]:
+    """Return the free GPU slot count per locality domain, summed over pool groups."""
+    return list(_cpp().locality_domain_free_slots(manager))
+
+
 def sparse_cache_base_cell(kv_cache: Any, lc_id: int, pool: int = 0) -> int | None:
     """First cell of this request's lease in one pool's arena region, or None if it holds none.
 

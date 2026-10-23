@@ -48,16 +48,19 @@ struct Block;
 
 // ---------------------------------------------------------------------------
 // ReuseScope — per-request namespace for prefix reuse.
-// Mirrors Python's ReuseScope(lora_id, salt).
+// Mirrors Python's ReuseScope(lora_id, salt, locality_domain_id).
 // ---------------------------------------------------------------------------
 struct ReuseScope
 {
     std::optional<LoraTaskIdType> loraId;
     std::optional<std::string> salt;
+    // The locality domain is part of the reuse key: pages are backed by one domain's memory,
+    // so prefixes are only shared between requests on the same domain.
+    std::optional<LocalityDomainId> localityDomainId;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
-        return loraId == other.loraId && salt == other.salt;
+        return loraId == other.loraId && salt == other.salt && localityDomainId == other.localityDomainId;
     }
 };
 

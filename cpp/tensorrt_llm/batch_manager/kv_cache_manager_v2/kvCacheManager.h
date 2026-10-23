@@ -234,6 +234,10 @@ public:
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;
+    int numLocalityDomains() const noexcept;
+    // Contiguous mapped extents of a buffer as (address, page count) pairs. A single pair unless
+    // the GPU tier is localized, whose pools are mapped in interleaved per-domain chunks.
+    std::vector<std::pair<MemAddress, size_t>> getMappedBufferViews(LayerId layerId, DataRole role) const;
     bool enablePartialMatch() const noexcept;
 
     // Partial commit is independent of partial matching so beam search can

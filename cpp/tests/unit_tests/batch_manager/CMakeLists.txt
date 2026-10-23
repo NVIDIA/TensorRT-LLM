@@ -265,6 +265,19 @@ add_tllm_gtest(
   "unit;batch-manager;host")
 
 add_tllm_gtest(
+  kvCacheManagerV2LocalityTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2LocalityTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
   kvCacheManagerV2ReentrantSharedMutexTest
   OWNER
   batch-manager
