@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from concurrent.futures import ThreadPoolExecutor
+import base64
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from io import BytesIO
+from multiprocessing import get_context
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
@@ -77,6 +81,24 @@ async def test_media_decode_failure_is_recorded():
     finally:
         _input_processing_observer.reset(token)
     assert [args.args[0] for args in observer.call_args_list] == ["decode_queue", "decode"]
+
+
+@pytest.mark.asyncio
+async def test_media_process_pool_keeps_decode_picklable():
+    data = BytesIO()
+    Image.new("RGB", (2, 3), color="red").save(data, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(data.getvalue()).decode()
+    observer = MagicMock()
+    token = _input_processing_observer.set(observer)
+    try:
+        with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn")) as pool:
+            with patch.object(BaseMediaIO, "_executor", pool):
+                image = await ImageMediaIO(format="pil").async_load(url)
+        assert image.size == (2, 3)
+        assert image.getpixel((0, 0)) == (255, 0, 0)
+        observer.assert_not_called()
+    finally:
+        _input_processing_observer.reset(token)
 
 
 class CustomError(Exception):
