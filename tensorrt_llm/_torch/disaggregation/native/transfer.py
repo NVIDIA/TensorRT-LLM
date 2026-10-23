@@ -2827,8 +2827,16 @@ class Receiver(ReceiverBase):
         try:
             peer_infos: RankInfo = self._get_sender_info(params)
         except (PeerIncompatibleError, RankInfoAuthenticationError) as e:
-            # This is rank-local: multi-rank async admission is coordinated
-            # by the transceiver's symmetric status poll before publication.
+            # Fail only this request via the normal transfer-error path
+            # (task ERROR -> session ERROR -> WaitResult.FAILED ->
+            # DISAGG_TRANS_ERROR), so one incompatible context peer does not
+            # take down the whole generation worker. Keyed multi-rank receives
+            # coordinate admission before publication; this handles local
+            # dispatch failures. The async outcome consensus unions failures
+            # only after the request reaches the completion-processing set.
+            # The task is already in the session's _kv_tasks, no bounce
+            # reservation exists yet, and session._sender_endpoints is still
+            # empty, so the unpublished owner can close locally.
             logger.error(
                 "dispatch_task: context peer rejected, failing request "
                 f"unique_rid={task._unique_rid}: {e}"

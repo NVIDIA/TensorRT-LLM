@@ -263,7 +263,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
-        # Only keyed multi-rank async receives need an admission agreement.
+        # Keyed multi-rank receives agree on admission before publication.
         self._pending_rank_info_admissions = (
             {}
             if cache_transceiver_config._rank_info_auth_key is not None and self._gen_need_sync
@@ -985,6 +985,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest) -> None:
+        if self._pending_rank_info_admissions is not None:
+            # Synchronous receives enter in the same admitted-request order on
+            # every generation rank, without rank-local CUDA-fence deferral.
+            # Agree before publication: a rejected rank cannot supply its shard.
+            error = None
+            try:
+                self._transfer_worker.prepare_rank_info(req)
+            except Exception as exc:
+                error = str(exc)
+            errors = self._gen_allgather(error)
+            if any(error is not None for error in errors):
+                logger.error(f"Synchronous RankInfo admission failed: {errors}")
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                return
         if not self._validate_bridge_req(req, synchronous=True):
             return
         rid = get_unique_rid(req)
