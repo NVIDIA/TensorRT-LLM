@@ -47,7 +47,7 @@ from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
-from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.data import TextPrompt, TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
@@ -1339,6 +1339,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
+        self.app.add_api_route("/v1/audio/transcriptions",
+                               self.openai_transcription,
+                               methods=["POST"])
         self.app.add_api_route(
             "/v1/chat/completions",
             self.openai_chat if not self.use_harmony else self.chat_harmony,
@@ -2025,6 +2028,60 @@ class OpenAIServer(_VideoRoutesMixin):
         postproc_args.return_spec_decode_stats = True
         postproc_args.spec_decode_num_spec_tokens = getattr(
             self, "_spec_decode_num_spec_tokens", None)
+
+    async def openai_transcription(self, raw_request: Request) -> Response:
+        """Transcribe one short audio upload with the served Whisper model."""
+        from .audio_transcriptions import create_transcription_response
+
+        try:
+            return await create_transcription_response(
+                raw_request,
+                served_model=self.model,
+                model_config=self.model_config,
+                processor=self.processor,
+                generate=self._generate_audio_transcription)
+        except HTTPException as exc:
+            return self.create_error_response(str(exc.detail),
+                                              status_code=HTTPStatus(
+                                                  exc.status_code))
+        except ValueError as exc:
+            return self.create_error_response(str(exc))
+        except Exception:
+            logger.error("Audio transcription failed: %s",
+                         traceback.format_exc())
+            return self.create_error_response(
+                "Audio transcription failed.",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    async def _generate_audio_transcription(self, inputs: TextPrompt,
+                                            temperature: float,
+                                            raw_request: Request) -> str:
+        sampling_params = SamplingParams(
+            max_tokens=int(self.model_config.max_target_positions) - 1,
+            temperature=temperature,
+            top_k=1 if temperature == 0 else 0)
+        preprocess_fn = getattr(self.generator, "preprocess", None)
+        if preprocess_fn is not None:
+            inputs = await asyncio.get_running_loop().run_in_executor(
+                self._input_proc_executor,
+                functools.partial(preprocess_fn, inputs, sampling_params))
+        promise = self.generator.generate_async(
+            inputs=inputs,
+            sampling_params=sampling_params,
+            streaming=False,
+            trace_headers=tracing.extract_trace_headers(raw_request.headers))
+        disconnect_task = asyncio.create_task(
+            self.await_disconnected(raw_request, promise))
+        try:
+            await promise.aresult()
+            return promise.outputs[0].text
+        except asyncio.CancelledError:
+            promise.abort()
+            raise
+        finally:
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
