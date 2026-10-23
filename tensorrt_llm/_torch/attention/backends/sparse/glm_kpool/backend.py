@@ -123,10 +123,12 @@ class GlmKpoolSparseAttention(TrtllmAttention):
 
     Metadata = TrtllmAttentionMetadata
 
-    #: FlashMLA tiles the top-k axis in blocks of 64 (``B_TOPK``); index rows
-    #: are padded to that multiple with ``-1`` (invalid) entries, which is
-    #: semantics-free by the kernel's own contract.
+    #: FlashMLA tiles the top-k axis in blocks of 64 (``B_TOPK``), and its SM90
+    #: sparse kernel requires a multiple of two blocks. Index rows are padded to
+    #: that multiple with ``-1`` (invalid) entries, which is semantics-free by
+    #: the kernel's own contract.
     _KERNEL_TOPK_ALIGN = 64
+    _KERNEL_TOPK_ALIGN_SM90 = 128
 
     # FlashMLA instantiates 64/128 query heads. Pad TP-local heads to the next
     # size and discard the extra outputs; heads attend independently.
@@ -507,7 +509,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                     q_latent[start:stop], selected, local_indices
                 )
             return output
-        pad = (-topk_rows.shape[-1]) % self._KERNEL_TOPK_ALIGN
+        align = self._KERNEL_TOPK_ALIGN_SM90 if get_sm_version() == 90 else self._KERNEL_TOPK_ALIGN
+        pad = (-topk_rows.shape[-1]) % align
         if pad:
             topk_rows = torch.nn.functional.pad(topk_rows, (0, pad), value=INDEX_SENTINEL)
         local_heads = q_latent.shape[1]

@@ -9,10 +9,11 @@ fused CUDA C++ single-token decode (``trtllm::kda_decode`` thop op wrapped
 by ``_kda_decode``). Neither requires the external
 ``exisiting_optimization_work`` collection at runtime.
 
-On Blackwell (sm_100/sm_103) with the CuTe DSL toolchain available the
-dispatch runs the optimized kernels. On any other arch (or when the in-tree
-prefill op is unavailable) the dispatch falls back to FLA's ``chunk_kda`` /
-``fused_recurrent_kda`` on-device references.
+On Blackwell (sm_100/sm_103) and Rubin (sm_107) with the CuTe DSL toolchain
+available the dispatch runs the optimized kernels. The fused decode also runs
+on Hopper (sm_90), where prefill and multi-token verify use FLA. On any other
+arch (or when the in-tree prefill op is unavailable) the dispatch falls back to
+FLA's ``chunk_kda`` / ``fused_recurrent_kda`` on-device references.
 
 Callers are the ``KimiKDALinearAttention`` module. The module owns the
 HF-parity semantics (Q/K/V projections, conv, gating, ``o_norm``,
@@ -64,8 +65,13 @@ def get_kda_sm_version() -> int:
 
 
 def is_kda_optimized_supported() -> bool:
-    """The optimized prefill/decode kernels need Blackwell sm_100 or Rubin sm_107."""
+    """The optimized prefill/verify kernels need Blackwell sm_100/sm_103 or Rubin sm_107."""
     return get_kda_sm_version() in (100, 103, 107)
+
+
+def is_kda_decode_supported() -> bool:
+    """The fused single-token decode kernel also runs on Hopper sm_90."""
+    return get_kda_sm_version() in (90, 100, 103, 107)
 
 
 @triton.jit(do_not_specialize=["num_tokens", "feature_stride"])
@@ -682,7 +688,7 @@ class KDAKernelDispatch:
         if use_optimized_prefill and optimized_supported and is_intree_prefill_available():
             self.prefill_kernel_path = "optimized"
         self.decode_kernel_path = (
-            "optimized" if use_optimized_decode and optimized_supported else "fla"
+            "optimized" if use_optimized_decode and is_kda_decode_supported() else "fla"
         )
         self.verify_kernel_path = "fla"
         if use_optimized_verify and optimized_supported and is_intree_mtp_available():
