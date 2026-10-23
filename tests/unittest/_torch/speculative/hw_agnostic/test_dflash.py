@@ -105,7 +105,7 @@ def test_dflash_graph_bucket_uses_full_seq_slot_pool():
     assert worker._ctx_k_buf.shape[0] == num_slots
     assert worker._ctx_v_buf.shape == worker._ctx_k_buf.shape
     assert worker._ctx_len.shape[0] == num_slots
-    assert worker._batch_to_slot.shape == (num_seq_slots,)
+    assert worker._batch_to_slot_buffer.tensor.shape == (num_seq_slots,)
     assert worker._dummy_slot == num_seq_slots
     assert list(worker._free_slots) == list(range(num_seq_slots))
 
