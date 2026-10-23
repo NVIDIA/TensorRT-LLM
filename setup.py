@@ -269,8 +269,9 @@ def warn_on_build_skew(precompiled_location: str) -> None:
     import subprocess
 
     NATIVE_BUILD_INPUTS = [
-        "cpp/", "3rdparty/", "setup.py", "scripts/build_wheel.py",
-        "requirements.txt"
+        "cpp/", "3rdparty/",
+        "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/csrc/",
+        "setup.py", "scripts/build_wheel.py", "requirements.txt"
     ]
 
     def head_of(checkout: str) -> str | None:

@@ -1178,16 +1178,17 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
 
 
 @situ_supported
+@pytest.mark.parametrize("tp_size", [8, 16], ids=lambda n: f"tp{n}")
 @pytest.mark.parametrize("num_tokens", [1, 16], ids=lambda n: f"tokens{n}")
-def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
-    """Sum of 8 TP-shard partial outputs == whole-expert reference.
+def test_tp_sharded_forward_matches_whole_expert(num_tokens, tp_size):
+    """Sum of the TP-shard partial outputs == whole-expert reference.
 
     Per-element MXFP4/MXFP8 numerics are identical between the two layouts
-    (group-32 boundaries align: 384 % 32 == 0), so the only expected error
-    is bf16 rounding of the per-shard FC2 partial sums.
+    (group-32 boundaries align: 384 and 192 are multiples of 32), so the only
+    expected error is bf16 rounding of the per-shard FC2 partial sums. At TP16
+    each shard's 192-wide slice is zero-padded to 256 and run as valid 192.
     """
-    tp_size = 8
-    ipp = _TP_INTERMEDIATE // tp_size  # 384 — the production TP8 shard size
+    ipp = _TP_INTERMEDIATE // tp_size  # 384 at TP8; 192 at TP16 (the no-spec layout)
     bank = _make_packed_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
     gate = _make_test_gate()
 
