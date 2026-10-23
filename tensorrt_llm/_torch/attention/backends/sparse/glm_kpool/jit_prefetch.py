@@ -26,10 +26,9 @@ What still varies from batch to batch is what Triton specializes on:
   ids); in verify with one request, a step of the positions.
 
 Every combination is planned once, in the background, by replaying the real
-launchers on ``meta`` tensors built from the template; a scheduled batch adds
-nothing the enumeration has not queued. Pointers that are fresh allocations
-or fixed views (pools, block tables, the query and its head weights) keep the
-alignment they were recorded with.
+launchers on ``meta`` tensors built from the template. Pointers that are fresh
+allocations or fixed views (pools, block tables, the query and its head
+weights) keep the alignment they were recorded with.
 
 ``flashinfer_modules`` names the FlashInfer JIT module the backend's native
 decode path builds (``fmha_gen``) when the model's geometry selects that path,

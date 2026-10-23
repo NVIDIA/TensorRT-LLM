@@ -292,7 +292,6 @@ def test_tune_ahead_benchmarks_untuned_keys(prefetch, monkeypatch, tmp_path):
 
 _SWITCHES = (
     "TLLM_JIT_AHEAD",
-    "TLLM_JIT_PLAN_PER_ITER",
     "TLLM_JIT_PREFETCH",
     "TLLM_JIT_TUNE_AHEAD",
     "TLLM_JIT_STATS",
@@ -302,104 +301,59 @@ _SWITCHES = (
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "env,ahead,per_iter,tune,coverage,engine",
+    "env,ahead,tune,coverage,engine",
     [
-        ({}, False, False, False, True, False),
-        # Compile ahead and tune ahead switch together; per-batch planning
-        # follows them unless set.
-        ({"TLLM_JIT_AHEAD": "1"}, True, True, True, False, True),
-        ({"TLLM_JIT_AHEAD": "1", "TLLM_JIT_PLAN_PER_ITER": "0"}, True, False, True, False, True),
-        ({"TLLM_JIT_AHEAD": "1", "TLLM_JIT_PLAN_PER_ITER": "1"}, True, True, True, False, True),
-        # Per-batch planning needs compile ahead's helpers: ignored alone.
-        ({"TLLM_JIT_PLAN_PER_ITER": "1"}, False, False, False, True, False),
-        ({"TLLM_JIT_AHEAD": "0", "TLLM_JIT_PLAN_PER_ITER": "1"}, False, False, False, True, False),
+        ({}, False, False, True, False),
+        # Compile ahead and tune ahead switch together.
+        ({"TLLM_JIT_AHEAD": "1"}, True, True, False, True),
         # TLLM_JIT_TUNE_AHEAD still overrides the tune-ahead half either way.
-        ({"TLLM_JIT_AHEAD": "1", "TLLM_JIT_TUNE_AHEAD": "0"}, True, True, False, False, True),
-        ({"TLLM_JIT_TUNE_AHEAD": "1"}, False, False, True, True, True),
-        ({"TLLM_JIT_STATS": "1"}, False, False, False, True, True),
+        ({"TLLM_JIT_AHEAD": "1", "TLLM_JIT_TUNE_AHEAD": "0"}, True, False, False, True),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, False, True, True, True),
+        ({"TLLM_JIT_STATS": "1"}, False, False, True, True),
         # The earlier single switch reads as TLLM_JIT_AHEAD while that is unset.
-        ({"TLLM_JIT_PREFETCH": "1"}, True, True, True, False, True),
-        ({"TLLM_JIT_PREFETCH": "1", "TLLM_JIT_AHEAD": "0"}, False, False, False, True, False),
-        ({"TLLM_JIT_PREFETCH": "0", "TLLM_JIT_AHEAD": "1"}, True, True, True, False, True),
+        ({"TLLM_JIT_PREFETCH": "1"}, True, True, False, True),
+        ({"TLLM_JIT_PREFETCH": "1", "TLLM_JIT_AHEAD": "0"}, False, False, True, False),
+        ({"TLLM_JIT_PREFETCH": "0", "TLLM_JIT_AHEAD": "1"}, True, True, False, True),
     ],
 )
-def test_jit_ahead_and_plan_per_iter_switches(
-    env, ahead, per_iter, tune, coverage, engine, monkeypatch
-):
+def test_jit_ahead_switches(env, ahead, tune, coverage, engine, monkeypatch):
     """TLLM_JIT_AHEAD switches compile ahead and tune ahead (and skips warmup's
-    compile-only passes); TLLM_JIT_PLAN_PER_ITER switches per-batch planning
-    on top of it and follows it while unset."""
+    compile-only passes); TLLM_JIT_TUNE_AHEAD overrides the tune-ahead half."""
     for var in _SWITCHES:
         monkeypatch.delenv(var, raising=False)
     for var, value in env.items():
         monkeypatch.setenv(var, value)
     assert jp.prefetch_enabled() == ahead
-    assert jp.plan_per_iter_enabled() == per_iter
     assert jp.tune_ahead_enabled() == tune
     assert jp.warmup_jit_coverage_enabled() == coverage
     assert jp.jit_engine_enabled() == engine
 
 
-class _CountingProvider:
-    """Records every batch it is asked to plan; plans nothing."""
-
-    def __init__(self):
-        self.batches = []
-
-    def __call__(self, batch_ctx, seen=None):
-        self.batches.append(batch_ctx)
-        return []
-
-
 @pytest.mark.cpu_only
 @pytest.mark.usefixtures("restore_triton_hooks")
-@pytest.mark.parametrize("per_iter", [True, False])
-def test_plan_per_iter_off_plans_no_batch_but_binds_executor(per_iter, monkeypatch):
-    """With TLLM_JIT_PLAN_PER_ITER=0 a scheduled batch is not planned (no
-    provider call, no DeepGEMM or CuTe DSL request, and no fallback start of
-    the background enumeration, which the end of warmup starts), yet the
-    executor thread is bound, so the JIT stats and the waits on helper
-    compiles still work."""
-    import queue
+def test_executor_thread_binds_once(monkeypatch):
+    """The first bind marks the calling thread as the executor loop and drops
+    the DeepGEMM compiles of warmup; a later call, from any thread, changes
+    nothing, so the JIT stats keep counting the serving executor's thread."""
     import threading
 
     for var in _SWITCHES:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
-    monkeypatch.setenv("TLLM_JIT_PLAN_PER_ITER", "1" if per_iter else "0")
-    monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
-    monkeypatch.setattr(jp.JitPrefetcher, "_take_deep_gemm_compiles", lambda self, report: None)
-    started = []
-    monkeypatch.setattr(jp.JitPrefetcher, "start_background", lambda self: started.append(1))
+    monkeypatch.setenv("TLLM_JIT_STATS", "1")
+    drains = []
+    monkeypatch.setattr(
+        jp.JitPrefetcher, "_take_deep_gemm_compiles", lambda self, report: drains.append(report)
+    )
     p = jp.JitPrefetcher(rank=0)
-    assert p.prefetch and p.plan_per_iter == per_iter
-    prov = _CountingProvider()
-    p.register("counting", prov)
-
-    class _Dg:
-        def plan_tokens(self, num_tokens):
-            return [f"dg-{num_tokens}"]
-
-    class _Cd:
-        def plan(self, ctx_chunk_lens):
-            return ["cd-spec"]
-
-    p._dg, p._cd = _Dg(), _Cd()
-    p._queues["deep_gemm"] = queue.PriorityQueue()
-    p._queues["cute_dsl"] = queue.PriorityQueue()
-    p._key_event["cd-spec"] = threading.Event()  # queued, not compiled yet
-    batch = types.SimpleNamespace(ctx_chunk_lens=[7], any_ctx_cached=False, gen_tokens=0)
-
-    p.plan_deep_gemm(5)
-    p.plan_cute_dsl([7])
-    p.plan(batch)
-
+    p.bind_executor_thread()
     assert p._executor_thread == threading.get_ident()
-    assert prov.batches == ([batch] if per_iter else [])
-    assert p._queues["deep_gemm"].qsize() == (1 if per_iter else 0)
-    assert p._queues["cute_dsl"].qsize() == (1 if per_iter else 0)
-    assert started == ([1] if per_iter else [])
-    assert f"plan_per_iter={int(per_iter)}" in p.summary()
+    other = threading.Thread(target=p.bind_executor_thread)
+    other.start()
+    other.join()
+    p.bind_executor_thread()
+    assert p._executor_thread == threading.get_ident()
+    assert drains == [False]
+    assert "plan_per_iter" not in p.summary()
 
 
 @pytest.mark.usefixtures("restore_triton_hooks")

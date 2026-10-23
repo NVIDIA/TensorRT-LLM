@@ -27,8 +27,8 @@ so two M values that select the same layout are compiled once (the second is
 a disk-cache hit in the helper).
 
 A provider (``FP8LinearDeepGemmProvider``) knows each FP8 Linear's (N, K) from
-its weight, and the scheduled batch gives M (its token count; with attention
-DP, each rank plans its own M).
+its weight; M is a batch's token count, and the enumeration covers every M
+up to ``max_num_tokens`` (``enumerate_specs``).
 """
 
 from __future__ import annotations
@@ -321,22 +321,15 @@ class FP8LinearDeepGemmProvider:
         self.priority_ms = sorted(
             {int(m) for m in priority_ms if 0 < int(m) <= self.max_num_tokens} - set(self.first_ms)
         )
-        self._seen_m: set = set()
 
     @classmethod
     def with_shapes(cls, base: "FP8LinearDeepGemmProvider", shapes) -> "FP8LinearDeepGemmProvider":
         """A provider over ``shapes`` only, otherwise like ``base`` (its
-        limits, priority token counts and the M it has planned so far)."""
+        limits and priority token counts)."""
         p = cls.__new__(cls)
         p.__dict__.update(base.__dict__)
         p.shapes = sorted(shapes)
-        p._seen_m = set()
         return p
-
-    def adopt_seen(self, other: "FP8LinearDeepGemmProvider") -> None:
-        """Continue from the M ``other`` has planned for batches; the shapes
-        ``other`` did not have are queued by enumeration instead."""
-        self._seen_m = set(other._seen_m)
 
     def __bool__(self):
         return bool(self.shapes)
@@ -344,12 +337,13 @@ class FP8LinearDeepGemmProvider:
     def specs_for_m(self, m: int) -> List[str]:
         return [spec_for(m, n, k) for n, k in self.shapes]
 
-    def plan_tokens(self, num_tokens: int) -> List[str]:
-        """Requests for a batch of ``num_tokens``; each M is planned once."""
-        if num_tokens <= 0 or num_tokens in self._seen_m:
-            return []
-        self._seen_m.add(num_tokens)
-        return self.specs_for_m(num_tokens)
+    def enumerated_m(self, m: int) -> int:
+        """The M ``enumerate_specs`` builds for ``m``'s layout window: ``m``
+        itself up to 16 rows, else the window's last row (``max_num_tokens``
+        in the last window). An M beyond ``max_num_tokens`` is returned as is."""
+        if m <= 16 or m > self.max_num_tokens:
+            return m
+        return min(-(-m // 16) * 16, self.max_num_tokens)
 
     def enumerate_specs(self, rank: int = 0, world: int = 1):
         """Background coverage: every M up to max_num_tokens.
@@ -378,8 +372,6 @@ class FP8LinearDeepGemmProvider:
             start = (len(part) * (rank % world)) // world
             order += part[start:] + part[:start]
         for m in order:
-            if m in self._seen_m:
-                continue
             for s in self.specs_for_m(m):
                 yield s
 
@@ -405,16 +397,6 @@ def note_launch_done(m: int, n: int, k: int, t0: float) -> None:
     obs = done_observer
     if obs is not None:
         obs(m, n, k, time.perf_counter() - t0)
-
-
-def batch_tokens(scheduled_requests) -> int:
-    """Token count M the FP8 Linears see for this batch (pre-padding)."""
-    n = 0
-    for r in scheduled_requests.context_requests:
-        n += r.context_chunk_size
-    for r in scheduled_requests.generation_requests:
-        n += 1 + len(getattr(r, "py_draft_tokens", None) or [])
-    return n
 
 
 def log_unsupported_once(reason: str) -> None:

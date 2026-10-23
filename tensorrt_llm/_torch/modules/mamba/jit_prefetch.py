@@ -14,7 +14,7 @@
 # limitations under the License.
 """Variant provider for the Mamba2 SSD prefill path (Triton kernels).
 
-Given a scheduled batch, reproduce on ``meta`` tensors exactly the Triton
+Given a batch composition, reproduce on ``meta`` tensors exactly the Triton
 launches that ``Mamba2Mixer.forward_core`` + ``Mamba2Metadata.prepare`` will
 issue for its context requests, and return them as KernelCalls.
 
@@ -25,7 +25,7 @@ meta tensors, and every Triton ``run`` is recorded instead of executed. Only
 the tensors entering the SSD are rebuilt here, with the same layout the mixer
 produces (views into the in_proj output, token-major conv output).
 
-Batch facts used, all known once the batch is scheduled:
+Batch facts used:
   num context requests, their chunk lengths, whether any has cached tokens.
 They decide every specialization that varies at runtime: ``HAS_INITSTATES``,
 the multi-sequence chunk-index kernel, and Triton's integer specialization of
@@ -173,8 +173,8 @@ class MambaSSDProvider:
         )
 
     def __call__(self, batch_ctx: Any, seen: Optional[set] = None) -> List[KernelCall]:
-        """Plan one batch. ``seen`` is the caller's dedup set (the executor
-        and the background enumeration each keep their own)."""
+        """Plan one batch. ``seen`` is the caller's dedup set (the background
+        enumeration and tune ahead each keep their own)."""
         ctx_lens: List[int] = batch_ctx.ctx_chunk_lens
         if not ctx_lens:
             return []

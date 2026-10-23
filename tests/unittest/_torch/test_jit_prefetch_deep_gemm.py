@@ -132,7 +132,7 @@ def test_provider_finds_kimi_fp8_weight_read_linears():
     model = torch.nn.ModuleList([_Fp8BlockScaleWeightReadLinear(w, ws, n)])
     p = jdg.FP8LinearDeepGemmProvider(model, max_num_tokens=64)
     assert p.shapes == [(n, k)]
-    assert p.plan_tokens(17) == [jdg.spec_for(17, n, k)]
+    assert p.specs_for_m(17) == [jdg.spec_for(17, n, k)]
 
 
 def test_provider_enumeration_windows():
@@ -142,7 +142,6 @@ def test_provider_enumeration_windows():
     assert ms[:16] == list(range(1, 17))
     # One M per 16-row window up to max_num_tokens, which is included.
     assert ms[16:] == [32, 48, 64, 80, 96, 100]
-    assert p.plan_tokens(37) and not p.plan_tokens(37)
 
 
 def test_provider_enumerates_priority_tokens_first():

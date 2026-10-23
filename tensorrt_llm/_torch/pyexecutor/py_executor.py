@@ -3948,11 +3948,6 @@ class PyExecutor:
                              self.dist.pp_size) % self.num_micro_batches
         self.wait_on_pp_send_handles(self.send_handles, due_microbatch_id)
 
-    def _plan_jit_prefetch(self, scheduled_batch: ScheduledRequests) -> None:
-        plan = getattr(self.model_engine, "_plan_jit_prefetch", None)
-        if plan is not None:
-            plan(scheduled_batch, self.resource_manager)
-
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Synchronize draft length and buffers before preparing resources."""
@@ -4939,7 +4934,6 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self._plan_jit_prefetch(scheduled_batch)
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
@@ -5833,7 +5827,6 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self._plan_jit_prefetch(scheduled_batch)
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)

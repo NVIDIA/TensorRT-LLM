@@ -2409,33 +2409,27 @@ def test_warmup_joins_the_sampling_build_the_model_loader_started(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("per_iter", [True, False])
-def test_plan_jit_prefetch_binds_the_executor_and_plans_only_with_plan_per_iter(
-    per_iter: bool,
-) -> None:
-    """The engine's per-batch hook binds the executor thread for every
-    scheduled batch, so the JIT stats and the waits on helper compiles see its
-    launches; it plans the batch (DeepGEMM, CuTe DSL, Triton providers) only
-    with TLLM_JIT_PLAN_PER_ITER on. Warmup batches are never planned."""
-    prefetcher = Mock(plan_per_iter=per_iter)
+def test_first_forward_after_warmup_binds_the_jit_executor_thread() -> None:
+    """After warmup the engine's first forward binds the JIT prefetcher's
+    executor thread, once, so the JIT stats count the serving executor's
+    launches; warmup forwards never bind it."""
+    prefetcher = Mock()
     engine = object.__new__(PyTorchModelEngine)
     engine._jit_prefetcher = prefetcher
-    engine._is_warmup = False
-    engine._runner = object()  # not a DecoderRunner: no CUDA graph runner, every batch eager
-    ctx = SimpleNamespace(context_chunk_size=5, context_current_position=0,
-                          py_num_compressed_tokens=0)  # fmt: skip
-    scheduled = SimpleNamespace(context_requests=[ctx], generation_requests=[])
-
-    engine._plan_jit_prefetch(scheduled, Mock())
-
-    prefetcher.bind_executor_thread.assert_called_once_with()
-    planned = [prefetcher.plan_deep_gemm, prefetcher.plan_cute_dsl, prefetcher.plan]
-    assert [m.called for m in planned] == [per_iter] * 3
-    if per_iter:
-        prefetcher.plan_deep_gemm.assert_called_once_with(5)
-        prefetcher.plan_cute_dsl.assert_called_once_with([5])
-
-    prefetcher.reset_mock()
+    engine._jit_bind_pending = True
     engine._is_warmup = True
-    engine._plan_jit_prefetch(scheduled, Mock())
-    assert not prefetcher.bind_executor_thread.called and not prefetcher.plan.called
+    engine._runner = object()
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 0
+    with (
+        patch.object(model_engine_module, "make_scheduled_inputs", return_value=Mock()),
+        patch.object(engine, "_forward_scheduled", return_value={}) as forward_scheduled,
+    ):
+        engine.forward(ScheduledRequests(), Mock())
+        assert not prefetcher.bind_executor_thread.called
+        engine._is_warmup = False
+        engine.forward(ScheduledRequests(), Mock())
+        engine.forward(ScheduledRequests(), Mock())
+    prefetcher.bind_executor_thread.assert_called_once_with()
+    assert forward_scheduled.call_count == 3
+    assert engine._jit_bind_pending is False

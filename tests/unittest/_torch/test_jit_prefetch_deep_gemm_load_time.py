@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The DeepGEMM helpers started while the weights load, then refreshed at
-warmup with the shapes weight loading adds (planning only, no helper
-processes)."""
+warmup with the shapes weight loading adds, and the queued request a launch
+loads (planning only, no helper processes)."""
 
 import json
 import threading
@@ -66,13 +66,10 @@ def _wait_enum(pf):
 def test_refresh_queues_only_the_shapes_weight_loading_added():
     pf = _Prefetcher()
     pf._dg = _provider([(512, 256)], priority_ms=[7, 14], first_ms=[7, 1])
-    pf._dg.plan_tokens(7)
     loaded = _provider([(512, 256), (1024, 256)], priority_ms=[7, 14], first_ms=[7, 1])
     assert pf.refresh_deep_gemm(loaded) == 1
     _wait_enum(pf)
     assert pf._dg is loaded
-    # The planned M carry over, so a batch of 7 is not planned again.
-    assert loaded.plan_tokens(7) == []
     shapes = {(s["n"], s["k"]) for s, _ in pf.submitted}
     assert shapes == {(1024, 256)}
     # The first warmup forwards' layouts of the new shape (their token
@@ -121,6 +118,27 @@ def test_provider_plans_the_shapes_a_model_creates_while_loading():
 
     # A failed prediction leaves the shapes to the loaded model.
     assert jdg.FP8LinearDeepGemmProvider(_Fails(), max_num_tokens=64).shapes == []
+
+
+@pytest.mark.cpu_only
+def test_a_launch_finds_the_request_queued_for_its_m_window():
+    pf = _Prefetcher()
+    pf._dg = _provider([(512, 256)], max_num_tokens=100, priority_ms=[24])
+    pf._spec_prio = {s: jp._PRIO_ENUM for s in pf._dg.enumerate_specs()}
+
+    def queued(m, n=512, k=256):
+        return pf._queued_deep_gemm_spec(m, n, k)
+
+    # Its own request when one is queued (here the CUDA graph token count
+    # 24), else the one queued for its 16-row window, which has its layout.
+    assert queued(24) == jdg.spec_for(24, 512, 256)
+    assert queued(37) == jdg.spec_for(48, 512, 256)
+    assert queued(97) == jdg.spec_for(100, 512, 256)
+    for m in range(1, 101):
+        assert -(-json.loads(queued(m))["m"] // 16) == -(-m // 16)
+    # Outside the enumeration: an M beyond max_num_tokens, or another shape.
+    assert queued(101) is None
+    assert queued(37, n=1024) is None
 
 
 @pytest.mark.cpu_only

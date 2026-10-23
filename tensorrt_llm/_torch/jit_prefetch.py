@@ -14,14 +14,10 @@
 # limitations under the License.
 """Compile JIT kernel variants ahead of the forward pass that needs them.
 
-Experimental. Two switches:
-
-- ``TLLM_JIT_AHEAD=1``: compile ahead and tune ahead. CPU-only helpers build
-  every variant the providers can reach, from model load to the end of
-  warmup, and the untuned autotune keys are benchmarked at the end of warmup.
-- ``TLLM_JIT_PLAN_PER_ITER``: also plan each scheduled batch before its
-  forward, queuing its variants ahead of the background enumeration. Needs
-  ``TLLM_JIT_AHEAD=1``; unset, it follows it.
+Experimental, switched on by ``TLLM_JIT_AHEAD=1``: compile ahead and tune
+ahead. CPU-only helpers build every variant the providers can reach, from
+model load to the end of warmup, and the untuned autotune keys are
+benchmarked at the end of warmup.
 
 A kernel variant that warmup never produced compiles synchronously at its
 first launch, on the executor thread, stalling the GPU. This module compiles
@@ -35,12 +31,11 @@ tensors under :func:`shadow_launches`, which records each ``run`` instead of
 executing it, so the recorded arguments are exactly those of the real launch.
 At the end of warmup a background thread plans one batch per kernel-signature
 class each provider can reach within the engine limits, so a process that
-has never run this model before is covered; with ``TLLM_JIT_PLAN_PER_ITER`` a
-scheduled batch is planned too, ahead of that. Some providers take the
+has never run this model before is covered. Some providers take the
 batch-independent part of a launch (pool layouts, fixed scalars) from the
 launches warmup made; they are enumerated again after each warmup. DeepGEMM
-and CuTe DSL providers do the
-same through those libraries' compile-only entry points
+and CuTe DSL providers do the same through those libraries' compile-only
+entry points
 (``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``). MiniMax-M3's
 MSA ``fmha_sm100`` kernels follow from the engine's geometry alone, so they
 are built from the moment the model is constructed, while its weights load,
@@ -61,10 +56,10 @@ on-disk cache (the same lookup ``JITFunction.run`` and ``triton.compile`` do,
 minus the launch). Misses go to the helpers, which call ``triton.compile``
 into the on-disk cache, so the real launch loads the cubin in about a
 millisecond. A priority queue orders the work: a variant the executor is
-about to wait on, then the scheduled batch, then provider enumeration. If the
-executor reaches a variant a helper is already compiling, it waits for that
-compile instead of compiling it a second time; one still queued it compiles
-itself.
+about to wait on, then those warmup and the first forwards need (tune ahead,
+the priority token counts), then provider enumeration. If the executor reaches
+a variant a helper is already compiling, it waits for that compile instead of
+compiling it a second time; one still queued it compiles itself.
 
 Autotuned kernels: if the autotuner already picked a config for a key, only
 that config is planned; otherwise every candidate config is compiled, so the
@@ -102,14 +97,14 @@ from tensorrt_llm.logger import logger
 _AHEAD_ENV = "TLLM_JIT_AHEAD"
 # The earlier single switch, read when TLLM_JIT_AHEAD is unset.
 _LEGACY_AHEAD_ENV = "TLLM_JIT_PREFETCH"
-_PER_ITER_ENV = "TLLM_JIT_PLAN_PER_ITER"
 _STATS_ENV = "TLLM_JIT_STATS"
 _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
 _TUNE_ENV = "TLLM_JIT_TUNE_AHEAD"
 _TUNE_THREADS_ENV = "TLLM_JIT_TUNE_AHEAD_THREADS"
 
-# Queue priorities, lowest first: the executor is blocked on it; the batch
-# being scheduled needs it; a provider can reach it (background enumeration).
+# Queue priorities, lowest first: the executor is blocked on it; warmup or the
+# first forwards need it (tune ahead, priority token counts); a provider can
+# reach it (background enumeration).
 _PRIO_URGENT, _PRIO_BATCH, _PRIO_ENUM = -1, 0, 1
 
 
@@ -149,29 +144,10 @@ def prefetch_enabled() -> bool:
         v = os.environ.get(_LEGACY_AHEAD_ENV)
         if v is not None:
             logger.warning_once(
-                f"[JIT prefetch] {_LEGACY_AHEAD_ENV} is deprecated; use {_AHEAD_ENV} "
-                f"(compile and tune ahead) and {_PER_ITER_ENV} (per-batch planning)",
+                f"[JIT prefetch] {_LEGACY_AHEAD_ENV} is deprecated; use {_AHEAD_ENV}",
                 key="jitp_legacy_env",
             )
     return v == "1"
-
-
-def plan_per_iter_enabled() -> bool:
-    """Whether each scheduled batch is also planned before its forward
-    (``TLLM_JIT_PLAN_PER_ITER``), queuing the variants it needs ahead of the
-    background enumeration.
-
-    Needs compile ahead, whose helpers do the compiling; ignored without it.
-    Unset, it follows ``TLLM_JIT_AHEAD``.
-    """
-    if not prefetch_enabled():
-        if os.environ.get(_PER_ITER_ENV) == "1":
-            logger.warning_once(
-                f"[JIT prefetch] {_PER_ITER_ENV}=1 needs {_AHEAD_ENV}=1; ignored",
-                key="jitp_per_iter_without_ahead",
-            )
-        return False
-    return os.environ.get(_PER_ITER_ENV, "1") == "1"
 
 
 def tune_ahead_enabled() -> bool:
@@ -1091,12 +1067,10 @@ class _Stats:
     helper_ok: int = 0
     helper_fail: int = 0
     helper_s: float = 0.0
-    plan_s: float = 0.0
     wait_n: int = 0
     wait_s: float = 0.0
     bg_submitted: int = 0
     urgent: int = 0
-    dg_planned: int = 0
     dg_unplanned: int = 0
     dg_helper_built: int = 0
     dg_executor_compiles: int = 0
@@ -1140,10 +1114,6 @@ class JitPrefetcher:
     def __init__(self, rank: int):
         self.rank = rank
         self.prefetch = prefetch_enabled()
-        # Each scheduled batch is planned too (TLLM_JIT_PLAN_PER_ITER); the
-        # bound executor thread, the waits on helper compiles and the stats
-        # do not depend on it.
-        self.plan_per_iter = plan_per_iter_enabled()
         # The executor-side JIT stats (on with prefetch or TLLM_JIT_STATS);
         # tune ahead alone records only its own counters.
         self.stats_on = stats_enabled()
@@ -1151,7 +1121,6 @@ class JitPrefetcher:
         self._providers: List[Callable[[Any], List[KernelCall]]] = []
         self._provider_names: set = set()
         self._spec_prio: Dict[str, int] = {}
-        self._bg_started = False
         # ids of the providers a background enumeration has covered.
         self._enumerated: set = set()
         self._enum_lock = threading.Lock()
@@ -1320,6 +1289,17 @@ class JitPrefetcher:
         """Whether ``enable_deep_gemm`` has started the DeepGEMM helpers."""
         return self._dg is not None
 
+    def _queued_deep_gemm_spec(self, m: int, n: int, k: int) -> Optional[str]:
+        """The queued request whose cubin an FP8 GEMM launch loads: its own,
+        else the one the enumeration queued for its M window (the same
+        layout); None when neither is queued."""
+        from . import jit_prefetch_deep_gemm as jdg
+
+        spec = jdg.spec_for(m, n, k)
+        if spec not in self._spec_prio and self._dg is not None:
+            spec = jdg.spec_for(self._dg.enumerated_m(m), n, k)
+        return spec if spec in self._spec_prio else None
+
     def refresh_deep_gemm(self, provider, moe_provider=None) -> int:
         """Swap in providers built from the loaded model, keeping the helpers
         ``enable_deep_gemm`` started from the constructed one.
@@ -1338,7 +1318,6 @@ class JitPrefetcher:
         old_moe = set(self._dg_moe.shapes) if self._dg_moe else set()
         new = [s for s in provider.shapes if s not in old]
         new_moe = [s for s in (moe_provider.shapes if moe_provider else ()) if s not in old_moe]
-        provider.adopt_seen(self._dg)
         self._dg = provider
         if moe_provider:
             self._dg_moe = moe_provider
@@ -1423,10 +1402,11 @@ class JitPrefetcher:
             if (m, n, k) in _seen:
                 return
             _seen.add((m, n, k))
-            spec = jdg.spec_for(m, n, k)
-            if spec not in self._spec_prio:
+            spec = self._queued_deep_gemm_spec(m, n, k)
+            if spec is None:
                 self.stats.dg_unplanned += 1
                 self._event(f"DeepGEMM launch not planned: m={m} n={n} k={k}")
+                return
             ev = self._key_event.get(spec)
             if ev is not None and not ev.is_set():
                 # A helper has it queued or in progress: move it to the front
@@ -1536,20 +1516,18 @@ class JitPrefetcher:
                 self._write_line(proc, line)
         return True
 
-    # -- planning (executor thread) --------------------------------------
+    # -- executor thread -------------------------------------------------
     def bind_executor_thread(self) -> None:
-        """Mark the calling thread as the executor loop (idempotent).
-
-        Also reports the DeepGEMM kernels this process compiled since the
-        previous call; the first call drops those compiled during warmup.
-        """
-        if self._executor_thread is None:
-            self._executor_thread = threading.get_ident()
-            self._event("executor thread bound; counting JIT from here")
-            self._take_deep_gemm_compiles(report=False)
-            self.report_fmha_sm100_builds()
+        """Mark the calling thread as the executor loop; from here on its JIT
+        counts as executor JIT. Called by the engine's first forward after
+        warmup; a no-op once bound. Drops the DeepGEMM compiles of warmup,
+        reports the fmha_sm100 builds warmup made."""
+        if self._executor_thread is not None:
             return
-        self._take_deep_gemm_compiles(report=True)
+        self._executor_thread = threading.get_ident()
+        self._event("executor thread bound; counting JIT from here")
+        self._take_deep_gemm_compiles(report=False)
+        self.report_fmha_sm100_builds()
 
     def _take_deep_gemm_compiles(self, report: bool) -> None:
         """Count DeepGEMM compiles from DeepJIT's record of disk-cache misses.
@@ -1578,18 +1556,6 @@ class JitPrefetcher:
         except ImportError:
             return None
         return deep_gemm
-
-    def plan_deep_gemm(self, num_tokens: int) -> None:
-        """Queue the DeepGEMM variants a batch of ``num_tokens`` will run."""
-        if self._dg is None or not self.plan_per_iter:
-            return
-        from . import jit_prefetch_deep_gemm as jdg
-
-        t0 = time.perf_counter()
-        for spec in self._dg.plan_tokens(num_tokens):
-            self.stats.dg_planned += 1
-            self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND)
-        self.stats.plan_s += time.perf_counter() - t0
 
     def _start_cute_dsl_helpers(self) -> bool:
         """Start the CuTe DSL helper pool once (shared by every CuTe DSL
@@ -1814,17 +1780,6 @@ class JitPrefetcher:
         )
         return True
 
-    def plan_cute_dsl(self, ctx_chunk_lens) -> None:
-        """Move the K123 variant this batch needs to the front of the queue."""
-        if self._cd is None or not self.plan_per_iter:
-            return
-        from . import jit_prefetch_cute_dsl as jcd
-
-        for spec in self._cd.plan(ctx_chunk_lens):
-            ev = self._key_event.get(spec)
-            if ev is not None and not ev.is_set():
-                self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
-
     def _enumerate_dg(self) -> None:
         """Queue every M window up to max_num_tokens, at background priority."""
         from . import jit_prefetch_deep_gemm as jdg
@@ -1855,7 +1810,6 @@ class JitPrefetcher:
         """
         if not self.prefetch or not self._providers:
             return
-        self._bg_started = True
         with self._lock:
             providers = [
                 p
@@ -1871,33 +1825,13 @@ class JitPrefetcher:
                 name="jit_prefetch_enumerate",
             ).start()
 
-    def plan(self, batch_ctx: Any) -> None:
-        """Called once a batch is scheduled, before its inputs are prepared."""
-        self.bind_executor_thread()
-        if not self.plan_per_iter or not self._providers:
-            return
-        if not self._bg_started:
-            self.start_background()
-        t0 = time.perf_counter()
-        for provider in self._providers:
-            try:
-                calls = provider(batch_ctx)
-            except Exception as e:  # noqa: BLE001 - never break serving
-                logger.warning_once(
-                    f"[JIT prefetch] provider failed: {e}", key=f"jitp_provider_{id(provider)}"
-                )
-                continue
-            for call in calls:
-                self._plan_call(call)
-        self.stats.plan_s += time.perf_counter() - t0
-
     def _plan_call(
         self, call: KernelCall, priority: int = 0, keys_out: Optional[List[str]] = None
     ) -> int:
         """Plan one call; return how many variants it queued. ``priority`` 0
-        = the batch being scheduled now, 1 = background enumeration; lower is
-        compiled first. ``keys_out`` collects the cache key of every variant
-        not compiled yet, queued now or before."""
+        = needed by warmup or the first forwards (tune ahead), 1 = background
+        enumeration; lower is compiled first. ``keys_out`` collects the cache
+        key of every variant not compiled yet, queued now or before."""
         jit_fn, _, _ = _unwrap_jit(call.fn)
         try:
             variants, tuned = _expand(call)
@@ -2123,11 +2057,10 @@ class JitPrefetcher:
     def _enumerate_all(self, providers: List[Any]) -> None:
         """Queue every variant ``providers`` can reach, at background priority.
 
-        Runs on its own thread so the executor never waits for it. It plans
-        with the same meta-tensor replay as ``plan``, only over the batch
-        compositions a provider enumerates (``enumerate_batches``) instead of
-        the one batch being scheduled. Variants the current batch needs are
-        always queued ahead of these. Enumerations run one at a time.
+        Runs on its own thread so the executor never waits for it. It replays
+        each provider's launchers on ``meta`` tensors over the batch
+        compositions the provider enumerates (``enumerate_batches``).
+        Enumerations run one at a time.
         """
         with self._enum_lock:
             t0 = time.perf_counter()
@@ -2387,16 +2320,15 @@ class JitPrefetcher:
         s = self.stats
         return (
             f"[JIT stats] rank {self.rank} SUMMARY prefetch={int(self.prefetch)}"
-            f" plan_per_iter={int(self.plan_per_iter)}"
             f" executor_compiles={s.compiles} executor_compile_s={s.compile_s:.3f}"
             f" executor_disk_hits={s.disk_hits} disk_hit_s={s.disk_hit_s:.3f}"
             f" executor_autotunes={s.tunes} executor_autotune_s={s.tune_s:.3f}"
             f" planned={s.planned} already_compiled={s.already_compiled}"
             f" submitted={s.submitted} helper_ok={s.helper_ok}"
             f" helper_fail={s.helper_fail} helper_s={s.helper_s:.3f}"
-            f" plan_s={s.plan_s:.3f} wait_n={s.wait_n} wait_s={s.wait_s:.3f}"
+            f" wait_n={s.wait_n} wait_s={s.wait_s:.3f}"
             f" bg_submitted={s.bg_submitted} urgent={s.urgent} workers={len(self._procs)}"
-            f" dg_planned={s.dg_planned} dg_unplanned={s.dg_unplanned} dg_helper_built={s.dg_helper_built}"
+            f" dg_unplanned={s.dg_unplanned} dg_helper_built={s.dg_helper_built}"
             f" dg_executor_compiles={s.dg_executor_compiles}"
             f" dg_executor_compile_s={s.dg_executor_compile_s:.3f}"
             f" dg_process_compiles={s.dg_process_compiles}"

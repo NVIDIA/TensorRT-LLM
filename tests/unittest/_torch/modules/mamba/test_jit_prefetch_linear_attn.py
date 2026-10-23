@@ -74,7 +74,6 @@ def _provider(shapes):
     p.chunk_size = 64
     p.max_batch_size = 0
     p.kda_staged = False
-    p._reset_planned = set()
     return p
 
 
@@ -278,30 +277,27 @@ def _real_kda_reset(s, n):
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 16, 17])
-def test_kda_staged_reset_planned_per_request_count(n):
+def test_kda_staged_reset_enumerated_per_request_count(n):
+    """The staged state pool has one row per context request, a constexpr of
+    the reset kernel: the enumeration plans every request count up to
+    max_batch_size."""
     s = _kda()
     p = _provider([s])
-    p.max_batch_size, p.kda_staged, p._reset_planned = 32, True, set()
-    batch = type("B", (), {"ctx_chunk_lens": [64] * n, "gen_tokens": 0})()
-    planned = _keys(p(batch))
+    p.max_batch_size, p.kda_staged = 32, True
     real = _keys(_real_kda_reset(s, n))
     assert {name for name, _ in real} == {"_reset_recurrent_state_rows_kernel"}, real
-    assert real <= planned, f"unplanned: {sorted(real - planned)}"
-    # Each request count is planned once, and enumeration covers them all.
-    assert not _keys(p(batch)) & real
     enumerated = set()
     for b in p.enumerate_batches():
         enumerated |= _keys(p(b, seen=set()))
-    assert real <= enumerated
+    assert real <= enumerated, f"unplanned: {sorted(real - enumerated)}"
 
 
 def test_kda_reset_not_planned_for_fp32_state():
     p = la.LinearAttnProvider(torch.nn.Module(), max_num_tokens=256, max_batch_size=8,
                               ssm_state_dtype=torch.float32)  # fmt: skip
     p.shapes = [_kda()]
-    batch = type("B", (), {"ctx_chunk_lens": [64, 64], "gen_tokens": 0})()
-    names = {c.label for c in p(batch)}
-    assert "_reset_recurrent_state_rows_kernel" not in names
+    names = {c.label for b in p.enumerate_batches() for c in p(b, seen=set())}
+    assert names and "_reset_recurrent_state_rows_kernel" not in names
 
 
 def test_enumeration_covers_chunk_index_classes():

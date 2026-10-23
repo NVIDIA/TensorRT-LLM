@@ -23,9 +23,6 @@ provider covers.
     TLLM_JIT_AHEAD=1 python3 jit_prefetch_coverage.py --model <hf dir> \
         [--tp N] [--layers N] [--config extra.yaml] [--report out.json]
 
-With ``TLLM_JIT_PLAN_PER_ITER=0`` the report lists what compile ahead alone
-misses: the variants only per-batch planning would have queued.
-
 Exits 1 if anything compiled or autotuned on the executor after warmup.
 """
 

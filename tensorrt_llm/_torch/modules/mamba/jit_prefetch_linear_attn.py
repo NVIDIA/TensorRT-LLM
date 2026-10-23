@@ -152,7 +152,6 @@ class LinearAttnProvider:
         )
         self.device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
         self._seen: set = set()
-        self._reset_planned: set = set()
         self._num_sms = None
 
     def __bool__(self):
@@ -212,15 +211,6 @@ class LinearAttnProvider:
         if not ctx_lens and gen_tokens == 0:
             return []
         calls: List[KernelCall] = []
-        # A scheduled batch: its request count's reset variant, once.
-        if (
-            seen is None
-            and self.kda_staged
-            and ctx_lens
-            and len(ctx_lens) not in self._reset_planned
-        ):
-            self._reset_planned.add(len(ctx_lens))
-            calls.extend(self._plan_kda_reset(len(ctx_lens)))
         seen = self._seen if seen is None else seen
         key = self.batch_key(ctx_lens, gen_tokens, any_cached)
         if key in seen:

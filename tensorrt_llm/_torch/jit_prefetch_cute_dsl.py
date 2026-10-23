@@ -855,15 +855,6 @@ class KdaPrefillProvider:
             for H, b, sg in self.cfgs
         ]
 
-    def plan(self, ctx_chunk_lens: List[int]) -> List[str]:
-        if not ctx_chunk_lens:
-            return []
-        # A single unaligned sequence is sentinel-padded onto the aligned
-        # variant (see _chunk_kda_fwd), so only a multi-sequence batch with an
-        # unaligned length needs the ragged one.
-        pure = len(ctx_chunk_lens) == 1 or all(n % _BT == 0 for n in ctx_chunk_lens)
-        return self.specs(pure) + self.k4_specs
-
     def enumerate_specs(self) -> List[str]:
         return self.specs(True) + self.specs(False) + self.k4_specs
 

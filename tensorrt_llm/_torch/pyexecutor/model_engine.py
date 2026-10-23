@@ -7,7 +7,6 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from types import SimpleNamespace
 from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type,
                     Union)
 
@@ -163,6 +162,9 @@ def _configure_deep_gemm_pdl() -> None:
 
 
 class PyTorchModelEngine(ModelEngine):
+    # Set by _init_jit_prefetch: the next forward outside warmup binds the
+    # JIT prefetcher's executor thread (JIT stats count from there).
+    _jit_bind_pending = False
 
     def __init__(
         self,
@@ -1209,6 +1211,7 @@ class PyTorchModelEngine(ModelEngine):
                                     tune_ahead_enabled)
         prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
         self._jit_prefetcher = prefetcher
+        self._jit_bind_pending = prefetcher is not None
         if prefetcher is not None and get_sm_version() in (100, 103):
             prefetcher.observe_deep_gemm()
             if self._uses_minimax_m3_msa():
@@ -1336,46 +1339,6 @@ class PyTorchModelEngine(ModelEngine):
         if provider and prefetcher.register("mamba_ssd", provider):
             logger.info(f"[JIT prefetch] Mamba SSD provider: "
                         f"{len(provider.shapes)} distinct layer shape(s)")
-
-    def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,
-                           resource_manager: ResourceManager) -> None:
-        prefetcher = getattr(self, "_jit_prefetcher", None)
-        if prefetcher is None or self.is_warmup:
-            return
-        # Bound even without per-batch planning: the JIT stats and the waits
-        # on helper compiles count the executor thread's launches.
-        prefetcher.bind_executor_thread()
-        if not prefetcher.plan_per_iter:
-            return
-        from .. import jit_prefetch_deep_gemm as jdg
-        prefetcher.plan_deep_gemm(jdg.batch_tokens(scheduled_requests))
-        ctx = scheduled_requests.context_requests
-        gen = scheduled_requests.generation_requests
-        gen_tokens = sum(1 + len(getattr(r, "py_draft_tokens", None) or [])
-                         for r in gen)
-        # A generation-only batch at a captured size replays a CUDA graph and
-        # compiles nothing; eager ones (above the largest graph, or graphs
-        # disabled) are planned like any other batch.
-        if not ctx and self._jit_prefetch_gen_in_graph(len(gen)):
-            return
-        # The same facts _prepare_tp_inputs and Mamba2Metadata.prepare derive
-        # later: per-request chunk length and whether any request has a cached
-        # prefix (num_cached_tokens_per_seq > 0 -> HAS_INITSTATES).
-        lens = [r.context_chunk_size for r in ctx]
-        if lens:
-            prefetcher.plan_cute_dsl(lens)
-        any_cached = any(r.context_current_position -
-                         r.py_num_compressed_tokens > 0 for r in ctx)
-        prefetcher.plan(
-            SimpleNamespace(ctx_chunk_lens=lens,
-                            any_ctx_cached=any_cached,
-                            gen_tokens=gen_tokens))
-
-    def _jit_prefetch_gen_in_graph(self, num_gen: int) -> bool:
-        runner = getattr(self, "cuda_graph_runner", None)
-        sizes = getattr(runner, "supported_batch_sizes", None) or []
-        return bool(getattr(runner, "enabled", False)) and num_gen <= max(
-            sizes, default=0)
 
     ### Helper methods promoted from the original warmup method ###
 
@@ -1629,6 +1592,9 @@ class PyTorchModelEngine(ModelEngine):
             return self._runner.forward(batch)
         assert resource_manager is not None, (
             "scheduled execution requires a resource manager")
+        if self._jit_bind_pending and not self.is_warmup:
+            self._jit_bind_pending = False
+            self._jit_prefetcher.bind_executor_thread()
         inputs = make_scheduled_inputs(
             batch,
             new_tensors_device,

@@ -375,13 +375,13 @@ def test_csa2_publish_export_is_what_the_op_runs(tmp_path):
         assert torch.equal(a, b)
 
 
-def test_provider_plans_the_variant_the_op_keys_on():
+def test_provider_enumerates_both_variants_the_op_keys_on():
+    # The op keys K123 on whether a batch is ragged (a multi-sequence batch
+    # with an unaligned length) or aligned; the enumeration builds both.
     p = jcd.KdaPrefillProvider(torch.nn.Module())
     p.cfgs = [(H, True, True)]
     ragged, aligned = p.specs(False), p.specs(True)
-    assert p.plan([100, 37, 200]) == ragged
-    assert p.plan([64, 128]) == aligned
-    assert p.plan([100]) == aligned  # single sequence: sentinel-padded onto aligned
+    assert ragged != aligned
     assert set(p.enumerate_specs()) == set(ragged + aligned)
 
 
@@ -449,7 +449,7 @@ def test_kda_provider_lists_one_k4_variant_per_layer_shape():
     assert p.k4_specs == [] and not p
     p.cfgs = [(H, True, True)]
     p.k4_specs = [jcd.k4_spec(148, H, K, K, True)]
-    assert p.k4_specs[0] in p.plan([100, 37]) and p.k4_specs[0] in p.enumerate_specs()
+    assert p.k4_specs[0] in p.enumerate_specs()
     # Keys of pools of any row count map to that one spec; other layouts to none.
     for rows in (1, 3, 16):
         key = (0, 148, H, K, K, (torch.float32, (rows, H, K, K), (H * K * K, K * K, K, 1), True),
