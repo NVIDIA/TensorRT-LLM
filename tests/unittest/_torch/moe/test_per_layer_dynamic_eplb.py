@@ -8,9 +8,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE
-from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler import (
-    RebalanceSlotSchedulerGroup,
-)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     BaseMoeLoadBalancer,
     MoeLoadBalancer,
@@ -19,6 +16,9 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     maybe_create_moe_load_balancer,
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
+    RebalanceSlotSchedulerGroup,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -244,7 +244,7 @@ def test_layer_disables_standard_host_migration_and_checks_geometry():
 
 
 def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_slot_scheduler
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
 
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
@@ -253,7 +253,7 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
     group = _Group()
     builder = MagicMock(return_value=group)
     monkeypatch.setattr(
-        rebalance_slot_scheduler,
+        planner,
         "build_rebalance_slot_scheduler_group",
         builder,
     )
@@ -281,7 +281,7 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
 def test_bind_backend_rejects_different_backend_or_arena_before_construction(
     monkeypatch,
 ):
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_slot_scheduler
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
 
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
@@ -289,7 +289,7 @@ def test_bind_backend_rejects_different_backend_or_arena_before_construction(
     backend = _Backend(arena)
     builder = MagicMock(return_value=_Group())
     monkeypatch.setattr(
-        rebalance_slot_scheduler,
+        planner,
         "build_rebalance_slot_scheduler_group",
         builder,
     )
@@ -367,7 +367,7 @@ def test_quiesced_owner_release_rejects_unfinished_generation():
 
 
 def test_ep_communicator_is_model_owned(monkeypatch):
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_live_arena
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
     creations = []
 
@@ -380,7 +380,7 @@ def test_ep_communicator_is_model_owned(monkeypatch):
         def validate_geometry(self, *, expected_rank, expected_world):
             self.validations.append((expected_rank, expected_world))
 
-    monkeypatch.setattr(rebalance_live_arena, "_EpComm", Comm)
+    monkeypatch.setattr(arena_module, "_EpComm", Comm)
     manager = _manager()
     process_group = object()
 
@@ -395,7 +395,7 @@ def test_ep_communicator_is_model_owned(monkeypatch):
 
 
 def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_live_arena
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
@@ -414,7 +414,7 @@ def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
     monkeypatch.setattr(manager, "get_ep_comm", get_ep_comm)
     monkeypatch.setattr(manager, "create_arena_provider", create_arena_provider)
     allocate = MagicMock(return_value=arena)
-    monkeypatch.setattr(rebalance_live_arena, "allocate_rebalance_arena", allocate)
+    monkeypatch.setattr(arena_module, "allocate_rebalance_arena", allocate)
     bundle, mapping = object(), object()
 
     allocated = layer.allocate_arena(

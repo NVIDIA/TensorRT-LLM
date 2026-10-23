@@ -1142,7 +1142,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Step 2-3: the same quant method registers every live Parameter.
         self.quant_method.create_weights(self)
         if self._rebalance_arena is not None:
-            from .rebalance_slot_scheduler import bind_live_weight_planes
+            from ..per_layer_dynamic_eplb.planner import bind_live_weight_planes
 
             bind_live_weight_planes(self.quant_method, self, self._rebalance_arena)
         # Step 4.

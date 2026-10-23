@@ -124,10 +124,6 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler import (
-    RebalanceSlotSchedulerGroup,
-    _LiveBankLeaseProvider,
-)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     IMPL_PRIORITY,
     _reject_unsupported_activation,
@@ -138,6 +134,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import (
     ExternalCommMoEScheduler,
     FusedCommMoEScheduler,
+)
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
+    RebalanceSlotSchedulerGroup,
+    _LiveBankLeaseProvider,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
@@ -2438,8 +2438,10 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
 def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     monkeypatch,
 ):
-    from tensorrt_llm._torch.moe.fused_moe import PerLayerDynamicMoeLoadBalancer
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_slot_scheduler
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
+        PerLayerDynamicMoeLoadBalancer,
+        planner,
+    )
 
     config = SimpleNamespace(
         num_slots=24,
@@ -2473,7 +2475,7 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     moe.layer_load_balancer = layer
     builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
     monkeypatch.setattr(
-        rebalance_slot_scheduler,
+        planner,
         "build_rebalance_slot_scheduler_group",
         builder,
     )
