@@ -298,10 +298,12 @@ def test_fill_gate_wiring():
         assert result[1] is False and order == []
         k.drain.assert_not_called()
 
-    # Exactly one `self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)` in __init__.
+    # Each execution phase (initial construction or rebind) gets a fresh keepalive.
     tree = ast.parse(inspect.getsource(pe))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PyExecutor")
-    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    init = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_initialize_execution"
+    )
     constructions = [
         n
         for n in ast.walk(init)
