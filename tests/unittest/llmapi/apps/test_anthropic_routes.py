@@ -160,6 +160,20 @@ def test_messages_route_converts_nonstream_response(server_kind):
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_messages_route_accepts_thinking_display(server_kind):
+    """The thinking config Claude Code sends is served, not answered with a 400."""
+    client, backend = _make_route_client(server_kind, _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(max_tokens=4096, thinking={"type": "adaptive", "display": "updates"}),
+    )
+
+    assert response.status_code == 200
+    assert backend.await_args.args[0].chat_template_kwargs["enable_thinking"] is True
+
+
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
 def test_messages_route_rejects_anthropic_server_tools(server_kind):
     client, backend = _make_route_client(server_kind, _json_chat_response())
 
