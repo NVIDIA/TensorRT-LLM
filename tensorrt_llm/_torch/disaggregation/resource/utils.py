@@ -243,7 +243,19 @@ def get_unique_pool_memory_descs(
 ) -> list[tuple[int, int, int, str]]:
     """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools."""
     unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
-    pool_counter = 0
+
+    def add_pool(pool: PhysicalPool, size: int) -> None:
+        # A pool with holes registers each backed range on its own; a region already inside a
+        # registered one is skipped.
+        ranges = pool.mapped_ranges if pool.mapped_ranges is not None else ((0, size),)
+        for start, end in ranges:
+            base = pool.base_address + start
+            if end <= start or any(
+                b <= base and base + end - start <= b + s for b, s in unique_pools
+            ):
+                continue
+            unique_pools[(base, end - start)] = len(unique_pools)
+
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if lg.kind == CacheKind.STATE:
             assert isinstance(lg, MambaLayerGroup)
@@ -256,21 +268,18 @@ def get_unique_pool_memory_descs(
                 key=lambda p: p.base_address,
             )
             for pool in pools:
-                pool_size = pool.num_slots * pool.slot_stride_bytes
-                if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
+                # Interleaved role views start inside the same allocation;
+                # their nominal stride extent can run past its end.
+                if pool.mapped_ranges is None and any(
+                    b <= pool.base_address < b + s for b, s in unique_pools
+                ):
                     continue
-                pool_key = (pool.base_address, pool_size)
-                if pool_key not in unique_pools:
-                    unique_pools[pool_key] = pool_counter
-                    pool_counter += 1
+                add_pool(pool, pool.num_slots * pool.slot_stride_bytes)
         else:
             # PAGED (attention): each pool view is an independent allocation
             for pv in lg.pool_views:
                 pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                pool_key = (pool.base_address, pool.num_slots * pool.slot_stride_bytes)
-                if pool_key not in unique_pools:
-                    unique_pools[pool_key] = pool_counter
-                    pool_counter += 1
+                add_pool(pool, pool.num_slots * pool.slot_stride_bytes)
     return [
         (pool_ptr, pool_size, device_id, f"kv_cache_memory_pool{idx}")
         for (pool_ptr, pool_size), idx in unique_pools.items()
