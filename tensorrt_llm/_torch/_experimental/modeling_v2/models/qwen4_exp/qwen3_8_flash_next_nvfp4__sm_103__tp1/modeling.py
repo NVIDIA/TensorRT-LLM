@@ -225,6 +225,9 @@ from .ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
 from .ops.moe.fused_sigmoid_gate_mul_add import fused_sigmoid_gate_mul_add
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
+from .ops.moe.nvfp4_moe_gemv import nvfp4_moe_gemv_op
+from .ops.moe.nvfp4_moe_gemv import precompile as nvfp4_moe_gemv_precompile
+from .ops.moe.nvfp4_moe_gemv import register_weights as nvfp4_moe_gemv_register
 from .ops.moe.renorm_moe_routing_op import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm import flashinfer_gemma_rmsnorm
 from .ops.norm.layer_norm import layer_norm
@@ -760,6 +763,24 @@ _MTP_MOE_NVFP4_FC2_MARGIN = 4.0
 def _mtp_moe_nvfp4_enabled() -> bool:
     mode = os.environ.get(_MTP_MOE_NVFP4_ENV, "0")
     assert mode in ("0", "1"), f"{_MTP_MOE_NVFP4_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
+
+
+#: Set to 1 to run the decode step's routed experts on `nvfp4_moe_gemv` at the row counts in
+#: `_MOE_GEMV_ROWS`, where the runner's finalize folds into the next hyper-connection site:
+#: Renormalize routing, FC1, SwiGLU, NVFP4 requantization and FC2 in two PDL launches on the
+#: tcgen05 block-scaled MMA over the trtllm-gen expert stacks (bitwise the runner's outputs on
+#: the checkpoint). The TMA descriptors of every layer's stacks are built and the kernels
+#: compiled at load. 0 (default): the trtllm-gen runner.
+_MOE_GEMV_ENV = "TRTLLM_MODELING_V2_MOE_GEMV"
+#: Decode row counts `nvfp4_moe_gemv` takes: where it measured faster than the runner (GB300,
+#: 48-layer chain with the router projection).
+_MOE_GEMV_ROWS = frozenset({1, 2, 3, 4})
+
+
+def _moe_gemv_enabled() -> bool:
+    mode = os.environ.get(_MOE_GEMV_ENV, "0")
+    assert mode in ("0", "1"), f"{_MOE_GEMV_ENV}={mode!r}: expected 0 or 1"
     return mode == "1"
 
 
@@ -1465,6 +1486,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self.moe_prefill_copy = _moe_prefill_copy(
             self.trunk_moe_backend, model_config.max_num_tokens
         )
+        # `_MOE_GEMV_ENV`: the small-row decode MoE over the trtllm-gen stacks.
+        self.moe_gemv = _moe_gemv_enabled() and self.trunk_moe_backend == "TRTLLM"
         self.max_num_tokens = model_config.max_num_tokens
 
         # ---- PLE -----------------------------------------------------------
@@ -1795,6 +1818,11 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         )
         self._moe_scalars = moe_scalars
         self._moe_scalars_cd = moe_scalars_cd
+        if self.moe_gemv and device.type == "cuda":
+            # Before any CUDA-graph capture: the descriptors are uploaded, the kernels built.
+            for i in range(self.num_layers):
+                nvfp4_moe_gemv_register(w[f"l{i}_fc1_w"], w[f"l{i}_fc2_w"])
+            nvfp4_moe_gemv_precompile(max(_MOE_GEMV_ROWS))
         # Both delta-rule entries index A_log and dt_bias as `ptr + head` and certify
         # fp32; the checkpoint is bf16.
         self._gdn_gating = {
@@ -5259,7 +5287,12 @@ class DecodeTarget:
             routed = _cute_dsl_routed(core, L, logits, xq, xsf, routed_out)
             main.wait_stream(side)
             return routed, (gate_logits, shared, None, None)
-        moe_op = fp4_block_scale_moe_renorm_permuted if fold else fp4_block_scale_moe_renorm_routed
+        if fold and core.moe_gemv and x.shape[0] in _MOE_GEMV_ROWS:
+            moe_op = nvfp4_moe_gemv_op
+        elif fold:
+            moe_op = fp4_block_scale_moe_renorm_permuted
+        else:
+            moe_op = fp4_block_scale_moe_renorm_routed
         out = moe_op(
             logits,
             xq,
