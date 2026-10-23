@@ -482,6 +482,10 @@ class PyTorchModelEngine(ModelEngine):
             self._nccl_window_tensor_scope_hooks = []
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
+                # Dynamo config overrides are thread-local and forward runs on
+                # the executor thread, so bind the limit to each compiled callable.
+                torch_compile_recompile_limit = max(
+                    torch._dynamo.config.recompile_limit, 16)
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
@@ -513,7 +517,8 @@ class PyTorchModelEngine(ModelEngine):
                     compiled_model = torch.compile(
                         eager_model,
                         backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
+                        fullgraph=torch_compile_fullgraph,
+                        recompile_limit=torch_compile_recompile_limit)
                     self._torch_compile_prefill_only = (
                         self._torch_compile_piecewise_cuda_graph
                         and (compile_only_piecewise_graphs
@@ -527,14 +532,16 @@ class PyTorchModelEngine(ModelEngine):
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
                     # scope through the mixin.
-                    apply_llm_torch_compile(backend=self._torch_compile_backend,
-                                            fullgraph=torch_compile_fullgraph)
+                    apply_llm_torch_compile(
+                        backend=self._torch_compile_backend,
+                        fullgraph=torch_compile_fullgraph,
+                        recompile_limit=torch_compile_recompile_limit)
                 else:
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
-                torch._dynamo.config.cache_size_limit = 16
+                        fullgraph=torch_compile_fullgraph,
+                        recompile_limit=torch_compile_recompile_limit)
             else:
                 set_torch_compiling(False)
                 self._nccl_window_tensor_scope_hooks = (
