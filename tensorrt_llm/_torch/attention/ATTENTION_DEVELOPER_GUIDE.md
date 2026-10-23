@@ -574,7 +574,11 @@ The FMHA package is split by role:
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
   With an FP8 KV cache it passes `mla_bmm1_scale` / `mla_bmm2_scale` to the
   kernel as device tensors (element 0 of each), so the scales need no host
-  read and stay valid under CUDA graph replay.
+  read and stay valid under CUDA graph replay. The kernel is compiled with a
+  16-byte `assumed_align` for the page table and the KV lengths; slices of
+  `kv_cache_block_offsets` or `sequence_lengths` that start past the context
+  requests or in a non-first pool can break it, so such slices are copied
+  (`_aligned_kernel_input`) while aligned ones launch in place.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
