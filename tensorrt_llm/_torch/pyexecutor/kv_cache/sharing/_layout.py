@@ -21,11 +21,20 @@ import enum
 import hashlib
 import json
 import struct
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
+from ..page_layout import (
+    BufferDesc,
+    LayerGroupDesc,
+    MapperKind,
+    PageLayout,
+    RankTopology,
+    RoleLayout,
+    ShardDesc,
+)
 from . import _manager
 
 if TYPE_CHECKING:
@@ -35,144 +44,10 @@ if TYPE_CHECKING:
 
 # A new field left out at its default keeps the version; changing the encoding or the meaning of
 # an existing field bumps it.
-LAYOUT_ID_VERSION = 2
+LAYOUT_ID_VERSION = 3
 
 # The fallback entry of the manager's per-role declarations (``Role.ALL``).
 _ALL_ROLE = "all"
-
-
-class BufferMapper(enum.IntEnum):
-    """How a buffer's bytes split across tensor-parallel ranks; the values of the mapper kinds
-    managers declare per role, read by value."""
-
-    INDEXED = 0  # head-major K/V, the default: a head range is one contiguous range per buffer
-    REPLICATED = 1  # bytes identical on every TP rank
-    NHD = 2  # token-major [token, head, dim] K/V: a head range is a slice inside every token
-    SECTIONED = 3  # [Sec0|Sec1|...], each section sharded independently (recurrent conv state)
-
-
-@dataclass(frozen=True)
-class BufferGeometry:
-    """Resharding geometry of one buffer; all ``None`` means no head axis. ``section_bytes`` sum to
-    the buffer's size; ``bytes_per_head * num_heads`` equals it."""
-
-    section_bytes: tuple[int, ...] | None = None
-    bytes_per_head: int | None = None
-    num_heads: int | None = None
-
-    def validate(self) -> BufferGeometry:
-        """A copy with ``section_bytes`` as ints; ``ValueError`` unless every size given is
-        positive."""
-        sections = self.section_bytes
-        if sections is not None:
-            sections = tuple(int(s) for s in sections)
-            if any(s <= 0 for s in sections):
-                raise ValueError(f"section sizes must be positive, got {sections}")
-        for name in ("bytes_per_head", "num_heads"):
-            value = getattr(self, name)
-            if value is not None and int(value) <= 0:
-                raise ValueError(f"{name} must be positive, got {value}")
-        return BufferGeometry(sections, self.bytes_per_head, self.num_heads)
-
-    def check_size(self, size: int) -> None:
-        """``ValueError`` unless this geometry describes a buffer of ``size`` bytes."""
-        if self.section_bytes is not None and sum(self.section_bytes) != size:
-            raise ValueError(f"sections {self.section_bytes} do not sum to {size} bytes")
-        if self.bytes_per_head is not None and size % self.bytes_per_head:
-            raise ValueError(
-                f"{size} bytes is not a whole number of {self.bytes_per_head}-byte heads"
-            )
-        if (
-            self.bytes_per_head is not None
-            and self.num_heads is not None
-            and self.bytes_per_head * self.num_heads != size
-        ):
-            raise ValueError(
-                f"{self.num_heads} heads of {self.bytes_per_head} bytes is not {size} bytes"
-            )
-
-
-@dataclass(frozen=True)
-class ShardDesc:
-    """Which share (``index`` of ``count``) of a layer group's content this rank holds; ``(1, 0)``
-    is the whole content, which every rank names alike. ``ValueError`` for an index outside the
-    count."""
-
-    count: int = 1
-    index: int = 0
-
-    def __post_init__(self) -> None:
-        if self.count < 1 or not 0 <= self.index < self.count:
-            raise ValueError(f"shard {self.index} of {self.count}")
-
-
-@dataclass(frozen=True)
-class LayerGroupDesc:
-    """One layer group: its kind, window and sink blocks (which blocks exist), its device pool
-    group, its global layer ids and the share of its content this rank holds."""
-
-    kind: Literal["attention", "state"]
-    window: int | None
-    sink_blocks: int
-    pool_group: int
-    layers: tuple[int, ...]
-    shard: ShardDesc = ShardDesc()
-
-
-@dataclass(frozen=True)
-class BufferDesc:
-    """One buffer of one layer (global id) in a page: ``size`` bytes at ``offset`` in the slot of
-    ``pool`` = (pool group, pool index), how its bytes split across ranks, whether peers transfer
-    it, and its sub-pages per block. ``ValueError`` for a non-positive size or expansion."""
-
-    layer: int
-    role: str
-    pool: tuple[int, int]
-    offset: int
-    size: int
-    mapper: BufferMapper = BufferMapper.INDEXED
-    geometry: BufferGeometry = BufferGeometry()
-    # False for local-only buffers peers skip; they still ride along wherever whole slots are
-    # copied.
-    transfer: bool = True
-    # The buffer's own tokens per block is tokens_per_block / expansion; a consumer reading inside
-    # the buffer that does not support the value must reject the layout.
-    expansion: int = 1
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "role", str(self.role))
-        object.__setattr__(self, "mapper", BufferMapper(self.mapper))
-        if not isinstance(self.geometry, BufferGeometry):
-            raise ValueError(f"geometry must be a buffer geometry, got {self.geometry!r}")
-        if self.size <= 0 or self.offset < 0:
-            raise ValueError(f"buffer at offset {self.offset} of {self.size} bytes")
-        if int(self.expansion) < 1:
-            raise ValueError(f"expansion must be a positive integer, got {self.expansion}")
-        self.geometry.check_size(self.size)
-
-
-@dataclass(frozen=True)
-class Layout:
-    """How pages are built, without addresses or slot counts: ``pool_groups[g]`` holds the slot
-    widths of device pool group ``g`` in pool order. ``ValueError`` for an expansion that does not
-    divide ``tokens_per_block``."""
-
-    tokens_per_block: int
-    pool_groups: Mapping[int, tuple[int, ...]]
-    layer_groups: tuple[LayerGroupDesc, ...]
-    buffers: tuple[BufferDesc, ...]
-
-    def __post_init__(self) -> None:
-        pool_groups = {
-            int(g): tuple(int(w) for w in widths) for g, widths in dict(self.pool_groups).items()
-        }
-        object.__setattr__(self, "pool_groups", pool_groups)
-        for b in self.buffers:
-            if self.tokens_per_block % int(b.expansion):
-                raise ValueError(
-                    f"buffer ({b.layer}, {b.role}): expansion {b.expansion} does not divide "
-                    f"{self.tokens_per_block} tokens per block"
-                )
 
 
 # Enums encode as the member name, floats as "f64:" plus the 16 hex digits of their big-endian
@@ -202,8 +77,7 @@ def _canonical(value: object) -> object:
 
 
 def canonical_bytes(document: Mapping) -> bytes:
-    """``document`` as ASCII JSON, keys sorted, no whitespace; enums by name, floats as ``f64:`` and
-    their big-endian bits in hex, ``None`` values dropped from objects."""
+    """``document`` as ASCII JSON, keys sorted, no whitespace, values encoded by ``_canonical``."""
     return json.dumps(
         _canonical(document),
         sort_keys=True,
@@ -223,47 +97,51 @@ def canonical_order(layers: Sequence[Sequence[int]]) -> list[int]:
     return canonical
 
 
-def _geometry_document(geometry: BufferGeometry) -> dict:
+def _geometry_document(buffer: BufferDesc) -> dict:
+    geometry = buffer.geometry
+    indexed = buffer.mapper not in (MapperKind.REPLICATED, MapperKind.SECTIONED)
     return {
         "section_bytes": None if geometry.section_bytes is None else list(geometry.section_bytes),
         "bytes_per_head": geometry.bytes_per_head,
-        "num_heads": geometry.num_heads,
+        "num_heads": buffer.size // geometry.bytes_per_head
+        if indexed and geometry.bytes_per_head
+        else None,
     }
 
 
-def _buffer_document(layout: Layout, b: BufferDesc) -> dict:
+def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
     # A buffer's position in the page: the slot widths of the pools before it in its group, plus
     # its offset inside the slot.
-    widths = layout.pool_groups.get(b.pool[0])
+    widths = layout.pool_slot_bytes.get(b.pool_group)
     if widths is None:
-        raise ValueError(f"buffer ({b.layer}, {b.role}) lies in pool {b.pool}, not in the layout")
+        raise ValueError(
+            f"buffer ({b.layer}, {b.role}) lies in pool {(b.pool_group, b.pool_index)}, not in the layout"
+        )
     doc = {
         "layer": int(b.layer),
         "role": b.role,
-        "offset": sum(widths[: b.pool[1]]) + int(b.offset),
+        "offset": sum(widths[: b.pool_index]) + int(b.slot_offset),
         "size": int(b.size),
     }
-    # Fields at their defaults are left out, so a new defaulted field keeps existing ids.
-    if b.mapper is not BufferMapper.INDEXED:
+    if b.mapper is not MapperKind.INDEXED:
         doc["mapper"] = b.mapper.name
-    geometry = {k: v for k, v in _geometry_document(b.geometry).items() if v is not None}
+    geometry = {k: v for k, v in _geometry_document(b).items() if v is not None}
     if geometry:
         doc["geometry"] = geometry
-    if not b.transfer:
+    if not b.transferred:
         doc["transfer"] = False
     if int(b.expansion) != 1:
         doc["expansion"] = int(b.expansion)
     return doc
 
 
-def layout_document(layout: Layout) -> dict:
-    """The document ``layout_id`` hashes: tokens per block, groups in canonical order (layers, slot
-    widths, kind), buffers by (layer, role). Addresses, windows, sinks, shards, local numbering and
-    element types stay out."""
+def layout_document(layout: PageLayout) -> dict:
+    """Hash canonical global layer groups, slot widths, kinds and buffer geometry, but no addresses,
+    windows, sinks, shards, topology, head counts, dtypes or local region numbering."""
     canonical = canonical_order([desc.layers for desc in layout.layer_groups])
     groups = [None] * len(layout.layer_groups)
     for local, desc in enumerate(layout.layer_groups):
-        widths = layout.pool_groups.get(desc.pool_group)
+        widths = layout.pool_slot_bytes.get(desc.pool_group)
         if widths is None:
             raise ValueError(
                 f"layer group {local} maps to pool group {desc.pool_group}, which is not in the "
@@ -285,13 +163,13 @@ def layout_document(layout: Layout) -> dict:
             raise ValueError(f"buffer ({before['layer']}, {before['role']}) appears twice")
     return {
         "v": LAYOUT_ID_VERSION,
-        "tokens_per_block": int(layout.tokens_per_block),
+        "tokens_per_block": int(layout.tokens_per_page),
         "groups": groups,
         "buffers": buffers,
     }
 
 
-def layout_id(layout: Layout) -> bytes:
+def layout_id(layout: PageLayout) -> bytes:
     """SHA-256 of ``canonical_bytes(layout_document(layout))``."""
     return hashlib.sha256(canonical_bytes(layout_document(layout))).digest()
 
@@ -309,11 +187,10 @@ class DevicePool:
 
 @dataclass(frozen=True, eq=False)
 class ManagerLayout:
-    """What the lender reads of one manager, as plain values that hold no manager: the address-free
-    ``layout``, facts per layer group (tuples indexed by the local layer group) and per device pool
-    group (mappings keyed by the pool group)."""
+    """Plain values without a manager reference; ``cp`` is (rank, size), (0, 1) without Helix.
+    ``tokens_per_block`` spans ``size`` physical pages of ``tokens_per_block // size`` tokens."""
 
-    layout: Layout
+    page_layout: PageLayout
     tokens_per_block: int
     pool_group_of: tuple[int, ...]
     windows: tuple[int | None, ...]
@@ -324,6 +201,14 @@ class ManagerLayout:
     shards: tuple[tuple[int, int], ...]
     page_bytes: Mapping[int, int]
     device_pools: Mapping[int, tuple[DevicePool, ...]]
+    cp: tuple[int, int] = (0, 1)
+    # Per layer group, the window its attention reads, at most the window kept; ``()``: the same.
+    read_windows: tuple[int | None, ...] = ()
+    # Per layer group, whether it lends by name: none of its layers kept out of prefix reuse.
+    named_groups: tuple[bool, ...] = field(kw_only=True)
+    # Whether every windowed layer group's stale range is the runtime's window formula of its
+    # window and sink blocks at each history, as the manager answered for every history probed.
+    stale_ranges_by_formula: bool = field(default=False, kw_only=True)
 
     @property
     def num_layer_groups(self) -> int:
@@ -337,9 +222,8 @@ class ManagerLayout:
 
 
 def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
-    """The global id of each internal layer id, the same under any pipeline split: the declared id;
-    else for virtual layers ``model_layer * number_of_attention_types + attention_type``; else the
-    model layer."""
+    """Each internal layer's global id, the same under any pipeline split: the declared id, else for
+    virtual layers ``model_layer * num_types + attention_type``, else the model layer."""
     # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
     declared = _manager.declared_global_layer_ids(manager)
     if declared is not None:
@@ -347,10 +231,28 @@ def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> 
     virtual = _manager.virtual_layers(manager)
     if virtual is None:
         return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
-    # The number of types counts every member of the enum, so stages holding different attention
-    # types agree.
     inverse, num_types = virtual
     return [inverse[int(lid)][0] * num_types + inverse[int(lid)][1] for lid in internal_ids]
+
+
+def _topology(mapping: object) -> RankTopology:
+    """The rank's place as native's ``RankInfo`` reads it from the mapping: under attention data
+    parallelism each tensor-parallel rank is a data-parallel rank of its own."""
+    if mapping is None:
+        return RankTopology()
+    adp = bool(getattr(mapping, "enable_attention_dp", False))
+    tp_size, tp_rank = int(getattr(mapping, "tp_size", 1)), int(getattr(mapping, "tp_rank", 0))
+    return RankTopology(
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        pp_size=int(getattr(mapping, "pp_size", 1)),
+        pp_rank=int(getattr(mapping, "pp_rank", 0)),
+        cp_size=int(getattr(mapping, "cp_size", 1)),
+        cp_rank=int(getattr(mapping, "cp_rank", 0)),
+        dp_size=tp_size if adp else int(getattr(mapping, "dp_size", 1)),
+        dp_rank=tp_rank if adp else 0,
+        attention_dp=adp,
+    )
 
 
 def _sparse(layer_config: AttentionLayerConfig | SsmLayerConfig) -> bool:
@@ -409,8 +311,7 @@ class _Heads:
 
     def attention_shard(self, internal: int) -> ShardDesc:
         """The share of a head-sharded attention buffer this rank holds: ``T`` heads over ``tp``
-        ranks, rank ``r`` holds ``ceil(T / tp)`` from ``r * T // tp``. Where any rank's range starts
-        inside a share, each rank's buffer is a share of its own."""
+        ranks, rank ``r`` holding ``ceil(T / tp)`` from ``r * T // tp``."""
         if self.tp_size == 1:
             return ShardDesc()
         heads, total = self.per_rank(internal), self.total(internal)
@@ -430,21 +331,21 @@ class _Heads:
 
 
 def _buffer_geometry(
-    declared: object, mapper: BufferMapper, size: int, heads: int, state: bool
-) -> BufferGeometry:
+    declared: object, mapper: MapperKind, size: int, heads: int, state: bool
+) -> RoleLayout:
     """A buffer's head geometry: declared sections or head size, completed per buffer.
     ``ValueError`` if the declared or completed geometry has a size that is not positive."""
-    declared = BufferGeometry(
+    declared = RoleLayout(
         getattr(declared, "section_bytes", None), getattr(declared, "bytes_per_head", None)
-    ).validate()
-    if mapper in (BufferMapper.REPLICATED, BufferMapper.SECTIONED):
+    )
+    if mapper in (MapperKind.REPLICATED, MapperKind.SECTIONED):
         return declared
     bytes_per_head = declared.bytes_per_head
     if bytes_per_head is None and not state and heads > 0 and size % heads == 0:
         bytes_per_head = size // heads
     if bytes_per_head is None or size % bytes_per_head:
         return declared
-    return BufferGeometry(declared.section_bytes, bytes_per_head, size // bytes_per_head).validate()
+    return RoleLayout(declared.section_bytes, bytes_per_head)
 
 
 # A layer group is whole when every transferred buffer holds the same bytes on every rank
@@ -475,13 +376,17 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
         if _manager.is_recurrent_layer(layer_cfg[layer_ids[0]]):
             state_groups.add(lg)
 
-    # TODO: the base manager declares head-major K/V whichever attention backend writes its pages,
-    # so a manager paired with a token-major backend gets the head-major layout_id unless it
-    # declares its layout itself.
+    # TODO: the base manager declares head-major K/V whichever backend writes its pages, so a
+    # token-major backend's manager gets a head-major layout_id unless it declares its own.
     mappers = {
-        role: BufferMapper(int(kind)) for role, kind in _manager.role_mapper_kinds(manager).items()
+        role: MapperKind(int(kind)) for role, kind in _manager.role_mapper_kinds(manager).items()
     }
-    default_mapper = mappers.get(_ALL_ROLE, BufferMapper.INDEXED)
+    if _ALL_ROLE not in mappers:
+        raise ValueError(
+            "the manager declares no mapper kind for Role.ALL, the fallback of the roles it does "
+            "not list"
+        )
+    default_mapper = mappers[_ALL_ROLE]
     role_layouts = _manager.role_layouts(manager)
     ignored = _manager.ignored_roles(manager)
     heads = _Heads(manager)
@@ -515,31 +420,44 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
                         BufferDesc(
                             layer=global_of.get(lid, lid),
                             role=role,
-                            pool=(g, pool_index),
-                            offset=j * size,
+                            pool_group=g,
+                            pool_index=pool_index,
+                            slot_offset=j * size,
                             size=size,
                             mapper=mapper,
                             geometry=_buffer_geometry(
                                 role_layouts.get(role), mapper, size, heads.per_rank(lid), state
                             ),
-                            transfer=transfer,
+                            transferred=transfer,
                             expansion=expansions.get(lid, {}).get(role, 1),
                         )
                     )
-                    if not transfer or mapper is BufferMapper.REPLICATED:
+                    if not transfer or mapper is MapperKind.REPLICATED:
                         continue
                     shards[lg].append(heads.state_shard() if state else heads.attention_shard(lid))
 
     layer_groups: list[LayerGroupDesc] = []
+    total_kv_heads: dict[int, int] = {}
     for lg, layer_ids in enumerate(grouping):
         first = layer_cfg[layer_ids[0]]
         is_state = lg in state_groups
-        window = None
+        window = read = None
         sink_tokens = 0
         if not is_state:
             window = getattr(first, "window_size", None)
             window = None if window is None else int(window)
+            read = _manager.read_window(manager, lg, window)
+            read = None if read is None else int(read)
+            if (read is None) != (window is None) or (read is not None and not 0 < read <= window):
+                raise ValueError(
+                    f"layer group {lg} reads a window of {read} tokens, which its kept window of "
+                    f"{window} tokens does not hold"
+                )
             sink_tokens = int(getattr(first, "num_sink_tokens", None) or 0)
+            for lid in layer_ids:
+                total = heads.total(lid)
+                if total:
+                    total_kv_heads[global_of[lid]] = total
         # Layer groups with equal slot sizes may share a pool group, each drawing its own slots.
         g = pg_of_lg[lg]
         if g not in device_pools:
@@ -547,30 +465,44 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
         layer_groups.append(
             LayerGroupDesc(
                 kind="state" if is_state else "attention",
-                window=window,
-                sink_blocks=-(-sink_tokens // tokens_per_block),
+                kept_window=window,
+                num_sink_blocks=-(-sink_tokens // tokens_per_block),
                 pool_group=g,
                 layers=tuple(sorted(global_of[lid] for lid in layer_ids)),
                 shard=_group_shard(shards[lg], ShardDesc(heads.tp_size, heads.tp_rank)),
+                read_window=read,
             )
         )
 
-    layout = Layout(
-        tokens_per_block=tokens_per_block,
-        pool_groups={g: tuple(p.slot_bytes for p in pools) for g, pools in device_pools.items()},
+    page_layout = PageLayout(
+        tokens_per_page=tokens_per_block,
+        pool_slot_bytes={
+            g: tuple(p.slot_bytes for p in pools) for g, pools in device_pools.items()
+        },
         layer_groups=tuple(layer_groups),
         buffers=tuple(buffers),
+        topology=_topology(getattr(manager, "mapping", None)),
+        total_kv_heads_by_layer=total_kv_heads,
+        dtype=_manager.kv_dtype(manager),
+        quant_mode=_manager.kv_quant_mode(manager),
     )
+    cp_rank, cp_size = _manager.helix(manager)
     return ManagerLayout(
-        layout=layout,
-        tokens_per_block=tokens_per_block,
+        page_layout=page_layout,
+        tokens_per_block=tokens_per_block * cp_size,
         pool_group_of=tuple(pg_of_lg),
-        windows=tuple(desc.window for desc in layer_groups),
-        sink_blocks=tuple(desc.sink_blocks for desc in layer_groups),
+        windows=tuple(desc.kept_window for desc in layer_groups),
+        sink_blocks=tuple(desc.num_sink_blocks for desc in layer_groups),
         recurrent=tuple(desc.kind == "state" for desc in layer_groups),
         sparse=tuple(_sparse(layer_cfg[layer_ids[0]]) for layer_ids in grouping),
         layers=tuple(desc.layers for desc in layer_groups),
         shards=tuple((desc.shard.count, desc.shard.index) for desc in layer_groups),
         page_bytes={g: sum(p.slot_bytes for p in pools) for g, pools in device_pools.items()},
         device_pools=device_pools,
+        cp=(cp_rank, cp_size),
+        read_windows=tuple(desc.read_window for desc in layer_groups),
+        named_groups=tuple(
+            not any(_manager.is_private_layer(layer_cfg[lid]) for lid in group)
+            for group in grouping
+        ),
     )
