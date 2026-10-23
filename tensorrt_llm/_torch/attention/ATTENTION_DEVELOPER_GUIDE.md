@@ -553,6 +553,16 @@ The FMHA package is split by role:
   owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
   manager keeps the SSM, convolution, and KDA replay state. Disaggregated
   serving of hybrid FP4 MLA models is not supported yet.
+  With an NVFP4 KV cache, Kimi K3 keeps the last two MLA layers of the global
+  `linear_attn_config.full_attn_layers` schedule in an FP8 KV cache. The model,
+  the cache allocation, and the memory estimator share this policy
+  (`kimi_k3_cache_policy.py`); KDA state is unaffected.
+  `TLLM_KIMI_K3_FP8_KV_LAYERS` replaces the default with a comma-separated
+  list of zero-based global MLA layer IDs, and an empty value keeps every MLA
+  layer in NVFP4. The FP8 layers use their own non-evicting lifecycle with
+  the FP4 MLA page size, and `fmha/cute_dsl_mla.py` serves their generation
+  phase, including in mixed batches. Each pipeline stage still needs at least
+  one NVFP4 MLA layer.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through

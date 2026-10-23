@@ -45,7 +45,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+from tensorrt_llm._torch.kimi_k3_cache_policy import (
+    KIMI_K3_FP8_KV_LAYERS_ENV,
+    get_kimi_k3_fp8_kv_layer_ids,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     KVCacheManagerV2,
@@ -649,11 +652,11 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
     assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
 
 
-def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
+def test_fp4_mla_v2_cache_size_accounts_for_fp8_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             model_type="kimi_linear",
@@ -674,8 +677,67 @@ def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
     )
 
     fp4_bytes_per_token = 320 + 40 + 32
-    assert slope == fp4_bytes_per_token + 576 * torch.bfloat16.itemsize
+    assert slope == fp4_bytes_per_token + 576 * torch.float8_e4m3fn.itemsize
     assert intercept == 3 * (HP_BLOCK_SIZE + 3) * 576 * 2
+
+
+@pytest.mark.parametrize("rank, num_fp8_layers", [(0, 0), (1, 2)])
+def test_fp4_mla_v2_default_fp8_tail_sizing_uses_global_layers(
+    monkeypatch: pytest.MonkeyPatch, rank: int, num_fp8_layers: int
+) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_k3",
+            num_hidden_layers=16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            linear_attn_config={"full_attn_layers": list(range(2, 17, 2))},
+        )
+    )
+    slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        Mapping(world_size=2, tp_size=1, pp_size=2, rank=rank),
+        num_layers=4,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_batch_size=3,
+        spec_config=SimpleNamespace(tokens_per_gen_step=4),
+    )
+
+    # The last two MLA layers of the global schedule (13 and 15) live on the
+    # second pipeline stage.
+    num_fp4_layers = 4 - num_fp8_layers
+    assert slope == num_fp4_layers * (320 + 40 + 32) + num_fp8_layers * 576
+    assert intercept == 3 * 2 * num_fp4_layers * (HP_BLOCK_SIZE + 3) * 576 * 2
+
+
+def test_kimi_k3_fp8_kv_layer_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    # NVFP4 defaults to the last two MLA layers; other dtypes keep none.
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True) == frozenset({5, 7})
+    assert get_kimi_k3_fp8_kv_layer_ids(config) == frozenset()
+    # Other model families never take the Kimi K3 default.
+    assert (
+        get_kimi_k3_fp8_kv_layer_ids(SimpleNamespace(model_type="deepseek_v3"), nvfp4_enabled=True)
+        == frozenset()
+    )
+
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "1")
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True) == frozenset({1})
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "")
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True) == frozenset()
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "2")
+    with pytest.raises(ValueError, match="only MLA layers"):
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "9")
+    with pytest.raises(ValueError, match="outside"):
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
 
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:

@@ -28,7 +28,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MambaLayerGroup,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -2384,7 +2384,7 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     mgr = _fp4_mla_hybrid_manager_stub()
 
     config = _configure_fp4_mla_hybrid(mgr, SimpleNamespace(kv_lora_rank=32))
@@ -2412,11 +2412,11 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     assert mgr._get_pool_roles(2) == (Role.MLA_HP_TAIL, None)
 
 
-def test_v2_hybrid_composes_bf16_fallback_with_fp4_mla_and_ssm_layers(
+def test_v2_hybrid_composes_fp8_fallback_with_fp4_mla_and_ssm_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     mgr = _fp4_mla_hybrid_manager_stub()
     pretrained_config = SimpleNamespace(
         model_type="kimi_linear",
@@ -2428,14 +2428,14 @@ def test_v2_hybrid_composes_bf16_fallback_with_fp4_mla_and_ssm_layers(
     config = _configure_fp4_mla_hybrid(mgr, pretrained_config)
 
     assert mgr._cache_manager_layer_ids == [LayerId(1)]
-    assert mgr._bf16_mla_manager_layer_ids == [LayerId(3)]
+    assert mgr._fp8_mla_manager_layer_ids == [LayerId(3)]
     assert mgr._hp_manager_layer_ids == [LayerId(4)]
     assert [buffer.role for buffer in config.layers[3].buffers] == [Role.KEY]
     assert config.layers[3].buffers[0].size == (
-        96 * torch.bfloat16.itemsize * FP4_MLA_TOKENS_PER_BLOCK
+        96 * torch.float8_e4m3fn.itemsize * FP4_MLA_TOKENS_PER_BLOCK
     )
     assert mgr.get_kv_cache_dtype(1) == DataType.NVFP4
-    assert mgr.get_kv_cache_dtype(3) == DataType.BF16
+    assert mgr.get_kv_cache_dtype(3) == DataType.FP8
 
 
 def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:
