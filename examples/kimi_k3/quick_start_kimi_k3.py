@@ -39,6 +39,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of GPUs used for expert parallelism (default: 16).",
     )
     parser.add_argument(
+        "--checkpoint-io-policy",
+        choices=("auto", "native", "rank_striped_read_ahead", "model_streamer"),
+        default="auto",
+        help="Checkpoint I/O policy (default: auto).",
+    )
+    parser.add_argument(
         "--enable-block-reuse",
         action="store_true",
         help="Enable KV-cache block reuse (unified-pool hybrid cache "
@@ -52,6 +58,7 @@ def main() -> None:
     args = parse_arguments()
     llm = LLM(
         model=args.model,
+        checkpoint_io_policy=args.checkpoint_io_policy,
         tensor_parallel_size=args.tp_size,
         enable_attention_dp=True,
         moe_expert_parallel_size=args.tp_size,

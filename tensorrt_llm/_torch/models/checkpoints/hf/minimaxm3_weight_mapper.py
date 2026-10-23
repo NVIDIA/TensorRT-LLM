@@ -17,14 +17,15 @@ from torch import Tensor, nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 MINIMAX_M3_PARAMS_MAP = {
     r"^(.*\.block_sparse_moe)\.e_score_correction_bias$": r"\1.gate.e_score_correction_bias",
 }
 
 
-@register_mapper("HF", "MiniMaxM3SparseForCausalLM")
-@register_mapper("HF", "MiniMaxM3SparseForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "MiniMaxM3SparseForCausalLM")
+@register_mapper(CheckpointFormat.HF, "MiniMaxM3SparseForConditionalGeneration")
 class MiniMaxM3HfWeightMapper(HfWeightMapper):
     """Handle M3 gate naming and MXFP8 GQA duplication for loader v2."""
 

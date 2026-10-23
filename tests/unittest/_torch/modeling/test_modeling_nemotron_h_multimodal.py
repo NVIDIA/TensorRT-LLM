@@ -213,7 +213,7 @@ def _spec_forward_stub():
 
 @pytest.mark.cpu_only
 def test_nemotron_nano_delegates_draft_loading():
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.pyexecutor.weight_sources import model_hooks
 
     model = object.__new__(NemotronHMultimodalModel)
     torch.nn.Module.__init__(model)
@@ -222,7 +222,7 @@ def test_nemotron_nano_delegates_draft_loading():
 
     assert model.draft_config is model.llm.draft_config
     assert model.draft_model is model.llm.draft_model
-    ModelLoader._call_load_weights(None, model.load_draft_weights, weights, mapper)
+    model_hooks.call_load_weights(model.load_draft_weights, weights, mapper)
     model.llm.load_draft_weights.assert_called_once_with(weights, weight_mapper=mapper)
 
 
