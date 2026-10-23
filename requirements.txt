@@ -68,7 +68,7 @@ peft>=0.18.1,<0.19.0
 patchelf
 einops
 fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
-flashinfer-python==0.6.18
+flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@eed63cd1eafb6a519e42094c058a8509cd938a66#egg=flashinfer-python  # 0.7.2.dev20261022 nightly (contains #5351); switch to the next release
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema
