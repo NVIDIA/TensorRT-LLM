@@ -621,8 +621,13 @@ def run_mamba_transfer_test(
     use_v2: bool = True,
     conv_state_layout: str = "x_b_c",
     with_ple: bool = False,
+    cpp_bounce: bool = False,
 ):
-    """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP)."""
+    """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP).
+
+    With cpp_bounce, the C++ transfer-agent bounce carries every write, using the relaxed gate of
+    the Qwen3.5 GB300 agentic configs.
+    """
     # -- 1. Create managers, zero mamba caches --
     ctx_mgrs = _create_managers(
         ctx_tp,
@@ -644,6 +649,12 @@ def run_mamba_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
+        kv_cache_bounce_size_mb=64 if cpp_bounce else 0,
+        agent_bounce_params=(
+            {"min_descriptor_count": "1", "max_average_descriptor_size": "4MB"}
+            if cpp_bounce
+            else None
+        ),
     )
     ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
     gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
@@ -749,6 +760,15 @@ def run_mamba_transfer_test(
         gen_tcs,
         lambda tc: tc.check_gen_transfer_status(None),
     )
+    if cpp_bounce:
+        # Only context ranks write, and every write must take the bounce.
+        agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
+        assert all(agent.bounce_enabled for agent in agents)
+        ctx_agents = agents[:ctx_tp]
+        assert all(agent.bounce_reject_count == 0 for agent in ctx_agents), [
+            agent.bounce_reject_counts for agent in ctx_agents
+        ]
+        assert sum(agent.bounce_submit_count for agent in ctx_agents) > 0
 
     # -- 8. Read actual AFTER transfer --
     actual = _read_actual(gen_mgrs, gen_rids)
@@ -814,6 +834,7 @@ def test_mamba_transfer(ctx_tp, gen_tp):
 
 
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("cpp_bounce", [False, True], ids=["no_bounce", "cpp_bounce"])
 @pytest.mark.parametrize(
     "ctx_tp,gen_tp,conv_state_layout",
     [
@@ -823,17 +844,19 @@ def test_mamba_transfer(ctx_tp, gen_tp):
     ],
     ids=["same_tp_xbc", "expand_tp_qkv", "contract_tp_xbc"],
 )
-def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout):
+def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout, cpp_bounce):
     """Transfer slot-major V2 Mamba states through Python/NIXL."""
     run_mamba_transfer_test(
         ctx_tp,
         gen_tp,
         use_v2=True,
         conv_state_layout=conv_state_layout,
+        cpp_bounce=cpp_bounce,
     )
 
 
 @pytest.mark.timeout(180)
-def test_v2_mamba_transfer_with_replicated_ple_state():
+@pytest.mark.parametrize("cpp_bounce", [False, True], ids=["no_bounce", "cpp_bounce"])
+def test_v2_mamba_transfer_with_replicated_ple_state(cpp_bounce):
     """Transfer PLE state once while standard Mamba state contracts from TP2 to TP1."""
-    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True)
+    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True, cpp_bounce=cpp_bounce)
