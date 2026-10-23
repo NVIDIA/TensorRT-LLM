@@ -15,6 +15,15 @@ if TYPE_CHECKING:
     from .manager import PerLayerDynamicMoeLoadBalancer
 
 
+def _append_note(error: BaseException, note: str) -> None:
+    """Attach ``note`` to ``error`` like ``BaseException.add_note``, which Python 3.10 lacks."""
+    notes = getattr(error, "__notes__", None)
+    if type(notes) is not list:
+        notes = []
+        error.__notes__ = notes
+    notes.append(note)
+
+
 class PerLayerDynamicMoeLayerLoadBalancer:
     """Adapter between the common MoE routing seam and one replica planner."""
 
@@ -100,16 +109,17 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                 "valid in standard mode."
             )
 
-    # These hooks are part of the standard EPLB layer interface. Routing and
-    # statistics are produced by HALO-Q, so the corresponding CPU stages are
-    # intentionally empty here.
+    def start_set_cpu_stage(self) -> None:
+        """Release the plan of the chunk whose MoE kernel was just enqueued."""
+        self.finish_replica_plan()
+
+    # The other hooks of the standard EPLB layer interface are intentionally
+    # empty: HALO-Q produces the routing and statistics on the GPU, and no CPU
+    # stage migrates weights.
     def start_wait_gpu_stage(self) -> None:
         pass
 
     def done_wait_gpu_stage(self) -> None:
-        pass
-
-    def start_set_cpu_stage(self) -> None:
         pass
 
     def done_set_cpu_stage(self) -> None:
@@ -287,11 +297,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                         "rebalance generation cleanup failed and the group "
                         f"requires teardown: {cleanup_error!r}"
                     )
-                notes = getattr(error, "__notes__", None)
-                if type(notes) is not list:
-                    notes = []
-                    error.__notes__ = notes
-                notes.append("overlap_fn failed after HALO-Q/TMA enqueue; " + cleanup_note)
+                _append_note(error, "overlap_fn failed after HALO-Q/TMA enqueue; " + cleanup_note)
                 raise
             physical, generation = self._scheduler_group.plan_finish(part, defer_wait=True)
         generation = int(generation)
@@ -334,17 +340,6 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         pending.wait_for_routes()
         self._scheduler_group.finish(completion_event=completion_event)
         self._pending_replica_plan = None
-
-    @property
-    def has_submission_owner(self) -> bool:
-        group = self._scheduler_group
-        return bool(group is not None and group.has_submission_owner)
-
-    def handoff_submission_owner(self, execution_stream_handle: int) -> None:
-        """Release this layer's warmup submitter after a caller device drain."""
-        group = self._scheduler_group
-        if group is not None and group.has_submission_owner:
-            group.release_warmup_owner_after_sync(int(execution_stream_handle))
 
     def _clear_runtime(self) -> None:
         self._pending_replica_plan = None

@@ -12,6 +12,7 @@ import math
 import os
 import re
 import sys
+import threading
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -1198,7 +1199,7 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
 @pytest.mark.parametrize("auxiliary_sms", [4, 8])
 def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms):
     trace = []
-    state = SimpleNamespace(device=0, thread=7)
+    state = SimpleNamespace(device=0)
     main = SimpleNamespace(cuda_stream=44, priority=0)
     copy = SimpleNamespace(cuda_stream=19, priority=-1)
     cuda = SimpleNamespace(
@@ -1212,7 +1213,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     )
     torch = SimpleNamespace(cuda=cuda, _C=raw, Tensor=_Routes, int32="int32")
     source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py"
-    namespace = {"torch": torch, "threading": SimpleNamespace(get_ident=lambda: state.thread)}
+    namespace = {"torch": torch}
     group_cls = _extract_class(source, "RebalanceSlotSchedulerGroup", None, namespace)
     lease_cls = _extract_class(source, "_LiveBankLeaseProvider", None, namespace)
     group = group_cls.__new__(group_cls)
@@ -1229,7 +1230,6 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group._pending_release = None
     group._routes_in_flight = None
     group._closed = False
-    group._owner_thread_id = None
     group._execution_stream_handle = None
     group.device = 0
     group.topk = 6
@@ -1310,13 +1310,9 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
             )
     assert launch_bounds == [_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES]
 
-    # The bound-owner fast path still rejects another thread, stream or device.
-    state.thread = 8
-    with pytest.raises(RuntimeError, match="one MAIN thread and stream"):
-        group.plan_schedule(_Routes(8, trace))
-    state.thread = 7
+    # The bound-stream fast path still rejects another stream or device.
     main.cuda_stream = 45
-    with pytest.raises(RuntimeError, match="one MAIN thread and stream"):
+    with pytest.raises(RuntimeError, match="MAIN stream cannot change"):
         group.plan_schedule(_Routes(8, trace))
     main.cuda_stream = 44
     state.device = 1
@@ -1354,6 +1350,64 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group._closed = True
     with pytest.raises(RuntimeError, match="closed"):
         group.wait_for_routes()
+
+
+def test_rebalance_submission_binds_one_main_stream_for_every_thread():
+    priorities = {19: -1, 44: 0, 45: 0, 46: -1}
+    current = SimpleNamespace(stream=46)
+    torch = SimpleNamespace(
+        _C=SimpleNamespace(
+            _cuda_getDevice=lambda: 0,
+            _cuda_getCurrentRawStream=lambda _: current.stream,
+        ),
+        cuda=SimpleNamespace(
+            current_stream=lambda _: SimpleNamespace(
+                cuda_stream=current.stream, priority=priorities[current.stream]
+            )
+        ),
+    )
+    group_cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py",
+        "RebalanceSlotSchedulerGroup",
+        {"_check_owner"},
+        {"torch": torch},
+    )
+    group = group_cls()
+    group._closed = False
+    group.device = 0
+    group.copy_stream = SimpleNamespace(cuda_stream=19, priority=-1)
+    group._stream_handle = 19
+    group._execution_stream_handle = None
+
+    # Neither COPY nor a stream of its priority can become MAIN.
+    for stream in (46, 19):
+        current.stream = stream
+        with pytest.raises(RuntimeError, match="distinct from the higher-priority COPY"):
+            group._check_owner()
+    assert group._execution_stream_handle is None
+
+    # The first other stream binds as MAIN, and any thread may submit on it:
+    # warmup and serving run on different threads but share one stream.
+    current.stream = 44
+    group._check_owner()
+    assert group._execution_stream_handle == 44
+    errors = []
+
+    def submit():
+        try:
+            group._check_owner()
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    worker = threading.Thread(target=submit)
+    worker.start()
+    worker.join()
+    assert errors == []
+
+    current.stream = 45
+    with pytest.raises(RuntimeError, match="MAIN stream cannot change"):
+        group._check_owner()
+    assert group._execution_stream_handle == 44
 
 
 def _module_constants(path: Path, names: set[str]) -> dict:
@@ -1648,6 +1702,31 @@ def test_megamoe_cute_pointer_cache_keys_address_and_alignment():
     assert to_cute_ptr_cached(buffer(4096)) is not first
 
 
+def test_executors_of_one_engine_share_the_execution_stream():
+    # The planner binds the first MAIN stream for good, so the KV-cache
+    # estimation executor and the final executor must share one stream.
+    tree = ast.parse((_TORCH_ROOT / "pyexecutor/py_executor_creator.py").read_text())
+    create = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_create_py_executor"
+    )
+    calls = [
+        node
+        for node in ast.walk(create)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_py_executor_instance"
+    ]
+    assert len(calls) >= 2
+    for call in calls:
+        stream = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "execution_stream"),
+            None,
+        )
+        assert isinstance(stream, ast.Name) and stream.id == "execution_stream"
+
+
 def test_route_wait_occurs_after_independent_staging():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
     impl = _extract_class(
@@ -1789,90 +1868,6 @@ def test_megamoe_runner_identity_is_built_once():
     assert runner.unique_id() == (100, 8, 6)
     assert runner.unique_id() == (100, 8, 6)
     assert builds == [1]
-
-
-def test_warmup_owner_handoff_uses_deduplicated_manager_public_api():
-    events = []
-    main = SimpleNamespace(cuda_stream=11, priority=0, device=0)
-    torch = SimpleNamespace(
-        cuda=SimpleNamespace(
-            synchronize=lambda device: events.append(("synchronize", device)),
-        )
-    )
-    executor_cls = _extract_class(
-        _TORCH_ROOT / "pyexecutor/py_executor.py",
-        "PyExecutor",
-        {"_handoff_rebalance_warmup_owners"},
-        {"torch": torch},
-    )
-
-    class Manager:
-        def __init__(self, name):
-            self.name = name
-
-        def handoff_submission_owner(self, stream_handle):
-            events.append(("handoff", self.name, stream_handle))
-
-    target = Manager("target")
-    draft = Manager("draft")
-    executor = executor_cls()
-    executor.execution_stream = main
-    executor.model_engine = SimpleNamespace(moe_load_balancer=target)
-    executor.draft_model_engine = SimpleNamespace(moe_load_balancer=draft)
-
-    executor._handoff_rebalance_warmup_owners()
-    assert events == [
-        ("synchronize", 0),
-        ("handoff", "target", 11),
-        ("handoff", "draft", 11),
-    ]
-
-    events.clear()
-    executor.draft_model_engine = SimpleNamespace(moe_load_balancer=target)
-    executor._handoff_rebalance_warmup_owners()
-    assert events == [("synchronize", 0), ("handoff", "target", 11)]
-
-    events.clear()
-    executor.model_engine = SimpleNamespace(moe_load_balancer=None)
-    executor.draft_model_engine = None
-    executor._handoff_rebalance_warmup_owners()
-    assert events == []
-
-
-def test_quiesced_owner_release_uses_deduplicated_manager_public_api():
-    events = []
-    main = SimpleNamespace(cuda_stream=11, priority=0, device=0)
-    executor_cls = _extract_class(
-        _TORCH_ROOT / "pyexecutor/py_executor.py",
-        "PyExecutor",
-        {"_release_quiesced_rebalance_submission_owners"},
-        {},
-    )
-
-    class Manager:
-        def __init__(self, name):
-            self.name = name
-
-        def release_quiesced_submission_owner(self, stream_handle):
-            events.append(("release", self.name, stream_handle))
-
-    target = Manager("target")
-    draft = Manager("draft")
-    executor = executor_cls()
-    executor.execution_stream = main
-    executor.model_engine = SimpleNamespace(moe_load_balancer=target)
-    executor.draft_model_engine = SimpleNamespace(moe_load_balancer=draft)
-
-    executor._release_quiesced_rebalance_submission_owners()
-    assert events == [
-        ("release", "target", 11),
-        ("release", "draft", 11),
-    ]
-
-    events.clear()
-    executor.draft_model_engine = SimpleNamespace(moe_load_balancer=target)
-    executor._release_quiesced_rebalance_submission_owners()
-    assert events == [("release", "target", 11)]
 
 
 def _autotune_helpers(torch):
@@ -2095,6 +2090,301 @@ def test_per_layer_dynamic_shutdown_reports_in_iter_through_collective_preflight
     assert calls == [
         ("allgather", {"local_safe": False, "pool_count": 1}),
     ]
+
+
+def test_post_moe_hook_releases_a_replica_plan_every_chunk():
+    moe_cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/interface.py",
+        "MoE",
+        {"_load_balancer_start_set_cpu_stage", "_load_balancer_uses_replica_plan"},
+        {},
+    )
+    moe_cls._using_dynamic_load_balancer = _extract_function(
+        _TORCH_ROOT / "moe/fused_moe/impl_blocks.py", "_using_dynamic_load_balancer", {}
+    )
+    started = []
+
+    class Layer:
+        def __init__(self, *, produces_replica_plan, dynamic_routing):
+            self.produces_replica_plan = produces_replica_plan
+            self.dynamic_routing = dynamic_routing
+
+        def is_dynamic_routing(self):
+            return self.dynamic_routing
+
+        def start_set_cpu_stage(self):
+            started.append(self)
+
+    cases = [
+        # A per-layer dynamic layer disables standard host migration.
+        (Layer(produces_replica_plan=True, dynamic_routing=False), [True, True]),
+        (Layer(produces_replica_plan=False, dynamic_routing=True), [False, True]),
+        (Layer(produces_replica_plan=False, dynamic_routing=False), [False, False]),
+        (None, [False, False]),
+    ]
+    for layer, expected in cases:
+        moe = moe_cls()
+        moe.layer_load_balancer = layer
+        observed = []
+        for is_last_call in (False, True):
+            started.clear()
+            moe._load_balancer_start_set_cpu_stage(is_last_call)
+            observed.append(started == [layer])
+        assert observed == expected
+
+
+def test_iteration_context_aborts_the_iteration_of_a_failed_forward():
+    source = _TORCH_ROOT / "moe/fused_moe/moe_load_balancer.py"
+    context_cls = _extract_class(source, "MoeLoadBalancerIterContext", None, {})
+    base_cls = _extract_class(source, "BaseMoeLoadBalancer", {"abort_iter"}, {})
+    events = []
+
+    class Manager:
+        static = False
+
+        def is_static_routing(self):
+            return self.static
+
+        def set_iter_info(self, enable_statistic, enable_update_weights):
+            events.append("set_iter_info")
+
+        def start_iter(self):
+            events.append("start_iter")
+
+        def end_iter(self):
+            events.append("end_iter")
+
+        def abort_iter(self, error):
+            events.append(("abort_iter", error))
+
+    manager = Manager()
+    with context_cls(manager):
+        pass
+    assert events == ["set_iter_info", "start_iter", "end_iter"]
+
+    events.clear()
+    error = RuntimeError("forward failed")
+    with pytest.raises(RuntimeError, match="forward failed") as caught:
+        with context_cls(manager):
+            raise error
+    assert caught.value is error
+    assert events == ["set_iter_info", "start_iter", ("abort_iter", error)]
+
+    # Static placement runs no iteration hook.
+    events.clear()
+    manager.static = True
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with context_cls(manager):
+            raise error
+    assert events == []
+
+    # By default an aborted iteration simply ends, as standard EPLB always did.
+    class Standard(base_cls):
+        def end_iter(self):
+            events.append("end_iter")
+
+    Standard().abort_iter(error)
+    assert events == ["end_iter"]
+
+
+def test_per_layer_dynamic_abort_releases_pending_plans_and_keeps_the_error():
+    namespace = {}
+    _extract_function(
+        _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/layer.py", "_append_note", namespace
+    )
+    manager_cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/manager.py",
+        "PerLayerDynamicMoeLoadBalancer",
+        {"abort_iter", "shutdown"},
+        namespace,
+    )
+    released = []
+
+    class Layer:
+        def __init__(self, layer_idx, plan=None, cleanup_error=None):
+            self.layer_idx = layer_idx
+            self.replica_plan = plan
+            self.cleanup_error = cleanup_error
+
+        def finish_replica_plan(self):
+            released.append(self.layer_idx)
+            if self.cleanup_error is not None:
+                raise self.cleanup_error
+            self.replica_plan = None
+
+    manager = manager_cls()
+    manager.in_iter = True
+    manager.iter_id = 3
+    manager.single_layer_load_balancers = [
+        Layer(0),
+        Layer(1, plan="first", cleanup_error=RuntimeError("route wait failed")),
+        Layer(2, plan="second"),
+    ]
+    error = ValueError("forward failed")
+
+    manager.abort_iter(error)
+
+    # Every pending plan is released; a failed release only annotates the
+    # forward's error, which the iteration context then re-raises.
+    assert released == [1, 2]
+    assert [layer.replica_plan for layer in manager.single_layer_load_balancers] == [
+        None,
+        "first",
+        None,
+    ]
+    assert len(error.__notes__) == 1
+    assert "layer 1" in error.__notes__[0]
+    assert "route wait failed" in error.__notes__[0]
+    assert (manager.in_iter, manager.iter_id) == (False, 4)
+
+    # The plan left pending makes this rank unsafe for collective teardown.
+    states = []
+
+    class Comm:
+        def allgather(self, state):
+            states.append(state)
+            return [state, {"local_safe": True, "pool_count": 0}]
+
+    manager.is_shutdown = False
+    manager._ep_comm = Comm()
+    manager._rebalance_shared_slot_pool_order = []
+    assert manager.shutdown(local_safe=True) is False
+    assert states == [{"local_safe": False, "pool_count": 0}]
+
+    # The iteration ends even if the release loop itself fails.
+    class Broken:
+        @property
+        def replica_plan(self):
+            raise RuntimeError("layer state unavailable")
+
+    manager.in_iter = True
+    manager.single_layer_load_balancers = [Broken()]
+    with pytest.raises(RuntimeError, match="layer state unavailable"):
+        manager.abort_iter(ValueError("forward failed"))
+    assert (manager.in_iter, manager.iter_id) == (False, 5)
+
+
+class _ChunkRoutes:
+    dtype = "int32"
+
+    def __init__(self, name):
+        self.name = name
+
+
+@pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
+def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
+    source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
+    trace = []
+
+    class ExpertStatistic:
+        @staticmethod
+        def set_layer(layer_idx):
+            assert layer_idx == 7
+
+        @staticmethod
+        def maybe_add_info(num_slots, routes):
+            trace.append(("statistic", routes.name))
+
+    def maybe_collect_or_replay_slots(num_slots, routes):
+        trace.append(("calibrator", routes.name))
+        return _ChunkRoutes("replayed " + routes.name)
+
+    namespace = {
+        "ExpertStatistic": ExpertStatistic,
+        "get_calibrator": lambda: SimpleNamespace(
+            maybe_collect_or_replay_slots=maybe_collect_or_replay_slots
+        ),
+        "get_active_route_capture": lambda: None,
+        "torch": SimpleNamespace(int32="int32", float32="float32"),
+        "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
+        "MoERunContext": lambda **kwargs: SimpleNamespace(**kwargs),
+    }
+    _extract_function(source, "_record_routes", namespace)
+    _extract_function(source, "_leading_rows", namespace)
+    scheduler_cls = _extract_class(source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace)
+
+    plan = object()
+    layer = None if mode == "off" else SimpleNamespace(produces_replica_plan=mode != "standard")
+
+    def route(routes, use_dp):
+        trace.append(("route", routes.name))
+        return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
+
+    def run_moe(ctx):
+        trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
+        return "out"
+
+    moe = SimpleNamespace(
+        apply_router_weight_on_input=False,
+        mapping=SimpleNamespace(moe_ep_rank=0),
+        layer_idx=7,
+        num_slots=24,
+        use_dp=True,
+        layer_load_balancer=layer,
+        routing_method=SimpleNamespace(
+            apply=lambda logits, input_ids: (
+                _ChunkRoutes("logical"),
+                SimpleNamespace(dtype="float32"),
+            )
+        ),
+        _maybe_get_perfect_router_expert_ids=lambda routes: routes,
+        _load_balancer_start_wait_gpu_stage=lambda is_first_call: None,
+        _load_balancer_done_wait_gpu_stage=lambda is_first_call: None,
+        _load_balancer_update_statistic=lambda routes, *args, **kwargs: trace.append(
+            ("update_statistic", routes.name)
+        ),
+        _load_balancer_uses_replica_plan=lambda: mode == "per_layer_dynamic",
+        _load_balancer_route=route,
+        _load_balancer_replica_plan=lambda: plan if mode == "per_layer_dynamic" else None,
+        _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
+        _load_balancer_done_set_cpu_stage=lambda is_last_call: trace.append("done_set_cpu"),
+        backend=SimpleNamespace(
+            quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
+            set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
+            run_moe=run_moe,
+        ),
+    )
+    scheduler = scheduler_cls()
+    scheduler.moe = moe
+    x = SimpleNamespace(shape=(4, 16))
+
+    out = scheduler._forward_chunk(
+        x,
+        SimpleNamespace(shape=(4, 24)),
+        output_dtype="bf16",
+        all_rank_num_tokens=[4, 6],
+        do_finalize=True,
+    )
+
+    assert out == "out"
+    tail = [("quantize", {}), ("bucket", 6)]
+    if mode == "per_layer_dynamic":
+        # The planner consumes the logical routes the calibrator records or replays.
+        expected = [
+            ("update_statistic", "logical"),
+            ("statistic", "logical"),
+            ("calibrator", "logical"),
+            ("route", "replayed logical"),
+            *tail,
+            ("run_moe", "physical", plan),
+        ]
+    elif mode == "standard":
+        expected = [
+            ("update_statistic", "logical"),
+            ("route", "logical"),
+            ("statistic", "slots"),
+            ("calibrator", "slots"),
+            *tail,
+            ("run_moe", "replayed slots", None),
+        ]
+    else:
+        expected = [
+            ("statistic", "logical"),
+            ("calibrator", "logical"),
+            *tail,
+            ("run_moe", "replayed logical", None),
+        ]
+    assert trace == expected + ["start_set_cpu", "done_set_cpu"]
 
 
 def test_base_worker_finalizes_rank_follower_pyexecutor():

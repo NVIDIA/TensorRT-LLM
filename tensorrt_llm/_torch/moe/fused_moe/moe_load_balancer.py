@@ -775,8 +775,9 @@ class BaseMoeLoadBalancer(ABC):
     Model construction enters the balancer as a context manager so that MoE
     layers register through ``get_moe_load_balancer``. The engine drives each
     forward through ``MoeLoadBalancerIterContext`` (``set_iter_info``,
-    ``start_iter`` and ``end_iter``), and workers release resources with a
-    collective ``shutdown``. Subclasses initialize ``_previous_balancer``,
+    ``start_iter``, and ``end_iter`` or, when the forward raises,
+    ``abort_iter``), and workers release resources with a collective
+    ``shutdown``. Subclasses initialize ``_previous_balancer``,
     ``enable_statistic`` and ``enable_update_weights``.
     """
 
@@ -818,6 +819,10 @@ class BaseMoeLoadBalancer(ABC):
     @abstractmethod
     def end_iter(self) -> None:
         """End the current forward iteration."""
+
+    def abort_iter(self, error: BaseException) -> None:
+        """End an iteration whose forward raised ``error``; defaults to ``end_iter``."""
+        self.end_iter()
 
     @abstractmethod
     def shutdown(self, local_safe: bool = True) -> bool:
@@ -1205,7 +1210,10 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.end_iter()
+            if exc_type is None:
+                self.moe_load_balancer.end_iter()
+            else:
+                self.moe_load_balancer.abort_iter(exc_val)
         return False
 
 

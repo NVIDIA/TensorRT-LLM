@@ -779,15 +779,12 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             return None
         return self.layer_load_balancer.require_replica_plan()
 
-    def _load_balancer_finish_replica_plan(self, plan) -> None:
-        """Release a caller-owned plan after its last MAIN-stream consumer."""
-        if plan is None or not self.layer_load_balancer:
-            return
-        self.layer_load_balancer.finish_replica_plan(plan)
-
     def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
         """Start CPU stage in load balancer."""
-        if self._using_dynamic_load_balancer() and is_last_call:
+        # A per-layer dynamic EPLB layer plans every chunk and releases that
+        # chunk's replica plan here, after the chunk's MoE kernel.
+        if self._load_balancer_uses_replica_plan() or (
+                self._using_dynamic_load_balancer() and is_last_call):
             self.layer_load_balancer.start_set_cpu_stage()
 
     def _load_balancer_done_set_cpu_stage(self, is_last_call: bool):
