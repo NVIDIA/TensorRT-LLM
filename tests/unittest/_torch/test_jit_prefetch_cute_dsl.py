@@ -542,6 +542,95 @@ def test_fp8_gemm_export_is_what_the_runner_runs(tmp_path):
         assert torch.equal(got[key], value), key
 
 
+def test_nvfp4_gemm_export_is_what_the_runner_runs(tmp_path):
+    """Every NVFP4 dense GEMM tactic Nvfp4GemmProvider enumerates for a
+    model's NVFP4 Linear layers (those whose allowed backends include CuTe
+    DSL), compiled by the helper (no visible GPU) and loaded through the
+    runner's loader, gives bitwise the runner's own in-process output on
+    GEMMs of several shapes, and the runner compiles nothing."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    shapes = [(1024, 512), (2048, 1536)]  # (n, k)
+    max_num_tokens = 256
+    model = torch.nn.Module()
+    for i, (n, k) in enumerate(shapes):
+        setattr(model, f"proj{i}", Linear(k, n, bias=False, dtype=torch.bfloat16, quant_config=qc))
+    # A layer without the CuTe DSL backend never runs this runner.
+    model.other = Linear(
+        512, 4096, bias=False, dtype=torch.bfloat16, quant_config=qc,
+        nvfp4_allowed_backends=["cutlass"],
+    )  # fmt: skip
+    provider = jcd.Nvfp4GemmProvider(model, max_num_tokens)
+    assert provider.shapes == sorted((n, k // 2) for n, k in shapes)
+    specs = provider.enumerate_specs()
+    runner = ops.CuteDSLNVFP4BlackwellRunner(torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(0)
+
+    def inputs(m, n, k):
+        x = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
+        w = torch.randn(n, k, generator=g, device="cuda").to(torch.bfloat16)
+        x_global = (448 * 6) / x.abs().max().float()
+        w_global = (448 * 6) / w.abs().max().float()
+        x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, x_global, 16, False)
+        w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_global, 16, False)
+        alpha = (1.0 / (x_global * w_global)).reshape(1).float()
+        return [x_fp4, w_fp4, x_sf, w_sf, alpha]
+
+    # M buckets the autotuner profiles (powers of two up to max_num_tokens).
+    data, valid = {}, {}
+    for n, k in shapes:
+        for m in (1, 32, max_num_tokens):
+            data[(m, n, k)] = inputs(m, n, k)
+            valid[(m, n, k)] = [
+                runner._unpack_tactic(t) for t in runner.get_valid_tactics(data[(m, n, k)], None)
+            ]
+    tactics = {t for ts in valid.values() for t in ts}
+    planned = set()
+    for spec in map(json.loads, specs):
+        planned.add((tuple(spec["mma_tiler"]), tuple(spec["cluster"]), spec["swap_ab"],
+                     spec["use_prefetch"], spec["swizzle_size"], spec["raster_along_m"]))  # fmt: skip
+    # The provider covers every tactic the autotuner benchmarks for these shapes.
+    assert tactics <= planned, tactics - planned
+    replies = _helper_build(str(tmp_path / "aot"), specs)
+    assert all(r["ok"] and r["built"] for r in replies), [r for r in replies if not r["ok"]][:3]
+
+    def run():
+        out = {}
+        for c, x in data.items():
+            for t in valid[c]:
+                out[(t, c)] = runner(x, tactic=t).clone()
+        torch.cuda.synchronize()
+        return out
+
+    saved = dict(ops.CuteDSLNVFP4BlackwellRunner.kernel_cache)
+    try:
+        ops.CuteDSLNVFP4BlackwellRunner.kernel_cache.clear()
+        ops.nvfp4_gemm_loader = None
+        ref = run()
+        ops.CuteDSLNVFP4BlackwellRunner.kernel_cache.clear()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, str(tmp_path / "aot"))
+            loads.append((fn is not None, spec))
+            return fn
+
+        assert jcd.install_nvfp4_gemm_loader(loader)
+        got = run()
+    finally:
+        ops.nvfp4_gemm_loader = None
+        ops.CuteDSLNVFP4BlackwellRunner.kernel_cache.clear()
+        ops.CuteDSLNVFP4BlackwellRunner.kernel_cache.update(saved)
+    missing = [spec for ok, spec in loads if not ok]
+    assert len(loads) == len(tactics) and not missing, f"tactics not prefetched: {missing}"
+    for key, value in ref.items():
+        assert torch.equal(got[key], value), key
+
+
 def test_fp8_bmm_loads_the_gemm_tactic_exports(tmp_path):
     """The grouped FP8 O-LoRA projection of DeepSeek-V4 / V4.1 attention (an
     FP8 ``o_a_proj`` of shape (groups, o_lora_rank, group_dim)) runs the FP8

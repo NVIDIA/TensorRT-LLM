@@ -609,6 +609,13 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
 # CuteDSLFp8BlackwellBmmRunner compile the same kernel.
 fp8_gemm_loader = None
 
+# Set by the JIT prefetcher (jit_prefetch_cute_dsl.install_nvfp4_gemm_loader):
+# (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
+# swizzle_size, raster_along_m, max_active_clusters) -> the TVM-FFI NVFP4
+# dense GEMM of CuteDSLNVFP4BlackwellRunner a CPU-only helper exported, or
+# None to compile it here as usual.
+nvfp4_gemm_loader = None
+
 
 def get_dense_gemm_approximate_cta_nums(
         M: int, N: int, tile_mn: Tuple[int, int],
@@ -1316,29 +1323,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
+                # A TVM-FFI kernel is shape-generic: the tactic and the
+                # cluster occupancy alone select it, so a CPU-only JIT
+                # prefetch helper may have exported it already.
+                loader = nvfp4_gemm_loader
+                compiled_gemm = (
+                    loader(sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                           use_prefetch, swizzle_size, raster_along_m,
+                           max_active_clusters) if self.use_tvm_ffi
+                    and loader is not None and self.__class__.kernel_class
+                    is Sm100BlockScaledPersistentDenseGemmKernel else None)
                 # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
                 # so we make alpha as the cute.Tensor type in the jit func.
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    kernel_m,
-                    kernel_n,
-                    real_k,
-                    kernel_sf_m // 128,
-                    kernel_sf_n // 128,
-                    sf_k // 4,
-                    1,  # batch
-                    kernel_a_ptr,
-                    kernel_b_ptr,
-                    kernel_a_sf_ptr,
-                    kernel_b_sf_ptr,
-                    c_ptr,
-                    alpha_cute_tensor,
-                    max_active_clusters,
-                    stream,
-                    swap_ab,
-                    options="--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
-                )
+                if compiled_gemm is None:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        kernel_sf_m // 128,
+                        kernel_sf_n // 128,
+                        sf_k // 4,
+                        1,  # batch
+                        kernel_a_ptr,
+                        kernel_b_ptr,
+                        kernel_a_sf_ptr,
+                        kernel_b_sf_ptr,
+                        c_ptr,
+                        alpha_cute_tensor,
+                        max_active_clusters,
+                        stream,
+                        swap_ab,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
 
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:

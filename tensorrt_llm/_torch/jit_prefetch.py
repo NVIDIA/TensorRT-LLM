@@ -537,7 +537,9 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     * the CuTe DSL FP8 blockwise GEMM tactics the autotuner benchmarks
       (``jit_prefetch_cute_dsl.Fp8GemmProvider``: block-FP8 Linear layers
       without DeepGEMM, and the batched GEMM of DeepSeek-V4's grouped FP8
-      O-LoRA projection), the KDA prefill kernel (``KdaPrefillProvider``) and
+      O-LoRA projection), the NVFP4 dense GEMM tactics the NVFP4 GEMM's
+      autotuner races (``Nvfp4GemmProvider``, M buckets up to the engine's
+      ``max_num_tokens``), the KDA prefill kernel (``KdaPrefillProvider``) and
       FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``);
       the CuTe DSL helpers start here, so their start-up overlaps the weight
       load;
@@ -596,21 +598,28 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
             from . import jit_prefetch_cute_dsl as jcd
 
             # They follow from the layers' geometry and are compiled in
-            # warmup's first forwards: the FP8 GEMM tactics by the
+            # warmup's first forwards: the FP8 and NVFP4 GEMM tactics by the
             # autotuner, the KDA prefill kernel by the first prefill, the
             # FlashInfer norms by the first forward.
             gemm_provider = jcd.Fp8GemmProvider(model)
+            nvfp4_provider = jcd.Nvfp4GemmProvider(
+                model, getattr(llm_args, "max_num_tokens", None) or 0
+            )
             kda_provider = jcd.KdaPrefillProvider(model)
             norm_provider = jcd.FlashInferNormProvider(model)
-            if gemm_provider or kda_provider or norm_provider:
+            if gemm_provider or nvfp4_provider or kda_provider or norm_provider:
                 prefetcher = JitPrefetcher.init(rank)
                 if prefetcher is not None:
+                    # Queued in the order warmup needs them: the norms in the
+                    # first forward, ahead of the rest.
+                    if norm_provider:
+                        started = prefetcher.enable_flashinfer_norm(norm_provider) or started
                     if gemm_provider:
                         started = prefetcher.enable_fp8_gemm(gemm_provider) or started
                     if kda_provider:
                         started = prefetcher.enable_cute_dsl(kda_provider) or started
-                    if norm_provider:
-                        started = prefetcher.enable_flashinfer_norm(norm_provider) or started
+                    if nvfp4_provider:
+                        started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
     except Exception as e:  # noqa: BLE001 - the kernels then compile in place
         logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
     if llm_args is not None and FmhaSm100Builds.get() is None:
@@ -1254,6 +1263,7 @@ class JitPrefetcher:
         self._cd = None  # CuTe DSL KDA provider (jit_prefetch_cute_dsl)
         self._cd_dir = None
         self._fp8_gemm = False  # the FP8 blockwise GEMM loader is installed
+        self._nvfp4_gemm = False  # the NVFP4 dense GEMM loader is installed
         self._lowm = False  # the low-M direct GEMM loader is installed
         self._fi_norm = False  # the FlashInfer norm loader is installed
 
@@ -1998,6 +2008,32 @@ class JitPrefetcher:
         self._event(
             f"CuTe DSL FP8 GEMM prefetch: {len(gemm_provider.shapes)} GEMM shape(s), "
             f"{len(gemm_provider.specs)} tactic(s)"
+        )
+        return True
+
+    def enable_nvfp4_gemm(self, nvfp4_provider) -> bool:
+        """Compile the CuTe DSL NVFP4 dense GEMM tactics the model's NVFP4
+        layers reach in the CuTe DSL helpers, and have the runner load them.
+
+        Called right after the model is constructed (``start_model_builds``):
+        the autotuner's first pass compiles every tactic it benchmarks, and
+        the helpers compile them while the weights load. A tactic whose
+        export is missing when the runner needs it compiles in place; one a
+        helper is compiling is waited for (``_cute_dsl_load``).
+        """
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if self._nvfp4_gemm or not nvfp4_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_nvfp4_gemm_loader(self._cute_dsl_load):
+            return False
+        self._nvfp4_gemm = True
+        self._grow_cute_dsl_helpers(len(nvfp4_provider.specs))
+        for spec in nvfp4_provider.enumerate_specs():
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(
+            f"CuTe DSL NVFP4 GEMM prefetch: {len(nvfp4_provider.shapes)} GEMM shape(s), "
+            f"{len(nvfp4_provider.specs)} tactic(s)"
         )
         return True
 

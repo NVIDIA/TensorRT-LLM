@@ -593,6 +593,79 @@ def _build_fp8_gemm(s: Dict[str, Any]):
     return gemm.wrapper, (args, kwargs), "--opt-level 2 --enable-tvm-ffi"
 
 
+# The TVM-FFI NVFP4 dense GEMM of ``CuteDSLNVFP4BlackwellRunner``, one of the
+# backends the unified NVFP4 GEMM op's autotuner races; keyed like the
+# runner's ``kernel_cache`` plus the cluster occupancy it compiles with.
+_NVFP4_GEMM = "cute_dsl_nvfp4_dense_gemm"
+
+
+def nvfp4_gemm_spec(
+    sf_vec_size: int,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    swap_ab: bool,
+    use_prefetch: bool,
+    swizzle_size: int,
+    raster_along_m: bool,
+    max_active_clusters: int,
+) -> str:
+    """Spec for one TVM-FFI ``CuteDSLNVFP4BlackwellRunner`` kernel."""
+    return json.dumps(
+        {
+            "kernel": _NVFP4_GEMM,
+            "sf_vec_size": int(sf_vec_size),
+            "mma_tiler": [int(x) for x in mma_tiler_mn],
+            "cluster": [int(x) for x in cluster_shape_mn],
+            "swap_ab": bool(swap_ab),
+            "use_prefetch": bool(use_prefetch),
+            "swizzle_size": int(swizzle_size),
+            "raster_along_m": bool(raster_along_m),
+            "max_active_clusters": int(max_active_clusters),
+        },
+        sort_keys=True,
+    )
+
+
+def _build_nvfp4_gemm(s: Dict[str, Any]):
+    """Return (wrapper, fake args, options) for one NVFP4 dense GEMM tactic.
+
+    The runner passes every extent as a runtime 64-bit scalar, the operands
+    as pointers (FP4 A/B 32-byte aligned, the FP8 scale factors and the BF16
+    output 16-byte aligned) and alpha as the one-element FP32 tensor
+    ``from_dlpack`` makes of it; the batch count (1), the occupancy and
+    ``swap_ab`` are compile-time. So any address and extent compile the
+    kernel the runner would compile for any shape.
+    """
+    import cutlass
+    import cutlass.cute as cute
+
+    from .kernels.blackwell.dense_blockscaled_gemm_persistent import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+    from .kernels.blackwell.utils import make_ptr
+
+    gemm = Sm100BlockScaledPersistentDenseGemmKernel(
+        s["sf_vec_size"],
+        tuple(s["mma_tiler"]),
+        tuple(s["cluster"]),
+        s["use_prefetch"],
+        s["swizzle_size"],
+        s["raster_along_m"],
+    )
+
+    def ptr(dtype, align):
+        return make_ptr(dtype, 1 << 20, cute.AddressSpace.gmem, assumed_align=align)
+
+    i64 = cutlass.Int64
+    alpha = cute.runtime.make_fake_tensor(cutlass.Float32, (1,), (1,), assumed_align=16)
+    args = [i64(1), i64(1), i64(1), i64(1), i64(1), i64(1), 1]  # m n k sf_m sf_n sf_k batch
+    args += [ptr(cutlass.Float4E2M1FN, 32), ptr(cutlass.Float4E2M1FN, 32)]
+    args += [ptr(cutlass.Float8E4M3FN, 16), ptr(cutlass.Float8E4M3FN, 16)]
+    args += [ptr(cutlass.BFloat16, 16), alpha, s["max_active_clusters"]]
+    args += [cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), s["swap_ab"]]
+    return gemm.wrapper, (args, {}), "--opt-level 2 --enable-tvm-ffi"
+
+
 # FlashInfer's low-M BF16 direct (SIMT) GEMM, which ``modules.low_m_gemm``'s
 # AutoTuner race benchmarks once per tactic and runtime shape
 # (``TRTLLM_LOW_M_GEMM_BACKEND``). Its compiled form is specialized on M, N
@@ -653,11 +726,12 @@ _BUILDERS = {
     _FI_NORM: _build_fi_norm,
     _CSA2_PUBLISH: _build_csa2_publish,
     _FP8_GEMM: _build_fp8_gemm,
+    _NVFP4_GEMM: _build_nvfp4_gemm,
 }
 # Builders that return an already compiled kernel instead of (fn, args, options).
 _PRECOMPILED = {_TOPK: _build_topk, _LOWM_DIRECT: _build_lowm_direct}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
-_TVM_FFI = {_FI_NORM, _TOPK, _FP8_GEMM}
+_TVM_FFI = {_FI_NORM, _TOPK, _FP8_GEMM, _NVFP4_GEMM}
 
 
 def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
@@ -976,6 +1050,105 @@ def install_fp8_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bool
         )
 
     ops.fp8_gemm_loader = _loader
+    return True
+
+
+class Nvfp4GemmProvider:
+    """Every TVM-FFI NVFP4 dense GEMM tactic the model's NVFP4 layers reach.
+
+    An NVFP4 ``Linear`` whose allowed backends include CuTe DSL (the default)
+    runs ``trtllm::nvfp4_gemm``, whose autotuner benchmarks, among the other
+    backends' tactics, every tactic ``CuteDSLNVFP4BlackwellRunner`` lists for
+    each M bucket it tunes (powers of two up to ``max_num_tokens``), and the
+    first benchmark of each compiles it on the executor thread (~0.5 s each,
+    about a hundred per model). The runner's kernel is shape-generic, so the
+    set follows from the layers' ``(n, k)`` and the M buckets, which the
+    runner's own ``get_valid_tactics`` is asked for on ``meta`` tensors, and
+    the cluster occupancy of this device.
+    """
+
+    def __init__(self, model, max_num_tokens: int):
+        import torch
+
+        from .._utils import get_sm_version
+        from .modules.linear import Linear
+
+        self.shapes: List[Tuple[int, int]] = []
+        self.specs: List[str] = []
+        if get_sm_version() not in (100, 103) or not max_num_tokens:
+            return
+        shapes = set()
+        for mod in model.modules():
+            if not isinstance(mod, Linear):
+                continue
+            if "cutedsl" not in (getattr(mod, "nvfp4_allowed_backends", None) or ()):
+                continue
+            # The quant mode, not the quant method: right after construction
+            # the layers have no quant method yet, but their FP4 weights
+            # (two values per byte, rows padded as the GEMM sees them) exist.
+            mode = getattr(getattr(mod, "quant_config", None), "layer_quant_mode", None)
+            if mode is None or not mode.has_nvfp4():
+                continue
+            w = getattr(mod, "weight", None)
+            if w is None or w.dim() != 2 or w.dtype != torch.uint8:
+                continue
+            shapes.add((int(w.shape[0]), int(w.shape[1])))
+        self.shapes = sorted(shapes)
+        if self.shapes:
+            self.specs = self._enumerate(int(max_num_tokens))
+
+    def __bool__(self):
+        return bool(self.specs)
+
+    def _enumerate(self, max_num_tokens: int) -> List[str]:
+        import cutlass
+        import torch
+
+        from .custom_ops.cute_dsl_custom_ops import CuteDSLNVFP4BlackwellRunner
+        from .utils import get_last_power_of_2_num_tokens_buckets
+
+        runner = CuteDSLNVFP4BlackwellRunner(torch.bfloat16)
+        meta = torch.device("meta")
+        tactics = set()
+        for m in get_last_power_of_2_num_tokens_buckets(max_num_tokens):
+            for n, k_bytes in self.shapes:
+                a = torch.empty(m, k_bytes, dtype=torch.uint8, device=meta)
+                b = torch.empty(n, k_bytes, dtype=torch.uint8, device=meta)
+                for t in runner.get_valid_tactics([a, b], None):
+                    tiler, cluster, swap_ab, prefetch, swizzle, raster = runner._unpack_tactic(t)
+                    tactics.add((tuple(tiler), tuple(cluster), bool(swap_ab), bool(prefetch),
+                                 int(swizzle), bool(raster)))  # fmt: skip
+        # The cluster occupancy, computed as the runner computes it.
+        hw = cutlass.utils.HardwareInfo()
+        occupancy: Dict[int, int] = {}
+        specs = []
+        for tiler, cluster, swap_ab, prefetch, swizzle, raster in sorted(tactics):
+            size = cluster[0] * cluster[1]
+            if size not in occupancy:
+                occupancy[size] = hw.get_max_active_clusters(size)
+            specs.append(
+                nvfp4_gemm_spec(
+                    16, tiler, cluster, swap_ab, prefetch, swizzle, raster, occupancy[size]
+                )  # fmt: skip
+            )
+        return specs
+
+    def enumerate_specs(self) -> List[str]:
+        return list(self.specs)
+
+
+def install_nvfp4_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
+    """Route the TVM-FFI compiles of ``CuteDSLNVFP4BlackwellRunner`` through
+    ``loader(spec)``; returns False if CuTe DSL is unavailable."""
+    try:
+        from .custom_ops import cute_dsl_custom_ops as ops
+    except ImportError:
+        return False
+
+    def _loader(*key):
+        return loader(nvfp4_gemm_spec(*key))
+
+    ops.nvfp4_gemm_loader = _loader
     return True
 
 
