@@ -16,7 +16,7 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modelingV2*.cmake` (excl. docs); per family when only one family changed |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
@@ -303,7 +303,20 @@ Outcomes:
 Path-only rule. Claims non-documentation source changes under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
-from a catalog of op wrappers).
+from a catalog of op wrappers), under `cpp/tensorrt_llm/modeling_v2/`, its
+native code (one library per model family, loaded only when routing picks
+one of the family's targets), and the native build module
+`cpp/cmake/modules/modelingV2*.cmake`.
+
+Scope — per family, else all of modeling_v2: a change confined to one
+family's directories (`models/<family>/` in Python,
+`cpp/tensorrt_llm/modeling_v2/<familyCamel>/` in C++, the family named by the
+Python package whose camelCase form the C++ directory is) keeps that family's
+entries -- `accuracy/modeling_v2/test_<family>.py` and
+`unittest/_torch/modeling_v2/models/<family>` -- plus the modeling_v2 CPU
+checks (`unittest/_torch/modeling_v2/test_modeling_v2_*.py`). Several
+families union. Any other modeling_v2 change keeps every modeling_v2 entry.
+A claimed family with no entry in any test-db yaml falls back to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -318,9 +331,10 @@ in `backend: pytorch` blocks beside everything else. A block belongs to
 modeling_v2 iff one of its `tests:` entries matches
 `_MV2_ENTRY_PATTERNS`:
 
-- `unittest/_torch/modeling_v2/` — the op-level catalog matrix, carried
-  as whole-directory entries (one on `l0_gb300`, one on
-  `l0_gb300_multi_gpus` for the 4-rank collectives).
+- `unittest/_torch/modeling_v2/` — the op-level catalog matrix (one
+  directory entry with `--ignore` of `comm/` and `models/`, plus `comm/`
+  on `l0_gb300_multi_gpus` for the 4-rank collectives) and one entry per
+  family under `models/<family>`, so a family scope can keep its own.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
 Both markers are exact by construction rather than by luck: every test
