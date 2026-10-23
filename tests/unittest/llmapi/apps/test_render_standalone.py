@@ -21,7 +21,6 @@ import fnmatch
 import glob
 import importlib.machinery
 import importlib.util
-import io
 import json
 import os
 import shutil
@@ -229,24 +228,20 @@ class TestCpuOnlyStartup:
 
         def load():
             loaded.clear()
-            launcher._load_cuda_stub_if_needed()
+            return launcher._load_cuda_stub_if_needed()
 
         monkeypatch.setattr(ctypes, "CDLL", cdll)
         monkeypatch.setattr(glob, "glob", fake_glob)
         monkeypatch.setattr(os.path, "realpath", lambda p: p)
         monkeypatch.delenv("CUDA_HOME", raising=False)
-        stderr = io.StringIO()
-        monkeypatch.setattr(sys, "stderr", stderr)
 
         with warnings.catch_warnings():
-            load()
+            assert load() is None
             assert loaded == [("libcuda.so.1", 0)]
-            assert stderr.getvalue() == ""
 
             driver_present = False
-            load()
+            assert load() == stub.format("/usr/local/cuda")
             assert loaded[-1] == (stub.format("/usr/local/cuda"), ctypes.RTLD_GLOBAL)
-            assert "CPU-only" in stderr.getvalue()
 
             monkeypatch.setenv("CUDA_HOME", "/opt/cuda")
             load()
