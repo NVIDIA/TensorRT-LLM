@@ -32,7 +32,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig,
 )
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, skip_pre_ada
 
 _SOURCE_TEXT = "translate English to German: The house is wonderful."
 _MIXED_ENCODER_SOURCE_TEXTS = [
@@ -742,6 +742,7 @@ def _run_t5_pytorch_generate_encoder_decoder(
         )
 
 
+@skip_pre_ada
 def test_t5_pytorch_fp8_self_cache_with_model_dtype_cross_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
