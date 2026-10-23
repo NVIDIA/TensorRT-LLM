@@ -24,6 +24,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     kpool_score,
     kpool_score_fp8,
     kpool_update,
+    merge_split_attention,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -581,6 +582,7 @@ def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
     backend.kv_lora_rank = 512
     backend.softmax_scale = 256**-0.5
     backend._kernel_topk_align = 128 if get_sm_version() == 90 else 64
+    backend._split_topk = False
     backend.kv_scale_quant_orig = torch.tensor([0.5], device="cuda")
     backend._FP8_QUERY_CHUNK_SIZE = 2  # Exercise multiple chunks and a short final chunk.
     generator = torch.Generator(device="cuda").manual_seed(71)
@@ -611,6 +613,59 @@ def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
     storage.copy_((storage.float() * 0.5).to(storage.dtype))
     graph.replay()
     torch.testing.assert_close(captured, reference(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.skipif(get_sm_version() < 90, reason="FlashMLA requires SM90 (Hopper) or later")
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
+def test_split_topk_sparse_core_matches_single_call(num_tokens):
+    """Decode-sized calls split over top-k chunks match the single-call kernel."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import GlmKpoolSparseAttention
+
+    def make_backend(split: bool) -> GlmKpoolSparseAttention:
+        backend = object.__new__(GlmKpoolSparseAttention)
+        backend.kv_lora_rank = 512
+        backend.softmax_scale = 256**-0.5
+        backend._kernel_topk_align = 128 if get_sm_version() == 90 else 64
+        backend._split_topk = split
+        return backend
+
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    kv_rows = (torch.randn(4096, 1, 512, device="cuda", generator=generator) * 0.5).to(
+        torch.bfloat16
+    )
+    q = (torch.randn(num_tokens, 16, 512, device="cuda", generator=generator) * 0.5).to(
+        torch.bfloat16
+    )
+    indices = torch.randint(
+        0, kv_rows.shape[0], (num_tokens, 2112), device="cuda", generator=generator
+    ).int()
+    indices[:, -61:] = -1  # Padding tail, as in the expanded k-pool rows.
+    indices[0, : 2 * 128] = -1  # Whole chunks without a valid row.
+
+    expected = make_backend(split=False)._dispatch_sparse_core(q, kv_rows, indices)
+    actual = make_backend(split=True)._dispatch_sparse_core(q, kv_rows, indices)
+    assert actual.shape == expected.shape == (num_tokens, 16, 512)
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+
+
+def test_merge_split_attention_matches_reference():
+    generator = torch.Generator(device="cuda").manual_seed(9)
+    num_tokens, splits, heads, kernel_heads, dim = 3, 5, 16, 64, 512
+    out = torch.randn(
+        num_tokens * splits, kernel_heads, dim, device="cuda", generator=generator
+    ).to(torch.bfloat16)
+    lse = torch.randn(num_tokens * splits, kernel_heads, device="cuda", generator=generator) * 4
+    lse[1] = float("inf")  # A chunk without valid rows.
+
+    actual = merge_split_attention(out, lse, num_tokens, splits, heads)
+
+    lse_ref = lse.view(num_tokens, splits, kernel_heads)[..., :heads]
+    lse_ref = torch.where(torch.isinf(lse_ref), torch.full_like(lse_ref, float("-inf")), lse_ref)
+    weights = torch.softmax(lse_ref, dim=1)
+    parts = out.view(num_tokens, splits, kernel_heads, dim)[:, :, :heads].float()
+    expected = (weights[..., None] * parts).sum(dim=1)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("context", [False, True])

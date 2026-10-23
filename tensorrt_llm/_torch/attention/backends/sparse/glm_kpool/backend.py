@@ -51,6 +51,7 @@ from .kernels import (
     kpool_score,
     kpool_score_fp8,
     kpool_update,
+    merge_split_attention,
 )
 from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
@@ -133,6 +134,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     #: walks two blocks per step and requires a multiple of 128.
     _KERNEL_TOPK_ALIGN = 64
     _SM90_KERNEL_TOPK_ALIGN = 128
+    #: Calls with at most this many query tokens split the top-k axis on SM90.
+    _SM90_SPLIT_TOPK_MAX_TOKENS = 16
 
     # FlashMLA instantiates 64/128 query heads. Pad TP-local heads to the next
     # size and discard the extra outputs; heads attend independently.
@@ -273,6 +276,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             self._SM90_KERNEL_TOPK_ALIGN if get_sm_version() == 90 else self._KERNEL_TOPK_ALIGN
         )
         self._kernel_output_width = sparse_params.kernel_output_width(self._kernel_topk_align)
+        #: The SM90 sparse kernel runs one CTA per query token, so a decode-sized
+        #: call occupies a handful of SMs; split its top-k axis across CTAs.
+        self._split_topk = get_sm_version() == 90
         #: ``softmax_scale * kv_scale_quant_orig`` for the native FP8 kernel, read to
         #: the host once outside CUDA graph capture (the KV scale is fixed after
         #: construction). A float lets the kernel take it as an argument, without a
@@ -677,6 +683,15 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             q_latent = q_padded
         if flash_mla_sparse_fwd is None:
             raise RuntimeError("glm_kpool sparse attention requires FlashMLA in this build")
+        num_tokens, width = q_latent.shape[0], topk_rows.shape[-1]
+        if (
+            self._split_topk
+            and num_tokens <= self._SM90_SPLIT_TOPK_MAX_TOKENS
+            and width > self._kernel_topk_align
+        ):
+            return self._split_topk_sparse(
+                q_latent, kv_rows, topk_rows, width // self._kernel_topk_align, local_heads
+            )
         out, _, _ = flash_mla_sparse_fwd(
             q_latent,
             kv_rows,
@@ -689,6 +704,31 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             # consumes strided batches, so no copy of [T, H, kv_lora] here.
             out = out[:, :local_heads, :]
         return out
+
+    def _split_topk_sparse(
+        self,
+        q_latent: torch.Tensor,
+        kv_rows: torch.Tensor,
+        topk_rows: torch.Tensor,
+        splits: int,
+        local_heads: int,
+    ) -> torch.Tensor:
+        """Sparse attention over ``splits`` equal top-k chunks, merged by LSE.
+
+        Each (token, chunk) pair is one kernel row, so the call spreads over
+        ``splits`` times as many CTAs; returns ``[T, local_heads, kv_lora]``.
+        """
+        num_tokens, heads, dim = q_latent.shape
+        chunk = topk_rows.shape[-1] // splits
+        q_rep = q_latent.unsqueeze(1).expand(num_tokens, splits, heads, dim)
+        out, _, lse = flash_mla_sparse_fwd(
+            q_rep.reshape(num_tokens * splits, heads, dim),
+            kv_rows,
+            topk_rows.view(num_tokens * splits, 1, chunk),
+            self.softmax_scale,
+            self.kv_lora_rank,
+        )
+        return merge_split_attention(out, lse, num_tokens, splits, local_heads)
 
     def _finalize_output(
         self, out_latent: torch.Tensor, output: torch.Tensor | None
