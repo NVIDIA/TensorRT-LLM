@@ -17,6 +17,7 @@ import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
+from functools import lru_cache
 from types import TracebackType
 from typing import Any, Iterable, Iterator, TypeVar
 
@@ -42,11 +43,24 @@ def is_nccl_window_tensor_scoped_module(module_type: type[torch.nn.Module]) -> b
     return getattr(module_type, _SCOPED_MODULE_MARKER, False)
 
 
+# Exact built-in scalar types cannot contain tensor fields. Subclasses still
+# use the generic traversal, including dataclass subclasses.
+_SCALAR_TYPES = frozenset((type(None), bool, int, float, complex, str, bytes))
+
+
+@lru_cache(maxsize=256)
+def _dataclass_field_names(cls: type) -> tuple[str, ...]:
+    return tuple(field.name for field in fields(cls))
+
+
 def _cuda_tensors(
     value: Any,
     tensors: list[torch.Tensor],
     visited: set[int] | None = None,
 ) -> None:
+    if type(value) in _SCALAR_TYPES:
+        return
+
     if isinstance(value, torch.Tensor):
         if value.is_cuda:
             tensors.append(value)
@@ -67,18 +81,20 @@ def _cuda_tensors(
         _cuda_tensors(value.fp8_tensor, tensors, visited)
         _cuda_tensors(value.scaling_factor, tensors, visited)
     elif is_dataclass(value) and not isinstance(value, type):
-        for field in fields(value):
+        for name in _dataclass_field_names(type(value)):
             # Computed metadata properties can require initialization or read CUDA values.
-            if isinstance(getattr(type(value), field.name, None), property):
+            if isinstance(getattr(type(value), name, None), property):
                 continue
             # ``init=False`` fields need not exist until the dataclass initializes them.
-            _cuda_tensors(getattr(value, field.name, None), tensors, visited)
+            _cuda_tensors(getattr(value, name, None), tensors, visited)
     elif isinstance(value, dict):
         for item in value.values():
-            _cuda_tensors(item, tensors, visited)
+            if type(item) not in _SCALAR_TYPES:
+                _cuda_tensors(item, tensors, visited)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _cuda_tensors(item, tensors, visited)
+            if type(item) not in _SCALAR_TYPES:
+                _cuda_tensors(item, tensors, visited)
 
 
 def _module_call_tensors(
