@@ -431,3 +431,73 @@ def test_messenger_receive_timeout_allows_subsequent_reply():
             assert request == b"request"
             server.send([identity, b"reply"])
             assert client.receive(timeout_ms=1000) == [b"reply"]
+
+
+@pytest.mark.parametrize("rejected_rank", [None, 0, 1])
+@pytest.mark.parametrize("reason", ["server busy", "handshake timed out"])
+def test_sync_rank_info_admission_rejects_all_ranks_before_publication(rejected_rank, reason):
+    from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
+
+    barrier = threading.Barrier(2, timeout=5)
+    votes = [None, None]
+    admitted = [False, False]
+    transceivers, requests = [], []
+
+    def gather(rank, error):
+        votes[rank] = error
+        admitted[rank] = True
+        barrier.wait()
+        return list(votes)
+
+    for rank in range(2):
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._pending_rank_info_admissions = {}
+        tc._gen_allgather = Mock(side_effect=lambda error, rank=rank: gather(rank, error))
+        tc._transfer_worker = Mock()
+        if rank == rejected_rank:
+            tc._transfer_worker.prepare_rank_info.side_effect = RankInfoAuthenticationError(reason)
+        tc._validate_bridge_req = Mock(return_value=True)
+        tc._recv_sessions, tc._recv_reqs = {}, {}
+        tc._create_cache_extent = Mock()
+        fetches = Mock()
+        fetches.session.wait_complete.return_value = WaitResult.COMPLETED
+        tc._open_peer_source = Mock(return_value=fetches)
+        tc._chunk_num_bytes = Mock(return_value=8)
+        tc._kv_size_rank_factor = 1
+        tc._need_aux_transfer = Mock(return_value=False)
+        tc._assert_disagg_history_declared = Mock()
+
+        def publish(_extent):
+            assert all(admitted)
+            assert rejected_rank is None
+
+        fetches.fetch.side_effect = publish
+        req = SimpleNamespace(
+            py_request_id=7,
+            request_id=7,
+            py_disaggregated_params=None,
+            state=LlmRequestState.DISAGG_GENERATION_INIT,
+            set_kv_cache_size=Mock(),
+        )
+        transceivers.append(tc)
+        requests.append(req)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(tc.request_and_receive_sync, req) for tc, req in zip(transceivers, requests)
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    for tc, req in zip(transceivers, requests):
+        tc._gen_allgather.assert_called_once()
+        if rejected_rank is None:
+            tc._open_peer_source.return_value.fetch.assert_called_once()
+            tc._open_peer_source.return_value.session.close.assert_called_once()
+            assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        else:
+            tc._create_cache_extent.assert_not_called()
+            tc._open_peer_source.assert_not_called()
+            assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert not tc._recv_sessions
+        assert not tc._recv_reqs
