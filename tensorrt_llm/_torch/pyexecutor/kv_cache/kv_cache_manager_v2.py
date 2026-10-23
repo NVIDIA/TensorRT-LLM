@@ -3350,6 +3350,22 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_cache_manager_py_config.layers[layer_offset], AttentionLayerConfig
         )
 
+    @property
+    def kv_capacity_tokens_all_tiers(self) -> int:
+        """Total KV capacity in tokens over the GPU tier and every host tier.
+
+        The v1 manager exposes ``blocks_in_primary_pool`` and ``blocks_in_secondary_pool``, which
+        ``ConversationAwareADPRouter`` sums to size its write-volume window (the token volume after
+        which a conversation's blocks have most likely been recycled). This manager has no
+        secondary-pool attribute, so it reports the summed capacity directly. Per tier, a block
+        needs a slot in every pool group, so the binding block count is the minimum over groups.
+        """
+        total_blocks = 0
+        for level in range(len(self.impl.cache_tier_list)):
+            stats = self._get_storage_statistics(CacheLevel(level))
+            total_blocks += min((int(stat.total) for stat in stats), default=0)
+        return total_blocks * int(self.tokens_per_block)
+
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
