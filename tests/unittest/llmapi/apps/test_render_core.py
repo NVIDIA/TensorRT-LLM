@@ -332,6 +332,23 @@ class TestRenderChat:
 
         assert render_chat_for_length(with_media, res).text == render_chat(text_only, res).text
 
+        # kimi_k3 keeps a tool-call argument that is not JSON.
+        call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "not json"},
+                }
+            ],
+        }
+        lenient = chat_request(messages=[with_media.messages[0], call], tools=[WEATHER_TOOL])
+        lenient_text = chat_request(messages=[text_only.messages[0], call], tools=[WEATHER_TOOL])
+
+        assert render_chat_for_length(lenient, res).text == render_chat(lenient_text, res).text
+
     def test_only_a_harmony_conversion_error_falls_back_to_the_template_for_a_length(
         self, tokenizer
     ) -> None:
