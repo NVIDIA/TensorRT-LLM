@@ -4,14 +4,16 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
-from tensorrt_llm._torch.disaggregation.blob.keys import FORMAT_VERSION, encode_key
+from tensorrt_llm._torch.disaggregation.blob.keys import FORMAT_VERSION, encode_key, key_stem
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
     RegionLayout,
+    RowBatch,
     RowIO,
     RowResult,
     RowStatus,
@@ -78,6 +80,8 @@ def test_span_and_layout_validate_their_numbers() -> None:
     with pytest.raises(ValueError):
         Span(0, 0)
     assert Span(0x1000, 64).overlaps(Span(0x1020, 64))
+    assert not Span(0x1040, 8).overlaps(Span(0x1000, 64))  # adjacent, so back to back
+    assert not Span(0x1000, 64).overlaps(Span(0x1040, 8))
     assert Span(0x1010, 16).within(Span(0x1000, 64))
     for slot_bytes, slot_count in ((0, 1), (8, 0), (-8, 1)):
         with pytest.raises(ValueError):
@@ -98,6 +102,59 @@ def test_a_row_is_a_key_and_disjoint_spans_in_the_order_given() -> None:
         RowIO("k", ())
     with pytest.raises(ValueError):
         RowIO("k", (Span(0x1000, 64), Span(0x1020, 64)))
+
+
+def test_a_batch_of_slots_builds_nothing_until_read() -> None:
+    names = np.array([[0xAB, 0x01], [0xCD, 0x02], [0xEF, 0x03]], dtype=np.uint8)
+    slots = np.array([4096, 8192, 12288], dtype=np.int64)
+    region = Span(4096, 3 * 4096)
+    batch = RowBatch.of_slots(key_stem("p"), names, slots, 4096, region)
+    assert len(batch) == 3 and batch.spans_per_row == 1 and batch.row_bytes == 4096
+    # Both columns are the caller's arrays: a change to them shows, as nothing was copied or built.
+    names[0] = [0x12, 0x34]
+    assert np.shares_memory(batch.addresses, slots)
+    assert not batch.addresses.flags.writeable  # a driver cannot write through it
+    assert batch.addresses[:, 0].tolist() == [4096, 8192, 12288]
+    assert batch.span_bytes == (4096,)
+    assert batch.keys() == ["p/v1/1234", "p/v1/cd02", "p/v1/ef03"]
+    assert batch.extents == (region,)
+    assert batch[1] == RowIO("p/v1/cd02", (Span(8192, 4096),))
+    assert list(batch) == [batch[0], batch[1], batch[2]]  # read row by row, as a Sequence[RowIO]
+
+
+def test_a_slice_of_a_batch_is_the_batch_of_those_rows() -> None:
+    names = np.arange(8, dtype=np.uint8).reshape(4, 2)
+    batch = RowBatch.of_slots("s/", names, np.arange(4, dtype=np.int64) * 8, 8, Span(0, 32))
+    part = batch[1:3]
+    assert isinstance(part, RowBatch) and len(part) == 2
+    assert part.keys() == batch.keys()[1:3]
+    assert part.addresses[:, 0].tolist() == [8, 16] and part.row_bytes == 8
+    with pytest.raises(ValueError, match="contiguous"):
+        batch[::2]
+
+
+def test_a_batch_of_rows_is_checked() -> None:
+    a = RowIO("a", (Span(0, 4),))
+    b = RowIO("b", (Span(10, 4),))
+    batch = RowBatch.of([a, b])
+    assert batch.keys() == ["a", "b"] and list(batch) == [a, b]
+    assert not batch.addresses.flags.writeable  # a driver cannot write through it
+    assert batch.span_bytes == (4,) and batch.row_bytes == 4
+    assert batch.extents == (Span(0, 14),)  # the smallest span holding every row
+    split = RowIO("m", (Span(8, 2), Span(0, 3)))
+    other = RowIO("n", (Span(20, 2), Span(4, 3)))
+    pair = RowBatch.of([split, other])
+    assert pair.spans_per_row == 2 and pair.span_bytes == (2, 3) and pair.row_bytes == 5
+    assert pair.extents == (Span(8, 14), Span(0, 7))  # one per span, in span order
+    assert pair[1] == other
+    with pytest.raises(ValueError, match="at least one row"):
+        RowBatch.of([])
+    with pytest.raises(ValueError, match="appears twice"):
+        RowBatch.of([a, RowIO("a", (Span(8, 4),))])
+    with pytest.raises(ValueError, match="same span sizes"):
+        RowBatch.of([a, RowIO("c", (Span(8, 6),))])  # rows of different sizes
+    with pytest.raises(ValueError, match="same span sizes"):
+        RowBatch.of([a, split])  # different numbers of spans
 
 
 def test_capabilities_that_grant_are_declared_and_later_ones_default_off() -> None:

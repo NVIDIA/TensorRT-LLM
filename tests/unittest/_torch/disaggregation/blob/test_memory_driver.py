@@ -99,9 +99,13 @@ class TimeoutStore(MemoryStore):
 
 
 class CrashingStore(MemoryStore):
-    """Raises something that is not a ``StoreError`` from inside a commit, as a binding bug would."""
+    """Raises something that is not a ``StoreError`` from inside every commit and read, as a
+    binding bug would."""
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
+        raise RuntimeError("binding returned garbage")
+
+    def get(self, key: str) -> StoredObject | None:
         raise RuntimeError("binding returned garbage")
 
 
@@ -160,6 +164,10 @@ class TestMemoryDriverConformance(DriverConformance):
     driver_cls: type[MemoryDriver] = MemoryDriver
     capabilities = DEFAULT_CAPABILITIES
     background = False  # True: put/get return once recorded and a thread executes them
+    # Automatic mode runs each operation inside put/get, which the protocol forbids; the checks
+    # that hold a put or a get inside the store skip it, and TestAsyncMemoryDriverConformance runs
+    # them.
+    handles_before_completion = False
 
     def _driver(self, store: MemoryStore | None = None) -> MemoryDriver:
         # An empty store is falsy (it has a length), so test for None explicitly.
@@ -182,6 +190,11 @@ class TestMemoryDriverConformance(DriverConformance):
         store.gate.clear()
         return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
 
+    def make_blocked_put(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+        store = GatedStore(held={STAGED_KEY})
+        store.gate.clear()
+        return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
+
     def make_held_key(self) -> tuple[StoreDriver, str, Unblock]:
         store = MemoryStore()
         store.begin_write(STAGED_KEY)
@@ -192,6 +205,9 @@ class TestMemoryDriverConformance(DriverConformance):
 
     def make_crash_after_record(self) -> StoreDriver:
         return self._driver(CrashingStore())
+
+    def make_driver_starting_nothing(self) -> StoreDriver:
+        return self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
 
     def make_failing_presence(self) -> tuple[StoreDriver, str]:
         store = MemoryStore()
@@ -217,8 +233,8 @@ class _HintFreeSignatures(MemoryDriver):
     """A driver written before hints existed: ``get`` and ``probe`` take no hint. With
     ``hints`` undeclared the backend never passes one, so it stays a valid driver."""
 
-    def get(self, rows: Sequence[RowIO]) -> MemoryOp:  # type: ignore[override]
-        return super().get(rows)
+    def get(self, rows: Sequence[RowIO], *, on_change=None) -> MemoryOp:  # type: ignore[override]
+        return super().get(rows, on_change=on_change)
 
     def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:  # type: ignore[override]
         return super().probe(keys, budget_s)
@@ -1132,12 +1148,30 @@ def test_a_skip_on_the_broken_side_is_not_an_expected_failure() -> None:
             _run_check(suite, "test_probe_reports_hit_and_miss")
 
 
-def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> None:
+def test_every_check_fails_a_broken_driver_and_each_breaks_one_rule() -> None:
     pairings = [*BROKEN_CONFORMANCE.values(), *BROKEN_ASYNC_CONFORMANCE.values()]
     conformance = [cls for cls, _, _ in pairings]
     memory = [cls for cls, _ in BROKEN_MEMORY.values()]
     assert len(set(conformance + memory)) == len(conformance) + len(memory)
     checks = {check for _, _, check in pairings}
-    assert checks <= {name for name in dir(DriverConformance) if name.startswith("test_")}
+    # A check no broken driver fails is one nothing proves can fail.
+    assert checks == {name for name in dir(DriverConformance) if name.startswith("test_")}
     checks = {check for _, check in BROKEN_MEMORY.values()}
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}
+
+
+class TestMemoryDriverOnChange:
+    @pytest.mark.parametrize("stop", ["cancel", "drain"])
+    def test_a_cancel_shows_before_on_change_is_called(self, stop: str) -> None:
+        driver = MemoryDriver(MemoryStore(), controlled=True)
+        reader = endpoint(driver, ["A"])
+        seen: list[tuple[list[RowStatus], bool]] = []
+        op = driver.get(
+            reader.rows(),
+            on_change=lambda op: seen.append((statuses(driver, op), driver.access_ended(op))),
+        )
+        if stop == "cancel":
+            driver.cancel(op)
+        else:
+            assert driver.drain(TIMEOUT) is True
+        assert seen == [([RowStatus.CANCELLED], True)]
