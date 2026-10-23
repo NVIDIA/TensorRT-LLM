@@ -164,6 +164,17 @@ class BudgetTracker:
         self._seen_peft_task_ids.add(lora_task_id)
 
 
+def _in_other_locality_domain(victim, locality_domain_id) -> bool:
+    # Pages are allocated per locality domain, so a victim in another
+    # domain frees nothing for this request.
+    victim_domain = getattr(victim, "py_locality_domain_id", None)
+    return (
+        isinstance(locality_domain_id, int)
+        and isinstance(victim_domain, int)
+        and victim_domain != locality_domain_id
+    )
+
+
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
 
@@ -763,6 +774,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 recompute_paused,
                 preempted_ids,
                 pending_ctx_index[req.py_request_id],
+                locality_domain_id=getattr(req, "py_locality_domain_id", None),
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -2199,6 +2211,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         preempted_ids: set[int],
         requester_idx: int,
+        locality_domain_id: int | None = None,
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
 
@@ -2246,6 +2259,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             victim
             for victim in reversed(requests_list[stop + 1 :])
             if victim.py_request_id not in protected_ids
+            and not _in_other_locality_domain(victim, locality_domain_id)
             and self._is_recompute_pause_candidate(victim, inflight_request_ids)
         ]
         # An active request holds its pages on GPU, so preempting it always
