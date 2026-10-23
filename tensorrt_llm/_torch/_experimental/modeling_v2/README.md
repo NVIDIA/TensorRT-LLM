@@ -285,7 +285,9 @@ Perf is measured, never gated.
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
 sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
-and the entries it owns are certified on sm_103.
+and the entries it owns are certified on sm_103. Kimi K3's sm_100 operation
+receipts remain in its adjacent records; its generic-operation regressions
+exercise the relocated entries.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
