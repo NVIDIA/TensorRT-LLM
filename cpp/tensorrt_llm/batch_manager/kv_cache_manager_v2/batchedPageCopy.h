@@ -59,16 +59,25 @@ struct PoolCopyArgs
     uint32_t numPairs = 0;
 };
 
-//! Chooses and launches the host<->device page-copy kernel.
+//! Chooses and launches the host<->device page-copy engine or SM kernel.
 //!
 //! Construction performs all platform detection and grid sizing once, for both directions, so the
-//! launch path is branch-light. The constants are measured; the short version:
+//! launch path is branch-light. Path selection (copy engine vs SM kernel) follows this decision
+//! tree:
+//!
+//!   1. TRTLLM_KV_CACHE_FORCE_SM_COPY=1 → SM kernel, opt-in escape hatch.
+//!   2. HostMem::shouldUseChunkedRegistration() → SM kernel (copy-engine descriptors cannot cross
+//!      a registration boundary; the kernel works on a contiguous virtual range).
+//!   3. Otherwise → copy engine (cuMemcpyBatchAsync). This is the default for both PCIe and
+//!      coherent NVLink-C2C; the SM kernel on coherent links regresses CUDA-graph replay latency
+//!      by leaving idle gaps between kernel boundaries.
+//!
+//! Kernel tuning constants (in-flight bytes, grid sizing) are measured; the short version:
 //!
 //!   * in-flight bytes per CTA is the only kernel parameter that matters, and the knees are
 //!     platform-independent: 32 KiB for offload, 64 KiB for onboard;
 //!   * CTA count scales with the CPU-GPU link bandwidth, sized via Little's Law;
-//!   * on H100-class PCIe parts the SM store path is far slower than the copy engine, so the
-//!     kernel is disabled and callers should keep using cuMemcpyBatchAsync.
+//!   * the kernel is zero-CTA on the copy-engine path so callers can skip grid launch entirely.
 class BatchedPageCopier
 {
 public:
@@ -84,7 +93,9 @@ public:
         uint32_t inFlightBytes = 0;
         //! Dynamic shared memory required per CTA, in bytes. Equal to inFlightBytes.
         uint32_t sharedBytes = 0;
-        //! False when the copy engine is expected to beat the kernel; caller should fall back.
+        //! True when the SM copy kernel will be launched; false when the copy engine is used.
+        //! Kernel presence is gated by path selection in computeConfigs(): the copy engine is the
+        //! default (zero SMs, no graph-replay idle gaps on coherent links).
         bool useKernel = false;
     };
 
