@@ -232,13 +232,10 @@ def get_kv_cache_manager_cls(
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
         if (is_hybrid_linear(config)
                 and model_config.get_num_mamba_layers() > 0):
-            if is_disagg:
-                raise NotImplementedError(
-                    "FP4 MLA disaggregated serving does not support hybrid "
-                    "linear-attention models yet.")
             # The hybrid V2 manager composes the FP4 MLA cache layout with
             # its recurrent-state lifecycle and keeps the KDA replay caches
-            # used by fused speculative verification.
+            # used by fused speculative verification. Its disaggregation
+            # declarations cover both the MLA and the recurrent-state roles.
             return MambaHybridCacheManagerV2
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2

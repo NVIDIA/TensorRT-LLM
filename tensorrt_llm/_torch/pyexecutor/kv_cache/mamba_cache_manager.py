@@ -3611,8 +3611,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         default (sharded by head). PLE state is computed from replicated
         inputs, so every rank holds identical bytes and the transfer copies
         whole per-layer regions.
+
+        With the FP4 MLA cache layout, the MLA roles take the policy's
+        explicit kinds. They are declared per role rather than through the
+        ``Role.ALL`` fallback, which SSM state still needs for INDEXED.
         """
-        return {
+        kinds = {
             **super().get_disagg_role_mapper_kinds(),
             MambaRole.CONV_STATE:
             MapperKind.SECTIONED,
@@ -3621,6 +3625,36 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             MambaRole.PLE_NGRAM_CONTEXT:
             MapperKind.REPLICATED,
         }
+        layout_policy = self._attention_cache_layout_policy
+        if layout_policy is not None:
+            kinds.update(layout_policy.DISAGG_ROLE_MAPPER_KINDS)
+        return kinds
+
+    def get_disagg_global_layer_ids(self, layer_group_id: int) -> List[int]:
+        """Transfer IDs of a layer group's layers.
+
+        Without the FP4 MLA cache layout every layer uses its global model
+        layer. With it, the MLA latent and HP-ring layers use the policy's
+        ``2 * L`` / ``2 * L + 1`` encoding, and recurrent layers use ``2 * L``
+        so that the IDs stay collision-free across all of the manager's
+        layers and identical under any pipeline split.
+        """
+        layout_policy = self._attention_cache_layout_policy
+        result = []
+        for layer_id in self.impl.layer_grouping[layer_group_id]:
+            internal_layer = int(layer_id)
+            if layout_policy is None:
+                global_layer_id = int(self.pp_layers[internal_layer])
+            elif self._is_local_mamba_layer(internal_layer):
+                global_layer_id = 2 * int(self.pp_layers[internal_layer])
+            else:
+                global_layer_id = self._fp4_mla_disagg_global_layer_id(
+                    internal_layer)
+                if global_layer_id is None:
+                    raise ValueError("Unknown hybrid FP4 MLA internal layer "
+                                     f"{internal_layer}.")
+            result.append(global_layer_id)
+        return result
 
     def get_disagg_role_layouts(self) -> Dict[DataRole, RoleLayout]:
         """Per-layer geometry for resharding conv and SSM state."""
@@ -3648,6 +3682,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         replay_roles = {DataRole(name) for name in self._kda_replay_layout()}
         if replay_roles:
             replay_roles.add(_KDA_REPLAY_COUNT_ROLE)
+        layout_policy = self._attention_cache_layout_policy
+        if layout_policy is not None:
+            # FP4 MLA V scales and packed V are rebuilt on the generation
+            # worker from the transferred K and K scales.
+            replay_roles |= layout_policy.DISAGG_IGNORED_ROLES
         return super().get_disagg_ignored_roles() | frozenset(replay_roles)
 
     @property
@@ -4111,6 +4150,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return slope, intercept + attention_intercept
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
+        if local_layer_idx >= len(self.pp_layers):
+            # Virtual layers past the model's own (the FP4 MLA HP ring) are
+            # attention layers.
+            return False
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
     def _get_pool_roles(self,
