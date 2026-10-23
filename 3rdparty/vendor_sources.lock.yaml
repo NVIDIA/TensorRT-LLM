@@ -14,8 +14,8 @@ vendors:
     digest: sha256-tree-v1:d2d382335ccb68b55078523e63835c28b699607227afb81308cb7bb1d85845ac
   flashinfer-prims-ts:
     url: https://github.com/yunruis/flashinfer.git
-    branch: trtllm-prims-ts-dev-20261022
-    commit: f924fd45d1040a84a54a3f48f3978507b61064e6
+    branch: trtllm-prims-ts-dev-20261023
+    commit: aa709061230a58858375c513056e7733fa74294a
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
