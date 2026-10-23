@@ -487,6 +487,11 @@ public:
         return mReuseScope;
     }
 
+    std::optional<LocalityDomainId> localityDomainId() const noexcept
+    {
+        return mReuseScope.localityDomainId;
+    }
+
     // Plan dropping SWA blocks needed only by the next conversation turn.
     //
     // The plan covers committed pages in each SWA life cycle's current attention

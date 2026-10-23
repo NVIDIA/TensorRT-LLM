@@ -76,10 +76,25 @@ LRUEvictionPolicy& PrioritizedEvictionPolicy::getOrCreate(Priority p)
     return mPolicies[p]; // std::map default-constructs if not present
 }
 
+void PrioritizedEvictionPolicy::count(Page const& page, SlotCount delta) noexcept
+{
+    auto const domain = page.localityDomainId();
+    if (!domain.has_value())
+    {
+        return;
+    }
+    if (*domain >= mDomainCounts.size())
+    {
+        mDomainCounts.resize(*domain + 1, SlotCount{0});
+    }
+    mDomainCounts[*domain] += delta;
+}
+
 NodeRef PrioritizedEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 {
     Priority p = page->priority();
     LRUEvictionPolicy& policy = getOrCreate(p);
+    count(*page, SlotCount{1});
     return policy.push(std::move(page), evictFirst);
 }
 
@@ -93,6 +108,7 @@ SharedPtr<Page> PrioritizedEvictionPolicy::pop()
     {
         mPolicies.erase(it);
     }
+    count(*page, SlotCount{-1});
     return page;
 }
 
@@ -107,6 +123,7 @@ SharedPtr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
     {
         mPolicies.erase(it);
     }
+    count(*page, SlotCount{-1});
     return page;
 }
 
@@ -118,6 +135,15 @@ SlotCount PrioritizedEvictionPolicy::size() const noexcept
         total += slotCountValueFromSize(policy.size());
     }
     return total;
+}
+
+SlotCount PrioritizedEvictionPolicy::size(std::optional<LocalityDomainId> localityDomainId) const noexcept
+{
+    if (!localityDomainId.has_value())
+    {
+        return size();
+    }
+    return *localityDomainId < mDomainCounts.size() ? mDomainCounts[*localityDomainId] : SlotCount{0};
 }
 
 // allPages() removed — use begin()/end() iterator instead.
@@ -169,7 +195,7 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
 }
 
 TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(
-    TypedVec<PoolGroupIndex, SlotCount> const& minNumPages)
+    TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, std::optional<LocalityDomainId> localityDomainId)
 {
     TLLM_CHECK_DEBUG(minNumPages.size() == numPoolGroups());
 
@@ -185,16 +211,37 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionControlle
             {
                 throw LogicError("PerLevelEvictionController::evict: page count must be non-negative");
             }
-            SlotCount const available = policy.size() + slotCountValueFromSize(ret[pgIdx].size());
-            if (available < count)
+            if (policy.size(localityDomainId) < count)
             {
                 throw OutOfPagesError("Not enough pages to evict in group " + std::to_string(pgIdx.value()));
+            }
+            if (localityDomainId.has_value())
+            {
+                // One pass over the queue: pages of other domains are skipped once, and the
+                // generator is finished before any removal can invalidate it.
+                std::vector<SharedPtr<Page>> candidates;
+                auto gen = policy.pageGenerator();
+                while (slotCountValueFromSize(candidates.size()) < count)
+                {
+                    auto const* candidate = gen();
+                    TLLM_CHECK_DEBUG(candidate != nullptr);
+                    if ((*candidate)->localityDomainId() == localityDomainId)
+                    {
+                        candidates.push_back(*candidate);
+                    }
+                }
+                for (auto& page : candidates)
+                {
+                    remove(page->nodeRef.value());
+                    ret[pgIdx].push_back(std::move(page));
+                }
+                continue;
             }
             while (slotCountValueFromSize(ret[pgIdx].size()) < count)
             {
                 auto page = policy.pop();
                 page->nodeRef = std::nullopt;
-                ret[pgIdx].push_back(page);
+                ret[pgIdx].push_back(std::move(page));
                 // @TODO: evict dependencies (like Python _evict_dependencies)
             }
         }
@@ -235,9 +282,10 @@ void PerLevelEvictionController::remove(NodeRef node)
     page->nodeRef = std::nullopt;
 }
 
-SlotCount PerLevelEvictionController::numEvictablePages(PoolGroupIndex pgIdx) const
+SlotCount PerLevelEvictionController::numEvictablePages(
+    PoolGroupIndex pgIdx, std::optional<LocalityDomainId> localityDomainId) const
 {
-    return mPolicies.at(pgIdx).size();
+    return mPolicies.at(pgIdx).size(localityDomainId);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

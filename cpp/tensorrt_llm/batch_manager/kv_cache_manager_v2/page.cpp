@@ -58,6 +58,7 @@ Page::~Page()
             {
                 Slot s;
                 s.setSlotId(slotId());
+                s.setLocalityDomainId(localityDomainId());
                 s.readyEvent = std::move(readyEvent);
                 resetSlot();
                 manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
@@ -249,6 +250,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
+    committed->setLocalityDomainId(localityDomainId());
     committed->readyEvent = std::move(readyEvent);
     resetSlot();
     readyEvent = CachedCudaEvent::makeNull();
@@ -540,8 +542,9 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         for (auto const& page : pages)
             if (page->cacheLevel != kHotLevel)
                 ++requirements[storeMgr->getPoolGroupIndex(kHotLevel, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
-        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder);
+        storeMgr->prepareFreeSlots(
+            kHotLevel, requirements, migrationRecorder, dropRecorder, kvCache.localityDomainId());
+        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder, kvCache.localityDomainId());
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).
