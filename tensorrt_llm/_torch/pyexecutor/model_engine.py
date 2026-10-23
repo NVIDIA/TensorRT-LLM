@@ -682,7 +682,9 @@ class PyTorchModelEngine(ModelEngine):
             # NCCL window tensors are only created by collectives with peers, so
             # a forward without peers never holds a lease to scope. Skip the
             # scopes there: the eager hooks run on every scoped layer of every
-            # eager iteration.
+            # eager iteration. This gates the eager hooks and the outer
+            # model_forward scope only; the torch.compile backend inserts its
+            # per-layer scope ops independently of this gate.
             self._nccl_window_tensor_scopes_enabled = (
                 self._is_distributed_forward())
             if self._torch_compile_enabled:

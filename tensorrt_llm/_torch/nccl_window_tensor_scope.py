@@ -81,35 +81,61 @@ def _cuda_tensors(
             _cuda_tensors(item, tensors, visited)
 
 
-# Argument types a scoped module call may receive window tensors through.
-_MODULE_CALL_TENSOR_ARGUMENT_TYPES = (
-    torch.Tensor,
-    Fp4QuantizedTensor,
-    MxFp8QuantizedTensor,
-    list,
-    tuple,
-    dict,
-)
+def _module_call_tensors(
+    value: Any,
+    tensors: list[torch.Tensor],
+    visited: set[int],
+) -> None:
+    """Collect CUDA tensors reachable through activation-carrying values only.
+
+    Recurses into tensors, quantized-tensor wrappers and plain list/tuple/dict
+    containers, and ignores every other object at every depth, so a metadata
+    object nested inside a container is skipped too.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            tensors.append(value)
+        return
+
+    identity = id(value)
+    if identity in visited:
+        return
+    visited.add(identity)
+
+    if isinstance(value, Fp4QuantizedTensor):
+        _module_call_tensors(value.fp4_tensor, tensors, visited)
+        _module_call_tensors(value.scaling_factor, tensors, visited)
+        _module_call_tensors(value.unquantized_hidden_states, tensors, visited)
+    elif isinstance(value, MxFp8QuantizedTensor):
+        _module_call_tensors(value.fp8_tensor, tensors, visited)
+        _module_call_tensors(value.scaling_factor, tensors, visited)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _module_call_tensors(item, tensors, visited)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _module_call_tensors(item, tensors, visited)
 
 
 def _module_call_cuda_tensors(args: tuple, kwargs: dict[str, Any]) -> list[torch.Tensor]:
-    """Collect CUDA tensors passed directly to a scoped module call.
+    """Collect CUDA tensors passed to a scoped module call as activations.
 
-    Activations flow between scoped modules as direct arguments: tensors,
-    quantized-tensor wrappers, and plain containers of them. Per-forward
-    metadata objects (attention, speculative-decoding, Mamba metadata, ...) are
-    shared by every scoped module in the forward pass, so one module must not
-    adopt and release leases they hold; their enclosing scope owns them.
+    Activations flow between scoped modules as tensors, quantized-tensor
+    wrappers, and plain containers of them. Per-forward metadata objects
+    (attention, speculative-decoding, Mamba metadata, ...) are shared by every
+    scoped module in the forward pass, so one module must not adopt and release
+    leases they hold; the enclosing model-forward scope owns them. They are
+    skipped at every depth, including inside containers.
 
-    Skipping those objects also bounds the per-call cost by the number of
-    arguments instead of the batch size. The eager hooks run once per scoped
-    module, i.e. once per decoder layer per iteration, so walking the
+    Skipping those objects also bounds the per-call cost by the size of the
+    activation arguments instead of the batch size. The eager hooks run once
+    per scoped module, i.e. once per decoder layer per iteration, so walking the
     per-request lists inside attention metadata dominated eager iterations.
     """
     tensors: list[torch.Tensor] = []
+    visited: set[int] = set()
     for value in (*args, *kwargs.values()):
-        if isinstance(value, _MODULE_CALL_TENSOR_ARGUMENT_TYPES):
-            _cuda_tensors(value, tensors)
+        _module_call_tensors(value, tensors, visited)
     return tensors
 
 

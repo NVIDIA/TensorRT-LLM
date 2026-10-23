@@ -311,6 +311,17 @@ def tensor_scope_events(monkeypatch):
         collect_tensors,
     )
 
+    def collect_module_call_tensors(value, tensors, visited):
+        # Placeholder "tensors" arrive as a list or tuple argument.
+        if isinstance(value, (list, tuple)):
+            tensors.extend(value)
+
+    monkeypatch.setattr(
+        nccl_window_tensor_scope,
+        "_module_call_tensors",
+        collect_module_call_tensors,
+    )
+
     def begin(tensors):
         events.append(("begin", tensors))
         return 7
@@ -614,6 +625,9 @@ def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
             (residual,),
             attn_metadata=metadata,
             quantized=Fp4QuantizedTensor(fp4_tensor, scaling_factor),
+            # Metadata nested inside containers is skipped at every depth.
+            nested_tuple=(metadata,),
+            nested_dict={"metadata": metadata},
         )
     finally:
         for handle in handles:
@@ -623,10 +637,70 @@ def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
         return len(actual) == len(expected) and all(a is b for a, b in zip(actual, expected))
 
     assert [event[0] for event in events] == ["begin", "end"]
-    # Direct tensors, containers, and quantized wrappers are adopted; metadata is not.
+    # Direct tensors, containers, and quantized wrappers are adopted; metadata is not,
+    # whether passed directly or inside a container.
     assert same_tensors(events[0][1], [hidden_states, residual, fp4_tensor, scaling_factor])
     assert same_tensors(events[1][2], [hidden_states, residual])
     assert events[1][3] is False
+
+
+def test_shared_metadata_lease_stays_with_enclosing_scope(monkeypatch):
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    @dataclass
+    class Metadata:
+        seq_lens_cuda: torch.Tensor
+
+    class TestLayer(DecoderLayer):
+        def forward(self, hidden_states, attn_metadata, **kwargs):
+            return hidden_states
+
+    with FakeTensorMode():
+        hidden_states = torch.empty(1, device="cuda")
+        seq_lens_cuda = torch.empty(1, device="cuda")
+    metadata = Metadata(seq_lens_cuda)
+    events = []
+
+    def begin(tensors):
+        events.append(("begin", list(tensors)))
+        return len(events)
+
+    def end(inputs, outputs, failed, entry_depth):
+        events.append(("end", list(inputs), list(outputs), failed))
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+
+    layers = [TestLayer(), TestLayer()]
+    handles = [
+        handle
+        for layer in layers
+        for handle in nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    ]
+    try:
+        # The model-forward scope adopts the per-forward metadata.
+        with nccl_window_tensor_scope.nccl_window_tensor_scope(
+            {"hidden_states": hidden_states, "attn_metadata": metadata}
+        ) as outer:
+            out = hidden_states
+            for layer in layers:
+                out = layer(out, attn_metadata=metadata)
+            outer.escape(out)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    def holds(tensors, tensor):
+        return any(t is tensor for t in tensors)
+
+    assert [event[0] for event in events] == ["begin", "begin", "end", "begin", "end", "end"]
+    outer_begin, layer_events, outer_end = events[0], events[1:5], events[5]
+    # Only the enclosing scope owns the shared metadata lease ...
+    assert holds(outer_begin[1], seq_lens_cuda)
+    assert holds(outer_end[1], seq_lens_cuda)
+    # ... so neither layer adopts it or releases it when the layer exits.
+    for event in layer_events:
+        assert not holds(event[1], seq_lens_cuda)
 
 
 def test_disabled_window_tensor_scope_issues_no_lease_ops(monkeypatch):
