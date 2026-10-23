@@ -482,6 +482,12 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         runner.capture_all(device if device is not None else self.device)
         self._blocks_graph_runner = runner
 
+    def clear_blocks_cuda_graph(self, *, release_nccl_window_owners: bool = True) -> None:
+        """Release the block graphs at the engine coordinated teardown boundary."""
+        if self._blocks_graph_runner is not None:
+            self._blocks_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
+            self._blocks_graph_runner = None
+
     def _encoder_graph_fn(
         self, inputs: Mapping[str, torch.Tensor], attn_metadata: AttentionMetadata
     ) -> Dict[str, torch.Tensor]:

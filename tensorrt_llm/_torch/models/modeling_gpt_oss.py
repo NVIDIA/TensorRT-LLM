@@ -564,10 +564,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         statically dividing memory between them.
 
         The preference is adopted only when the user leaves
-        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Two-model
-        speculative decoding demotes it to V1 because V2 sizes both the target
-        and draft KV cache managers from the full budget; an explicit ``True``
-        is rejected by ``llm_utils._resolve_kv_cache_manager_v2_auto``.
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``.
         """
         return "V2"
 

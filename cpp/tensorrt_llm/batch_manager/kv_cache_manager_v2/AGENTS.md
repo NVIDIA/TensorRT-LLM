@@ -213,6 +213,36 @@ Eviction controller
   Every `KvCache` must be closed before manager shutdown so this deferred cleanup
   runs while `StorageManager` is still alive.
 
+### Beam-search pages
+
+Prefill normally runs at beam width 1. Expanding the beam width does not
+physically duplicate the whole prompt; ownership splits at the prompt tail:
+
+- `_appendBeams` starts at block `floor(expectedPromptLength / tokensPerBlock)`.
+  Full prompt-prefix blocks before that ordinal stay on beam 0, and other beams
+  read that shared prefix through attention cache indirection.
+- The partially filled prompt tail, if any, gets a private writable page per
+  beam, copied from beam 0. Preallocated uncommitted generation blocks are
+  handled the same way. Newly allocated decode blocks have one row per beam.
+  Already committed blocks remain canonical on beam 0, even when the
+  prompt-length hint is conservative.
+- Raw page-index rows of non-leading beams contain `BAD_PAGE_INDEX` for the
+  shared prefix. `getAggregatedPageIndices()` and `Batch` publication expose the
+  actual storage rows. Cache indirection resolves shared attention history; do
+  not duplicate beam-0 pages into every raw row.
+- `getPagePriorities(layerGroupId, beamIndex)` preserves block ordinals. For a
+  block with one shared row it reads beam 0; otherwise it reads the requested
+  beam's private row. A missing lifecycle page yields `kPriorityDefault`.
+- Commit canonicalizes a reusable block to a single beam-0 row and releases the
+  alternative beam rows.
+- The wrapper disables `enablePartialCommit` when `maxBeamWidth > 1`, and
+  changing the beam width while partial commit is enabled is rejected.
+  Full-block reuse remains enabled. Partial reuse is also allowed: on resume,
+  a matched partial prefix is copied into a private uncommitted page before
+  beams expand.
+- SSM current state lives separately in `mSsmBlocks` and is copied per beam on
+  expansion. It is per-beam writable state, not a shared attention prefix.
+
 ## Correctness invariants
 
 - `ReuseScope::salt` is an optional string used directly by scope equality and

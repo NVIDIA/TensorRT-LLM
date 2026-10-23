@@ -124,12 +124,12 @@ def test_torch_llm_build_passes_model_dir_to_executor(monkeypatch, tmp_path):
     llm._build_model()
 
     create_call = llm._executor_cls.create.call_args
-    assert create_call.args == (None, )
+    assert create_call.args == ()
     assert create_call.kwargs["hf_model_dir"] == tmp_path
 
 
 @pytest.mark.cpu_only
-def test_multimodal_encoder_build_passes_none_to_executor(
+def test_multimodal_encoder_build_passes_model_dir_to_executor(
         monkeypatch, tmp_path):
     encoder = object.__new__(MultimodalEncoder)
     encoder.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
@@ -147,7 +147,9 @@ def test_multimodal_encoder_build_passes_none_to_executor(
 
     encoder._build_model()
 
-    assert encoder._executor_cls.create.call_args.args == (None, )
+    create_call = encoder._executor_cls.create.call_args
+    assert create_call.args == ()
+    assert create_call.kwargs["hf_model_dir"] == tmp_path
 
 
 @pytest.mark.cpu_only

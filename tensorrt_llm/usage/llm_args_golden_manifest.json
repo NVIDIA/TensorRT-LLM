@@ -622,6 +622,11 @@
       "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.cold_tier_offload_min_priority"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.copy_on_partial_reuse"
@@ -829,11 +834,6 @@
     {
       "capture_policy": "int|none",
       "kind": "value",
-      "path": "kv_cache_config.secondary_offload_min_priority"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
       "path": "kv_cache_config.sink_token_length"
     },
     {
@@ -895,6 +895,15 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "layer_wise_benchmarks_config.calibration_mode"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float32"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "lm_head_output_dtype"
     },
     {
       "allowed_values": [
