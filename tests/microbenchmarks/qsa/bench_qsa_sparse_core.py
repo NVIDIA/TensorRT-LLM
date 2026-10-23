@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import statistics
+import sys
 import time
 from types import SimpleNamespace
 
@@ -169,7 +170,7 @@ def triton_runner(case, args):
 
 
 def prims_runner(case, args, device):
-    from flashinfer.attention.prims_ts import (
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         QTokenKvBlockSparsePagedTSWrapper,
         get_q_token_kv_block_sparse_workspace_size,
         make_q_token_kv_block_sparse_qo_indptr,
@@ -206,7 +207,7 @@ def prims_runner(case, args, device):
         max_seq_len_kv=args.ctx,
         o_data_type=out.dtype,
         qo_indptr=qo_indptr,
-        group_size=group,
+        seq_len_q=group if packed else None,
         kv_block_size=KV_BLOCK,
         split_kv=split_kv,
     )
@@ -214,6 +215,7 @@ def prims_runner(case, args, device):
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         routes,
+        group,
         case.hq,
         case.hkv,
         HEAD_DIM,
@@ -223,7 +225,6 @@ def prims_runner(case, args, device):
         args.ctx,
         device=device,
         workspace_buffer=workspace,
-        group_size=group,
         use_packed_q=packed,
         split_kv=split_kv,
         q_data_type=q.dtype,
@@ -436,7 +437,11 @@ def main():
         with open(args.json, "a") as f:
             for r in rows:
                 f.write(json.dumps(r) + "\n")
+    bad = [r["label"] for r in rows if "error" in r or not (r["triton_ok"] and r["prims_ok"])]
+    if bad:
+        print("FAILED cases:", ", ".join(bad))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

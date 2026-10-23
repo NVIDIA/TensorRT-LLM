@@ -16,10 +16,14 @@ _PREFILL_GROUP_SIZE = 4
 # A plan miss costs ~40 ms per layer; padding prefill rows to a bucket bounds
 # the plan keys to max_num_tokens / bucket per layer.
 _PREFILL_ROW_BUCKET = 256
-# Decode rows below which Triton is faster under CUDA graphs (Rubin SM107,
-# 32K context, TP2): the core ties at one row, the indexer until ~32 rows.
+# Decode plans are keyed on the row count too; eager decode batches vary.
+_DECODE_ROW_BUCKET = 8
+# Query rows (requests x query tokens per request, so MTP counts draft tokens)
+# below which Triton is faster under CUDA graphs (Rubin SM107 and B300, 32K
+# context, TP2): the core ties at one row, the indexer until ~32 rows.
 _MIN_DECODE_ROWS = 2
 _MIN_INDEXER_DECODE_ROWS = 32
+_KV_BLOCK_SIZE = 4
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -29,7 +33,7 @@ _FP8_MAX = 448.0
 @functools.cache
 def _prims_ts_api():
     try:
-        from flashinfer.attention.prims_ts import (
+        from ...prims_ts import (
             QTokenKvBlockSparsePagedTSWrapper,
             get_q_token_kv_block_sparse_workspace_size,
             make_q_token_kv_block_sparse_qo_indptr,
@@ -57,7 +61,7 @@ def _unsupported_reason(
     if torch.cuda.get_device_capability(q.device) not in _SUPPORTED_CAPABILITIES:
         return "requires an SM100, SM103 or SM107 GPU"
     if not prims_ts_available():
-        return "flashinfer.attention.prims_ts is not importable"
+        return "the vendored PrimTS package is not importable"
     if q.dtype not in _SUPPORTED_Q_DTYPES or k_cache.dtype not in _SUPPORTED_KV_DTYPES:
         return f"unsupported dtypes q={q.dtype} kv={k_cache.dtype}"
     if k_cache.dtype != q.dtype and k_cache.dtype != torch.float8_e4m3fn:
@@ -69,8 +73,21 @@ def _unsupported_reason(
     return None
 
 
+@functools.cache
+def _prims_ts_indexer_available() -> bool:
+    try:
+        from . import prims_ts_indexer  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def use_prims_ts_indexer(
-    params: QSASparseParams, q: torch.Tensor, *, is_decode: bool = False
+    params: QSASparseParams,
+    q: torch.Tensor,
+    *,
+    tokens_per_block: int | None = None,
+    is_decode: bool = False,
 ) -> bool:
     """Whether the indexer scoring runs on the PrimTS kernel instead of Triton.
 
@@ -92,6 +109,13 @@ def use_prims_ts_indexer(
         reason = "requires an SM100, SM103 or SM107 GPU"
     elif q.dtype != torch.bfloat16:
         reason = f"requires BF16 index queries, got {q.dtype}"
+    elif tokens_per_block is not None and (
+        tokens_per_block % params.compress_ratio != 0
+        or 128 % (tokens_per_block // params.compress_ratio) != 0
+    ):
+        reason = f"unsupported page size {tokens_per_block}"
+    elif not _prims_ts_indexer_available():
+        reason = "the CUTLASS task-scheduling DSL is not importable"
     if reason is None:
         return True
     if backend == "prims_ts":
@@ -236,33 +260,30 @@ class _PrimsTSSparseCore:
         block_topk = block_ids.shape[-1]
         out_dtype = q.dtype
 
-        sm_scale = softmax_scale
         if k_cache.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-            # The sparse route has no BF16-Q/FP8-KV kernel, so Q is quantized per
-            # call with a dynamic per-tensor scale folded into sm_scale. This
-            # differs numerically from the Triton path, which upcasts K/V, and
-            # the scale readback synchronizes the host.
-            q_scale = (q.float().abs().amax() / _FP8_MAX).clamp_min(1e-12)
-            q = (q.float() / q_scale).to(torch.float8_e4m3fn)
-            sm_scale = softmax_scale * float(q_scale)
+            # The sparse route has no BF16-Q/FP8-KV kernel, so Q is cast to FP8
+            # with unit scale: the normed Q of this model sits well inside the
+            # E4M3 range, and a per-call scale would need a host readback that
+            # CUDA-graph capture forbids. This differs numerically from the
+            # Triton path, which upcasts K/V.
+            q = q.clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
 
         request_indices = request_indices.to(torch.int32).contiguous()
         q = q.contiguous()
-        num_rows = rows
-        if not is_decode:
-            rows = -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
-            if rows != num_rows:
-                # Padding rows attend to nothing but token 0 of request 0; the
-                # suffix gets its own routes and is sliced off the output.
-                q = _pad_rows(q, rows, 0)
-                block_ids = _pad_rows(block_ids, rows, -1)
-                request_indices = _pad_rows(request_indices, rows, 0)
-                query_positions = _pad_rows(query_positions, rows, 0)
+        bucket = _DECODE_ROW_BUCKET if is_decode else _PREFILL_ROW_BUCKET
+        padded_rows = -(-rows // bucket) * bucket
+        if padded_rows != rows:
+            # Padding rows attend to nothing but token 0 of request 0 and are
+            # sliced off the output; in packed prefill they form inert routes.
+            q = _pad_rows(q, padded_rows, 0)
+            block_ids = _pad_rows(block_ids, padded_rows, -1)
+            request_indices = _pad_rows(request_indices, padded_rows, 0)
+            query_positions = _pad_rows(query_positions, padded_rows, 0)
         if is_decode:
-            route_q = q.view(rows, 1, 1, num_qo_heads, head_dim)
+            route_q = q.view(padded_rows, 1, 1, num_qo_heads, head_dim)
             qo_indptr = None
             group_size = 1
-            num_routes = rows
+            num_routes = padded_rows
             split_kv = True
         else:
             route_q = q
@@ -271,7 +292,9 @@ class _PrimsTSSparseCore:
                 # boundaries to keep the stream running.
                 request_boundaries = _request_boundaries(request_indices)
             with self._lock:
-                qo_indptr = self._route_offsets(make_qo_indptr, request_boundaries, rows, q.device)
+                qo_indptr = self._route_offsets(
+                    make_qo_indptr, request_boundaries, padded_rows, q.device
+                )
             group_size = _PREFILL_GROUP_SIZE
             num_routes = qo_indptr.numel() - 1
             split_kv = False
@@ -282,7 +305,7 @@ class _PrimsTSSparseCore:
             q.device.index,
             k_cache.data_ptr(),
             v_cache.data_ptr(),
-            rows,
+            padded_rows,
             num_routes,
             group_size,
             is_decode,
@@ -298,8 +321,10 @@ class _PrimsTSSparseCore:
             block_topk,
         )
         result = out
-        if out is None or rows != num_rows:
-            out = torch.empty((rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device)
+        if out is None or padded_rows != rows:
+            out = torch.empty(
+                (padded_rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device
+            )
         with self._lock:
             wrapper = self._plans.get(key)
             if wrapper is None:
@@ -313,24 +338,25 @@ class _PrimsTSSparseCore:
                     max_seq_len_kv=max_seq_len_kv,
                     o_data_type=out_dtype,
                     qo_indptr=qo_indptr,
-                    group_size=group_size,
-                    kv_block_size=4,
+                    seq_len_q=None if is_decode else group_size,
+                    kv_block_size=_KV_BLOCK_SIZE,
                     split_kv=split_kv,
                 )
                 workspace = self._workspace_for(nbytes, q.device)
                 wrapper = wrapper_cls()
+                # The vendored API names the route width seq_len_q.
                 wrapper.plan(
                     num_routes,
+                    group_size,
                     num_qo_heads,
                     num_kv_heads,
                     head_dim,
-                    4,
+                    _KV_BLOCK_SIZE,
                     page_size,
                     block_topk,
                     max_seq_len_kv,
                     device=q.device,
                     workspace_buffer=workspace,
-                    group_size=group_size,
                     use_packed_q=not is_decode,
                     split_kv=split_kv,
                     q_data_type=q.dtype,
@@ -356,7 +382,7 @@ class _PrimsTSSparseCore:
                     request_indices,
                     query_positions,
                     qo_indptr=qo_indptr,
-                    sm_scale=sm_scale,
+                    sm_scale=softmax_scale,
                     out=run_out,
                 )
             except RuntimeError as error:
@@ -370,9 +396,9 @@ class _PrimsTSSparseCore:
             if key not in self._last_abi:
                 self._last_abi[key] = _run_abi(run_args)
         if result is None:
-            return out[:num_rows]
+            return out[:rows]
         if result is not out:
-            result.copy_(out[:num_rows])
+            result.copy_(out[:rows])
         return result
 
 

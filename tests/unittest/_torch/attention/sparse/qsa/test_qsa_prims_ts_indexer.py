@@ -49,8 +49,9 @@ def _case(request_lengths, ctx, tokens_per_block, seed, *, q_scale=1.0, position
 def _requires_prims_ts():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Blackwell/Rubin tcgen05 required")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("PrimTS QSA scorer requires SM100/SM103/SM107")
+    pytest.importorskip("cutlass.experimental.task_scheduling")
 
 
 def _scorer():

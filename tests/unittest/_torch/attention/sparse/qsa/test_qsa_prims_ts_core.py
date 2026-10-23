@@ -53,11 +53,12 @@ def _requires_prims_ts() -> None:
         pytest.skip("CUDA is required")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("PrimTS QToken sparse attention requires SM100/SM103/SM107")
-    if not prims_ts_available():
-        pytest.skip("flashinfer.attention.prims_ts is not installed")
+    # The vendored package ships with TRT-LLM, so a missing kernel on a
+    # supported GPU is a failure, not a skip.
+    assert prims_ts_available()
 
 
-def _make_case(query_lens: list[int], seed: int):
+def _make_case(query_lens: list[int], seed: int, kv_dtype: torch.dtype = torch.bfloat16):
     torch.manual_seed(seed)
     device = torch.device("cuda")
     num_requests = len(query_lens)
@@ -65,8 +66,10 @@ def _make_case(query_lens: list[int], seed: int):
     num_pages = num_requests * PAGES_PER_REQUEST
     k_cache = torch.randn(
         num_pages, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device
-    )
-    v_cache = torch.randn_like(k_cache)
+    ).to(kv_dtype)
+    v_cache = torch.randn(
+        num_pages, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device
+    ).to(kv_dtype)
     block_table = torch.randperm(num_pages, dtype=torch.int32, device=device).view(
         num_requests, PAGES_PER_REQUEST
     )
@@ -316,10 +319,19 @@ def test_auto_gates_small_decode_batches() -> None:
     assert indexer("auto", 1, False)
     assert indexer("prims_ts", 1, True)
     assert not indexer("triton", 4096, False)
+    q64 = torch.empty(64, 4, 128, dtype=torch.bfloat16, device=device)
+    q31 = torch.empty(31, 4, 128, dtype=torch.bfloat16, device=device)
     assert not use_prims_ts_indexer(
-        _params(sparse_core_backend="prims_ts", indexer_backend="triton"),
-        torch.empty(64, 4, 128, dtype=torch.bfloat16, device=device),
+        _params(sparse_core_backend="prims_ts", indexer_backend="triton"), q64
     )
+    assert use_prims_ts_indexer(
+        _params(sparse_core_backend="triton", indexer_backend="prims_ts"), q31, is_decode=True
+    )
+    assert not use_prims_ts_indexer(
+        _params(sparse_core_backend="prims_ts", indexer_backend="auto"), q31, is_decode=True
+    )
+    assert not use_prims_ts_indexer(_params(), q64, tokens_per_block=48)
+    assert use_prims_ts_indexer(_params(), q64, tokens_per_block=64)
 
 
 def test_align_prefill_chunk() -> None:
@@ -357,3 +369,116 @@ def test_prefill_writes_into_caller_output() -> None:
         torch.cuda.synchronize()
         assert result.data_ptr() == out.data_ptr()
         assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("is_decode", [False, True], ids=["packed_prefill", "fixed_decode"])
+def test_prims_ts_sparse_gqa_fp8_kv_matches_reference(is_decode) -> None:
+    _requires_prims_ts()
+    query_lens = [1] * 8 if is_decode else [37, 91]
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, selected, metadata = (
+        _make_case(query_lens, seed=4321, kv_dtype=torch.float8_e4m3fn)
+    )
+    softmax_scale = HEAD_DIM**-0.5
+    actual = prims_ts_sparse_gqa(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        block_ids,
+        request_indices,
+        positions,
+        page_size=PAGE_SIZE,
+        max_seq_len_kv=CONTEXT,
+        softmax_scale=softmax_scale,
+        is_decode=is_decode,
+    )
+    expected = qsa_sparse_gqa_reference(
+        q=q,
+        k_cache=k_cache.to(torch.bfloat16),
+        v_cache=v_cache.to(torch.bfloat16),
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=softmax_scale,
+    )
+    torch.cuda.synchronize()
+    # FP8 Q on the PrimTS side vs BF16 Q upcast on the reference side.
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+def test_decode_graph_capture_replay(kv_dtype) -> None:
+    _requires_prims_ts()
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
+        [1] * 4, seed=99, kv_dtype=kv_dtype
+    )
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=True
+    )
+    out = torch.empty_like(q)
+    # Eager run prepares the plan; capture must not need the host afterwards.
+    prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, out=out, **kwargs
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prims_ts_sparse_gqa(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            block_ids,
+            request_indices,
+            positions,
+            out=out,
+            **kwargs,
+        )
+    q.copy_(torch.randn_like(q, dtype=torch.float32).to(q.dtype))
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+def test_decode_rows_share_plans_within_bucket() -> None:
+    _requires_prims_ts()
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import _CORE
+
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=True
+    )
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, selected, metadata = (
+        _make_case([1] * 5, seed=7)
+    )
+    prims_ts_sparse_gqa(
+        q[:3],
+        k_cache,
+        v_cache,
+        block_table,
+        block_ids[:3],
+        request_indices[:3],
+        positions[:3],
+        **kwargs,
+    )
+    plans = len(_CORE._plans)
+    out = prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+    )
+    assert len(_CORE._plans) == plans
+    assert out.shape[0] == 5
+    expected = qsa_sparse_gqa_reference(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
