@@ -11,9 +11,11 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
@@ -135,7 +137,6 @@ class DecoderInputBuffers(InputBuffers):
     previous_batch_indices_cuda: torch.Tensor
     # Host counter of the steady-state generation prepare cache.
     steady_gen_positions_pinned: torch.Tensor
-    num_accepted_draft_tokens_cuda: torch.Tensor | None = None
     previous_pos_indices_cuda: torch.Tensor | None = None
     previous_pos_id_offsets_cuda: torch.Tensor | None = None
     previous_kv_lens_offsets_cuda: torch.Tensor | None = None
@@ -166,11 +167,6 @@ class DecoderInputBuffers(InputBuffers):
             ),
             steady_gen_positions_pinned=torch.empty(
                 (config.max_num_tokens,), dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            num_accepted_draft_tokens_cuda=(
-                torch.empty((config.max_batch_size,), dtype=torch.int, device="cuda")
-                if spec
-                else None
             ),
             previous_pos_indices_cuda=(
                 torch.empty((config.max_num_tokens,), dtype=torch.int, device="cuda")
@@ -241,7 +237,6 @@ class HostLists:
     mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
     mrope_delta_write_seq_slots: list[int] = field(default_factory=list)
     mrope_delta_read_seq_slots: list[int] = field(default_factory=list)
-    num_accepted_draft_tokens: list[int] = field(default_factory=list)  # per request
     # will contain previous batch indices of generation requests
     previous_batch_indices: list[int] = field(default_factory=list)
     previous_pos_indices: list[int] = field(default_factory=list)
@@ -339,6 +334,19 @@ class DecoderInputPreparer:
         self._steady_gen_cache_supported = steady_gen_cache_supported
         self.guided_decoder: CapturableGuidedDecoder | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
+        self._gather_ids_buffer = (
+            DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
+            if config.is_spec_decode
+            else None
+        )
+        # Reuse device indices while the scheduled batch stays unchanged.
+        self._staged_previous_batch_indices: list[int] | None = None
+        self._staged_previous_pos_indices: list[int] | None = None
+        self._step_input_gather: spec_step_copies.StepInputGather | None = (
+            spec_step_copies.StepInputGather()
+            if config.is_spec_decode and spec_step_copies.is_supported()
+            else None
+        )
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
@@ -832,14 +840,13 @@ class DecoderInputPreparer:
             new_tokens_lens_device,
             next_draft_tokens_device,
             runtime_draft_len,
+            attn_metadata=attn_metadata,
+            enable_spec_decode=enable_spec_decode,
         )
         self._copy_position_ids_to_device(host)
 
         if enable_spec_decode:
-            self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)].copy_(
-                torch.tensor(host.lists.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            self._gather_ids_buffer.update(torch.tensor(host.lists.gather_ids, dtype=torch.int))
 
         self._prepare_attn_metadata(
             host,
@@ -891,7 +898,7 @@ class DecoderInputPreparer:
             )
 
         gather_ids_device = (
-            self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)]
+            self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             if enable_spec_decode
             else None
         )
@@ -965,7 +972,6 @@ class DecoderInputPreparer:
         position_ids = host.lists.position_ids
         num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
         draft_lens = host.lists.draft_lens
-        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
         multimodal_params_list = host.lists.multimodal_params_list
         extra_inputs = host.extra_inputs
         context_prompt_lookahead = host.context_prompt_lookahead
@@ -1000,7 +1006,6 @@ class DecoderInputPreparer:
 
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
-            num_accepted_draft_tokens.append(len(prompt_tokens) - 1)
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
@@ -1261,7 +1266,6 @@ class DecoderInputPreparer:
         draft_lens = host.lists.draft_lens
         prompt_lengths = host.lists.prompt_lengths
         sequence_lengths = host.lists.sequence_lengths
-        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
         gather_ids = host.lists.gather_ids
         position_ids = host.lists.position_ids
         num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
@@ -1321,7 +1325,6 @@ class DecoderInputPreparer:
                     prompt_lengths.append(request.py_prompt_len)
 
                 sequence_lengths.append(1 + num_draft_tokens)
-                num_accepted_draft_tokens.append(num_draft_tokens)
                 gather_ids.extend(
                     list(range(len(position_ids), len(position_ids) + 1 + num_draft_tokens))
                 )
@@ -1361,7 +1364,6 @@ class DecoderInputPreparer:
                 request.py_batch_idx = request.py_seq_slot
 
                 sequence_lengths.append(runtime_tokens_per_gen_step)
-                num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
 
                 draft_lens.append(runtime_draft_token_buffer_width)
@@ -1418,7 +1420,6 @@ class DecoderInputPreparer:
         generation_requests = host.lists.generation_requests
         draft_lens = host.lists.draft_lens
         sequence_lengths = host.lists.sequence_lengths
-        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
         request_ids = host.lists.request_ids
         input_ids = host.lists.input_ids
         previous_batch_indices = host.lists.previous_batch_indices
@@ -1498,7 +1499,6 @@ class DecoderInputPreparer:
             # overhead (saves ~3 append calls per request).
             draft_lens.extend([0] * (_n_gen * beam_width))
             sequence_lengths.extend([1] * (_n_gen * beam_width))
-            num_accepted_draft_tokens.extend([0] * (_n_gen * beam_width))
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
@@ -1674,10 +1674,12 @@ class DecoderInputPreparer:
         new_tokens_lens_device: torch.Tensor | None,
         next_draft_tokens_device: torch.Tensor | None,
         runtime_draft_len: int,
+        *,
+        attn_metadata: AttentionMetadata,
+        enable_spec_decode: bool,
     ) -> None:
         input_ids = host.lists.input_ids
         draft_tokens = host.lists.draft_tokens
-        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
         position_ids = host.lists.position_ids
         draft_lens = host.lists.draft_lens
         previous_batch_indices = host.lists.previous_batch_indices
@@ -1688,11 +1690,13 @@ class DecoderInputPreparer:
         previous_batch_len = len(previous_batch_indices)
 
         def previous_seq_slots_device() -> torch.Tensor:
-            previous_batch_indices_host = torch.tensor(
-                previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
-            )
             previous_slots = self._buffers.previous_batch_indices_cuda[:previous_batch_len]
-            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            if previous_batch_indices != self._staged_previous_batch_indices:
+                previous_batch_indices_host = torch.tensor(
+                    previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+                self._staged_previous_batch_indices = list(previous_batch_indices)
             return previous_slots
 
         if scheduled_requests.is_attention_dp_phase_idle:
@@ -1702,6 +1706,7 @@ class DecoderInputPreparer:
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
+        step_gather = self._step_input_gather if enable_spec_decode else None
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
@@ -1715,50 +1720,36 @@ class DecoderInputPreparer:
             self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
                 draft_tokens, non_blocking=True
             )
-        if self._config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
-            num_accepted_draft_tokens = torch.tensor(
-                num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
-            )
-            self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
-                num_accepted_draft_tokens, non_blocking=True
-            )
         if next_draft_tokens_device is not None:
-            # Initialize these two values to zeros
-            self._buffers.previous_pos_id_offsets_cuda.zero_()
-            self._buffers.previous_kv_lens_offsets_cuda.zero_()
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+            # The offsets of requests without a previous batch and of dummy
+            # requests must read 0. On a CUDA graph step (no token padding)
+            # where every row is a request with a previous batch, the gathers
+            # below overwrite all rows _preprocess_inputs reads, so the buffers
+            # need no zeroing first.
+            if not (
+                attn_metadata.is_cuda_graph
+                and previous_batch_len == num_extend_reqeust_wo_dummy
+                and not extend_dummy_requests
+                and not host.lists.generation_requests
+                and scheduled_requests.num_context_requests == 0
+            ):
+                self._buffers.previous_pos_id_offsets_cuda.zero_()
+                self._buffers.previous_kv_lens_offsets_cuda.zero_()
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
-                # previous input ids
                 previous_batch_tokens = previous_batch_len * runtime_tokens_per_gen_step
-                new_tokens = new_tokens_device.transpose(0, 1)[
-                    previous_slots, :runtime_tokens_per_gen_step
-                ].flatten()
-                self._buffers.input_ids_cuda[num_tokens : num_tokens + previous_batch_tokens].copy_(
-                    new_tokens, non_blocking=True
-                )
-
-                # previous draft tokens
-                previous_batch_draft_tokens = previous_batch_len * runtime_draft_token_buffer_width
-                if runtime_draft_token_buffer_width > 0:
-                    self._buffers.draft_tokens_cuda[
-                        num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
-                    ].copy_(
-                        next_draft_tokens_device[
-                            previous_slots, :runtime_draft_token_buffer_width
-                        ].flatten(),
-                        non_blocking=True,
+                if previous_pos_indices != self._staged_previous_pos_indices:
+                    previous_pos_indices_host = torch.tensor(
+                        previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                     )
-                # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - runtime_tokens_per_gen_step
-                previous_pos_indices_host = torch.tensor(
-                    previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
-                )
-                self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
-                    previous_pos_indices_host, non_blocking=True
-                )
+                    self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                        previous_pos_indices_host, non_blocking=True
+                    )
+                    self._staged_previous_pos_indices = list(previous_pos_indices)
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that
@@ -1772,29 +1763,67 @@ class DecoderInputPreparer:
                 #   For 1) 'requests that do not have previous batch': disable overlap scheduler or
                 #          the first step in the generation server of disaggregated serving.
                 #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to
-                #       '0' to skip the value changes in preprocess_inputs.
-                #       Already set to '0' during initialization.
+                #       '0' to skip the value changes in _preprocess_inputs.
+                #       Zeroed above.
                 #   For 2) 'requests that already have previous batch': enable overlap scheduler.
                 #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to
-                #       new_tokens_lens_device and kv_len_offsets_device.
+                #       new_tokens_lens_device.
                 #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
-                #       Already set to '0' during initialization.
+                #       Zeroed above.
+                previous_begin = num_extend_reqeust_wo_dummy - previous_batch_len
+                if step_gather is None or not step_gather.gather(
+                    new_tokens_device,
+                    next_draft_tokens_device,
+                    new_tokens_lens_device,
+                    self._buffers.previous_batch_indices_cuda,
+                    self._buffers.previous_pos_indices_cuda,
+                    previous_batch_len,
+                    runtime_tokens_per_gen_step,
+                    runtime_draft_token_buffer_width,
+                    self._buffers.input_ids_cuda,
+                    num_tokens,
+                    self._buffers.draft_tokens_cuda,
+                    num_draft_tokens,
+                    self._buffers.previous_pos_id_offsets_cuda,
+                    previous_begin * runtime_tokens_per_gen_step,
+                    self._buffers.previous_kv_lens_offsets_cuda,
+                    previous_begin,
+                ):
+                    # previous input ids
+                    new_tokens = new_tokens_device.transpose(0, 1)[
+                        previous_slots, :runtime_tokens_per_gen_step
+                    ].flatten()
+                    self._buffers.input_ids_cuda[
+                        num_tokens : num_tokens + previous_batch_tokens
+                    ].copy_(new_tokens, non_blocking=True)
 
-                num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
-                self._buffers.previous_pos_id_offsets_cuda[
-                    (num_extend_reqeust_wo_dummy - previous_batch_len)
-                    * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
-                    * runtime_tokens_per_gen_step
-                ].copy_(
-                    new_tokens_lens_device[
-                        self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens]
-                    ],
-                    non_blocking=True,
-                )
-
-                self._buffers.previous_kv_lens_offsets_cuda[
-                    num_extend_reqeust_wo_dummy - previous_batch_len : num_extend_reqeust_wo_dummy
-                ].copy_(kv_len_offsets_device[previous_slots], non_blocking=True)
+                    # previous draft tokens
+                    previous_batch_draft_tokens = (
+                        previous_batch_len * runtime_draft_token_buffer_width
+                    )
+                    if runtime_draft_token_buffer_width > 0:
+                        self._buffers.draft_tokens_cuda[
+                            num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
+                        ].copy_(
+                            next_draft_tokens_device[
+                                previous_slots, :runtime_draft_token_buffer_width
+                            ].flatten(),
+                            non_blocking=True,
+                        )
+                    # prepare data for the preprocess inputs
+                    kv_len_offsets_device = new_tokens_lens_device - runtime_tokens_per_gen_step
+                    self._buffers.previous_pos_id_offsets_cuda[
+                        previous_begin * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
+                        * runtime_tokens_per_gen_step
+                    ].copy_(
+                        new_tokens_lens_device[
+                            self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens]
+                        ],
+                        non_blocking=True,
+                    )
+                    self._buffers.previous_kv_lens_offsets_cuda[
+                        previous_begin:num_extend_reqeust_wo_dummy
+                    ].copy_(kv_len_offsets_device[previous_slots], non_blocking=True)
 
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
@@ -2111,13 +2140,10 @@ class DecoderInputPreparer:
             total_draft_lens = sum(host.lists.draft_lens)
             spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
             spec_metadata.request_ids = host.lists.request_ids
-            spec_metadata.gather_ids = self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)]
+            spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
             spec_metadata.host_position_ids = host.host_position_ids
-            spec_metadata.num_accepted_draft_tokens = self._buffers.num_accepted_draft_tokens_cuda[
-                : len(host.lists.num_accepted_draft_tokens)
-            ]
             if host.context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(host.context_prompt_lookahead)
             # No-op for non 1-model

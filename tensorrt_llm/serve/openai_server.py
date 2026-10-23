@@ -43,6 +43,7 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
@@ -227,6 +228,34 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "a relayed mode from a context worker. Reasoning content will not be "
         "separated correctly. Check that the context worker is running a "
         "build that relays 'resolved_thinking'.")
+
+
+def _validate_required_tool_grammar_request(
+        request: ChatCompletionRequest, sampling_params: SamplingParams, *,
+        guided_decoding_backend: Optional[str], tool_parser: Optional[str],
+        reasoning_parser: Optional[str]) -> None:
+    """Validate inputs for mandatory tool-call grammar construction."""
+    if guided_decoding_backend != "xgrammar":
+        raise ValueError("Required tool grammars need the xgrammar backend.")
+    if not tool_parser:
+        raise ValueError("Required tool grammars need a tool parser.")
+    if not reasoning_parser or not ReasoningParserFactory.resolves_thinking_from_prompt(
+            reasoning_parser):
+        raise ValueError(
+            "Required tool grammars need a reasoning parser that resolves its "
+            "mode from the rendered prompt. Configure the server with "
+            "--reasoning_parser nemotron-v3 (or a compatible parser alias).")
+    if not request.tools:
+        raise ValueError("tool_choice='required' requires request-level tools.")
+    if (request.prompt_token_ids is not None or request.prompt_token_ids_b64
+            or not request.add_generation_prompt
+            or request.disaggregated_params is not None):
+        raise ValueError("Required tool grammars need chat messages with "
+                         "add_generation_prompt=True on a native server.")
+    if sampling_params.guided_decoding is not None:
+        raise ValueError(
+            "tool_choice='required' cannot be combined with response_format "
+            "or other guided-decoding settings.")
 
 
 def _configure_parser_special_token_decoding(
@@ -655,6 +684,19 @@ class OpenAIServer(_VideoRoutesMixin):
             thread_name_prefix="trtllm_media_load",
         )
         BaseMediaIO.set_executor(self._media_load_executor)
+        # /metrics reads iteration stats with a blocking call that waits up to
+        # 2 s. A dedicated thread keeps those waits off the default executor,
+        # which request handling also uses; get_iteration_stats runs at most
+        # one read on it at a time.
+        self._metrics_stats_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="trtllm_metrics_stats",
+        )
+        self._metrics_stats_read: Optional[asyncio.Future] = None
+        # Whether a scrape is awaiting the last read, and whether a scrape has
+        # returned its stats.
+        self._metrics_stats_read_waiting = False
+        self._metrics_stats_read_consumed = True
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -805,6 +847,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
+            # A stats read still in flight fails fast now that the executor is
+            # down; the /metrics handler already treats that as no stats.
+            self._metrics_stats_executor.shutdown(wait=False,
+                                                  cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.router.route_class = _MsgspecRoute
@@ -1762,6 +1808,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
+        # Without iteration stats the engine produces none, so there is
+        # nothing to wait for.
+        if not getattr(self.generator.args, "enable_iter_perf_stats", True):
+            return JSONResponse(content=[])
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
@@ -1774,9 +1825,43 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=stats)
 
         # Legacy path: no background collector -> read the queue directly.
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
+        # The read waits up to 2 s for stats inside a blocking executor call,
+        # so it runs on the metrics thread; on the event loop it would stall
+        # every response being streamed for as long as it waits.
+        # One read at a time: a scrape that arrives while a read is in flight
+        # returns no stats instead of queueing behind it, so scraping an idle
+        # server faster than one read per 2 s cannot build a backlog. A read
+        # drains the queue and hands everything to its own scrape, so when two
+        # scrapers poll at once, one of them regularly gets an empty list.
+        read = self._metrics_stats_read
+        if read is not None and (not read.done()
+                                 or self._metrics_stats_read_waiting):
+            # In flight, or finished with its scrape about to take the stats.
+            return JSONResponse(content=[])
+        if (read is None or self._metrics_stats_read_consumed
+                or read.cancelled()):
+            read = asyncio.get_running_loop().run_in_executor(
+                self._metrics_stats_executor, self.generator.get_stats, 2)
+            self._metrics_stats_read = read
+            self._metrics_stats_read_consumed = False
+        # Otherwise the last read finished after its scrape went away, and
+        # this scrape takes the stats it drained rather than losing them.
+        self._metrics_stats_read_waiting = True
+        try:
+            # Shielded so a scrape that goes away leaves the read running
+            # until its thread finishes, and its stats for the next scrape.
+            stats = await asyncio.shield(read)
+        except RPCError as e:
+            # The executor is unreachable, e.g. while it shuts down.
+            logger.debug(f"Failed to fetch iteration stats: {e}")
+            stats = []
+        except Exception:
+            # The read failed; the next scrape starts a new one.
+            self._metrics_stats_read_consumed = True
+            raise
+        finally:
+            self._metrics_stats_read_waiting = False
+        self._metrics_stats_read_consumed = True
         return JSONResponse(content=stats)
 
     async def get_energy_metrics(self) -> JSONResponse:
@@ -1994,6 +2079,9 @@ class OpenAIServer(_VideoRoutesMixin):
             extension = render_resources.extension
             tool_dicts = prepare_chat_request(request,
                                               render_resources).tool_dicts
+            required_mode = extension.required_tool_choice_mode()
+            required_tool_grammar = (request.tool_choice == "required"
+                                     and required_mode == "grammar")
             conversation: List[ConversationMessage] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -2006,6 +2094,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if required_tool_grammar:
+                _validate_required_tool_grammar_request(
+                    request,
+                    sampling_params,
+                    guided_decoding_backend=self.generator.args.
+                    guided_decoding_backend,
+                    tool_parser=self.tool_parser,
+                    reasoning_parser=self.generator.args.reasoning_parser)
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2123,7 +2219,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # via structural tags (only if response_format doesn't already
                 # set guided decoding). Dynamic tools must be in the grammar
                 # too, or their calls would be masked out.
-                if sampling_params.guided_decoding is None:
+                if sampling_params.guided_decoding is None and not required_tool_grammar:
                     if (forced_tool_name is not None
                             and _parser_extracts_forced_tool_calls(
                                 self.tool_parser)):
@@ -2280,6 +2376,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
+            thinking = None
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             # Templates that prefill <think>/</think> leave the marker in the
             # prompt, so the request kwargs alone cannot tell the parser which
@@ -2287,7 +2384,6 @@ class OpenAIServer(_VideoRoutesMixin):
             if postproc_args.reasoning_parser and (
                     ReasoningParserFactory.resolves_thinking_from_prompt(
                         postproc_args.reasoning_parser)):
-                thinking = None
                 if rendered_prompt and request.add_generation_prompt:
                     thinking = ReasoningParserFactory.resolve_prefilled_thinking(
                         postproc_args.reasoning_parser, rendered_prompt)
@@ -2306,6 +2402,26 @@ class OpenAIServer(_VideoRoutesMixin):
                         "thinking": thinking,
                         "enable_thinking": thinking,
                     }
+            if required_tool_grammar:
+                if thinking is None:
+                    raise ValueError(
+                        "Cannot resolve required-tool reasoning state from the rendered prompt."
+                    )
+                parser = ToolParserFactory.create_tool_parser(self.tool_parser)
+                build_required = functools.partial(
+                    parser.build_required_structural_tag,
+                    request.tools,
+                    thinking=thinking)
+                required_format = await asyncio.get_running_loop(
+                ).run_in_executor(self._input_proc_executor, build_required)
+                if required_format is None:
+                    raise ValueError(
+                        "The configured tool parser does not support required tools."
+                    )
+                sampling_params.guided_decoding = GuidedDecodingParams(
+                    structural_tag=required_format.model_dump_json(
+                        by_alias=True))
+                postproc_args.tool_parser_grammar_constrained = True
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(

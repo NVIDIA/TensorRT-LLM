@@ -51,6 +51,7 @@ from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
+from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
@@ -294,6 +295,31 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             "Encoder-decoder tensor parallelism currently supports "
             f"attn_backend='TRTLLM' only, but got "
             f"attn_backend='{model_config.attn_backend}'.")
+
+
+def validate_lm_head_output_dtype(model: torch.nn.Module,
+                                  requested_dtype: str) -> None:
+    """Reject an explicit output dtype that the constructed LM heads ignore."""
+    if requested_dtype == "auto":
+        return
+
+    expected_dtype = str_dtype_to_torch(requested_dtype)
+    found_lm_head = False
+    for name, module in model.named_modules():
+        # Embedding inherits LMHead but does not project hidden states to logits.
+        if not isinstance(module, LMHead) or isinstance(module, Embedding):
+            continue
+        found_lm_head = True
+        if module.output_dtype != expected_dtype:
+            raise ValueError(
+                f"lm_head_output_dtype={requested_dtype!r} is not supported "
+                f"by {type(model).__name__}: {name or '<root>'}.output_dtype "
+                f"is {module.output_dtype}, expected {expected_dtype}.")
+
+    if not found_lm_head:
+        raise ValueError(
+            f"lm_head_output_dtype={requested_dtype!r} is not supported by "
+            f"{type(model).__name__}: no LMHead was constructed.")
 
 
 def initialize_dummy_weights(
@@ -973,6 +999,9 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+
+            validate_lm_head_output_dtype(model,
+                                          self.llm_args.lm_head_output_dtype)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -1946,6 +1975,9 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            lm_head_output_dtype=(torch.float32
+                                  if self.llm_args.lm_head_output_dtype
+                                  == "float32" else None),
             locality_domain_policy=LocalityDomainPolicy(
                 enabled=self.llm_args.enable_locality_domains),
         )

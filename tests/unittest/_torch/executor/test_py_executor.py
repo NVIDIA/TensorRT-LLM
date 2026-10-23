@@ -16,7 +16,7 @@ import threading
 import time
 import types
 from contextlib import nullcontext
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -68,6 +68,48 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("shutdown_method", "releases_model_owned_graphs"),
+    [
+        ("shutdown", True),
+        ("shutdown_for_kv_cache_estimation", False),
+    ],
+)
+def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
+    engine = Mock()
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.encoder_launch_executor = None
+    executor.kv_connector_manager = None
+    executor.model_engine = engine
+    executor.draft_model_engine = None
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    executor._profile_manager = Mock()
+
+    with patch("torch.cuda.is_available", return_value=False):
+        getattr(executor, shutdown_method)()
+
+    executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
+    executor._profile_manager.cleanup.assert_called_once()
+    engine._release_cuda_graphs.assert_called_once()
+    if releases_model_owned_graphs:
+        assert engine.method_calls[:2] == [
+            call._release_model_owned_cuda_graphs(),
+            call._release_cuda_graphs(),
+        ]
+    else:
+        engine._release_model_owned_cuda_graphs.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -2464,6 +2506,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
+        kv_cache_manager.kda_context_only = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -3366,6 +3409,42 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     # pick: this rank is empty precisely because it is short of KV cache.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
+
+
+def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert scheduled_batch.generation_requests == []
+    assert len(scheduled_batch.context_requests) == 1
+    dummy = scheduled_batch.context_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy in stub.active_requests
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert call["max_num_draft_tokens"] == 0
+    assert stub._pending_adp_dummy_request is dummy
+
+
+def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+    # The dummy role can still say generation when no transceiver drives it.
+    stub._adp_dummy_is_gen = True
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 1
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=1, max_num_draft_tokens=0
+    )
+    assert len(scheduled_batch.context_requests) == 1
 
 
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():

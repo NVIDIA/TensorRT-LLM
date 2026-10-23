@@ -1282,6 +1282,10 @@ class TestFailFastDuringBenchmarkFill:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
+        # The fill-gate requests model "waiting for KV" / "generating", not
+        # mid-transfer; a bare Mock would answer has_inflight_transfer with a
+        # truthy Mock and make the error path defer them as transfer-owned.
+        ex.kv_cache_transceiver.has_inflight_transfer.return_value = False
         ex.kv_cache_manager = _make_v2_kv_cache_manager()
         ex._is_kv_manager_v2 = True
         ex._prefetched_request_ids = set()
