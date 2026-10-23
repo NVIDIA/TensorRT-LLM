@@ -1037,7 +1037,7 @@ def setup_disagg_cluster(
         print(
             f"[startup] cluster_launch_to_ready: done in {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
-    except Exception:
+    except BaseException:
         print(
             f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
@@ -2558,6 +2558,7 @@ def run_disaggregated_aiperf(config_file,
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
 
+    failed = False
     try:
         # Wait for server to be ready
         if not wait_for_server(
@@ -2703,7 +2704,7 @@ def run_disaggregated_aiperf(config_file,
                     "Fatal error patterns detected in disaggregated "
                     f"worker/server logs after accuracy run:\n{summary}")
 
-    except Exception:
+    except BaseException:
         # Print the context around the first fatal-pattern match (the root
         # cause, e.g. an OOM traceback) and the tail of each captured
         # worker/server log to aid triage.
@@ -2721,12 +2722,14 @@ def run_disaggregated_aiperf(config_file,
                             logger.error(line.rstrip())
             except OSError:
                 pass
-        # Keep the full logs for post-mortem: copy them into the CI output
-        # directory before the finally block removes work_dir.
-        archive_process_logs(work_dir, log_output_dir)
+        failed = True
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
+        if failed:
+            # The log writers are closed now, so the files are complete. Copy
+            # them into the CI output directory before work_dir is removed.
+            archive_process_logs(work_dir, log_output_dir)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
