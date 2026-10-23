@@ -146,7 +146,12 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
-from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+    is_gated_activation,
+)
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -2641,6 +2646,114 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     expected = x * backend.fc31_act_scale if has_pre_quant_scale else x
     torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
     assert global_scale is backend.fc31_input_scale
+
+
+def _make_cutedsl_sibling_for_quantize_input_test(
+    backend_cls: type, hidden_size: int, pre_quant_scale: Optional[torch.Tensor]
+):
+    """A CuteDSL sibling backend carrying only what ``quantize_input`` reads.
+
+    ``__new__`` without ``__init__``: the real constructors want a GPU (and,
+    for the FC12 one, Rubin), while ``quantize_input`` reads the quant config,
+    the two scales and the scale geometry.
+    """
+    backend = backend_cls.__new__(backend_cls)
+    torch.nn.Module.__init__(backend)
+    # ``has_nvfp4`` asserts weights exist and reads the layer quant mode;
+    # NVFP4_AWQ folds onto the NVFP4 quant mode (quantization/mode.py).
+    backend._weights_created = True
+    backend.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ)
+    backend.hidden_size = hidden_size
+    backend.scaling_vector_size = 16
+    backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    # ``create_weights`` registers the slot as None, and only a checkpoint
+    # that carries ``*.pre_quant_scale`` fills it, as
+    # ``NVFP4FusedMoEMethod.load_quant_scales`` does.
+    backend.register_parameter("fc31_act_scale", None)
+    if pre_quant_scale is not None:
+        backend.register_parameter(
+            "fc31_act_scale", torch.nn.Parameter(pre_quant_scale, requires_grad=False)
+        )
+    return backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "backend_cls",
+    [CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    ids=["grouped_gemm", "fused_fc12"],
+)
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_cutedsl_quantize_input_applies_pre_quant_scale(
+    monkeypatch: pytest.MonkeyPatch, backend_cls: type, has_pre_quant_scale: bool
+) -> None:
+    """The two CuteDSL siblings apply an NVFP4_AWQ / NVFP4_ARC pre-quant scale.
+
+    Both select ``NVFP4CuteDslFusedMoEMethod``, which inherits the CUTLASS
+    NVFP4 pipeline and therefore loads a checkpoint's per-channel
+    ``pre_quant_scale`` into ``fc31_act_scale``, and both calibrate
+    ``fc31_input_scale`` on the scaled activation. Their kernels consume only
+    the quantized activation, which leaves ``quantize_input`` as the one place
+    to apply it; before this it was dropped and the output silently wrong.
+    """
+    hidden_size = 64
+    pre_quant_scale = (
+        torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0)
+        if has_pre_quant_scale
+        else None
+    )
+    backend = _make_cutedsl_sibling_for_quantize_input_test(
+        backend_cls, hidden_size, pre_quant_scale
+    )
+    quantizer_calls = []
+
+    def fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        quantizer_calls.append((x.clone(), global_scale))
+        num_rows, num_cols = x.shape
+        return (
+            torch.zeros(num_rows, num_cols // 2, dtype=torch.uint8),
+            torch.zeros(num_rows * num_cols // sf_vec_size, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fake_fp4_quantize, raising=False)
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    backend.quantize_input(x, post_quant_comm=False)
+
+    [(quantized, global_scale)] = quantizer_calls
+    expected = x * pre_quant_scale if has_pre_quant_scale else x
+    torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
+    assert global_scale is backend.fc31_input_scale
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "backend_cls",
+    [CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    ids=["grouped_gemm", "fused_fc12"],
+)
+def test_cutedsl_quantize_input_rejects_prequantized_awq_input(backend_cls: type) -> None:
+    """An already-quantized input can no longer take the pre-quant scale.
+
+    Both backends also accept an ``Fp4QuantizedTensor`` produced upstream (a
+    fused norm+quant, or a post-quant dispatch) that never saw
+    ``fc31_act_scale``. Refuse that combination rather than serve the
+    checkpoint wrong, as ``CutlassFusedMoE.quantize_input`` does.
+    """
+    hidden_size = 64
+    backend = _make_cutedsl_sibling_for_quantize_input_test(
+        backend_cls,
+        hidden_size,
+        torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0),
+    )
+    x = Fp4QuantizedTensor(
+        fp4_tensor=torch.zeros(3, hidden_size // 2, dtype=torch.uint8),
+        scaling_factor=torch.zeros(3 * hidden_size // 16, dtype=torch.uint8),
+        is_sf_swizzled=False,
+    )
+
+    with pytest.raises(AssertionError, match="not expected for AWQ"):
+        backend.quantize_input(x, post_quant_comm=False)
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
