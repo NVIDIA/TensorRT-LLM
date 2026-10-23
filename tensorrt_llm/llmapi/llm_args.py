@@ -7084,6 +7084,12 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "Mixed-precision KV is not supported together with sparse attention."
             )
+        # The connector layout maps every cache layer to one model layer; the
+        # retained-token layers break that mapping.
+        if self.kv_connector_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with a KV connector."
+            )
         if (self.speculative_config is not None
                 or self.kv_cache_compression_config is not None
                 or self.max_beam_width != 1):

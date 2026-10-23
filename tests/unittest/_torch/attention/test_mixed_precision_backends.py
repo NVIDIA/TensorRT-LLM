@@ -679,6 +679,17 @@ def test_mixed_precision_public_options():
         ({"attn_backend": "vanilla"}, ValueError, "TRTLLM and FLASHINFER"),
         ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse"),
         (
+            {
+                "kv_connector_config": {
+                    "connector_module": "connector_module",
+                    "connector_scheduler_class": "Scheduler",
+                    "connector_worker_class": "Worker",
+                }
+            },
+            ValueError,
+            "KV connector",
+        ),
+        (
             {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 2}},
             ValueError,
             "single-beam",
@@ -690,7 +701,7 @@ def test_mixed_precision_public_options():
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
     ],
-    ids=("v1", "auto_v2", "backend", "sparse", "speculative", "compression", "beam"),
+    ids=("v1", "auto_v2", "backend", "sparse", "connector", "speculative", "compression", "beam"),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):
