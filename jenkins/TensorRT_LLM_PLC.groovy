@@ -732,7 +732,7 @@ pipeline {
         choice(name: 'scanMode', choices: ['monitor','release','pre_merge'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
         booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
         booleanParam(name: 'runContainerOssScanning', defaultValue: true, description: 'Run Container OSS Scanning (Pulse container scan)')
-        booleanParam(name: 'runContainerMalwareScanning', defaultValue: true, description: 'Run Container Malware Scanning (Pulse container scan)')
+        booleanParam(name: 'runContainerMalwareScanning', defaultValue: false, description: 'Run Container Malware Scanning (Pulse container scan)')
         booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
     options {
