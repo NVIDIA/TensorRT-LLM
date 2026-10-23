@@ -2629,11 +2629,18 @@ class KVCacheManagerV2(BaseResourceManager):
         Debug level only, and the guard runs before any of the strings or the
         page-index scan are built, so a default run does no additional work.
         """
-        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+        if new_capacity <= pre_capacity:
             return
-        for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
-            if not (pre_capacity <= window_size < new_capacity):
-                continue
+        # Cheap tests first: this runs once per generation request per step, and
+        # ``is_debug_enabled`` walks the call stack to find the caller's module.
+        crossed = [
+            (layer_group_id, window_size)
+            for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items()
+            if pre_capacity <= window_size < new_capacity
+        ]
+        if not crossed or not logger.is_debug_enabled():
+            return
+        for layer_group_id, window_size in crossed:
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
                 f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "

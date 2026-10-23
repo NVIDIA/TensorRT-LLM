@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
@@ -3236,6 +3237,39 @@ class TestRequestSeed:
         assert mixed.seed.tolist() == [1234, 42]
         unseeded = before.offset.tolist() + mixed.offset.tolist()[1:] + after.offset.tolist()
         assert unseeded == [UNSEEDED_OFFSET_BASE + i for i in range(3)]
+
+    def test_vectorized_take_matches_per_row_reference(self):
+        """Unique-slot batches (n-sample children) take the vectorized path.
+
+        It must hand out exactly what a per-row loop would: the slot's seed and
+        next offset when seeded, the global seed and the shared counter when not,
+        in row order, and advance the same state.
+        """
+        num_slots = 64
+        rng = random.Random(0)
+        manager = _SeedManager(max_num_sequences=num_slots, global_seed=42)
+        ref_offsets = [0] * num_slots
+        ref_unseeded = UNSEEDED_OFFSET_BASE
+        for slot in range(num_slots):
+            if rng.random() < 0.6:
+                manager._seeds[slot] = 1000 + slot
+                manager._slot_seeded[slot] = True
+        for _ in range(5):
+            rows = rng.sample(range(num_slots), 40)
+            got = manager.take_row_seeds(rows, device=torch.device("cpu"))
+            want_seed, want_offset = [], []
+            for slot in rows:
+                if manager._slot_seeded[slot]:
+                    want_seed.append(1000 + slot)
+                    want_offset.append(ref_offsets[slot])
+                    ref_offsets[slot] += 1
+                else:
+                    want_seed.append(42)
+                    want_offset.append(ref_unseeded)
+                    ref_unseeded += 1
+            assert got.seed.tolist() == want_seed
+            assert got.offset.tolist() == want_offset
+        assert manager._offsets.tolist() == ref_offsets
 
     def test_user_seed_equal_to_global_seed_does_not_share_unseeded_streams(self):
         manager = _SeedManager(max_num_sequences=4, global_seed=42)

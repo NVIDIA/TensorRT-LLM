@@ -21,6 +21,7 @@ docstring for why a single batch-wide ``torch.Generator`` is not sufficient.
 
 from typing import Optional
 
+import numpy as np
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
@@ -57,6 +58,10 @@ class _SeedManager:
         # Indexed by py_seq_slot. Host-side int64; copied to device per step.
         self._seeds = torch.full((max_num_sequences,), global_seed, dtype=torch.int64)
         self._offsets = torch.zeros((max_num_sequences,), dtype=torch.int64)
+        # Host views sharing the tensors' memory: per-element torch indexing costs
+        # microseconds per row, numpy indexing nanoseconds.
+        self._seeds_np = self._seeds.numpy()
+        self._offsets_np = self._offsets.numpy()
         # Request id currently owning each slot, so that slot reuse by a new
         # request re-seeds instead of inheriting the previous occupant's stream.
         self._slot_owner: list[Optional[int]] = [None] * max_num_sequences
@@ -110,23 +115,37 @@ class _SeedManager:
                 seed=torch.full((num_rows,), self._global_seed, dtype=torch.int64, device=device),
                 offset=torch.arange(start, self._unseeded_offset, dtype=torch.int64, device=device),
             )
-        seeds: list[int] = []
-        offsets: list[int] = []
-        for slot in slots_per_row:
-            if not self._slot_seeded[slot]:
-                seeds.append(self._global_seed)
-                offsets.append(self._unseeded_offset)
-                self._unseeded_offset += 1
-            else:
-                seeds.append(int(self._seeds[slot]))
-                offsets.append(int(self._offsets[slot]))
-                self._offsets[slot] += 1
-        pin = prefer_pinned()
-        return RequestSeeds(
-            seed=torch.tensor(seeds, dtype=torch.int64, pin_memory=pin).to(
-                device=device, non_blocking=True
-            ),
-            offset=torch.tensor(offsets, dtype=torch.int64, pin_memory=pin).to(
-                device=device, non_blocking=True
-            ),
+        slots = np.fromiter(slots_per_row, dtype=np.int64, count=num_rows)
+        seeded = np.fromiter(
+            map(self._slot_seeded.__getitem__, slots_per_row), dtype=bool, count=num_rows
         )
+        if len(np.unique(slots)) == num_rows:
+            # One row per slot (e.g. n-sample children, one token each): vectorized.
+            seeds = np.where(seeded, self._seeds_np[slots], self._global_seed)
+            offsets = self._offsets_np[slots]  # fancy indexing copies
+            unseeded = ~seeded
+            num_unseeded = num_rows - int(seeded.sum())
+            offsets[unseeded] = np.arange(
+                self._unseeded_offset, self._unseeded_offset + num_unseeded, dtype=np.int64
+            )
+            self._unseeded_offset += num_unseeded
+            self._offsets_np[slots[seeded]] += 1
+        else:
+            # A slot drawing several tokens this step takes consecutive offsets.
+            seeds = np.empty(num_rows, dtype=np.int64)
+            offsets = np.empty(num_rows, dtype=np.int64)
+            for row, slot in enumerate(slots_per_row):
+                if not self._slot_seeded[slot]:
+                    seeds[row] = self._global_seed
+                    offsets[row] = self._unseeded_offset
+                    self._unseeded_offset += 1
+                else:
+                    seeds[row] = self._seeds_np[slot]
+                    offsets[row] = self._offsets_np[slot]
+                    self._offsets_np[slot] += 1
+        # One host-to-device transfer for both vectors.
+        packed = torch.from_numpy(np.stack((seeds, offsets)))
+        if prefer_pinned():
+            packed = packed.pin_memory()
+        packed = packed.to(device=device, non_blocking=True)
+        return RequestSeeds(seed=packed[0], offset=packed[1])
