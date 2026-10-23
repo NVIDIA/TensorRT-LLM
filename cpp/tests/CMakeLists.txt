@@ -100,7 +100,11 @@ function(add_tllm_gtest test_name)
   endif()
   target_link_libraries(${test_name} PRIVATE ${ARG_LINK_LIBRARIES})
   if(NOT ARG_FULL_STACK)
-    tllm_assert_test_is_component_local(${test_name})
+    cmake_language(
+      EVAL
+      CODE
+      "cmake_language(DEFER CALL tllm_assert_test_is_component_local [[${test_name}]])"
+    )
   endif()
   target_compile_features(${test_name} PRIVATE cxx_std_20)
   target_compile_definitions(${test_name}
