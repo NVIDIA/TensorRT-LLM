@@ -15,6 +15,10 @@ from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
 from tensorrt_llm._torch.disaggregation.native.bounce import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    PhysicalOperationState,
+    SendOperationOwner,
+)
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
@@ -639,6 +643,20 @@ def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBa
     assert session._sender._begin_task_operation(task, 7)
     assert session._sender._submit_transfer(task, 7, object()) == (True, None)
     task.complete()
+
+
+def test_operation_snapshot_distinguishes_empty_and_retains_state_values() -> None:
+    """Snapshots contain immutable evidence, not live operation objects."""
+    owner = SendOperationOwner()
+    assert owner.try_snapshot_operation_states() == ()
+    assert owner.begin_physical_operation(1)
+    snapshot = owner.try_snapshot_operation_states()
+    assert snapshot == (PhysicalOperationState.ADMITTED,)
+
+    owner.retire_unsubmitted_physical_operation(1)
+
+    assert snapshot == (PhysicalOperationState.ADMITTED,)
+    assert owner.try_snapshot_operation_states() == (PhysicalOperationState.NOT_SUBMITTED,)
 
 
 def test_timeout_progress_reports_mixed_sender_phases_without_advancing_deadlines() -> None:
