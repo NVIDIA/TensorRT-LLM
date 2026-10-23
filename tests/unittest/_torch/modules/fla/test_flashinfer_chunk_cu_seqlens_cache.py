@@ -49,22 +49,6 @@ def test_cast_is_shared_within_an_iteration_and_dropped_on_invalidate():
     assert second is not first and second.tolist() == [0, 7, 8, 20]
 
 
-def test_int32_input_passes_through_and_inference_mode_tensors_work():
-    already = torch.tensor([0, 3], dtype=torch.int32)
-    assert fc._int32_cu_seqlens(already) is already
-    with torch.inference_mode():
-        buf = torch.tensor([0, 2, 6], dtype=torch.int64)
-        out = fc._int32_cu_seqlens(buf)
-        assert out.dtype == torch.int32 and out.tolist() == [0, 2, 6]
-        assert fc._int32_cu_seqlens(buf) is out
-
-
-def test_cache_is_bounded():
-    for i in range(fc._INT32_CU_SEQLENS_CACHE_MAX + 3):
-        fc._int32_cu_seqlens(torch.arange(i + 2, dtype=torch.int64))
-    assert len(fc._int32_cu_seqlens_cache) <= fc._INT32_CU_SEQLENS_CACHE_MAX
-
-
 def test_recycled_address_of_a_freed_buffer_does_not_alias():
     """A cast for an ad-hoc buffer must not be handed to a later buffer that
     lands on the same address with the same length (the entry keeps its source

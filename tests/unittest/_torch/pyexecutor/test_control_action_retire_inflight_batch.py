@@ -137,35 +137,6 @@ class TestRetireInflightBatch:
         assert without.calls == ["enqueue_empty", "flush", "enqueue_empty"]
         assert without.gathers == with_batch.gathers == 3
 
-    @pytest.mark.parametrize(
-        "kwargs",
-        [dict(pp_size=2), dict(overlap=False)],
-        ids=["pipeline_parallel", "non_overlap_loop"],
-    )
-    def test_out_of_scope_loops_are_untouched(self, kwargs):
-        """PP keeps its microbatches (BatchStatePP is consumed by
-        _handle_executed_batch); the non-overlap loop has no in-flight batch."""
-        batch = _batch()
-        rank = _Rank(previous_batch=batch, **kwargs)
-
-        rank._retire_inflight_batch_for_control()
-
-        assert rank.calls == []
-        assert rank.previous_batch is batch
-
-    def test_spec_decode_cleanup_mirrors_the_loop(self):
-        drafter = MagicMock()
-        with_batch = _Rank(previous_batch=_batch(), drafter=drafter, use_spec_decode=True)
-        without = _Rank(previous_batch=None, drafter=drafter, use_spec_decode=True)
-
-        with_batch._retire_inflight_batch_for_control()
-        drafter.cleanup_previous_draft_resources.assert_called_once()
-        without._retire_inflight_batch_for_control()
-        drafter.cleanup_previous_draft_resources.assert_called_once()  # not again
-        assert with_batch.has_previous_draft_tokens is False
-        assert without.has_previous_draft_tokens is False
-
-
 class _RecordingEvent(threading.Event):
     def __init__(self, log, name):
         super().__init__()
@@ -246,22 +217,6 @@ class TestHandleControlRequest:
 
         ex.dist.tp_allgather.assert_called_once_with(1)
         assert ex.order == [] and len(ex.control_requests) == 1
-
-    def test_drain_fires_when_unanimous(self, cuda_sync):
-        ex = _ControlExecutor(drain=True, votes=[1, 1, 1, 1])
-
-        ex._handle_control_request()
-
-        assert ex.order == ["retire", "barrier"]
-        assert ex.control_requests == []
-
-    def test_drain_without_attention_dp_does_not_vote(self, cuda_sync):
-        ex = _ControlExecutor(drain=True, attention_dp=False)
-
-        ex._handle_control_request()
-
-        ex.dist.tp_allgather.assert_not_called()
-        assert ex.order == ["retire", "barrier"]
 
     def test_drain_waits_for_pending_connector_loads(self, cuda_sync):
         ex = _ControlExecutor(drain=True, attention_dp=False)

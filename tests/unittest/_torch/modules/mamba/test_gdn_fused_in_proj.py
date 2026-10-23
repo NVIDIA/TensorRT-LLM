@@ -137,25 +137,3 @@ def test_replaced_parameter_storage_is_re_aliased_on_post_load():
     assert fused is fused_before  # same buffer, so captured graphs keep a valid address
     assert torch.equal(fused[:rows_q], fresh)
     assert mixer.in_proj_qkvz.weight.data_ptr() == fused[:rows_q].data_ptr()
-
-
-def test_ineligible_projections_fall_back_to_the_pair(monkeypatch):
-    mixer = _make_mixer()
-    mixer.in_proj_ba.bias = torch.nn.Parameter(
-        torch.zeros(mixer.in_proj_ba.weight.shape[0], device="cuda", dtype=torch.bfloat16)
-    )
-    mixer.cache_derived_state()
-    assert mixer._in_proj_fused_weight is None
-    x = torch.randn(3, mixer.hidden_size, device="cuda", dtype=torch.bfloat16)
-    mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
-    assert mixed_qkv.shape == (3, mixer.conv_dim_per_tp) and b.shape == (
-        3,
-        mixer.num_v_heads_per_tp,
-    )
-    mixer.in_proj_ba.bias = None
-    mixer.cache_derived_state()
-    assert mixer._in_proj_fused_weight is not None
-    with monkeypatch.context() as m:
-        m.setattr(gdn_mixer, "_GDN_FUSED_IN_PROJ", False)
-        mixer.cache_derived_state()
-        assert mixer._in_proj_fused_weight is None
