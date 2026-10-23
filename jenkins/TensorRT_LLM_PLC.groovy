@@ -273,7 +273,9 @@ def generateLockFiles(llmRepo, ref)
                 sh "git fetch origin ${ref}"
                 sh "git status"
                 sh "git rebase origin/${ref}"
-                sh "git push origin HEAD:${ref}"
+                // setupGitMirror() installs a global read-only Authorization header for github.com,
+                // which would override the push credentials embedded in authedUrl. Reset it.
+                sh "git -c http.https://github.com/.extraheader= push origin HEAD:${ref}"
             }
         }
     }
