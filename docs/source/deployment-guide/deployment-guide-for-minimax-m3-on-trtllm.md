@@ -56,8 +56,32 @@ The `MiniMax-M3-NVFP4` checkpoint uses MXFP8 base layers and NVFP4 routed expert
 (`MIXED_PRECISION`). Its name describes weight precision; set
 `kv_cache_config.dtype` explicitly to select FP8 or NVFP4 KV cache.
 
+The compressed-tensors NVFP4 MoE packaging of the MiniMax M3 architecture is
+also loaded as mixed MXFP8/NVFP4. Such a checkpoint declares
+`quant_method: mxfp8` together with `moe_quant_algo: NVFP4`,
+`moe_quant_format: nvfp4-pack-quantized` and `group_size: 16`, and stores each
+routed expert projection as `weight_packed`, `weight_scale`,
+`weight_global_scale` and `input_global_scale`. TensorRT LLM keeps the packed
+FP4 bytes and E4M3 block scales as stored and converts the global scales at
+load time. A global scale that is zero, negative or not finite fails the load
+with an error naming the checkpoint tensor. Use `moe_config.backend: CUTLASS`
+for these routed experts. They follow the rounding steps of the reference
+implementation of this packaging: every token's FC1 input is quantized with
+its own scale (2688 / amax of the token), the inverse of that scale times the
+FC1 weight scale multiplies the FC1 accumulators before their BF16 rounding,
+and the routing weight multiplies the activation before it is requantized to
+NVFP4 for FC2 (from FP32, with the stored static FC2 input scale), so the
+finalize step sums the expert outputs without weights. Only the CUTLASS
+backend implements this, so loading such a checkpoint with another MoE backend
+fails; the finalize step runs unfused, and the stored w1/w3 input scales must
+be 1.0.
+
 Use the checkpoint's chat template (`chat_template.jinja`) when launching the
 server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
+Evaluate a checkpoint in this packaging through the chat template as well, for
+example `trtllm-eval ... gsm8k --apply_chat_template --chat_template_kwargs
+'{"thinking_mode": "disabled"}'`; the raw eight-shot prompts of the `gsm8k`
+default bypass the template the model was trained with.
 
 ## Feature Support Notes
 
@@ -67,7 +91,7 @@ server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
 * **Eagle3.** The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.
 * **`max_seq_len` must be capped for CUDA graphs.** The dense GQA expansion in the first few attention layers and the per-Q FP32 expansion in the sparse decode kernel allocate temporary tensors whose size grows linearly with the warmup decode's `max_k`. If `max_seq_len` is left at the checkpoint default, that `max_k` follows `max_position_embeddings` (1M for MXFP8, 512K for BF16) and the resulting gigabyte-scale single-allocation request exceeds the caching allocator's CUDA-graph-safe path, so capture fails with `cudaErrorStreamCaptureUnsupported` / OOM. The curated YAML therefore sets `max_seq_len` to a small value just above ISL+OSL (`2068` for the 1k/1k benchmark) so CUDA graphs can capture cleanly. Raise it for longer-context workloads, but expect a corresponding cut in `max_batch_size`.
 * **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.
-* **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture.
+* **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. Text requests need only the tokenizer. The checkpoint's Hugging Face processor is loaded on the first image or video request. If `AutoProcessor` cannot build a processor with an image processor for the checkpoint directory (for example, it returns only a tokenizer because no loadable processor code is shipped), that request fails with a `ValueError` saying that MiniMax-M3 image and video inputs need an HF processor with an image processor. Text requests keep working. To serve images, point the model at a directory whose processor loads with `AutoProcessor`.
 
 ## Deployment Steps
 

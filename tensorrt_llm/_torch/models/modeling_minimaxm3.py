@@ -50,7 +50,11 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.common import (
+    get_sparse_disable_index_value_layer_ids,
+    get_sparse_layer_ids,
+    index_head_range,
+)
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
@@ -72,7 +76,11 @@ from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cu
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
-from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
+from .checkpoints.hf.minimaxm3_weight_mapper import (
+    MINIMAX_M3_PARAMS_MAP,
+    MiniMaxM3HfWeightMapper,
+    translate_packed_nvfp4_experts,
+)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
@@ -426,39 +434,6 @@ def _validate_sparse_attention_runtime_config(
             )
 
 
-def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
-    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    n_layers = int(text_config.num_hidden_layers)
-    if sparse_cfg is None:
-        return list(range(n_layers)), []
-    if not sparse_cfg.get("use_sparse_attention", True):
-        return list(range(n_layers)), []
-    freq = sparse_cfg.get("sparse_attention_freq")
-    if freq is None:
-        return list(range(n_layers)), []
-    if len(freq) != n_layers:
-        raise ValueError(
-            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
-        )
-    dense = [i for i, f in enumerate(freq) if int(f) == 0]
-    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
-    return dense, sparse
-
-
-def get_sparse_disable_index_value_layer_ids(
-    text_config: PretrainedConfig,
-) -> List[int]:
-    """Return layer ids where the sparse index-value branch is disabled."""
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    if sparse_cfg is None:
-        return []
-    flags = sparse_cfg.get("sparse_disable_index_value")
-    if flags is None:
-        return []
-    return [i for i, f in enumerate(flags) if int(f) != 0]
-
-
 def get_moe_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
     """Return ``(dense_mlp_layer_ids, moe_layer_ids)`` for the M3 text model."""
     freq = getattr(text_config, "moe_layer_freq", None)
@@ -472,6 +447,36 @@ def get_moe_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[in
     dense = [i for i, f in enumerate(freq) if int(f) == 0]
     moe = [i for i, f in enumerate(freq) if int(f) != 0]
     return dense, moe
+
+
+def _get_index_projection_quant_config(
+    model_config: "ModelConfig[PretrainedConfig]", layer_idx: Optional[int]
+) -> Optional[QuantConfig]:
+    """Return the quant config the checkpoint declares for the index projections.
+
+    ``index_q_proj`` and ``index_k_proj`` load into one fused ``index_qk_proj``
+    that ``apply_layerwise_quant_config`` cannot match by name, so their
+    per-layer entries are read here. Without such entries the projection
+    stays unquantized, as before.
+    """
+    quant_config_dict = getattr(model_config, "quant_config_dict", None)
+    if quant_config_dict is None or layer_idx is None:
+        return None
+    prefix = f"model.layers.{layer_idx}.self_attn"
+    q_config = quant_config_dict.get(f"{prefix}.index_q_proj")
+    k_config = quant_config_dict.get(f"{prefix}.index_k_proj")
+    if q_config is None and k_config is None:
+        return None
+    if (
+        q_config is None
+        or k_config is None
+        or (q_config.quant_algo, q_config.group_size) != (k_config.quant_algo, k_config.group_size)
+    ):
+        raise ValueError(
+            f"{prefix}.index_q_proj and {prefix}.index_k_proj load into one fused "
+            f"projection and need the same quantization, got {q_config} and {k_config}."
+        )
+    return q_config
 
 
 # Outside ``language_model.*``: deferred multimodal branches.
@@ -583,8 +588,16 @@ class MiniMaxM3Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
-        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
+        # Router runs in fp32 to match SGLang. cublas_mm always computes with
+        # CUBLAS_COMPUTE_32F; F.linear follows torch's fp32 matmul precision,
+        # which is TF32 under TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 (set in the
+        # NGC PyTorch based containers) and then flips near-tied top-k choices.
+        return torch.ops.trtllm.cublas_mm(
+            hidden_states.to(torch.float32).contiguous(),
+            self.weight.t(),
+            bias=None,
+            out_dtype=torch.float32,
+        )
 
     def load_weights(self, weights: List[Dict]):
         """Load the router weight and the e_score_correction_bias.
@@ -1176,7 +1189,9 @@ class MiniMaxM3Attention(Attention):
                     dtype=config.torch_dtype,
                     mapping=self.qkv_proj.mapping,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    quant_config=None,
+                    # Quantized when the checkpoint declares per-layer entries
+                    # for the index projections; None keeps them unquantized.
+                    quant_config=_get_index_projection_quant_config(model_config, layer_idx),
                     weights_loading_config=WeightsLoadingConfig(
                         weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
                     ),
@@ -2897,6 +2912,9 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # Rename packed NVFP4 routed-expert tensors to the NVFP4 MoE contract
+        # (a no-op for other packagings and for already rewritten weights).
+        weights = translate_packed_nvfp4_experts(weights)
         # Pack the opt-in five-way projection with MiniMax-specific TP
         # sharding before the generic mapper handles the compatibility path.
         packed_projection_modules = _load_qkv_index_proj_weights(self, weights)
@@ -3097,6 +3115,8 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         # set of unknown top-level keys it surfaces as errors.
         from .modeling_minimaxm3_vl import load_minimax_m3_vl_state_dict, split_multimodal_weights
 
+        # Rewrite before the prefix strip so errors name the checkpoint tensor.
+        weights = translate_packed_nvfp4_experts(weights)
         text_or_other_weights, vision_weights = split_multimodal_weights(weights)
 
         text_weights, ignored = _strip_language_model_prefix(text_or_other_weights)
@@ -3108,6 +3128,12 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             )
             self.last_loaded_vision_keys = loaded
             self.last_missing_vision_keys = missing
+        logger.info(
+            f"MiniMax-M3 VL weights: {len(self.last_loaded_vision_keys)} vision tensors "
+            f"loaded, {len(self.last_missing_vision_keys)} vision parameters missing, "
+            f"{len(ignored)} checkpoint tensors skipped "
+            f"({sorted(set(ignored.values()))})."
+        )
 
         super().load_weights(
             weights=text_weights,

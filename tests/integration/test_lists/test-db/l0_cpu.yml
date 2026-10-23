@@ -83,6 +83,12 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
+  # MiniMax-M3 packaged-checkpoint loading and tokenizer-only CPU contracts.
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_quantization_follows_checkpoint_entries
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_text_request_needs_no_hf_processor
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_tokenizer_from_auto_processor_is_not_image_support
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_image_request_uses_a_valid_processor
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe

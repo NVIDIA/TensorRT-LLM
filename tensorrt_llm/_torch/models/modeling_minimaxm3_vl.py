@@ -1760,7 +1760,7 @@ class MiniMaxM3VLInputProcessor:
             **kwargs,
         )
 
-        from transformers import AutoProcessor, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self._tokenizer = (
             tokenizer
@@ -1769,20 +1769,18 @@ class MiniMaxM3VLInputProcessor:
         )
         self._model_path = model_path
         self._config = config
-        self._processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self._use_fast,
-            trust_remote_code=trust_remote_code,
-        )
+        # Loaded on the first image/video request; text requests need only
+        # the tokenizer (see ``processor``).
+        self._processor = None
         # The HF processor tokenizes with add_special_tokens=True and the cache with False,
         # so their ids match only if the tokenizer adds no special tokens.
-        if enable_tokenization_cache and self._processor.tokenizer.num_special_tokens_to_add() != 0:
+        if enable_tokenization_cache and self._tokenizer.num_special_tokens_to_add() != 0:
             logger.warning(
                 "enable_tokenization_cache is ignored: the MiniMax-M3 tokenizer adds "
                 "special tokens, so cached ids would differ from the HF processor's."
             )
             enable_tokenization_cache = False
-        self._init_tokenization_cache(enable_tokenization_cache, self._processor.tokenizer)
+        self._init_tokenization_cache(enable_tokenization_cache, self._tokenizer)
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
             self._dtype = getattr(text_cfg, "torch_dtype", torch.bfloat16)
@@ -1830,6 +1828,32 @@ class MiniMaxM3VLInputProcessor:
     # ----- registry contract properties -----------------------------------
     @property
     def processor(self):
+        """HF processor for image/video requests, loaded on first use.
+
+        ``AutoProcessor`` returns a plain tokenizer when it cannot build the
+        checkpoint's processor (no processor code the installed transformers
+        can load). That cannot preprocess images, so it is rejected here with
+        an actionable error rather than failing inside the request.
+        """
+        if self._processor is None:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                self._model_path,
+                use_fast=self._use_fast,
+                trust_remote_code=self._trust_remote_code,
+            )
+            if getattr(processor, "image_processor", None) is None:
+                raise ValueError(
+                    "MiniMax-M3 image and video inputs need an HF processor with an "
+                    f"image processor, but AutoProcessor.from_pretrained({self._model_path!r}) "
+                    f"returned {type(processor).__name__}, which has none: the checkpoint "
+                    "ships no processor this transformers version can load. Text-only "
+                    "requests are unaffected. For image or video requests, serve a model "
+                    "directory whose processor loads with AutoProcessor (for example, "
+                    "processor code registered through an auto_map entry)."
+                )
+            self._processor = processor
         return self._processor
 
     @property
@@ -1896,7 +1920,7 @@ class MiniMaxM3VLInputProcessor:
 
     def get_num_tokens_per_image(self, *, image: Any, **kwargs: Any) -> int:
         """Token count per image: ``(grid_h*grid_w)/merge^2 + 2`` (+VS/VE framing)."""
-        ip = self._processor.image_processor
+        ip = self.processor.image_processor
         h, w = self._hw(image)
         merge = int(ip.merge_size)
         return ip.get_number_of_image_patches(h, w) // (merge * merge) + 2
@@ -1922,7 +1946,7 @@ class MiniMaxM3VLInputProcessor:
         grid = (
             video_grid_thw.tolist() if isinstance(video_grid_thw, torch.Tensor) else video_grid_thw
         )
-        merge = int(self._processor.image_processor.merge_size)
+        merge = int(self.processor.image_processor.merge_size)
         grid_t, grid_h, grid_w = int(grid[0]), int(grid[1]), int(grid[2])
         return grid_t * (grid_h // merge) * (grid_w // merge) + 2
 
@@ -2002,19 +2026,37 @@ class MiniMaxM3VLInputProcessor:
         1. Pull ``prompt`` (text) and ``multi_modal_data`` (dict with
            optional ``image`` / ``video`` lists) from the ``inputs``
            mapping.
-        2. Drive the checkpoint's HF processor (loaded via AutoProcessor;
-           backed by ``processing_minimax.MiniMaxVLProcessor`` on the
-           real checkpoint) to expand placeholders and produce
-           ``pixel_values`` / ``image_grid_thw`` (and the video
-           equivalents).
+        2. Drive the checkpoint's HF processor (see ``processor``: loaded via
+           AutoProcessor on the first image or video request) to expand
+           placeholders and produce ``pixel_values`` / ``image_grid_thw``
+           (and the video equivalents).
         3. Return ``(input_ids_list, {"multimodal_data": {...}})`` in the
            shape TRT-LLM's runtime expects.
+
+        Text-only requests are tokenized like the default input processor and
+        never load the HF processor.
         """
         text_prompt = inputs.get("prompt") if isinstance(inputs, Mapping) else None
         mm_data = (inputs.get("multi_modal_data") if isinstance(inputs, Mapping) else None) or {}
 
         images = self._coerce_to_list(mm_data.get("image"))
         video_inputs = self._coerce_to_list(mm_data.get("video"))
+        if not images and not video_inputs:
+            ids = self._encode_with_tokenization_cache(text_prompt or "", sampling_params)
+            if ids is not None:
+                return ids, None
+            truncate_prompt_tokens = getattr(sampling_params, "truncate_prompt_tokens", None)
+            kwargs = (
+                {}
+                if truncate_prompt_tokens is None
+                else dict(truncation=True, max_length=truncate_prompt_tokens)
+            )
+            token_ids = self._tokenizer.encode(
+                text_prompt or "",
+                add_special_tokens=getattr(sampling_params, "add_special_tokens", True),
+                **kwargs,
+            )
+            return list(token_ids), None
 
         # The HF MiniMaxVLProcessor expects video frames as nested lists
         # of frames (one list per video). Accept either pre-extracted
@@ -2061,15 +2103,10 @@ class MiniMaxM3VLInputProcessor:
                 explicit.extend(["]<]image[>["] * len(images))
                 explicit.extend(["]<]video[>["] * len(videos))
                 templated_text = "\n".join(explicit)
-        else:
-            templated_text = text_prompt or ""
-            ids = self._encode_with_tokenization_cache(templated_text, sampling_params)
-            if ids is not None:
-                return ids, {"multimodal_data": {}}
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
         # in the BatchFeature output.
-        processed = self._processor(
+        processed = self.processor(
             text=[templated_text],
             images=images if images else None,
             videos=videos if videos else None,

@@ -2195,3 +2195,145 @@ def test_fast_path_hooks_are_registered_on_processor_class():
     assert hasattr(cls, "expand_prompt_token_ids_for_mm")
     assert hasattr(cls, "get_num_tokens_per_image")
     assert hasattr(cls, "get_num_tokens_per_video")
+
+
+class _WordTokenizer:
+    """Tokenizer stand-in: one id per whitespace-separated word, BOS id 1."""
+
+    unk_token_id = 0
+
+    def __init__(self):
+        self.template_calls = 0
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {"]<]start of image[>[": _VS_TOK, "]<]end of image[>[": _VE_TOK}.get(token, 0)
+
+    def encode(self, text, add_special_tokens=True, truncation=False, max_length=None):
+        ids = [100 + i for i, _ in enumerate(text.split())]
+        if add_special_tokens:
+            ids = [1] + ids
+        return ids[:max_length] if truncation and max_length is not None else ids
+
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=True, tools=None, **kwargs
+    ):
+        # Content is either the flattened text trtllm-serve renders (STRING
+        # content format) or the content list the input processor builds.
+        self.template_calls += 1
+        content = messages[0]["content"]
+        if isinstance(content, str):
+            return "user: " + content + " assistant:"
+        markers = {"image": "]<]image[>[", "video": "]<]video[>["}
+        parts = [
+            item["text"] if item["type"] == "text" else markers[item["type"]] for item in content
+        ]
+        return "user: " + " ".join(parts) + " assistant:"
+
+
+class _ValidImageProcessor:
+    """Processor stand-in with an image processor: one placeholder per item.
+
+    Patch 14 / merge 2 / temporal 2 like the checkpoint; ``calls`` records
+    the text of every call and ``call_kwargs`` the processor kwargs.
+    """
+
+    image_processor = SimpleNamespace(
+        merge_size=2, get_number_of_image_patches=lambda h, w: (h // 14) * (w // 14)
+    )
+    video_processor = SimpleNamespace(merge_size=2, temporal_patch_size=2)
+
+    def __init__(self):
+        self.calls = []
+        self.call_kwargs = []
+
+    def __call__(self, text, images=None, videos=None, return_tensors=None, **kwargs):
+        self.calls.append(text)
+        self.call_kwargs.append(kwargs)
+        num_images = len(images or [])
+        num_videos = len(videos or [])
+        input_ids = (
+            [7]
+            + [_VS_TOK, _IMG_TOK, _VE_TOK] * num_images
+            + [_VS_TOK, _VID_TOK, _VE_TOK] * num_videos
+        )
+        out = {"input_ids": torch.tensor([input_ids])}
+        if num_images:
+            out["pixel_values"] = torch.ones(4 * num_images, 8)
+            out["image_grid_thw"] = torch.tensor([[1, 2, 2]] * num_images)
+        if num_videos:
+            out["pixel_values_videos"] = torch.ones(4 * num_videos, 8)
+            out["video_grid_thw"] = torch.tensor([[1, 2, 2]] * num_videos)
+        return out
+
+
+def _tokenizer_only_processor(monkeypatch, auto_processor_result):
+    """Construct the input processor while recording AutoProcessor loads."""
+    loads = []
+
+    def fake_from_pretrained(*args, **kwargs):
+        loads.append(args)
+        return auto_processor_result
+
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", fake_from_pretrained)
+    cls = get_minimax_m3_vl_input_processor_cls()
+    config = SimpleNamespace(
+        image_token_index=_IMG_TOK,
+        video_token_index=_VID_TOK,
+        vocab_size=200_064,
+        text_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+    proc = cls(model_path="/m3-model-dir", config=config, tokenizer=_WordTokenizer())
+    return proc, loads
+
+
+@pytest.mark.cpu_only
+def test_text_request_needs_no_hf_processor(monkeypatch):
+    proc, loads = _tokenizer_only_processor(monkeypatch, _WordTokenizer())
+    assert loads == [] and proc._processor is None
+
+    ids, extra = proc.call_with_text_prompt(
+        {"prompt": "why is the sky blue"}, SimpleNamespace(add_special_tokens=True)
+    )
+    assert ids == [1, 100, 101, 102, 103, 104] and extra is None
+    ids, _ = proc.call_with_text_prompt(
+        {"prompt": "why is the sky blue"},
+        SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=2),
+    )
+    assert ids == [100, 101]
+    assert loads == [] and proc._processor is None
+
+
+@pytest.mark.cpu_only
+def test_tokenizer_from_auto_processor_is_not_image_support(monkeypatch):
+    proc, loads = _tokenizer_only_processor(monkeypatch, _WordTokenizer())
+    image = Image.new("RGB", (32, 32))
+    with pytest.raises(ValueError, match="need an HF processor with an image processor") as error:
+        proc.call_with_text_prompt(
+            {"prompt": "describe", "multi_modal_data": {"image": [image]}}, SimpleNamespace()
+        )
+    assert "Text-only requests are unaffected" in str(error.value)
+    assert "_WordTokenizer" in str(error.value)
+    assert len(loads) == 1
+    # Text keeps working after the rejected image request.
+    ids, extra = proc.call_with_text_prompt({"prompt": "hello"}, SimpleNamespace())
+    assert ids == [1, 100] and extra is None
+
+
+@pytest.mark.cpu_only
+def test_image_request_uses_a_valid_processor(monkeypatch):
+    valid = _ValidImageProcessor()
+    proc, loads = _tokenizer_only_processor(monkeypatch, valid)
+    image = Image.new("RGB", (32, 32))
+    ids, extra = proc.call_with_text_prompt(
+        {"prompt": "describe", "multi_modal_data": {"image": [image]}}, SimpleNamespace()
+    )
+    assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
+    assert valid.calls == [["user: describe ]<]image[>[ assistant:"]]
+    image_data = extra["multimodal_data"]["image"]
+    assert image_data["pixel_values"].dtype == torch.bfloat16
+    assert image_data["image_grid_thw"].tolist() == [[1, 2, 2]]
+    # Loaded once, then reused; token counting uses the same processor.
+    proc.call_with_text_prompt(
+        {"prompt": "again", "multi_modal_data": {"image": [image]}}, SimpleNamespace()
+    )
+    assert len(loads) == 1 and proc.processor is valid

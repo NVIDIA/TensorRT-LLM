@@ -71,6 +71,10 @@ l0_gb300_multi_gpus:
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
+  # MiniMax-M3 compressed-tensors NVFP4 MoE packaging: expert loading and
+  # eager/graph numerics on CUTLASS, MXFP8 index projections per TP rank.
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_nvfp4_experts_load_and_run_on_cutlass
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank
   # Kimi K3 truncated-model (first 4 layers) e2e SA spec-dec logits parity;
   # resolves <LLM_MODELS_ROOT>/Kimi-K3 and FAILS if the checkpoint is not
   # staged (deliberate: a skipped post-merge entry is indistinguishable
