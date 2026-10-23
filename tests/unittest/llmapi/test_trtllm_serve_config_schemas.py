@@ -80,6 +80,39 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 0}}}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "multimodal_config": {
+                    "encoder_cuda_graph": {"audio": {"max_batch_size": 4, "max_num_tokens": 2048}}
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"buckets": [[256, 1]]}}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "multimodal_config": {
+                    "encoder_cuda_graph": {"vision": {"max_batch_size": 8, "max_num_tokens": 0}}
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
