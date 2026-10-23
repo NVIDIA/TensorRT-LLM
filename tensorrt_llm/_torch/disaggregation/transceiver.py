@@ -132,6 +132,8 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    _pending_rank_info_admissions: Optional[dict[int, tuple[LlmRequest, Optional[str]]]] = None
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -214,7 +216,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
                 rank_info_auth_key=cache_transceiver_config._rank_info_auth_key,
-                rank_info_error_sync=self._sync_rank_info_error,
             )
         )
         if enforce_physical_ownership:
@@ -262,6 +263,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+        # Only keyed multi-rank async receives need an admission agreement.
+        self._pending_rank_info_admissions = (
+            {}
+            if cache_transceiver_config._rank_info_auth_key is not None and self._gen_need_sync
+            else None
+        )
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -368,6 +375,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
+        if self._pending_rank_info_admissions is not None:
+            self._pending_rank_info_admissions.clear()
         self._transfer_worker.shutdown()
         self._shutdown_complete = True
 
@@ -539,11 +548,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             ready_ids = _find_consensus_request_ids(pp_all_ranks, self._mapping.pp_size)
 
         return ready_ids
-
-    def _sync_rank_info_error(self, error: Optional[str]) -> Optional[str]:
-        """Agree on peer admission before any generation rank publishes a receive."""
-        errors = self._gen_allgather(error) if self._gen_need_sync else [error]
-        return next((message for message in errors if message is not None), None)
 
     def _gen_consensus(self, local_ids: list) -> list:
         sync_size = (
@@ -1069,6 +1073,47 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"request_and_receive_async: rid={rid} already has a recv session, skipping"
             )
             return
+        pending = self._pending_rank_info_admissions
+        if pending is not None:
+            if rid not in pending:
+                error = None
+                try:
+                    self._transfer_worker.prepare_rank_info(req)
+                except Exception as exc:
+                    # Network/decoding failures must also reach the symmetric
+                    # poll instead of skipping a collective on this rank.
+                    error = str(exc)
+                pending[rid] = (req, error)
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            return
+        self._start_async_receive(req)
+
+    def _poll_rank_info_admissions(self, local_done: list[int]) -> tuple[list[int], list[int]]:
+        pending = self._pending_rank_info_admissions
+        if pending is None:
+            return self._gen_consensus(local_done), []
+        # Piggyback on the existing status collective, including ranks whose
+        # CUDA fence has not admitted any local receive yet.
+        votes = self._gen_allgather(
+            (local_done, {rid: error for rid, (_, error) in pending.items()})
+        )
+        done = _find_consensus_request_ids([vote[0] for vote in votes], len(votes))
+        admissions = [vote[1] for vote in votes]
+        ready = set.intersection(*(set(vote) for vote in admissions))
+        failed = []
+        for rid in sorted(ready):
+            req, _ = pending.pop(rid)
+            error = next((vote[rid] for vote in admissions if vote[rid] is not None), None)
+            if error is not None:
+                logger.error(f"RankInfo admission failed for request {rid}: {error}")
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                failed.append(rid)
+            else:
+                self._start_async_receive(req)
+        return done, failed
+
+    def _start_async_receive(self, req: LlmRequest) -> None:
+        rid = get_unique_rid(req)
         extent = self._create_cache_extent(req)
         req.py_kv_cache_xfer_bytes = self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
         fetches = self._open_peer_source(req)
@@ -1195,9 +1240,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        consensus, admission_failed = self._poll_rank_info_admissions(
+            local_completed + local_failed
+        )
         to_process = self._build_to_process(
             self._recv_sessions,
-            self._gen_consensus(local_completed + local_failed),
+            consensus,
             0 if need_progress else wait_num,
             block_all,
         )
@@ -1278,7 +1326,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
-        return GenTransferStatus(completed, failed, cancelled_reqs)
+        return GenTransferStatus(completed, failed + admission_failed, cancelled_reqs)
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
         self._poll_sessions_for_interval(
@@ -1363,6 +1411,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         retry next iteration. Returns True when safe to free KV memory.
         """
         rid = get_unique_rid(req)
+
+        # A pending admission has not published any destination.
+        if self._pending_rank_info_admissions is not None:
+            self._pending_rank_info_admissions.pop(rid, None)
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)

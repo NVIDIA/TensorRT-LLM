@@ -879,7 +879,6 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
     assert worker_config.tx_timeout_s == expected_slice_s
     assert worker_config.tx_overall_timeout_s == expected_timeout_s
     assert worker_config.rx_timeout_s == expected_timeout_s
-    assert worker_config.rank_info_error_sync.__func__ is KvCacheTransceiverV2._sync_rank_info_error
 
 
 @pytest.mark.parametrize(

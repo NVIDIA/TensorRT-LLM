@@ -21,7 +21,9 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     _rank_info_auth_tag,
     _validate_rank_info_auth_key,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
 
@@ -144,7 +146,6 @@ def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key)
 def test_authentication_failure_fails_only_affected_task(ownership):
     receiver = Receiver.__new__(Receiver)
     receiver._build_recv_req_info = Mock()
-    receiver._rank_info_error_sync = None
     receiver._get_sender_info = Mock(side_effect=RankInfoAuthenticationError("wrong key"))
     receiver._enforce_physical_ownership = ownership
     session = Mock()
@@ -292,81 +293,94 @@ def test_receiver_rejects_mismatched_authentication_modes(key, reply):
 
 
 @pytest.mark.parametrize("rejected_rank", [None, 0, 1])
-@pytest.mark.parametrize("ownership", [False, True])
-def test_rank_info_admission_is_collective_before_request_data(rejected_rank, ownership):
-    # Two generation ranks overlap one context rank. A partial fan-in must
-    # never be published when only one RankInfo request is rejected.
+@pytest.mark.parametrize("error_type", [RankInfoAuthenticationError, ValueError])
+def test_rank_info_admission_waits_for_asymmetric_receive_fences(rejected_rank, error_type):
     barrier = threading.Barrier(2, timeout=5)
-    errors = [None, None]
-    arrived = [False, False]
-    receivers, tasks = [], []
+    payloads = [None, None]
+    histories = [[], []]
+    coordinators, transceivers, requests, fences = [], [], [], []
 
-    def gather(rank, error):
-        errors[rank] = error
-        arrived[rank] = True
+    def gather(rank, payload):
+        histories[rank].append(type(payload))
+        payloads[rank] = payload
         barrier.wait()
-        return list(errors)
+        result = list(payloads)
+        barrier.wait()
+        return result
 
     for rank in range(2):
-        transceiver = object.__new__(KvCacheTransceiverV2)
-        transceiver._gen_need_sync = True
-        transceiver._gen_allgather = lambda error, rank=rank: gather(rank, error)
-        receiver = object.__new__(Receiver)
-        receiver._shutdown = True
-        receiver._enforce_physical_ownership = ownership
-        receiver._rank_info_error_sync = transceiver._sync_rank_info_error
-        receiver._build_recv_req_info = Mock(
-            return_value=SimpleNamespace(unique_rid=1, slice_id=0, to_bytes=lambda: b"request")
-        )
-        receiver._get_sender_info = Mock(
-            return_value=SimpleNamespace(
-                sender_endpoints={0: "tcp://context"}, cp_size=1, dp_size=1
-            )
-        )
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._gen_need_sync = True
+        tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
+        tc._mapping = SimpleNamespace(world_size=2, pp_size=1, enable_attention_dp=False)
+        tc._pending_rank_info_admissions = {}
+        tc._recv_sessions, tc._recv_reqs = {}, {}
+        tc._ever_had_recv_session = False
+        tc._validate_bridge_req = Mock(return_value=True)
+        tc._start_async_receive = Mock()
+        tc._transfer_worker = Mock()
         if rank == rejected_rank:
-            receiver._get_sender_info.side_effect = RankInfoAuthenticationError("cache full")
-        receiver._registrar = SimpleNamespace(
-            self_rank_info=SimpleNamespace(cp_size=1),
-            get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0])),
+            tc._transfer_worker.prepare_rank_info.side_effect = error_type("peer rejected")
+        req = SimpleNamespace(
+            py_request_id=7,
+            request_id=7,
+            py_disaggregated_params=None,
+            state=LlmRequestState.DISAGG_GENERATION_INIT,
+            set_kv_cache_transfer_start=Mock(),
         )
-        receiver._get_mamba_slot = Mock(return_value=None)
-        receiver._bounce = Mock(reserve=Mock(return_value=False))
-        session = Mock()
-        session._sender_endpoints = set()
-        session.try_begin_transfer.side_effect = lambda *args, **kwargs: (
-            kwargs["publish"]() or True
-        )
-        receiver._get_session = Mock(return_value=session)
-        receiver._acquire_ownership_admission = lambda: lambda: None
+        fence = Mock(query=Mock(return_value=rank == 0))
+        coordinator = object.__new__(DisaggTransferCoordinator)
+        coordinator._transceiver = tc
+        coordinator._defer_unready_gen_receives = True
+        coordinator._unpublished_gen_receives = {7: (req, fence)}
+        coordinator._stamp_gen_transfer_start = Mock()
+        coordinator.inflight_cancel_active = Mock(return_value=False)
+        coordinator._check_transfer_errors = Mock()
+        coordinators.append(coordinator)
+        transceivers.append(tc)
+        requests.append(req)
+        fences.append(fence)
 
-        def publish(_endpoint, _payload):
-            assert all(arrived), "REQUEST_DATA escaped before every rank checked RankInfo"
-            assert not any(errors)
+    def poll_both():
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(c.poll_gen_transfers) for c in coordinators]
+            for future in futures:
+                future.result(timeout=10)
 
-        receiver._request_sender_data = Mock(side_effect=publish)
-        task = Mock(
-            _unique_rid=1, slice_id=0, _perf_timer=None, _params=SimpleNamespace(ctx_dp_rank=0)
-        )
-        receivers.append(receiver)
-        tasks.append(task)
+    with patch(
+        "tensorrt_llm._torch.disaggregation.orchestration.coordinator.uses_async_gen_transfer",
+        return_value=True,
+    ):
+        poll_both()
+        for tc in transceivers:
+            tc._start_async_receive.assert_not_called()
+        transceivers[0]._transfer_worker.prepare_rank_info.assert_called_once()
+        transceivers[1]._transfer_worker.prepare_rank_info.assert_not_called()
+        # A duplicate local dispatch also must not enter a collective or redo admission.
+        transceivers[0].request_and_receive_async(requests[0])
+        transceivers[0]._transfer_worker.prepare_rank_info.assert_called_once()
+        assert histories == [[tuple, list], [tuple, list]]
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(receiver.dispatch_task, task) for receiver, task in zip(receivers, tasks)
-        ]
-        for future in futures:
-            future.result(timeout=10)
+        fences[1].query.return_value = True
+        poll_both()
 
-    for receiver, task in zip(receivers, tasks):
+    assert histories == [[tuple, list] * 2, [tuple, list] * 2]
+    for tc, req in zip(transceivers, requests):
+        assert not tc._pending_rank_info_admissions
         if rejected_rank is None:
-            task.fail.assert_not_called()
-            receiver._request_sender_data.assert_called_once_with("tcp://context", b"request")
+            tc._start_async_receive.assert_called_once_with(req)
         else:
-            task.fail.assert_called_once()
-            assert isinstance(task.fail.call_args.args[0], RankInfoAuthenticationError)
-            receiver._request_sender_data.assert_not_called()
-            receiver._bounce.reserve.assert_not_called()
-            if ownership:
-                receiver._get_session.return_value.cancel_unpublished_task.assert_called_once_with(
-                    task
-                )
+            tc._start_async_receive.assert_not_called()
+            assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+def test_cancel_pending_rank_info_admission_does_not_publish():
+    tc = object.__new__(KvCacheTransceiverV2)
+    req = SimpleNamespace(py_request_id=7, request_id=7, py_disaggregated_params=None)
+    tc._pending_rank_info_admissions = {7: (req, None)}
+    tc._wait_reqs, tc._send_sessions, tc._recv_sessions = {}, {}, {}
+    tc._gen_allgather = Mock(return_value=[([], {}), ([], {7: None})])
+    tc._start_async_receive = Mock()
+    assert tc.cancel_request(req)
+    assert tc._poll_rank_info_admissions([]) == ([], [])
+    tc._start_async_receive.assert_not_called()

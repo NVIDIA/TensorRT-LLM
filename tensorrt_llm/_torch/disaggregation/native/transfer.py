@@ -2617,7 +2617,6 @@ class Receiver(ReceiverBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         rank_info_auth_key: Optional[bytes] = None,
-        rank_info_error_sync: Optional[Callable[[Optional[str]], Optional[str]]] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
@@ -2626,7 +2625,6 @@ class Receiver(ReceiverBase):
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
         self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
-        self._rank_info_error_sync = rank_info_error_sync
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -2824,21 +2822,14 @@ class Receiver(ReceiverBase):
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
-        peer_error = None
         try:
             peer_infos: RankInfo = self._get_sender_info(params)
         except (PeerIncompatibleError, RankInfoAuthenticationError) as e:
-            peer_error = e
-        if self._rank_info_error_sync is not None:
-            error = self._rank_info_error_sync(str(peer_error) if peer_error is not None else None)
-            if error is not None:
-                peer_error = RankInfoAuthenticationError(error)
-        if peer_error is not None:
-            # Every participating rank rejects before REQUEST_DATA can publish
-            # a destination. No sibling can be left waiting for a partial fan-in.
+            # This is rank-local: multi-rank async admission is coordinated
+            # by the transceiver's symmetric status poll before publication.
             logger.error(
                 "dispatch_task: context peer rejected, failing request "
-                f"unique_rid={task._unique_rid}: {peer_error}"
+                f"unique_rid={task._unique_rid}: {e}"
             )
             if self._enforce_physical_ownership:
                 session = self._get_session(task._unique_rid)
@@ -2846,7 +2837,7 @@ class Receiver(ReceiverBase):
                     task.cancel_unpublished()
                 else:
                     session.cancel_unpublished_task(task)
-            task.fail(peer_error)
+            task.fail(e)
             return
 
         if sender_dp_rank is not None:
@@ -4195,7 +4186,6 @@ class TransferWorkerConfig:
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
     rank_info_auth_key: Optional[bytes] = None
-    rank_info_error_sync: Optional[Callable[[Optional[str]], Optional[str]]] = None
 
 
 class TransferWorker:
@@ -4232,6 +4222,10 @@ class TransferWorker:
             prompt_len=request.prompt_len,
             overall_timeout_s=self._config.tx_overall_timeout_s,
         )
+
+    def prepare_rank_info(self, request: LlmRequest) -> None:
+        """Authenticate and cache the context peer without publishing receive buffers."""
+        self._receiver._get_sender_info(request.py_disaggregated_params)
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params
@@ -4313,7 +4307,6 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 rank_info_auth_key=self._rank_info_auth_key,
-                rank_info_error_sync=self._config.rank_info_error_sync,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
