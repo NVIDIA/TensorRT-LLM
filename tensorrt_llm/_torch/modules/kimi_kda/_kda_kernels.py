@@ -64,8 +64,8 @@ def get_kda_sm_version() -> int:
 
 
 def is_kda_optimized_supported() -> bool:
-    """The optimized prefill/decode kernels are Blackwell sm_100 only."""
-    return get_kda_sm_version() in (100, 103)
+    """The optimized prefill/decode kernels need Blackwell sm_100 or Rubin sm_107."""
+    return get_kda_sm_version() in (100, 103, 107)
 
 
 @triton.jit(do_not_specialize=["num_tokens", "feature_stride"])
@@ -434,17 +434,24 @@ def replay_kda_token_records(
     num_accepted_tokens: torch.Tensor,
 ) -> None:
     """Replay each selected slot's accepted drafts onto its pool state from
-    the per-draft records the Kimi K3 verify kernels keep in the slot's
-    per-token state region.
+    the per-draft records the Kimi K3 verify kernels keep in ``state_tok``.
 
-    A slot's region of ``state_tok`` (``[slots, num_spec, H, V, K]`` fp32)
-    starts with the records of the last round's drafts: the row innovations
-    ``vn`` ``[num_spec][H][V]``, then ``beta * k`` and the decay
-    ``[num_spec][H][K]``. Draft ``t`` updates the state as the kernels do,
-    ``S = fma(decay, S, vn (beta * k))``, so the result is bit-identical to the
-    state their next verify starts from.
+    A slot of ``state_tok`` (``[slots, 3, num_spec, H, K]`` fp32) holds the
+    records of the last round's drafts: the row innovations ``vn``
+    ``[num_spec][H][V]``, then ``beta * k`` and the decay
+    ``[num_spec][H][K]`` (V = K). Draft ``t`` updates the state as the
+    kernels do, ``S = fma(decay, S, vn (beta * k))``, so the result is
+    bit-identical to the state their next verify starts from.
     """
-    num_spec, num_heads, v_dim, k_dim = state_tok.shape[1:]
+    _, num_spec, num_heads, k_dim = state_tok.shape[1:]
+    v_dim = recurrent_state.shape[-2]
+    if state_tok.shape[1] != 3 or v_dim != k_dim:
+        raise ValueError(
+            "replay_kda_token_records: expected the drafts' records "
+            "[slots, 3, num_spec, H, K] with V = K, got "
+            f"{tuple(state_tok.shape)} for a state of "
+            f"{tuple(recurrent_state.shape)}"
+        )
     if state_indices.numel() == 0:
         return
     block_v = 32
@@ -471,9 +478,10 @@ def commit_kda_pending_drafts(
     conv_q: torch.Tensor,
     conv_k: torch.Tensor,
     conv_v: torch.Tensor,
-    qkg_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
+    g_cache: Optional[torch.Tensor],
+    v_cache: Optional[torch.Tensor],
+    beta_cache: Optional[torch.Tensor],
     state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     state_tok: Optional[torch.Tensor] = None,
@@ -483,25 +491,35 @@ def commit_kda_pending_drafts(
     ``num_accepted_tokens[n]`` is the number of drafts of slot
     ``state_indices[n]`` the last verify accepted, which the next verify
     would take up first. Afterwards ``recurrent_state`` and ``conv_pool``
-    hold the state and the conv window that verify would start from, bit for
-    bit, and the caller clears the slot's count:
+    hold the state and the conv window that verify would start from (the
+    window bit for bit), and the caller clears the slot's count:
 
-    * with per-token states (``state_tok``), the drafts are replayed from the
-      per-draft records the Kimi K3 verify kernels keep there
-      (``replay_kda_token_records``);
+    * with the Kimi K3 verify kernels' draft records (``state_tok``), the
+      drafts are replayed from those (``replay_kda_token_records``), and the
+      replay caches, which are then not allocated, may be None;
     * otherwise they are replayed from the replay caches by the fused verify
-      kernel's own replay steps (``kda_mtp_commit_pending_drafts``).
+      kernel's own replay steps (``kda_mtp_commit_pending_drafts``). The
+      tensor-core verify computes a chunk in one pass, so this commit
+      rounds the state differently from a verify that replays the drafts
+      itself.
     """
     num_spec = conv_q.shape[2] - conv_pool.shape[2]
     if state_tok is not None:
         replay_kda_token_records(recurrent_state, state_tok, state_indices, num_accepted_tokens)
     else:
+        assert (
+            k_cache is not None
+            and g_cache is not None
+            and v_cache is not None
+            and beta_cache is not None
+        )
         _load_mtp_module().kda_mtp_commit_pending_drafts(
             recurrent_state,
             conv_q,
             conv_k,
             conv_v,
-            qkg_cache,
+            k_cache,
+            g_cache,
             v_cache,
             beta_cache,
             state_indices,
@@ -594,6 +612,37 @@ def is_kda_mtp_verify_available() -> bool:
     return is_kda_optimized_supported() and is_intree_mtp_available()
 
 
+def kda_mtp_max_num_spec() -> int:
+    """Largest draft count the fused multi-token verify kernel supports."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+        MAX_NUM_SPEC,
+    )
+
+    return MAX_NUM_SPEC
+
+
+def kda_mtp_replay_num_spec(num_spec: int) -> Optional[int]:
+    """Draft count to size the KDA replay caches for, or ``None``.
+
+    ``None`` keeps the legacy intermediate verification buffers, so the
+    module runs the sequential FLA verify: either the fused kernel cannot
+    run here, or ``num_spec`` exceeds what it supports.
+    """
+    if not is_kda_mtp_verify_available():
+        return None
+    max_num_spec = kda_mtp_max_num_spec()
+    if num_spec > max_num_spec:
+        from tensorrt_llm.logger import logger
+
+        logger.warning_once(
+            f"KDA fused multi-token verify supports at most {max_num_spec} draft "
+            f"tokens, got {num_spec}; using the sequential FLA verify.",
+            key="kda_mtp_num_spec_fallback",
+        )
+        return None
+    return num_spec
+
+
 # ---------------------------------------------------------------------------
 # Dispatch API used by the KimiKDALinearAttention module.
 # ---------------------------------------------------------------------------
@@ -653,10 +702,15 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def mtp_verify(self, **kwargs) -> torch.Tensor:
+    def mtp_verify(
+        self, *, mxfp8_output: bool = False, **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
-        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
+        Thin passthrough to ``trtllm::kda_mtp_decode``, or with
+        ``mxfp8_output`` to ``trtllm::kda_mtp_decode_fp8``, which always
+        fuses the output norm and returns the E4M3 core and its R128c4
+        scales (see
         ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
@@ -667,7 +721,11 @@ class KDAKernelDispatch:
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        _load_mtp_module()  # registers trtllm::kda_mtp_decode
+        _load_mtp_module()  # registers both the BF16 and the MXFP8-output ops
+        if mxfp8_output:
+            if not kwargs.pop("fuse_output_norm", True):
+                raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
     def can_use_indexed_prefill(

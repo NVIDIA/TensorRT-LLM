@@ -153,6 +153,30 @@ prefix matching. It excludes dummy and draft requests. The default, `0`, disable
 the entire endpoint-priority callback, including its preference for the final window.
 This option requires V2, block reuse, and the `all_reusable` policy.
 
+### Branch Snapshots
+
+Sliding-window attention (SWA) layers can reuse a cached prefix only up to a
+point where V2 kept the SWA window. The `per_request` and `per_conversation`
+policies keep this window only at the prompt end. SWA scratch reuse keeps it
+only at each context chunk end. So when a request shares a prefix with an
+earlier request and then diverges, it cannot reuse up to the fork. The prototype
+`kv_cache_config.block_reuse_config.enable_branch_snapshot` option makes V2 also
+keep the SWA window at the fork:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    policy: per_conversation
+    enable_branch_snapshot: true
+```
+
+The fork is aligned down to a block boundary and becomes a context chunk
+boundary, so the executor uses the `FORCE_CHUNK` chunking policy. The option
+requires V2 and block reuse. It has no effect on models without SWA layers or on
+SWA layers with joint target/draft KV cache reuse.
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the
@@ -202,11 +226,17 @@ compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
 
+For hybrid Mamba models, `block_reuse_config.enable_branch_snapshot` also
+snapshots the recurrent state at the fork. The deprecated
+`mamba_state_config.enable_branch_snapshot` alias turns on the same option.
+
 ### KV Cache Salting for Secure Reuse
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
 
-To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be a user ID, tenant ID, or hash string. V2 uses the complete UTF-8 string in its reuse scope; an empty string is distinct from an omitted salt.
+
+V2 stored events report the scope's string in `cache_salt`. For ordinary requests this is the supplied value. CSA2 with encoder replay enabled adds its encoder-replay namespace to the scope, so its events report that effective namespace. The integer salt conversion used by `v1_block_key` events is confined to event hashing and matches the router; it does not affect V2 reuse identity.
 
 This isolation is enforced entirely by the block-key hash: the salt is mixed into the hashed input and prefix matching is decided by digest equality alone (blocks are not re-compared token-by-token). The block-key hash is therefore required to be a cryptographic hash with strong collision resistance and a 256-bit digest (SHA-256 provides ~128-bit collision resistance, which is ample here); substituting a non-cryptographic hash would allow crafted collisions to bypass salt isolation and must not be done.
 
@@ -249,7 +279,7 @@ V2 derives `mm_keys` directly from the cached token sequence. Each entry identif
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
 
-When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
+When offloading is enabled, `KvCacheConfig.cold_tier_offload_min_priority` controls which unreferenced blocks can be offloaded. Blocks below the threshold are discarded from GPU memory; blocks at or above it can move to a cold tier. The default threshold is 30. The old name, `secondary_offload_min_priority`, remains accepted as a deprecated alias.
 
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 

@@ -602,6 +602,11 @@
       "path": "kv_cache_config.avg_seq_len"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.enable_branch_snapshot"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.block_reuse_config.max_num_turns"
@@ -620,6 +625,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.cold_tier_offload_min_priority"
     },
     {
       "capture_policy": "bool",
@@ -792,11 +802,6 @@
       "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
-    },
-    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"
@@ -825,11 +830,6 @@
       "capture_policy": "list[float]|none",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
-      "path": "kv_cache_config.secondary_offload_min_priority"
     },
     {
       "capture_policy": "int|none",
@@ -895,6 +895,15 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "layer_wise_benchmarks_config.calibration_mode"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float32"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "lm_head_output_dtype"
     },
     {
       "allowed_values": [
@@ -1842,6 +1851,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "speculative_config.skip_ctx_buffer_budget_check"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.spec_dec_variant"
     },
     {
       "capture_policy": "list[int]|none",

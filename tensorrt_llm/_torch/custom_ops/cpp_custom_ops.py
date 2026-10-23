@@ -317,6 +317,26 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_router_latent_gemm_op")
+    def _(input: torch.Tensor, gate_weight: torch.Tensor,
+          down_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        for tensor in (input, gate_weight, down_weight):
+            torch._check(tensor.is_cuda and tensor.device == input.device)
+            torch._check(tensor.dim() == 2 and tensor.dtype == torch.bfloat16)
+            torch._check(tensor.is_contiguous())
+            torch._check(tensor.stride(0) == 7168)
+            torch._check(tensor.stride(1) == 1)
+            torch._check(tensor.storage_offset() % 8 == 0)
+        torch._check(input.shape[0] >= 1)
+        torch._check(input.shape[0] <= 16)
+        torch._check(input.shape[1] == 7168)
+        torch._check(gate_weight.shape[0] == 896)
+        torch._check(gate_weight.shape[1] == 7168)
+        torch._check(down_weight.shape[0] == 3584)
+        torch._check(down_weight.shape[1] == 7168)
+        return (input.new_empty((input.shape[0], 896), dtype=torch.float32),
+                input.new_empty((input.shape[0], 3584), dtype=torch.bfloat16))
+
     @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
@@ -362,6 +382,11 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
+        pass
+
+    @torch.library.register_fake("trtllm::dwdp_fabric_gather")
+    def _(dst_ptrs, src_ptrs, lines, row_starts, blocks_per_row, threads):
+        # Copies through raw device pointers; no return value.
         pass
 
     @torch.library.register_fake("trtllm::indexer_topk_prefill")
@@ -944,6 +969,20 @@ def _register_fake():
     ) -> torch.Tensor:
         return logits.new_empty(logits.shape, dtype=torch.float32)
 
+    @torch.library.register_fake("trtllm::chain_speculative_sampling")
+    def _(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_draft = draft_token_ids.shape
+        return (
+            draft_token_ids.new_empty((batch_size, num_draft + 1)),
+            draft_token_ids.new_empty((batch_size, )),
+        )
+
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
@@ -952,6 +991,25 @@ def _register_fake():
         return logits.new_empty((batch_size, num_mtp_modules + 1),
                                 dtype=torch.int32), logits.new_empty(
                                     (batch_size, ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::sage_quantize")
+    def _(query: Optional[torch.Tensor],
+          key: torch.Tensor,
+          value: torch.Tensor,
+          cu_seqlens_q: Optional[torch.Tensor],
+          cu_seqlens_kv: torch.Tensor,
+          q_quant: Optional[torch.Tensor],
+          k_quant: torch.Tensor,
+          v_quant: torch.Tensor,
+          q_scale: Optional[torch.Tensor],
+          k_scale: torch.Tensor,
+          v_scale: torch.Tensor,
+          k_mean: Optional[torch.Tensor],
+          v_mean: Optional[torch.Tensor],
+          q_block_size: int,
+          k_block_size: int,
+          reuse_stats: bool = False) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128")
     def _(input: torch.Tensor, use_ue8m0: bool = False):

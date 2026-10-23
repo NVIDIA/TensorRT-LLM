@@ -166,10 +166,9 @@ def markov_prev_embeddings(prev_tokens: torch.Tensor,
     """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
 
     The anchor is the last accepted token, which on the one-model rejection path
-    comes from flashinfer's ``chain_speculative_sampling``: it pads non-accepted
-    positions with ``-1`` and returns an out-of-range id for a row whose
-    ``relu(target - draft)`` residual has no mass. Mask like modules/embedding.py
-    does, so such a row contributes no bias instead of tripping a device assert.
+    comes from ``trtllm::chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1``. Mask like modules/embedding.py does, so such a
+    position contributes no bias instead of tripping a device assert.
 
     Args:
         prev_tokens: previous token ids (draft vocab), any shape.
@@ -1895,12 +1894,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
+            # The target logits, in the layout the worker's acceptance reads.
+            logits = self.spec_worker.target_logits(
                 hidden_states[spec_metadata.gather_ids],
                 self.lm_head,
+                self.logits_processor,
                 attn_metadata,
-                True,
+                spec_metadata,
+                self.draft_model,
             )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with

@@ -3797,7 +3797,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
     block_scale_interleave) so the backend's
     hybrid prefill path can continue to consume the standard CUTLASS
-    NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
+    NVFP4 GroupGEMM layout via the inherited ``TrtllmCutlassNvfp4Impl.run_moe``.
 
     On top of that base layout, ``transform_weights`` materialises the
     b12x-specific weight tensors: SF un-normalization (multiply per-block
@@ -7248,6 +7248,11 @@ def _import_deep_gemm():
     try:
         from tensorrt_llm import deep_gemm as _dg
     except ImportError as e:
+        # An ImportError chained to an AttributeError (from
+        # tensorrt_llm.__getattr__) means deep_gemm raised while importing;
+        # surface it instead of turning it into _MegaMoEUnavailable.
+        if isinstance(e.__cause__, AttributeError):
+            raise
         raise _MegaMoEUnavailable(
             f"tensorrt_llm.deep_gemm not importable: {e}") from e
 

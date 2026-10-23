@@ -16,6 +16,7 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
@@ -41,6 +42,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..speculative.utils import get_static_draft_len
@@ -49,7 +51,7 @@ from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
-from .engine.lora import make_lora_model_config
+from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
@@ -478,6 +480,7 @@ class PyTorchModelEngine(ModelEngine):
             use_ub_for_nccl = (
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
+            self._nccl_window_tensor_scope_hooks = []
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
@@ -535,6 +538,8 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+                self._nccl_window_tensor_scope_hooks = (
+                    install_eager_nccl_window_tensor_scopes(self.model))
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
@@ -585,6 +590,8 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self._lora_owner: Optional[DecoderLoraOwner] = None
+        self._lora_model: Optional[torch.nn.Module] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self._model_caller = ModelCaller(
@@ -838,21 +845,25 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return 2
 
-    def set_lora_model_config(self,
-                              lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str],
-                              swap_gate_up_proj_lora_b_weight: bool = True):
-        # Called by `_util.py` after model loading, before graph-manager initialization.
-        self.lora_model_config = make_lora_model_config(
-            self.model, lora_target_modules, trtllm_modules_to_hf_modules,
-            swap_gate_up_proj_lora_b_weight)
+    def initialize_lora_owner(self) -> DecoderLoraOwner:
+        """Bind the decoder owner once, across resource-capacity estimation passes."""
+        if self._lora_owner is None:
+            self._lora_owner, self._lora_model = resolve_lora_owner(
+                self.model, self.input_processor)
+        return self._lora_owner
+
+    def set_lora_model_config(self, lora_model_config: LoraModelConfig) -> None:
+        """Share the validated configuration with decoder execution."""
+        self.lora_model_config = lora_model_config
         if isinstance(self._runner, DecoderRunner):
             self._runner.lora_model_config = self.lora_model_config
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Build LoRA preparation state for the current executor resources."""
         if isinstance(self._runner, DecoderRunner):
-            self._runner.init_cuda_graph_lora_manager(lora_config)
+            assert self._lora_model is not None
+            self._runner.init_cuda_graph_lora_manager(lora_config,
+                                                      self._lora_model)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -1097,7 +1108,8 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. Runner resources and engine-owned CUDA Graph captures.
+        2. Runner resources and executor-owned CUDA Graph captures (via
+           :meth:`_release_cuda_graphs`).
         3. The runner, model caller, MM item scheduler, and model references.
         4. Input processors.
 
@@ -1111,8 +1123,8 @@ class PyTorchModelEngine(ModelEngine):
             deliberately does *not* call this: it is also invoked mid-init by
             ``configure_kv_cache_capacity``, which reads ``model`` right
             afterwards, so clearing ``model`` here would break it. That path
-            calls :meth:`_release_cuda_graphs` and then drops its reference
-            instead.
+            uses an explicit temporary-executor shutdown and then drops its
+            reference instead.
         """
         if self._cleanup_done:
             return
@@ -1128,7 +1140,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # Release runner-owned graphs before dropping the runner. Keep the
         # handle available if graph release fails and cleanup is retried.
-        self._release_cuda_graphs()
+        # Destruction timing is not rank-symmetric; only explicit shutdown releases owners.
+        self._release_cuda_graphs(release_nccl_window_owners=False)
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
@@ -1136,6 +1149,8 @@ class PyTorchModelEngine(ModelEngine):
         self._runner = None
         self._model_caller = None
         self._mm_item_scheduler = None
+        self._lora_model = None
+        self._lora_owner = None
         self.model = None
 
         self.input_processor = None
@@ -1252,11 +1267,31 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
-    def _release_cuda_graphs(self) -> None:
+    def _release_model_owned_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ) -> None:
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                clear_blocks_graph = getattr(module, "clear_blocks_cuda_graph",
+                                             None)
+                if clear_blocks_graph is not None:
+                    clear_blocks_graph(
+                        release_nccl_window_owners=release_nccl_window_owners)
+
+    def _release_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ) -> None:
         if self._runner is not None:
-            self._runner.release_graphs()
+            self._runner.release_graphs(
+                release_nccl_window_owners=release_nccl_window_owners)
         if self._torch_compile_backend is not None:
-            self._torch_compile_backend.clear_piecewise_cuda_graphs()
+            self._torch_compile_backend.clear_piecewise_cuda_graphs(
+                release_nccl_window_owners=release_nccl_window_owners)
 
     def get_max_num_sequences(self) -> int:
         """
