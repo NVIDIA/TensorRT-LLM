@@ -818,6 +818,7 @@ unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BCombin
 
 # NVFP4 examples for T2V-A14B and I2V-A14B.
 examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
 
 # Wan 2.2 I2V serving: synchronous and asynchronous video-generation requests.
 unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_sync
