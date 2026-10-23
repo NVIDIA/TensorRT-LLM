@@ -489,6 +489,39 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
             release_nccl_window_owners=False)
 
 
+class EagerNcclWindowTensorScopeHooksTestCase(unittest.TestCase):
+    """NCCL-window scopes are only enabled for forwards with peers."""
+
+    def _create_engine(self,
+                       distributed: bool) -> tuple[PyTorchModelEngine, Mock]:
+        llm_args = TorchLlmArgs(model="dummy",
+                                max_batch_size=1,
+                                max_num_tokens=16,
+                                cuda_graph_config=None)
+        with patch.object(PyTorchModelEngine,
+                          "_is_distributed_forward",
+                          return_value=distributed), patch(
+                              "tensorrt_llm._torch.pyexecutor.model_engine."
+                              "install_eager_nccl_window_tensor_scopes",
+                              return_value=["hook"]) as install:
+            engine = DummyModelEngine(llm_args, torch.half)
+        return engine, install
+
+    def test_single_rank_eager_engine_skips_scopes(self) -> None:
+        engine, install = self._create_engine(distributed=False)
+
+        install.assert_not_called()
+        self.assertEqual(engine._nccl_window_tensor_scope_hooks, [])
+        self.assertFalse(engine._nccl_window_tensor_scopes_enabled)
+
+    def test_distributed_eager_engine_installs_scope_hooks(self) -> None:
+        engine, install = self._create_engine(distributed=True)
+
+        install.assert_called_once_with(engine.model)
+        self.assertEqual(engine._nccl_window_tensor_scope_hooks, ["hook"])
+        self.assertTrue(engine._nccl_window_tensor_scopes_enabled)
+
+
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_generation_only_is_identity(self) -> None:

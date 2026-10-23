@@ -678,6 +678,12 @@ class PyTorchModelEngine(ModelEngine):
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
             self._nccl_window_tensor_scope_hooks = []
+            # NCCL window tensors are only created by collectives with peers, so
+            # a forward without peers never holds a lease to scope. Skip the
+            # scopes there: the eager hooks run on every scoped layer of every
+            # eager iteration.
+            self._nccl_window_tensor_scopes_enabled = (
+                self._is_distributed_forward())
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
@@ -724,8 +730,9 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
-                self._nccl_window_tensor_scope_hooks = (
-                    install_eager_nccl_window_tensor_scopes(self.model))
+                if self._nccl_window_tensor_scopes_enabled:
+                    self._nccl_window_tensor_scope_hooks = (
+                        install_eager_nccl_window_tensor_scopes(self.model))
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
@@ -6573,15 +6580,19 @@ class PyTorchModelEngine(ModelEngine):
         compile_scope = (
             torch_compiling(get_per_request_prefill_cuda_graph_flag())
             if self._torch_compile_prefill_only else contextlib.nullcontext())
-        with reclaim_scope, compile_scope:
-            # This boundary stays outside torch.compile, so one lease scope covers
-            # eager, compiled, and CUDA-graph model execution.
-            with nccl_window_tensor_scope(kwargs) as scope:
-                if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-                    outputs = trace_func(self.model.forward)(**kwargs)
-                else:
-                    outputs = self.model.forward(**kwargs)
-                return scope.escape(outputs)
+        # This boundary stays outside torch.compile, so one lease scope covers
+        # eager, compiled, and CUDA-graph model execution.
+        window_scope = (nccl_window_tensor_scope(kwargs) if getattr(
+            self, "_nccl_window_tensor_scopes_enabled", True) else None)
+        with reclaim_scope, compile_scope, (window_scope
+                                            or contextlib.nullcontext()):
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                outputs = trace_func(self.model.forward)(**kwargs)
+            else:
+                outputs = self.model.forward(**kwargs)
+            if window_scope is not None:
+                outputs = window_scope.escape(outputs)
+            return outputs
 
     @nvtx_range("_forward_step")
     def _forward_step(self,
