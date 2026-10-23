@@ -34,6 +34,7 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
+from .greedy_argmax import greedy_argmax
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -2889,7 +2890,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
-        return torch.argmax(logits, dim=-1).type(torch.int32)
+        return greedy_argmax(logits, torch.int32)
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
                                     spec_metadata: "SpecMetadata",
@@ -3269,6 +3270,6 @@ class SpecWorkerBase(nn.Module, ABC):
                 seed=seed,
                 offset=offset)
         else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
+            sampled_tokens = greedy_argmax(logits)
 
         return sampled_tokens

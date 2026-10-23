@@ -206,6 +206,7 @@ from .ops.hc.qwen4_exp_hc_decode_rows_tc import (
     qwen4_exp_hc_decode_rows_first,
     qwen4_exp_hc_decode_rows_mix,
 )
+from .ops.hc.qwen4_exp_hc_decode_tc_first import precompile as hc_tc_first_precompile
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_first_rescale_tc import qwen4_exp_hc_first_rescale_tc
 from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
@@ -715,6 +716,17 @@ _MID_MM_ROWS = {
 }  # capacity: fixed: dispatch thresholds
 
 
+#: Decode rows from which `DecodeTarget._moe_block` launches the router before the shared
+#: expert's side-stream work: the router heads the routed chain (router, routing, FC1, FC2),
+#: and launched after the side stream's gate|up GEMM its CTAs waited for SMs behind that
+#: GEMM's (STP con256 nsys: a router call 9.2 us launched second, 5.8 launched first). GB300
+#: micro-bench (`DecodeTarget`'s MoE block, 24 layers of cold weights in one graph), us a
+#: block, shared expert first vs router first: 2 rows 21.7 vs 22.4, 4 rows 30.8 vs 30.9, 8
+#: rows 46.5 vs 45.7, 16 rows 76.0 vs 74.6, 32 rows 112.9 vs 112.1, 128 rows 206.7 vs 204.4,
+#: 256 rows 275.6 vs 271.7, 1024 rows 366.6 vs 364.7.
+_ROUTER_FIRST_MIN_ROWS = 8  # capacity: fixed: a dispatch threshold, not a buffer size
+
+
 def _mid_rows(kind: str, rows: int) -> bool:
     lo, hi = _MID_MM_ROWS[kind]
     return lo <= rows <= hi
@@ -794,9 +806,10 @@ _HC_DECODE_GEMV_MAX_ROWS = 1  # capacity: fixed: dispatch threshold, not a buffe
 #: `_HC_DECODE_GEMV_MAX_ROWS + 1` rows) runs its first half (projection and
 #: activations) as the one tcgen05 launch `qwen4_exp_hc_decode_tc_first` instead of
 #: cuBLAS split-K (+ its reduce) + `qwen4_exp_hc_lowrank_act`: the entry's MAX_ROWS
-#: (one 128-row MMA tile); larger batches keep cuBLAS.
+#: (two 128-row MMA tiles); larger batches keep cuBLAS. GB300 micro-bench (96 sites,
+#: cold weights), us a site for the whole site at 256 rows: 17.8 against 22.4.
 _HC_TC_FIRST_MAX_ROWS = (
-    128  # capacity: fixed: dispatch threshold (one MMA tile), not a buffer bound
+    256  # capacity: fixed: dispatch threshold (two MMA tiles), not a buffer bound
 )
 
 #: Prefill steps of at least this many rows run each trunk hyper-connection site on the
@@ -1948,6 +1961,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 self._mtp = self._mtp._replace(**self._mtp_moe_nvfp4)
 
         self._fuse_hc_first_projections()
+        if device.type == "cuda":
+            # Every first-half tile `DecodeTarget` reaches up to `_HC_TC_FIRST_MAX_ROWS` rows.
+            hc_tc_first_precompile(self.stream, self.hc_lowrank, self.hc_count, device)
         if self.mtp_enabled:
             self._mtp_fused = _mtp_fused_views(self)
         # FP8 copies of the trunk's dense projections (`_DENSE_FP8_ENV`), beside the bf16
@@ -5368,7 +5384,8 @@ class DecodeTarget:
 
         The shared expert and its per-token gate logit run on the core's side
         stream, concurrently with the routed path, and join it before this
-        returns. `x` is the bf16 hidden states (router and shared expert); `xq` /
+        returns; from `_ROUTER_FIRST_MIN_ROWS` rows they launch after the router.
+        `x` is the bf16 hidden states (router and shared expert); `xq` /
         `xsf` are the same states in NVFP4 with **linear** block scales, from
         `_hc_moe_site`. On trtllm-gen the routed path hands the runner the router
         logits (its Renormalize routing is bitwise the `renorm_moe_routing_op` +
@@ -5383,15 +5400,21 @@ class DecodeTarget:
         # so far. What it allocates is consumed on `main` after the join below,
         # and the next layer's fork orders any reuse of those blocks after that.
         side.wait_stream(main)
+        # The routing reads its logits as a dense row-major buffer from data_ptr() and
+        # ignores strides; every projection entry allocates them contiguous. From
+        # `_ROUTER_FIRST_MIN_ROWS` rows the router launches before the shared expert (the
+        # fork above precedes it, so the side stream does not wait for it).
+        router_first = x.shape[0] >= _ROUTER_FIRST_MIN_ROWS
+        if router_first:
+            logits = _dense_mm(x, L.router, None, gemm, "router", mid=L.router_m)
         with torch.cuda.stream(side):
             gu = _dense_mm(x, L.sh_gu, None, gemm, "sh_gu", L.sh_gu_g, mid=L.sh_gu_m)
             shared = _dense_mm(
                 flashinfer_silu_and_mul(gu), L.sh_dn, None, gemm, "sh_dn", L.sh_dn_g, mid=L.sh_dn_m
             )
             gate_logits = gemm(x, L.sh_gate)
-        # The routing reads its logits as a dense row-major buffer from data_ptr() and
-        # ignores strides; every projection entry allocates them contiguous.
-        logits = _dense_mm(x, L.router, None, gemm, "router", mid=L.router_m)
+        if not router_first:
+            logits = _dense_mm(x, L.router, None, gemm, "router", mid=L.router_m)
         if core.trunk_moe_backend == "CUTEDSL":
             routed = _cute_dsl_routed(core, L, logits, xq, xsf, routed_out)
             main.wait_stream(side)
