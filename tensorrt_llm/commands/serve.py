@@ -657,23 +657,6 @@ def _terminate_attached_frontends(children: list) -> None:
             child.kill()
 
 
-def _read_disagg_auth_key(config_file: str,
-                          worker_key: Optional[str]) -> Optional[str]:
-    """Read the shared serving key without importing proxy settings into LLM args."""
-    with open(config_file) as f:
-        config = yaml.safe_load(f)
-    if config is None:
-        config = {}
-    if not isinstance(config, dict):
-        raise ValueError("Disaggregated configuration root must be a mapping")
-    key = _pop_optional_str_config_option(config, "internal_request_auth_key")
-    if worker_key is not None and worker_key != key:
-        raise ValueError(
-            "internal_request_auth_key in the worker config must match the disaggregated config"
-        )
-    return key
-
-
 def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
     """Provision native transfer authentication before executor workers are spawned."""
     config = llm_args.get("cache_transceiver_config")
@@ -1215,13 +1198,6 @@ def launch_visual_gen_server(
                   help="Specify the parser for tool models. "
                   "Use 'auto' to automatically select based on the model.",
                   status="prototype")
-@stability_option(
-    "--disagg_config",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help=
-    "Shared disaggregated serving config containing internal_request_auth_key.",
-    status="prototype")
 @stability_option("--metadata_server_config_file",
                   type=str,
                   default=None,
@@ -1407,7 +1383,6 @@ def serve(
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
     report_addr: Optional[str],
-    disagg_config: Optional[str] = None,
 ) -> None:
     """Running an OpenAI API compatible server
 
@@ -1464,7 +1439,7 @@ def serve(
             raise e
 
     explicit_cli_keys = collect_explicit_cli_keys(
-        exclude=("extra_llm_api_options", "config", "disagg_config"))
+        exclude=("extra_llm_api_options", "config"))
 
     def _serve_llm():
         nonlocal server_role, allow_request_chat_template
@@ -1521,9 +1496,6 @@ def serve(
                                        or extra_allow_request_chat_template)
         internal_disagg_auth_key = _pop_optional_str_config_option(
             llm_args_extra_dict, "internal_request_auth_key")
-        if disagg_config is not None:
-            internal_disagg_auth_key = _read_disagg_auth_key(
-                disagg_config, internal_disagg_auth_key)
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 

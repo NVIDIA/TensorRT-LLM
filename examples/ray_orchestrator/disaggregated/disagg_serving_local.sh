@@ -154,6 +154,17 @@ EOF
 
 fi
 
+# Forward the optional shared key through the existing worker config reader.
+python3 - "$DISAGG_CONFIG" <<'PYTHON' || exit 1
+import pathlib, sys, yaml
+key = (yaml.safe_load(pathlib.Path(sys.argv[1]).read_text()) or {}).get("internal_request_auth_key")
+if key is not None:
+    path = pathlib.Path("extra_llm_config.yaml")
+    config = yaml.safe_load(path.read_text())
+    config["internal_request_auth_key"] = key
+    path.write_text(yaml.safe_dump(config))
+PYTHON
+
 # Conditionally start ray head if using ray backend and not in attach mode
 RAY_STARTED=false
 if [[ "$BACKEND" == "ray" && "$ATTACH_MODE" != "true" ]]; then
@@ -176,14 +187,14 @@ if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml --disagg_config "$DISAGG_CONFIG" &> output_ctx0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
 fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml --disagg_config "$DISAGG_CONFIG" &> output_gen0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."

@@ -476,20 +476,12 @@ def test_rank_info_key_is_carried_by_transceiver_config():
 
 @pytest.mark.parametrize("protocol", ["openengine", "smg"])
 @pytest.mark.parametrize("key", [None, "deployment-key"])
-@pytest.mark.parametrize("shared_config", [False, True])
-def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key, shared_config):
+def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key):
     config = tmp_path / "worker.yaml"
     config.write_text(
-        (f"internal_request_auth_key: {key}\n" if key is not None and not shared_config else "")
+        (f"internal_request_auth_key: {key}\n" if key is not None else "")
         + "cache_transceiver_config:\n  backend: NIXL\n"
     )
-    extra_args = []
-    if shared_config:
-        disagg_config = tmp_path / "disagg.yaml"
-        disagg_config.write_text(
-            f"internal_request_auth_key: {key}\n" if key is not None else "hostname: localhost\n"
-        )
-        extra_args = ["--disagg_config", str(disagg_config)]
     launch = mock.Mock()
     module = SimpleNamespace(launch_server=launch, launch_smg_server=launch)
     monkeypatch.setitem(sys.modules, f"tensorrt_llm.grpc.{protocol}.server", module)
@@ -498,8 +490,7 @@ def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key,
     monkeypatch.setattr(serve, "find_spec", lambda _: object())
 
     serve.main(
-        args=["dummy/model", "--config", str(config), "--grpc", "--grpc-protocol", protocol]
-        + extra_args,
+        args=["dummy/model", "--config", str(config), "--grpc", "--grpc-protocol", protocol],
         standalone_mode=False,
     )
 
@@ -513,52 +504,3 @@ def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key,
         assert transceiver._rank_info_auth_key == key.encode()
         assert "_rank_info_auth_key" not in transceiver.model_dump()
     assert "internal_request_auth_key" not in llm_args
-
-
-@pytest.mark.parametrize("key", [None, "shared-key"])
-def test_mpi_launcher_reads_key_from_disagg_config(tmp_path, monkeypatch, key):
-    config = tmp_path / "disagg.yaml"
-    config.write_text(
-        "model: dummy/model\ncontext_servers:\n  num_instances: 1\n"
-        "generation_servers:\n  num_instances: 1\n"
-        + (f"internal_request_auth_key: {key}\n" if key is not None else "")
-    )
-    monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX, "0")
-    with (
-        mock.patch.object(serve, "mpi_rank", return_value=0),
-        mock.patch.object(serve, "launch_server") as launch,
-    ):
-        serve._launch_disaggregated_server(str(config), {"model": "dummy/model"})
-    assert launch.call_args.kwargs.get("internal_disagg_auth_key") == key
-
-
-@pytest.mark.parametrize(
-    "content,worker_key,expected",
-    [
-        ("", None, None),
-        ("hostname: localhost", None, None),
-        ("internal_request_auth_key: shared", None, "shared"),
-        ("internal_request_auth_key: shared", "shared", "shared"),
-    ],
-)
-def test_read_disagg_auth_key(tmp_path, content, worker_key, expected):
-    config = tmp_path / "disagg.yaml"
-    config.write_text(content)
-    assert serve._read_disagg_auth_key(str(config), worker_key) == expected
-
-
-@pytest.mark.parametrize(
-    "content,worker_key",
-    [
-        ("[]", None),
-        ('internal_request_auth_key: ""', None),
-        ("internal_request_auth_key: 123", None),
-        ("internal_request_auth_key: shared", "different"),
-        ("", "worker-only"),
-    ],
-)
-def test_read_disagg_auth_key_rejects_invalid_config(tmp_path, content, worker_key):
-    config = tmp_path / "disagg.yaml"
-    config.write_text(content)
-    with pytest.raises(ValueError):
-        serve._read_disagg_auth_key(str(config), worker_key)

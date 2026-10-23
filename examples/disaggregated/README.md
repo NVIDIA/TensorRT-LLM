@@ -260,15 +260,11 @@ Native Python RankInfo authentication is optional. Without a configured key,
 workers log a warning and retain the unauthenticated RankInfo exchange; anyone
 who can reach the RankInfo endpoint can retrieve its transfer metadata.
 To enable authentication, set `internal_request_auth_key` once in the shared
-disaggregated serving YAML passed to `trtllm-serve disaggregated -c`.
-The MPI worker launcher reads that config directly. For separately launched HTTP
-or gRPC workers, the coordinator passes `--disagg_config <same YAML>` alongside
-each worker's `--config`; only the authentication key is read from the shared file.
-The simple SLURM and benchmark launchers pass this file automatically. For the Ray
-example, pass `--disagg_config <path>` to `disagg_serving_local.sh`.
-Benchmark configs set the key under `server_config_extra.internal_request_auth_key`.
-No LLM API parameter is required and no fallback key is generated.
-A conflicting key in a worker config is rejected at startup.
+disaggregated serving YAML. The MPI launcher reads it directly; the simple SLURM
+and Ray example scripts copy it into generated worker configs. For the Ray
+example, pass that YAML using the script's `--disagg_config <path>` option.
+Benchmark configs set `server_config_extra.internal_request_auth_key`, which is
+forwarded to the proxy and workers. No LLM API parameter or generated key is required.
 
 When authentication is enabled, both peers must support the authenticated
 protocol and use the same key; a configured receiver never falls back to an
