@@ -88,6 +88,19 @@ class TestReuseScope(unittest.TestCase):
         # Deterministic across repeated derivation.
         self.assertEqual(roots, [_root_key(scope) for scope in scopes])
 
+    def test_locality_domain_is_part_of_the_scope_key(self) -> None:
+        # A scope without a locality domain keeps its two-field shape and key, so existing
+        # digests are unchanged; each domain seeds its own key.
+        plain = ReuseScope(lora_id=7, salt="11")
+        self.assertEqual(len(plain), 2)
+        self.assertEqual(_root_key(plain), _root_key(ReuseScope(7, "11", None)))
+        domain_keys = {
+            _root_key(ReuseScope(lora_id=7, salt="11", locality_domain_id=d)) for d in (0, 1)
+        }
+        self.assertEqual(len(domain_keys), 2)
+        self.assertNotIn(_root_key(plain), domain_keys)
+        self.assertEqual(len(ReuseScope(lora_id=7, salt="11", locality_domain_id=0)), 3)
+
     def test_blockchain_keys_are_seeded_by_reuse_scope(self) -> None:
         tokens = [TokenId(1), TokenId(2), TokenId(3), TokenId(4)]
         scope = ReuseScope(lora_id=7, salt="11")
