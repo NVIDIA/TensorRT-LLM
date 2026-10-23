@@ -1874,6 +1874,113 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
 
 
 @pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+def test_fp4_mla_helix_generation_writes_hp_ring_at_global_position(monkeypatch) -> None:
+    """Helix generation stores the BF16 tail at the token's global ring slot.
+
+    The context writer and the disaggregated ring transfer address the HP
+    ring by global position, while a Helix rank's cache position is
+    rank-local. The generation update must use the global position.
+    """
+    _reset_triton_allocator()
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    local_kv_len = 6
+    local_cache_position = local_kv_len - 1
+    global_position = 70
+    num_heads = 4
+    (
+        kv_cache_manager,
+        metadata,
+        _,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) = _build_fp4_mla_attention_decode_case(
+        seq_lens=[local_kv_len],
+        num_heads=num_heads,
+        seed=37,
+    )
+    try:
+        state = metadata.fp4_mla_state
+        head_dim = kv_lora_rank + qk_rope_head_dim
+        ring_size = kv_cache_manager.fp4_mla_hp_pool_size
+        assert global_position % ring_size != local_cache_position % ring_size
+        state.positions = torch.tensor([global_position], dtype=torch.int32, device="cuda")
+        metadata._helix_spec_tokens_valid = False
+        metadata.helix_position_offsets = state.positions
+        metadata.helix_is_inactive_rank = torch.tensor([False], dtype=torch.bool, device="cuda")
+
+        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+        kv_cache.zero_()
+        sf_cache.zero_()
+        state.hp_pool.zero_()
+        state.v_scale_pool.zero_()
+        v_packed_pool = kv_cache_manager.get_mla_v_packed_pool_base()
+        if v_packed_pool is not None:
+            v_packed_pool.zero_()
+
+        generation_latent = (
+            torch.randn(1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        generation_latent[:, :kv_lora_rank] += 0.5
+        q_pe = (
+            torch.randn(1, num_heads, qk_rope_head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        q_quant_input = torch.zeros(1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        q_rope_out = q_quant_input[..., kv_lora_rank:]
+        rotary_cos_sin = torch.zeros(
+            (FP4_MLA_TOKENS_PER_BLOCK, qk_rope_head_dim, 2),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        rotary_cos_sin[..., 0] = 1.0
+
+        assert scatter_fp4_mla_kv_cache(
+            metadata,
+            generation_latent,
+            layer_idx=0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+            rotary_cos_sin=rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=q_rope_out,
+            q_quant_input=q_quant_input,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+        )
+        torch.cuda.synchronize()
+
+        hp_pool = state.hp_pool
+        pool_head_dim = hp_pool.shape[-1] // ring_size
+        ring = hp_pool.view(*hp_pool.shape[:-1], ring_size, pool_head_dim)
+        written_slots = sorted(
+            {
+                int(slot)
+                for slot in torch.nonzero(ring[..., :kv_lora_rank].abs().amax(dim=-1))[
+                    :, -1
+                ].tolist()
+            }
+        )
+        assert written_slots == [global_position % ring_size]
+        slot_rows = ring[..., global_position % ring_size, :kv_lora_rank].reshape(-1, kv_lora_rank)
+        written = slot_rows[slot_rows.abs().amax(dim=-1) > 0]
+        assert written.shape[0] >= 1
+        torch.testing.assert_close(
+            written[0].float(), generation_latent[0, :kv_lora_rank].float(), rtol=0, atol=0
+        )
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="requires Rubin SM107",
 )
