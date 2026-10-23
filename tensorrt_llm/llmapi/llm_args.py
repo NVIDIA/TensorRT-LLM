@@ -786,6 +786,18 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
+    encoder_data_parallel_size: PositiveInt | None = Field(
+        default=None,
+        description=
+        ("Number of multimodal encoder replicas within the LLM tensor-parallel "
+         "group. None preserves the model's existing encoder parallelism. An "
+         "explicit value divides the group into this many replicas, each using "
+         "tensor parallelism over tensor_parallel_size / encoder_data_parallel_size "
+         "ranks, independently of LLM attention DP. Requires pipeline- and "
+         "context-parallel sizes of 1."),
+        status="prototype",
+    )
+
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
@@ -863,6 +875,17 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        if (self.encoder_data_parallel_size or 1) > 1:
+            if self.encoder_cuda_graph is not None:
+                raise ValueError(
+                    "multimodal_config.encoder_data_parallel_size > 1 and "
+                    "multimodal_config.encoder_cuda_graph are mutually exclusive."
+                )
+            if self.encoder_side_stream_max_ahead > 0:
+                raise ValueError(
+                    "multimodal_config.encoder_data_parallel_size > 1 and "
+                    "multimodal_config.encoder_side_stream_max_ahead > 0 are "
+                    "mutually exclusive.")
         return self
 
 
@@ -7019,6 +7042,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        if (self.mm_encoder_only and
+            (self.multimodal_config.encoder_data_parallel_size or 1) > 1):
+            raise ValueError(
+                "multimodal encoder data parallelism does not support "
+                "mm_encoder_only execution yet.")
         return self
 
     @model_validator(mode="after")
@@ -7033,6 +7061,34 @@ class TorchLlmArgs(BaseLlmArgs):
             # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
             self.multimodal_config = self.multimodal_config.model_copy(
                 update={"encoder_cache_max_bytes": 0})
+        return self
+
+    @model_validator(mode="after")
+    def validate_encoder_data_parallel(self) -> 'TorchLlmArgs':
+        size = self.multimodal_config.encoder_data_parallel_size
+        if size is None:
+            return self
+        if self.pipeline_parallel_size != 1 or self.context_parallel_size != 1:
+            raise ValueError(
+                "Explicit multimodal encoder parallelism requires "
+                "pipeline_parallel_size == 1 and context_parallel_size == 1.")
+        if self.tensor_parallel_size % size:
+            raise ValueError(
+                "multimodal_config.encoder_data_parallel_size must divide "
+                f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
+            )
+        if self.enable_attention_dp and size < self.tensor_parallel_size:
+            if (self.mm_encoder_only
+                    or self.multimodal_config.encoder_scheduling_policy
+                    == MultimodalEncoderSchedulingPolicy.DISABLED):
+                raise ValueError(
+                    "Encoder TP with attention DP requires MM item scheduling "
+                    "in aggregated LLM execution.")
+            if (self.multimodal_config.encoder_cuda_graph is not None or
+                    self.multimodal_config.encoder_side_stream_max_ahead > 0):
+                raise ValueError(
+                    "Encoder TP with attention DP does not yet support encoder "
+                    "CUDA graphs or side-stream prefetch.")
         return self
 
     @model_validator(mode="after")

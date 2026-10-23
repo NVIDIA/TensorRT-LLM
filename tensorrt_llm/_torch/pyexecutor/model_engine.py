@@ -1063,7 +1063,9 @@ class PyTorchModelEngine(ModelEngine):
         scheduled_items: Dict[int, List[int]],
     ) -> None:
         """Forward selected MM encoder items into the unified output cache."""
-        if not scheduled_items:
+        if not scheduled_items and not (
+                isinstance(self.model, MultimodalModelMixin)
+                and self.model.encoder_collective_required):
             return
         if self._mm_item_scheduler is None:
             raise TypeError(

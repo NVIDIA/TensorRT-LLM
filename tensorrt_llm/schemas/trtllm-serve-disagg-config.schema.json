@@ -2314,6 +2314,17 @@
           "$ref": "#/$defs/LayerwiseBenchmarksConfig",
           "status": "prototype"
         },
+        "lm_head_output_dtype": {
+          "default": "auto",
+          "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+          "enum": [
+            "auto",
+            "float32"
+          ],
+          "status": "prototype",
+          "title": "Lm Head Output Dtype",
+          "type": "string"
+        },
         "load_format": {
           "anyOf": [
             {
@@ -5682,7 +5693,7 @@
         },
         "role": {
           "default": "both",
-          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without moving any KV, so they pin no staging buffers and pay no per-request cost.",
+          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without registering any KV cache, so it needs no GPUDirect RDMA.",
           "enum": [
             "both",
             "producer",
@@ -5722,8 +5733,8 @@
           "title": "Segment Size"
         },
         "stage_through_host": {
-          "default": true,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. The only transfer path supported today, so 'false' is ignored with a warning. Costs a copy each way and needs no GPUDirect RDMA.",
+          "default": false,
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
           "telemetry": {
             "exclude": true
           },
@@ -5776,6 +5787,21 @@
           "description": "CUDA graph capture for multimodal encoders, keyed by modality name. This config is not applied automatically - each model must read `model_config.multimodal_config.encoder_cuda_graph` and implement capture + replay via `MultimodalEncoderCudaGraphRunner` (see `tensorrt_llm/_torch/models/multimodal_encoder_graph.py`).",
           "status": "prototype",
           "title": "Encoder Cuda Graph"
+        },
+        "encoder_data_parallel_size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of multimodal encoder replicas within the LLM tensor-parallel group. None preserves the model's existing encoder parallelism. An explicit value divides the group into this many replicas, each using tensor parallelism over tensor_parallel_size / encoder_data_parallel_size ranks, independently of LLM attention DP. Requires pipeline- and context-parallel sizes of 1.",
+          "status": "prototype",
+          "title": "Encoder Data Parallel Size"
         },
         "encoder_scheduling_policy": {
           "$ref": "#/$defs/MultimodalEncoderSchedulingPolicy",
@@ -8614,6 +8640,17 @@
     "layer_wise_benchmarks_config": {
       "$ref": "#/$defs/LayerwiseBenchmarksConfig",
       "status": "prototype"
+    },
+    "lm_head_output_dtype": {
+      "default": "auto",
+      "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+      "enum": [
+        "auto",
+        "float32"
+      ],
+      "status": "prototype",
+      "title": "Lm Head Output Dtype",
+      "type": "string"
     },
     "load_format": {
       "anyOf": [

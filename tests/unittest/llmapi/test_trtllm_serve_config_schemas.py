@@ -80,6 +80,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"tensor_parallel_size": 2, "multimodal_config": {"encoder_data_parallel_size": 2}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_data_parallel_size": 0}},
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
@@ -98,6 +108,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
         (
             generator.DISAGG_SCHEMA,
+            {
+                "context_servers": {
+                    "tensor_parallel_size": 2,
+                    "multimodal_config": {"encoder_data_parallel_size": 2},
+                }
+            },
+            True,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
             {"context_servers": {"moe_config": {"backend_typo": "CUTLASS"}}},
             False,
         ),
@@ -112,6 +132,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
 def test_config_validation(
     schemas: dict[str, dict], filename: str, config: dict, valid: bool
 ) -> None:
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("value,valid", [(None, True), (1, True), (0, False), (1.5, False)])
+def test_dflash_spec_dec_variant_schema(schemas, filename, value, valid) -> None:
+    config = {"speculative_config": {"decoding_type": "DFlash", "spec_dec_variant": value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 

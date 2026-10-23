@@ -53,9 +53,11 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
+    EncoderParallelMode,
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
+    make_multimodal_encoder_model_config,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
@@ -1250,6 +1252,12 @@ class Qwen3VisionModelBase(nn.Module):
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_mm_encoder_item_scheduling = True
 
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"tp", "dp"})}
+
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:
@@ -1365,7 +1373,8 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         # saves the encoder's GPU memory for the KV cache pool.
         if not (_is_mm_disagg() or model_config.disable_mm_encoder):
             self.mm_encoder = Qwen3VisionModelBase(
-                copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
+                make_multimodal_encoder_model_config(model_config),
+                kwargs.get("vision_model_class", None),
             ).eval()
             # Reuse the encoder's own group definition so the aggregated and
             # mm-encoder-only paths share a single source of truth.

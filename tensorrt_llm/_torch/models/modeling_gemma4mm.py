@@ -23,7 +23,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-from collections.abc import Sequence
 from itertools import groupby
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
@@ -57,8 +56,10 @@ from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_mixin import (
     EncoderCachePartition,
+    EncoderParallelMode,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    make_multimodal_encoder_model_config,
 )
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -599,9 +600,26 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 
 
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
-    """Shared multimodal encoder flow for Gemma4 conditional generation models."""
+    """Shared multimodal encoder flow for Gemma4 conditional generation models.
+
+    The mixin's ``build_multimodal_encoder_input`` handles item-major
+    ``pixel_values`` and ``audio_features``, including their per-item position,
+    length, and mask fields, so Gemma4 needs no slicing override.
+    """
 
     supports_encoder_cache = True
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        config = model_config.pretrained_config
+        modes: dict[str, frozenset[EncoderParallelMode]] = {}
+        if config.vision_config is not None:
+            modes["vision"] = frozenset({"tp", "dp"})
+        if config.audio_config is not None:
+            modes["audio"] = frozenset({"dp"})
+        return modes
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -701,63 +719,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                     looked_up=partition.looked_up,
                 )
         return partition
-
-    def build_multimodal_encoder_input(
-        self,
-        param: MultimodalParams,
-        item_indices: Sequence[int],
-    ) -> MultimodalParams:
-        """Build a Gemma4 image or audio input containing selected items.
-
-        The generic implementation recognizes item-major images through a parallel `image_sizes`
-        field and item-major audio through the `input_features` key. Gemma4 instead provides
-        fixed-size `pixel_values` without `image_sizes` and uses `audio_features`.
-
-        Partial encoder-cache hits therefore need this override to slice those tensors, together
-        with their per-item position, length, and mask fields.
-        """
-        modality = self._encoder_cache_modality(param)
-        # Partial video partitions are converted to full misses above, so they cannot call this
-        # hook. Delegate unexpected direct calls to the generic validation so they fail instead of
-        # returning an incorrectly unsliced input.
-        if modality not in ("image", "audio"):
-            return super().build_multimodal_encoder_input(param, item_indices)
-        input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
-
-        modality_data = param.multimodal_data[modality]
-        if not isinstance(modality_data, dict):
-            raise TypeError(
-                f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
-            )
-
-        item_count = len(param.multimodal_data.get("multimodal_embedding_lengths") or ())
-        input_tensor = modality_data.get(input_key)
-        # Only slice dim 0 after confirming it is the per-item axis declared by the cache metadata.
-        # Let the generic implementation handle any other recognized layout, or reject an
-        # inconsistent Gemma4 payload.
-        if (
-            not isinstance(input_tensor, torch.Tensor)
-            or input_tensor.dim() == 0
-            or input_tensor.shape[0] != item_count
-        ):
-            return super().build_multimodal_encoder_input(param, item_indices)
-
-        indices = list(item_indices)
-        sliced = {input_key: input_tensor[indices]}
-        sliced = {
-            **modality_data,
-            **sliced,
-            **self._slice_per_item_sibling_fields(
-                modality_data, item_count, indices, sliced.keys()
-            ),
-        }
-        residual_input = (
-            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
-        )
-        return MultimodalParams(
-            multimodal_data={**param.multimodal_data, modality: sliced},
-            multimodal_input=residual_input,
-        )
 
     def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Encode uncached Gemma4 image, video, and audio payloads."""
@@ -948,7 +909,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         **forward_kwargs,
     ) -> Dict:
         """Build Gemma4-specific language-model forward arguments."""
-        del position_ids, forward_kwargs
         mm_token_type_ids = None
         if raw_input_ids is not None and mm_inputs.input_ids is None:
             mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
@@ -1080,6 +1040,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         model_config_cp = copy.deepcopy(model_config)
         model_config_cp.extra_attrs = model_config.extra_attrs
         self.model_config = model_config_cp
+        encoder_model_config = make_multimodal_encoder_model_config(model_config_cp)
 
         # --- Language model ---
         # Remap quantization exclude_modules patterns from HF naming to
@@ -1101,7 +1062,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
 
         # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
-            vision_model_config = self.get_sub_model_config(model_config_cp, "vision_config")
+            vision_model_config = self.get_sub_model_config(encoder_model_config, "vision_config")
             self.vision_tower = Gemma4VisionModel(vision_model_config).eval().to(self._device)
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
@@ -1112,7 +1073,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
                     text_hidden_size=text_hidden,
                     eps=vision_eps,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)
@@ -1123,7 +1084,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
 
         # --- Audio tower (native TRT-LLM, see modeling_gemma4_audio.py) ---
         if config.audio_config is not None:
-            audio_model_config = self.get_sub_model_config(model_config_cp, "audio_config")
+            audio_model_config = self.get_sub_model_config(encoder_model_config, "audio_config")
             self.audio_tower = Gemma4AudioModel(audio_model_config).eval().to(self._device)
             audio_hidden = getattr(
                 config.audio_config, "output_proj_dims", config.audio_config.hidden_size
@@ -1136,7 +1097,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
                     text_hidden_size=text_hidden,
                     eps=audio_eps,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)

@@ -1064,6 +1064,11 @@
       "path": "multimodal_config.encoder_cache_max_bytes"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "multimodal_config.encoder_data_parallel_size"
+    },
+    {
       "allowed_values": [
         "DISABLED",
         "DEFAULT",

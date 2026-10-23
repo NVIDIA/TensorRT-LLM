@@ -24,6 +24,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from .checkpoints.hf.exaone4_5_weight_mapper import Exaone4_5HfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_mixin import EncoderParallelMode, make_multimodal_encoder_model_config
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -192,6 +193,12 @@ class Exaone4_5_VisionModel(Qwen2VisionModelBase):
     ),
 )
 class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"tp", "dp"})}
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -226,7 +233,7 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         if not _is_mm_disagg():
-            mm_encoder_config = copy.deepcopy(model_config)
+            mm_encoder_config = make_multimodal_encoder_model_config(model_config)
             self.mm_encoder = Exaone4_5_VisionModel(mm_encoder_config, Qwen2_5_VisionModel)
         else:
             self.mm_encoder = None
@@ -259,8 +266,13 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
 
         if len(mm_multimodal_params) > 0:
             if not _is_mm_disagg():
+                encoder_forward_fn = (
+                    self._run_multimodal_encoder
+                    if self.encoder_data_parallel_active
+                    else self.mm_encoder.forward
+                )
                 mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.mm_encoder.forward,
+                    encoder_forward_fn=encoder_forward_fn,
                     multimodal_params=mm_multimodal_params,
                 )
             else:
