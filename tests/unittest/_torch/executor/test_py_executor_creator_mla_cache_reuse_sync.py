@@ -24,6 +24,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
+    _fp4_mla_block_reuse_blocker,
+    _validate_fp4_mla_chunk_size,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import (
@@ -492,6 +494,109 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
         "model_engine_creation_seconds": 1.0,
         "total_py_executor_creation_seconds": 1.5,
     }
+
+
+def _dense_fp4_mla_model_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("enable_chunked_prefill", "max_num_tokens"),
+    [(True, 4096), (False, 4097)],
+)
+def test_dense_fp4_mla_accepts_aligned_or_disabled_chunking(
+    enable_chunked_prefill: bool,
+    max_num_tokens: int,
+) -> None:
+    _validate_fp4_mla_chunk_size(
+        _dense_fp4_mla_model_config(),
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_tokens=max_num_tokens,
+    )
+
+
+def test_dense_fp4_mla_rejects_unaligned_chunk_size() -> None:
+    # Only a request's final chunk may end inside an FP4 quantization tile.
+    with pytest.raises(ValueError, match="multiple of 16"):
+        _validate_fp4_mla_chunk_size(
+            _dense_fp4_mla_model_config(),
+            enable_chunked_prefill=True,
+            max_num_tokens=4097,
+        )
+
+
+@pytest.mark.parametrize(
+    ("is_hybrid", "enable_chunked_prefill", "supported"),
+    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+)
+def test_fp4_mla_block_reuse_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    is_hybrid: bool,
+    enable_chunked_prefill: bool,
+    supported: bool,
+) -> None:
+    monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: is_hybrid)
+
+    blocker = _fp4_mla_block_reuse_blocker(
+        SimpleNamespace(), enable_chunked_prefill=enable_chunked_prefill
+    )
+
+    assert (blocker is None) == supported
+    if not is_hybrid:
+        assert "hybrid linear-attention" in blocker
+    elif not enable_chunked_prefill:
+        assert "enable_chunked_prefill" in blocker
+
+
+@pytest.mark.parametrize("sm_version", [100, 107])
+def test_hybrid_fp4_mla_keeps_block_reuse_with_chunked_prefill(monkeypatch, sm_version):
+    ctx_chunk_configs = []
+    kv_cache_reuse, runtime_cache_reuse, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=sm_version,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        enable_chunked_prefill=True,
+        is_hybrid_linear_model=True,
+        ctx_chunk_configs=ctx_chunk_configs,
+    )
+
+    # The cached prefix is attended through the FP4 chunked-prefill
+    # partitions, and snapshot-bounded chunks use the 128-token FP4 block.
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
+    assert runtime_chunked_prefill is True
+    assert ctx_chunk_configs == [(ContextChunkingPolicy.FORCE_CHUNK, 128)]
+
+
+@pytest.mark.parametrize(
+    ("is_hybrid", "enable_chunked_prefill"),
+    [(True, False), (False, True), (False, False)],
+    ids=["hybrid_without_chunked_prefill", "dense", "dense_without_chunked_prefill"],
+)
+def test_fp4_mla_disables_unsupported_block_reuse(
+    monkeypatch, is_hybrid: bool, enable_chunked_prefill: bool
+):
+    ctx_chunk_configs = []
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
+        monkeypatch,
+        sm_version=107,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        enable_chunked_prefill=enable_chunked_prefill,
+        is_hybrid_linear_model=is_hybrid,
+        ctx_chunk_configs=ctx_chunk_configs,
+    )
+
+    assert kv_cache_reuse is False
+    assert runtime_cache_reuse is False
+    # Without reuse, the hybrid model does not force snapshot chunking.
+    assert ctx_chunk_configs[0] is None or ctx_chunk_configs[0][0] != (
+        ContextChunkingPolicy.FORCE_CHUNK
+    )
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):

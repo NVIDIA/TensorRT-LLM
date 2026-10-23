@@ -64,6 +64,7 @@ accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_s
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mmmu[tp_size=4-ep_size=4]
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4]
 accuracy/test_kimi3.py::TestKimiK3::test_gsm8k_nvfp4_dep8
+accuracy/test_kimi3.py::TestKimiK3::test_gsm8k_nvfp4_kv_dep8
 accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]

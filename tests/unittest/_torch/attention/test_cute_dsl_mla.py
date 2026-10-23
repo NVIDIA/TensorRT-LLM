@@ -251,3 +251,63 @@ def test_mla_generation_single_token_wide_head_fp8_below_perf_floor_falls_throug
         )
         == "trtllm_gen"
     )
+
+
+# kv_cache_block_offsets geometry with an odd page count per sequence, e.g. a
+# max_seq_len of 8320 over 128-token pages: each [num_seqs, 2, max_blocks] row
+# is 8 * 65 bytes, so an odd row offset leaves an 8-byte aligned slice.
+_NUM_POOLS = 3
+_MAX_NUM_SEQUENCES = 7
+_MAX_BLOCKS_PER_SEQ = 65
+
+
+@pytest.mark.parametrize(
+    "pool_idx, num_contexts, layer_in_pool, slice_is_aligned",
+    [
+        (0, 0, 0, True),
+        # Mixed batch: generation rows start past an odd number of contexts.
+        (0, 1, 0, False),
+        # A non-first pool behind an odd sequence capacity.
+        (1, 0, 0, False),
+        (2, 3, 0, False),
+        # KVCacheManagerV1 folds the layer slot into a fresh page table.
+        (0, 1, 2, False),
+    ],
+)
+def test_generation_page_table_keeps_the_runner_alignment(
+    pool_idx: int, num_contexts: int, layer_in_pool: int, slice_is_aligned: bool
+) -> None:
+    """The decode runner compiles the page table with assumed_align=16."""
+    batch_size = 4
+    block_offsets = torch.arange(
+        _NUM_POOLS * _MAX_NUM_SEQUENCES * 2 * _MAX_BLOCKS_PER_SEQ, dtype=torch.int32
+    ).view(_NUM_POOLS, _MAX_NUM_SEQUENCES, 2, _MAX_BLOCKS_PER_SEQ)
+    page_table_layer = block_offsets[pool_idx, :, 0, :]
+    rows = page_table_layer[num_contexts : num_contexts + batch_size]
+    assert (rows.data_ptr() % 16 == 0) == slice_is_aligned
+
+    page_table = CuteDslMlaFmha._generation_page_table(
+        page_table_layer, num_contexts, batch_size, layer_in_pool
+    )
+
+    assert page_table.data_ptr() % 16 == 0
+    assert page_table.dtype == torch.int32
+    assert page_table.shape == (_MAX_BLOCKS_PER_SEQ, batch_size)
+    assert page_table.stride(0) == 1
+    torch.testing.assert_close(page_table, rows.transpose(0, 1) + layer_in_pool)
+    if slice_is_aligned and not layer_in_pool:
+        # The common decode-only case launches on the metadata buffer itself.
+        assert page_table.data_ptr() == rows.data_ptr()
+
+
+@pytest.mark.parametrize("num_contexts", [0, 1, 3, 4])
+def test_generation_kv_lengths_keep_the_runner_alignment(num_contexts: int) -> None:
+    sequence_lengths = torch.arange(1, 17, dtype=torch.int32)
+    generation_lengths = sequence_lengths[num_contexts:]
+
+    aligned = CuteDslMlaFmha._aligned_kernel_input(generation_lengths)
+
+    assert aligned.data_ptr() % 16 == 0
+    torch.testing.assert_close(aligned, generation_lengths)
+    if generation_lengths.data_ptr() % 16 == 0:
+        assert aligned is generation_lengths

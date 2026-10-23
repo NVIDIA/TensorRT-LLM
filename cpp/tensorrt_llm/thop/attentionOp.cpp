@@ -1706,9 +1706,23 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
                 readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, 1, "host_kv_cache_pool_pointers"))
             + intraPoolOffsetSf);
     }
+    else if (hostKvCachePoolPointers.dim() == 3)
+    {
+        // A cache that also holds NVFP4 layers publishes the NVFP4 layout for every pool; a non-FP4 layer
+        // (for example an FP8 fallback layer of an FP4 MLA cache) reads the data pointers and has no scales.
+        pointers.primaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(
+                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, 0, "host_kv_cache_pool_pointers"))
+            + intraPoolOffset);
+        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(
+                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, 0, "host_kv_cache_pool_pointers"))
+            + intraPoolOffset);
+    }
     else
     {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2,
+            "host_kv_cache_pool_pointers must have rank 2, or rank 3 for a cache that also holds NVFP4 layers");
         pointers.primaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
                 readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))

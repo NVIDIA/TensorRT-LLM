@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -56,6 +57,9 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# ``assumed_align`` the decode runner compiles the page table and the KV
+# lengths with; their runtime pointers must keep it.
+_KERNEL_INPUT_ALIGN_BYTES = 16
 
 
 @triton.jit(
@@ -261,6 +265,27 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
+    def _is_nvfp4_manager_fallback_layer(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+    ) -> bool:
+        """Whether an NVFP4 KV cache manager stores this layer in its FP8 fallback pool.
+
+        The pool uses the FP4 MLA 128-token pages, which only this library
+        consumes for FP8 MLA generation, in decode-only and in mixed batches.
+        """
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is None or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4:
+            return False
+        layer_offsets = getattr(kv_cache_manager, "layer_offsets", {})
+        get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+        return (
+            callable(get_kv_cache_dtype)
+            and attn.layer_idx in layer_offsets
+            and get_kv_cache_dtype(attn.layer_idx) == DataType.FP8
+        )
+
+    @staticmethod
     def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
         if getattr(attn, "has_fp8_kv_cache", False):
             return torch.float8_e4m3fn
@@ -446,8 +471,11 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # overhead is reduced, except for an NVFP4 manager's FP8 fallback
+        # layer: no other library consumes its pages, and this path already
+        # slices the generation inputs and page tables past num_contexts.
+        nvfp4_fallback_layer = self._is_nvfp4_manager_fallback_layer(attn, meta)
+        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not nvfp4_fallback_layer):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -516,7 +544,7 @@ class CuteDslMlaFmha(PhasedFmha):
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group):
+        if not (helix_h96_verify_group or fp8_wide_head_verify_group or nvfp4_fallback_layer):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
@@ -640,15 +668,11 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        cache_seqs_base = self._aligned_kernel_input(params.sequence_lengths.to(torch.int32))
         # The page-table batch dimension determines the kernel launch batch.
-        page_table = (
-            page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
-            .transpose(0, 1)
-            .to(torch.int32)
+        page_table = self._generation_page_table(
+            page_table_layer, meta.num_contexts, batch_size, layer_in_pool
         )
-        if layers_in_pool > 1:
-            page_table = page_table + layer_in_pool
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view
@@ -708,6 +732,42 @@ class CuteDslMlaFmha(PhasedFmha):
             ),
             block_split_kvs,
         )
+
+    @staticmethod
+    def _aligned_kernel_input(tensor: torch.Tensor) -> torch.Tensor:
+        """Return ``tensor``, or a contiguous copy when its pointer breaks ``assumed_align``.
+
+        The decode runner compiles the page table and the KV lengths with a
+        16-byte ``assumed_align``, which the runtime pointer itself must keep.
+        Slicing past the context requests of a mixed batch, or into a
+        non-first pool of ``kv_cache_block_offsets``, can leave a 4- or 8-byte
+        aligned view of an aligned buffer. Aligned views (every decode-only
+        batch whose pool offset is aligned) pass through without a copy; the
+        copy otherwise comes from the caching allocator and, under CUDA graph
+        capture, replays with the graph.
+        """
+        if tensor.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return tensor
+        return tensor.clone(memory_format=torch.contiguous_format)
+
+    @classmethod
+    def _generation_page_table(
+        cls,
+        page_table_layer: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        layer_in_pool: int,
+    ) -> torch.Tensor:
+        """This step's ``[max_blocks, batch]`` int32 page table for the generation requests.
+
+        ``page_table_layer`` is one pool's ``[num_seqs, max_blocks]`` view of
+        ``kv_cache_block_offsets``; ``layer_in_pool`` folds a KVCacheManagerV1
+        layer slot into the page indices.
+        """
+        rows = page_table_layer[num_contexts : num_contexts + batch_size].to(torch.int32)
+        if layer_in_pool:
+            rows = rows + layer_in_pool
+        return cls._aligned_kernel_input(rows).transpose(0, 1)
 
     @staticmethod
     def _split_kv_plan(

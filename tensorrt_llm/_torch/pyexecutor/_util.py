@@ -231,10 +231,13 @@ def get_kv_cache_manager_cls(
                     "cache_transceiver_config backend='NIXL' with "
                     "transceiver_runtime='PYTHON' (got "
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
-        if is_hybrid_linear(config):
-            raise NotImplementedError(
-                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
-                "support hybrid linear-attention models.")
+        if (is_hybrid_linear(config)
+                and model_config.get_num_mamba_layers() > 0):
+            # The hybrid V2 manager composes the FP4 MLA cache layout with
+            # its recurrent-state lifecycle and keeps the KDA replay caches
+            # used by fused speculative verification. Its disaggregation
+            # declarations cover both the MLA and the recurrent-state roles.
+            return MambaHybridCacheManagerV2
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 
@@ -2176,8 +2179,8 @@ class KvCacheCreator:
     def _get_draft_kv_model_config(self) -> ModelConfig:
         """The draft ModelConfig describing the KV pool as it is ALLOCATED.
 
-        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 KV
-        algo onto every loaded model, including a standalone drafter. The drafter
+        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 or
+        nvfp4 KV algo onto every loaded model, including a standalone drafter. The drafter
         stores and reads its pool in its weights dtype (DFlash validates a bf16 pool
         and otherwise falls back to the max_seq_len-dense private arena, which OOMs at
         long context), so the pool dtype must follow the drafter.
@@ -2198,12 +2201,13 @@ class KvCacheCreator:
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
         quant_config = getattr(effective_draft_config, "quant_config", None)
-        if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
-        ):
+        if quant_config is None or not (
+                quant_config.quant_mode.has_fp8_kv_cache()
+                or quant_config.quant_mode.has_fp4_kv_cache()):
             return effective_draft_config
         logger.info(
             "External drafter KV pool keeps the drafter dtype; dropping "
-            "the fp8 KV quant algo inherited from the target.")
+            "the fp8/nvfp4 KV quant algo inherited from the target.")
         neutral_quant = copy.copy(quant_config)
         neutral_quant.kv_cache_quant_algo = None
         # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
@@ -2299,7 +2303,7 @@ class KvCacheCreator:
 
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP), with the
-        # target's inherited fp8 KV algo dropped for a standalone drafter. The
+        # target's inherited fp8/nvfp4 KV algo dropped for a standalone drafter. The
         # budget split in _get_kv_size_per_token resolves it through the SAME
         # helper, so the bytes/token it charges match the pool allocated here.
         effective_draft_config = self._get_draft_kv_model_config()
@@ -3526,6 +3530,12 @@ def _create_kv_cache_manager(
                 if (issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                         and getattr(backbone, "kda_draft_records", False)):
                     kda_extra_kwargs["kda_draft_records"] = True
+        if (not is_glm5_next and issubclass(kv_cache_manager_cls,
+                                            MambaHybridCacheManagerV2)):
+            # The V2 manager reads the MLA geometry and the per-layer KV
+            # dtype policy from the model config when it composes the FP4
+            # MLA cache layout (NVFP4 KV cache).
+            kda_extra_kwargs["pretrained_config"] = config
         if is_glm5_next:
             # The manager places an indexer buffer on every attention layer.
             from ..attention.backends.sparse.glm_kpool import \
