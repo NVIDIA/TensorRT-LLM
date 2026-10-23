@@ -3563,8 +3563,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
-            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
-                draft_len = self.max_total_draft_tokens
+            if not self.is_draft and not req.py_disable_speculative_decoding:
+                # The GEN pads a CTX draft shorter than its own width (no draft,
+                # or a CTX with a smaller max_draft_len) up to
+                # max_total_draft_tokens, so reserve for the padded width.
+                draft_len = max(draft_len, self.max_total_draft_tokens)
         return draft_len
 
     def _helix_local_len(self, global_len: int) -> int:

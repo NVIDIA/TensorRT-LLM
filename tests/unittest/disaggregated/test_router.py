@@ -3,6 +3,7 @@
 
 import asyncio
 import copy
+import os
 import random
 import threading
 from pathlib import Path
@@ -2385,6 +2386,219 @@ def _grow_conversation():
         convo.append({"role": "assistant", "content": f"resp{turn} " * 30})
         convo.append({"role": "user", "content": f"q{turn} " * 12})
         yield [dict(m) for m in convo]
+
+
+class _BoundaryMergingTokenizer:
+    """Greedy tokenizer with a merge across the prompt rewrite boundary.
+
+    ``<|im_start|>`` and ``<|im_end|>`` are added tokens, the restart points
+    of incremental tokenization.
+    """
+
+    _TOKENS = {
+        "<|im_start|>": 10,
+        "<|im_end|>": 11,
+        "\nactual": 1,
+        "\n": 2,
+    }
+
+    def __init__(self):
+        self.calls = []
+        self.added_tokens_decoder = {
+            token_id:
+            SimpleNamespace(content=token,
+                            lstrip=False,
+                            rstrip=False,
+                            single_word=False,
+                            normalized=False)
+            for token, token_id in self._TOKENS.items()
+            if token.startswith("<|")
+        }
+
+    def _tokenize(self, text):
+        ids = []
+        offsets = []
+        position = 0
+        vocabulary = sorted(self._TOKENS, key=len, reverse=True)
+        while position < len(text):
+            token = next(
+                (item
+                 for item in vocabulary if text.startswith(item, position)),
+                None)
+            if token is None:
+                token = text[position]
+                token_id = 1000 + ord(token)
+            else:
+                token_id = self._TOKENS[token]
+            ids.append(token_id)
+            offsets.append((position, position + len(token)))
+            position += len(token)
+        return ids, offsets
+
+    def __call__(self,
+                 text,
+                 add_special_tokens=False,
+                 return_offsets_mapping=False):
+        del add_special_tokens
+        self.calls.append(text)
+        ids, offsets = self._tokenize(text)
+        result = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return self._tokenize(text)[0]
+
+
+class _LeadingWhitespaceTokenizer:
+
+    @staticmethod
+    def _tokenize(text):
+        ids = []
+        offsets = []
+        for position, character in enumerate(text):
+            if character.isspace():
+                continue
+            ids.append(ord(character))
+            offsets.append((position, position + 1))
+        return ids, offsets
+
+    def __call__(self,
+                 text,
+                 add_special_tokens=False,
+                 return_offsets_mapping=False):
+        del add_special_tokens
+        ids, offsets = self._tokenize(text)
+        result = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return self._tokenize(text)[0]
+
+
+class _OffsetFailureTokenizer(_BoundaryMergingTokenizer):
+
+    def __init__(self):
+        super().__init__()
+        self.offset_failure = None
+
+    def __call__(self, *args, **kwargs):
+        result = super().__call__(*args, **kwargs)
+        if self.offset_failure == "unavailable":
+            raise NotImplementedError
+        if self.offset_failure == "invalid":
+            result["offset_mapping"] = result["offset_mapping"][:-1]
+        return result
+
+
+# The next turn replaces the previous prompt's trailing ``<think>\n`` generation
+# prefix with the actual response, so the new prompt is not an extension of the old.
+_REWRITE_COMMON = "stable-prefix<|im_end|>\n<|im_start|>assistant"
+_REWRITE_PREVIOUS = _REWRITE_COMMON + "\n<think>\n"
+_REWRITE_CURRENT_SUFFIX = ("\nactual response<|im_end|>\n"
+                           "<|im_start|>user\nnext request<|im_end|>\n"
+                           "<|im_start|>assistant\n<think>\n")
+_REWRITE_CURRENT = _REWRITE_COMMON + _REWRITE_CURRENT_SUFFIX
+# Re-encoded from the last added token inside the common prefix.
+_REWRITE_REENCODED = "<|im_start|>assistant" + _REWRITE_CURRENT_SUFFIX
+
+
+@pytest.mark.asyncio
+async def test_ctx_frontend_uses_shared_incremental_tokenizer():
+    """CTX frontend tokenization must exercise the same cache as router tokenization."""
+    from tensorrt_llm.serve.chat_tokenization import \
+        IncrementalTokenizationCache
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    tokenizer = _BoundaryMergingTokenizer()
+    server = object.__new__(OpenAIServer)
+    server._incremental_tokenizer = IncrementalTokenizationCache(
+        name="ctx frontend", enabled=True)
+    server.tokenizer = SimpleNamespace(tokenizer=tokenizer)
+    server._input_proc_executor = None
+    request = ChatCompletionRequest(
+        model="mock",
+        messages=[{
+            "role": "user",
+            "content": "next request"
+        }],
+        conversation_params=ConversationParams(
+            conversation_id="agentic-session"),
+    )
+
+    first = await server._maybe_incremental_tokenize_chat_prompt(
+        _REWRITE_PREVIOUS, request, has_multimodal=False)
+    assert first == tokenizer.encode(_REWRITE_PREVIOUS)
+    tokenizer.calls.clear()
+    result = await server._maybe_incremental_tokenize_chat_prompt(
+        _REWRITE_CURRENT, request, has_multimodal=False)
+
+    assert result == tokenizer.encode(_REWRITE_CURRENT)
+    assert tokenizer.calls == [_REWRITE_REENCODED]
+    assert server._incremental_tokenizer._incremental_hits == 1
+
+
+def test_prefix_cache_rolls_back_boundary_token(servers):
+    """A rewritten prompt tail is re-encoded from the last added token before it."""
+    with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _BoundaryMergingTokenizer()
+        key = 42
+        assert not _REWRITE_CURRENT.startswith(_REWRITE_PREVIOUS)
+        assert router._encode_with_prefix_cache(
+            _REWRITE_PREVIOUS, key,
+            tokenizer) == tokenizer.encode(_REWRITE_PREVIOUS)
+        tokenizer.calls.clear()
+        result = router._encode_with_prefix_cache(_REWRITE_CURRENT, key,
+                                                  tokenizer)
+
+    assert result == tokenizer.encode(_REWRITE_CURRENT)
+    assert tokenizer.calls == [_REWRITE_REENCODED]
+
+
+def test_prefix_cache_zero_cut_includes_changed_leading_text(servers):
+    """A zero-token cut must start before a tokenizer-skipped prefix."""
+    with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _LeadingWhitespaceTokenizer()
+        key = 43
+        previous = " cached"
+        current = "Xcached"
+        assert router._encode_with_prefix_cache(
+            previous, key, tokenizer) == tokenizer.encode(previous)
+        result = router._encode_with_prefix_cache(current, key, tokenizer)
+
+    assert result == tokenizer.encode(current)
+
+
+@pytest.mark.parametrize("offset_failure", ["unavailable", "invalid"])
+def test_prefix_cache_falls_back_for_unusable_offsets(servers, offset_failure):
+    """Unavailable or inconsistent offsets trigger canonical tokenization."""
+    with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _OffsetFailureTokenizer()
+        key = 44
+        previous = "system<|im_end|>stable\n"
+        current = "system<|im_end|>stable\nactual response"
+        assert router._encode_with_prefix_cache(
+            previous, key, tokenizer) == tokenizer.encode(previous)
+        tokenizer.calls.clear()
+        tokenizer.offset_failure = offset_failure
+        result = router._encode_with_prefix_cache(current, key, tokenizer)
+
+    assert result == tokenizer.encode(current)
+    assert tokenizer.calls == ["<|im_end|>stable\nactual response", current]
 
 
 def test_prefix_cache_tokenize_matches_full_encode(servers):

@@ -2861,6 +2861,17 @@ class TestPiecewiseCudaGraphCaptureDefaults:
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
                 torch_compile_config=TorchCompileConfig())
 
+    def test_prefill_bcg_env_selects_breakable_and_keeps_buckets(
+            self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_PREFILL_BCG", "1")
+        args = TorchLlmArgs(model=llama_model_path,
+                            torch_compile_config=TorchCompileConfig(
+                                enable_piecewise_cuda_graph=True,
+                                capture_num_tokens=[128, 256]))
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE
+        assert args.prefill_capture_num_tokens == [256, 128]
+        assert args.torch_compile_config is None
+
     def test_breakable_allows_speculative_decoding(self):
         speculative_config = MTPDecodingConfig(max_draft_len=1)
         args = TorchLlmArgs(

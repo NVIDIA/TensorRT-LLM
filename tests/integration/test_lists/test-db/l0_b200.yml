@@ -276,6 +276,11 @@ l0_b200:
   # step that runs them (SM 100; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py
   - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/speculative/test_q35_fused_accept.py
+  - unittest/_torch/speculative/test_sampling_scan_cache.py
+  - unittest/_torch/speculative/test_spec_prepare_cache.py
+  - unittest/_torch/speculative/test_spec_store_scatter.py
+  - unittest/_torch/test_q35_env.py
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel

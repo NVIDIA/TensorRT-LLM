@@ -905,9 +905,12 @@ class DecoderCudaGraphs:
             self._config.prefill_cuda_graph_num_tokens, reverse=True
         )
 
+        # The breakable backend also opens the piecewise capture window: per-bucket graphs outside the captured
+        # body (the Qwen3.5 context MTP draft step, speculative/q35_ctx_mtp_graph.py) capture only inside it.
         capture_context = (
             capture_piecewise_cuda_graph(True)
             if self._config.torch_compile_piecewise_cuda_graph
+            or self.breakable_cuda_graph_runner is not None
             else contextlib.nullcontext()
         )
         enable_spec_decode = self._config.is_spec_decode

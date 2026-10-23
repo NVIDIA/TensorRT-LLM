@@ -1001,6 +1001,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        # In-forward Mamba snapshot point P the scheduler let this context
+        # chunk run past (MambaHybridCacheManagerV2 consumes it), and the event
+        # after which the request's live recurrent state is restored.
+        self.py_mamba_inforward_snapshot_point: Optional[int] = None
+        self.py_mamba_restore_event: Optional[torch.cuda.Event] = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1631,7 +1636,12 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    else:
+        # Owned int32 ndarray: the LlmRequest ctor memcpys it, where
+        # `input_token_ids` would build O(ISL) PyLongs to be cast back one by one.
+        input_tokens = executor_request.input_token_ids_i32
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     # Kept in its native list[list[int]] form, like py_bad_words. The

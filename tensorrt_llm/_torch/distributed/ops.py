@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch import q35_env
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
@@ -245,13 +246,28 @@ def _mnnvl_workspace_all_succeeded(comm, local_success: bool) -> bool:
     return comm.allreduce(int(local_success)) == comm.Get_size()
 
 
+def _q35_mnnvl_presize_bytes(mapping: Mapping, dtype: torch.dtype) -> int:
+    """Bytes per Lamport buffer for the model's largest all-reduce (as recorded by AllReduce.__init__), or 0."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+    tokens = AllReduceRunner._prealloc_max_num_tokens
+    hidden = AllReduceRunner._prealloc_hidden_size
+    if not tokens or not hidden:
+        return 0
+    return MNNVLAllReduce.get_required_workspace_size(tokens, hidden,
+                                                      mapping.tp_size, dtype)
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
-        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+        buffer_size_bytes: Optional[int] = None) -> Optional[_MnnvlWorkspace]:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
+
+    Under the Qwen3.5 fast paths the first call sizes the workspace for the model's largest all-reduce and it
+    is never re-created (re-creation is a collective fabric allocation); a call needing more gets None and
+    the caller falls back to another all-reduce.
     """
 
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
@@ -264,9 +280,9 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(mapping)
     with workspace_lock:
-        return _mark_if_capturing(
-            _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
-                                                    buffer_size_bytes))
+        workspace = _get_or_scale_allreduce_mnnvl_workspace(
+            mapping, dtype, buffer_size_bytes)
+        return _mark_if_capturing(workspace) if workspace is not None else None
 
 
 def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
@@ -279,7 +295,7 @@ def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
 def _get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
-        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+        buffer_size_bytes: Optional[int] = None) -> Optional[_MnnvlWorkspace]:
 
     NUM_LAMPORT_BUFFERS = 3
 
@@ -291,6 +307,23 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         workspace = allreduce_mnnvl_workspaces[mapping]
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
+
+    if q35_env.fast_paths_enabled():
+        # Sized once (see get_or_scale_allreduce_mnnvl_workspace).
+        workspace = allreduce_mnnvl_workspaces.get(mapping)
+        if workspace is not None:
+            if workspace["buffer_size_bytes"] < (buffer_size_bytes or 0):
+                logger.warning_once(
+                    f"[MNNVL] The workspace of tp_size {mapping.tp_size} is sized once at "
+                    f"{workspace['buffer_size_bytes']} bytes per buffer; a call needing {buffer_size_bytes} "
+                    "bytes takes another all-reduce",
+                    key=("mnnvl_sized_once", mapping.pp_rank, mapping.tp_size))
+                return None
+            return workspace
+        # Never below the default initial size (1024 tokens x 8192 hidden).
+        buffer_size_bytes = max(
+            buffer_size_bytes or 0, _q35_mnnvl_presize_bytes(mapping, dtype),
+            1024 * 8192 * torch.tensor([], dtype=dtype).element_size())
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
@@ -976,6 +1009,8 @@ class MNNVLAllReduce(nn.Module):
             self.dtype,
             buffer_size_bytes=workspace_size_bytes,
         )
+        if workspace is None:  # Sized once (Qwen3.5 fast paths) and too small for this call.
+            return None
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
         buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
@@ -1237,6 +1272,13 @@ class AllReduce(nn.Module):
         if allreduce_strategy in (AllReduceStrategy.MNNVL,
                                   AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
+        # The Qwen3.5 fast paths never run NCCL_SYMMETRIC (see q35_ar_no_nccl_symm): explicit NCCL_SYMMETRIC
+        # runs NCCL, and AUTO keeps the Python tactic selection, whose cache-miss fallback is NCCL rather
+        # than the native lookup's NCCL_SYMMETRIC.
+        q35_no_nccl_symm = q35_env.fast_paths_enabled()
+        if (allreduce_strategy == AllReduceStrategy.NCCL_SYMMETRIC
+                and q35_no_nccl_symm):
+            allreduce_strategy = AllReduceStrategy.NCCL
 
         additional_args = {}
         if self._disable_mpi:
@@ -1256,7 +1298,9 @@ class AllReduce(nn.Module):
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
             # Use native lookup after tuning unless its Python/C++ contract
             # failed; then retain the existing Python cache and selection path.
-            if _ALLREDUCE_AUTOTUNER_TUNING_MODE or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+            if (_ALLREDUCE_AUTOTUNER_TUNING_MODE
+                    or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
+                    or q35_no_nccl_symm):
                 output = torch.ops.trtllm.tunable_allreduce(
                     input=input,
                     residual=all_reduce_params.residual,

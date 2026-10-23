@@ -45,6 +45,7 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -196,6 +197,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
+        self._inputs.breakable_cuda_graph_runner = self._graphs.breakable_cuda_graph_runner
+        self._inputs.cuda_graph_runner = self._graphs.cuda_graph_runner
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -463,6 +466,10 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
+        logger.info(
+            f"Breakable prefill CUDA graphs on {type(decoder_model.model).__name__} "
+            f"for num_tokens={self._config.prefill_cuda_graph_num_tokens}"
+        )
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     @property

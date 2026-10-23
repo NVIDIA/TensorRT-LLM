@@ -18,6 +18,8 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import os
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -5040,3 +5042,330 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+# ===========================================================================
+# Shortest-first context order and its starvation guard (TRTLLM_CTX_SCHED_SRPT*)
+# ===========================================================================
+
+_SRPT_ENV_KEYS = (
+    "TRTLLM_CTX_SCHED_SRPT",
+    "TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS",
+    "TRTLLM_CTX_SCHED_SRPT_SHORT_TOKENS",
+    "TRTLLM_CTX_SCHED_SRPT_AGE_S",
+    "TRTLLM_CTX_SCHED_SRPT_AGE_ITERS",
+    "TRTLLM_CTX_SCHED_SRPT_AGE_CAP",
+)
+TP4 = SimpleNamespace(tp_size=4, cp_size=1, enable_attention_dp=False)
+DEP4 = SimpleNamespace(tp_size=4, cp_size=1, enable_attention_dp=True)
+
+
+def _make_srpt_scheduler(env, budget, mgr=None, max_batch_size=100, policy=None, mapping=None):
+    """Scheduler built under *env* (other SRPT keys unset) with 64-token chunk units."""
+    mgr = mgr or make_kv_cache_manager(tokens_per_block=64)
+    if mapping is not None:
+        mgr.mapping = mapping
+    with patch.dict(os.environ, env):
+        for key in _SRPT_ENV_KEYS:
+            if key not in env:
+                os.environ.pop(key, None)
+        return make_scheduler(
+            mgr,
+            max_batch_size=max_batch_size,
+            max_num_tokens=budget,
+            ctx_chunk_config=(policy, 64),
+        )
+
+
+class TestShortestFirstOrder:
+    SRPT = {"TRTLLM_CTX_SCHED_SRPT": "1"}
+
+    def test_shortest_first_order(self):
+        sched = _make_srpt_scheduler(self.SRPT, 8192)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        short = make_ctx_request(1, context_remaining_length=3000)
+        out = sched.schedule_request([long, short], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert short.context_chunk_size == 3000
+        assert long.context_chunk_size == 5184  # (8192 - 3000) // 64 * 64
+
+    def test_equal_lengths_keep_arrival_order(self):
+        sched = _make_srpt_scheduler(self.SRPT, 8192)
+        reqs = [make_ctx_request(i, context_remaining_length=6000) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert reqs[0].context_chunk_size == 6000
+        assert reqs[1].context_chunk_size == 2176  # (8192 - 6000) // 64 * 64
+        assert 2 not in ids(out.context_requests)
+
+    def test_reusable_prefix_is_not_counted(self):
+        """A mostly-cached first chunk sorts ahead of a shorter uncached prompt, probed once."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        reusable = {0: 0, 1: 9000}
+        mgr.probe_context_reuse.side_effect = lambda req: reusable[req.py_request_id]
+        sched = _make_srpt_scheduler(self.SRPT, 8192, mgr=mgr)
+        uncached = make_ctx_request(0, context_remaining_length=6000)
+        cached = make_ctx_request(1, context_remaining_length=10000)
+        ordered, first_uncached = sched._order_ctx_shortest_first([uncached, cached])
+        assert ordered == [cached, uncached]
+        assert first_uncached == 1000
+        sched._order_ctx_shortest_first([uncached, cached])
+        assert mgr.probe_context_reuse.call_count == 2  # once per request
+        # Probing claims nothing.
+        mgr.prepare_context.assert_not_called()
+        mgr.prepare_context_cache.assert_not_called()
+
+    def test_started_request_uses_remaining_length(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.probe_context_reuse.side_effect = lambda req: 40000
+        sched = _make_srpt_scheduler(self.SRPT, 8192, mgr=mgr)
+        started = make_ctx_request(0, context_remaining_length=5000, is_first_context_chunk=False)
+        assert sched._uncached_tokens(started) == 5000
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_encoder_requests_keep_arrival_order(self):
+        sched = _make_srpt_scheduler(self.SRPT, 8192)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        enc = make_encoder_request(1, encoder_output_len=100)
+        short = make_ctx_request(2, context_remaining_length=3000)
+        ordered, first_uncached = sched._order_ctx_shortest_first([long, enc, short])
+        assert ordered == [long, enc, short]
+        assert first_uncached is None
+
+    @pytest.mark.parametrize(
+        "second_len, short_tokens, long_chunk",
+        [
+            (3000, "4096", 1088),  # short request pending: budget capped at 4096
+            (60000, "4096", 16384),  # long requests only: full budget
+            (3000, "2048", 13376),  # 3000 is not short under a 2048 threshold
+        ],
+    )
+    def test_latency_budget(self, second_len, short_tokens, long_chunk):
+        sched = _make_srpt_scheduler(
+            {
+                **self.SRPT,
+                "TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS": "4096",
+                "TRTLLM_CTX_SCHED_SRPT_SHORT_TOKENS": short_tokens,
+            },
+            16384,
+        )
+        long = make_ctx_request(0, context_remaining_length=50000)
+        second = make_ctx_request(1, context_remaining_length=second_len)
+        sched.schedule_request([long, second], set())
+        assert long.context_chunk_size == long_chunk
+
+
+class TestShortestFirstAging:
+    BUDGET = 8192
+    SRPT = {"TRTLLM_CTX_SCHED_SRPT": "1"}
+    AGED = {"TRTLLM_CTX_SCHED_SRPT": "1", "TRTLLM_CTX_SCHED_SRPT_AGE_S": "8"}
+    AGED_ITERS = {"TRTLLM_CTX_SCHED_SRPT": "1", "TRTLLM_CTX_SCHED_SRPT_AGE_ITERS": "3"}
+
+    def _make_sched(self, env, max_batch_size=100, policy=None, mapping=None):
+        """Scheduler with an 8192-token budget, 64-token chunk units and a fake clock at t=100 s."""
+        sched = _make_srpt_scheduler(
+            env, self.BUDGET, max_batch_size=max_batch_size, policy=policy, mapping=mapping
+        )
+        now = [100.0]
+        sched._clock = lambda: now[0]
+        return sched, now
+
+    @staticmethod
+    def _seen_at(req, t):
+        req.py_ctx_sched_since = float(t)
+        return req
+
+    @staticmethod
+    def _shorts(first_id, n=4, length=2100):
+        return [
+            make_ctx_request(i, context_remaining_length=length)
+            for i in range(first_id, first_id + n)
+        ]
+
+    def test_plain_shortest_first_starves_old_request(self):
+        sched, _ = self._make_sched(self.SRPT)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        out = sched.schedule_request([long] + self._shorts(1), set())
+        # 3 x 2100 + 1856 leave 36 tokens: less than one 64-token unit for the long prefill.
+        assert 0 not in ids(out.context_requests)
+
+    def test_aged_request_takes_capped_share_first(self):
+        sched, _ = self._make_sched(self.AGED)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        shorts = self._shorts(1)
+        out = sched.schedule_request([long] + shorts, set())
+        assert sorted(ids(out.context_requests)) == [0, 1, 2, 3]
+        # 2048 held for the aged request; the shorts fill 8192 - 2048 = 6144 shortest-first.
+        assert [s.context_chunk_size for s in shorts[:3]] == [2100, 2100, 1920]
+        assert long.context_chunk_size == 2048
+
+    def test_aged_request_gets_leftover(self):
+        sched, _ = self._make_sched(self.AGED)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        short = make_ctx_request(1, context_remaining_length=1000)
+        sched.schedule_request([long, short], set())
+        assert short.context_chunk_size == 1000
+        # 2048 + the 5144 the short request left, in 64-token units.
+        assert long.context_chunk_size == 7168
+
+    def test_aged_requests_oldest_first(self):
+        sched, _ = self._make_sched(self.AGED)
+        younger = self._seen_at(make_ctx_request(0, context_remaining_length=30000), 50)
+        older = self._seen_at(make_ctx_request(1, context_remaining_length=60000), 10)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        sched.schedule_request([younger, older, short], set())
+        assert short.context_chunk_size == 1000
+        # Both hold 2048; the 3096 left by the short request goes to the older one first.
+        assert older.context_chunk_size == 5120
+        assert younger.context_chunk_size == 2048
+
+    def test_aged_request_holds_only_what_it_needs(self):
+        sched, _ = self._make_sched(self.AGED)
+        tail = self._seen_at(make_ctx_request(0, context_remaining_length=500), 0)
+        shorts = self._shorts(1)
+        sched.schedule_request([tail] + shorts, set())
+        assert tail.context_chunk_size == 500
+        assert [s.context_chunk_size for s in shorts] == [2100, 2100, 2100, 1344]
+
+    def test_wait_counts_from_first_sight(self):
+        sched, now = self._make_sched(self.AGED)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        sched.schedule_request([long] + self._shorts(1), set())
+        assert long.py_ctx_sched_since == 100.0
+        now[0] = 108.0  # waited exactly the limit: not aged yet
+        out = sched.schedule_request([long] + self._shorts(11), set())
+        assert 0 not in ids(out.context_requests)
+        now[0] = 108.5
+        out = sched.schedule_request([long] + self._shorts(21), set())
+        assert 0 in ids(out.context_requests)
+        assert long.context_chunk_size == 2048
+
+    def test_lone_aged_request_takes_whole_budget(self):
+        sched, _ = self._make_sched(self.AGED)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        sched.schedule_request([long], set())
+        assert long.context_chunk_size == 8192
+
+    def test_aged_request_keeps_a_request_slot(self):
+        sched, _ = self._make_sched(self.AGED, max_batch_size=2)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        out = sched.schedule_request([long] + self._shorts(1, n=3, length=500), set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert long.context_chunk_size == 7680  # 8192 - 500, in 64-token units
+
+    def test_force_chunk_stops_at_cap_before_snapshot_point(self):
+        sched, _ = self._make_sched(self.AGED, policy=ContextChunkingPolicy.FORCE_CHUNK)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        long.expect_snapshot_points = [49998]
+        shorts = self._shorts(1)
+        sched.schedule_request([long] + shorts, set())
+        assert long.context_chunk_size == 2048
+        assert [s.context_chunk_size for s in shorts[:3]] == [2100, 2100, 1920]
+
+    # ---- rank consistency: TP / CP ranks without attention DP run the same schedule ----
+
+    @pytest.mark.parametrize("mapping, aged", [(TP4, False), (DEP4, True)])
+    def test_seconds_only_where_each_rank_schedules_alone(self, mapping, aged):
+        sched, _ = self._make_sched(self.AGED, mapping=mapping)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        out = sched.schedule_request([long] + self._shorts(1), set())
+        assert (0 in ids(out.context_requests)) is aged
+        if aged:
+            assert long.context_chunk_size == 2048
+
+    def test_iterations_threshold(self):
+        sched, now = self._make_sched(self.AGED_ITERS, mapping=TP4)
+        assert sched._ctx_age_iters == 3
+        long = make_ctx_request(0, context_remaining_length=50000)
+        # First seen in iteration 1; up to iteration 4 it has not waited more than 3 iterations.
+        for it in range(1, 5):
+            now[0] += 100.0  # the clock plays no part
+            out = sched.schedule_request([long] + self._shorts(10 * it), set())
+            assert 0 not in ids(out.context_requests), it
+        assert long.py_ctx_sched_since_iter == 1
+        out = sched.schedule_request([long] + self._shorts(50), set())
+        assert 0 in ids(out.context_requests)
+        assert long.context_chunk_size == 2048
+
+    def test_iterations_same_decisions_on_every_tp_rank(self):
+        """Two TP ranks with drifting clocks age the same requests in the same iteration."""
+
+        def rank(clock_step):
+            sched, now = self._make_sched(self.AGED_ITERS, mapping=TP4)
+            long = make_ctx_request(0, context_remaining_length=50000)
+            chunks = []
+            for it in range(8):
+                now[0] += clock_step  # each rank's own clock
+                shorts = self._shorts(10 * (it + 1))
+                out = sched.schedule_request([long] + shorts, set())
+                sizes = [r.context_chunk_size for r in [long] + shorts]
+                chunks.append((sorted(ids(out.context_requests)), sizes))
+            return chunks
+
+        assert rank(0.9) == rank(1.7)
+
+
+class TestInforwardMambaSnapshot:
+    """A forced chunk ending at the last snapshot point P runs through the prompt end
+    instead when the Mamba manager takes the snapshot inside the forward."""
+
+    PROMPT = 4000
+
+    def _sched(self, rows=2, max_num_tokens=8192):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        mgr.inforward_snapshot_rows = rows
+        mgr.inforward_snapshot_max_tail = 16
+        mgr.inforward_snapshot_min_main = 3
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=max_num_tokens,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        return sched
+
+    def _req(self, rid, point=PROMPT - 2):
+        req = make_ctx_request(rid, context_remaining_length=self.PROMPT)
+        req.expect_snapshot_points = [point]
+        req.py_multimodal_data = None
+        req.py_mamba_inforward_snapshot_point = None
+        return req
+
+    def test_context_only_chunk_runs_through_the_prompt_end(self):
+        sched = self._sched()
+        req = self._req(0)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == self.PROMPT
+        assert req.py_mamba_inforward_snapshot_point == self.PROMPT - 2
+
+    @pytest.mark.parametrize(
+        "rows, max_num_tokens, point, with_gen",
+        [
+            (0, 8192, PROMPT - 2, False),  # no staging rows
+            (2, 8192, PROMPT - 2, True),  # batch with generation requests
+            (2, 8192, PROMPT - 17, False),  # tail longer than max_tail
+            (2, PROMPT - 1, PROMPT - 2, False),  # tail does not fit the token budget
+        ],
+        ids=["no_rows", "with_gen", "long_tail", "over_budget"],
+    )
+    def test_keeps_the_split(self, rows, max_num_tokens, point, with_gen):
+        sched = self._sched(rows=rows, max_num_tokens=max_num_tokens)
+        req = self._req(0, point=point)
+        extra = [make_gen_request(1)] if with_gen else []
+        sched.schedule_request([req] + extra, set())
+        assert req.context_chunk_size == point
+        assert req.py_mamba_inforward_snapshot_point is None
+
+    def test_staging_rows_cap_the_requests_per_batch(self):
+        sched = self._sched(rows=1, max_num_tokens=3 * self.PROMPT)
+        reqs = [self._req(i) for i in range(2)]
+        sched.schedule_request(reqs, set())
+        assert [r.context_chunk_size for r in reqs] == [self.PROMPT, self.PROMPT - 2]
+        assert [r.py_mamba_inforward_snapshot_point for r in reqs] == [self.PROMPT - 2, None]
+
+    def test_interior_snapshot_point_is_a_plain_chunk_boundary(self):
+        sched = self._sched()
+        req = self._req(0)
+        req.expect_snapshot_points = [2944, self.PROMPT - 2]
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 2944
+        assert req.py_mamba_inforward_snapshot_point is None

@@ -224,3 +224,20 @@ def test_connector_release_without_transceiver_terminates_on_last_claim() -> Non
     PyExecutor._release_transfer(executor, req)
 
     executor._terminate_request.assert_called_once_with(req)
+
+
+def test_send_waits_for_inforward_mamba_snapshot_restores() -> None:
+    """The prompt-end Mamba state is restored after the sampler event, so the
+    send must wait for the restore before the sender reads the cache."""
+    executor = _stub_executor()
+    calls = _wrapper_calls(executor)
+    executor._wait_mamba_restore_events = True
+    event = Mock()
+    event.synchronize.side_effect = lambda: calls.append("restore_wait")
+    restored = SimpleNamespace(py_mamba_restore_event=event)
+    plain = SimpleNamespace(py_mamba_restore_event=None)
+
+    PyExecutor._send_kv_async(executor, [plain, restored])
+
+    assert calls == ["restore_wait", "disagg_send", "connector_save", "ctx_reap:0"]
+    assert restored.py_mamba_restore_event is None

@@ -10,6 +10,8 @@ import triton.language.extra.libdevice as tldevice
 
 from tensorrt_llm._torch.modules.fla.op import exp
 from tensorrt_llm._torch.modules.fla.utils import input_guard
+from tensorrt_llm._torch.q35_env import fast_paths_enabled
+from tensorrt_llm._torch.q35_env import register as _q35_register
 from tensorrt_llm._utils import get_sm_version
 
 _SMALL_GRID_HEAD_TILES = 512
@@ -21,7 +23,30 @@ _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
-CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
+# Decode batches from CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE requests on use the partitioned replay and one all-layer
+# checkpoint commit per step; smaller ones commit inside each layer's replay.
+_DEFAULT_PARTITION_MIN_BATCH_SIZE = 16
+# Qwen3.5 on SM 10.3: the fused GDN target-verify kernels (gdn_mixer.py) commit in-layer up to 64 requests, so the
+# partitioned replay starts above that.
+Q35_PARTITION_MIN_BATCH_SIZE = 65
+
+
+@_q35_register
+def _q35_read_settings() -> None:
+    """Settings that differ under the Qwen3.5 fast paths; q35_env re-runs this when they are switched."""
+    global CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, _Q35_REPLAY_TILE
+    q35 = fast_paths_enabled()
+    CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = (
+        Q35_PARTITION_MIN_BATCH_SIZE if q35 else _DEFAULT_PARTITION_MIN_BATCH_SIZE
+    )
+    # The fine-grained value tiling (BV=16, 2 warps for <= 64 head tiles) for every T in [2, 8], not only T == 4.
+    # Outputs, histories and committed states are bitwise equal to the BV=128 launch.
+    _Q35_REPLAY_TILE = q35
+
+
+def cached_replay_partition_min_batch_size() -> int:
+    """The decode batch size from which the partitioned replay and the all-layer commit are used."""
+    return CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
 
 def _default_cached_replay_block_v(
@@ -761,14 +786,14 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     BK = triton.next_power_of_2(K)
     # The complete workload mapping is retained for the 4:1 shape; the
     # 2:1 fine tiling is enabled only through the measured low-batch range.
+    head_tiles = N * HV
     use_production_bf16_shape = (
-        T == 4
+        (T == 4 or (_Q35_REPLAY_TILE and 2 <= T and head_tiles <= _BV16_MAX_HEAD_TILES))
         and history_size <= 16
         and K == 128
         and V == 128
         and ssm_states.dtype == torch.bfloat16
     )
-    head_tiles = N * HV
     use_tuned_bf16_mapping = use_production_bf16_shape and HV == 4 * H
     use_fine_grained_mapping = use_production_bf16_shape and _supports_fine_grained_replay_tiling(
         H, HV, head_tiles

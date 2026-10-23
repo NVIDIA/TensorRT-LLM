@@ -309,17 +309,20 @@ def test_disagg_gen_transition_does_not_reserve_disabled_speculation():
     assert manager._effective_draft_len(request) == 0
 
 
-def test_disagg_gen_transition_prefers_context_drafts():
+@pytest.mark.parametrize("ctx_draft_len, expected", [(2, 4), (4, 4), (5, 5)])
+def test_disagg_gen_transition_reserves_padded_context_drafts(ctx_draft_len, expected):
+    # The GEN pads a CTX draft shorter than its own width (e.g. a CTX with
+    # max_draft_len 1) up to max_total_draft_tokens before its first forward.
     manager = _manager(is_draft=False)
     manager.max_total_draft_tokens = 4
     request = SimpleNamespace(
         py_draft_tokens=[],
         is_disagg_generation_transmission_complete=True,
-        context_phase_params=SimpleNamespace(draft_tokens=[1, 2]),
+        context_phase_params=SimpleNamespace(draft_tokens=list(range(ctx_draft_len))),
         py_disable_speculative_decoding=False,
     )
 
-    assert manager._effective_draft_len(request) == 2
+    assert manager._effective_draft_len(request) == expected
 
 
 def _generation_manager(draft_len: int, capacity: int = 100) -> tuple[KVCacheManagerV2, MagicMock]:

@@ -197,6 +197,22 @@ def _fill_stall_timeout_sec() -> float:
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1: also stream the first GEN step of a
+# generation-only request (see _handle_responses); otherwise its first streamed
+# content waits for decoding iteration stream_interval.
+DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME = "TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP"
+
+# With "1", the overlap loop of a speculative-decoding executor makes
+# ``execution_stream`` its current stream, so the two cross-stream waits per
+# forward drop out; the work order is unchanged.
+OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME = (
+    "TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM")
+
+# With "1", _forward_step orders the streams with two events re-recorded every
+# step instead of Stream.wait_stream (a new event per call). A wait captures the
+# record current at the time of the wait, so re-recording later is safe.
+CACHED_STREAM_EVENTS_ENV_VAR_NAME = "TRTLLM_Q35_CACHED_STREAM_EVENTS"
+
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
 # max_input_len truncation.
@@ -415,6 +431,9 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+    # The KV cache manager takes Mamba snapshots inside the forward, so a KV
+    # send must wait for the requests' state restores (_send_kv_async).
+    _wait_mamba_restore_events = False
 
     def __init__(
         self,
@@ -562,6 +581,8 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.disagg_gen_emit_first_step = os.environ.get(
+            DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME, "0") == "1"
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
@@ -687,6 +708,10 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        inforward_snapshot_rows = getattr(self.kv_cache_manager,
+                                          "inforward_snapshot_rows", 0)
+        self._wait_mamba_restore_events = (isinstance(
+            inforward_snapshot_rows, int) and inforward_snapshot_rows > 0)
         self.enable_joint_kv_cache_reuse = (
             self._is_kv_manager_v2
             and self.kv_cache_manager.enable_joint_kv_cache_reuse)
@@ -2748,7 +2773,7 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                token_count = item.request.num_input_tokens
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
@@ -5773,11 +5798,47 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    def _overlap_loop_stream(self):
+        """The current-stream context of the overlap loop.
+
+        ``execution_stream`` for a speculative-decoding executor with
+        ``TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM=1``; otherwise the thread's
+        current stream is left as it is.
+        """
+        if (os.environ.get(OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME, "0") == "1"
+                and self.model_engine.spec_config is not None):
+            return torch.cuda.stream(self.execution_stream)
+        return nullcontext()
+
+    def _cached_stream_events(
+            self) -> Optional[tuple[torch.cuda.Event, torch.cuda.Event]]:
+        """The two reusable stream-ordering events of _forward_step, or None (flag off)."""
+        if os.environ.get(CACHED_STREAM_EVENTS_ENV_VAR_NAME, "0") != "1":
+            return None
+        events = getattr(self, "_stream_ordering_events", None)
+        if events is None:
+            events = self._stream_ordering_events = (torch.cuda.Event(),
+                                                     torch.cuda.Event())
+        return events
+
+    def _forward_on_current_stream(self) -> bool:
+        """Whether the forward already runs on the caller's current stream.
+
+        True when the overlap loop runs on the execution stream
+        (``TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM=1``) and the caller's
+        current stream is that stream, so the forward needs no cross-stream
+        ordering.
+        """
+        if os.environ.get(OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME, "0") != "1":
+            return False
+        return torch.cuda.current_stream() == self.execution_stream
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        with self._profiler() as profile_step, self.hang_detector, \
+                self._overlap_loop_stream():
             iter_start_time = time.time()
             iter_stats = None
             previous_tensors_device = None
@@ -8125,6 +8186,14 @@ class PyExecutor:
                 # and the draft model will produce real tokens for next step.
                 ctx_draft_tokens = [0
                                     ] * self.model_engine.max_total_draft_tokens
+            elif (self.model_engine.enable_spec_decode and len(ctx_draft_tokens)
+                  < self.model_engine.max_total_draft_tokens):
+                # A CTX with a smaller max_draft_len than this GEN: pad to the
+                # GEN's draft width; like the dummies above, the padding is
+                # rejected on verify.
+                ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
+                    self.model_engine.max_total_draft_tokens -
+                    len(ctx_draft_tokens))
             req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
@@ -8299,6 +8368,15 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+        if self._wait_mamba_restore_events:
+            # In-forward Mamba snapshots copy the prompt-end state back after
+            # the sampler event; the KV sender reads the cache on its own
+            # stream, so that copy has to finish first.
+            for req in scheduled_requests:
+                restore_event = req.py_mamba_restore_event
+                if restore_event is not None:
+                    req.py_mamba_restore_event = None
+                    restore_event.synchronize()
         # Order matters: reaping before the connector registers its transfer
         # can release a request the connector still needs.
         self.disagg.send_completed_context(scheduled_requests)
@@ -8486,8 +8564,19 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
-            # with KVCacheTransferManager's onboard/offload operations.
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            # with KVCacheTransferManager's onboard/offload operations. With the
+            # overlap loop on the execution stream the forward already runs on
+            # the current stream, and the two stream-ordering waits are skipped.
+            same_stream = self._forward_on_current_stream()
+            stream_events = (None
+                             if same_stream else self._cached_stream_events())
+            if same_stream:
+                pass
+            elif stream_events is None:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
+            else:
+                stream_events[0].record(torch.cuda.current_stream())
+                self.execution_stream.wait_event(stream_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -8501,7 +8590,13 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if same_stream:
+                pass
+            elif stream_events is None:
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
+            else:
+                stream_events[1].record(self.execution_stream)
+                torch.cuda.current_stream().wait_event(stream_events[1])
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:
@@ -9353,6 +9448,9 @@ class PyExecutor:
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}
+        # Read through getattr: this pass also runs on the minimal executors
+        # unit tests assemble.
+        emit_first_gen_step = getattr(self, "disagg_gen_emit_first_step", False)
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -9430,9 +9528,15 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
+            # A generation-only request skipped its iteration-1 response (the
+            # CTX returned the first token); without this its first streamed
+            # content waits for decoding iteration stream_interval.
+            first_gen_emit = (
+                emit_first_gen_step and request.is_generation_only_request
+                and not getattr(request, "py_gen_first_emitted", False))
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or request.py_decoding_iter % self.stream_interval
-                           == 0)
+                           or first_gen_emit or
+                           request.py_decoding_iter % self.stream_interval == 0)
             # The early-emit prototype issues the (non-terminal) iter-1
             # response from `_emit_first_token_responses`; suppress it here.
             if (not emit_first_iter and request.py_decoding_iter == 1
@@ -9445,6 +9549,8 @@ class PyExecutor:
                         [request], gpu_times_cache=gpu_times_cache)
                 response = request.create_response()
                 if response:
+                    if first_gen_emit:
+                        request.py_gen_first_emitted = True
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     self._maybe_attach_ctx_usage(request, response)

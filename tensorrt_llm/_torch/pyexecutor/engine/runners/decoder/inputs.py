@@ -12,16 +12,22 @@ from typing import Any
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch import q35_env
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner,
+    get_mrope_dummy_seq_slot,
+)
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.q35_steady_prepare import SteadyMtpPrepare
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
@@ -30,8 +36,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
-from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_tokens
+from tensorrt_llm._torch.speculative import MTPSpecMetadata, SpecMetadata, get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
@@ -208,6 +215,9 @@ class ExtraInputsCollector:
 
 _NO_EXTRA_INPUTS = ExtraInputsCollector()
 
+# Spec metadata whose prepare() reads only the fields the steady one-model MTP prepare sets.
+_STEADY_MTP_SPEC_METADATA = (MTPSpecMetadata, Eagle3OneModelSpecMetadata)
+
 
 @dataclass(frozen=True, slots=True)
 class HostLists:
@@ -333,6 +343,10 @@ class DecoderInputPreparer:
         self.use_beam_search = use_beam_search
         self._steady_gen_cache_supported = steady_gen_cache_supported
         self.guided_decoder: CapturableGuidedDecoder | None = None
+        # Set by the runner once its CUDA graph components exist; the steady one-model MTP
+        # prepare reads cuda_graph_runner.
+        self.breakable_cuda_graph_runner: BreakableCUDAGraphRunner | None = None
+        self.cuda_graph_runner: CUDAGraphRunner | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
         self._gather_ids_buffer = (
             DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
@@ -355,6 +369,11 @@ class DecoderInputPreparer:
         # buffer is never the source of an async H2D). Invalidated (set to
         # None) by every full prepare_inputs pass.
         self._steady_gen_cache: dict[str, Any] | None = None
+        # Speculative counterpart of the cache above: the steady one-model MTP
+        # decode prepare (q35_steady_prepare.py), built on the first pass when
+        # it applies to this engine.
+        self._steady_mtp: SteadyMtpPrepare | None = None
+        self._steady_mtp_resolved = False
         # Log cached prefixes in model-input sequence order when enabled.
         self.log_cached_kv_tokens_per_req = (
             os.getenv("TLLM_LOG_CACHED_KV_TOKENS_PER_REQ", "0") == "1"
@@ -526,6 +545,14 @@ class DecoderInputPreparer:
                 mapping=self.mapping,
                 dist=self.dist,
             )
+        prefill_cuda_graph_num_tokens = self._config.prefill_cuda_graph_num_tokens
+        breakable_runner = self.breakable_cuda_graph_runner
+        if breakable_runner is not None and not (
+            breakable_runner.is_capturing or breakable_runner.is_warming_up
+        ):
+            # Pad only to a bucket that replays; any other batch runs eagerly
+            # at its real token count. Every TP rank captures the same buckets.
+            prefill_cuda_graph_num_tokens = breakable_runner.captured_num_tokens
         return pad_input_tokens(
             attn_metadata,
             num_tokens,
@@ -540,7 +567,7 @@ class DecoderInputPreparer:
                 if allow_prefill_cuda_graph
                 else PrefillCudaGraphBackend.DISABLED
             ),
-            prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
+            prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
         )
 
     def model_inputs(
@@ -687,6 +714,142 @@ class DecoderInputPreparer:
             self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
         )
 
+    def _steady_mtp_prepare(self) -> SteadyMtpPrepare | None:
+        """Return the steady one-model MTP decode state, or None when the path does not apply.
+
+        Built on the first prepare pass (an engine warmup pass), once the
+        Qwen3.5 fast paths are decided and the runner's graphs exist.
+        """
+        if not self._steady_mtp_resolved:
+            self._steady_mtp_resolved = True
+            spec_config = self._config.spec_config
+            if (
+                q35_env.fast_paths_enabled()
+                and spec_config is not None
+                and self._config.is_spec_decode
+                and spec_config.spec_dec_mode.use_one_engine()
+                and spec_config.is_linear_tree
+                and not self._config.disable_overlap_scheduler
+                and not self._config.enable_attention_dp
+                and not self.use_beam_search
+                and self._config.max_beam_width == 1
+                and self._steady_gen_cache_supported
+                and not self.mapping.has_cp_helix()
+            ):
+                self._steady_mtp = SteadyMtpPrepare(
+                    max_batch_size=self._config.max_batch_size,
+                    max_num_tokens=self._config.max_num_tokens,
+                    max_tokens_per_step=self.get_runtime_tokens_per_gen_step(
+                        self._config.max_draft_len
+                    ),
+                    use_mrope=self._config.use_mrope,
+                    has_static_inputs=(
+                        self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled
+                    ),
+                )
+        return self._steady_mtp
+
+    def _can_use_steady_mtp_fast_prepare(
+        self,
+        steady_mtp: SteadyMtpPrepare | None,
+        scheduled_requests: ScheduledRequests,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        new_tensors_device: SampleStateTensors | None,
+        promoted_context_request_ids: frozenset[int],
+        runtime_draft_len: int,
+        is_dummy: bool,
+    ) -> bool:
+        """Check whether the recorded steady one-model MTP decode prepare applies.
+
+        The record is only kept by a full pass whose batch consisted purely of
+        non-dummy generation requests that all verified their previous device
+        drafts (see _record_steady_mtp); this checks that the step runs the
+        same requests on the same slots and metadata.
+        """
+        return (
+            steady_mtp is not None
+            and steady_mtp.record is not None
+            and not is_dummy
+            and not promoted_context_request_ids
+            and spec_metadata is not None
+            and scheduled_requests.num_context_requests == 0
+            and steady_mtp.matches(
+                scheduled_requests.generation_requests,
+                attn_metadata,
+                spec_metadata,
+                new_tensors_device,
+                runtime_draft_len,
+            )
+        )
+
+    @nvtx_range("_apply_steady_mtp_fast_prepare")
+    def _apply_steady_mtp_fast_prepare(
+        self,
+        steady_mtp: SteadyMtpPrepare,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+        new_tensors_device: SampleStateTensorsSpec,
+        resource_manager: ResourceManager | None,
+    ) -> PreparedInputs:
+        """Prepare inputs for an unchanged one-model MTP decode batch.
+
+        The speculative counterpart of _apply_steady_gen_fast_prepare: one
+        kernel writes the device inputs the full pass writes (see
+        q35_steady_prepare.py), and the host metadata comes from the record.
+        """
+        record = steady_mtp.record
+        requests = scheduled_requests.generation_requests
+        num_requests = len(requests)
+        num_tokens = num_requests * record.tokens_per_step
+        num_cached_tokens_per_seq, kv_lens = steady_mtp.stage(
+            requests, new_tensors_device, self._buffers, attn_metadata, self.cuda_graph_runner
+        )
+
+        attn_metadata.beam_width = 1
+        attn_metadata.request_ids = record.request_ids
+        attn_metadata.prompt_lens = record.prompt_lengths
+        attn_metadata.num_contexts = 0
+        attn_metadata.num_chunked_ctx_requests = 0
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            num_extra_kv_tokens=record.num_extra_kv_tokens,
+            use_full_generation_page_table=record.use_full_generation_page_table,
+        )
+        attn_metadata.kv_cache_manager = kv_cache_manager
+        if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
+            attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        with nvtx_range("steady_mtp_metadata_prepare"):
+            steady_mtp.prepare_attention(attn_metadata, kv_lens)
+
+        virtual_num_tokens = self.pad_tokens(attn_metadata, num_tokens, 0)
+
+        spec_metadata.num_tokens = num_tokens
+        spec_metadata.num_generations = scheduled_requests.num_generation_requests
+        spec_metadata.seq_lens = record.sequence_lengths
+        spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[: num_tokens - num_requests]
+        spec_metadata.request_ids = record.request_ids
+        spec_metadata.gather_ids = self._buffers.gather_ids_cuda[:num_tokens]
+        # The positions are written on the device only.
+        spec_metadata.host_position_ids = None
+        spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
+        spec_metadata.prepare()
+
+        inputs = self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
+        inputs["spec_metadata"] = spec_metadata
+
+        self.iter_states["num_ctx_requests"] = 0
+        self.iter_states["num_ctx_tokens"] = 0
+        self.iter_states["num_generation_tokens"] = num_tokens
+        self.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
+        if self.log_cached_kv_tokens_per_req:
+            self.record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
+
+        return PreparedInputs(inputs, self._buffers.gather_ids_cuda[:num_tokens])
+
     def _build_multimodal_data_for_llm(
         self,
         request: LlmRequest,
@@ -764,6 +927,11 @@ class DecoderInputPreparer:
         spec_config = self._config.spec_config if enable_spec_decode else None
         runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
 
+        steady_mtp = self._steady_mtp_prepare() if enable_spec_decode else None
+        if steady_mtp is not None and self.cuda_graph_runner is not None:
+            # Only a steady MTP step stages the graph's static inputs itself.
+            self.cuda_graph_runner.set_static_inputs_staged(None)
+
         fast_inputs = self._prepare_inputs_fast_path(
             scheduled_requests,
             kv_cache_manager,
@@ -790,9 +958,35 @@ class DecoderInputPreparer:
                 kv_cache_manager,
                 runtime_draft_len,
             )
-        # Any full pass invalidates the steady-state cache; it is re-recorded
-        # at the end of this pass when the batch qualifies.
+        if self._can_use_steady_mtp_fast_prepare(
+            steady_mtp,
+            scheduled_requests,
+            attn_metadata,
+            spec_metadata,
+            new_tensors_device,
+            promoted_context_request_ids,
+            runtime_draft_len,
+            is_dummy,
+        ):
+            return self._finish_prepared(
+                self._apply_steady_mtp_fast_prepare(
+                    steady_mtp,
+                    scheduled_requests,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata,
+                    new_tensors_device,
+                    resource_manager,
+                ),
+                scheduled_requests,
+                kv_cache_manager,
+                runtime_draft_len,
+            )
+        # Any full pass invalidates the steady-state caches; they are
+        # re-recorded at the end of this pass when the batch qualifies.
         self._steady_gen_cache = None
+        if steady_mtp is not None:
+            steady_mtp.invalidate()
 
         host = HostInputs(
             use_mrope=self._config.use_mrope,
@@ -896,6 +1090,19 @@ class DecoderInputPreparer:
             self._record_steady_gen_cache(
                 host, kv_cache_manager, attn_metadata, spec_metadata, new_tokens_device, lora_params
             )
+            if steady_mtp is not None:
+                self._record_steady_mtp(
+                    steady_mtp,
+                    host,
+                    scheduled_requests,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata,
+                    resource_manager,
+                    lora_params,
+                    promoted_context_request_ids,
+                    runtime_draft_len,
+                )
 
         gather_ids_device = (
             self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
@@ -2200,8 +2407,17 @@ class DecoderInputPreparer:
         self.iter_states["num_generation_tokens"] = scheduled_requests.num_generation_requests
 
     def record_input_copy(self) -> None:
-        """Mark the end of this pass's host-to-device input copies."""
-        self._prepare_inputs_event = torch.cuda.Event()
+        """Mark the end of this pass's host-to-device input copies.
+
+        With ``TRTLLM_Q35_CACHED_STREAM_EVENTS=1`` one event is re-recorded every
+        pass instead of a new one: ``wait_for_input_copy`` always waits on the
+        latest record, as with a new event per pass.
+        """
+        if os.environ.get("TRTLLM_Q35_CACHED_STREAM_EVENTS", "0") == "1":
+            if self._prepare_inputs_event is None:
+                self._prepare_inputs_event = torch.cuda.Event()
+        else:
+            self._prepare_inputs_event = torch.cuda.Event()
         self._prepare_inputs_event.record()
 
     def wait_for_input_copy(self) -> None:
@@ -2265,6 +2481,89 @@ class DecoderInputPreparer:
                 "seq_lens_ones": maybe_pin_memory(torch.ones(host.n_gen, dtype=torch.int)),
                 "use_mrope": host.use_mrope,
             }
+
+    def _record_steady_mtp(
+        self,
+        steady_mtp: SteadyMtpPrepare,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        resource_manager: ResourceManager | None,
+        lora_params: dict[str, Any] | None,
+        promoted_context_request_ids: frozenset[int],
+        runtime_draft_len: int,
+    ) -> None:
+        """Record this pass for the steady one-model MTP decode prepare when it qualifies.
+
+        It qualifies when every request is a non-dummy, text-only generation
+        request verifying its previous step's device drafts from an unchanged
+        sequence slot (previous_batch_len == the number of extend requests and
+        no host-side input ids or draft tokens) with all of its draft slots, on CUDA
+        graph metadata without padding, LoRA, guided decoding or position-id
+        offsets.
+        """
+        extend_requests = host.lists.extend_requests
+        num_requests = len(extend_requests)
+        tokens_per_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+        if not (
+            num_requests > 0
+            and type(spec_metadata) in _STEADY_MTP_SPEC_METADATA
+            and self.guided_decoder is None
+            and not promoted_context_request_ids
+            and host.num_ctx_requests == 0
+            and scheduled_requests.num_context_requests == 0
+            and not host.lists.extend_dummy_requests
+            and not host.lists.generation_requests
+            and host.num_tokens == 0
+            and not host.lists.draft_tokens
+            and host.previous_batch_len == num_requests
+            and attn_metadata.is_cuda_graph
+            and attn_metadata.padded_num_tokens is None
+            and getattr(attn_metadata, "prepare_context_replay", None) is None
+            and not host.lists.mrope_position_ids
+            and not host.lists.mrope_delta_write_seq_slots
+            and not host.lists.mrope_delta_read_seq_slots
+            and not host.has_any_multimodal_request
+            and not host.lists.multimodal_params_list
+            and not lora_params
+            and resource_manager is not None
+            and resource_manager.get_resource_manager(ResourceManagerType.PEFT_CACHE_MANAGER)
+            is None
+            and get_position_id_offset(self.model) == 0
+            and not getattr(kv_cache_manager, "kv_compression_manages_history", False)
+            and tokens_per_step >= 2
+            and host.lists.sequence_lengths == [tokens_per_step] * num_requests
+            and host.lists.draft_lens == [tokens_per_step - 1] * num_requests
+        ):
+            return
+        slots = [request.py_seq_slot for request in extend_requests]
+        if host.lists.previous_batch_indices != slots or any(
+            request.is_dummy or request.py_multimodal_data is not None
+            for request in extend_requests
+        ):
+            return
+        spec_config = self._config.spec_config
+        steady_mtp.record_batch(
+            requests=list(extend_requests),
+            prompt_lengths=host.lists.prompt_lengths,
+            sequence_lengths=host.lists.sequence_lengths,
+            tokens_per_step=tokens_per_step,
+            runtime_draft_len=runtime_draft_len,
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=self._should_use_full_generation_page_table(
+                spec_config, attn_metadata
+            ),
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            static_tensors=(
+                self.cuda_graph_runner.shared_static_tensors
+                if self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled
+                else None
+            ),
+        )
 
     def _get_remote_tail_decode_rank_tokens(
         self, attn_metadata: AttentionMetadata, can_run_graph: bool

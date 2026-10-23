@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch import q35_env
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -27,8 +29,19 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .attention import Attention
 from .backends.interface import PositionalEmbeddingParams
+from .kernels import fused_qk_norm_rope_gate as _fused_ops
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
                                               fused_sigmoid_mul_inplace)
+
+
+@q35_env.register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_POSITIONS_HOIST
+    # TRTLLM_Q35_POSITIONS_HOIST=1 (see models/modeling_speculative.py): make
+    # the positions contiguous once for both prologue kernels.
+    _Q35_POSITIONS_HOIST = os.environ.get("TRTLLM_Q35_POSITIONS_HOIST",
+                                          "0") == "1"
 
 
 # Move out from this class
@@ -275,6 +288,58 @@ class QKNormRoPEAttention(Attention):
         use_mrope = position_ids.dim() == 3
         positions = position_ids.reshape(
             3, -1) if use_mrope else position_ids.reshape(-1)
+        if _Q35_POSITIONS_HOIST:
+            positions = positions.contiguous()
+        # Qwen3.5 decode (see Attention.forward): with a paged FP8 destination from the backend, the kernel also
+        # writes the FP8 query / K / V and the FMHA scales.
+        q35_meta = getattr(self, "_q35_attn_metadata", None)
+        if q35_meta is not None and qkv.dtype == torch.bfloat16:
+            from .backends.fmha import flashinfer_trtllm_gen as _fitg
+            plan = _fitg.q35_kv_append_plan(self.attn, q35_meta, qkv.shape[0],
+                                            self.num_heads,
+                                            self.num_key_value_heads,
+                                            self.head_dim)
+            # Fused decode path: skip the prologue; the folded kernel reads the raw projection and always applies
+            # the gate, so the gate must be offered to the backend.
+            fold = None
+            if (plan is not None and self.attn_output_gate
+                    and self.sparse_attn_hooks is None):
+                fold = _fitg.q35_fold_inputs(
+                    self.attn, plan, qkv, self.q_norm.weight,
+                    self.k_norm.weight, self.rotary_emb.rotary_cos_sin,
+                    positions.contiguous(), self.q_norm.variance_epsilon,
+                    self._get_qk_norm_rotary_dim(),
+                    tuple(self.pos_embd_params.mrope_section)
+                    if use_mrope else None)
+            if fold is not None:
+                plan.fold = fold
+                self.attn.q35_kv_appended = plan
+                num_tokens = qkv.shape[0]
+                packed = (self.num_heads +
+                          2 * self.num_key_value_heads) * self.head_dim
+                # Shape-only stand-ins for the backend's checks; their content is not read on the folded path.
+                gate = qkv[:, :2 * self.q_size].view(
+                    num_tokens, self.num_heads,
+                    2 * self.head_dim)[:, :, self.head_dim:]
+                return qkv[:, :packed], None, None, gate
+            if plan is not None:
+                qkv, gate, plan.q_fp8, plan.scales = _fused_ops.q35_fused_qkv_rope_gate_append(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.rotary_cos_sin,
+                    positions.contiguous(),
+                    self.q_norm.variance_epsilon,
+                    self.num_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self._get_qk_norm_rotary_dim(),
+                    tuple(self.pos_embd_params.mrope_section)
+                    if use_mrope else None,
+                    plan,
+                )
+                self.attn.q35_kv_appended = plan
+                return qkv, None, None, gate
         qkv, gate = fused_qkv_gemma_rmsnorm_rope_gate(
             qkv,
             self.q_norm.weight,

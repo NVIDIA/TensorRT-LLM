@@ -7082,6 +7082,16 @@ class TorchLlmArgs(BaseLlmArgs):
             if not buckets_are_explicit and legacy_buckets is not None:
                 self.prefill_capture_num_tokens = list(legacy_buckets)
 
+        if os.environ.get("TRTLLM_PREFILL_BCG", "0") == "1":
+            # Per-worker opt-in that keeps a shared YAML's torch_compile_config:
+            # breakable prefill graphs on the buckets resolved above, and
+            # torch.compile is not applied.
+            logger.info(
+                "TRTLLM_PREFILL_BCG=1: prefill_cuda_graph_backend='breakable', "
+                "torch_compile_config is not applied")
+            self.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
+            self.torch_compile_config = compile_config = None
+
         if (compile_config is not None
                 and compile_config.compile_only_piecewise_graphs):
             if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.PIECEWISE:

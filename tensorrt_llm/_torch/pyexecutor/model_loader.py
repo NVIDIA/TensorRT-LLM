@@ -43,6 +43,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from .. import q35_env
 from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
@@ -2000,6 +2001,9 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        # Qwen3.5 on SM 10.3: enable its fast paths and apply the
+        # TRTLLM_Q35_PROFILE switch values before any layer is built.
+        q35_env.activate(config)
 
         # Decided here, after `load_config_and_apply_defaults` resolved the
         # built-in class and applied its model defaults to `llm_args`: a

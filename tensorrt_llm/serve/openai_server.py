@@ -81,7 +81,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.chat_tokenization import (
-    render_chat_request_for_tokenizer, tokenize_harmony_chat_request)
+    IncrementalTokenizationCache, render_chat_request_for_tokenizer,
+    tokenize_harmony_chat_request)
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -665,6 +666,12 @@ class OpenAIServer(_VideoRoutesMixin):
         self._runtime_control_api_key = runtime_control_api_key
         self._runtime_control_replay_cache = RuntimeControlReplayCache()
         self.server_role = server_role
+        frontend_name = (f"{server_role.name.lower()} frontend"
+                         if server_role is not None else "server frontend")
+        self._incremental_tokenizer = (
+            IncrementalTokenizationCache.from_environment(frontend_name))
+        if self._incremental_tokenizer.enabled:
+            logger.info(f"Incremental tokenization enabled for {frontend_name}")
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
@@ -1983,9 +1990,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch blocks for up to its timeout, so it runs on the
+                # metrics thread, which /metrics leaves idle while this loop runs.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
+                    for llm_stat in await asyncio.get_running_loop(
+                    ).run_in_executor(self._metrics_stats_executor,
+                                      self.generator.get_stats, 0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
                         # Tee into the /metrics snapshot buffer so the HTTP
                         # handler can serve without competing for the engine
@@ -2025,6 +2035,29 @@ class OpenAIServer(_VideoRoutesMixin):
         postproc_args.return_spec_decode_stats = True
         postproc_args.spec_decode_num_spec_tokens = getattr(
             self, "_spec_decode_num_spec_tokens", None)
+
+    async def _maybe_incremental_tokenize_chat_prompt(
+            self, prompt: str | list[int], request: ChatCompletionRequest,
+            has_multimodal: bool) -> str | list[int]:
+        """Use the shared cache for eligible conversation-keyed text prompts."""
+        if (not self._incremental_tokenizer.enabled
+                or not isinstance(prompt, str)
+                or request.conversation_params is None or has_multimodal
+                or request.add_special_tokens
+                or request.truncate_prompt_tokens is not None):
+            return prompt
+
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._input_proc_executor,
+            functools.partial(
+                self._incremental_tokenizer.encode,
+                prompt,
+                request.conversation_params.conversation_id,
+                tokenizer,
+            ),
+        )
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
@@ -2273,6 +2306,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args.tools = (postproc_args.tools
                                        or []) + dynamic_tool_params
             self._validate_internal_disagg_request(request, raw_request)
+            # Before rendering: the conversation id keys the incremental
+            # tokenization cache.
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
@@ -2351,6 +2388,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     # resolve_prefilled_thinking() inspects what the chat
                     # template rendered, and the prefix is not part of it.
                     rendered_prompt = rendered.template_text
+                prompt = await self._maybe_incremental_tokenize_chat_prompt(
+                    prompt, request, bool(mm_data or mm_embeddings))
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -2429,8 +2468,6 @@ class OpenAIServer(_VideoRoutesMixin):
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
 
-            resolve_request_conversation_id(
-                request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
             scheduling_params = self._get_scheduling_params(

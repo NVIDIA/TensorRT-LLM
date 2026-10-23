@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import zlib
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -1559,3 +1560,77 @@ class TestRemoteTailHandoffRetry:
         mock_router.finish_request.assert_awaited_once_with(
             completion_request, mock_session, success=True, req_id=42
         )
+
+
+class TestCtxFrontendAffinity:
+    """TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY=K:S picks a CTX frontend port per conversation."""
+
+    @staticmethod
+    def _client(monkeypatch, mock_router, mock_session, value, role=ServerRole.CONTEXT):
+        _reset_prometheus_registry()
+        if value is None:
+            monkeypatch.delenv("TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY", value)
+        return OpenAIHttpClient(router=mock_router, role=role, session=mock_session)
+
+    @staticmethod
+    def _request(conversation_id):
+        conversation_params = (
+            None if conversation_id is None else ConversationParams(conversation_id=conversation_id)
+        )
+        return CompletionRequest(
+            model="test-model", prompt="Hello", conversation_params=conversation_params
+        )
+
+    @pytest.mark.parametrize("server", ["localhost:8000", "[::1]:8000"])
+    def test_conversation_goes_to_its_frontend_port(
+        self, monkeypatch, mock_router, mock_session, server
+    ):
+        client = self._client(monkeypatch, mock_router, mock_session, "4:100")
+        host = server.rpartition(":")[0]
+        for conversation_id in ("conv-a", "conv-b", "conv-c", "conv-d", "conv-e"):
+            frontend = zlib.crc32(conversation_id.encode()) % 4
+            expected = f"{host}:{8000 + 100 * (frontend + 1)}"
+            request = self._request(conversation_id)
+            assert client._url_server(server, request) == expected
+
+    @pytest.mark.parametrize(
+        "value,role,conversation_id",
+        [
+            (None, ServerRole.CONTEXT, "conv-a"),
+            ("4:100", ServerRole.GENERATION, "conv-a"),
+            ("4:100", ServerRole.CONTEXT, None),
+        ],
+    )
+    def test_shared_port_without_affinity(
+        self, monkeypatch, mock_router, mock_session, value, role, conversation_id
+    ):
+        client = self._client(monkeypatch, mock_router, mock_session, value, role)
+        assert client._url_server("localhost:8000", self._request(conversation_id)) == (
+            "localhost:8000"
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_request_posts_to_frontend_port(
+        self, monkeypatch, mock_router, mock_session
+    ):
+        client = self._client(monkeypatch, mock_router, mock_session, "8:10")
+        response_body = TestOpenAIHttpClient().dummy_response()
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json = AsyncMock(return_value=response_body.model_dump())
+        http_response.__aenter__ = AsyncMock(return_value=http_response)
+        http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = http_response
+        request = self._request("conv-a")
+        hooks = MagicMock(spec=ResponseHooks)
+
+        await client.send_request(request, hooks=hooks)
+
+        frontend = zlib.crc32(b"conv-a") % 8
+        url = mock_session.post.call_args[0][0]
+        assert url.startswith(f"http://localhost:{8000 + 10 * (frontend + 1)}/")
+        # Router bookkeeping keeps the routed server's shared address.
+        hooks.on_ctx_resp.assert_called_once_with("localhost:8000", response_body)
