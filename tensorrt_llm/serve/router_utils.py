@@ -299,7 +299,8 @@ class BlockHashMixin:
     def _length_chat_ids(self, request: ChatCompletionRequest) -> list[int]:
         """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
-        A request the request model rejects gets no ids. One the chat template rejects raises.
+        A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
+        template rejects raises.
         """
         try:
             return render_chat_for_length(
@@ -307,7 +308,7 @@ class BlockHashMixin:
                 self._render_resources(request.model),
                 encode_rendered=self._make_encode_rendered(request),
             ).token_ids
-        except UnsupportedRenderError as error:
+        except (UnsupportedRenderError, HarmonyConversionError) as error:
             logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
             return []
 

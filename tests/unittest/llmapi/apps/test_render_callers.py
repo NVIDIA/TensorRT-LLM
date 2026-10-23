@@ -515,10 +515,12 @@ class TestRouterWriteBack:
             "type": "function",
             "function": {"name": "f", "parameters": {"type": "object", "properties": {}}},
         }
-        request = chat_request(tools=[no_description])
+        named = {"type": "function", "function": {"name": "f"}}
+        for tool_choice in (None, named):
+            request = chat_request(tools=[no_description], tool_choice=tool_choice)
 
-        assert router._tokenize(request) == [[]]
-        assert request.prompt_token_ids is None
+            assert router._tokenize(request) == [[]]
+            assert request.prompt_token_ids is None
 
     def test_object_valued_tool_arguments_are_routed_on_no_ids_not_on_a_partial_render(
         self, router, tokenizer

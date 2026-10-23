@@ -474,7 +474,7 @@ def render_chat_for_length(
                 return RenderedPrompt(token_ids=list(token_ids))
     plain = dataclasses.replace(
         res,
-        model_type="",
+        model_type="" if _is_passthrough_model(res) else res.model_type,
         hf_config=None,
         input_processor=None,
         extension=_LengthExtension(res.extension),
