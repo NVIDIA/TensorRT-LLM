@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -37,6 +38,10 @@ from torch import nn
 
 MINIMAX_M3_VL_VISION_START_TOKEN = "]<]start of image[>["  # nosec B105 - vision delimiter token, not a password
 MINIMAX_M3_VL_VISION_END_TOKEN = "]<]end of image[>["  # nosec B105 - vision delimiter token, not a password
+# Per-item markers the chat template renders for ``{"type": "image"}`` /
+# ``{"type": "video"}`` content entries; the HF processor expands each one.
+MINIMAX_M3_VL_IMAGE_TOKEN = "]<]image[>["  # nosec B105 - image marker token, not a password
+MINIMAX_M3_VL_VIDEO_TOKEN = "]<]video[>["  # nosec B105 - video marker token, not a password
 
 
 # ---------------------------------------------------------------------------
@@ -1916,6 +1921,10 @@ class MiniMaxM3VLInputProcessor:
     def _hw(media: Any) -> Tuple[int, int]:
         if isinstance(media, torch.Tensor):
             return int(media.shape[-2]), int(media.shape[-1])
+        if isinstance(media, np.ndarray):
+            # HWC uint8 from ImageMediaIO's "np" format, the format
+            # ``get_preferred_media_io_kwargs`` asks for.
+            return int(media.shape[0]), int(media.shape[1])
         return int(media.height), int(media.width)
 
     def get_num_tokens_per_image(self, *, image: Any, **kwargs: Any) -> int:
@@ -1932,23 +1941,56 @@ class MiniMaxM3VLInputProcessor:
         video_grid_thw: Optional[Any] = None,
         **kwargs: Any,
     ) -> int:
-        """Token count per video block (+ VS/VE framing).
+        """Token count per video item, framing included.
 
-        ``video_grid_thw`` is populated by the fast-path's dummy-text pass
-        in :func:`find_mm_token_lengths`, so we don't duplicate the video
-        resize / temporal-patch math here.
+        The HF processor expands one ``]<]video[>[`` marker into one bracket
+        per temporal patch, ``VISION_START + VIDEO_TOKEN * (grid_h*grid_w /
+        merge^2) + VISION_END`` repeated ``grid_t`` times, so the count is
+        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. The brackets are
+        adjacent: the processor prefixes a timestamp only when the video
+        carries fps metadata, and the frame lists handed over here carry
+        none.
+
+        ``video_grid_thw`` is the processor's grid for this video,
+        computed by the dummy-text pass of :func:`find_mm_token_lengths`
+        and passed as a ``[1, 3]`` row; a bare ``(t, h, w)`` triple is
+        accepted too.
         """
         if video_grid_thw is None:
             raise RuntimeError(
                 "MiniMaxM3VL fast path: get_num_tokens_per_video requires "
                 "precomputed video_grid_thw from the dummy-text pass."
             )
-        grid = (
-            video_grid_thw.tolist() if isinstance(video_grid_thw, torch.Tensor) else video_grid_thw
-        )
-        merge = int(self.processor.image_processor.merge_size)
-        grid_t, grid_h, grid_w = int(grid[0]), int(grid[1]), int(grid[2])
-        return grid_t * (grid_h // merge) * (grid_w // merge) + 2
+        grid = torch.as_tensor(video_grid_thw).reshape(-1, 3)
+        merge = int(self.processor.video_processor.merge_size)
+        per_patch = (grid[:, 1] * grid[:, 2]) // (merge * merge) + 2
+        return int((grid[:, 0] * per_patch).sum().item())
+
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # uint8 HWC arrays for both modalities. The checkpoint's image and
+        # video processors rescale by 1/255 themselves (``do_rescale``);
+        # media_io's default "pt" format delivers float [0, 1] tensors, which
+        # they rescale a second time, and the vision tower then sees an
+        # almost black input. trtllm-serve seeds its media_io defaults from
+        # this method, so no --media_io_kwargs flag is needed; an explicit
+        # flag still wins.
+        return {"image": {"format": "np"}, "video": {"format": "np"}}
+
+    @staticmethod
+    def _video_frames(video: Any) -> List[Any]:
+        """Frames of one raw video item (``VideoData`` or a frame list)."""
+        if hasattr(video, "frames"):
+            return list(video.frames)
+        return list(video) if isinstance(video, (list, tuple)) else [video]
+
+    def _video_bracket_count(self, video: Any) -> int:
+        """Temporal patches of a video item: one framed bracket each.
+
+        Mirrors the video processor, which pads the frame count to a
+        multiple of ``temporal_patch_size`` and emits ``grid_t`` brackets.
+        """
+        temporal = int(self.processor.video_processor.temporal_patch_size)
+        return -(-len(self._video_frames(video)) // temporal)
 
     def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
         # Return ``""``: ``__call__``'s chat-template branch already
@@ -1970,7 +2012,10 @@ class MiniMaxM3VLInputProcessor:
         ``video_token_id`` per item with no VISION_START / VISION_END
         framing; the HF MiniMaxVLProcessor would normally add it on the
         slow path. We do the same here from ``num_mm_tokens_per_placeholder``
-        (which already accounts for the +2 framing).
+        (which already accounts for the +2 framing per bracket). An image is
+        one bracket; a video is one bracket per temporal patch, as the
+        processor lays it out (see :meth:`get_num_tokens_per_video`), so the
+        placeholder runs line up with the vision rows at merge time.
         """
         mm_data = mm_data or {}
         has_image = bool(mm_data.get("image"))
@@ -1982,6 +2027,7 @@ class MiniMaxM3VLInputProcessor:
         if not (has_image or has_video):
             return list(prompt_token_ids), None
         placeholder_id = self._image_token_id if has_image else self._video_token_id
+        items = self._coerce_to_list(mm_data.get("video")) if has_video else []
         expected = len(num_mm_tokens_per_placeholder)
         expanded: List[int] = []
         consumed = 0
@@ -1994,15 +2040,18 @@ class MiniMaxM3VLInputProcessor:
                     "MiniMaxM3VL fast path: prompt has more placeholders than "
                     f"num_mm_tokens entries ({expected})."
                 )
-            inner = int(num_mm_tokens_per_placeholder[consumed]) - 2
-            if inner < 1:
+            brackets = self._video_bracket_count(items[consumed]) if has_video else 1
+            total = int(num_mm_tokens_per_placeholder[consumed])
+            inner, remainder = divmod(total - 2 * brackets, brackets)
+            if inner < 1 or remainder:
                 raise ValueError(
-                    f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={inner + 2} "
-                    "must be >= 3 (VISION_START + >=1 placeholder + VISION_END)."
+                    f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={total} must be "
+                    f"{brackets} x (VISION_START + >=1 placeholder + VISION_END)."
                 )
-            expanded.append(self._vision_start_token_id)
-            expanded.extend([placeholder_id] * inner)
-            expanded.append(self._vision_end_token_id)
+            for _ in range(brackets):
+                expanded.append(self._vision_start_token_id)
+                expanded.extend([placeholder_id] * inner)
+                expanded.append(self._vision_end_token_id)
             consumed += 1
         if consumed != expected:
             raise ValueError(
@@ -2061,24 +2110,26 @@ class MiniMaxM3VLInputProcessor:
         # The HF MiniMaxVLProcessor expects video frames as nested lists
         # of frames (one list per video). Accept either pre-extracted
         # frames or wrapper objects with a ``frames`` attribute.
-        videos: List[Any] = []
-        for v in video_inputs:
-            if hasattr(v, "frames"):
-                videos.append(list(v.frames))
-            else:
-                videos.append(list(v) if isinstance(v, (list, tuple)) else [v])
+        videos: List[Any] = [self._video_frames(v) for v in video_inputs]
 
-        # Apply the M3 chat template before invoking the processor. The
-        # M3 ``chat_template.jinja`` inserts the canonical
-        # ``IMAGE_TOKEN`` / ``VIDEO_TOKEN`` markers around each image
-        # / video item in the user's content list. The
-        # ``MiniMaxVLProcessor`` then expands those markers in place
-        # using ``VISION_START_TOKEN + IMAGE_TOKEN*N + VISION_END_TOKEN``
-        # before tokenization. Without the chat template, the raw user
-        # prompt doesn't carry any image marker and the processor
-        # emits no multimodal token positions in the final input_ids.
-        templated_text: str
-        if images or videos:
+        # The ``MiniMaxVLProcessor`` expands each ``IMAGE_TOKEN`` /
+        # ``VIDEO_TOKEN`` marker in place into
+        # ``VISION_START_TOKEN + IMAGE_TOKEN*N + VISION_END_TOKEN`` before
+        # tokenization.
+        #
+        # ``chat_template_applied`` (``TextPrompt``) says the prompt is the
+        # chat template's output with one registry marker per media item
+        # already in it; trtllm-serve and the prompt builders in
+        # ``tensorrt_llm.inputs.utils`` set it. Such a prompt is used
+        # verbatim. Without it the prompt is raw LLM-API text: it becomes
+        # the text of one user turn with one ``{"type": "image"}`` /
+        # ``{"type": "video"}`` entry per item, and the M3 chat template
+        # inserts the markers. Marker text inside a raw prompt is counted
+        # on top of the template's markers and rejected by the count check
+        # below: the markers are control tokens, not literal text.
+        if inputs.get("chat_template_applied"):
+            templated_text = text_prompt if isinstance(text_prompt, str) else ""
+        else:
             content: List[Dict[str, Any]] = []
             if isinstance(text_prompt, str) and text_prompt:
                 content.append({"type": "text", "text": text_prompt})
@@ -2100,17 +2151,57 @@ class MiniMaxM3VLInputProcessor:
                 explicit: List[str] = []
                 if isinstance(text_prompt, str) and text_prompt:
                     explicit.append(text_prompt)
-                explicit.extend(["]<]image[>["] * len(images))
-                explicit.extend(["]<]video[>["] * len(videos))
+                explicit.extend([MINIMAX_M3_VL_IMAGE_TOKEN] * len(images))
+                explicit.extend([MINIMAX_M3_VL_VIDEO_TOKEN] * len(videos))
                 templated_text = "\n".join(explicit)
+
+        # Callers may frame a marker with the vision start/end tokens
+        # (``VISION_START_TOKEN + IMAGE_TOKEN + VISION_END_TOKEN``). The
+        # processor adds exactly that framing when it expands a bare marker,
+        # so a framed marker can only mean it is framed already: reduce it to
+        # the bare marker rather than nesting a second frame around it.
+        # Accepted instead of rejected so a prompt that embeds the framed form
+        # to position an image keeps working.
+        for marker in (MINIMAX_M3_VL_IMAGE_TOKEN, MINIMAX_M3_VL_VIDEO_TOKEN):
+            templated_text = templated_text.replace(
+                MINIMAX_M3_VL_VISION_START_TOKEN + marker + MINIMAX_M3_VL_VISION_END_TOKEN,
+                marker,
+            )
+
+        # Each marker becomes a placeholder run that the model fills with
+        # vision-tower rows, so marker and item counts must agree. Reject a
+        # mismatch here as a request error; at forward time it fails the
+        # whole batch.
+        for marker, items in (
+            (MINIMAX_M3_VL_IMAGE_TOKEN, images),
+            (MINIMAX_M3_VL_VIDEO_TOKEN, videos),
+        ):
+            if templated_text.count(marker) != len(items):
+                raise ValueError(
+                    f"MiniMax-M3 VL prompt has {templated_text.count(marker)} {marker!r} "
+                    f"markers but the request carries {len(items)} matching media items. "
+                    "A prompt rendered outside TRT-LLM needs 'chat_template_applied' set; "
+                    "a raw prompt must not contain marker text."
+                )
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
         # in the BatchFeature output.
+        #
+        # The processor's video default is ``do_resize=False`` (it expects
+        # frames already resized by the caller, as SGLang does); the decoded
+        # frames arrive here as is, so let the processor resize them: frame
+        # sides must be multiples of ``patch_size * merge_size`` for its
+        # patch view, and its ``max_pixels`` bounds the token count. Images
+        # are resized by default.
+        processor_kwargs: Dict[str, Any] = {}
+        if videos:
+            processor_kwargs["videos_kwargs"] = {"do_resize": True}
         processed = self.processor(
             text=[templated_text],
             images=images if images else None,
             videos=videos if videos else None,
             return_tensors="pt",
+            **processor_kwargs,
         )
 
         multimodal_data: Dict[str, Any] = {}

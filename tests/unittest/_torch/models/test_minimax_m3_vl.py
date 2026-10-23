@@ -15,6 +15,9 @@ parameter slots with matching shapes and dtypes.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import io
 import json
 import os
 from types import SimpleNamespace
@@ -30,6 +33,8 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
 from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+    MINIMAX_M3_VL_VISION_END_TOKEN,
+    MINIMAX_M3_VL_VISION_START_TOKEN,
     CLIPVisionConfig,
     MiniMaxVLPatchEmbedding,
     MiniMaxVLPatchMerger,
@@ -2037,11 +2042,14 @@ def _make_minimax_m3_vl_fast_path_processor():
     obj._video_token_id = _VID_TOK
     obj._vision_start_token_id = _VS_TOK
     obj._vision_end_token_id = _VE_TOK
-    # Fake processor exposing the merge_size that the per-image / per-video
-    # token-count helpers consult. We don't need the real image_processor
-    # here because the tests below feed precomputed image_grid_thw values.
-    fake_image_processor = SimpleNamespace(merge_size=2)
-    obj._processor = SimpleNamespace(image_processor=fake_image_processor)
+    # Fake processor exposing the merge_size / temporal_patch_size that the
+    # per-image / per-video token-count and bracket helpers consult. We don't
+    # need the real processors here because the tests below feed precomputed
+    # grid values.
+    obj._processor = SimpleNamespace(
+        image_processor=SimpleNamespace(merge_size=2),
+        video_processor=SimpleNamespace(merge_size=2, temporal_patch_size=2),
+    )
     return obj
 
 
@@ -2135,6 +2143,69 @@ def test_fast_path_expand_video_placeholders_use_video_token_id():
     assert expanded.count(vid) == 2
 
 
+def test_fast_path_expand_video_one_bracket_per_temporal_patch():
+    """A video spans ``grid_t`` framed brackets, as the HF processor lays it out.
+
+    Three frames pad to two temporal patches; a count of 8 is two brackets of
+    VISION_START + 2 placeholders + VISION_END.
+    """
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    frames = [object()] * 3
+    expanded, _ = proc.expand_prompt_token_ids_for_mm(
+        [100, _VID_TOK, 200],
+        num_mm_tokens_per_placeholder=[8],
+        mm_data={"video": [SimpleNamespace(frames=frames)]},
+    )
+    bracket = [_VS_TOK, _VID_TOK, _VID_TOK, _VE_TOK]
+    assert expanded == [100, *bracket, *bracket, 200]
+    # A plain frame list works like the ``frames`` wrapper.
+    expanded_list, _ = proc.expand_prompt_token_ids_for_mm(
+        [100, _VID_TOK, 200], num_mm_tokens_per_placeholder=[8], mm_data={"video": [frames]}
+    )
+    assert expanded_list == expanded
+    # A count that does not split into whole brackets is rejected.
+    with pytest.raises(ValueError, match="2 x \\(VISION_START"):
+        proc.expand_prompt_token_ids_for_mm(
+            [100, _VID_TOK, 200], num_mm_tokens_per_placeholder=[7], mm_data={"video": [frames]}
+        )
+
+
+def test_video_token_count_is_one_bracket_per_temporal_patch():
+    """``grid_t * (grid_h*grid_w/merge^2 + 2)`` for the processor's grid.
+
+    ``find_mm_token_lengths`` passes the grid as a ``[1, 3]`` row; a 1-D
+    tensor and a plain triple are accepted too. 10 frames at 224x224 give
+    grid [5, 16, 16]: 5 brackets of 64 video tokens plus framing, 330.
+    """
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    assert (
+        proc.get_num_tokens_per_video(video=[], video_grid_thw=torch.tensor([[5, 16, 16]])) == 330
+    )
+    assert proc.get_num_tokens_per_video(video=[], video_grid_thw=torch.tensor([5, 16, 16])) == 330
+    assert proc.get_num_tokens_per_video(video=[], video_grid_thw=(5, 16, 16)) == 330
+    assert proc.get_num_tokens_per_video(video=[], video_grid_thw=[[1, 4, 6]]) == 8
+    with pytest.raises(RuntimeError, match="requires precomputed video_grid_thw"):
+        proc.get_num_tokens_per_video(video=[])
+
+
+def test_preferred_media_io_format_is_uint8_numpy():
+    """The registered processor asks media_io for uint8 HWC arrays.
+
+    The HF processors rescale by 1/255 themselves, so float tensors (the
+    media_io default) would be rescaled twice; ``OpenAIServer`` seeds its
+    media_io defaults from this method for ``BaseMultimodalInputProcessor``
+    instances.
+    """
+    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    assert isinstance(proc, BaseMultimodalInputProcessor)
+    assert proc.get_preferred_media_io_kwargs() == {
+        "image": {"format": "np"},
+        "video": {"format": "np"},
+    }
+
+
 def test_fast_path_expand_rejects_mixed_image_and_video():
     """Single-modality only: the registry's ``_get_single_mm_token_lengths``
     returns only one modality's counts, so mixing image + video in one
@@ -2195,6 +2266,12 @@ def test_fast_path_hooks_are_registered_on_processor_class():
     assert hasattr(cls, "expand_prompt_token_ids_for_mm")
     assert hasattr(cls, "get_num_tokens_per_image")
     assert hasattr(cls, "get_num_tokens_per_video")
+
+
+# ---------------------------------------------------------------------------
+# Input contract without an image processor: text needs only the tokenizer;
+# image requests load the HF processor on first use and reject a tokenizer.
+# ---------------------------------------------------------------------------
 
 
 class _WordTokenizer:
@@ -2264,6 +2341,34 @@ class _ValidImageProcessor:
             out["pixel_values_videos"] = torch.ones(4 * num_videos, 8)
             out["video_grid_thw"] = torch.tensor([[1, 2, 2]] * num_videos)
         return out
+
+
+def _serve_style_prompt(tokenizer, text: str, media: Dict[str, list]) -> dict:
+    """Build the request the way trtllm-serve does for a chat completion.
+
+    Same steps as `parse_chat_messages_coroutines` + `apply_chat_template`
+    (STRING content format) + the prompt assembly in `openai_server.py`:
+    the registry supplies the placeholder per item, `apply_mm_placeholders`
+    writes it into the message text, the tokenizer renders the chat
+    template, and the rendered text is handed over with the media,
+    `mm_item_order` and `chat_template_applied`.
+    """
+    from tensorrt_llm.inputs.utils import MultimodalDataTracker, apply_mm_placeholders
+
+    tracker = MultimodalDataTracker("minimax_m3_vl")
+    for modality, items in media.items():
+        for item in items:
+            tracker.add_data(modality, item)
+    message = {"role": "user", "content": text, "media": [], "content_parts": []}
+    apply_mm_placeholders("minimax_m3_vl", message, tracker.placeholder_counts(), tracker)
+    rendered = tokenizer.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+    mm_data, _ = tracker.retrieve_all_sync()
+    return {
+        "prompt": rendered,
+        "multi_modal_data": mm_data,
+        "mm_item_order": tracker.item_order(),
+        "chat_template_applied": True,
+    }
 
 
 def _tokenizer_only_processor(monkeypatch, auto_processor_result):
@@ -2337,3 +2442,233 @@ def test_image_request_uses_a_valid_processor(monkeypatch):
         {"prompt": "again", "multi_modal_data": {"image": [image]}}, SimpleNamespace()
     )
     assert len(loads) == 1 and proc.processor is valid
+
+
+@pytest.mark.cpu_only
+def test_serve_rendered_image_prompt_is_used_verbatim(monkeypatch):
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    request = _serve_style_prompt(
+        proc.tokenizer, "describe", {"image": [Image.new("RGB", (32, 32))]}
+    )
+    rendered = request["prompt"]
+    # The registry placeholder is the bare marker: the HF processor adds the
+    # start/end framing, so the rendered prompt must not carry it.
+    assert rendered == "user: ]<]image[>[\ndescribe assistant:"
+    assert MINIMAX_M3_VL_VISION_START_TOKEN not in rendered
+    assert MINIMAX_M3_VL_VISION_END_TOKEN not in rendered
+    assert proc.tokenizer.template_calls == 1
+
+    ids, extra = proc.call_with_text_prompt(request, SimpleNamespace())
+    # Not rendered a second time; the processor sees the serve output as is.
+    assert proc.tokenizer.template_calls == 1
+    assert valid.calls == [[rendered]]
+    assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
+    assert extra["multimodal_data"]["image"]["image_grid_thw"].tolist() == [[1, 2, 2]]
+
+
+@pytest.mark.cpu_only
+def test_serve_rendered_mixed_image_and_video_prompt(monkeypatch):
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    video = SimpleNamespace(frames=[Image.new("RGB", (32, 32))] * 2)
+    request = _serve_style_prompt(
+        proc.tokenizer, "compare", {"image": [Image.new("RGB", (32, 32))], "video": [video]}
+    )
+    rendered = request["prompt"]
+    assert rendered == "user: ]<]image[>[\n]<]video[>[\ncompare assistant:"
+
+    ids, extra = proc.call_with_text_prompt(request, SimpleNamespace())
+    assert proc.tokenizer.template_calls == 1
+    assert valid.calls == [[rendered]]
+    assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK, _VS_TOK, _VID_TOK, _VE_TOK]
+    assert extra["multimodal_data"]["image"]["image_grid_thw"].tolist() == [[1, 2, 2]]
+    assert extra["multimodal_data"]["video"]["video_grid_thw"].tolist() == [[1, 2, 2]]
+
+
+@pytest.mark.cpu_only
+def test_framed_marker_is_reduced_to_the_bare_marker(monkeypatch):
+    # A caller that frames the marker itself gets one frame, from the processor.
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    framed = MINIMAX_M3_VL_VISION_START_TOKEN + "]<]image[>[" + MINIMAX_M3_VL_VISION_END_TOKEN
+    ids, _ = proc.call_with_text_prompt(
+        {
+            "prompt": f"user: {framed}\ndescribe assistant:",
+            "multi_modal_data": {"image": [Image.new("RGB", (32, 32))]},
+            "chat_template_applied": True,
+        },
+        SimpleNamespace(),
+    )
+    assert valid.calls == [["user: ]<]image[>[\ndescribe assistant:"]]
+    assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
+
+
+@pytest.mark.cpu_only
+def test_marker_and_media_count_mismatch_is_rejected(monkeypatch):
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    image = Image.new("RGB", (32, 32))
+    with pytest.raises(ValueError, match="2 ']<]image\\[>\\[' markers but the request carries 1"):
+        proc.call_with_text_prompt(
+            {
+                "prompt": "]<]image[>[ ]<]image[>[ compare",
+                "multi_modal_data": {"image": [image]},
+                "chat_template_applied": True,
+            },
+            SimpleNamespace(),
+        )
+    assert valid.calls == []
+
+
+@pytest.mark.cpu_only
+def test_raw_prompt_marker_text_is_rejected(monkeypatch):
+    # Without chat_template_applied the template inserts the markers, so
+    # marker text in the raw prompt is one marker too many.
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    with pytest.raises(ValueError, match="2 ']<]image\\[>\\[' markers but the request carries 1"):
+        proc.call_with_text_prompt(
+            {
+                "prompt": "Explain ]<]image[>[",
+                "multi_modal_data": {"image": [Image.new("RGB", (32, 32))]},
+            },
+            SimpleNamespace(),
+        )
+    assert proc.tokenizer.template_calls == 1
+    assert valid.calls == []
+    # With no media the prompt is plain text and is tokenized as written.
+    ids, extra = proc.call_with_text_prompt({"prompt": "Explain ]<]image[>["}, SimpleNamespace())
+    assert ids == [1, 100, 101] and extra is None
+    assert proc._processor is None
+
+
+@pytest.mark.cpu_only
+def test_image_token_count_accepts_every_media_io_format(monkeypatch):
+    """``get_num_tokens_per_image`` reads the size of PIL, CHW tensor and HWC array input.
+
+    The hashing path (``find_mm_token_lengths``) hands over whatever
+    media_io decoded; with the preferred "np" format that is a uint8 HWC
+    array. 56x84 is a 4x6 patch grid: 24 patches / 4 + 2 framing = 8.
+    """
+    proc, _ = _tokenizer_only_processor(monkeypatch, _ValidImageProcessor())
+    pil = Image.new("RGB", (84, 56))
+    tensor = torch.zeros(3, 56, 84)
+    array = np.zeros((56, 84, 3), dtype=np.uint8)
+    assert [proc.get_num_tokens_per_image(image=m) for m in (pil, tensor, array)] == [8, 8, 8]
+
+
+@pytest.mark.cpu_only
+def test_video_request_lets_the_processor_resize_frames(monkeypatch):
+    """Videos go to the HF processor with ``videos_kwargs={"do_resize": True}``.
+
+    The processor's video default is ``do_resize=False`` and its patch
+    view needs frame sides that are multiples of 28; the decoded frames
+    are not pre-resized here. Image-only requests pass no such kwargs.
+    """
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    frames = [np.zeros((230, 230, 3), dtype=np.uint8)] * 3
+    proc.call_with_text_prompt(
+        {"prompt": "watch", "multi_modal_data": {"video": [SimpleNamespace(frames=frames)]}},
+        SimpleNamespace(),
+    )
+    proc.call_with_text_prompt(
+        {"prompt": "look", "multi_modal_data": {"image": [Image.new("RGB", (32, 32))]}},
+        SimpleNamespace(),
+    )
+    assert valid.call_kwargs == [{"videos_kwargs": {"do_resize": True}}, {}]
+
+
+@pytest.mark.cpu_only
+def test_openai_chat_marks_the_rendered_prompt_for_the_input_processor(monkeypatch):
+    """The prompt ``openai_chat`` assembles is accepted by the input processor as rendered.
+
+    Runs ``OpenAIServer.openai_chat`` on a one-image chat request with the
+    generator replaced by a recorder, then feeds the captured ``TextPrompt``
+    to the M3 input processor. The server must set ``chat_template_applied``:
+    without it the processor renders the chat template a second time and
+    rejects the request for having one marker more than images.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    valid = _ValidImageProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
+    tokenizer = proc.tokenizer
+    # The server reads the vocabulary size off the wrapped HF tokenizer.
+    tokenizer.tokenizer = tokenizer
+
+    class _M3VLConfig:
+        model_type = "minimax_m3_vl"
+        vocab_size = 200_064
+
+    captured = {}
+
+    def generate_async(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(prompt_token_ids=[7, _VS_TOK, _IMG_TOK, _VE_TOK], finished=True)
+
+    async def create_chat_response(*args, **kwargs):
+        return SimpleNamespace(model_dump=lambda: {"captured": True})
+
+    server = object.__new__(OpenAIServer)
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(
+            reasoning_parser=None,
+            backend="pytorch",
+            gather_generation_logits=False,
+            guided_decoding_backend=None,
+            num_postprocess_workers=0,
+            cache_transceiver_config=None,
+        ),
+        generate_async=generate_async,
+    )
+    server.model_config = _M3VLConfig()
+    server.tokenizer = tokenizer
+    server.processor = None
+    server.chat_template = None
+    server.tool_parser = None
+    server.tool_call_id_type = "random"
+    server.multimodal_server_config = None
+    server.allow_request_chat_template = False
+    server._create_chat_response = create_chat_response
+
+    png = io.BytesIO()
+    Image.new("RGB", (32, 32), "red").save(png, format="PNG")
+    request = ChatCompletionRequest(
+        model="minimax-m3",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,"
+                            + base64.b64encode(png.getvalue()).decode()
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    response = asyncio.run(server.openai_chat(request, None))
+    assert response.status_code == 200, response.body
+
+    prompt = captured["inputs"]
+    assert prompt["prompt"] == "user: ]<]image[>[\ndescribe assistant:"
+    assert prompt["chat_template_applied"] is True
+    assert prompt["mm_item_order"] == [
+        {"modality": "image", "index": 0, "placeholder": "]<]image[>["}
+    ]
+    assert len(prompt["multi_modal_data"]["image"]) == 1
+    assert tokenizer.template_calls == 1
+
+    ids, extra = proc.call_with_text_prompt(prompt, SimpleNamespace())
+    # The server's rendering is the only one; the processor saw it verbatim.
+    assert tokenizer.template_calls == 1
+    assert valid.calls == [[prompt["prompt"]]]
+    assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
+    assert extra["multimodal_data"]["image"]["image_grid_thw"].tolist() == [[1, 2, 2]]
