@@ -432,17 +432,20 @@ class DecoderWarmup:
         from tensorrt_llm._torch.jit_prefetch import (
             cancel_flashinfer_build,
             flashinfer_build_pending,
+            flashinfer_layer_builds_pending,
             prefetch_enabled,
             start_flashinfer_build,
             start_mxfp8_tune_builds,
+            wait_flashinfer_layer_builds,
         )
 
         # With JIT compile ahead on, a CPU-only helper builds the sampling
         # module (started by the model loader while the weights loaded, or
         # here) while the eager warmup forwards below run on the GPU; it is
         # joined (and the module loaded) before CUDA graph capture, the first
-        # phase that can launch the sampling kernels, together with any helper
-        # the model loader started on a module of the model's layers. Another
+        # phase that can launch the sampling kernels. Helpers the model loader
+        # started on modules of the model's layers are joined before the
+        # first forward. Another
         # builds the FlashInfer modules the autotuner warmup's FlashInfer MXFP8
         # pass needs, if it runs and the model loader has not started them
         # already; the pass waits on their file locks.
@@ -468,6 +471,11 @@ class DecoderWarmup:
                 return None
             if self.before_warmup_forwards_callable is not None:
                 self.before_warmup_forwards_callable()
+            if flashinfer_layer_builds_pending():
+                # FlashInfer modules the model's layers build in the first
+                # forward: join their helpers first, so it only loads them.
+                with self._warmup_timer.phase("flashinfer_layer_join"):
+                    wait_flashinfer_layer_builds()
             return self._warmup_scheduled_forwards(
                 resource_manager, kv_cache_manager, sampling_in_helper
             )

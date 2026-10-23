@@ -233,6 +233,19 @@ def test_tune_batches_respect_engine_limits(monkeypatch):
     assert [b.ctx_chunk_lens for b in prov.tune_batches()] == [[1, 1, 1]] * 2
 
 
+@pytest.mark.cpu_only
+def test_early_batches_are_the_tune_batches_with_cached_prefixes(monkeypatch):
+    """The batches queued before warmup's first forward are tune ahead's
+    batch with cached prefixes: no warmup forward reaches its initial-state
+    keys. Its batch without them shares the keys warmup's prefills tune."""
+    monkeypatch.setattr(mjp._MixerShape, "triton_ssd", True)
+    _, prov = _tune_provider(True)
+    early = list(prov.early_batches())
+    assert [b.any_ctx_cached for b in early] == [True]
+    assert early[0].ctx_chunk_lens == next(prov.tune_batches()).ctx_chunk_lens
+    assert prov.plans_warmup_batches
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.usefixtures("restore_triton_hooks")
 @pytest.mark.parametrize("prefetch", [True, False], ids=["with_prefetch", "tune_ahead_alone"])

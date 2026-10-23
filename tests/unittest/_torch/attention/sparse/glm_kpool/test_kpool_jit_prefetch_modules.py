@@ -111,6 +111,8 @@ def test_start_model_builds_starts_a_helper_only_with_prefetch(sm, monkeypatch, 
         started = jp.start_model_builds(_Model())
     assert started is prefetch
     if prefetch:
-        start.assert_called_once_with(("fmha_gen",))
+        # A layer's module: joined before the first forward, at this
+        # process's priority.
+        start.assert_called_once_with(("fmha_gen",), nice=0, layer=True)
     else:
         start.assert_not_called()

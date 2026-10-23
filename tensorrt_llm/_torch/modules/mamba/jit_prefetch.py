@@ -110,6 +110,10 @@ class MambaSSDProvider:
 
     # Largest batch tune ahead runs, in tokens (see tune_batches).
     TUNE_MAX_TOKENS = 4096
+    # Warmup's prefills are planned before they run (JitPrefetcher.
+    # plan_warmup_batch): the autotuner warmup's compiles every candidate
+    # config of the SSD kernels' autotune keys.
+    plans_warmup_batches = True
 
     def __init__(
         self, model, max_num_tokens: int = 0, max_batch_size: int = 0, max_seq_len: int = 0
@@ -274,6 +278,14 @@ class MambaSSDProvider:
         lens = [q + 1] * r + [q] * (n - r)
         for any_cached in (False, True):
             yield SimpleNamespace(ctx_chunk_lens=lens, any_ctx_cached=any_cached)
+
+    def early_batches(self) -> Iterator[Any]:
+        """The batches whose variants are queued before warmup's first
+        forward (``JitPrefetcher.queue_early_batches``): tune ahead's batch
+        with cached prefixes. No warmup forward reaches its initial-state
+        autotune keys, so its candidate configs are compiled while warmup
+        runs, and tune ahead only benchmarks them."""
+        return (b for b in self.tune_batches() if b.any_ctx_cached)
 
     def run_tune_batch(self, batch_ctx: Any) -> None:
         """Run ``batch_ctx``'s SSD prefill launches on the GPU, on scratch

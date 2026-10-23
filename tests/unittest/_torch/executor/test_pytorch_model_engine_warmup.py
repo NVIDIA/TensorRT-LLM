@@ -1221,6 +1221,15 @@ class TestWarmupCleanup(unittest.TestCase):
             patch.object(
                 model_engine, "_start_deep_gemm_prefetch", side_effect=record("dg_helpers")
             ),
+            patch.object(model_engine, "_start_warmup_triton_builds", side_effect=record("triton")),
+            patch(
+                "tensorrt_llm._torch.jit_prefetch.flashinfer_layer_builds_pending",
+                side_effect=lambda: os.environ.get("TLLM_JIT_AHEAD") == "1",
+            ),
+            patch(
+                "tensorrt_llm._torch.jit_prefetch.wait_flashinfer_layer_builds",
+                side_effect=record("layer_join"),
+            ),
             patch.object(model_engine, "_init_jit_prefetch", side_effect=record("init_prefetch")),
             patch(
                 "tensorrt_llm._torch.modules.mamba.jit_prefetch_decode.start_recording",
@@ -1242,9 +1251,13 @@ class TestWarmupCleanup(unittest.TestCase):
                         model_engine._warmup_impl(resource_manager)
                     phases = ["sampling", "engram", "csa2", "msa_indexer", "forwards"]
                     if prefetch:
-                        phases = ["record", *phases[:4], "dg_helpers", "forwards", "stop_record"]
+                        phases = [
+                            "record", *phases[:4], "dg_helpers", "triton", "layer_join",
+                            "forwards", "stop_record",
+                        ]  # fmt: skip
                     self.assertEqual(events, [*phases, "init_prefetch"])
                     self.assertIsNone(runner.before_warmup_forwards_callable)
+                    self.assertIsNone(getattr(runner, "warmup_batch_callable", None))
 
     @pytest.mark.cpu_only
     def test_jit_prefetch_deep_gemm_priority_token_counts(self) -> None:
@@ -2433,3 +2446,83 @@ def test_first_forward_after_warmup_binds_the_jit_executor_thread() -> None:
     prefetcher.bind_executor_thread.assert_called_once_with()
     assert forward_scheduled.call_count == 3
     assert engine._jit_bind_pending is False
+
+
+@pytest.mark.cpu_only
+def test_warmup_forward_reports_its_batch_before_it_runs() -> None:
+    """Every warmup forward hands its batch to the runner's
+    ``warmup_batch_callable`` (the engine's JIT compile-ahead planning)
+    before it runs, and none is handed over without one."""
+    runner = object.__new__(DecoderRunner)
+    runner._trtllm_gen_jit_warmup = False
+    order = []
+    batch = object()
+
+    def forward(inputs, resource_manager, is_dummy):
+        order.append(("forward", inputs))
+
+    runner.forward = forward
+    with patch.object(decoder_runner_module, "make_scheduled_inputs", return_value="inputs"):
+        runner.warmup_batch_callable = lambda b: order.append(("planned", b))
+        runner._forward_warmup(batch, Mock(), enable_spec_decode=False, runtime_draft_len=0)
+        runner.warmup_batch_callable = None
+        runner._forward_warmup(batch, Mock(), enable_spec_decode=False, runtime_draft_len=0)
+    assert order == [("planned", batch), ("forward", "inputs"), ("forward", "inputs")]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("forced", [False, True], ids=["plain", "forced_initial_states"])
+def test_engine_plans_a_warmup_batch_from_its_requests(monkeypatch, forced: bool) -> None:
+    """The engine describes a warmup forward's batch to the JIT prefetcher
+    by its context chunk lengths, its generation tokens, and whether a
+    request has a cached prefix, which Mamba's warmup can force; a batch
+    without context requests is not planned."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
+    planned = []
+    prefetcher = SimpleNamespace(plan_warmup_batch=planned.append)
+    monkeypatch.setattr(jp.JitPrefetcher, "get", classmethod(lambda cls: prefetcher))
+    monkeypatch.setattr(Mamba2Metadata, "_warmup_force_initial_states", forced)
+    engine = object.__new__(PyTorchModelEngine)
+    ctx = [
+        SimpleNamespace(
+            context_chunk_size=n, context_current_position=0, py_num_compressed_tokens=0
+        )
+        for n in (100, 28)
+    ]
+    gen = [SimpleNamespace(py_draft_tokens=[7, 8])]
+    engine._plan_warmup_batch(SimpleNamespace(context_requests=[], generation_requests=gen))
+    assert planned == []
+    engine._plan_warmup_batch(SimpleNamespace(context_requests=ctx, generation_requests=gen))
+    (batch_ctx,) = planned
+    assert batch_ctx.ctx_chunk_lens == [100, 28]
+    assert batch_ctx.gen_tokens == 3
+    assert batch_ctx.any_ctx_cached is forced
+
+
+@pytest.mark.cpu_only
+def test_serving_forwards_report_unobserved_jit_compiles() -> None:
+    """Once the executor thread is bound, each serving forward lets the JIT
+    prefetcher report the compiles no launch hook observes (it rate-limits
+    itself); the binding forward and warmup forwards do not."""
+    prefetcher = Mock()
+    engine = object.__new__(PyTorchModelEngine)
+    engine._jit_prefetcher = prefetcher
+    engine._jit_bind_pending = True
+    engine._jit_report_compiles = True
+    engine._is_warmup = False
+    engine._runner = object()
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 0
+    with (
+        patch.object(model_engine_module, "make_scheduled_inputs", return_value=Mock()),
+        patch.object(engine, "_forward_scheduled", return_value={}),
+    ):
+        engine.forward(ScheduledRequests(), Mock())
+        assert not prefetcher.report_process_compiles.called
+        engine.forward(ScheduledRequests(), Mock())
+        engine._is_warmup = True
+        engine.forward(ScheduledRequests(), Mock())
+    prefetcher.bind_executor_thread.assert_called_once_with()
+    prefetcher.report_process_compiles.assert_called_once_with()

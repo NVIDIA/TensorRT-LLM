@@ -7,6 +7,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type,
                     Union)
 
@@ -164,8 +165,11 @@ def _configure_deep_gemm_pdl() -> None:
 
 class PyTorchModelEngine(ModelEngine):
     # Set by _init_jit_prefetch: the next forward outside warmup binds the
-    # JIT prefetcher's executor thread (JIT stats count from there).
+    # JIT prefetcher's executor thread (JIT stats count from there), and
+    # serving forwards then report the JIT compiles of paths no launch hook
+    # observes.
     _jit_bind_pending = False
+    _jit_report_compiles = False
 
     def __init__(
         self,
@@ -1054,16 +1058,19 @@ class PyTorchModelEngine(ModelEngine):
         # The DeepGEMM helpers start once the runner's pre-JIT prewarms are
         # done, before its first warmup forward: started earlier, their
         # start-up competes with those in-process nvcc builds for the CPU.
+        # Each warmup forward's batch is then planned before it runs.
         early_start = record_decode and hasattr(
             self._runner, "before_warmup_forwards_callable")
         if early_start:
             self._runner.before_warmup_forwards_callable = (
-                self._start_deep_gemm_prefetch)
+                self._before_warmup_forwards)
+            self._runner.warmup_batch_callable = self._plan_warmup_batch
         try:
             self._runner.warmup(resource_manager)
         finally:
             if early_start:
                 self._runner.before_warmup_forwards_callable = None
+                self._runner.warmup_batch_callable = None
             if record_decode:
                 jit_prefetch_decode.stop_recording()
             if record_msa:
@@ -1104,6 +1111,63 @@ class PyTorchModelEngine(ModelEngine):
             logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: "
                            f"{type(e).__name__}: {e}")
 
+    def _before_warmup_forwards(self) -> None:
+        """Start what JIT compile ahead builds before warmup's first forward
+        (the runner calls this once its pre-JIT prewarms are done)."""
+        self._start_deep_gemm_prefetch()
+        self._start_warmup_triton_builds()
+
+    def _start_warmup_triton_builds(self) -> None:
+        """Register the Triton providers that follow from the model and the
+        engine limits alone before warmup's first forward, so they plan the
+        warmup forwards' batches (``_plan_warmup_batch``), and queue the
+        batches tune ahead will run at the end of warmup
+        (``JitPrefetcher.queue_early_batches``)."""
+        try:
+            from ..jit_prefetch import JitPrefetcher
+            prefetcher = JitPrefetcher.get()
+            if prefetcher is None:
+                return
+            self._register_tune_ahead_providers(prefetcher)
+            prefetcher.queue_early_batches()
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(
+                f"[JIT prefetch] Triton providers not started before warmup: "
+                f"{type(e).__name__}: {e}")
+
+    def _plan_warmup_batch(self, batch: ScheduledRequests) -> None:
+        """Queue the not yet compiled variants of a warmup forward's batch for
+        the JIT helpers before it runs (``JitPrefetcher.plan_warmup_batch``).
+        A batch without context requests is skipped: warmup's generation
+        batches reach no provider that plans warmup batches."""
+        ctx = batch.context_requests
+        if not ctx:
+            return
+        try:
+            from ..jit_prefetch import JitPrefetcher
+            from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+            prefetcher = JitPrefetcher.get()
+            if prefetcher is None:
+                return
+            # The facts _prepare_tp_inputs and Mamba2Metadata.prepare derive:
+            # each request's chunk length, and whether a request has a cached
+            # prefix (initial states), which Mamba's warmup can force.
+            any_cached = Mamba2Metadata._warmup_force_initial_states or any(
+                r.context_current_position - r.py_num_compressed_tokens > 0
+                for r in ctx)
+            gen_tokens = sum(1 + len(getattr(r, "py_draft_tokens", None) or [])
+                             for r in batch.generation_requests)
+            prefetcher.plan_warmup_batch(
+                SimpleNamespace(
+                    ctx_chunk_lens=[r.context_chunk_size for r in ctx],
+                    any_ctx_cached=any_cached,
+                    gen_tokens=gen_tokens))
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail warmup
+            logger.warning_once(
+                f"[JIT prefetch] warmup batch not planned: "
+                f"{type(e).__name__}: {e}",
+                key="jitp_engine_warmup_batch")
+
     def _start_deep_gemm_prefetch(self) -> None:
         """Start building the DeepGEMM FP8 Linear and MoE kernels in CPU-only
         helpers before warmup's first forward, rather than once warmup ends.
@@ -1142,12 +1206,13 @@ class PyTorchModelEngine(ModelEngine):
         """The engine limits the DeepGEMM FP8 Linear provider plans from,
         for CUDA graph batch sizes ``graph_batch_sizes`` and ``draft_tokens``
         draft tokens per generation request."""
-        # MLA with a cached prefix runs kv_b_proj over up to chunk_size x
-        # chunked_prefill_buffer_batch_size cached tokens per loop, more
-        # than max_num_tokens rows.
+        # With chunked prefill, MLA runs kv_b_proj over a request's cached
+        # prefix (its earlier chunks, or reused blocks) in loops of up to
+        # chunk_size x chunked_prefill_buffer_batch_size rows, more than
+        # max_num_tokens.
         rf = self.attn_runtime_features
         max_m = self.max_num_tokens
-        if rf.chunked_prefill and rf.cache_reuse:
+        if rf.chunked_prefill:
             max_m = max(
                 max_m,
                 int(rf.chunk_size or 0) *
@@ -1216,6 +1281,7 @@ class PyTorchModelEngine(ModelEngine):
         prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
         self._jit_prefetcher = prefetcher
         self._jit_bind_pending = prefetcher is not None
+        self._jit_report_compiles = prefetcher is not None and prefetcher.stats_on
         if prefetcher is not None and get_sm_version() in (100, 103):
             prefetcher.observe_deep_gemm()
             if self._uses_minimax_m3_msa():
@@ -1621,6 +1687,8 @@ class PyTorchModelEngine(ModelEngine):
         if self._jit_bind_pending and not self.is_warmup:
             self._jit_bind_pending = False
             self._jit_prefetcher.bind_executor_thread()
+        elif self._jit_report_compiles and not self.is_warmup:
+            self._jit_prefetcher.report_process_compiles()
         inputs = make_scheduled_inputs(
             batch,
             new_tensors_device,

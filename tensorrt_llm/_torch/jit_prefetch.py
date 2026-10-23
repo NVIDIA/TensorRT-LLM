@@ -41,11 +41,12 @@ MSA ``fmha_sm100`` kernels follow from the engine's geometry alone, so they
 are built from the moment the model is constructed, while its weights load,
 rather than at the end of warmup (:class:`FmhaSm100Builds`,
 ``start_model_builds``). So do FlashInfer JIT modules: a module a model's
-layers build in their first forward (the TRTLLM-GEN attention launcher of
-GLM-5.3-Flash and MiniMax-M3), and the MXFP8 GEMM the autotuner warmup tunes
-for decode graphs (DeepSeek-V4.1's Engram WKV, MiniMax-M3;
-``start_mxfp8_tune_builds``), from the moment the model is constructed; the
-sampling module from the start of warmup. The DeepGEMM kernels and
+layers build in their first forward (the TRTLLM-GEN attention launcher, which
+any model whose attention runs on FlashInfer's TRTLLM-GEN FMHA library builds,
+GLM-5.3-Flash's MLA decode and MiniMax-M3 among them), and the MXFP8 GEMM the
+autotuner warmup tunes for decode graphs (DeepSeek-V4.1's Engram WKV,
+MiniMax-M3; ``start_mxfp8_tune_builds``), from the moment the model is
+constructed, as does the sampling module. The DeepGEMM kernels and
 FlashInfer's low-M BF16 GEMM variants follow from the weight shapes and the
 engine limits; they start once the weights are materialized on the GPU, while
 their values load (``start_weight_load_builds``).
@@ -83,6 +84,7 @@ listed there is a variant no provider covers.
 
 from __future__ import annotations
 
+import collections
 import importlib
 import json
 import os
@@ -90,7 +92,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -102,9 +104,10 @@ _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
 _TUNE_ENV = "TLLM_JIT_TUNE_AHEAD"
 _TUNE_THREADS_ENV = "TLLM_JIT_TUNE_AHEAD_THREADS"
 
-# Queue priorities, lowest first: the executor is blocked on it; warmup or the
-# first forwards need it (tune ahead, priority token counts); a provider can
-# reach it (background enumeration).
+# Queue priorities, lowest first: the executor is blocked on it, or the warmup
+# forward about to run reaches it; warmup or the first forwards need it (tune
+# ahead, priority token counts); a provider can reach it (background
+# enumeration).
 _PRIO_URGENT, _PRIO_BATCH, _PRIO_ENUM = -1, 0, 1
 
 
@@ -130,6 +133,59 @@ def _default_workers() -> int:
         or 1
     )
     return max(2, min(16, cpus // max(1, local) - 2))
+
+
+# Variables of the job launcher (MPI, PMIx, Slurm, UCX): a helper that saw
+# them could initialize MPI in its interpreter.
+_LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_")
+# The JIT cache locations helpers build into, as the libraries (and
+# TRTLLM_CACHE_DIR's defaults in tensorrt_llm/_bootstrap.py) set them.
+_CACHE_DIR_ENV = (
+    "TRITON_CACHE_DIR",
+    "DG_JIT_CACHE_DIR",
+    "TRTLLM_DG_CACHE_DIR",
+    "CUTE_DSL_CACHE_DIR",
+    "TLLM_JIT_CUTE_DSL_DIR",
+    "FLASHINFER_WORKSPACE_BASE",
+    "FLASHINFER_CUBIN_DIR",
+    "TORCH_EXTENSIONS_DIR",
+    "CUDA_CACHE_PATH",
+)
+
+
+def _helper_env(keep_pythonpath: bool = False, **extra: str) -> Dict[str, str]:
+    """The environment of a CPU-only helper process: this process's, without
+    the job launcher's variables, with no visible GPU and no user site, plus
+    ``extra``. The JIT cache locations are made absolute, since helpers run
+    in ``/tmp``: a relative one would otherwise name another directory than
+    the one this process loads from. ``PYTHONPATH`` is dropped unless
+    ``keep_pythonpath``: helpers that import no ``tensorrt_llm`` module load
+    only what they are given by path."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(_LAUNCHER_ENV_PREFIXES)}
+    for name in _CACHE_DIR_ENV:
+        if env.get(name):
+            env[name] = os.path.abspath(env[name])
+    env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1", **extra)
+    if not keep_pythonpath:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
+def _wait_timeout_s() -> float:
+    """Seconds a launch waits for a helper's build of the variant it needs
+    (``TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S``, default 300); also bounds the
+    joins of warmup's FlashInfer helpers and tune ahead's wait for its
+    candidates. A value that is not a number is ignored."""
+    v = os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            logger.warning_once(
+                f"[JIT prefetch] ignoring TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S={v!r}: not a number",
+                key="jitp_wait_timeout_env",
+            )
+    return 300.0
 
 
 def prefetch_enabled() -> bool:
@@ -211,6 +267,9 @@ def jit_engine_enabled() -> bool:
 _fi_builds: List[Tuple[Tuple[str, ...], Any]] = []
 # Every module a build has been started for, so none is started twice.
 _fi_started: set = set()
+# The modules among them that a model's layers build in warmup's first
+# forwards (``start_model_builds``), joined before those forwards.
+_fi_layer_modules: set = set()
 
 
 def _flashinfer_is_compiled(name: str) -> bool:
@@ -226,25 +285,34 @@ def _flashinfer_is_compiled(name: str) -> bool:
     )
 
 
-def start_flashinfer_build(modules: Tuple[str, ...] = ("sampling",)) -> bool:
+def start_flashinfer_build(
+    modules: Tuple[str, ...] = ("sampling",), nice: int = 19, layer: bool = False
+) -> bool:
     """Start building FlashInfer JIT ``modules`` in a CPU-only helper process.
 
     FlashInfer builds a JIT module with nvcc at its first use, about a minute
     with a cold cache, during which the GPU idles. Warmup builds the sampling
     module (``warmup_sampling_module``) before its first forward; a model's
-    layers may build others in warmup's first forwards (see
+    layers may build others in warmup's first forwards (``layer``, see
     ``start_model_builds``). Started ahead of that use, the helper builds the
     modules, one after another in the given order, while the process does
     other work: the sampling module from the beginning of warmup, a layer's
-    module while the weights load. ``wait_flashinfer_build`` joins the helpers
-    before the first warmup phase that can launch the sampling kernels (CUDA
-    graph capture); a use before that waits on FlashInfer's own file lock,
-    which the helper holds while it builds the module. Either way the
-    in-process ``build_and_load`` only loads the result. The helper has no
-    visible GPU: ``FLASHINFER_CUDA_ARCH_LIST`` gives it this process's
-    FlashInfer targets, which also name the cache directory, so the build
-    lands where this process looks. Returns False if prefetch is off,
-    FlashInfer is missing, or every module is built already or being built.
+    module while the weights load. Warmup joins the helpers before the use:
+    a layer's modules before its first forward
+    (``wait_flashinfer_layer_builds``), the rest before the first phase that
+    can launch the sampling kernels (CUDA graph capture,
+    ``wait_flashinfer_build``); the in-process ``build_and_load`` then finds
+    the module built. A use while the helper builds would wait on FlashInfer's
+    file lock, which the helper holds, and then run FlashInfer's ninja, which
+    rebuilds the module in place if an input changed during the helper's
+    build: the TRTLLM-GEN launcher's generator, run again by that use, fetches
+    its kernel header anew while the helper's own fetch is under way. The
+    helper runs at ``nice`` (a layer's module, which its first forward waits
+    for, at the priority of this process). It has no visible GPU:
+    ``FLASHINFER_CUDA_ARCH_LIST`` gives it this process's FlashInfer targets,
+    which also name the cache directory, so the build lands where this
+    process looks. Returns False if prefetch is off, FlashInfer is missing, or
+    every module is built already or being built.
     """
     if not prefetch_enabled() or os.environ.get("FLASHINFER_DISABLE_JIT"):
         return False
@@ -279,13 +347,7 @@ def start_flashinfer_build(modules: Tuple[str, ...] = ("sampling",)) -> bool:
     import subprocess
     import sys
 
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
-    }
-    env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1", FLASHINFER_CUDA_ARCH_LIST=archs)
-    env.pop("PYTHONPATH", None)
+    env = _helper_env(FLASHINFER_CUDA_ARCH_LIST=archs)
     helper = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_flashinfer_helper.py"
     )
@@ -305,41 +367,49 @@ def start_flashinfer_build(modules: Tuple[str, ...] = ("sampling",)) -> bool:
     except OSError as e:
         logger.warning(f"[JIT prefetch] FlashInfer build not started: {type(e).__name__}: {e}")
         return False
-    try:
-        os.setpriority(os.PRIO_PROCESS, proc.pid, 19)
-    except OSError:
-        pass
+    if nice:
+        try:
+            os.setpriority(os.PRIO_PROCESS, proc.pid, nice)
+        except OSError:
+            pass
     _fi_builds.append((tuple(pending), proc))
     _fi_started.update(pending)
+    if layer:
+        _fi_layer_modules.update(pending)
     logger.info(f"[JIT prefetch] building FlashInfer {', '.join(pending)} in a CPU-only helper")
     return True
 
 
-def wait_flashinfer_build(timeout_s: Optional[float] = None) -> Optional[float]:
-    """Join the helpers ``start_flashinfer_build`` started; return the seconds
-    waited, or None if none was started. Called where warmup needs the
-    modules: a failed or timed-out build only means the module is built in
-    place. ``timeout_s`` bounds the whole join."""
+def wait_flashinfer_build(
+    timeout_s: Optional[float] = None, modules: Optional[set] = None
+) -> Optional[float]:
+    """Join the helpers ``start_flashinfer_build`` started, or only those
+    building one of ``modules``; return the seconds waited, or None if there
+    was none to join. Called where warmup needs the modules: a failed or
+    timed-out build only means the module is built in place. ``timeout_s``
+    bounds the whole join."""
     import subprocess
 
-    if not _fi_builds:
+    joining = [b for b in _fi_builds if modules is None or set(b[0]) & set(modules)]
+    if not joining:
         return None
     if timeout_s is None:
-        timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
+        timeout_s = _wait_timeout_s()
     t0 = time.perf_counter()
-    while _fi_builds:
-        modules, proc = _fi_builds[0]
+    for i, (names, proc) in enumerate(joining):
         try:
             out, _ = proc.communicate(timeout=max(0.0, timeout_s - (time.perf_counter() - t0)))
         except subprocess.TimeoutExpired:
-            unjoined = [name for names, _ in _fi_builds for name in names]
-            cancel_flashinfer_build()
+            unjoined = [name for b in joining[i:] for name in b[0]]
+            for b in joining[i:]:
+                _fi_builds.remove(b)
+                _stop_flashinfer_helper(b[1])
             logger.warning(
                 f"[JIT prefetch] FlashInfer {', '.join(unjoined)} build(s) still running after"
                 f" {timeout_s:.0f} s: stopped, built in place instead"
             )
             return time.perf_counter() - t0
-        _fi_builds.pop(0)
+        _fi_builds.remove((names, proc))
         reported = set()
         for line in (out or "").splitlines():
             try:
@@ -347,7 +417,7 @@ def wait_flashinfer_build(timeout_s: Optional[float] = None) -> Optional[float]:
                 name, ok, secs = r["module"], r["ok"], float(r["s"])
             except (ValueError, TypeError, KeyError):
                 continue
-            if name not in modules:
+            if name not in names:
                 continue
             reported.add(name)
             if not ok:
@@ -362,7 +432,7 @@ def wait_flashinfer_build(timeout_s: Optional[float] = None) -> Optional[float]:
                     f"[JIT prefetch] FlashInfer {name} built by the helper in {secs:.1f} s"
                     f" (waited {time.perf_counter() - t0:.1f} s)"
                 )
-        missing = [m for m in modules if m not in reported]
+        missing = [m for m in names if m not in reported]
         if missing:
             logger.warning(
                 f"[JIT prefetch] FlashInfer helper exited with code {proc.returncode} before"
@@ -371,46 +441,64 @@ def wait_flashinfer_build(timeout_s: Optional[float] = None) -> Optional[float]:
     return time.perf_counter() - t0
 
 
+def wait_flashinfer_layer_builds() -> Optional[float]:
+    """Join the helpers building modules of the model's layers (``layer`` in
+    ``start_flashinfer_build``), before warmup's first forward; return the
+    seconds waited, or None if there is none to join."""
+    return wait_flashinfer_build(modules=_fi_layer_modules)
+
+
 def cancel_flashinfer_build() -> None:
     """Stop the helpers ``start_flashinfer_build`` started that have not been
     joined, and return once they have exited. Their modules are then built in
     place."""
+    while _fi_builds:
+        _, proc = _fi_builds.pop(0)
+        _stop_flashinfer_helper(proc)
+
+
+def _stop_flashinfer_helper(proc) -> None:
+    """Stop one helper ``start_flashinfer_build`` started; return once it has
+    exited.
+
+    SIGTERM goes to the helper's process group, again each second until the
+    helper exits, so a ninja started after the first one gets it as well.
+    ninja stops the compilers it runs (each in a process group of its own)
+    and removes their partial outputs; the helper waits for it. A compiler
+    left running would write into the directory the in-place build uses.
+    """
     import signal
     import subprocess
 
-    while _fi_builds:
-        _, proc = _fi_builds.pop(0)
-        # SIGTERM to the helper's process group, sent again each second until
-        # the helper exits, so a ninja started after the first one gets it as
-        # well. ninja stops the compilers it runs (each in a process group of
-        # its own) and removes their partial outputs; the helper waits for it.
-        # A compiler left running would write into the directory the in-place
-        # build uses.
-        sig, deadline = signal.SIGTERM, time.monotonic() + 60.0
-        while proc.poll() is None:
-            if time.monotonic() > deadline:
-                if sig == signal.SIGKILL:
-                    logger.warning("[JIT prefetch] FlashInfer helper did not exit; left running")
-                    break
-                logger.warning(
-                    "[JIT prefetch] FlashInfer helper did not stop on SIGTERM; killing it"
-                )
-                sig, deadline = signal.SIGKILL, time.monotonic() + 10.0
-            try:
-                os.killpg(proc.pid, sig)
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                pass
-        proc.stdout.close()
+    sig, deadline = signal.SIGTERM, time.monotonic() + 60.0
+    while proc.poll() is None:
+        if time.monotonic() > deadline:
+            if sig == signal.SIGKILL:
+                logger.warning("[JIT prefetch] FlashInfer helper did not exit; left running")
+                break
+            logger.warning("[JIT prefetch] FlashInfer helper did not stop on SIGTERM; killing it")
+            sig, deadline = signal.SIGKILL, time.monotonic() + 10.0
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+    proc.stdout.close()
 
 
 def flashinfer_builds_pending() -> bool:
     """Whether a helper ``start_flashinfer_build`` started is still to be
     joined (``wait_flashinfer_build``) or stopped (``cancel_flashinfer_build``)."""
     return bool(_fi_builds)
+
+
+def flashinfer_layer_builds_pending() -> bool:
+    """Whether a helper still to be joined builds a module of the model's
+    layers (``wait_flashinfer_layer_builds``)."""
+    return any(set(modules) & _fi_layer_modules for modules, _ in _fi_builds)
 
 
 def flashinfer_build_pending(name: str) -> bool:
@@ -434,9 +522,11 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     alone; called once the model is constructed, so the builds run while the
     weights load instead of inside warmup:
 
-    * FlashInfer JIT modules, one helper for all of them: each provider
-      module that knows of such modules lists them (GLM-5.3-Flash's and
-      MiniMax-M3's TRTLLM-GEN attention launcher ``fmha_gen``), then the
+    * FlashInfer JIT modules, one helper each: each provider module that
+      knows of such modules lists them (``fmha_gen``, FlashInfer's TRTLLM-GEN
+      attention launcher, for the layers of any model that run on its FMHA
+      library, GLM-5.3-Flash's MLA decode and MiniMax-M3), which warmup joins
+      before its first forward (``wait_flashinfer_layer_builds``), and the
       sampling module, if the engine ``llm_args`` describes builds it in
       warmup (``warmup_builds_sampling_module``; warmup starts it otherwise);
     * the FlashInfer modules of the autotuner warmup's FlashInfer MXFP8 pass,
@@ -447,7 +537,10 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     * the CuTe DSL FP8 blockwise GEMM tactics the autotuner benchmarks
       (``jit_prefetch_cute_dsl.Fp8GemmProvider``: block-FP8 Linear layers
       without DeepGEMM, and the batched GEMM of DeepSeek-V4's grouped FP8
-      O-LoRA projection) and the KDA prefill kernel (``KdaPrefillProvider``);
+      O-LoRA projection), the KDA prefill kernel (``KdaPrefillProvider``) and
+      FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``);
+      the CuTe DSL helpers start here, so their start-up overlaps the weight
+      load;
     * MiniMax-M3's MSA ``fmha_sm100`` kernels (:class:`FmhaSm100Builds`),
       whose plan also needs the KV cache's page size and dtypes, taken from
       ``llm_args``. Without it they start at the beginning of warmup instead.
@@ -461,6 +554,7 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     started = False
     modules: List[str] = []
     for provider_module in (
+        "attention.backends.fmha.jit_prefetch",
         "attention.backends.sparse.glm_kpool.jit_prefetch",
         "attention.backends.sparse.minimax_m3.jit_prefetch_fmha",
     ):
@@ -472,18 +566,20 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
                 f"[JIT prefetch] FlashInfer builds of {provider_module} not planned: "
                 f"{type(e).__name__}: {e}"
             )
+    # One helper per module, so they build side by side. The layers' modules
+    # are joined before warmup's first forward, which waits for them, so they
+    # build at this process's priority.
+    for name in dict.fromkeys(modules):
+        started = start_flashinfer_build((name,), nice=0, layer=True) or started
     if llm_args is not None:
-        # After the layers' modules, which the first forward needs: warmup
-        # loads the sampling module only before CUDA graph capture.
+        # Warmup loads the sampling module only before CUDA graph capture.
         try:
             if warmup_builds_sampling_module(model, llm_args):
-                modules.append("sampling")
+                started = start_flashinfer_build(("sampling",)) or started
         except Exception as e:  # noqa: BLE001 - warmup then starts it
             logger.warning(
                 f"[JIT prefetch] FlashInfer sampling build not planned: {type(e).__name__}: {e}"
             )
-    if modules:
-        started = start_flashinfer_build(tuple(dict.fromkeys(modules)))
     if llm_args is not None:
         try:
             started = (
@@ -499,18 +595,22 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
         if IS_CUTLASS_DSL_AVAILABLE:
             from . import jit_prefetch_cute_dsl as jcd
 
-            # Both follow from the layers' geometry and are compiled in
+            # They follow from the layers' geometry and are compiled in
             # warmup's first forwards: the FP8 GEMM tactics by the
-            # autotuner, the KDA prefill kernel by the first prefill.
+            # autotuner, the KDA prefill kernel by the first prefill, the
+            # FlashInfer norms by the first forward.
             gemm_provider = jcd.Fp8GemmProvider(model)
             kda_provider = jcd.KdaPrefillProvider(model)
-            if gemm_provider or kda_provider:
+            norm_provider = jcd.FlashInferNormProvider(model)
+            if gemm_provider or kda_provider or norm_provider:
                 prefetcher = JitPrefetcher.init(rank)
                 if prefetcher is not None:
                     if gemm_provider:
                         started = prefetcher.enable_fp8_gemm(gemm_provider) or started
                     if kda_provider:
                         started = prefetcher.enable_cute_dsl(kda_provider) or started
+                    if norm_provider:
+                        started = prefetcher.enable_flashinfer_norm(norm_provider) or started
     except Exception as e:  # noqa: BLE001 - the kernels then compile in place
         logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
     if llm_args is not None and FmhaSm100Builds.get() is None:
@@ -708,13 +808,7 @@ class FmhaSm100Builds:
         self._queue: "queue.Queue[Tuple[int, str]]" = queue.Queue()
         for tag, spec in enumerate(self.specs):
             self._queue.put((tag, spec))
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
-        }
-        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
-        env.pop("PYTHONPATH", None)
+        env = _helper_env()
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_fmha_sm100_helper.py"
         )
@@ -1103,7 +1197,9 @@ class _Stats:
     fmha_helper_fail: int = 0
     fmha_executor_compiles: int = 0
     fmha_executor_compile_s: float = 0.0
-    events: List[str] = field(default_factory=list)
+    # The latest events (``JitPrefetcher._event``), bounded so a long-running
+    # server does not accumulate them.
+    events: Deque[str] = field(default_factory=lambda: collections.deque(maxlen=4096))
 
 
 class JitPrefetcher:
@@ -1123,6 +1219,8 @@ class JitPrefetcher:
         self._spec_prio: Dict[str, int] = {}
         # ids of the providers a background enumeration has covered.
         self._enumerated: set = set()
+        # Per provider, the batch classes plan_warmup_batch has planned.
+        self._warmup_seen: Dict[int, set] = {}
         self._enum_lock = threading.Lock()
         self._inflight: Dict[int, str] = {}
         self._tag_event: Dict[int, threading.Event] = {}
@@ -1138,6 +1236,16 @@ class JitPrefetcher:
         self._procs_by_kind: Dict[str, List[Any]] = {}
         self._stdin_locks: Dict[int, threading.Lock] = {}
         self._busy: Dict[int, threading.Event] = {}
+        # The request each helper is working on (pid -> tag), and the helpers
+        # that have exited; see _helper_exited.
+        self._proc_tag: Dict[int, int] = {}
+        self._exited: set = set()
+        # Threads queueing requests (see _start_enumeration), and the helper
+        # kinds stopped once serving had nothing left for them.
+        self._enum_threads: List[threading.Thread] = []
+        self._retired: set = set()
+        # Each helper's feed and drain threads; both end once it has exited.
+        self._helper_threads: List[threading.Thread] = []
         self._req_q = None
         # kind -> queue; "triton" uses self._req_q
         self._queues: Dict[str, Any] = {}
@@ -1147,7 +1255,10 @@ class JitPrefetcher:
         self._cd_dir = None
         self._fp8_gemm = False  # the FP8 blockwise GEMM loader is installed
         self._lowm = False  # the low-M direct GEMM loader is installed
+        self._fi_norm = False  # the FlashInfer norm loader is installed
 
+        self._wait_timeout = _wait_timeout_s()
+        self._next_compile_report = 0.0
         self._executor_thread: Optional[int] = None
         # The thread running JitPrefetcher.tune, while it runs.
         self._tune_thread: Optional[int] = None
@@ -1183,13 +1294,7 @@ class JitPrefetcher:
         # A plain interpreter on a script, not multiprocessing: a "spawn"
         # child re-imports the parent's __main__, which under an MPI launcher
         # would initialize MPI and CUDA in the helper.
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
-        }
-        env.update(TRITON_CACHE_DIR=cache_dir, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
-        env.pop("PYTHONPATH", None)
+        env = _helper_env(TRITON_CACHE_DIR=os.path.abspath(cache_dir))
         n = max(1, int(os.environ.get(_WORKERS_ENV, str(_default_workers()))))
         self._procs = []
         self._req_q = queue.PriorityQueue()
@@ -1223,8 +1328,13 @@ class JitPrefetcher:
             self._procs.append(p)
             self._procs_by_kind.setdefault(kind, []).append(p)
             self._ready[p.pid] = threading.Event()
-            threading.Thread(target=self._feed_loop, args=(p, q), daemon=True).start()
-            threading.Thread(target=self._drain_loop, args=(p,), daemon=True).start()
+            self._busy[p.pid] = threading.Event()
+            for t in (
+                threading.Thread(target=self._feed_loop, args=(p, q, kind), daemon=True),
+                threading.Thread(target=self._drain_loop, args=(p, kind), daemon=True),
+            ):
+                self._helper_threads.append(t)
+                t.start()
 
     def observe_deep_gemm(self) -> None:
         """Count DeepGEMM FP8 GEMM compiles on the executor thread after warmup.
@@ -1351,7 +1461,7 @@ class JitPrefetcher:
                     n += 1
             self._event(f"DeepGEMM enumeration of shapes added by weight loading: {n} requests")
 
-        threading.Thread(target=_enumerate, daemon=True, name="jit_prefetch_dg_enum2").start()
+        self._start_enumeration(_enumerate, "jit_prefetch_dg_enum2")
         self._event(
             f"DeepGEMM prefetch: weight loading added {len(new)} FP8 Linear and "
             f"{len(new_moe)} MoE shape(s)"
@@ -1376,13 +1486,7 @@ class JitPrefetcher:
             return False
         tgt = jdg.target()
         major, minor, sms = tgt[:3]
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
-        }
-        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
-        env.pop("PYTHONPATH", None)
+        env = _helper_env()
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_dg_helper.py"
         )
@@ -1394,6 +1498,7 @@ class JitPrefetcher:
             env,
             n,
         )
+        jdg.helpers_running = True
         self._dg = provider
         self._dg_moe = moe_provider
         seen_mnk: set = set()
@@ -1408,22 +1513,15 @@ class JitPrefetcher:
                 self._event(f"DeepGEMM launch not planned: m={m} n={n} k={k}")
                 return
             ev = self._key_event.get(spec)
-            if ev is not None and not ev.is_set():
+            if ev is not None and not ev.is_set() and self._helpers_alive(jdg.KIND):
                 # A helper has it queued or in progress: move it to the front
                 # and wait for its cubin instead of compiling it again here.
                 self._submit(spec, spec, "deep_gemm", _PRIO_URGENT, kind=jdg.KIND)
-                t0 = time.perf_counter()
-                ev.wait(float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300")))
-                dt = time.perf_counter() - t0
-                self.stats.wait_n += 1
-                self.stats.wait_s += dt
-                self._event(f"WAIT for helper deep_gemm m={m} n={n} k={k} {dt * 1e3:.0f} ms")
+                self._wait_for_build(ev, f"deep_gemm m={m} n={n} k={k}")
 
         jdg.launch_observer = _observe
         self.observe_deep_gemm()
-        threading.Thread(
-            target=self._enumerate_dg, daemon=True, name="jit_prefetch_dg_enum"
-        ).start()
+        self._start_enumeration(self._enumerate_dg, "jit_prefetch_dg_enum")
         self._event(
             f"DeepGEMM prefetch: {len(provider.shapes)} FP8 Linear shape(s), "
             f"{len(moe_provider.shapes) if moe_provider else 0} MoE shape(s), {n} helper(s), "
@@ -1432,30 +1530,183 @@ class JitPrefetcher:
         return True
 
     def wait_ready(self, timeout_s: float = 60.0) -> float:
-        """Block until every helper has imported Triton; return seconds waited.
+        """Block until every helper has started (imported its compiler) or
+        exited, for at most ``timeout_s`` in all; return seconds waited.
 
         Called at the end of warmup, so a helper's start-up (about 2 s for
         the interpreter and the Triton import) is never paid by a request.
         """
         t0 = time.perf_counter()
-        for ev in self._ready.values():
-            ev.wait(timeout_s)
+        deadline = t0 + timeout_s
+        for ev in list(self._ready.values()):
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                break
+            ev.wait(left)
         dt = time.perf_counter() - t0
-        n_ready = sum(ev.is_set() for ev in self._ready.values())
-        self._event(f"helpers ready {n_ready}/{len(self._ready)} after {dt * 1e3:.0f} ms")
+        exited = len(self._exited)
+        n_ready = sum(
+            ev.is_set() and pid not in self._exited for pid, ev in list(self._ready.items())
+        )
+        self._event(
+            f"helpers ready {n_ready}/{len(self._ready)} after {dt * 1e3:.0f} ms"
+            + (f" ({exited} exited)" if exited else "")
+        )
         return dt
 
-    def _feed_loop(self, proc, q):
-        # One request in flight per helper, so work spreads across helpers.
+    def _retire_idle_helpers(self, poll_s: float = 1.0) -> None:
+        """Stop each kind's helpers once they have nothing left to build.
+
+        Runs on a thread of its own from ``bind_executor_thread``, i.e. once
+        serving has started: after that nothing queues new requests, so a
+        helper whose queue has drained only holds host memory (several
+        hundred MB each, for its compiler's imports). A kind is stopped when
+        no enumeration thread is still queueing, its queue is empty and none
+        of its helpers is working on a request; its helpers then see their
+        stdin close and exit. A request queued later is never started, and
+        the launch that needs it builds it in place, as without prefetch.
+        """
         while True:
-            _prio, tag, spec = q.get()
-            key = self._tag_key.get(tag)
-            if key is not None:
-                self._key_started.add(key)
-            self._busy.setdefault(proc.pid, threading.Event()).clear()
-            if not self._write_line(proc, json.dumps({"tag": tag, "spec": spec}) + "\n"):
+            with self._lock:
+                enumerating = any(t.is_alive() for t in self._enum_threads)
+            if not enumerating:
+                for kind, procs in list(self._procs_by_kind.items()):
+                    q = self._queues.get(kind)
+                    with self._lock:
+                        if kind in self._retired:
+                            continue
+                        idle = (q is None or q.empty()) and not any(
+                            p.pid in self._proc_tag for p in procs
+                        )
+                        if idle:
+                            self._retired.add(kind)
+                    if idle:
+                        for p in procs:
+                            with self._stdin_locks.setdefault(p.pid, threading.Lock()):
+                                try:
+                                    p.stdin.close()
+                                except OSError:
+                                    pass
+                        self._event(f"{kind} helpers: {len(procs)} stopped, nothing left to build")
+                if self._retired >= set(self._procs_by_kind):
+                    return
+            time.sleep(poll_s)
+
+    def _wait_for_build(self, ev: threading.Event, what: str) -> None:
+        """Wait for a helper's build of the variant a launch needs, at most
+        the wait timeout. A build not done by then is given up on: its event
+        is set, so this launch and any later one build the variant in place
+        instead of waiting again."""
+        t0 = time.perf_counter()
+        done = ev.wait(self._wait_timeout)
+        dt = time.perf_counter() - t0
+        self.stats.wait_n += 1
+        self.stats.wait_s += dt
+        self._event(f"WAIT for helper {what} {dt * 1e3:.0f} ms" + ("" if done else " timed out"))
+        if not done:
+            ev.set()
+            logger.warning(
+                f"[JIT prefetch] a helper's {what} build was not done after {dt:.0f} s; "
+                "built in place"
+            )
+
+    def _helpers_alive(self, kind: str) -> bool:
+        """Whether a helper of ``kind`` is still running."""
+        return any(p.pid not in self._exited for p in self._procs_by_kind.get(kind, ()))
+
+    def _feed_loop(self, proc, q, kind: str):
+        # One request in flight per helper, so work spreads across helpers.
+        busy = self._busy[proc.pid]
+        while True:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                # Idle: end once the helper is gone, so no thread outlives it.
+                if proc.pid in self._exited or kind in self._retired:
+                    return
+                continue
+            _prio, tag, spec = item
+            # Under the lock that _helper_exited and _retire_idle_helpers
+            # take: either they see this request as the helper's, or this
+            # loop sees the helper gone.
+            with self._lock:
+                gone = proc.pid in self._exited or kind in self._retired
+                if not gone:
+                    busy.clear()
+                    self._proc_tag[proc.pid] = tag
+                    key = self._tag_key.get(tag)
+                    if key is not None:
+                        self._key_started.add(key)
+            if gone:
+                q.put(item)  # left to a helper still running
                 return
-            self._busy[proc.pid].wait()
+            if not self._write_line(proc, json.dumps({"tag": tag, "spec": spec}) + "\n"):
+                self._helper_exited(proc, kind)
+                return
+            busy.wait()
+            if proc.pid in self._exited:
+                return
+
+    def _helper_exited(self, proc, kind: str) -> None:
+        """Account for a helper that has exited (its stdout closed, or a
+        request could not be written to it); idempotent.
+
+        Its ready event is set, so ``wait_ready`` stops waiting for it. The
+        request it was working on is released: whoever waits for that
+        variant stops waiting and builds it in place. If it was the last
+        helper of its kind, so are the requests still queued for that kind;
+        a request queued later is never started, and the launch that needs
+        it builds it in place without waiting.
+        """
+        import subprocess
+
+        released: List[str] = []
+        with self._lock:
+            if proc.pid in self._exited:
+                return
+            self._exited.add(proc.pid)
+            tags = []
+            tag = self._proc_tag.pop(proc.pid, None)
+            if tag is not None:
+                tags.append(tag)
+            last = not self._helpers_alive(kind)
+            q = self._queues.get(kind)
+            if last and q is not None:
+                while True:
+                    try:
+                        tags.append(q.get_nowait()[1])
+                    except queue.Empty:
+                        break
+            for t in tags:
+                label = self._inflight.pop(t, None)
+                ev = self._tag_event.pop(t, None)
+                if ev is not None:
+                    ev.set()
+                if label is not None:
+                    released.append(label)
+            if tag is not None:
+                self.stats.helper_fail += 1
+        if last and self._executor_thread is None:
+            from . import jit_prefetch_deep_gemm as jdg
+
+            if kind == jdg.KIND:
+                # Warmup's swap-AB tuning pass compiles the layouts instead.
+                jdg.helpers_running = False
+        self._ready[proc.pid].set()
+        self._busy[proc.pid].set()
+        try:
+            code = proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            code = None
+        if kind in self._retired and not released:
+            return  # stopped by _retire_idle_helpers
+        msg = f"{kind} helper {proc.pid} exited (code {code})"
+        if tag is not None:
+            msg += " while building a variant"
+        if last:
+            msg += f"; no {kind} helper left, {len(released)} request(s) released"
+        logger.warning(f"[JIT prefetch] {msg}; their variants are built in place")
+        self._event(msg)
 
     def _write_line(self, proc, line: str) -> bool:
         """Write one request line to a helper; the feed thread and
@@ -1468,7 +1719,13 @@ class JitPrefetcher:
             except (OSError, ValueError):
                 return False
 
-    def _drain_loop(self, proc):
+    def _drain_loop(self, proc, kind: str):
+        try:
+            self._drain(proc)
+        finally:
+            self._helper_exited(proc, kind)
+
+    def _drain(self, proc):
         for line in proc.stdout:
             try:
                 r = json.loads(line)
@@ -1478,10 +1735,12 @@ class JitPrefetcher:
                 self._ready[proc.pid].set()
                 continue
             tag, ok, dt, err = r["tag"], r["ok"], r["s"], r["err"]
-            ev_busy = self._busy.get(proc.pid)
-            if ev_busy is not None:
-                ev_busy.set()
+            self._busy[proc.pid].set()
             with self._lock:
+                # The feed loop may already have sent this helper its next
+                # request; only this one is done.
+                if self._proc_tag.get(proc.pid) == tag:
+                    del self._proc_tag[proc.pid]
                 label = self._inflight.pop(tag, "?")
                 ev = self._tag_event.pop(tag, None)
                 if ev is not None:
@@ -1521,13 +1780,31 @@ class JitPrefetcher:
         """Mark the calling thread as the executor loop; from here on its JIT
         counts as executor JIT. Called by the engine's first forward after
         warmup; a no-op once bound. Drops the DeepGEMM compiles of warmup,
-        reports the fmha_sm100 builds warmup made."""
+        reports the fmha_sm100 builds warmup made, and starts stopping the
+        helpers as they run out of work (``_retire_idle_helpers``)."""
         if self._executor_thread is not None:
             return
         self._executor_thread = threading.get_ident()
         self._event("executor thread bound; counting JIT from here")
         self._take_deep_gemm_compiles(report=False)
         self.report_fmha_sm100_builds()
+        if self._procs:
+            threading.Thread(
+                target=self._retire_idle_helpers, daemon=True, name="jit_prefetch_retire"
+            ).start()
+
+    def report_process_compiles(self) -> None:
+        """Report the DeepGEMM kernels this process compiled since the last
+        report, at most once a second (``DEEP_GEMM compile in process``
+        events). Called by the engine's serving forwards, on the executor
+        thread, so a compile on a path no launch hook observes (the DSA
+        indexer, MegaMoE) is reported while serving runs, not only when the
+        executor shuts down."""
+        now = time.monotonic()
+        if now < self._next_compile_report:
+            return
+        self._next_compile_report = now + 1.0
+        self._take_deep_gemm_compiles(report=True)
 
     def _take_deep_gemm_compiles(self, report: bool) -> None:
         """Count DeepGEMM compiles from DeepJIT's record of disk-cache misses.
@@ -1578,13 +1855,9 @@ class JitPrefetcher:
         out_dir = os.path.abspath(out_dir)
         os.makedirs(out_dir, exist_ok=True)
         self._cd_dir = out_dir
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
-        }
-        # The helper targets the arch it is given (it sets CUTE_DSL_ARCH).
-        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
+        # The helper imports tensorrt_llm, from where this process does. It
+        # targets the arch it is given (it sets CUTE_DSL_ARCH).
+        env = _helper_env(keep_pythonpath=True)
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_cute_dsl_helper.py"
         )
@@ -1626,13 +1899,7 @@ class JitPrefetcher:
 
         ev = self._key_event.get(spec)
         if ev is not None and not ev.is_set() and spec in self._key_started:
-            wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
-            t0 = time.perf_counter()
-            ev.wait(wait_timeout_s)
-            dt = time.perf_counter() - t0
-            self.stats.wait_n += 1
-            self.stats.wait_s += dt
-            self._event(f"WAIT for helper cute_dsl {dt * 1e3:.0f} ms")
+            self._wait_for_build(ev, "cute_dsl")
         fn = jcd.load(spec, self._cd_dir)
         if fn is None:
             # The compile that follows is counted by the cute.compile wrapper.
@@ -1764,21 +2031,30 @@ class JitPrefetcher:
 
     def enable_flashinfer_norm(self, norm_provider) -> bool:
         """Compile FlashInfer's CuTe DSL norm variants in the CuTe DSL helpers
-        and have FlashInfer's compiled-kernel getters load them."""
+        and have FlashInfer's compiled-kernel getters load them.
+
+        Called once the model is constructed (``start_model_builds``), so the
+        helpers start, and build these variants, while the weights load; and
+        again at the end of warmup, which queues only variants not queued
+        before. Returns whether anything was queued."""
         from . import jit_prefetch_cute_dsl as jcd
 
         if not norm_provider or not self._start_cute_dsl_helpers():
             return False
-        wrapped = jcd.install_flashinfer_norm_loader(self._cute_dsl_load)
-        if not wrapped:
-            return False
-        for spec in norm_provider.enumerate_specs():
+        if not self._fi_norm:
+            if not jcd.install_flashinfer_norm_loader(self._cute_dsl_load):
+                return False
+            self._fi_norm = True
+        queued = sum(
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
-        self._event(
-            f"FlashInfer norm prefetch: {len(norm_provider.shapes)} norm shape(s), "
-            f"{len(norm_provider.specs)} variant(s)"
+            for spec in norm_provider.enumerate_specs()
         )
-        return True
+        if queued:
+            self._event(
+                f"FlashInfer norm prefetch: {len(norm_provider.shapes)} norm shape(s), "
+                f"{queued} variant(s)"
+            )
+        return bool(queued)
 
     def _enumerate_dg(self) -> None:
         """Queue every M window up to max_num_tokens, at background priority."""
@@ -1818,12 +2094,79 @@ class JitPrefetcher:
             ]
             self._enumerated.update(id(p) for p in providers)
         if providers:
-            threading.Thread(
-                target=self._enumerate_all,
-                args=(providers,),
-                daemon=True,
-                name="jit_prefetch_enumerate",
-            ).start()
+            self._start_enumeration(
+                lambda: self._enumerate_all(providers), "jit_prefetch_enumerate"
+            )
+
+    def _start_enumeration(self, target: Callable[[], None], name: str) -> None:
+        """Run ``target``, which queues requests for the helpers, on a thread
+        of its own; ``_retire_idle_helpers`` waits for it."""
+        t = threading.Thread(target=target, daemon=True, name=name)
+        with self._lock:
+            self._enum_threads.append(t)
+        t.start()
+
+    def plan_warmup_batch(self, batch_ctx: Any) -> int:
+        """Queue the variants a warmup forward of ``batch_ctx`` reaches that
+        are not compiled yet, before that forward runs: those of the
+        providers that plan warmup batches (``plans_warmup_batches``).
+
+        Warmup compiles each variant at its first launch, on the executor
+        thread, one after another; for an untuned autotune key that is every
+        candidate config (about 70 Mamba2 SSD ones in the autotuner warmup's
+        prefill). Queued here, ahead of everything else since the forward
+        needs them next, the helpers compile them side by side while it
+        runs: a launch waits for a variant a helper is compiling and compiles
+        one still queued itself (``cache_hook``). Nothing is waited for here.
+        Returns the number of variants queued."""
+        if not self.prefetch:
+            return 0
+        queued = 0
+        for provider in self._providers:
+            if not getattr(provider, "plans_warmup_batches", False):
+                continue
+            seen = self._warmup_seen.setdefault(id(provider), set())
+            try:
+                calls = provider(batch_ctx, seen=seen)
+            except Exception as e:  # noqa: BLE001 - its launches compile in place
+                logger.warning_once(
+                    f"[JIT prefetch] warmup batch not planned: {type(e).__name__}: {e}",
+                    key=f"jitp_warmup_batch_{type(provider).__name__}",
+                )
+                continue
+            for call in calls:
+                queued += self._plan_call(call, priority=_PRIO_URGENT)
+        if queued:
+            self._event(f"warmup batch: {queued} variant(s) queued")
+        return queued
+
+    def queue_early_batches(self) -> int:
+        """Queue, at batch priority and without waiting, the variants of the
+        providers' ``early_batches``: batches no warmup forward runs whose
+        autotune keys tune ahead benchmarks at the end of warmup. Called
+        before warmup's first forward, so the helpers have compiled those
+        candidates by the time tune ahead needs them. Returns the number of
+        variants queued."""
+        if not self.prefetch:
+            return 0
+        queued = 0
+        for provider in self._providers:
+            early = getattr(provider, "early_batches", None)
+            if early is None:
+                continue
+            seen: set = set()
+            try:
+                for batch_ctx in early():
+                    for call in provider(batch_ctx, seen=seen):
+                        queued += self._plan_call(call, priority=_PRIO_BATCH)
+            except Exception as e:  # noqa: BLE001 - tune ahead plans them later
+                logger.warning_once(
+                    f"[JIT prefetch] early batches not planned: {type(e).__name__}: {e}",
+                    key=f"jitp_early_batches_{type(provider).__name__}",
+                )
+        if queued:
+            self._event(f"early batches: {queued} variant(s) queued")
+        return queued
 
     def _plan_call(
         self, call: KernelCall, priority: int = 0, keys_out: Optional[List[str]] = None
@@ -1929,7 +2272,7 @@ class JitPrefetcher:
             return
         import torch
 
-        timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
+        timeout_s = _wait_timeout_s()
         t0 = time.perf_counter()
         before = (self.stats.ta_tunes, self.stats.ta_compiles, self.stats.ta_inproc_compiles)
         n_batches = 0
@@ -2235,7 +2578,6 @@ class JitPrefetcher:
         knobs.compilation.listener = compile_listener
 
         prev_cache_hook = knobs.runtime.jit_cache_hook
-        wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
 
         def cache_hook(*, key, repr, fn, compile, is_manual_warmup, already_compiled):
             # Called by JITFunction._do_compile just before it compiles a
@@ -2259,12 +2601,7 @@ class JitPrefetcher:
                 # request become a disk-cache hit.
                 ev = None
             if ev is not None and not ev.is_set():
-                t0 = time.perf_counter()
-                ev.wait(wait_timeout_s)
-                dt = time.perf_counter() - t0
-                stats.wait_n += 1
-                stats.wait_s += dt
-                me._event(f"WAIT for helper {fn.name} {dt * 1e3:.0f} ms")
+                me._wait_for_build(ev, fn.name)
             if prev_cache_hook is not None:
                 return prev_cache_hook(
                     key=key,

@@ -123,6 +123,10 @@ class PrefillCompiledModel(torch.nn.Module):
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Called with each warmup forward's batch before it runs (the engine
+    # queues that batch's JIT variants for its compile-ahead helpers).
+    warmup_batch_callable: Callable[[ScheduledRequests], None] | None = None
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -512,6 +516,8 @@ class DecoderRunner(ScheduledModelRunner):
         trtllm_gen_jit_warmup: bool = False,
     ) -> Any:
         """Run a dummy scheduled pass with this call's speculation values."""
+        if self.warmup_batch_callable is not None:
+            self.warmup_batch_callable(batch)
         inputs = make_scheduled_inputs(
             batch,
             None,

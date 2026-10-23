@@ -47,6 +47,7 @@ class _Prefetcher(jp.JitPrefetcher):
         self.events = []
         self._dg = None
         self._dg_moe = None
+        self._enum_threads = []
 
     def _submit(self, key, spec, label, priority, kind="triton"):
         self.submitted.append((json.loads(spec), priority))

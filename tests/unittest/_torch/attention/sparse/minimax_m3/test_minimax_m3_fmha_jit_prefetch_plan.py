@@ -211,7 +211,9 @@ def test_start_model_builds_starts_fmha_gen_for_m3_only_with_prefetch(monkeypatc
         started = jp.start_model_builds(model)
     assert started is prefetch
     if prefetch:
-        start.assert_called_once_with(("fmha_gen",))
+        # A layer's module: joined before the first forward, at this
+        # process's priority.
+        start.assert_called_once_with(("fmha_gen",), nice=0, layer=True)
     else:
         start.assert_not_called()
 
@@ -453,12 +455,13 @@ def _provider_model(sites):
     ],
     ids=["decoder", "encoder"],
 )
-def test_sampling_module_starts_after_the_layer_modules_at_load(monkeypatch, args_kw, sampling):
-    """``start_model_builds`` queues FlashInfer's sampling module, which every
-    decoder runner's warmup builds, in the same helper as the model's own
-    modules and after them, as the first forward needs those first; an engine
-    whose runner never samples does not build it."""
-    from unittest.mock import patch
+def test_sampling_module_starts_in_a_helper_of_its_own_at_load(monkeypatch, args_kw, sampling):
+    """``start_model_builds`` starts FlashInfer's sampling module, which every
+    decoder runner's warmup builds, in a helper of its own, next to the one
+    building the model's own modules: those, which warmup joins before its
+    first forward, at this process's priority. An engine whose runner never
+    samples does not build it."""
+    from unittest.mock import call, patch
 
     from tensorrt_llm._torch import jit_prefetch as jp
 
@@ -472,4 +475,5 @@ def test_sampling_module_starts_after_the_layer_modules_at_load(monkeypatch, arg
         patch.object(jp, "tunes_flashinfer_mxfp8_at_load", return_value=False),
     ):
         assert jp.start_model_builds(model, llm_args=llm_args)
-    start.assert_called_once_with(("fmha_gen", "sampling") if sampling else ("fmha_gen",))
+    layer = call(("fmha_gen",), nice=0, layer=True)
+    assert start.call_args_list == ([layer, call(("sampling",))] if sampling else [layer])

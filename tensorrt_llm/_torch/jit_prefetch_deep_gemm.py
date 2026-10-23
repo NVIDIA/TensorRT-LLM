@@ -41,6 +41,11 @@ from typing import List, Tuple
 from tensorrt_llm.logger import logger
 
 KIND = "deep_gemm"
+
+# Whether DeepGEMM helpers build the FP8 GEMM layouts ahead (set by
+# JitPrefetcher.enable_deep_gemm; cleared if they all exit before serving).
+# Without them, warmup's swap-AB tuning pass compiles the layouts.
+helpers_running = False
 _OP = "fp8_fp4_gemm_nt"
 # How TRT-LLM calls it on SM100: FP8 A/B, BF16 out, UE8M0 int scaling factors,
 # so DeepGEMM's default recipe for int SF is (1, 1, 128).
