@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
+    from ..kernels.sage_quant import SageQuantized
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -193,8 +194,9 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    # The number of heads per kv head.
-    num_heads_per_kv: Optional[int] = 1
+    # Upper bound on query heads per KV head over the target model's layers
+    # (unsharded); sizes the spec-dec tree mask.
+    max_num_heads_per_kv: Optional[int] = 1
 
     multi_item_part_lens: Optional[list[list[int]]] = None
     """Additional token layout information for multi-item scoring.
@@ -968,6 +970,12 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
     sage_attn_smooth_k: bool = False
+    # Subtract the per-channel V mean before quantizing V. Applied by FMHA libraries that add
+    # the mean back to the output; the others quantize V unsmoothed.
+    sage_attn_smooth_v: bool = False
+    # SageAttention inputs that the attention core quantized for the FMHA libraries
+    # taking quantized inputs; the attention op quantizes inside its kernels.
+    sage_quantized: Optional["SageQuantized"] = None
     # Per-tensor FP8 recipe of the PrimTS FMHA library. Quantize Q/K and/or V to
     # E4M3 with one scale each, folded into the softmax and output scales.
     qk_fp8_per_tensor: bool = False
@@ -997,6 +1005,15 @@ class AttentionForwardArgs:
             return int(AttentionMaskType.padding)
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
+
+    @property
+    def sage_attn_qk_dtype(self) -> Optional[torch.dtype]:
+        """Quantized Q/K dtype of the SageAttention recipe, or ``None`` without one."""
+        if (self.sage_attn_num_elts_per_blk_q <= 0
+                and self.sage_attn_num_elts_per_blk_k <= 0
+                and self.sage_attn_num_elts_per_blk_v <= 0):
+            return None
+        return torch.int8 if self.sage_attn_qk_int8 else torch.float8_e4m3fn
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(

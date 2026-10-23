@@ -24,16 +24,24 @@ def _warmup_fixture(context_only: bool, available: int = 64):
         tokens_per_block=128,
         num_extra_kv_tokens=0,
         _has_cp_helix=False,
+        _stream=SimpleNamespace(cuda_stream=0),
+        _create_kv_cache=Mock(
+            side_effect=lambda *_args, **_kwargs: Mock(
+                num_committed_tokens=0,
+                capacity=0,
+                resume=Mock(return_value=True),
+                resize=Mock(return_value=True),
+            )
+        ),
+        _ensure_generation_beam_width=Mock(return_value=True),
         get_num_available_tokens=lambda **kwargs: min(available, kwargs["token_num_upper_bound"]),
         get_num_free_blocks=lambda: 64,
     )
 
     def add_dummy_requests(request_ids, **kwargs):
-        # Use production request construction/state initialization. Only the
-        # GPU cache allocation is excluded from these CPU phase-contract tests.
-        return KVCacheManagerV2.add_dummy_requests(
-            manager, request_ids, prepare_resource=False, **kwargs
-        )
+        # Exercise production request initialization and allocation control flow
+        # with CPU stand-ins for the GPU cache objects.
+        return KVCacheManagerV2.add_dummy_requests(manager, request_ids, **kwargs)
 
     manager.add_dummy_requests = Mock(side_effect=add_dummy_requests)
     resource_manager = SimpleNamespace(

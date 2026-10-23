@@ -39,6 +39,7 @@ l0_cpu:
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
+  - unittest/scripts/test_perf_client_readiness.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
@@ -58,6 +59,8 @@ l0_cpu:
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   - unittest/_torch/executor
+  - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
+  - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation
@@ -98,6 +101,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -106,10 +110,13 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_nccl_window_graph.py
   - unittest/_torch/test_route_capture.py
+  - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
@@ -134,6 +141,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
+  - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_step_precision.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
@@ -163,6 +171,7 @@ l0_cpu:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_event_loop_error_broadcast.py
+  - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
   - unittest/executor/test_stats_serializer.py
@@ -189,7 +198,12 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
+  - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  - unittest/llmapi/apps/test_render_callers.py
+  - unittest/llmapi/apps/test_render_core.py
+  - unittest/llmapi/apps/test_render_http.py
+  - unittest/llmapi/apps/test_render_standalone.py
   # test_request_metrics.py as a whole is not registered on any list, so only the
   # two cases added with the KV-transfer fix are selected here. Registering the
   # file would also enable a dozen pre-existing cases that have never run in CI,
@@ -201,6 +215,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
+  - unittest/llmapi/apps/test_serve_lazy_import.py
   - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
@@ -218,6 +233,10 @@ l0_cpu:
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_mpi_session.py ISOLATION
+  - unittest/llmapi/test_mpi_server_lifecycle.py
+  - unittest/llmapi/test_mpi_launcher_shutdown.py
+  - unittest/llmapi/test_disagg_leader_lifecycle.py
+  - unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or worker_system_exit-2 or mixed_collective-4 or all_hang-2 or reuse-2 or sync_recovery-2 or async_drain-2" ISOLATION
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py

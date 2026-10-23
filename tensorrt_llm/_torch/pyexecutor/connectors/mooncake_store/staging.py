@@ -12,17 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pinned host slots that every page passes through on its way to the pool.
+"""Pinned host slots that stand in for GPU pages when the pool cannot reach them.
 
 Registering the KV pools themselves needs the HCA to pin GPU pages, which means
-GPUDirect RDMA via `nvidia_peermem` or dma-buf, and one registration per pool
-mapping. Staging trades a copy for both: Mooncake is given a pinned host buffer
-instead of the pools, and each page passes through a slot in it, gathered from
-its device regions before a write and scattered back after a read.
+GPUDirect RDMA via `nvidia_peermem` or dma-buf. Where that is unavailable,
+`ibv_reg_mr` fails on every pool range and the connector cannot start.
+
+Staging trades a copy for that dependency. Mooncake is given a pinned host
+buffer instead of the pools, and each page passes through a slot in it:
+gathered from its device regions before a write, scattered back after a read.
 
 A slot holds the page's regions concatenated in region order, which is the same
-payload a registered pool would produce, so a pool written by one path is
-readable by the other.
+payload the zero-copy path produces, so a pool written by one path is readable
+by the other.
 
 Copies go through `cudaMemcpyAsync` rather than the batched Triton kernel in
 `disaggregation/native/bounce/gather_scatter.py`, since one side here is host

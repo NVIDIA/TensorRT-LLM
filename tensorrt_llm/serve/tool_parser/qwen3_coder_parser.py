@@ -20,6 +20,10 @@ import math
 import re
 from typing import Any
 
+import jsonschema
+import xgrammar
+from xgrammar import structural_tag
+
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
@@ -66,6 +70,9 @@ _TYPE_PRIORITY = ("null", "integer", "number", "boolean", "object", "array", "st
 # A parameter's opening tag, and the start of one that may be cut short.
 _PARAMETER_OPENING_TAG = re.compile(r"<\s*parameter\s*=\s*([^>]*)>")
 _PARAMETER_TAG_START = re.compile(r"<\s*parameter\s*=")
+# A parameter that ends only at its closing tag, as grammar-constrained output
+# writes every parameter.
+_CLOSED_PARAMETER = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 
 
 def _trim_wrapping_newlines(value: str) -> str:
@@ -75,14 +82,6 @@ def _trim_wrapping_newlines(value: str) -> str:
     if value.endswith("\n"):
         value = value[:-1]
     return value
-
-
-def _strip_function_end(text: str) -> str:
-    """Drop the ``</function>`` tag that closes a function body, if it does."""
-    stripped = text.rstrip()
-    if stripped.endswith("</function>"):
-        return stripped[: -len("</function>")]
-    return text
 
 
 def _extract_types_from_schema(schema: Any) -> list[str]:
@@ -218,12 +217,6 @@ class Qwen3CoderToolParser(BaseToolParser):
         self.tool_call_regex = re.compile(
             r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
         )
-        # A function's body ends at the </function> that is followed by the next
-        # function or by the end of the tool call, so a value that contains
-        # "</function>" stays whole. Without </function> the body runs to the end.
-        self.tool_call_function_regex = re.compile(
-            r"<function=([^>]*)>(.*?)(?:</function>\s*(?=<function=|\Z)|\Z)", re.DOTALL
-        )
         # A parameter ends at its closing tag or, when the model leaves that
         # out, at the next parameter tag.
         self.tool_call_parameter_regex = re.compile(
@@ -244,11 +237,109 @@ class Qwen3CoderToolParser(BaseToolParser):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
+    def build_required_structural_tag(
+        self, tools: list[Tool], *, thinking: bool
+    ) -> structural_tag.StructuralTag:
+        """Build a mandatory grammar for Qwen-Coder XML tool calls.
+
+        The serving layer must validate model eligibility before calling this;
+        selecting this parser alone does not enable required tool choice.
+        ``thinking`` must be resolved from the rendered prompt and indicates
+        whether generation starts inside an already-open ``<think>`` block.
+        """
+        names = [tool.function.name for tool in tools]
+        if not names or len(set(names)) != len(names):
+            raise ValueError("Required tool calls need nonempty tools with unique names.")
+        if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in names):
+            raise ValueError("Tool names must contain only letters, digits, '_', '-', or '.'.")
+        tool_dicts = [tool.model_dump(exclude_none=True) for tool in tools]
+        for tool in tool_dicts:
+            schema = tool["function"].get("parameters") or {"type": "object"}
+            try:
+                jsonschema.validators.validator_for(schema).check_schema(schema)
+            except jsonschema.SchemaError as exc:
+                raise ValueError("Invalid required-tool parameter schema.") from exc
+            if schema.get("type") != "object":
+                raise ValueError("Required tools need object parameter schemas.")
+            if schema.get("additionalProperties", False) is not False:
+                raise ValueError("Required XML tools do not support additionalProperties.")
+            tool["function"]["parameters"] = {"properties": {}, **schema}
+        try:
+            template = xgrammar.get_builtin_structural_tag(
+                model="qwen_coder", tools=tool_dicts, reasoning=False
+            )
+            for tag, tool in zip(template.format.tags, tool_dicts):
+                schema = tool["function"]["parameters"]
+                if not schema["properties"] and schema.keys() <= {
+                    "type",
+                    "properties",
+                    "additionalProperties",
+                    "required",
+                    "minProperties",
+                    "maxProperties",
+                    "title",
+                    "description",
+                    "$schema",
+                }:
+                    # Empty argument lists have no XML parameter blocks.
+                    jsonschema.validate({}, schema)
+                    tag.content = structural_tag.ConstStringFormat(value="")
+                else:
+                    parameters = str(
+                        xgrammar.Grammar.from_structural_tag(
+                            structural_tag.StructuralTag(format=tag.content)
+                        )
+                    )
+                    # Allow spacing after XML parameter terminals while preserving
+                    # the excluded delimiter in string-value dispatch rules.
+                    parameters = "\n".join(
+                        re.sub(
+                            r'"(?:\\.|[^"\\])*"',
+                            lambda match: match[0] + r" [ \t\r\n]*"
+                            if match[0] == '"</parameter>"'
+                            else match[0],
+                            line,
+                        )
+                        if "::=" in line
+                        else line
+                        for line in parameters.splitlines()
+                    )
+                    tag.content = structural_tag.GrammarFormat(grammar=parameters)
+                tag.end = "</function>\n</tool_call>"
+            calls = template.format
+            calls.at_least_one = True
+            calls.triggers = [self.tool_call_start_token]
+            elements = [structural_tag.RegexFormat(pattern=r"[ \t\r\n]*"), calls]
+            if thinking:
+                # The opening <think> is already in the prompt.
+                elements.insert(
+                    0,
+                    structural_tag.TagFormat(
+                        begin="",
+                        content=structural_tag.AnyTextFormat(excludes=[self.tool_call_start_token]),
+                        end="</think>",
+                    ),
+                )
+            template.format = structural_tag.SequenceFormat(elements=elements)
+            xgrammar.Grammar.from_structural_tag(template)
+        except (RuntimeError, jsonschema.ValidationError) as exc:
+            raise ValueError("Invalid or unsupported required-tool parameter schema.") from exc
+        return template
+
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
 
+    def parse_partial(self, text: str, tools: list[Tool]) -> StreamingParseResult:
+        normal, calls = self._extract(text, tools, complete=False)
+        return StreamingParseResult(normal_text=normal, calls=calls)
+
     def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
+        return self._parse_streaming(new_text, tools, complete=False)
+
+    def _parse_streaming(
+        self, new_text: str, tools: list[Tool], *, complete: bool
+    ) -> StreamingParseResult:
         self._buf += new_text
         normal = ""
         calls: list[ToolCallItem] = []
@@ -260,8 +351,13 @@ class Qwen3CoderToolParser(BaseToolParser):
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
             if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+                partial = self._ends_with_partial_token(self._buf, self.tool_call_start_token)
+                if partial:
+                    normal += self._buf[:-partial]
+                    self._buf = self._buf[-partial:]
+                else:
+                    normal += self._buf
+                    self._buf = ""
                 break
 
             # Look for tool call start
@@ -288,43 +384,54 @@ class Qwen3CoderToolParser(BaseToolParser):
             # We're in a tool call, try to parse function name if not sent yet
             if not self._function_name_sent:
                 # Look for function name pattern: <function=name>
-                function_match = re.search(r"<function=([^>]+)>", self._buf)
+                function_match = re.search(r"<function=([^<>]*)>", self._buf)
                 if function_match:
                     function_name = function_match.group(1).strip()
 
-                    # Validate function name
-                    if function_name:
-                        self._current_function_name = function_name
-                        self._function_name_sent = True
-
-                        # Initialize tool call tracking
-                        if self.current_tool_id == -1:
-                            self.current_tool_id = 0
-
-                        # Ensure tracking arrays are large enough
-                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                            self.prev_tool_call_arr.append({})
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
-
-                        # Store tool call info
-                        self.prev_tool_call_arr[self.current_tool_id] = {
-                            "name": function_name,
-                            "arguments": {},
-                        }
-
-                        # Send tool name with empty parameters
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=function_name,
-                                parameters="",
-                            )
+                    if not function_name:
+                        end_pos = self._find_closing_tag(
+                            self._buf,
+                            self.tool_call_end_token,
+                            function_match.end(),
+                            complete=complete,
                         )
-
-                        # Remove the processed function declaration
-                        self._buf = self._buf[function_match.end() :]
+                        if end_pos == -1:
+                            # Keep the call buffered until all its markup can be discarded.
+                            break
+                        self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
+                        self._reset_streaming_state()
                         continue
+                    self._current_function_name = function_name
+                    self._function_name_sent = True
+
+                    # Initialize tool call tracking
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+
+                    # Ensure tracking arrays are large enough
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
+                    # Store tool call info
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": function_name,
+                        "arguments": {},
+                    }
+
+                    # Send tool name with empty parameters
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=function_name,
+                            parameters="",
+                        )
+                    )
+
+                    # Remove the processed function declaration
+                    self._buf = self._buf[function_match.end() :]
+                    continue
                 else:
                     # Function name not complete yet, wait for more text
                     break
@@ -333,37 +440,33 @@ class Qwen3CoderToolParser(BaseToolParser):
             if self._function_name_sent:
                 # Process parameters and get any calls to emit
                 param_config = self._get_arguments_config(self._current_function_name, tools)
-                parameter_calls = self._parse_and_stream_parameters(self._buf, param_config)
+                # A single increment can contain several calls. Parse only this call's body.
+                end_pos = self._find_closing_tag(
+                    self._buf, self.tool_call_end_token, complete=complete
+                )
+                body = self._buf if end_pos == -1 else self._buf[:end_pos]
+                if end_pos != -1:
+                    function_end = self._find_closing_tag(
+                        self._buf[: end_pos + len(self.tool_call_end_token)],
+                        "</function>",
+                        complete=True,
+                    )
+                    if function_end != -1:
+                        body = self._buf[:function_end]
+                parameter_calls = self._parse_and_stream_parameters(
+                    body, param_config, complete=end_pos != -1
+                )
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
-                if self.tool_call_end_token in self._buf:
-                    end_pos = self._buf.find(self.tool_call_end_token)
-                    # The function body is complete, so a last parameter with
-                    # no closing tag can now end with it.
-                    calls.extend(
-                        self._parse_and_stream_parameters(
-                            _strip_function_end(self._buf[:end_pos]), param_config, final=True
-                        )
-                    )
-
-                    # Add closing brace to complete the JSON object
+                if end_pos != -1:
+                    # Parameter deltas leave the outer object open until the call closes.
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                    if current_streamed:
-                        # Count opening and closing braces to check if JSON is complete
-                        open_braces = current_streamed.count("{")
-                        close_braces = current_streamed.count("}")
-                        if open_braces > close_braces:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters="}",
-                                )
-                            )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
-                            )
+                    closing = "}" if current_streamed else "{}"
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=closing)
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = current_streamed + closing
 
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
@@ -376,32 +479,28 @@ class Qwen3CoderToolParser(BaseToolParser):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        result = self._parse_streaming("", tools, complete=True)
+        if not self._in_tool_call:
+            result.normal_text += self._buf
+        self._buf = ""
+        self._reset_streaming_state()
+        return result
+
     def _parse_and_stream_parameters(
-        self, text_to_parse: str, param_config: dict, final: bool = False
+        self, text_to_parse: str, param_config: dict, *, complete: bool = False
     ) -> list[ToolCallItem]:
-        """Parse complete parameter blocks from text and return any tool call items to emit.
+        """Emit argument deltas for the current function body.
 
-        This method:
-        1. Finds all complete <parameter> blocks
-        2. Parses them into a dictionary
-        3. Compares with current parameters and generates diff if needed
-        4. Updates internal state
-
-        Args:
-            text_to_parse: The text to search for parameter blocks
-            param_config: The parameter schemas of the current tool
-            final: Whether ``text_to_parse`` is the whole function body, so a
-                last parameter with no closing tag ends where it ends
-
-        Returns:
-            List of ToolCallItem objects to emit (may be empty)
+        Once the body is complete, unconstrained output can recover its final
+        parameter without a closing marker.
         """
         calls: list[ToolCallItem] = []
 
         new_params = {
             name: self._convert_param_value(value, name, param_config, self._current_function_name)
             for name, value in self._parameter_values(
-                text_to_parse, self._current_function_name, final
+                text_to_parse, self._current_function_name, complete
             ).items()
         }
 
@@ -469,7 +568,51 @@ class Qwen3CoderToolParser(BaseToolParser):
         self._streamed_parameters = {}
         self.current_tool_name_sent = False
 
-    def _extract(self, text: str, tools: list[Tool]) -> tuple[str, list[ToolCallItem]]:
+    def _find_closing_tag(
+        self, text: str, end_token: str, start: int = 0, *, complete: bool = False
+    ) -> int:
+        """Find an outer closer, recovering unclosed parameters in unconstrained output.
+
+        A complete next-call header takes precedence over an unclosed parameter
+        in unconstrained output. Constrained output keeps that markup as literal
+        argument text. A final call can recover only when no parameter closer remains;
+        when its function also lacks ``</function>``, the unclosed parameter ends
+        at a tool-call closer that ends the text.
+        """
+        cursor = start
+        while True:
+            end = text.find(end_token, cursor)
+            parameter = text.find("<parameter=", cursor)
+            if end == -1 or parameter == -1 or end < parameter:
+                return end
+            parameter_end = text.find("</parameter>", parameter)
+            if not self.grammar_constrained:
+                limit = parameter_end if parameter_end != -1 else len(text)
+                for boundary in re.finditer(r"</function>\s*</tool_call>", text[parameter:limit]):
+                    boundary_start = parameter + boundary.start()
+                    boundary_end = parameter + boundary.end()
+                    next_call = re.match(
+                        r"\s*<tool_call>\s*<function=([^<>]+)>", text[boundary_end:limit]
+                    )
+                    if (next_call and next_call.group(1).strip()) or (
+                        complete and parameter_end == -1
+                    ):
+                        return text.find(end_token, boundary_start, boundary_end)
+            if parameter_end == -1:
+                last = text.rfind(end_token)
+                if (
+                    complete
+                    and not self.grammar_constrained
+                    and end_token == self.tool_call_end_token
+                    and not text[last + len(end_token) :].strip()
+                ):
+                    return last
+                return -1
+            cursor = parameter_end + len("</parameter>")
+
+    def _extract(
+        self, text: str, tools: list[Tool], *, complete: bool = True
+    ) -> tuple[str, list[ToolCallItem]]:
         normal_parts: list[str] = []
         calls: list[ToolCallItem] = []
         cursor = 0
@@ -479,22 +622,31 @@ class Qwen3CoderToolParser(BaseToolParser):
                 normal_parts.append(text[cursor:])
                 break
             normal_parts.append(text[cursor:s])
-            e = text.find(self.tool_call_end_token, s)
+            e = self._find_closing_tag(text, self.tool_call_end_token, s, complete=complete)
             if e == -1:
                 normal_parts.append(text[s:])
                 break
-            # Without </tool_call>, a function missing </function> ends where
-            # the tool call does.
-            block = text[s:e]
+            block = text[s : e + len(self.tool_call_end_token)]
             cursor = e + len(self.tool_call_end_token)
             calls.extend(self._parse_block(block, tools))
         return "".join(normal_parts), calls
 
     def _parse_block(self, block: str, tools: list[Tool]) -> list[ToolCallItem]:
         res: list[ToolCallItem] = []
-        for function_match in self.tool_call_function_regex.finditer(block):
-            fname = function_match.group(1).strip()
-            body = function_match.group(2)
+        cursor = 0
+        while match := re.search(r"<function=([^<>]*)>", block[cursor:]):
+            fname = match.group(1).strip()
+            body_start = cursor + match.end()
+            body_end = self._find_closing_tag(block, "</function>", body_start, complete=True)
+            if body_end == -1:
+                # Without </function>, the body ends where the tool call does.
+                body_end = len(block)
+                if block.endswith(self.tool_call_end_token):
+                    body_end -= len(self.tool_call_end_token)
+            body = block[body_start:body_end]
+            cursor = body_end + len("</function>")
+            if not fname:
+                continue
             params: dict[str, Any] = {}
             param_config = self._get_arguments_config(fname, tools)
             for pname, pval in self._parameter_values(body, fname, final=True).items():
@@ -514,7 +666,14 @@ class Qwen3CoderToolParser(BaseToolParser):
         A value ends at its closing tag or at the next parameter's opening tag.
         When ``final`` is set, ``body`` is the whole function body, so a last
         parameter whose closing tag is missing ends where the body ends.
+        Grammar-constrained output closes every parameter, so there a value
+        runs to its closing tag and may hold parameter markup as literal text.
         """
+        if self.grammar_constrained:
+            return {
+                match.group(1).strip(): _trim_wrapping_newlines(match.group(2))
+                for match in _CLOSED_PARAMETER.finditer(body)
+            }
         values = {}
         end = 0
         for match in self.tool_call_parameter_regex.finditer(body):
