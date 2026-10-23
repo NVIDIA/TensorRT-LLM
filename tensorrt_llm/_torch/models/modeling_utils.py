@@ -370,9 +370,18 @@ def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
                                moe_name: str) -> QuantConfig | None:
     """The ``quant_config_dict`` entry of the MoE module named ``moe_name``.
 
-    All linear layers inside a MoE share one quant config, so the first key
-    that contains the module name answers for the whole module.
+    An entry naming the module itself answers first. ``ModelConfig`` injects
+    one per MoE layer for DeepSeek-V4 and MiniMax-M3 exactly because the
+    checkpoint's fine-grained per-linear expert keys do not describe the module
+    as a whole, and it appends it to an insertion-ordered dict, so those keys
+    would otherwise shadow it.
+
+    Failing that, all linear layers inside a MoE share one quant config, so the
+    first key that contains the module name answers for the whole module.
     """
+    own_entry = quant_config_dict.get(moe_name)
+    if own_entry is not None:
+        return own_entry
     for key, quant_config in quant_config_dict.items():
         if moe_name in key:
             return quant_config

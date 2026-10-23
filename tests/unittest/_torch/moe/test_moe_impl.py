@@ -1578,6 +1578,26 @@ def test_moe_experts_quant_config_reads_the_layer_entry_then_the_exclusion():
     assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
 
 
+def test_moe_experts_quant_config_prefers_the_entry_naming_the_module():
+    """``ModelConfig`` appends a coarse per-layer expert entry for DeepSeek-V4
+    and MiniMax-M3 because the checkpoint's per-linear expert keys do not
+    describe the module; those keys come first in the dict and must not win."""
+    from tensorrt_llm._torch.models.modeling_utils import moe_experts_quant_config
+
+    per_linear = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
+    whole_module = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    experts = "model.layers.3.block_sparse_moe.experts"
+    cfg = SimpleNamespace(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict={
+            f"{experts}.0.w1": per_linear,
+            experts: whole_module,
+        },
+    )
+
+    assert moe_experts_quant_config(cfg, experts) is whole_module
+
+
 # Each MoE block, the constructor arguments besides ``model_config`` and
 # ``layer_idx``, and the attribute its decoder layer holds it under.
 _MOE_BLOCKS = (
