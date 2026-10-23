@@ -472,12 +472,13 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
         post_quant_comm: bool = True,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Keeps the activation high precision -- b12x consumes bf16 / fp16 and
-        produces its own scale factors -- and only applies an AWQ pre-quant
-        scale to it.
+        """Hand the activation over in high precision, with an AWQ pre-quant
+        scale applied to it.
 
-        A pre-quant scale is not part of the activation quantization this leaf
-        does not do: an AWQ-style checkpoint stores ``W / s`` and
+        The wrapper runs in ``quant_mode="w4a16"``: it dequantizes the NVFP4
+        weights and leaves the bf16 / fp16 activation alone, so there is no
+        activation quantization here at all. The pre-quant scale is a separate
+        concern. An AWQ-style checkpoint stores ``W / s``, and
         ``load_quant_scales`` fills ``fc31_act_scale`` from its
         ``*.pre_quant_scale`` keys regardless of ``quant_algo``, so the weights
         the kernel dequantizes expect the scaled activation ``x * s``. Same as

@@ -1195,6 +1195,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             return empty_x, empty_sf
         fc31_act_scale = getattr(self, "fc31_act_scale", None)
         if fc31_act_scale is not None:
+            # Product stays bf16, which is what ``fp4_quantize`` below is given
+            # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
+            # admits bf16 activations only, so ``fc31_act_scale``, created at
+            # ``module.dtype``, is bf16 as well.
             x_bf16 = x_bf16 * fc31_act_scale
         x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
             x_bf16,

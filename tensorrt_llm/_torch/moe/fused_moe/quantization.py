@@ -2844,16 +2844,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # Shape: (1, hidden_size) - single vector for all experts (they share
         # the same input).
         #
-        # ``device='cuda'`` by name, as the whole-checkpoint path has always
-        # created it, because this is the one tensor here that is a forward
-        # operand rather than load scratch: ``quantize_input`` multiplies the
-        # activation by it every call, so it has to end up on the compute
-        # device whichever loader allocated it. The current device is the
-        # right one on both paths -- the whole-checkpoint loader runs on it,
-        # and each streaming loader thread calls ``torch.cuda.set_device``
-        # before it loads an expert. The staged scales filled into it may sit
-        # anywhere, which is why ``_finalize_pre_quant_scales`` moves them
-        # onto THIS parameter's device instead of naming a device again.
+        # Named device, unlike the staging tensors around it, because this is
+        # a forward operand rather than load scratch: ``quantize_input``
+        # multiplies the activation by it on every call, so it belongs on the
+        # compute device whichever loader allocates it. The current device is
+        # the right one for both callers -- the whole-checkpoint loader runs
+        # on it, and each streaming loader thread calls
+        # ``torch.cuda.set_device`` before it loads an expert. This is the one
+        # place the device is chosen: ``_finalize_pre_quant_scales`` moves the
+        # staged scales onto this parameter.
         fc31_act_scale = nn.Parameter(torch.empty(1,
                                                   module.hidden_size,
                                                   dtype=module.dtype,
@@ -3093,11 +3092,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     raise ValueError(msg)
 
         # Take the max of w3 and w1 from the first expert, moved onto the
-        # destination parameter's device rather than naming a device a second
-        # time: ``_ensure_fc31_act_scale`` is the single place that chooses it,
-        # and the staged scales get there from both the host (the streaming
-        # loader) and the device (``load_quant_scales``, which keys its own
-        # staging off this same parameter).
+        # destination parameter's device: the staged scales sit wherever the
+        # loader that staged them put them -- the host for the streaming
+        # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
+        # keys its own staging off this same parameter -- and
+        # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
         fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
             dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
