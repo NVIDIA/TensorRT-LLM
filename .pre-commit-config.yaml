@@ -1590,15 +1590,19 @@ repos:
         # Use the active environment's TensorRT-LLM build and dependencies.
         language: system
         pass_filenames: false
-        # Nested configuration types live throughout the package.
+        # Keep this list aligned with the configuration types used by the generator.
+        # The schema unit tests provide the full freshness check in build environments.
         files: >-
           (?x)^(
-            \.pre-commit-config\.yaml |
-            pyproject\.toml |
-            setup\.py |
-            requirements[^/]*\.txt |
             scripts/generate_trtllm_serve_schemas\.py |
-            tensorrt_llm/.*\.py |
+            tensorrt_llm/commands/serve\.py |
+            tensorrt_llm/llmapi/(llm_args|disagg_utils|utils)\.py |
+            tensorrt_llm/_torch/peft/lora/config\.py |
+            tensorrt_llm/models/modeling_utils\.py |
+            tensorrt_llm/quantization/mode\.py |
+            tensorrt_llm/usage/config\.py |
+            tensorrt_llm/visual_gen/(args|sparse_attention)\.py |
+            tensorrt_llm/version\.py |
             tensorrt_llm/schemas/.*\.json |
             tests/unittest/llmapi/test_trtllm_serve_config_schemas\.py
           )$
