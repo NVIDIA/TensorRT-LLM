@@ -205,7 +205,7 @@ def _replay_precompute_impl(
     # [0, PNAT) of the active buffer; new tokens this step go after them
     # on no-replay-write steps).
     prev_num_accepted_tokens_ptr,
-    state_batch_indices_ptr,
+    replay_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
     dstate: tl.constexpr,
@@ -271,7 +271,7 @@ def _replay_precompute_impl(
     pid_hg = tl.program_id(axis=1)  # head-group index
     first_head = pid_hg * HEADS_PER_BLOCK
 
-    cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+    cache_batch_idx = tl.load(replay_batch_indices_ptr + pid_b).to(tl.int64)
 
     # --- Cache write semantics ---
     # cache_buf_idx names this step's "active" buffer — the one with the
@@ -458,7 +458,7 @@ def _rectangle_precompute_impl(
     old_dA_cumsum_ptr,
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
-    state_batch_indices_ptr,
+    replay_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
     MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,  # rectangle window bound
@@ -519,7 +519,7 @@ def _rectangle_precompute_impl(
     pid_hg = tl.program_id(axis=1)
     first_head = pid_hg * HEADS_PER_BLOCK
 
-    cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+    cache_batch_idx = tl.load(replay_batch_indices_ptr + pid_b).to(tl.int64)
 
     # Nowrite-only: write_buf = active, write_offset = PNAT.  No flip after.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
@@ -809,7 +809,7 @@ def _dynamic_precompute_kernel(
     old_dA_cumsum_ptr,
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
-    state_batch_indices_ptr,
+    replay_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
     MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
@@ -874,7 +874,7 @@ def _dynamic_precompute_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     pid_b = tl.program_id(axis=0)
-    cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+    cache_batch_idx = tl.load(replay_batch_indices_ptr + pid_b).to(tl.int64)
 
     pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
     needs_write_runtime = pnat_local + T > MAX_REPLAY_BUFFER_LENGTH
@@ -894,7 +894,7 @@ def _dynamic_precompute_kernel(
             old_dA_cumsum_ptr,
             cache_buf_idx_ptr,
             prev_num_accepted_tokens_ptr,
-            state_batch_indices_ptr,
+            replay_batch_indices_ptr,
             T,
             dstate,
             nheads_ngroups_ratio,
@@ -953,7 +953,7 @@ def _dynamic_precompute_kernel(
             old_dA_cumsum_ptr,
             cache_buf_idx_ptr,
             prev_num_accepted_tokens_ptr,
-            state_batch_indices_ptr,
+            replay_batch_indices_ptr,
             T,
             MAX_REPLAY_BUFFER_LENGTH,
             dstate,
@@ -1015,6 +1015,7 @@ def _persistent_main_impl(
     pid_b,
     pid_h,
     cache_batch_idx,
+    state_batch_idx,
     active_buf,
     prev_num_accepted_tokens,
     # Pointers
@@ -1192,11 +1193,11 @@ def _persistent_main_impl(
     # when no TMA path is reachable).
     state_mask = m_mask[:, None] & n_mask[None, :]
     offs_y = (
-        cache_batch_idx.to(tl.int32) * (stride_state_batch // stride_state_dim).to(tl.int32)
+        state_batch_idx.to(tl.int32) * (stride_state_batch // stride_state_dim).to(tl.int32)
         + pid_h * dim
         + pid_m * BLOCK_SIZE_M
     )
-    state_ptr_raw = state_ptr + cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+    state_ptr_raw = state_ptr + state_batch_idx * stride_state_batch + pid_h * stride_state_head
     state_ptrs = (
         state_ptr_raw + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
     )
@@ -1219,7 +1220,7 @@ def _persistent_main_impl(
     if QUANT_MAX > 0.0:
         state_scales_base = (
             state_scales_ptr
-            + cache_batch_idx * stride_state_scales_cache
+            + state_batch_idx * stride_state_scales_cache
             + pid_h * stride_state_scales_head
         )
         decode_scale = tl.load(
@@ -1332,7 +1333,7 @@ def _persistent_main_impl(
                 RAND_DIVISOR: tl.constexpr = 1  # unreachable; keeps constexpr initialized
 
             rand_seed = tl.load(rand_seed_ptr)
-            base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+            base_rand = state_batch_idx * stride_state_batch + pid_h * stride_state_head
             # Number of unique randoms per row = dstate / RAND_DIVISOR.
             # randint4x emits 4 randoms per offset, so use that / 4 offsets.
             offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // (4 * RAND_DIVISOR))
@@ -1369,7 +1370,7 @@ def _persistent_main_impl(
             decode_scale = 1.0 / encode_scale
             state_scales_ptrs = (
                 state_scales_ptr
-                + cache_batch_idx * stride_state_scales_cache
+                + state_batch_idx * stride_state_scales_cache
                 + pid_h * stride_state_scales_head
                 + offs_m * stride_state_scales_dim
             )
@@ -1500,6 +1501,7 @@ def _persistent_rectangle_impl(
     pid_b,
     pid_h,
     cache_batch_idx,
+    state_batch_idx,
     active_buf,
     prev_num_accepted_tokens,
     # Pointers
@@ -1602,14 +1604,14 @@ def _persistent_rectangle_impl(
     # Load state.  Quant scale hoist: defer `* decode_scale` post-matmul.
     if USE_TMA_LOAD:
         offs_y = (
-            cache_batch_idx.to(tl.int32) * (stride_state_batch // stride_state_dim).to(tl.int32)
+            state_batch_idx.to(tl.int32) * (stride_state_batch // stride_state_dim).to(tl.int32)
             + pid_h * dim
             + pid_m * BLOCK_SIZE_M
         )
         state = state_tma_descriptor.load([offs_y, 0])
     else:
         state_ptr_local = (
-            state_ptr + cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+            state_ptr + state_batch_idx * stride_state_batch + pid_h * stride_state_head
         )
         state_ptrs = (
             state_ptr_local
@@ -1621,7 +1623,7 @@ def _persistent_rectangle_impl(
     if QUANT_MAX > 0.0:
         state_scales_base = (
             state_scales_ptr
-            + cache_batch_idx * stride_state_scales_cache
+            + state_batch_idx * stride_state_scales_cache
             + pid_h * stride_state_scales_head
         )
         decode_scale = tl.load(
@@ -1788,6 +1790,7 @@ def _persistent_main_kernel(
     cb_scaled_ptr,
     decay_vec_ptr,
     state_batch_indices_ptr,
+    replay_batch_indices_ptr,
     replay_work_items_ptr,
     rand_seed_ptr,
     # Persistent-loop work-distribution scalars.  Caller pre-sorts the batch
@@ -1969,7 +1972,7 @@ def _persistent_main_kernel(
         work_item_idx = pid_b_local + slot_lo
         if IS_DYNAMIC:
             pid_b = work_item_idx
-            cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+            cache_batch_idx = tl.load(replay_batch_indices_ptr + pid_b).to(tl.int64)
             active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
             pnat = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
         else:
@@ -1978,6 +1981,7 @@ def _persistent_main_kernel(
             cache_batch_idx = tl.load(work_item_base + _REPLAY_WORK_CACHE_SLOT).to(tl.int64)
             pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
             active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(tl.int32)
+        state_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
         # Dispatch: when RECTANGLE is set, send nowrite slots to the rectangle
         # impl.  `replay_work_items` carries the cache slot, PNAT and active
         # buffer for persistent_main; persistent_dynamic resolves those once
@@ -2005,6 +2009,7 @@ def _persistent_main_kernel(
                     pid_b,
                     pid_h,
                     cache_batch_idx,
+                    state_batch_idx,
                     active_buf,
                     pnat,
                     state_ptr,
@@ -2100,6 +2105,7 @@ def _persistent_main_kernel(
                     pid_b,
                     pid_h,
                     cache_batch_idx,
+                    state_batch_idx,
                     active_buf,
                     pnat,
                     state_ptr,
@@ -2171,6 +2177,7 @@ def _persistent_main_kernel(
                 pid_b,
                 pid_h,
                 cache_batch_idx,
+                state_batch_idx,
                 active_buf,
                 pnat,
                 state_ptr,
@@ -3493,6 +3500,7 @@ def replay_selective_state_update(
     _cta_per_sm_nowrite: int | None = None,
     _num_loop_stages_write: int | None = None,
     _num_loop_stages_nowrite: int | None = None,
+    replay_batch_indices: torch.Tensor | None = None,
 ):
     """
     Replay SSM state update with precomputed CB and tl.dot fast-forward.
@@ -3537,7 +3545,9 @@ def replay_selective_state_update(
         replay_work_items: (batch, 4) int32 device tensor, sorted write-first.
             Persistent-main consumes all fields; persistent-dynamic only
             requires the argument for a stable wrapper signature.
-        state_batch_indices: (batch,) int32 cache slot mapping.
+        state_batch_indices: (batch,) int32 recurrent-state slot mapping.
+        replay_batch_indices: Optional (batch,) int32 replay slot mapping.
+            Defaults to state_batch_indices for pools with shared indexing.
         D: (nheads, dim) optional feed-through parameter.
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
@@ -3837,6 +3847,13 @@ def replay_selective_state_update(
     # larger when retaining replay history. Replay and rectangle window tile
     # sizes are derived independently from MAX_REPLAY_BUFFER_LENGTH so
     # max_window can exceed BLOCK_SIZE_T freely.
+    replay_cache_size = old_x.shape[0]
+    if replay_batch_indices is None:
+        replay_batch_indices = state_batch_indices
+    assert replay_batch_indices.shape == (batch,)
+    assert replay_batch_indices.dtype == torch.int32
+    assert replay_batch_indices.device == device
+    assert replay_batch_indices.is_contiguous()
     max_window = old_x.shape[2]
     assert T <= max_window, f"T={T} exceeds cache max_window={max_window}"
 
@@ -3845,15 +3862,15 @@ def replay_selective_state_update(
     assert A.shape == (nheads, dim, dstate)
     assert B.shape == (batch, T, ngroups, dstate)
     assert C.shape == B.shape
-    assert old_x.shape == (cache_size, 2, max_window, nheads, dim)
-    assert old_B.shape == (cache_size, 2, max_window, ngroups, dstate)
-    assert old_dt.shape == (cache_size, 2, nheads, max_window)
-    assert old_dA_cumsum.shape == (cache_size, 2, nheads, max_window)
-    assert cache_buf_idx.shape == (cache_size,)
+    assert old_x.shape == (replay_cache_size, 2, max_window, nheads, dim)
+    assert old_B.shape == (replay_cache_size, 2, max_window, ngroups, dstate)
+    assert old_dt.shape == (replay_cache_size, 2, nheads, max_window)
+    assert old_dA_cumsum.shape == (replay_cache_size, 2, nheads, max_window)
+    assert cache_buf_idx.shape == (replay_cache_size,)
     assert cache_buf_idx.dtype == torch.int32, (
         f"cache_buf_idx must be int32, got {cache_buf_idx.dtype}"
     )
-    assert prev_num_accepted_tokens.shape == (cache_size,)
+    assert prev_num_accepted_tokens.shape == (replay_cache_size,)
     assert prev_num_accepted_tokens.dtype == torch.int32, (
         f"prev_num_accepted_tokens must be int32, got {prev_num_accepted_tokens.dtype}"
     )
@@ -4125,7 +4142,7 @@ def replay_selective_state_update(
             old_dA_cumsum,
             cache_buf_idx,
             prev_num_accepted_tokens,
-            state_batch_indices,
+            replay_batch_indices,
             T,
             max_window,
             dstate,
@@ -4247,6 +4264,7 @@ def replay_selective_state_update(
             cb_scaled,
             decay_vec,
             state_batch_indices,
+            replay_batch_indices,
             replay_work_items_arg,
             rand_seed,
             n_writes,
@@ -4374,6 +4392,7 @@ def replay_selective_state_update(
             cb_scaled,
             decay_vec,
             state_batch_indices,
+            replay_batch_indices,
             replay_work_items_arg,
             rand_seed,
             n_writes_tensor,

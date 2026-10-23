@@ -2355,3 +2355,113 @@ def test_sr_grid_bracket(state_dtype):
                 f"hi={sample[2]} out={sample[3]}.  Likely the PTX byte-order "
                 "bug (cvt.rs source-register order)."
             )
+
+
+@pytest.mark.parametrize("mode", ["persistent_dynamic", "persistent_main"])
+@pytest.mark.parametrize("rectangle_for_nowrite", [False, True])
+@pytest.mark.parametrize("use_tma", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.float32])
+def test_replay_compact_slots_match_pool_indexed_history(
+    mode, rectangle_for_nowrite, use_tma, state_dtype
+):
+    if use_tma and get_sm_version() < 90:
+        pytest.skip("TMA requires SM90+")
+    torch.manual_seed(17)
+    batch, pool_size, history_size = 2, 32, 16
+    nheads, head_dim, d_state, ngroups, tokens = 16, 64, 128, 1, 4
+    device, dtype = "cuda", torch.bfloat16
+    state_indices = torch.tensor([29, 17], dtype=torch.int32, device=device)
+    replay_indices = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    state = torch.randn(pool_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+    reference_state = state.clone()
+    compact = [
+        torch.randn(batch, 2, history_size, nheads, head_dim, dtype=dtype, device=device) * 0.01,
+        torch.randn(batch, 2, history_size, ngroups, d_state, dtype=dtype, device=device) * 0.01,
+        torch.randn(batch, 2, nheads, history_size, device=device) * 0.01,
+        torch.randn(batch, 2, nheads, history_size, device=device) * 0.01,
+    ]
+    reference = []
+    for tensor in compact:
+        pool_tensor = torch.zeros(pool_size, *tensor.shape[1:], dtype=tensor.dtype, device=device)
+        pool_tensor[state_indices.long()] = tensor[replay_indices.long()]
+        reference.append(pool_tensor)
+    prev = torch.tensor([14, 4], dtype=torch.int32, device=device)
+    buf_idx = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    reference_prev = torch.zeros(pool_size, dtype=torch.int32, device=device)
+    reference_buf = torch.zeros_like(reference_prev)
+    reference_prev[state_indices.long()] = prev[replay_indices.long()]
+    reference_buf[state_indices.long()] = buf_idx[replay_indices.long()]
+    n_writes, work_items = _make_replay_work_items(
+        prev, buf_idx, tokens, history_size, batch, replay_indices, device
+    )
+    _, reference_work_items = _make_replay_work_items(
+        reference_prev, reference_buf, tokens, history_size, batch, state_indices, device
+    )
+    x = torch.randn(batch, tokens, nheads, head_dim, dtype=dtype, device=device)
+    dt = repeat(
+        torch.randn(batch, tokens, nheads, dtype=dtype, device=device),
+        "b t h -> b t h p",
+        p=head_dim,
+    )
+    A = repeat(-torch.rand(nheads, device=device) - 0.5, "h -> h p n", p=head_dim, n=d_state)
+    B = torch.randn(batch, tokens, ngroups, d_state, dtype=dtype, device=device)
+    C = torch.randn_like(B)
+    output = torch.empty_like(x)
+    reference_output = torch.empty_like(x)
+    kwargs = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        dt_softplus=True,
+        state_batch_indices=state_indices,
+        n_writes=n_writes,
+        mode=mode,
+        rectangle_for_nowrite=rectangle_for_nowrite,
+        use_internal_pdl=False,
+        _use_tma_rect_load=use_tma,
+        _use_tma_replay_write_load=use_tma,
+        _use_tma_replay_write_store=use_tma,
+        _use_tma_replay_nowrite_load=use_tma,
+    )
+
+    def run_compact():
+        replay_selective_state_update(
+            state,
+            *compact,
+            buf_idx,
+            prev,
+            out=output,
+            replay_work_items=work_items,
+            replay_batch_indices=replay_indices,
+            **kwargs,
+        )
+
+    def run_reference():
+        replay_selective_state_update(
+            reference_state,
+            *reference,
+            reference_buf,
+            reference_prev,
+            out=reference_output,
+            replay_work_items=reference_work_items,
+            **kwargs,
+        )
+
+    run_compact()
+    run_reference()
+    torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, reference_state, rtol=0, atol=0)
+    # Replay a captured invocation using the same separate index tensors.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_compact()
+    graph.replay()
+    run_reference()
+    torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, reference_state, rtol=0, atol=0)
+    for tensor, pool_tensor in zip(compact, reference):
+        torch.testing.assert_close(
+            tensor[replay_indices.long()], pool_tensor[state_indices.long()], rtol=0, atol=0
+        )

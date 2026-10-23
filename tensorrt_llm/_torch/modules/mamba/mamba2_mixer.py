@@ -825,6 +825,8 @@ class Mamba2Mixer(nn.Module):
                         dt_bias=dt_bias,
                         dt_softplus=self.delta_softplus,
                         state_batch_indices=state_batch_indices,
+                        replay_batch_indices=mamba_metadata.
+                        replay_state_indices[:num_decodes],
                         out=out_4d,
                         n_writes=mamba_metadata.replay_n_writes,
                         replay_work_items=(

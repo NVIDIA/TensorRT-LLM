@@ -70,6 +70,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
+                                           _mamba_replay_disabled_reason,
                                            use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
@@ -3638,44 +3639,12 @@ def _create_kv_cache_manager(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
 
-        use_replay = spec_config is not None and sm >= 80
-        if spec_config is None:
-            logger.info(
-                "Replay kernel requires speculative decoding; using non-replay path"
-            )
-
-        # Block reuse (prefix caching): replay leaves SSM state at a
-        # checkpoint after speculation. The next decode step replays forward
-        # to correct it. If block reuse feeds that stale state into a new
-        # prefill, the correction never happens.
-        # Currently we only save and reuse context tokens so this does not affect.
-
-        # Tree attention: replay assumes linear token sequence.
-        if (spec_config is not None
-                and getattr(spec_config, 'use_dynamic_tree', False)):
-            logger.info("Replay kernel incompatible with tree attention; "
-                        "using legacy MTP path")
-            use_replay = False
-
-        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs 100 <= sm < 120.
-        # Flashinfer has a SW fallback at any SM.
-        if (stochastic_rounding
-                and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and (sm < 100 or sm in (120, 121))):
-            logger.info("Replay kernel Philox requires 100 <= sm < 120; "
-                        "using legacy MTP path for stochastic rounding support")
-            use_replay = False
-
-        # Use replay algorithm for mamba (default is on).
-        enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
-                                                '1') == '0'
-        if enforce_disable_replay:
-            logger.info(
-                "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
-            use_replay = False
-        else:
-            logger.info(
-                "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
+        disabled_reason = _mamba_replay_disabled_reason(
+            spec_config, mamba_params.mamba_ssm_cache_dtype,
+            stochastic_rounding, sm)
+        use_replay = disabled_reason is None
+        replay_status = "ENABLED" if use_replay else f"DISABLED ({disabled_reason})"
+        logger.info(f"Mamba replay state update: {replay_status}")
 
         # Stochastic-rounding seeds must live on the cache manager (not be
         # re-created with torch.randint per forward) whenever SR can fire

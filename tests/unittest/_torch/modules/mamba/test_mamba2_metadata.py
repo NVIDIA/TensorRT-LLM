@@ -51,6 +51,9 @@ class _GdnReplayCacheManager:
         self.prev_num_accepted_tokens = prev_num_accepted_tokens
         self.cache_buf_idx = cache_buf_idx
 
+    def get_replay_state_indices(self, state_indices):
+        return state_indices
+
     def get_replay_state_update_metadata(self):
         return ReplayStateUpdateMetadata(
             prev_num_accepted_tokens=self.prev_num_accepted_tokens,
@@ -277,6 +280,9 @@ class TestMamba2Metadata:
 
             def get_state_indices(self, request_ids, is_padding):
                 return self.state_indices[: len(request_ids)]
+
+            def get_replay_state_indices(self, state_indices):
+                return state_indices
 
             def get_replay_state_update_metadata(self):
                 return ReplayStateUpdateMetadata(

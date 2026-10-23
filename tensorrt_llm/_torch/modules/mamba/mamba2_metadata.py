@@ -388,6 +388,9 @@ class Mamba2Metadata:
                                              device="cuda")
         self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.replay_num_decodes = 0
+        self.replay_state_indices = torch.zeros(max_batch_size,
+                                                dtype=torch.int32,
+                                                device="cuda")
 
         # Pre-allocated buffers.
         self._arange_buffer = torch.arange(max_batch_size + 1,
@@ -419,6 +422,10 @@ class Mamba2Metadata:
             if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
                 return
 
+        self.replay_state_indices[:num_decodes].copy_(
+            kv_cache_manager.get_replay_state_indices(
+                self.state_indices[num_contexts:batch_size]))
+
         if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
             raise RuntimeError(
                 "Replay state update is enabled, but the KV cache manager "
@@ -441,7 +448,7 @@ class Mamba2Metadata:
         else:
             build_work_items = _build_replay_work_items_torch
         build_work_items(
-            self.state_indices[num_contexts:batch_size],
+            self.replay_state_indices[:num_decodes],
             prev_num_accepted_tokens,
             cache_buf_idx,
             self.replay_work_items,
