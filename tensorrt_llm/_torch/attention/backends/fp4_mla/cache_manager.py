@@ -3,6 +3,7 @@
 """KV Cache Manager V2 specialization for NVFP4 MLA cache state."""
 
 import math
+import os
 from dataclasses import dataclass, replace
 from types import MethodType
 from typing import TYPE_CHECKING, Iterable, List, Optional
@@ -41,6 +42,20 @@ from .config import (
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
 )
 from .layout import get_fp4_mla_v_scale_pool_size
+
+# The serving launcher publishes the worker role here, and every MPI rank of
+# the worker inherits it.
+_DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
+
+
+def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
+    """Whether this worker keeps a single-copy FP4 MLA cache.
+
+    A disaggregated context worker never decodes, so it omits the
+    generation-only V scales and packed V; the generation worker rebuilds
+    them from the transferred K and K scales.
+    """
+    return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
 
 
 @dataclass(frozen=True)
@@ -83,6 +98,9 @@ class Fp4MlaV2CacheLayoutPolicy:
     # V scales and packed V derive from K and K scales; the generation worker
     # rebuilds them locally in rebuild_disagg_imported_cache.
     DISAGG_IGNORED_ROLES: frozenset[DataRole] = frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
+    # Set by configure_manager: a disaggregated context worker keeps neither
+    # V scales nor packed V (see is_fp4_mla_context_only_cache).
+    fp4_mla_context_only_cache: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
@@ -181,10 +199,17 @@ class Fp4MlaV2CacheLayoutPolicy:
             if manager._fp4_mla_storage_backend in _FP4_MLA_K_RESIDUAL_BACKENDS
             else 0
         )
+        manager.fp4_mla_context_only_cache = is_fp4_mla_context_only_cache(is_disagg)
+        if manager.fp4_mla_context_only_cache:
+            logger.info(
+                "FP4 MLA KV cache on a disaggregated context worker: omitting "
+                "the generation-only V scales and packed V."
+            )
         manager.mla_v_head_dim = (
             manager.mla_v_scale_head_dim
             if manager._fp4_mla_storage_backend == _FP4_MLA_CUTEDSL_BACKEND
             and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+            and not manager.fp4_mla_context_only_cache
             else None
         )
         max_rewind_len = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
@@ -252,9 +277,11 @@ class Fp4MlaV2CacheLayoutPolicy:
         # Partial pages leave unused V-scale tiles untouched while the
         # fixed-width PV path can load the complete scale page. Match V1's
         # deterministic initialization before any warmup or graph capture.
-        with torch.cuda.stream(manager._stream):
-            Fp4MlaV2CacheLayoutPolicy.get_mla_v_scale_pool_base(manager).zero_()
-        manager._stream.synchronize()
+        v_scale_pool = Fp4MlaV2CacheLayoutPolicy.get_mla_v_scale_pool_base(manager)
+        if v_scale_pool is not None:
+            with torch.cuda.stream(manager._stream):
+                v_scale_pool.zero_()
+            manager._stream.synchronize()
 
     @property
     def fp4_mla_hp_pool_size(self) -> int:
@@ -366,6 +393,8 @@ class Fp4MlaV2CacheLayoutPolicy:
         return self.head_dim_per_layer[local_layer_idx] + self.fp4_mla_k_residual_dim
 
     def _v_scale_bytes_per_page(self) -> int:
+        if self.fp4_mla_context_only_cache:
+            return 0
         return get_fp4_mla_v_scale_pool_size(self.mla_v_scale_head_dim, self.tokens_per_block)
 
     def _v_packed_bytes_per_page(self) -> int:
@@ -398,7 +427,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             ),
         }
         if data_role == Role.ALL:
-            roles = [Role.KEY, Role.KEY_BLOCK_SCALE, Role.MLA_V_SCALE]
+            roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
+            if not self.fp4_mla_context_only_cache:
+                roles.append(Role.MLA_V_SCALE)
             if self.mla_v_head_dim is not None:
                 roles.append(Role.MLA_V_PACKED)
             return sum(role_sizes[role] for role in roles)
@@ -411,12 +442,14 @@ class Fp4MlaV2CacheLayoutPolicy:
     ) -> Optional[dict[int, List[BufferConfig]]]:
         result = {}
         for local_layer in self._fp4_mla_local_layer_indices():
-            buffers = [
-                BufferConfig(
-                    role=Role.MLA_V_SCALE,
-                    size=self._v_scale_bytes_per_page(),
+            buffers = []
+            if not self.fp4_mla_context_only_cache:
+                buffers.append(
+                    BufferConfig(
+                        role=Role.MLA_V_SCALE,
+                        size=self._v_scale_bytes_per_page(),
+                    )
                 )
-            ]
             if self.mla_v_head_dim is not None:
                 buffers.append(
                     BufferConfig(
@@ -601,7 +634,9 @@ class Fp4MlaV2CacheLayoutPolicy:
                 "FP8 MLA fallback layers require one lifecycle distinct from "
                 f"FP4 and HP; got fp8={sorted(fp8_groups)}."
             )
-        cache_roles = [Role.KEY, Role.KEY_BLOCK_SCALE, Role.MLA_V_SCALE]
+        cache_roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
+        if not self.fp4_mla_context_only_cache:
+            cache_roles.append(Role.MLA_V_SCALE)
         if self.mla_v_head_dim is not None:
             cache_roles.append(Role.MLA_V_PACKED)
         for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
@@ -799,7 +834,8 @@ class Fp4MlaV2CacheLayoutPolicy:
                     self.head_dim_per_layer[fp8_local_layer],
                 ),
             )
-        yield self.get_mla_v_scale_pool_base().view(torch.float8_e4m3fn)
+        if not self.fp4_mla_context_only_cache:
+            yield self.get_mla_v_scale_pool_base().view(torch.float8_e4m3fn)
         if self.mla_v_head_dim is not None:
             yield self._role_pool_base_view(
                 cache_layer,
@@ -889,7 +925,9 @@ class Fp4MlaV2CacheLayoutPolicy:
         self._fp4_mla_view_cache[cache_key] = pool
         return pool
 
-    def get_mla_v_scale_pool(self) -> torch.Tensor:
+    def get_mla_v_scale_pool(self) -> Optional[torch.Tensor]:
+        if self.fp4_mla_context_only_cache:
+            return None
         return self._all_layer_role_view(
             self._cache_manager_layer_ids,
             Role.MLA_V_SCALE,
@@ -897,7 +935,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             (self._v_scale_bytes_per_page(),),
         ).view(torch.float8_e4m3fn)
 
-    def get_mla_v_scale_pool_base(self) -> torch.Tensor:
+    def get_mla_v_scale_pool_base(self) -> Optional[torch.Tensor]:
+        if self.fp4_mla_context_only_cache:
+            return None
         return self._role_pool_base_view(
             self._cache_manager_layer_ids[0],
             Role.MLA_V_SCALE,
@@ -1049,13 +1089,22 @@ class Fp4MlaV2CacheLayoutPolicy:
             )
         residual = FP4_MLA_K_RESIDUAL_DIM if backend in _FP4_MLA_K_RESIDUAL_BACKENDS else 0
         storage_head_dim = logical_head_dim + residual
-        v_scale_page = get_fp4_mla_v_scale_pool_size(config.kv_lora_rank, tokens_per_block)
+        context_only = is_fp4_mla_context_only_cache(bool(kwargs.get("is_disagg", False)))
+        v_scale_page = (
+            0
+            if context_only
+            else get_fp4_mla_v_scale_pool_size(config.kv_lora_rank, tokens_per_block)
+        )
         per_layer = (
             math.ceil(storage_head_dim / 2)
             + math.ceil(storage_head_dim / FP4_BLOCK_SIZE)
             + math.ceil(v_scale_page / tokens_per_block)
         )
-        if backend == _FP4_MLA_CUTEDSL_BACKEND and not _fp4_mla_cutedsl_fused_v_transpose_enabled():
+        if (
+            not context_only
+            and backend == _FP4_MLA_CUTEDSL_BACKEND
+            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+        ):
             per_layer += config.kv_lora_rank // 2
         local_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers

@@ -132,6 +132,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     # Set per instance when the MLA latent cache uses the FP4 MLA layout.
     _attention_cache_layout_policy = None
+    # Set per instance by the FP4 MLA layout on a disaggregated context
+    # worker, which keeps no generation-only V scales or packed V.
+    fp4_mla_context_only_cache = False
 
     # Construction and cache configuration
 
@@ -429,6 +432,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     tokens_per_block=tokens_per_block,
                     max_batch_size=max_batch_size,
                     spec_config=spec_config,
+                    is_disagg=kwargs.get("is_disagg", False),
                 )
             )
             max_resident_sequences = max_batch_size * mapping.pp_size

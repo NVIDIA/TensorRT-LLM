@@ -673,6 +673,7 @@ def _fp4_mla_context_cache_update_kernel(
     POOL_HEAD_D: tl.constexpr,
     STORE_HP_TAIL: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
+    STORE_V_SCALE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     work_idx = tl.program_id(1)
@@ -988,20 +989,22 @@ def _fp4_mla_context_cache_update_kernel(
                 mask=valid_tokens,
             )
 
-    v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
-        vsf_s0, tl.int64
-    ) + physical_page * tl.cast(vsf_s1, tl.int64)
-    token_scale_col = page_pos // HP_BLOCK
-    sf_offsets = _fp4_mla_swizzled_sf_offset(
-        safe_all_d,
-        token_scale_col,
-        SF_PER_PAGE,
-    )
-    tl.store(
-        v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
-        v_stored_scale,
-        mask=mask_all_d & (all_d < V_HEAD_D),
-    )
+    # A context-only cache (disaggregated context worker) has no V scales.
+    if STORE_V_SCALE:
+        v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
+            vsf_s0, tl.int64
+        ) + physical_page * tl.cast(vsf_s1, tl.int64)
+        token_scale_col = page_pos // HP_BLOCK
+        sf_offsets = _fp4_mla_swizzled_sf_offset(
+            safe_all_d,
+            token_scale_col,
+            SF_PER_PAGE,
+        )
+        tl.store(
+            v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
+            v_stored_scale,
+            mask=mask_all_d & (all_d < V_HEAD_D),
+        )
 
 
 @triton.jit

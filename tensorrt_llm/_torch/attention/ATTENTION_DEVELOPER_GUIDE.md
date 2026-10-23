@@ -551,7 +551,13 @@ The FMHA package is split by role:
   serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
-  (`rebuild_disagg_imported_cache`). Hybrid linear-attention models (Kimi K3)
+  (`rebuild_disagg_imported_cache`). A disaggregated context worker
+  (`TRTLLM_DISAGG_ROLE=context`, which `trtllm-serve --server_role CONTEXT`
+  and the disaggregated launcher publish) keeps a single-copy cache without
+  those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
+  only K, K scales, and the HP ring, runs context attention only, and skips
+  generation warmup shapes. Hybrid
+  linear-attention models (Kimi K3)
   keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
   `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
   owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
