@@ -271,11 +271,33 @@ from the launching environment and is not persisted in that state.
 ### Different consumer base branches
 
 Each monitor handles one `--base-branch` (default `main`) and one
-`--canonical-branch`. Different consumer branches may use different canonical
+`--canonical-branch`. The consumer target must be `main` or `release/<name>`;
+development branches are rejected at startup. This is an allowed naming pattern,
+not wildcard monitoring: only the exact configured branch is monitored. Running
+instances for `main` and `release/1.3` does not enable any other release branch.
+Different consumer branches may use different canonical
 source branches: run separate instances with separate workdirs. Discovery,
 promotion provenance, follow-up PR targets, and migration checks are scoped to
 the consumer repository and base branch. Retargeting a tracked PR makes it
 ineligible for its old monitor; changing `--base-branch` requires a new workdir.
+
+When an open PR moves to a development branch, the bot withdraws only its own
+vendor-marked blocking reviews and posts one superseding notice explaining that
+vendor validation no longer applies. Human reviews and other vendors/operators'
+feedback are untouched; no approval is issued. After successful cleanup the PR
+leaves active tracking. Failed cleanup remains pending for retry, with a clear
+notice if review-dismissal permission is missing. Unchanged retries do not post
+duplicate comments. A move between `main` and a release branch is instead handed
+off to the destination monitor, if one was explicitly launched; the old monitor
+does not dismiss the destination's reviews.
+
+GitHub feedback records the originating consumer base branch so only one monitor
+owns cleanup. Legacy feedback with no recorded base is cleaned up by the `main`
+monitor. Discovery checks existing feedback on out-of-scope open PRs to recover
+unfinished cleanup after SQLite loss, even if the PR predates `--since`; it does
+not validate their vendor source or require metadata. Completed cleanup is cached
+until the PR changes. Retargeting back to a monitored branch automatically
+rediscovers the PR and performs fresh validation.
 
 For example, a main monitor can use `--base-branch main --canonical-branch
 consumer-dev-new`, while a release monitor uses `--base-branch release/1.3
