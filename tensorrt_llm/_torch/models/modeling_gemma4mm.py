@@ -52,6 +52,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear
+from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
@@ -602,6 +603,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
     supports_encoder_cache = True
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -917,6 +919,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        layer_specs = self.llm.model_config.kv_cache_layer_specs
+        if layer_specs is not None:
+            self.model_config.set_kv_cache_layer_specs(layer_specs)
 
     @property
     def draft_config(self):

@@ -577,6 +577,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not self._has_context_chunk_budget(budget)
             ):
                 continue
+            if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
+                continue
             if req.py_request_id in preempted_ids:
                 continue
             remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
@@ -958,6 +960,26 @@ class KVCacheV2Scheduler(RequestScheduler):
                 self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
                 or remaining >= self.chunk_unit_size
             )
+        )
+
+    def _first_chunk_waits_for_budget(self, req: LlmRequest, budget: BudgetTracker) -> bool:
+        """Whether a first chunk should wait for the next iteration's budget.
+
+        FORCE_CHUNK admits a leftover below chunk_unit_size, because a started
+        context can end at a snapshot point or at its end inside it. A first
+        chunk learns its reuse only in prepare_context, which matches its prefix
+        and resumes its pages, and a failed first chunk releases both again.
+        Once another context chunk runs this iteration, the first chunk waits
+        for a fresh budget unless its whole remaining prompt fits.
+        """
+        remaining = budget.remaining_tokens
+        return (
+            self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+            and req.state_value == self._context_init_state_value
+            and req.is_first_context_chunk
+            and remaining is not None
+            and remaining < self.chunk_unit_size
+            and req.context_remaining_length > remaining
         )
 
     def _try_schedule_context_chunked(

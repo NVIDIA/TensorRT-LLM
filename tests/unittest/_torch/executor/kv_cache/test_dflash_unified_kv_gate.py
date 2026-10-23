@@ -20,6 +20,7 @@ import pytest
 import torch
 import yaml
 
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.quantization import QuantAlgo
@@ -60,7 +61,6 @@ def _creator(*, is_disagg, target, draft, tp_size=1):
         _allow_separate_draft_kv_cache=True,
         draft_len_schedule=None,
     )
-    creator._draft_model_engine = None
     creator._draft_config = draft
     creator._mapping = SimpleNamespace(
         pp_size=1, cp_size=1, tp_size=tp_size, enable_attention_dp=False
@@ -107,6 +107,30 @@ def test_fp8_target_with_bf16_draft_unifies(is_disagg: bool) -> None:
     draft = _model_config(kv_heads=8, head_dim=128)
 
     assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_variable_model_geometry_keeps_separate_cache(is_disagg: bool) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    target.kv_cache_layer_specs = (
+        KVCacheLayerSpec(head_dim=128, num_kv_heads=8, num_q_heads=32),
+        KVCacheLayerSpec(head_dim=256, num_kv_heads=4, num_q_heads=32),
+    )
+    draft = _model_config(kv_heads=8, head_dim=128)
+
+    assert not _creator(
+        is_disagg=is_disagg, target=target, draft=draft
+    )._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_retained_token_mixed_precision_keeps_separate_cache(is_disagg: bool) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+    creator._kv_cache_config.mixed_precision_kv = object()
+
+    assert not creator._should_unify_dflash_kv_cache()
 
 
 def test_layout_compares_rank_local_heads():
