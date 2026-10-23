@@ -25,6 +25,7 @@ import pytest
 grpc = pytest.importorskip(  # noqa: E402
     "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
