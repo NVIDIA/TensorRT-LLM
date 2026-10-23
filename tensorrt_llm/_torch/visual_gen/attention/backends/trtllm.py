@@ -487,7 +487,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 backends. The TRTLLM kernels have no key-padding input, so callers
                 that need padded keys must guard at the model level or select the
                 ``VANILLA`` backend.
-            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
+            kv: A ``ForwardPlan`` from a ``RolloutKVCacheInterface``. When given,
                 ``k``/``v`` are the new tokens only: the fused kernel writes them at
                 ``staging_offset`` and attends over everything cached before them plus
                 themselves, full within a causal block and causal across causal blocks.
@@ -663,7 +663,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self.quant_attention_config is None
 
     def support_kv_cache(self) -> bool:
-        return True
+        return self.quant_attention_config is None and self.sparse_params is None
 
     def support_kv_cache_page_size(
         self, tokens_per_page: int, dtype: Optional[torch.dtype] = None

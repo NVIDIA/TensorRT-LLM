@@ -715,6 +715,20 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
         attn._attn_impl(q, q, q, kv=cache.plan(CHUNK))
 
 
+def test_quantized_or_sparse_backends_report_no_cache_support():
+    """Configurations the cache path cannot run say so up front, so ``Attention`` refuses
+    the cache before the backend's forward does."""
+    cudnn = make_backend("cudnn")
+    cudnn.quant_dtype = "fp8"
+    assert not cudnn.support_kv_cache()
+    sage = make_backend("trtllm")
+    sage.quant_attention_config = SimpleNamespace()
+    assert not sage.support_kv_cache()
+    sparse = make_backend("trtllm")
+    sparse.sparse_params = SimpleNamespace()
+    assert not sparse.support_kv_cache()
+
+
 def test_trtllm_refuses_a_page_size_without_a_kernel(cache, monkeypatch):
     """Where the build has no paged context kernel for the cache's page size, the TRTLLM
     backend reports it and refuses the cache instead of running the unfused fallback."""

@@ -103,7 +103,7 @@ class AttentionBackend(ABC):
           key row counts, padding included, as the Attention module derives them from
           the tensor shapes.
         * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
-        * ``kv``: a ``ForwardPlan`` from a ``BlockCausalKVCacheManager``; only backends
+        * ``kv``: a ``ForwardPlan`` from a ``RolloutKVCacheInterface``; only backends
           whose ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this
           call's new tokens, staged into the cache and attended together with what the
           cache holds before them, full within a causal block and causal across causal
@@ -144,7 +144,7 @@ class AttentionBackend(ABC):
         return False
 
     def support_kv_cache(self) -> bool:
-        """Whether ``forward`` accepts a ``ForwardPlan`` over a ``BlockCausalKVCacheManager``
+        """Whether ``forward`` accepts a ``ForwardPlan`` over a ``RolloutKVCacheInterface``
         as ``kv``. A backend without support would silently drop the keyword through
         ``**kwargs``, so callers must check before passing one."""
         return False

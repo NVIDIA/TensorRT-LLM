@@ -23,11 +23,10 @@ from __future__ import annotations
 
 import abc
 import collections.abc
+import itertools
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Optional, Tuple
-
-import torch
 
 
 @dataclass(frozen=True)
@@ -109,7 +108,7 @@ class ForwardPlan:
 
     @property
     def graph_key(self) -> Tuple:
-        return (id(self.cache), self.spec, self.num_tokens, self.causal_block_size)
+        return (self.cache.instance_id, self.spec, self.num_tokens, self.causal_block_size)
 
     def validate(self) -> None:
         """Raise unless the plan's cache is open with the spec the plan was made for."""
@@ -125,9 +124,19 @@ class RolloutKVCacheInterface(abc.ABC):
 
     A pipeline drives it: ``open`` a rollout for a ``RolloutSpec``; for every forward,
     ``plan`` it and hand the plan to attention as ``kv=``; ``commit`` once the chunk's
-    K/V are final; ``close`` the rollout and finally ``shutdown`` the cache. Attention
-    backends call ``write_staged`` from inside their forward; pipelines do not.
+    K/V are final; ``close`` the rollout and finally ``shutdown`` the cache. How
+    attention backends write and read the K/V is up to each implementation.
     """
+
+    _instance_ids = itertools.count()
+
+    @property
+    def instance_id(self) -> int:
+        """An id unique to this cache for the life of the process; unlike ``id()``, it
+        is never reused by a later cache."""
+        if "_rollout_instance_id" not in self.__dict__:
+            self._rollout_instance_id = next(RolloutKVCacheInterface._instance_ids)
+        return self._rollout_instance_id
 
     @property
     @abc.abstractmethod
@@ -156,18 +165,6 @@ class RolloutKVCacheInterface(abc.ABC):
     def plan(self, num_tokens: int, causal_block_size: Optional[int] = None) -> ForwardPlan:
         """The plan of a forward of ``num_tokens`` real new tokens cut into causal blocks
         of ``causal_block_size`` (default: one causal block of all of them)."""
-
-    @abc.abstractmethod
-    def write_staged(
-        self,
-        layer_idx: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        causal_block_size: Optional[int] = None,
-    ) -> None:
-        """Stage a forward's new K/V ``[T, num_kv_heads, head_dim]`` for layer
-        ``layer_idx``, cut into causal blocks of ``causal_block_size``. Called by attention
-        backends inside their forward."""
 
     @abc.abstractmethod
     def commit(self, num_tokens: Optional[int] = None) -> None:

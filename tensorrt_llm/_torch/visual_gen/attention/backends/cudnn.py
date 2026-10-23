@@ -895,7 +895,7 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
-            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
+            kv: A ``ForwardPlan`` from a ``RolloutKVCacheInterface``. When given,
                 ``k``/``v`` are the new tokens only: they are written at
                 ``staging_offset`` and attention runs over everything cached before them
                 plus themselves, full within a causal block and causal across causal
@@ -955,7 +955,7 @@ class CuDNNAttention(AttentionBackend):
         return False
 
     def support_kv_cache(self) -> bool:
-        return True
+        return self.quant_dtype is None
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
