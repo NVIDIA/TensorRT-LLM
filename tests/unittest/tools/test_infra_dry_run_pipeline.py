@@ -85,15 +85,93 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         for body, empty_result in ((changed_files, "return []"), (one_file_diff, 'return ""')):
             with self.subTest(empty_result=empty_result):
                 self.assertIn(f"if ({infra_dry_run_check} ||", body)
-                self.assertLess(body.index(infra_dry_run_check), body.index("def githubPrApiUrl"))
-                self.assertLess(body.index(empty_result), body.index("def githubPrApiUrl"))
+                self.assertLess(body.index(infra_dry_run_check), body.index("getMRChangedFile("))
+                self.assertLess(body.index(empty_result), body.index("getMRChangedFile("))
 
-    def test_docs_skip_junit_after_a_successful_build(self) -> None:
+    def test_docs_skip_results_only_after_a_successful_build(self) -> None:
+        result_handler = _function_body(
+            L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
+        )
         self.assertIn(
-            'cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, '
+            'cacheErrorAndUploadResult(pipeline, "${key}", values[1], {}, true, attemptTag, '
             "isFinalAttempt, retryContext)",
             L0_TEST,
         )
+        process_results = "boolean shouldProcessResults = !noResultIfSuccess || stageIsFailed"
+        process_results_branch = "if (shouldProcessResults) {"
+        self.assertIn(f"{process_results}\n            {process_results_branch}", result_handler)
+        self.assertLess(
+            result_handler.index(process_results_branch),
+            result_handler.index('junit(testResults: "${stageName}/results*.xml")'),
+        )
+
+    def test_failure_evidence_match_is_logged_before_caching(self) -> None:
+        classifier = _function_body(L0_TEST, "classifyFailure", "preservePrimaryFailure")
+
+        self.assertIn("[FAILURE-EVIDENCE]", classifier)
+        self.assertIn("evidence.matchedQueryId", classifier)
+        self.assertLess(
+            classifier.index("[FAILURE-EVIDENCE]"),
+            classifier.index("retryContext.failureEvidence = evidence"),
+        )
+
+    def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
+        result_handler = _function_body(
+            L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
+        )
+        preserve_primary = _function_body(
+            L0_TEST, "preservePrimaryFailure", "rememberAvoidedKubernetesHostNodes"
+        )
+
+        self.assertIn("caughtError = e\n        stageIsInterrupted = true", result_handler)
+        self.assertIn("catch (InterruptedException e) {\n        throw e", preserve_primary)
+        self.assertIn(
+            "FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption",
+            preserve_primary,
+        )
+
+    def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
+        upload_results = _function_body(L0_TEST, "uploadResults", "runIsolatedTests")
+
+        self.assertIn("if (!fileExists(stageName))", upload_results)
+        self.assertLess(
+            upload_results.index("if (!fileExists(stageName))"),
+            upload_results.index('sh "tar -czvf results-${stageName}${postTag}.tar.gz'),
+        )
+
+    def test_sbatch_final_failure_is_classified_without_scanning_the_whole_step_log(
+        self,
+    ) -> None:
+        sbatch = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "cbtsResizeSplits")
+
+        marker_query = '[[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]'
+        self.assertIn(marker_query, sbatch)
+        self.assertIn("FailureClassifier.classify(finalFailure, InfraFailure.SLURM)", sbatch)
+        self.assertNotIn(
+            "classifyFailure(pipeline, submitEx, InfraFailure.SLURM, retryContext)", sbatch
+        )
+
+    def test_cbts_parser_preserves_coverage_preflight_fields(self) -> None:
+        parser = _function_body(
+            L0_PARENT, "_cbtsParseSelectionResult", "getOssComplianceFileChanged"
+        )
+
+        self.assertIn(
+            "coverage_residual_files: data.coverage_residual_files ?: []",
+            parser,
+        )
+        self.assertIn(
+            'coverage_decline_reason: data.coverage_decline_reason ?: ""',
+            parser,
+        )
+
+    def test_cbts_pin_policy_is_owned_by_python(self) -> None:
+        audit = _function_body(L0_PARENT, "_cbtsCoverageAudit", "_cbtsPrNumber")
+
+        self.assertIn("--resolve-pin cbts_db_pin.json", audit)
+        self.assertIn("pinPlan.pin_upload_required", audit)
+        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertNotIn("curl --noproxy", audit)
 
 
 if __name__ == "__main__":

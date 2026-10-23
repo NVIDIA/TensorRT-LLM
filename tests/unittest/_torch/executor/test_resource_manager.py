@@ -1015,6 +1015,65 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
+    def test_free_resources_poisoned_request_skips_reuse_store(self):
+        """A py_kv_reuse_poisoned release must not publish reuse blocks.
+
+        A context request that failed before completing its first chunk has
+        written no KV, but releaseBlocks' legacy fallback stores blocks for
+        requests still at context position 0. The poisoned release must
+        store nothing, while an untagged position-0 release keeps the legacy
+        fallback behavior. Runs against the real remove_sequence binding,
+        pinning the call signature free_resources uses.
+        """
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                          enable_block_reuse=True,
+                                          max_tokens=256),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+        )
+        try:
+            tokens = [1, 2, 3, 4, 5]
+            initial_reused = kv_cache_manager.get_kv_cache_stats().reused_blocks
+
+            # Failed first-chunk prefill: still at context position 0.
+            req1 = self.create_llm_request(0, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req1.py_request_id, req1.prompt_len, 1)], [req1])
+            req1.py_kv_reuse_poisoned = True
+            kv_cache_manager.free_resources(req1)
+
+            req2 = self.create_llm_request(1, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req2.py_request_id, req2.prompt_len, 1)], [req2])
+            stats = kv_cache_manager.get_kv_cache_stats()
+            self.assertEqual(
+                stats.reused_blocks, initial_reused,
+                "A poisoned (failed first-chunk) release must not publish "
+                "its unwritten blocks for reuse")
+
+            # Control: an untagged position-0 release keeps the legacy
+            # fallback, which stores the prompt's blocks for reuse.
+            kv_cache_manager.free_resources(req2)
+            req3 = self.create_llm_request(2, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req3.py_request_id, req3.prompt_len, 1)], [req3])
+            stats = kv_cache_manager.get_kv_cache_stats()
+            self.assertGreater(
+                stats.reused_blocks, initial_reused,
+                "An untagged position-0 release must keep the legacy "
+                "fallback store")
+            kv_cache_manager.free_resources(req3)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_batch_cache_indices_honor_requested_blocks_for_beam0(self):
         """V1 returns and truncates only beam 0's cache indices."""
         kv_cache_manager = KVCacheManager(
@@ -1180,6 +1239,59 @@ class TestResourceManager(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+class TestKVCacheManagerConnectorReporting(unittest.TestCase):
+    """Which allocations the V1 manager reports to an attached connector."""
+
+    @staticmethod
+    def _make_manager(connector) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.is_draft = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.kv_connector_manager = connector
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        manager.get_cache_indices = MagicMock(return_value=[4, 5])
+        return manager
+
+    @staticmethod
+    def _context_batch() -> ScheduledRequests:
+        request = SimpleNamespace(py_request_id=1,
+                                  prompt_len=64,
+                                  py_beam_width=1,
+                                  py_draft_tokens=[],
+                                  is_first_context_chunk=True,
+                                  is_last_context_chunk=True)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_a_fresh_allocation_is_reported(self):
+        connector = MagicMock(capacity_only=False)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        connector.update_state_after_alloc.assert_called_once()
+        self.assertEqual(connector.update_state_after_alloc.call_args.args[1],
+                         [4, 5])
+
+    def test_a_capacity_only_connector_is_told_of_no_allocation(self):
+        """It cannot reach these blocks, so gathering indices is wasted."""
+        connector = MagicMock(capacity_only=True)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        manager.get_cache_indices.assert_not_called()
+        connector.update_state_after_alloc.assert_not_called()
+
+
+@pytest.mark.cpu_only
 class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
 
     @staticmethod
@@ -1254,8 +1366,13 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
         """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
-        kv_cache_config = KvCacheConfig(max_tokens=64,
-                                        secondary_offload_min_priority=0)
+        for config_type in (KvCacheConfig, tllm.KvCacheConfig):
+            with self.subTest(config_type=config_type):
+                self._check_offload_priority_forwarding(config_type)
+
+    def _check_offload_priority_forwarding(self, config_type):
+        kv_cache_config = config_type(max_tokens=64,
+                                      secondary_offload_min_priority=0)
 
         mock_impl = MagicMock()
         mock_impl.get_block_pool_pointers.return_value = torch.empty(0)

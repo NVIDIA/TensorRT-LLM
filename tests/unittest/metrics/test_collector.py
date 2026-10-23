@@ -19,7 +19,7 @@ from typing import Dict
 import pytest
 from prometheus_client import REGISTRY
 
-from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
 from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
 
@@ -217,8 +217,8 @@ class TestConfigInfoMetrics:
 
     def test_model_config_info(self, collector):
         model_config = {
-            "model": "meta-llama/Llama-3.1-8B-Instruct",
-            "served_model_name": "Llama-3.1-8B-Instruct",
+            "model": "Qwen/Qwen3-8B",
+            "served_model_name": "Qwen3-8B",
             "dtype": "float16",
             "quantization": "none",
             "max_model_len": "4096",
@@ -731,12 +731,52 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             }
         }
+        stats["iterDiskPrefetchBlocks"] = 7
+        # Two GPU levels: the split keeps them apart even though they share a tier name.
+        stats["iterCachedTokensByLevel"] = [5, 2, 1]
+        stats["kvCacheLevelTiers"] = ["gpu", "gpu", "host"]
         collector.log_iteration_stats(stats)
 
         # Host utilization = 20/50 = 0.4
         assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
         # Iter reuse rate = 5/(5+3) = 0.625
         assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.625)
+        assert _get_counter_value(collector, "kv_cache_disk_prefetch_blocks_total") == 7
+        assert [
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier,
+                {**collector.labels, "cache_level": str(level), "cache_tier": tier},
+            )
+            for level, tier in enumerate(["gpu", "gpu", "host"])
+        ] == [5, 2, 1]
+        # No connector serves tokens, so no connector series is reported.
+        assert not _has_series(
+            collector.counter_tokens_cached_prompt_by_tier,
+            {**collector.labels, "cache_level": "", "cache_tier": "connector"},
+        )
+
+    def test_connector_cached_tokens_logged_as_connector_tier(self):
+        collector = _make_kv_iter_collector()
+        connector_labels = {**collector.labels, "cache_level": "", "cache_tier": "connector"}
+
+        # The series is visible before the connector serves its first token.
+        collector.log_iteration_stats({"iterConnectorCachedTokens": 0})
+        assert _has_series(collector.counter_tokens_cached_prompt_by_tier, connector_labels)
+        assert (
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier, connector_labels
+            )
+            == 0
+        )
+
+        collector.log_iteration_stats({"iterConnectorCachedTokens": 6})
+        collector.log_iteration_stats({"iterConnectorCachedTokens": 4})
+        assert (
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier, connector_labels
+            )
+            == 10
+        )
 
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""
@@ -816,6 +856,7 @@ class TestLogIterationStatsKvCacheIteration:
                     "iterFullReusedBlocks": 4,
                     "iterPartialReusedBlocks": 1,
                     "iterMissedBlocks": 3,
+                    "iterConnectorReusedBlocks": 2,
                 },
                 "1": {
                     "kind": "ssm",
@@ -849,6 +890,9 @@ class TestLogIterationStatsKvCacheIteration:
 
         before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
         before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+        before_connector_reused = _get_counter_value(
+            collector, "kv_cache_iter_connector_reused_blocks"
+        )
         before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
         before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
 
@@ -862,6 +906,9 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_counter_value(
             collector, "kv_cache_iter_missed_blocks"
         ) - before_missed == pytest.approx(3)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_connector_reused_blocks"
+        ) - before_connector_reused == pytest.approx(2)
         assert _get_counter_value(
             collector, "kv_cache_gen_alloc_blocks_total"
         ) - before_gen_alloc == pytest.approx(2)
@@ -1034,6 +1081,11 @@ def _counter_value_with_labels(metric, labels: Dict[str, str]) -> float:
     return metric.labels(**labels)._value.get()
 
 
+def _has_series(metric, labels: Dict[str, str]) -> bool:
+    """Whether a labelled series exists, without creating it as ``metric.labels`` would."""
+    return tuple(labels[name] for name in metric._labelnames) in metric._metrics
+
+
 class TestPromptCacheMetrics:
     """trtllm_prompt_cached_tokens_total counter + trtllm_prompt_cached_tokens histogram."""
 
@@ -1158,6 +1210,29 @@ class TestPerPositionSpecDecodeMetrics:
     def test_absent_arrays_no_error(self, collector):
         metrics = {MetricsCollector.labelname_finish_reason: "end_id"}
         collector.log_request_metrics_dict(metrics)  # must not raise
+
+    def test_label_cardinality_is_capped(self, collector):
+        """Deep drafting must not create unbounded token_position series.
+
+        The per-request arrays grow with max_draft_len so per-request acceptance
+        is not truncated, but each position is one Prometheus time series per
+        model, so the metrics side caps them independently.
+        """
+        deep = MAX_SPEC_DECODE_POSITION_LABELS + 5
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.SPEC_DEC_DRAFTED_PER_POS: [1] * deep,
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS: [1] * deep,
+        }
+        collector.log_request_metrics_dict(metrics)
+        existing_pos = {
+            sample.labels.get("token_position")
+            for metric in REGISTRY.collect()
+            if metric.name == collector.counter_tokens_drafted_per_position._name
+            for sample in metric.samples
+            if sample.name.endswith("_total")
+        }
+        assert existing_pos == {str(p) for p in range(MAX_SPEC_DECODE_POSITION_LABELS)}
 
     def test_no_observation_without_finish_reason(self, collector):
         """No per-position counter updates when finish_reason is missing."""

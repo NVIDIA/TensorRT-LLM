@@ -22,6 +22,8 @@ question into an assistant turn.
 
 import pytest
 
+from tensorrt_llm.inputs.utils import MultimodalDataTracker
+from tensorrt_llm.serve.chat_utils import parse_chat_message_content
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
@@ -269,3 +271,290 @@ def test_unknown_top_level_fields_are_tolerated():
         prompt_cache_key="k",
     )
     assert request.input == "hi"
+
+
+# ---------------------------------------------------------------------------
+# Explicit null means "unset" (litellm-style clients)
+# ---------------------------------------------------------------------------
+#
+# Item shapes below mirror live traffic from clients that serialize every
+# unset optional as null (content is synthetic).
+
+
+def _echoed_assistant_message_with_nulls():
+    return {
+        "id": "msg_0123456789abcdef",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "phase": None,
+        "content": [
+            {
+                "type": "output_text",
+                "text": "checking the log format first.",
+                "annotations": [],
+                "logprobs": None,
+            }
+        ],
+    }
+
+
+def _echoed_function_call_with_nulls():
+    return {
+        "type": "function_call",
+        "id": "fc_0123456789abcdef",
+        "call_id": "call_0123456789abcdef",
+        "name": "bash",
+        "arguments": '{"command": "ls /app"}',
+        "caller": None,
+        "namespace": None,
+        "status": None,
+        "async_": None,
+    }
+
+
+def test_null_logprobs_on_echoed_output_text_is_unset():
+    """Regression: null logprobs on an echoed output_text part failed validation."""
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            _message_item("user", "q1"),
+            _echoed_assistant_message_with_nulls(),
+            _message_item("user", "q2"),
+        ],
+    )
+    assert len(request.input) == 3
+
+
+def test_null_optionals_on_echoed_function_call_are_unset():
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            _message_item("user", "q"),
+            _echoed_function_call_with_nulls(),
+            {
+                "type": "function_call_output",
+                "call_id": "call_0123456789abcdef",
+                "output": "app.py",
+            },
+        ],
+    )
+    call = request.input[1]
+    call_id = call["call_id"] if isinstance(call, dict) else call.call_id
+    assert call_id == "call_0123456789abcdef"
+
+
+def test_full_multi_turn_echo_with_nulls_round_trips():
+    """System + user + assistant echo + reasoning + function_call + output."""
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            _message_item("user", "find the last date on each line"),
+            _echoed_assistant_message_with_nulls(),
+            {
+                "id": "rs_0123456789abcdef",
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "Need to check the file."}],
+            },
+            _echoed_function_call_with_nulls(),
+            {
+                "type": "function_call_output",
+                "call_id": "call_0123456789abcdef",
+                "output": '{"returncode": 0}',
+            },
+        ],
+    )
+    assert len(request.input) == 6
+
+
+def test_null_top_level_optionals_are_unset():
+    """tool_choice/metadata/temperature: null must mean "use the default"."""
+    request = ResponsesRequest(
+        model="m",
+        input="hi",
+        tool_choice=None,
+        metadata=None,
+        temperature=None,
+        service_tier=None,
+        truncation=None,
+    )
+    assert request.tool_choice == "auto"
+    assert request.metadata is None
+    assert request.service_tier == "auto"
+    assert request.truncation == "disabled"
+
+
+def test_meaningful_values_survive_the_null_scrub():
+    request = ResponsesRequest(
+        model="m",
+        input=[_message_item("user", "q")],
+        temperature=0.25,
+        tool_choice="none",
+    )
+    assert request.temperature == 0.25
+    assert request.tool_choice == "none"
+
+
+# ---------------------------------------------------------------------------
+# Multimodal content
+# ---------------------------------------------------------------------------
+
+_IMAGE_URL = "data:image/png;base64,iVBORw0KGgo="
+_QUESTION = {"type": "input_text", "text": "What is in this image?"}
+
+
+def _user_item(*parts, typed=True):
+    item = {"role": "user", "content": list(parts)}
+    if typed:
+        item["type"] = "message"
+    return item
+
+
+@pytest.mark.parametrize("typed", [True, False], ids=["message", "untyped"])
+def test_input_image_becomes_a_chat_image_part(typed):
+    """The image has to reach the chat parser, where the client placed it.
+
+    Keeping only the text parts left the model answering about an image it
+    never received.
+    """
+    image = {"type": "input_image", "image_url": _IMAGE_URL, "detail": "auto"}
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item(_QUESTION, image, typed=typed)
+    )
+    assert msg == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": _IMAGE_URL, "detail": "auto"}},
+        ],
+    }
+
+
+def _chat_text(message):
+    """The prompt text the chat parser reads from a converted message."""
+    return parse_chat_message_content(message, MultimodalDataTracker("llama"))["content"]
+
+
+def test_untyped_input_text_becomes_chat_text_parts():
+    """input_text parts are not chat parts; passed through, the chat parser rejects them."""
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item(
+            {"type": "input_text", "text": "hello"},
+            {"type": "input_text", "text": "there"},
+            typed=False,
+        )
+    )
+    assert msg == {
+        "role": "user",
+        "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "there"}],
+    }
+    assert _chat_text(msg) == "hello\nthere"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "text", "text": "First"}, {"type": "text", "text": "Second"}],
+        ["First", "Second"],
+    ],
+    ids=["text-parts", "string-parts"],
+)
+def test_untyped_chat_content_reads_as_in_a_chat_request(content):
+    """Chat-style parts are left for the chat parser, which joins them by line.
+
+    Converting them as Responses parts glued the text parts together and
+    dropped the plain strings, which changed or erased the prompt.
+    """
+    item = {"role": "user", "content": content}
+    msg = _response_output_item_to_chat_completion_message(item)
+    assert msg == item
+    assert _chat_text(msg) == "First\nSecond"
+    (message,) = _messages({"input": [item]})
+    assert _chat_text(message) == "First\nSecond"
+
+
+def test_typed_message_keeps_plain_string_parts():
+    """A plain string is a text part; skipping it erased the prompt without an error."""
+    item = _user_item("first ", {"type": "input_text", "text": "second"})
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": "user",
+        "content": "first second",
+    }
+    assert _messages({"input": [item]}) == [{"role": "user", "content": "first second"}]
+
+
+def test_typed_message_keeps_plain_string_parts_beside_media():
+    image = {"type": "input_image", "image_url": _IMAGE_URL}
+    item = _user_item("Describe it.", image)
+    expected = [
+        {"type": "text", "text": "Describe it."},
+        {"type": "image_url", "image_url": {"url": _IMAGE_URL}},
+    ]
+    assert _response_output_item_to_chat_completion_message(item)["content"] == expected
+    assert _messages({"input": [item]}) == [{"role": "user", "content": expected}]
+
+
+@pytest.mark.parametrize(
+    "part", [42, {"type": "input_video", "video_id": "v-1"}], ids=["non-dict", "unknown-dict"]
+)
+def test_typed_message_rejects_a_part_without_text(part):
+    with pytest.raises(ValueError, match="Unsupported message content part"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, part))
+
+
+def test_replayed_refusal_is_skipped():
+    """A refusal in a replayed assistant turn has no text for the model, and must not fail the request."""
+    item = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "I can't help with that."}],
+    }
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": "assistant",
+        "content": "",
+    }
+
+
+def test_input_image_accepts_the_chat_url_object():
+    image = {"type": "input_image", "image_url": {"url": _IMAGE_URL}}
+    msg = _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
+    assert msg["content"][1] == {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+
+
+def test_chat_style_media_parts_pass_through():
+    image = {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item({"type": "text", "text": "Describe it."}, image, typed=False)
+    )
+    assert msg["content"] == [{"type": "text", "text": "Describe it."}, image]
+
+
+def test_input_image_without_a_url_is_rejected():
+    """A file_id cannot be resolved here, and dropping the image is worse than failing."""
+    image = {"type": "input_image", "file_id": "file-123", "detail": "auto"}
+    with pytest.raises(ValueError, match="file_id"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
+
+
+def test_input_file_is_rejected():
+    document = {"type": "input_file", "filename": "spec.pdf", "file_data": "JVBERi0="}
+    with pytest.raises(ValueError, match="input_file"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, document))
+
+
+@pytest.mark.parametrize("image_part", [{"detail": "auto"}, {}], ids=["detail", "no-detail"])
+def test_image_request_reaches_the_chat_messages(image_part):
+    """The OpenAI SDK sends an untyped user item; the image must survive validation."""
+    image = {"type": "input_image", "image_url": _IMAGE_URL, **image_part}
+    messages = _messages({"input": [_user_item(_QUESTION, image, typed=False)]})
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": _IMAGE_URL, **image_part}},
+            ],
+        }
+    ]

@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -184,3 +187,53 @@ def test_requests_in_transfer():
     assert in_transfer[1] is request1
     assert in_transfer[2] is request2
     assert in_transfer[3] is request3
+
+
+def _slot_request(request_id: int) -> SimpleNamespace:
+    """Request stub with the attributes SeqSlotManager and the transfer manager read."""
+    return SimpleNamespace(
+        request_id=request_id,
+        py_request_id=request_id,
+        state=LlmRequestState.CONTEXT_INIT,
+        seq_slot=None,
+        py_seq_slot=None,
+        is_disagg_generation_init_state=False,
+        is_disagg_generation_transmission_complete=False,
+        return_perf_metrics=False,
+    )
+
+
+def test_start_transfer_frees_the_sequence_slot_so_the_next_request_fits():
+    """A context-only request entering transfer keeps only its KV blocks: its
+    sequence slot and speculative-decoding resources are released at once, so
+    with a single slot the next request can be prepared while the first one is
+    still transferring (the slot leak fixed in #6032)."""
+    seq_slots = SeqSlotManager(max_num_sequences=1)
+    spec_resource_manager = MagicMock()
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = 100
+    manager = AsyncTransferManager(
+        create_mock_resource_manager(
+            kv_cache_manager=kv_cache_manager,
+            seq_slot_manager=seq_slots,
+            spec_resource_manager=spec_resource_manager,
+        )
+    )
+
+    def prepare(request):
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        seq_slots.prepare_resources(batch)
+
+    first, second = _slot_request(1), _slot_request(2)
+    prepare(first)
+    assert first.py_seq_slot == 0
+    with pytest.raises(NoFreeSlotsError):
+        prepare(second)
+
+    manager.start_transfer(first)
+
+    prepare(second)
+    assert second.py_seq_slot == 0
+    spec_resource_manager.free_resources.assert_called_once_with(first)
+    assert list(manager.requests_in_transfer()) == [1]

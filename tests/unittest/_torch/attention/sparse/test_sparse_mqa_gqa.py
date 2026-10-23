@@ -58,9 +58,9 @@ from tensorrt_llm._torch.attention.backends.trtllm import (
     generate_spec_decoding_position_offsets,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -325,7 +325,7 @@ class _ContextInputs:
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     request_ids: List[int]
     metadata: _SparseMqaGqaMetadata
 
@@ -342,7 +342,7 @@ class _GenerationInputs:
     k_new: torch.Tensor
     v_new: torch.Tensor
     local_sparse_attn_indices: torch.Tensor
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     request_ids: List[int]
     metadata: _SparseMqaGqaMetadata
 
@@ -1095,14 +1095,12 @@ def _quant_config(s: SparseMqaGqaScenario) -> Optional[QuantConfig]:
     return None
 
 
-def _create_kv_cache_manager(
-    s: SparseMqaGqaScenario, kv_cache: Optional[torch.Tensor] = None
-) -> KVCacheManager:
+def _create_kv_cache_manager(s: SparseMqaGqaScenario) -> KVCacheManagerV2:
     """Create kv cache manager for testing."""
     kv_cache_config = KvCacheConfig(max_tokens=s.kv_pool_num_pages * s.page_size)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
-    manager = KVCacheManager(
+    manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=s.num_layers,
@@ -1115,9 +1113,8 @@ def _create_kv_cache_manager(
         dtype=str_dtype_to_binding(torch_dtype_to_str(s.kvcache_dtype)),
     )
 
-    if kv_cache is not None:
-        for i in range(s.num_layers):
-            manager.get_buffers(i, kv_layout="HND").copy_(kv_cache[i])
+    for i in range(s.num_layers):
+        manager.get_buffers(i, kv_layout="HND").zero_()
 
     return manager
 
@@ -1265,7 +1262,7 @@ def _build_expected_compacted_kv(
 
 
 def _read_paged_kv_cache(
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManagerV2,
     request_ids: List[int],
     token_lens: Tuple[int, ...],
     s: SparseMqaGqaScenario,
@@ -1510,17 +1507,7 @@ def _create_context_inputs(s: ContextScenario) -> _ContextInputs:
     k = torch.randn(s.nnz_q, s.num_kv_heads * s.head_dim, device=device, dtype=s.dtype)
     v = torch.randn(s.nnz_q, s.num_kv_heads * s.head_dim, device=device, dtype=s.dtype)
 
-    kv_cache = torch.zeros(
-        s.num_layers,
-        s.kv_pool_num_pages,
-        2,
-        s.num_kv_heads,
-        s.page_size,
-        s.head_dim,
-        device=device,
-        dtype=s.kvcache_dtype,
-    )
-    kv_cache_manager = _create_kv_cache_manager(s, kv_cache)
+    kv_cache_manager = _create_kv_cache_manager(s)
 
     request_ids = list(range(s.batch_size))
     kv_cache_manager.add_dummy_requests(request_ids, list(s.seq_lens))
@@ -1582,10 +1569,21 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         device=device,
         dtype=s.dtype,
     ).to(s.kvcache_dtype)
-    kv_cache_manager = _create_kv_cache_manager(s, kv_cache)
+    kv_cache_manager = _create_kv_cache_manager(s)
 
     request_ids = list(range(s.batch_size))
     kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    # Keep seeded request histories independent of physical page allocation.
+    for layer_idx in range(s.num_layers):
+        buffer = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+        page_tables = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=layer_idx)
+        logical_page = 0
+        for pages, token_num in zip(page_tables, token_nums, strict=True):
+            num_pages = math.ceil(token_num / s.page_size)
+            assert len(pages) >= num_pages
+            for page in pages[:num_pages]:
+                buffer[page].copy_(kv_cache[layer_idx, logical_page])
+                logical_page += 1
 
     metadata = _SparseMqaGqaMetadata(
         num_contexts=0,
@@ -1599,7 +1597,7 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         request_ids=request_ids,
         prompt_lens=list(s.past_kv_lens),
         num_sparse_topk=num_sparse_topk,
-        num_heads_per_kv=s.q_heads_per_kv_head,
+        max_num_heads_per_kv=s.q_heads_per_kv_head,
         runtime_features=AttentionRuntimeFeatures(has_speculative_draft_tokens=s.has_draft_tokens),
         is_spec_decoding_enabled=s.has_draft_tokens,
         use_spec_decoding=s.has_draft_tokens,

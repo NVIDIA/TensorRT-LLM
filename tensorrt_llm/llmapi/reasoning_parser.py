@@ -323,6 +323,128 @@ class DeepSeekR1Parser(BaseReasoningParser):
         return ReasoningParserResult(content=remaining)
 
 
+def _trailing_partial_marker(text: str, *markers: str) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of a marker.
+
+    A streaming parser withholds that many characters: they may still grow
+    into a marker split across deltas.
+    """
+    best = 0
+    for marker in markers:
+        for length in range(min(len(text), len(marker) - 1), best, -1):
+            if marker.startswith(text[-length:]):
+                best = length
+                break
+    return best
+
+
+@register_reasoning_parser("glm", reasoning_at_start=True)
+@register_reasoning_parser("glm45")
+@register_reasoning_parser("glm47", reasoning_at_start=True)
+@register_reasoning_parser("glm_moe_dsa", reasoning_at_start=True)
+class GlmReasoningParser(BaseReasoningParser):
+    """Reasoning parser for the GLM family.
+
+    GLM-4.7 and GLM-5 templates prefill `<think>` (`reasoning_at_start`), or
+    `</think>` when `enable_thinking` is false. GLM-4.5/4.6 (`glm45`) do not
+    prefill `<think>`; the model opens the block at the start of its output.
+
+    The block ends at the first `</think>`, or at a `<tool_call>` opened
+    before it; a later `<think>` is text. A `</think>` before any content, or
+    directly before the first `<tool_call>`, closes the block again and is
+    dropped. Text from the first `<tool_call>` on is kept verbatim.
+    """
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+    _tool_call_start = "<tool_call>"
+
+    def __init__(self,
+                 *,
+                 reasoning_at_start: bool = False,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        # The templates close the block in the prompt when `enable_thinking`
+        # is passed and false.
+        if not (chat_template_kwargs or {}).get("enable_thinking", True):
+            reasoning_at_start = False
+        self.reasoning_at_start = reasoning_at_start
+        # "start": the block may still open after leading whitespace;
+        # "closed": the block ended and no content followed yet.
+        self._state = "reasoning" if reasoning_at_start else "start"
+        self._buffer = ""
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        # The whole text as one delta to a fresh parser, so both paths agree.
+        parser = GlmReasoningParser(reasoning_at_start=self.reasoning_at_start)
+        result, tail = parser.parse_delta(text), parser.finish()
+        result.content += tail.content
+        result.reasoning_content += tail.reasoning_content
+        return result
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        data, self._buffer = self._buffer + delta_text, ""
+        content, reasoning = [], []
+        while data:
+            state = self._state
+            if state == "tool_calls":
+                content.append(data)
+                break
+            if state == "start":
+                stripped = data.lstrip()
+                if stripped.startswith(self.reasoning_start):
+                    data = stripped[len(self.reasoning_start):]
+                    self._state = "reasoning"
+                elif self.reasoning_start.startswith(stripped):
+                    self._buffer = data
+                    break
+                else:
+                    self._state = "closed"
+                continue
+            out = reasoning if state == "reasoning" else content
+            end = data.find(self.reasoning_end)
+            call = data.find(self._tool_call_start)
+            if call != -1 and (end == -1 or call < end):
+                # A tool call ends the block; everything after it is content.
+                out.append(data[:call])
+                content.append(data[call:])
+                self._state = "tool_calls"
+                break
+            if end == -1:
+                cut = len(data) - _trailing_partial_marker(
+                    data, self.reasoning_end, self._tool_call_start)
+                out.append(data[:cut])
+                self._buffer = data[cut:]
+                if cut and state == "closed":
+                    self._state = "content"
+                break
+            out.append(data[:end])
+            rest = data[end + len(self.reasoning_end):]
+            if state == "reasoning":
+                self._state = "closed"
+            elif end:
+                self._state = "content"
+            if self._state == "closed" or rest.startswith(
+                    self._tool_call_start):
+                # The tag ends the block or closes it again: drop it.
+                data = rest
+            elif self._tool_call_start.startswith(rest):
+                # Hold the tag until it is known whether a tool call follows.
+                self._buffer = data[end:]
+                break
+            else:
+                content.append(self.reasoning_end)
+                data = rest
+        return ReasoningParserResult(content="".join(content),
+                                     reasoning_content="".join(reasoning))
+
+    def finish(self) -> ReasoningParserResult:
+        remaining, self._buffer = self._buffer, ""
+        if self._state == "reasoning":
+            return ReasoningParserResult(reasoning_content=remaining)
+        return ReasoningParserResult(content=remaining)
+
+
 @register_reasoning_parser("deepseek_v4")
 class DeepSeekV4ReasoningParser(BaseReasoningParser):
     """DeepSeek-V4 parser selected by thinking-mode chat template kwargs."""
@@ -357,6 +479,16 @@ class DeepSeekV4ReasoningParser(BaseReasoningParser):
 
     def finish(self) -> ReasoningParserResult:
         return self._parser.finish()
+
+
+@register_reasoning_parser("deepseek_v41")
+class DeepSeekV41ReasoningParser(DeepSeekV4ReasoningParser):
+    """DeepSeek-V4.1 reasoning adapter.
+
+    V4.1 keeps V4's ``<think>...</think>`` reasoning protocol and thinking
+    controls.  The dedicated adapter makes the model-version pairing explicit
+    while intentionally inheriting the shared wire-format implementation.
+    """
 
 
 @register_reasoning_parser("poolside_v1", "laguna")
@@ -468,40 +600,116 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
 
           <mm:think>{reasoning}</mm:think>{content}
 
-    * Without reasoning (the template still emits a bare ``</mm:think>``
-      as a sentinel so the model knows where the visible content starts)::
+    * Without reasoning (a bare ``</mm:think>`` sentinel marks where the
+      visible content starts; the template prefills it when thinking is
+      disabled, and in adaptive mode the model generates it)::
 
           </mm:think>{content}
 
-    M3 is therefore not strictly ``reasoning_at_start`` — the leading
-    ``<mm:think>`` may or may not be present — so we partition on the
-    closing tag first and then strip an optional leading opening tag
-    from the reasoning portion. This keeps streaming behavior identical
-    to :class:`DeepSeekR1Parser` for the common (``<mm:think>...``) case
-    while also handling the bare-sentinel form.
+    Which shape the model produces depends on how the prompt was rendered:
+    with thinking enabled the template prefills ``<mm:think>`` into the
+    prompt, so the output opens inside the reasoning block with no opening
+    tag; with thinking disabled it prefills ``</mm:think>``, so the output is
+    all content; in adaptive mode (the template default) it prefills nothing
+    and the model emits ``<mm:think>`` or the bare sentinel first. The parser
+    therefore takes its mode from an explicit ``thinking_mode`` or from the
+    mode the server resolved off the rendered prompt (relayed as
+    ``enable_thinking``), and otherwise starts outside reasoning. Both
+    tags are delimiters and never appear in the result; text before an
+    opening tag is content; an opening tag without a closing tag is
+    reasoning cut off by the token limit. ``parse`` and ``parse_delta``
+    agree on every input for every chunking.
     """
+
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<mm:think>"
+    reasoning_end = "</mm:think>"
 
     def __init__(self,
                  *,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
-        super().__init__(reasoning_at_start=False,
+        kwargs = chat_template_kwargs or {}
+        # The template's own knob is `thinking_mode`; only "enabled" prefills
+        # the opening tag. Without it, trust the mode the server resolved
+        # from the rendered prompt, relayed as `enable_thinking` (a caller
+        # cannot pass that key: the template never reads it, so the
+        # unused-kwargs guard rejects it). A bare `thinking` is what the
+        # Responses path injects for `reasoning.effort`; this template does
+        # not act on it, so neither does the parser.
+        thinking_mode = kwargs.get("thinking_mode")
+        if thinking_mode is not None:
+            prefilled_open = thinking_mode == "enabled"
+        else:
+            prefilled_open = kwargs.get("enable_thinking") is True
+        super().__init__(reasoning_at_start=prefilled_open,
                          chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<mm:think>"
         self.reasoning_end = "</mm:think>"
 
     def parse(self, text: str) -> ReasoningParserResult:
+        if self.reasoning_at_start:
+            # The prompt ends with the opening tag, so the output begins
+            # inside the reasoning block.
+            text = self.reasoning_start + text
+        start_idx = text.find(self.reasoning_start)
         end_idx = text.find(self.reasoning_end)
+        if start_idx != -1 and (end_idx == -1 or start_idx < end_idx):
+            prefix = text[:start_idx]
+            body = text[start_idx + len(self.reasoning_start):]
+            if end_idx == -1:
+                # An opening tag with no closing tag is reasoning cut off
+                # (e.g. by max_tokens); streaming reports it as reasoning.
+                return self._create_reasoning_end_result(prefix, body)
+            reasoning_content, _, content = body.partition(self.reasoning_end)
+            return self._create_reasoning_end_result(prefix + content,
+                                                     reasoning_content)
         if end_idx == -1:
-            # No closing tag → no reasoning block in this response.
+            # No tags at all: no reasoning block in this response.
             return ReasoningParserResult(content=text)
-        reasoning_content = text[:end_idx]
-        content = text[end_idx + len(self.reasoning_end):]
-        # Strip an optional leading <mm:think> from the reasoning portion
-        # so the sentinel-only shape (no opening tag) reduces to
-        # reasoning_content="".
-        if reasoning_content.startswith(self.reasoning_start):
-            reasoning_content = reasoning_content[len(self.reasoning_start):]
-        return self._create_reasoning_end_result(content, reasoning_content)
+        # A closing tag with no opening tag is the empty-reasoning sentinel:
+        # a delimiter, dropped; what follows is parsed by the same rules.
+        rest = self.parse(text[end_idx + len(self.reasoning_end):])
+        return self._create_reasoning_end_result(text[:end_idx] + rest.content,
+                                                 rest.reasoning_content)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        # Outside a reasoning block the inherited parser only looks for the
+        # opening tag, so a bare ``</mm:think>`` sentinel would leak into the
+        # content; it drops text that precedes an opening tag in the same
+        # delta although it reports that text as content when it arrives on
+        # its own; and it only withholds a partial tag when the whole delta
+        # is one. Resolve the three here so streaming matches ``parse`` for
+        # every chunking; inside a reasoning block the inherited behaviour
+        # already does.
+        if self.in_reasoning:
+            return super().parse_delta(delta_text)
+        pending = self._buffer + delta_text
+        self._buffer = ""
+        start_idx = pending.find(self.reasoning_start)
+        end_idx = pending.find(self.reasoning_end)
+        if end_idx != -1 and (start_idx == -1 or end_idx < start_idx):
+            # Sentinel: a delimiter, dropped; the rest is parsed as usual.
+            before = pending[:end_idx]
+            after = pending[end_idx + len(self.reasoning_end):]
+        elif start_idx != -1:
+            # Text before the opening tag is content; the inherited parser
+            # takes over at the tag.
+            rest = super().parse_delta(pending[start_idx:])
+            return ReasoningParserResult(
+                content=pending[:start_idx] + rest.content,
+                reasoning_content=rest.reasoning_content)
+        else:
+            # Withhold a trailing fragment that could still grow into a tag.
+            tag_start = pending.rfind("<")
+            if tag_start != -1 and (
+                    self.reasoning_start.startswith(pending[tag_start:])
+                    or self.reasoning_end.startswith(pending[tag_start:])):
+                self._buffer = pending[tag_start:]
+                pending = pending[:tag_start]
+            return ReasoningParserResult(content=pending)
+        rest = (self.parse_delta(after) if after else ReasoningParserResult())
+        return ReasoningParserResult(content=before + rest.content,
+                                     reasoning_content=rest.reasoning_content)
 
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
@@ -515,10 +723,14 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "xing4_0": "xing4_0",
     "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
+    "deepseek_v41": "deepseek_v41",
+    "deepseek_v41_text": "deepseek_v41",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",
     "nemotron_h_omni": "nemotron-v3",
+    "exaone_moe": "k-exaone",
     "gemma4": "gemma4",
+    "glm_moe_dsa": "glm_moe_dsa",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
     "kimi_k3": "kimi_k3",
@@ -615,6 +827,7 @@ def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
 
 @register_reasoning_parser("nemotron-v3")
 @register_reasoning_parser("nano-v3")
+@register_reasoning_parser("k-exaone")
 class NemotronV3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for Nemotron Nano v3.
 
@@ -796,18 +1009,6 @@ class Gemma4ReasoningParser(BaseReasoningParser):
             reasoning_content="".join(reasoning_parts),
         )
 
-    @staticmethod
-    def _partial_suffix_len(buf: str, tag: str) -> int:
-        """Return length of the longest suffix of ``buf`` that is a prefix of ``tag``.
-
-        Used to hold back potential partial delimiters during streaming.
-        """
-        max_len = min(len(buf), len(tag) - 1)
-        for k in range(max_len, 0, -1):
-            if tag.startswith(buf[-k:]):
-                return k
-        return 0
-
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         self._buffer += delta_text
         content_parts: list[str] = []
@@ -816,7 +1017,7 @@ class Gemma4ReasoningParser(BaseReasoningParser):
             if not self.in_reasoning:
                 idx = self._buffer.find(self.CHANNEL_OPEN)
                 if idx == -1:
-                    hold = self._partial_suffix_len(self._buffer,
+                    hold = _trailing_partial_marker(self._buffer,
                                                     self.CHANNEL_OPEN)
                     emit_len = len(self._buffer) - hold
                     content_parts.append(self._buffer[:emit_len])
@@ -828,7 +1029,7 @@ class Gemma4ReasoningParser(BaseReasoningParser):
             else:
                 idx = self._buffer.find(self.CHANNEL_CLOSE)
                 if idx == -1:
-                    hold = self._partial_suffix_len(self._buffer,
+                    hold = _trailing_partial_marker(self._buffer,
                                                     self.CHANNEL_CLOSE)
                     emit_len = len(self._buffer) - hold
                     reasoning_parts.append(self._buffer[:emit_len])
@@ -1076,22 +1277,6 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         self._state = "body"
         self._channel: Optional[str] = self._initial_channel
 
-    @staticmethod
-    def _partial_suffix_len(text: str, markers: tuple[str, ...]) -> int:
-        """Length of the longest text suffix that is a proper prefix of any marker.
-
-        Markers may contain internal ``<`` (e.g. ``<|close|>tools<|sep|>``),
-        so every suffix length up to ``len(marker) - 1`` must be checked, not
-        just the one starting at the last ``<``.
-        """
-        best = 0
-        for marker in markers:
-            for length in range(min(len(text), len(marker) - 1), best, -1):
-                if marker.startswith(text[-length:]):
-                    best = length
-                    break
-        return best
-
     def _emit(self, text: str, content: list, reasoning: list) -> None:
         if not text:
             return
@@ -1115,7 +1300,7 @@ class KimiK3ReasoningParser(BaseReasoningParser):
             indices = [(buf.find(m), m) for m in markers]
             indices = [(i, m) for i, m in indices if i != -1]
             if not indices:
-                hold = self._partial_suffix_len(buf, markers)
+                hold = _trailing_partial_marker(buf, *markers)
                 emit_len = len(buf) - hold
                 self._emit(buf[:emit_len], content, reasoning)
                 self._buffer = buf[emit_len:]
@@ -1163,7 +1348,7 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         if self._state == "tools_pass":
             idx = buf.find(self.TOOLS_END)
             if idx == -1:
-                hold = self._partial_suffix_len(buf, (self.TOOLS_END, ))
+                hold = _trailing_partial_marker(buf, self.TOOLS_END)
                 emit_len = len(buf) - hold
                 self._emit(buf[:emit_len], content, reasoning)
                 self._buffer = buf[emit_len:]

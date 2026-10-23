@@ -755,7 +755,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     "Please run the following installation commands or "
                     "explicitly disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 "
                     "(user is responsible for deploying the model without guardrails). "
-                    "- `pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
+                    "- `pip install cosmos_guardrail==0.3.2 && pip uninstall opencv-python "
+                    "&& pip install opencv-python-headless`"
                 )
             # Guardrails are only evaluated on rank 0; load them only there to avoid
             # dead model weights occupying GPU memory on every other rank.
@@ -779,8 +780,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_warmup_steps(self):
+        steps = super().default_warmup_steps
+        # A step policy's edge windows cover every step of a short warmup; one
+        # more step than both windows reaches the FP8 middle as well.
+        controller = getattr(self.transformer, "step_precision_controller", None)
+        if controller is not None:
+            steps = max(steps, controller.first_steps + controller.last_steps + 1)
         # Distilled checkpoints only run their fixed schedule length.
-        return self.sampling.num_steps(super().default_warmup_steps)
+        return self.sampling.num_steps(steps)
 
     @property
     def default_generation_params(self):
@@ -2230,6 +2237,21 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return prepared
 
+    def _select_step_precision(self, step_index: int) -> None:
+        """Select this denoising step's activation precision on the transformer.
+
+        A pure function of step_index, so the conditional and unconditional CFG
+        branches of one step always select the same path even though each
+        calls this separately. No-op unless the checkpoint declares a step
+        policy.
+        """
+        # getattr: the transformer is not always a Cosmos3Transformer.
+        # Distilled-pipeline tests substitute a lightweight stand-in, and a
+        # transformer with no step policy has no reason to carry these.
+        set_step = getattr(self.transformer, "set_denoising_step", None)
+        if set_step is not None:
+            set_step(step_index=step_index, num_steps=len(self.scheduler.timesteps))
+
     def _denoise_request(
         self,
         request: _ResolvedRequest,
@@ -2291,6 +2313,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             encoder_hidden_states,
             extra_tensors,
         ):
+            self._select_step_precision(step_index)
+
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
             current_action = extra_stream_latents.get("action") if extra_stream_latents else None
 
@@ -2378,23 +2402,32 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         should_pin_condition = (
             prepared.condition_latents is not None and prepared.velocity_mask is not None
         )
-        denoise_result = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=cond_ids,
-            neg_prompt_embeds=uncond_ids,
-            guidance_scale=request.guidance_scale,
-            forward_fn=forward_fn,
-            extra_cfg_tensors=extra_cfg_tensors,
-            extra_streams=extra_streams,
-            guidance_interval=request.guidance_interval,
-            post_step_fn=(
-                post_step_fn
-                if (request.do_action or should_pin_condition)
-                else self._conditioning_anchor_post_step(prepared.image_latent)
-            ),
-            scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
-        )
+        try:
+            denoise_result = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=cond_ids,
+                neg_prompt_embeds=uncond_ids,
+                guidance_scale=request.guidance_scale,
+                forward_fn=forward_fn,
+                extra_cfg_tensors=extra_cfg_tensors,
+                extra_streams=extra_streams,
+                guidance_interval=request.guidance_interval,
+                post_step_fn=(
+                    post_step_fn
+                    if (request.do_action or should_pin_condition)
+                    else self._conditioning_anchor_post_step(prepared.image_latent)
+                ),
+                scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            )
+        finally:
+            # In a finally because a failed request must not leave the selection
+            # latched. The transfer path runs the transformer without selecting
+            # a step, so it would inherit whatever the failed request left
+            # behind and run every call in 16-bit with nothing to indicate it.
+            reset_step = getattr(self.transformer, "reset_denoising_step", None)
+            if reset_step is not None:
+                reset_step()
 
         action_latents = prepared.action_latents
         if extra_streams is not None:
@@ -2742,7 +2775,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> torch.Tensor:
         """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
 
-        branch_caches: dict[str, tuple[Any, Any]] = {}
+        branch_caches: dict[
+            str,
+            tuple[Any, Any, torch.Tensor | None, list[int] | None, bool | None],
+        ] = {}
 
         def run_branch(
             cache_key: str,
@@ -2752,10 +2788,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_control_latents: list[torch.Tensor] | None,
             timestep: torch.Tensor,
         ) -> torch.Tensor:
-            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
-                cache_key,
-                (None, None),
-            )
+            (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
+                self.transformer.cached_text_lengths_uniform,
+            ) = branch_caches.get(cache_key, (None, None, None, None, None))
             result = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
@@ -2769,6 +2808,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_caches[cache_key] = (
                 self.transformer.cached_kv,
                 self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
+                self.transformer.cached_text_lengths_uniform,
             )
             if result.video is None:
                 raise ValueError("Cosmos3 transfer diffusion expects video predictions.")

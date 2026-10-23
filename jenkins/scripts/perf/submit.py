@@ -22,12 +22,13 @@ jenkins/scripts/perf/disaggregated/submit.py.
 Three test shapes are supported (all flow through the same parsing logic):
   1. Multi-node aggregated:        aggr[_upload]-{config_base}-{server_name}
         runtime_mode = "aggregated", benchmark_mode = None
-  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only[-{modifier}]-{config_base}
-        runtime_mode = "aggregated", benchmark_mode = "ctx_only"
-        (reads disagg yaml, but launches via the aggregated single-pytest path
-         using the ctx worker's parallel sizes)
+  2. Disagg yaml on the agg path:  aggr[_upload]-{ctx_only|gen_only_no_context}
+                                     [-{modifier}]-{config_base}
+        runtime_mode = "aggregated", benchmark_mode in AGGREGATED_DISAGG_YAML_MODES
+        (both read a disagg yaml but launch via the aggregated single-pytest path)
   3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}[-{modifier}]-{config_base}
-        runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+        runtime_mode = "disaggregated", benchmark_mode in DISAGG_BENCHMARK_MODES
+        (four roles, one pytest each, rendezvousing through the hostnames dir)
 
 The optional {modifier} segment is an instrumentation flag that is orthogonal to
 the benchmark mode; the only one today is "time_breakdown", which launches
@@ -48,7 +49,18 @@ import sys
 from typing import List, Optional, Tuple
 
 import yaml
-from benchmark_utils import parse_positive_concurrency
+from benchmark_utils import (
+    AGGREGATED_DISAGG_YAML_MODES,
+    DISAGG_BENCHMARK_MODES,
+    GEN_ONLY_NO_CONTEXT_MODE,
+    ctx_only_world_size,
+    dwdp_ctx_layout,
+    dwdp_ctx_size,
+    gen_only_no_context_server_counts,
+    gen_only_no_context_world_size,
+    is_gen_only_no_context,
+    parse_positive_concurrency,
+)
 from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
 
 
@@ -388,12 +400,14 @@ def parse_test_case_name(
         if len(parts) < 3:
             raise ValueError(
                 f"Invalid disagg test format. Expected disagg[_upload]-"
-                f"{{e2e|gen_only}}[-{{modifier}}]-{{config_base}}, got: {bracket_content}"
+                f"{{{'|'.join(DISAGG_BENCHMARK_MODES)}}}[-{{modifier}}]-{{config_base}}, "
+                f"got: {bracket_content}"
             )
         benchmark_mode = parts[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
             raise ValueError(
-                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
             )
         runtime_mode = "disaggregated"
         server_name = None
@@ -402,10 +416,10 @@ def parse_test_case_name(
         )
         config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
     elif "aggr" in prefix:
-        if len(parts) > 2 and parts[1] == "ctx_only":
-            # ctx_only: aggr[_upload]-ctx_only[-{modifier}]-{config_base};
-            # reads disagg yaml.
-            benchmark_mode = "ctx_only"
+        if len(parts) > 2 and parts[1] in AGGREGATED_DISAGG_YAML_MODES:
+            # ctx_only / gen_only_no_context:
+            # aggr[_upload]-{mode}[-{modifier}]-{config_base}; reads disagg yaml.
+            benchmark_mode = parts[1]
             runtime_mode = "aggregated"
             server_name = None
             time_breakdown, config_base_name = _split_modifiers(
@@ -454,23 +468,24 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         gpus_per_ctx_server, gpus_per_gen_server,
         nodes_per_ctx_server, nodes_per_gen_server,
         gpus_per_node_per_ctx_server, gpus_per_node_per_gen_server,
-        total_nodes, total_gpus
+        dwdp_size, ctx_nodes, total_nodes, total_gpus
+    where dwdp_size is 0 unless the ctx side is a DWDP group, in which case
+    every ctx server is one rank of a single MPI step spanning ctx_nodes.
     """
     hardware = config.get("hardware", {}) or {}
     gpus_per_node = hardware.get("gpus_per_node")
     if gpus_per_node is None:
         raise ValueError("hardware.gpus_per_node is required")
 
-    if benchmark_mode == "ctx_only":
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        gpus_per_server = gen_only_no_context_world_size(config)
+    elif benchmark_mode == "ctx_only":
         # ctx_only reads disagg yaml; size the launch from worker_config.ctx.
         worker_config = config.get("worker_config", {}) or {}
         ctx_config = worker_config.get("ctx", {}) or {}
         if not ctx_config:
             raise ValueError("worker_config.ctx is required for ctx_only mode")
-        tp = ctx_config.get("tensor_parallel_size", 1)
-        pp = ctx_config.get("pipeline_parallel_size", 1)
-        cp = ctx_config.get("context_parallel_size", 1)
-        gpus_per_server = ctx_config.get("world_size") or (tp * pp * cp)
+        gpus_per_server = ctx_config.get("world_size") or ctx_only_world_size(config)
     elif runtime_mode == "aggregated":
         # Regular agg: match server_configs by name.
         server_configs = config.get("server_configs", []) or []
@@ -487,13 +502,13 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         ctx_config = worker_config.get("ctx", {}) or {}
         gen_config = worker_config.get("gen", {}) or {}
 
-        # gen_only_no_context comes from the yaml's benchmark.mode, not the
-        # test name (test name is always "gen_only" for both gen_only and
-        # gen_only_no_context tests). When set, ctx workers are not launched.
-        yaml_mode = (config.get("benchmark", {}) or {}).get("mode", "")
-        is_gen_only_no_context = benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
-        num_ctx_servers = 0 if is_gen_only_no_context else hardware.get("num_ctx_servers")
-        num_gen_servers = hardware.get("num_gen_servers")
+        # On this path gen_only_no_context can only come from the yaml's
+        # benchmark.mode, not the test name. When set, ctx workers are not launched.
+        if is_gen_only_no_context(benchmark_mode, config):
+            num_ctx_servers, num_gen_servers = gen_only_no_context_server_counts()
+        else:
+            num_ctx_servers = hardware.get("num_ctx_servers")
+            num_gen_servers = hardware.get("num_gen_servers")
 
         ctx_tp = ctx_config.get("tensor_parallel_size", 1)
         ctx_pp = ctx_config.get("pipeline_parallel_size", 1)
@@ -512,9 +527,12 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         gpus_per_node_per_ctx_server = min(gpus_per_ctx_server, gpus_per_node)
         gpus_per_node_per_gen_server = min(gpus_per_gen_server, gpus_per_node)
 
-        total_nodes = (
-            num_ctx_servers * nodes_per_ctx_server + num_gen_servers * nodes_per_gen_server
-        )
+        ctx_nodes = num_ctx_servers * nodes_per_ctx_server
+        dwdp_size = 0 if is_gen_only_no_context(benchmark_mode, config) else dwdp_ctx_size(config)
+        if dwdp_size:
+            # One MPI step hosts every single-GPU ctx server, packed per node.
+            _, ctx_nodes, _ = dwdp_ctx_layout(config)
+        total_nodes = ctx_nodes + num_gen_servers * nodes_per_gen_server
         total_gpus = total_nodes * gpus_per_node
 
         return {
@@ -527,6 +545,8 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
             "nodes_per_gen_server": nodes_per_gen_server,
             "gpus_per_node_per_ctx_server": gpus_per_node_per_ctx_server,
             "gpus_per_node_per_gen_server": gpus_per_node_per_gen_server,
+            "dwdp_size": dwdp_size,
+            "ctx_nodes": ctx_nodes,
             "total_nodes": total_nodes,
             "total_gpus": total_gpus,
         }
@@ -576,14 +596,16 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
     ctx_env = _join_env(common, ctx_extra)
     gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
-        if benchmark_mode == "ctx_only":
+        if benchmark_mode in AGGREGATED_DISAGG_YAML_MODES:
             return {
                 "worker_env_var": common,
                 "ctx_worker_env_var": ctx_env,
                 "gen_worker_env_var": gen_env,
-                # ctx_only launches through the aggregated single-pytest path;
-                # the ctx-merged env is what actually runs.
-                "server_env_var": ctx_env,
+                # These modes launch through the aggregated single-pytest path;
+                # the env of the worker they actually run is what goes here.
+                "server_env_var": (
+                    gen_env if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE else ctx_env
+                ),
                 "benchmark_env_var": env.get("benchmark_env_var", "") or "",
             }
         agg_server_env_var = ""
@@ -725,6 +747,41 @@ def get_pytest_commands(script_prefix_lines, runtime_mode):
     benchmark_pytest_command = " ".join(benchmark_parts)
 
     return ("", worker_pytest_command, disagg_server_pytest_command, benchmark_pytest_command)
+
+
+DWDP_CTX_RANK_SCRIPT = "jenkins/scripts/perf/disaggregated/dwdp_ctx_rank.sh"
+
+
+def get_dwdp_ctx_worker_command(worker_pytest_command, rank_launcher):
+    """Derive the DWDP ctx worker command from the regular worker command.
+
+    Args:
+        worker_pytest_command: The `export partialPytestCommandWorker=...` line
+            from get_pytest_commands().
+        rank_launcher: Shell words that launch pytest on one DWDP ctx rank.
+
+    Returns:
+        str: An `export partialPytestCommandDWDPCtxWorker=...` line in which
+        trtllm-llmapi-launch is replaced by ``rank_launcher`` (or, when the
+        worker command has no launcher, ``rank_launcher`` precedes pytest).
+
+    Raises:
+        ValueError: If the worker command runs no pytest.
+    """
+    parts = _split_pytest_command_line(
+        worker_pytest_command.replace(
+            "partialPytestCommandWorker", "partialPytestCommandDWDPCtxWorker"
+        )
+    )
+    launcher_parts = [i for i, p in enumerate(parts) if "trtllm-llmapi-launch" in p]
+    if launcher_parts:
+        parts[launcher_parts[0]] = rank_launcher
+        parts = [p for i, p in enumerate(parts) if i not in launcher_parts[1:]]
+    elif "pytest" in parts:
+        parts.insert(parts.index("pytest"), rank_launcher)
+    else:
+        raise ValueError(f"worker command runs no pytest: {worker_pytest_command!r}")
+    return " ".join(parts)
 
 
 def get_test_output_dir(script_prefix_lines, test_case_name):
@@ -904,16 +961,31 @@ def main():
     gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
-        # Aggregated (incl. ctx_only): single pytestCommand built from the
-        # matched server_config's server_env_var (regular agg) or the disagg
-        # yaml's environment.worker_env_var (ctx_only). The prefix runs on
-        # every rank before trtllm-llmapi-launch dispatches to pytest (rank 0)
-        # or mgmn_worker_node (others).
+        # Aggregated (incl. ctx_only and gen_only_no_context): single pytestCommand
+        # built from the matched server_config's server_env_var (regular agg) or the
+        # disagg yaml's merged worker env. The prefix runs on every rank before
+        # trtllm-llmapi-launch dispatches to pytest (rank 0) or mgmn_worker_node
+        # (others). ucx_prefix is a shell command prefix, so it must lead.
+        ucx_prefix = ""
+        env_prefix_parts = []
+        if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+            env_prefix_parts.append(
+                "FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${SLURM_LOCALID} "
+                "HF_HOME=/tmp/hf_home"
+            )
+            ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+            print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
+            ucx_prefix = ucx_tls_cmd.strip()
+            env_prefix_parts.append("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
+            script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
+            srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
+
         server_env_var = env_config["server_env_var"]
         if server_env_var.strip():
-            pytest_command_with_env = (
-                f'export pytestCommand="{server_env_var} $partialPytestCommand"'
-            )
+            env_prefix_parts.append(server_env_var.strip())
+        env_prefix = " ".join([ucx_prefix] + env_prefix_parts).strip()
+        if env_prefix:
+            pytest_command_with_env = f'export pytestCommand="{env_prefix} $partialPytestCommand"'
         else:
             pytest_command_with_env = 'export pytestCommand="$partialPytestCommand"'
 
@@ -944,10 +1016,9 @@ def main():
         gen_worker_env_vars = f"{base_prefix} {env_config['gen_worker_env_var']}".rstrip()
         server_env_vars = env_config["server_env_var"]
 
-        # gen_only_no_context comes from yaml's benchmark.mode, not the test
-        # name — see get_hardware_config.
-        yaml_mode = benchmark_config.get("mode", "")
-        if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+        # On this path gen_only_no_context comes from the yaml's benchmark.mode,
+        # not the test name -- see get_hardware_config.
+        if is_gen_only_no_context(benchmark_mode, config):
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
@@ -965,10 +1036,23 @@ def main():
         print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
+        ctx_worker_command_var = "$partialPytestCommandWorker"
+        dwdp_ctx_worker_command = ""
+        if hardware_config["dwdp_size"]:
+            # Every DWDP ctx rank runs pytest itself, so the worker command's
+            # trtllm-llmapi-launch (which runs pytest on rank 0 only) is
+            # replaced by the per-rank launcher.
+            dwdp_ctx_worker_command = get_dwdp_ctx_worker_command(
+                worker_pytest_command,
+                f"bash $llmSrcNode/{DWDP_CTX_RANK_SCRIPT}",
+            )
+            ctx_worker_command_var = "$partialPytestCommandDWDPCtxWorker"
+
         pytest_common_vars = ""
         script_prefix_lines.extend(
             [
                 worker_pytest_command,
+                dwdp_ctx_worker_command,
                 disagg_server_pytest_command,
                 benchmark_pytest_command,
                 f'export PYTEST_COMMON_VARS="{pytest_common_vars}"',
@@ -977,7 +1061,7 @@ def main():
                 f'export SERVER_ENV_VARS="{server_env_vars}"',
                 f'export BENCHMARK_ENV_VARS="{env_config["benchmark_env_var"]}"',
                 f'export pytestCommandCTXWorker="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS'
-                ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
+                f' $PYTEST_COMMON_VARS {ctx_worker_command_var}"',
                 f'export pytestCommandGENWorker="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS'
                 ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
                 f'export pytestCommandDisaggServer="{ucx_tls_server_cmd}'
@@ -996,6 +1080,8 @@ def main():
                 f"export nodesPerGenServer={hardware_config['nodes_per_gen_server']}",
                 f"export gpusPerNodePerCtxServer={hardware_config['gpus_per_node_per_ctx_server']}",
                 f"export gpusPerNodePerGenServer={hardware_config['gpus_per_node_per_gen_server']}",
+                f"export dwdpCtxSize={hardware_config['dwdp_size']}",
+                f"export dwdpCtxNodes={hardware_config['ctx_nodes']}",
                 f"export totalNodes={hardware_config['total_nodes']}",
                 f"export totalGpus={hardware_config['total_gpus']}",
                 f"export testOutputDir={test_output_dir}",

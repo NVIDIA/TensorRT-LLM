@@ -70,9 +70,10 @@ def test_worker_bootstrap_reuses_rank_workspace_and_releases_lock(
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(workspace)
     assert os.environ[_FLASHINFER_MANAGED_ENV] == "1"
     assert workspace.is_dir()
-    assert os.environ[_FLASHINFER_CUBIN_ENV] == str(
-        Path.home() / ".cache" / "flashinfer" / "cubins"
-    )
+    # The artifact cache must stay unpinned so FlashInfer derives it from the
+    # isolated workspace; a shared directory lets a peer's download replace a
+    # trtllm-gen export header mid-compilation.
+    assert _FLASHINFER_CUBIN_ENV not in os.environ
 
     with (workspace / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -113,6 +114,7 @@ def test_worker_bootstrap_replaces_inherited_managed_workspace(
     rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(tmp_path / f"rank-{rank}")
     assert os.environ[_FLASHINFER_MANAGED_ENV] == "1"
+    assert _FLASHINFER_CUBIN_ENV not in os.environ
 
 
 def test_worker_bootstrap_falls_back_when_isolation_fails(
@@ -196,27 +198,30 @@ def test_worker_bootstrap_warns_when_unlock_fails(
     assert "could not unlock the FlashInfer workspace" in capfd.readouterr().err
 
 
+_PLAIN_WORKER_ARGS = [
+    "-c",
+    mpi_session._WORKER_ENV_BOOTSTRAP + mpi_session._WORKER_SERVER_MAIN,
+]
+_ISOLATED_WORKER_ARGS = [
+    "-c",
+    mpi_session._WORKER_ENV_BOOTSTRAP + mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+    mpi_session._FLASHINFER_WORKSPACE_ROOT,
+]
+
+
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
-        (1, {}, None),
-        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, None),
-        (
-            4,
-            {},
-            [
-                "-c",
-                mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
-                mpi_session._FLASHINFER_WORKSPACE_ROOT,
-            ],
-        ),
-        (4, {_FLASHINFER_ISOLATION_ENV: "0"}, None),
+        (1, {}, _PLAIN_WORKER_ARGS),
+        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, _PLAIN_WORKER_ARGS),
+        (4, {}, _ISOLATED_WORKER_ARGS),
+        (4, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (
             4,
             {
                 _FLASHINFER_WORKSPACE_ENV: "/explicit",
             },
-            None,
+            _PLAIN_WORKER_ARGS,
         ),
     ],
 )
@@ -224,7 +229,7 @@ def test_mpi_pool_configures_worker_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
     n_workers: int,
     env_overrides: dict[str, str],
-    expected: list[str] | None,
+    expected: list[str],
 ) -> None:
     for name in (
         _FLASHINFER_WORKSPACE_ENV,
@@ -288,15 +293,7 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
-    expected_python_args = (
-        [
-            "-c",
-            mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
-            mpi_session._FLASHINFER_WORKSPACE_ROOT,
-        ]
-        if expect_bootstrap
-        else None
-    )
+    expected_python_args = _ISOLATED_WORKER_ARGS if expect_bootstrap else _PLAIN_WORKER_ARGS
     assert captured["python_args"] == expected_python_args
     env = captured["env"]
     assert isinstance(env, dict)
@@ -304,12 +301,21 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
     assert env.get(_FLASHINFER_MANAGED_ENV) == expected_marker
 
 
-def test_mpi_pool_shares_cubins_but_isolates_workspaces(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("explicit_cubin_dir", [False, True])
+def test_mpi_pool_isolates_workspaces_and_keeps_explicit_cubin_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_cubin_dir: bool, nested: bool
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
     monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
-    monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
+    monkeypatch.delenv(_FLASHINFER_CUBIN_ENV, raising=False)
+    monkeypatch.delenv(_FLASHINFER_MANAGED_ENV, raising=False)
+    if nested:
+        # A pool created inside a TRT-LLM-managed worker replaces the inherited slot.
+        monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, str(tmp_path / "parent-slot"))
+        monkeypatch.setenv(_FLASHINFER_MANAGED_ENV, "1")
+    if explicit_cubin_dir:
+        monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
     workspace_root = tmp_path / "workspaces"
     monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(workspace_root))
     session = mpi_session.MpiPoolSession(n_workers=2)
@@ -322,7 +328,10 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
     assert len(workspaces) == 2
     assert all(Path(workspace).is_dir() for workspace in workspaces)
     assert all(Path(workspace).parent == workspace_root for workspace in workspaces)
-    assert all(cubin == str(tmp_path / "cubins") for _, cubin in worker_envs)
+    # Unset means FlashInfer derives the artifact cache from each isolated
+    # workspace, so downloaded compiler inputs stay per-rank.
+    expected_cubin = str(tmp_path / "cubins") if explicit_cubin_dir else None
+    assert all(cubin == expected_cubin for _, cubin in worker_envs)
 
 
 def test_mpi_pool_propagates_explicit_workspace(

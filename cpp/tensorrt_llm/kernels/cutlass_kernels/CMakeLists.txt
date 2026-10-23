@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -160,9 +160,12 @@ endfunction()
 file(GLOB_RECURSE MIXED_SRC_CPP fpA_intB_gemm/*.cpp)
 file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
 
-# Get the sources for MOE Grouped GEMM launchers
-file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
-file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
+# Get the sources for MOE Grouped GEMM launchers. They live in the MoE domain
+# directory; the targets stay here, next to the CUTLASS instantiation generator
+# and the helpers (process_target, add_instantiations) they use.
+set(MOE_CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass)
+file(GLOB_RECURSE GROUPED_SRC_CPP ${MOE_CUTLASS_DIR}/*.cpp)
+file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 
 # Get the sources for FP8 Rowwise GEMM launchers
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
@@ -181,7 +184,6 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
@@ -239,7 +241,7 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+  file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
@@ -279,12 +281,19 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+else()
+  add_library(moe_host_src STATIC ${MOE_CUTLASS_DIR}/moe_kernels.cu)
+  target_compile_definitions(moe_host_src PRIVATE TLLM_MOE_NO_GEMM)
+  add_cuda_architectures(moe_host_src 89)
+  process_target(moe_host_src false false)
+  target_include_directories(
+    moe_host_src
+    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
 endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-  add_library(
-    ar_gemm_src STATIC
-    ${ARGEMM_SRC_CU} ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cu)
+  add_library(ar_gemm_src STATIC ${ARGEMM_SRC_CU})
+  target_link_libraries(ar_gemm_src PRIVATE ipc_nvls_memory_src)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
@@ -330,6 +339,10 @@ foreach(target_name ${TARGET_LIB})
 endforeach()
 
 list(APPEND ALL_KERNELS_LIB ${TARGET_LIB})
+
+if(NOT USING_OSS_CUTLASS_MOE_GEMM)
+  list(APPEND ALL_KERNELS_LIB moe_host_src)
+endif()
 
 add_custom_target(cutlass_kernels DEPENDS ${ALL_KERNELS_LIB})
 

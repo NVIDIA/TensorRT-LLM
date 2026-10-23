@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import ast
 import contextlib
 import copy
@@ -19,6 +33,11 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.nccl_window_graph import (
+    abandon_nccl_window_graph_owner, nccl_window_graph_capture,
+    release_nccl_window_graph_owner)
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -924,6 +943,7 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
+        self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1168,6 +1188,8 @@ class AutoTuner:
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
+            self._prime_cached_tactics(custom_op, runners, tuning_config,
+                                       inputs, **kwargs)
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1214,6 +1236,8 @@ class AutoTuner:
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
+        self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
+                                   **kwargs)
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occurred:
@@ -1237,7 +1261,85 @@ class AutoTuner:
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
 
+    def _prime_cached_tactics(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: List[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Compile cached winners in this process during tuning, not inference."""
+        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+            return
+        # Cache hits may differ across ranks; collective runners must stay
+        # inside lockstep profiling, including profiling scratch allocation.
+        if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
+            return
+        jit_classes = {
+            type(r)
+            for r in runners
+            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+        }
+        if not jit_classes:
+            return
+        for profile in self._optimization_profiles(tuning_config, inputs):
+            hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                profile.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            if not hit:
+                continue
+            runner = runners[runner_id]
+            if type(runner) not in jit_classes:
+                continue
+            key = (custom_op, type(runner).__name__, str(runner.unique_id()),
+                   str(tactic))
+            if key in self._primed_cached_tactics:
+                continue
+            tensors = self._prepare_input_tensors(profile, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = tuning_config.inputs_pre_hook(tensors)
+            try:
+                with nvtx_range(f"{custom_op} prime tactic {tactic}"):
+                    if "do_preparation" in inspect.signature(
+                            runner.forward).parameters:
+                        runner(tensors,
+                               tactic=-1,
+                               do_preparation=True,
+                               **kwargs)
+                    runner(tensors, tactic=tactic, **kwargs)
+                self._primed_cached_tactics.add(key)
+            except Exception as e:
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    pass
+                logger.warning(
+                    f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
+                    f"runner={type(runner).__name__}, tactic={tactic}, "
+                    f"shapes={profile.get_opt_shapes()}. Error: {e}")
+
     def _profile_runners(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        input_tensors: List[torch.Tensor],
+        profile: OptimizationProfile,
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> float:
+        with nccl_window_tensor_scope(input_tensors) as scope:
+            scope.escape(input_tensors)
+            if tuning_config.inputs_pre_hook is not None:
+                input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+            return self._profile_runners_impl(custom_op, runners, input_tensors,
+                                              profile, tuning_config, **kwargs)
+
+    def _profile_runners_impl(
         self,
         custom_op: str,
         runners: List[TunableRunner],
@@ -1256,10 +1358,6 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
-        # If the inputs_pre_hook is provided, it will be called before profiling.
-        if tuning_config.inputs_pre_hook is not None:
-            input_tensors = tuning_config.inputs_pre_hook(input_tensors)
-
         # Pre-walk the runners so we know the total candidate (runner, tactic)
         # pair count before deciding whether to short-circuit profiling. The
         # count is taken BEFORE distributed-strategy splitting; the PARALLEL
@@ -1301,7 +1399,8 @@ class AutoTuner:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
             try:
                 with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
-                    runner(input_tensors, tactic=tac, **kwargs)
+                    self._run_profile_runner(runner, input_tensors, tac,
+                                             **kwargs)
                 best_runner_id, best_tactic = runner_id, tac
                 # No comparable measurement exists; min_time stays 0.0 to
                 # distinguish "recorded without profiling" from a real
@@ -1321,6 +1420,17 @@ class AutoTuner:
                         tuning_config,
                         apply_map_to_tuning_buckets=False))
                 has_tuning_failure_occurred = True
+            # The shortcut's candidate is recorded like the timed path's, so a
+            # run's log lists every pair either way: 0.000 is the documented
+            # recorded-without-profiling marker, a failure shows as inf. Same
+            # placement rationale as the timed path: after the handler, so a
+            # formatting error is never recorded as a tactic failure.
+            self._debug_logger(
+                f"[Autotuner] Candidate: custom_op={custom_op}, "
+                f"runner={runner}, tactic={tac}, "
+                f"shapes={profile.get_opt_shapes()}, "
+                f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
+            )
         else:
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
@@ -1377,6 +1487,11 @@ class AutoTuner:
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
                         has_tuning_failure_occurred = True
+                    self._debug_logger(
+                        f"[Autotuner] Candidate: custom_op={custom_op}, "
+                        f"runner={runner}, tactic={tac}, "
+                        f"shapes={profile.get_opt_shapes()}, "
+                        f"time={time_measured:.3f}ms")
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
@@ -1393,7 +1508,7 @@ class AutoTuner:
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
             )
-            logger.debug(
+            self._debug_logger(
                 f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
                 f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
             )
@@ -1413,6 +1528,17 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    @staticmethod
+    def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
+                            tactic: Any, **kwargs) -> None:
+        with nccl_window_tensor_scope(inputs) as scope:
+            try:
+                runner(inputs, tactic=tactic, **kwargs)
+            finally:
+                # Profiling inputs outlive each candidate run; everything newly
+                # allocated by the runner is an internal, discarded result.
+                scope.escape(inputs)
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 
@@ -1461,6 +1587,24 @@ class AutoTuner:
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
             graph = torch.cuda.CUDAGraph()
 
+            @contextlib.contextmanager
+            def graph_pool_lifetime():
+                if not use_cuda_graph:
+                    yield None
+                    return
+                graph_pool = torch.cuda.graph_pool_handle()
+                completed = False
+                try:
+                    yield graph_pool
+                    completed = True
+                finally:
+                    graph.reset()
+                    if completed:
+                        release_nccl_window_graph_owner(graph_pool)
+                    else:
+                        # Local profiling failures need not occur on every rank.
+                        abandon_nccl_window_graph_owner(graph_pool)
+
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
                 end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
@@ -1488,14 +1632,15 @@ class AutoTuner:
                 def elapsed_time():
                     return start_evt.elapsed_time(end_evt)
 
-            with torch.cuda.stream(stream):
+            with graph_pool_lifetime() as graph_pool, torch.cuda.stream(stream):
                 if use_cuda_graph:
-                    with torch.cuda.graph(graph):
+                    with nccl_window_graph_capture(graph, graph_pool):
                         for r in range(repeat):
-                            runner(
+                            self._run_profile_runner(
+                                runner,
                                 input_tensor_batches[r %
                                                      len(input_tensor_batches)],
-                                tactic=tactic,
+                                tactic,
                                 **kwargs,
                             )
 
@@ -1516,9 +1661,10 @@ class AutoTuner:
                     graph.replay()
                 else:
                     for r in range(repeat):
-                        runner(
+                        self._run_profile_runner(
+                            runner,
                             input_tensor_batches[r % len(input_tensor_batches)],
-                            tactic=tactic,
+                            tactic,
                             **kwargs,
                         )
 
@@ -1529,7 +1675,8 @@ class AutoTuner:
 
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+            self._run_profile_runner(runner, input_tensor_batches[-1], tactic,
+                                     **kwargs)
 
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
@@ -1962,25 +2109,41 @@ class AutoTuner:
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )
 
+    def _tuning_group(self) -> Tuple[int, int]:
+        """Return ``(size, index)`` of this rank's tuning group.
+
+        The group is the TP group. Helix CP ranks run the same SPMD forward
+        on the same token batch, so Helix adds the CP ranks too. Otherwise a
+        Helix generation worker with ``tp_size == 1`` would profile every
+        tactic on every CP rank. The index matches the TP-major, CP-minor
+        order of ``Distributed.tp_cp_allgather``, which merges the results.
+        """
+        if self.mapping is None:
+            return 1, 0
+        size = self.mapping.tp_size
+        index = self.mapping.tp_rank
+        if self.mapping.has_cp_helix():
+            size *= self.mapping.cp_size
+            index = index * self.mapping.cp_size + self.mapping.cp_rank
+        return size, index
+
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
-        return self.mapping is not None and self.mapping.tp_size > 1 and self._dist is not None
+        return self._dist is not None and self._tuning_group()[0] > 1
 
     def _maybe_parallelize_tactics(
             self, all_valid_tactics: List[Any],
             strategy: DistributedTuningStrategy) -> List[Any]:
-        """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
+        """Split tactics across the tuning group if strategy is PARALLEL."""
         if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
         ):
-            # only distribute across TP ranks
-            # each TP rank will only tune the tactics that are assigned to it
-            tp_size = self.mapping.tp_size
-            tp_rank = self.mapping.tp_rank
-            valid_tactics = []
-            for idx, tactic in enumerate(all_valid_tactics):
-                if idx % tp_size == tp_rank:
-                    valid_tactics.append(tactic)
-            return valid_tactics
+            # Each rank of the tuning group only tunes its share of tactics;
+            # _merge_cache_data then keeps the fastest across the group.
+            group_size, group_index = self._tuning_group()
+            return [
+                tactic for idx, tactic in enumerate(all_valid_tactics)
+                if idx % group_size == group_index
+            ]
         else:
             return all_valid_tactics
 

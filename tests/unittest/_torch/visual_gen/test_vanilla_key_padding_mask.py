@@ -11,7 +11,7 @@ unpadded K/V. Single-rank, CPU.
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention_backend import VanillaAttention
+from tensorrt_llm._torch.visual_gen.attention.backends import VanillaAttention
 
 pytestmark = pytest.mark.cpu_only
 

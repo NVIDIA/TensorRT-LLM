@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the transformers AutoConfig / AutoTokenizer dispatch
-for TRT-LLM-only model_types (cosmos3, deepseek_v32, kimi_k2).
+for TRT-LLM-only model_types (cosmos3, deepseek_v32, kimi_k2, deepseek_v41).
 
 Before this registration, transformers >= 5.5 falls back to a bare
 PreTrainedConfig that lacks `max_position_embeddings`, and
@@ -13,12 +13,21 @@ regressions.
 """
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
-from tensorrt_llm._torch.configs import Cosmos3Config, DeepseekV3Config
+from tensorrt_llm._torch.configs import (
+    Cosmos3Config,
+    DeepseekV3Config,
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -56,6 +65,21 @@ def _deepseek_min_config(model_type: str) -> dict:
     }
 
 
+# DeepSeek-V4.1 nests its text tower, so `max_position_embeddings` lives one level down
+# and the shared assertion below reads it off the composite. That is deliberate: it makes
+# this test also cover the composite's attribute forwarding, which is the mechanism
+# `modeling_deepseekv4.py`'s `config.<field>` read sites depend on.
+_DEEPSEEK_V41_MIN_CONFIG = {
+    "architectures": ["DeepseekV41ForCausalLM"],
+    "model_type": "deepseek_v41",
+    "text_config": {
+        "model_type": "deepseek_v41_text",
+        "max_position_embeddings": 16384,
+    },
+    "vision_config": {"model_type": "deepseek_v41_vision"},
+}
+
+
 def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None:
     assert isinstance(cfg, config_cls)
     assert cfg.model_type == model_type
@@ -67,6 +91,14 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         assert cfg.text_config.max_position_embeddings == 8192
         assert cfg.vision_config.hidden_size == 256
         assert cfg.vision_config.out_hidden_size == 1024
+    elif model_type == "deepseek_v41":
+        assert not isinstance(cfg.text_config, dict)
+        assert not isinstance(cfg.vision_config, dict)
+        assert cfg.text_config.model_type == "deepseek_v41_text"
+        assert cfg.text_config.max_position_embeddings == 16384
+        # Read off the *composite*: the field only exists on the text tower, so this
+        # passes only if attribute forwarding is wired.
+        assert cfg.max_position_embeddings == 16384
     else:
         assert cfg.max_position_embeddings == 16384
 
@@ -78,6 +110,9 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         ("cosmos3_omni", Cosmos3Config),  # backward-compat alias
         ("deepseek_v32", DeepseekV3Config),
         ("kimi_k2", DeepseekV3Config),
+        # The composite is covered by from_pretrained below; check subtypes directly.
+        ("deepseek_v41_text", DeepseekV41TextConfig),
+        ("deepseek_v41_vision", DeepseekV41VisionConfig),
     ],
 )
 def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
@@ -93,6 +128,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
         ("cosmos3", Cosmos3Config, _COSMOS3_MIN_CONFIG),
         ("deepseek_v32", DeepseekV3Config, _deepseek_min_config("deepseek_v32")),
         ("kimi_k2", DeepseekV3Config, _deepseek_min_config("kimi_k2")),
+        ("deepseek_v41", DeepseekV41Config, _DEEPSEEK_V41_MIN_CONFIG),
     ],
 )
 def test_autoconfig_from_pretrained_resolves_to_local_config(
@@ -153,3 +189,218 @@ def test_load_hf_model_config_uses_autoconfig_dispatch(tmp_path, model_type):
     assert cfg is not None
     assert isinstance(cfg, DeepseekV3Config)
     assert cfg.max_position_embeddings == 16384
+
+
+# The published nvidia/NVIDIA-Nemotron-Nano-9B-v2 pattern: "-" marks MLP layers.
+_NEMOTRON_H_DENSE_PATTERN = "M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-"
+
+
+def _nemotron_h_min_config(pattern: str) -> dict:
+    return {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "hybrid_override_pattern": pattern,
+        "num_hidden_layers": len(pattern),
+        "hidden_size": 4480,
+        "intermediate_size": 15680,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "max_position_embeddings": 131072,
+        "vocab_size": 131072,
+        "ssm_state_size": 128,
+        "conv_kernel": 4,
+        "chunk_size": 128,
+        "n_groups": 8,
+        "mamba_num_heads": 128,
+        "mamba_head_dim": 80,
+        "rms_norm_eps": 1e-5,
+    }
+
+
+def _write_config(tmp_path, name: str, config_dict: dict) -> str:
+    model_dir = tmp_path / name
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(config_dict))
+    return str(model_dir)
+
+
+def test_nemotron_h_dense_pattern_survives_autoconfig(tmp_path):
+    # transformers 5.5.x NemotronHConfig converts hybrid_override_pattern to
+    # layers_block_type with a mapping that only knows "M"/"E"/"*", so every
+    # dense Nemotron-H checkpoint raises `KeyError: '-'` inside
+    # AutoConfig.from_pretrained (and therefore AutoTokenizer.from_pretrained).
+    # TRT-LLM builds the model by iterating hybrid_override_pattern, so the
+    # literal string has to survive config loading intact.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    model_dir = _write_config(
+        tmp_path, "nemotron_h_dense", _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    )
+
+    cfg = AutoConfig.from_pretrained(model_dir)
+
+    assert isinstance(cfg, NemotronHConfig)
+    assert cfg.hybrid_override_pattern == _NEMOTRON_H_DENSE_PATTERN
+    assert cfg.num_hidden_layers == len(_NEMOTRON_H_DENSE_PATTERN)
+    # Layer routing in modeling_nemotron_h / model_config counts these chars.
+    assert cfg.hybrid_override_pattern.count("*") == 4
+    assert cfg.hybrid_override_pattern.count("M") == 27
+    assert cfg.hybrid_override_pattern.count("-") == 25
+    assert cfg.layers_block_type.count("mlp") == 25
+    # Attributes modeling_nemotron_h reads off the pretrained config.
+    assert cfg.ssm_state_size == 128
+    assert cfg.mamba_head_dim == 80
+    assert cfg.rms_norm_eps == 1e-5
+    assert cfg.num_nextn_predict_layers == 0
+
+
+def test_nemotron_h_representable_pattern_uses_native_config(tmp_path):
+    # Patterns the installed transformers can express must keep loading through
+    # the native class, so this shim cannot regress checkpoints that work today.
+    from transformers.models.nemotron_h.configuration_nemotron_h import (
+        NemotronHConfig as HFNemotronHConfig,
+    )
+
+    model_dir = _write_config(tmp_path, "nemotron_h_moe", _nemotron_h_min_config("M*E" * 4))
+
+    cfg = AutoConfig.from_pretrained(model_dir)
+
+    assert type(cfg) is HFNemotronHConfig
+    assert cfg.hybrid_override_pattern == "M*E" * 4
+
+
+def test_nemotron_h_invalid_pattern_rejected():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    with pytest.raises(ValueError, match="hybrid_override_pattern"):
+        NemotronHConfig(
+            hybrid_override_pattern="M*XZ-",
+            layers_block_type=["mamba", "attention", "moe", "mlp", "mlp"],
+        )
+
+
+@pytest.mark.parametrize(
+    "layers_block_type",
+    [
+        ["moe", "moe", "moe"],
+        ["mamba"],
+    ],
+)
+def test_nemotron_h_pattern_overrides_explicit_block_types(layers_block_type):
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    config = NemotronHConfig(hybrid_override_pattern="M-*", layers_block_type=layers_block_type)
+
+    assert config.layers_block_type == ["mamba", "mlp", "attention"]
+    assert len(config.layers_block_type) == config.num_hidden_layers
+
+
+def test_nemotron_h_mtp_pattern_follows_block_types():
+    # speculative/utils.py overlays a draft checkpoint's mtp_layers_block_type
+    # onto the target config; the pattern modeling_nemotron_h builds MTP layers
+    # from must follow it, as it does on the native config.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    config = NemotronHConfig(hybrid_override_pattern="M-*", mtp_hybrid_override_pattern="*E*")
+    assert config.mtp_layers_block_type == ["attention", "moe", "attention"]
+
+    # An explicit pattern wins over a block-type list left at its default.
+    config = NemotronHConfig(
+        hybrid_override_pattern="M-*",
+        mtp_hybrid_override_pattern="*E*",
+        mtp_layers_block_type=["attention", "moe"],
+    )
+    assert config.mtp_hybrid_override_pattern == "*E*"
+
+    config.mtp_layers_block_type = ["moe"]
+    assert config.mtp_hybrid_override_pattern == "E"
+    with pytest.raises(AttributeError):
+        config.mtp_hybrid_override_pattern = "*E"
+
+
+def test_nemotron_h_keeps_use_cache():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    assert NemotronHConfig(hybrid_override_pattern="-").use_cache is True
+    assert NemotronHConfig(hybrid_override_pattern="-", use_cache=False).use_cache is False
+
+
+def test_nemotron_h_block_types_only_dense_checkpoint(tmp_path):
+    # transformers >= 5.13 re-saves only layers_block_type; "mlp" entries there
+    # are as unrepresentable natively as "-" in the pattern.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    config_dict = _nemotron_h_min_config("M-M*")
+    del config_dict["hybrid_override_pattern"]
+    config_dict["layers_block_type"] = ["mamba", "mlp", "mamba", "attention"]
+
+    cfg = AutoConfig.from_pretrained(_write_config(tmp_path, "nemotron_h_list", config_dict))
+
+    assert isinstance(cfg, NemotronHConfig)
+    assert cfg.hybrid_override_pattern == "M-M*"
+
+
+def test_nemotron_h_missing_pattern_rejected():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    with pytest.raises(ValueError, match="hybrid_override_pattern"):
+        NemotronHConfig(hybrid_override_pattern=None)
+
+
+def test_nemotron_h_invalid_block_type_rejected():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    with pytest.raises(ValueError, match="layers_block_type"):
+        NemotronHConfig(hybrid_override_pattern=None, layers_block_type=["unknown"])
+
+
+def test_transformers_tokenizer_registers_dense_nemotron_h_in_clean_process(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    config_dict = _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    config_dict["tokenizer_class"] = "PreTrainedTokenizerFast"
+    model_dir = Path(_write_config(tmp_path, "nemotron_h_tokenizer", config_dict))
+
+    backend = Tokenizer(WordLevel({"<unk>": 0, "hello": 1}, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    backend.save(str(model_dir / "tokenizer.json"))
+
+    script = """
+import sys
+
+from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer
+
+assert "tensorrt_llm._torch.configs" not in sys.modules
+tokenizer = TransformersTokenizer.from_pretrained(sys.argv[1])
+assert tokenizer.encode("hello") == [1]
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(model_dir)],
+        # Do not put the source checkout first on sys.path: CPU L0 runs this
+        # test against the built wheel, while the checkout has no compiled
+        # tensorrt_llm.bindings extension for a fresh interpreter to import.
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_load_hf_model_config_handles_dense_nemotron_h(tmp_path):
+    # ModelLoader.load_hf_model_config swallows exceptions and returns None,
+    # which is how the KeyError surfaced as a confusing downstream failure.
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    model_dir = _write_config(
+        tmp_path, "nemotron_h_loader", _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    )
+
+    cfg = ModelLoader.load_hf_model_config(model_dir)
+
+    assert cfg is not None
+    assert cfg.hybrid_override_pattern == _NEMOTRON_H_DENSE_PATTERN

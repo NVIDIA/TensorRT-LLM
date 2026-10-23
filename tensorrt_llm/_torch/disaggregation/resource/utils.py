@@ -118,6 +118,18 @@ def get_pool_view_num_layers(pool_view: PoolView) -> int:
     return len(get_unique_layers(pool_view))
 
 
+def get_pool_view_slot_bytes(pool_view: PoolView) -> int:
+    """Transferable bytes of *pool_view* within one physical slot.
+
+    Sum of the view's buffer-entry sizes: exactly the byte regions the
+    mappers move for this view, per slot. This is smaller than the physical
+    pool's ``slot_bytes`` whenever the slot also holds other role classes
+    (coalesced pools carry one view per class) or local-only ignored-role
+    buffers (which occupy slot offsets but appear in no view).
+    """
+    return int(pool_view.buffer_entries["size"].sum())
+
+
 def get_pool_view_global_layer_ids(pool_view: PoolView, layer_group: "LayerGroup") -> List[int]:
     """
     Global layer IDs for the layers that appear in *pool_view*, ordered by their
@@ -235,34 +247,22 @@ def get_unique_pool_memory_descs(
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if lg.kind == CacheKind.STATE:
             assert isinstance(lg, MambaLayerGroup)
-            if lg.slot_major_layout:
-                # MambaHybridCacheManagerV2: roles may share one allocation
-                # (interleaved, equal sizes) or be separate (unequal sizes).
-                # Process lowest-base first so the covering region registers
-                # before higher-offset roles that fall inside it.
-                pools = sorted(
-                    (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
-                    key=lambda p: p.base_address,
-                )
-                for pool in pools:
-                    pool_size = pool.num_slots * pool.slot_stride_bytes
-                    if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
-                        continue
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
-            else:
-                # Layer-major (MambaHybridCacheManager): each role is a separate
-                # allocation. Register each: size = num_layers * layer_stride.
-                for pv in lg.pool_views:
-                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                    num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
-                    pool_size = num_layers * pool.layer_stride_bytes
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
+            # MambaHybridCacheManagerV2: roles may share one allocation
+            # (interleaved, equal sizes) or be separate (unequal sizes).
+            # Process lowest-base first so the covering region registers
+            # before higher-offset roles that fall inside it.
+            pools = sorted(
+                (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
+                key=lambda p: p.base_address,
+            )
+            for pool in pools:
+                pool_size = pool.num_slots * pool.slot_stride_bytes
+                if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
+                    continue
+                pool_key = (pool.base_address, pool_size)
+                if pool_key not in unique_pools:
+                    unique_pools[pool_key] = pool_counter
+                    pool_counter += 1
         else:
             # PAGED (attention): each pool view is an independent allocation
             for pv in lg.pool_views:

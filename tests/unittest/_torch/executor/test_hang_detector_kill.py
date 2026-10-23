@@ -35,6 +35,8 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import (
     start_rank_crash_kill_watchdog,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_detector_fires_after_timeout():
     fired = []
@@ -194,7 +196,8 @@ def test_status_provider_errors_are_logged(monkeypatch):
     messages = "\n".join(message for kind, message in events if kind == "log")
     assert "provider failed" in messages
     assert "transceiver status" in messages
-    assert events[-2:] == [("stacks", None), ("detected", None)]
+    assert events[1] == ("stacks", None)
+    assert events[-1] == ("detected", None)
 
 
 def test_propagate_hard_kill_self_sigkills_without_mpi():

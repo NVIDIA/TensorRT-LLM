@@ -3,11 +3,11 @@
 
 import asyncio
 import base64
-import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import (Any, Collection, Coroutine, Dict, List, Optional, Tuple,
+                    TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -18,19 +18,20 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs.chat_template_guard import \
+    validate_chat_template_kwargs
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
-from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY,
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
+                                          _decode_base64_with_limit,
                                           _get_aiohttp_session,
                                           _load_and_convert_image,
-                                          _load_video_by_cv2,
                                           _normalize_file_uri,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
-from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
-                                            default_hasher)
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
@@ -40,6 +41,7 @@ from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -132,8 +134,7 @@ def load_base64_video(video: str) -> BytesIO:
         msg = "Only base64 data URLs are supported for now."
         raise NotImplementedError(msg)
 
-    content = base64.b64decode(data)
-    return content
+    return _decode_base64_with_limit(data)
 
 
 def load_video(video: str,
@@ -142,38 +143,31 @@ def load_video(video: str,
                format: str = "pt",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
+    """Load video frames with the shared source-byte cache identity.
+
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
+    """
+    # Decode through `VideoMediaIO`, the loader `trtllm-serve` uses, so the
+    # same video gets the same source-byte anchor (`raw_bytes_hash`) and
+    # therefore the same multimodal hash offline and in serving.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(video, stream=False)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix=".mp4") as tmp_file:
-            tmp_file.write(resp.content)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(resp.content)
     elif parsed_url.scheme in ("", "file"):
-        return _load_video_by_cv2(video,
-                                  num_frames,
-                                  fps,
-                                  format,
-                                  device,
-                                  extract_audio=extract_audio)
+        try:
+            return video_io.load_file(video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix='.mp4') as tmp_file:
-            tmp_file.write(decoded_video)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(load_base64_video(video))
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -184,36 +178,33 @@ async def async_load_video(video: str,
                            format: str = "pt",
                            device: str = "cpu",
                            extract_audio: bool = False) -> VideoData:
+    """Load video frames without blocking the event loop.
+
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
+    """
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
+    # See `load_video`: share the serving decode path so hashes agree.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
-
-    def _load_from_bytes(data: bytes) -> VideoData:
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
-            tmp.write(data)
-            tmp.flush()
-            return _load_video_by_cv2(tmp.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
-
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
         video_data = await _safe_aiohttp_get(video, session=session)
-        return await asyncio.to_thread(_load_from_bytes, video_data)
+        return await asyncio.to_thread(video_io.load_bytes, video_data)
     elif parsed_url.scheme == "data":
         decoded_video = await asyncio.to_thread(load_base64_video, video)
-        return await asyncio.to_thread(_load_from_bytes, decoded_video)
+        return await asyncio.to_thread(video_io.load_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
-        return await asyncio.to_thread(_load_video_by_cv2,
-                                       video,
-                                       num_frames,
-                                       fps,
-                                       format,
-                                       device,
-                                       extract_audio=extract_audio)
+        try:
+            return await asyncio.to_thread(video_io.load_file, video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
@@ -648,6 +639,9 @@ def resolve_hf_chat_template(
 
     # 1. If chat_template is not None, return it
     if chat_template is not None:
+        templates = getattr(tokenizer, "chat_template", None)
+        if isinstance(templates, dict) and chat_template in templates:
+            return templates[chat_template]
         return chat_template
 
     # 2. If tool is not provided, use the processor's default chat template
@@ -738,8 +732,13 @@ def apply_chat_template(
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
+    injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template to the conversation.
+
+    `injected_chat_template_kwargs` names the keys of `chat_template_kwargs`
+    the server derived from API-level fields rather than the caller; the
+    unused-kwargs guard exempts them (see `validate_chat_template_kwargs`).
 
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
@@ -748,8 +747,25 @@ def apply_chat_template(
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
+    if isinstance(tokenizer, DeepseekV41Tokenizer):
+        # The native renderer deep-copies messages; omit pending media coroutines
+        # and retain flattened content with its interleaved image placeholders.
+        messages = [{
+            key: value
+            for key, value in message.items()
+            if key not in ("media", "content_parts")
+        } for message in conversation]
+        native_kwargs = dict(chat_template_kwargs or {})
+        native_kwargs.update(tokenize=enable_tokenize,
+                             add_generation_prompt=add_generation_prompt)
+        return tokenizer.apply_chat_template(messages=messages,
+                                             tools=tools,
+                                             **native_kwargs)
+
     # Handle DeepSeek tokenizers with custom chat templates.
-    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
+    if isinstance(
+            tokenizer,
+        (DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,
@@ -790,6 +806,10 @@ def apply_chat_template(
         raise ValueError(
             "No chat template found for the given tokenizer and tools.")
 
+    validate_chat_template_kwargs(hf_chat_template,
+                                  chat_template_kwargs,
+                                  injected_keys=injected_chat_template_kwargs)
+
     # Determine content format and prepare conversation accordingly
     content_format = _resolve_content_format(model_type, hf_chat_template)
 
@@ -829,6 +849,7 @@ async def async_apply_chat_template(
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
+    injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template without blocking the event loop."""
     return await asyncio.to_thread(
@@ -844,6 +865,7 @@ async def async_apply_chat_template(
         chat_template=chat_template,
         chat_template_kwargs=chat_template_kwargs,
         enable_tokenize=enable_tokenize,
+        injected_chat_template_kwargs=injected_chat_template_kwargs,
     )
 
 
@@ -1164,14 +1186,3 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
-
-
-def get_cache_salt_id(cache_salt: str) -> int:
-    b = cache_salt.encode("utf-8")
-    h = default_hasher(b).digest(length=8)
-    cache_salt_id = int.from_bytes(h, "little", signed=False)
-    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
-        raise ValueError(
-            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
-
-    return cache_salt_id

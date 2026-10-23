@@ -298,6 +298,33 @@ def test_clean_wipes_checkpoint_and_managed_files(tmp_path):
         workflow.close()
 
 
+def test_clean_wipes_concurrent_graph_state_and_node_workspaces(tmp_path):
+    """``--clean`` also removes concurrent-mode state so a rerun re-plans from scratch.
+
+    Regression: ``--clean`` previously wiped only the linear managed files, leaving
+    ``.graph_state.json`` (the NodeScheduler checkpoint) and ``nodes/`` (per-node
+    sub-workspaces) behind — so a ``--clean --concurrent`` rerun silently resumed the
+    prior (possibly crashed) graph instead of starting over.
+    """
+    module = _load_module()
+    (tmp_path / ".graph_state.json").write_text(
+        '{"version": 1, "states": {"s1": "running"}}\n', encoding="utf-8"
+    )
+    node_dir = tmp_path / "nodes" / "s1.g1"
+    node_dir.mkdir(parents=True)
+    (node_dir / "progress.yaml").write_text("- iteration: 3\n", encoding="utf-8")
+
+    workflow = _make_workflow(module, tmp_path, clean=True)
+    try:
+        assert workflow.resume is False
+        # The concurrent scheduler checkpoint is gone (no stale resume).
+        assert not (tmp_path / ".graph_state.json").exists()
+        # Per-node sub-workspaces are gone.
+        assert not (tmp_path / "nodes").exists()
+    finally:
+        workflow.close()
+
+
 def test_clean_on_empty_workspace_is_a_noop(tmp_path):
     """``--clean`` against an empty workspace just starts fresh, no error."""
     module = _load_module()
@@ -765,6 +792,27 @@ def test_clean_cli_flag_default_and_value(tmp_path):
     assert args.clean is False
     args = module._parse_args(_TASK_CLI + ["--clean"])
     assert args.clean is True
+
+
+def test_max_replan_rounds_default_and_custom(tmp_path):
+    """``max_replan_rounds`` defaults to 3 and stores a custom value."""
+    module = _load_module()
+    ws_a, ws_b = tmp_path / "a", tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    wf = module.AgentTeamWorkflow(workspace=ws_a)
+    assert wf.max_replan_rounds == 3
+    wf = module.AgentTeamWorkflow(workspace=ws_b, max_replan_rounds=5)
+    assert wf.max_replan_rounds == 5
+
+
+def test_max_replan_rounds_cli_flag_default_and_value():
+    """``--max-replan-rounds`` parses to 3 by default and to the supplied int."""
+    module = _load_cli_module()
+    args = module._parse_args(_TASK_CLI)
+    assert args.max_replan_rounds == 3
+    args = module._parse_args(_TASK_CLI + ["--max-replan-rounds", "5"])
+    assert args.max_replan_rounds == 5
 
 
 def test_feedback_cli_flag_default_and_value():
@@ -1707,48 +1755,23 @@ def test_every_registered_tool_is_documented_in_the_role_prompt(tmp_path):
 
 
 def test_coder_and_reviewer_required_tools_include_status_update(tmp_path):
-    """The composed Stop hook must enforce both progress and status calls."""
+    """Every role declares all required calls, including Codex-backed roles."""
     module = _load_module()
     workflow = _make_workflow(module, tmp_path)
     try:
-        # Each per-tool hook is a separate matcher; with two required tools
-        # we expect two matchers stacked together (composition = AND).
-        coder_hooks = workflow.coder.config.backend.hooks
-        reviewer_hooks = workflow.reviewer.config.backend.hooks
-        plan_drafter_hooks = workflow.plan_drafter.config.backend.hooks
-        plan_reviewer_hooks = workflow.plan_reviewer.config.backend.hooks
-        qa_hooks = workflow.qa.config.backend.hooks
-
-        assert coder_hooks is not None
-        assert len(coder_hooks["Stop"]) == 2
-        assert reviewer_hooks is not None
-        assert len(reviewer_hooks["Stop"]) == 2
-
-        # PlanDrafter, PlanReviewer, and QA each have a single required
-        # tool — one matcher.
-        assert plan_drafter_hooks is not None
-        assert len(plan_drafter_hooks["Stop"]) == 1
-        assert plan_reviewer_hooks is not None
-        assert len(plan_reviewer_hooks["Stop"]) == 1
-        assert qa_hooks is not None
-        assert len(qa_hooks["Stop"]) == 1
+        expected = {
+            "coder": ("append_coder_progress", "update_status"),
+            "reviewer": ("append_reviewer_progress", "update_status"),
+            "plan_drafter": ("append_plan_drafter_progress",),
+            "plan_reviewer": ("append_plan_reviewer_progress",),
+            "qa": ("append_qa_progress",),
+        }
+        for role, names in expected.items():
+            config = getattr(workflow, role).config
+            assert config.required_tools == names
+            assert config.backend.hooks is None
     finally:
         workflow.close()
-
-
-def test_compose_required_tools_hooks_handles_empty_and_single(tmp_path):
-    """Helper returns ``None`` for empty and one matcher for a single tool."""
-    module = _load_module()
-
-    assert module._compose_required_tools_hooks([]) is None
-
-    single = module._compose_required_tools_hooks(["append_plan_drafter_progress"])
-    assert single is not None
-    assert len(single["Stop"]) == 1
-
-    pair = module._compose_required_tools_hooks(["append_coder_progress", "update_status"])
-    assert pair is not None
-    assert len(pair["Stop"]) == 2
 
 
 def test_qa_uses_stateless_session(tmp_path):
@@ -2306,6 +2329,7 @@ def test_resume_from_qa_skips_coder_and_reviewer(tmp_path):
     assert state.done is True
 
 
+@pytest.mark.live_backend
 def test_claude_agents_baseline_context_under_20_percent(tmp_path):
     """Each Claude-backed team agent's pre-input context must stay < 20%.
 
@@ -3334,6 +3358,7 @@ def test_no_mcp_mode_builds_agents_without_tools(tmp_path):
         for agent in (wf.plan_drafter, wf.plan_reviewer, wf.coder, wf.reviewer, wf.qa):
             assert agent.config.backend.tools is None
             assert agent.config.backend.hooks is None
+            assert agent.config.required_tools == ()
             assert agent.config.human_input_enabled is False
         # The backend split itself is untouched: only the tools are dropped.
         assert wf.plan_drafter.config.backend.kind == "codex"
@@ -3349,7 +3374,7 @@ def test_mcp_mode_is_the_default_and_keeps_tools(tmp_path):
     try:
         assert wf.use_in_process_tools is True
         assert wf.plan_drafter.config.backend.tools is not None
-        assert wf.plan_drafter.config.backend.hooks is not None
+        assert wf.plan_drafter.config.required_tools == ("append_plan_drafter_progress",)
         assert wf.plan_drafter.config.human_input_enabled is True
     finally:
         wf.close()
@@ -3364,8 +3389,10 @@ def test_no_mcp_mode_resets_rebuild_agents_without_tools(tmp_path):
         wf._reset_reviewer()
         assert wf.coder.config.backend.tools is None
         assert wf.coder.config.backend.hooks is None
+        assert wf.coder.config.required_tools == ()
         assert wf.reviewer.config.backend.tools is None
         assert wf.reviewer.config.backend.hooks is None
+        assert wf.reviewer.config.required_tools == ()
     finally:
         wf.close()
 

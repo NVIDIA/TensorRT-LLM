@@ -1,5 +1,20 @@
-"""Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Test KV Transfer with KVCacheManagerV2."""
 
+import ast
 import os
 import random
 import time
@@ -21,6 +36,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -30,7 +46,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
-import tensorrt_llm.bindings.executor as trtllm
 
 try:
     import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
@@ -39,25 +54,18 @@ except ImportError as e:
 else:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import (
-    KVSlice,
-    LayerRange,
-    SessionStatus,
-    TokenRange,
-    WaitResult,
-)
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings import LayerType as LayerTypeCpp
-from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -82,7 +90,7 @@ class KvCacheConfigV2:
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
 
@@ -97,6 +105,73 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+
+
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parents[2]
+
+# Every KvCacheConfigV2 stub in the repo: the duck-typed stand-ins handed to
+# KVCacheManagerV2 in place of the real pydantic KvCacheConfig. The example
+# driver lives outside the test tree and may be absent from a tests-only
+# checkout, hence the existence check in the test body.
+_CTT_EXAMPLE_DIR = _REPO_ROOT / "examples/disaggregated/slurm/cache_transceiver_test"
+_KV_CACHE_CONFIG_V2_STUBS = (
+    _THIS_DIR / "test_kv_transfer.py",
+    _THIS_DIR / "test_cache_transceiver_single_process.py",
+    _CTT_EXAMPLE_DIR / "run_cache_transceiver_test.py",
+)
+
+
+def _config_attrs_read_by_manager() -> set:
+    """Return the ``kv_cache_config.<attr>`` names KVCacheManagerV2 reads.
+
+    Parsed from the source rather than from the real ``KvCacheConfig`` because
+    the stubs only have to cover what the manager actually touches, not the
+    full (and much larger) public config surface.
+    """
+    source = Path(kv_cache_manager_v2.__file__).read_text()
+    return {
+        node.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "kv_cache_config"
+    }
+
+
+def _stub_fields(path: Path) -> set:
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == "KvCacheConfigV2":
+            return {stmt.target.id for stmt in node.body if isinstance(stmt, ast.AnnAssign)}
+    raise AssertionError(f"no KvCacheConfigV2 class found in {path}")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("stub_path", _KV_CACHE_CONFIG_V2_STUBS, ids=lambda p: p.name)
+def test_kv_cache_config_v2_stub_covers_manager_reads(stub_path: Path):
+    """Guard the duck-typed KvCacheConfigV2 stubs against config drift.
+
+    KVCacheManagerV2 reads its settings straight off the config object, so a
+    field added to the real ``KvCacheConfig`` and consumed by
+    ``_build_base_config()`` turns into an ``AttributeError`` at manager
+    construction time for every caller passing one of these stubs. That has
+    now bitten repeatedly (``kv_cache_event_hash_algo``, ``pool_ratio``,
+    ``kv_pool_rebalance_*``), each time as a wave of red disaggregated tests
+    rather than as an obvious config error, so check the coverage directly.
+    """
+    if not stub_path.exists():
+        pytest.skip(f"{stub_path} not present in this checkout")
+
+    missing = sorted(_config_attrs_read_by_manager() - _stub_fields(stub_path))
+    assert not missing, (
+        f"{stub_path.relative_to(_REPO_ROOT)}: KvCacheConfigV2 is missing {missing}, "
+        "which KVCacheManagerV2 reads off kv_cache_config. Add the field(s) with the "
+        "same default as tensorrt_llm.llmapi.llm_args.KvCacheConfig."
+    )
 
 
 @pytest.mark.cpu_only
@@ -128,48 +203,25 @@ def test_token_range_invalid_start_gt_end():
 
 
 @pytest.mark.cpu_only
-def test_layer_range_valid():
-    lr = LayerRange(start=0, end=32)
-    assert lr.start == 0
-    assert lr.end == 32
-
-
-@pytest.mark.cpu_only
-def test_layer_range_invalid_negative():
-    with pytest.raises(ValueError, match="non-negative"):
-        LayerRange(start=-1, end=5)
-    with pytest.raises(ValueError, match="non-negative"):
-        LayerRange(start=0, end=-1)
-
-
-@pytest.mark.cpu_only
-def test_layer_range_invalid_start_ge_end():
-    with pytest.raises(ValueError, match="Invalid range"):
-        LayerRange(start=5, end=5)
-    with pytest.raises(ValueError, match="Invalid range"):
-        LayerRange(start=10, end=3)
-
-
-@pytest.mark.cpu_only
-def test_kv_slice_construction():
-    lr = LayerRange(0, 32)
-    s = KVSlice(
-        layer_range=lr,
+def test_chunk_construction():
+    c = Chunk(
         block_ids_per_layer_groups=[[1, 2, 3]],
-        is_last_slice=True,
+        kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=3),
+        is_last=True,
     )
-    assert s.layer_range == lr
-    assert s.block_ids_per_layer_groups == [[1, 2, 3]]
-    assert s.is_last_slice is True
-    assert s.token_range == TokenRange(start=0, end=3)
+    assert c.block_ids_per_layer_groups == [[1, 2, 3]]
+    assert c.kind_per_layer_group == [CacheKind.PAGED]
+    assert c.token_range == TokenRange(start=0, end=3)
+    assert c.is_last is True
 
-    # Test defaults
-    s2 = KVSlice()
-    assert s2.layer_range is None
-    assert s2.block_ids_per_layer_groups == []
-    assert s2.is_last_slice is False
-    assert s2.token_range is None
+    # Everything a reader cannot recompute has to be stated.
+    with pytest.raises(TypeError):
+        Chunk(
+            block_ids_per_layer_groups=[],
+            kind_per_layer_group=[],
+            token_range=TokenRange(start=0, end=0),
+        )
 
 
 @pytest.mark.cpu_only
@@ -178,20 +230,25 @@ def test_session_status_enum():
         "INIT",
         "READY",
         "TRANSFERRING",
-        "KV_TRANSFERRED",
-        "FULLY_TRANSFERRED",
+        "TRANSFERRED",
         "ERROR",
         "CANCELLED",
     ]
     for name in expected:
         assert hasattr(SessionStatus, name)
         assert SessionStatus[name].value == name
-    assert len(SessionStatus) == 7
+    assert len(SessionStatus) == 6
 
 
 # ---------------------------------------------------------------------------
 # Pipelined prefill chunk creation tests
 # ---------------------------------------------------------------------------
+
+
+def _valid(table) -> np.ndarray:
+    """Slots a positional block table actually holds (drops the -1 holes)."""
+    table = np.asarray(table, dtype=np.int64)
+    return table[table >= 0]
 
 
 def _send_prefill_chunks(
@@ -205,12 +262,17 @@ def _send_prefill_chunks(
     """Build and optionally send slices through the real prefill-chunk path."""
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
-    base_slice = KVSlice(block_ids_per_layer_groups=all_block_ids)
+    whole = Chunk(
+        block_ids_per_layer_groups=all_block_ids,
+        kind_per_layer_group=[CacheKind.PAGED] * len(all_block_ids),
+        token_range=TokenRange(start=0, end=total_blocks * tokens_per_block),
+        is_last=True,
+    )
     session = sender_session if sender_session is not None else MagicMock()
     session.kv_tasks = []
     transceiver = MagicMock()
     transceiver._get_or_create_send_session.return_value = session
-    transceiver._create_kv_slice = MagicMock(return_value=base_slice)
+    transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
@@ -254,7 +316,8 @@ def _send_prefill_chunks(
         is_last_chunk = idx == len(chunk_bounds) - 1
         req.py_last_context_chunk = (chunk_start_pos, chunk_end_pos)
         req.context_remaining_length = 0 if is_last_chunk else prompt_len - chunk_end_pos
-        kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+        extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
+        kv_slice = None if extent is None else extent.local
         if kv_slice is None:
             continue
         slices.append(kv_slice)
@@ -280,9 +343,12 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     transceiver._page_table.layer_groups = [SimpleNamespace(sliding_window_size=None)]
     transceiver._send_reqs = {}
     # A full-attention group keeps the whole prompt resident from block 0, so
-    # _create_kv_slice describes every block regardless of prefill progress.
-    transceiver._create_kv_slice.return_value = KVSlice(
-        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)]
+    # _describe_local describes every block regardless of prefill progress.
+    transceiver._describe_local.return_value = Chunk(
+        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=prompt_blocks * tokens_per_block),
+        is_last=True,
     )
 
     req = MagicMock()
@@ -301,12 +367,13 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
         )
         req.context_remaining_length = req.prompt_len - req.py_last_context_chunk[1]
 
-        kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+        extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
 
-        assert np.array_equal(
-            kv_slice.block_ids_per_layer_groups[0],
-            np.arange(chunk_start, chunk_end, dtype=np.int64),
-        )
+        kv_slice = None if extent is None else extent.local
+
+        expected = np.full(prompt_blocks, -1, dtype=np.int64)
+        expected[chunk_start:chunk_end] = np.arange(chunk_start, chunk_end)
+        assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
         assert kv_slice.token_range == TokenRange(
             start=chunk_start * tokens_per_block, end=chunk_end * tokens_per_block
         )
@@ -318,7 +385,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
         np.arange(16, dtype=np.int64),
         np.arange(9, 13, dtype=np.int64),
     ],
-    ids=["v1_full_prompt_allocation", "v2_incremental_allocation"],
+    ids=["full_prompt_allocation", "v2_incremental_allocation"],
 )
 def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     """A partial SWA chunk is deferred for both cache-manager allocation strategies."""
@@ -329,11 +396,16 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     layer_group = SimpleNamespace(
         kind=CacheKind.PAGED, sliding_window_size=window_blocks * tokens_per_block
     )
+
+    def _unexpected_get_block_ids(req, idx, lg):
+        raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
+
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
-        get_block_ids=lambda req, idx, lg: source_block_ids,
+        get_block_ids=_unexpected_get_block_ids,
+        get_block_ordinals=lambda req, idx, lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
     transceiver._kv_cache_manager = SimpleNamespace(
@@ -351,8 +423,12 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     req.py_last_context_chunk = (11 * tokens_per_block, 13 * tokens_per_block)
     req.context_remaining_length = 3 * tokens_per_block
     req.is_generation_only_request = False
+    req.py_csa2_remote_tail_start = None
+    req.py_csa2_remote_tail_split = None
 
-    kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+    extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
+
+    kv_slice = None if extent is None else extent.local
 
     assert kv_slice is None
 
@@ -372,10 +448,10 @@ def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks, expected_nu
     """Pipelined prefill chunking produces the expected number of slices."""
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks)
     assert len(slices) == expected_num_slices
-    assert slices[-1].is_last_slice is True
+    assert slices[-1].is_last is True
     if expected_num_slices > 1:
         for s in slices[:-1]:
-            assert s.is_last_slice is False
+            assert s.is_last is False
 
 
 @pytest.mark.parametrize("prepopulated_blocks", [0, 1, 5], ids=["no_reuse", "reuse_1", "reuse_5"])
@@ -390,7 +466,7 @@ def test_send_prefill_chunks_integrity_check(prepopulated_blocks):
     for lg_idx, original in enumerate(all_block_ids):
         reassembled = []
         for s in slices:
-            reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
+            reassembled.extend(_valid(s.block_ids_per_layer_groups[lg_idx]).tolist())
         assert reassembled == original
 
 
@@ -408,8 +484,8 @@ def test_send_prefill_chunks_unaligned_boundary_splits_on_a_block():
         TokenRange(start=0, end=4 * tokens_per_block),
         TokenRange(start=4 * tokens_per_block, end=8 * tokens_per_block),
     ]
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.arange(4))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.arange(4, 8))
+    assert np.array_equal(_valid(slices[0].block_ids_per_layer_groups[0]), np.arange(4))
+    assert np.array_equal(_valid(slices[1].block_ids_per_layer_groups[0]), np.arange(4, 8))
 
 
 def test_send_prefill_chunks_multiple_layer_groups():
@@ -417,10 +493,15 @@ def test_send_prefill_chunks_multiple_layer_groups():
     all_block_ids = [list(range(8)), list(range(100, 108))]
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([100, 101, 102, 103]))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([104, 105, 106, 107]))
+    # Positional tables: the chunk keeps its own ordinals and blanks the rest.
+    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], [0, 1, 2, 3, -1, -1, -1, -1])
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], [-1, -1, -1, -1, 4, 5, 6, 7])
+    assert np.array_equal(
+        slices[0].block_ids_per_layer_groups[1], [100, 101, 102, 103, -1, -1, -1, -1]
+    )
+    assert np.array_equal(
+        slices[1].block_ids_per_layer_groups[1], [-1, -1, -1, -1, 104, 105, 106, 107]
+    )
     # Default tokens_per_block is 1, so the token range doubles as block coords.
     assert slices[0].token_range == TokenRange(start=0, end=4)
     assert slices[1].token_range == TokenRange(start=4, end=8)
@@ -434,13 +515,13 @@ def create_transfer_worker_setup(
     gen_pp: int,
     gen_enable_dp: bool,
     is_mla: bool = False,
-    use_v2: bool = False,
+    use_v2: bool = True,
     max_attention_window_vec: Optional[List[int]] = None,
 ):
     """Helper function to set up transfer workers for testing.
 
     Args:
-        use_v2: If True, use KVCacheManagerV2. Otherwise use KVCacheManager (C++ bindings).
+        use_v2: Use KVCacheManagerV2 for Python KV transfers.
         max_attention_window_vec: List of window sizes, e.g. [max_seq_len] or [max_seq_len, small_window].
     """
     ctx_mappings = []
@@ -485,8 +566,14 @@ def create_transfer_worker_setup(
     ctx_transfer_workers = []
     ctx_kv_cache_managers = []
     device_id = 0
-    ctx_instance_name = "ctx_instance"
-    gen_instance_name = "gen_instance"
+    # NIXL agent names share one namespace per node, and this file and the multi-process one both
+    # used to name themselves the same thing. Two xdist workers then registered one name twice and
+    # the loser's transfer came back "remote agent was invalidated" -- a red that reads like a
+    # transport bug. The worker id is inherited by any process this test spawns, so every rank of
+    # one test agrees while two concurrent tests do not.
+    suffix = os.environ.get("PYTEST_XDIST_WORKER", "")
+    ctx_instance_name = f"ctx_instance{suffix}"
+    gen_instance_name = f"gen_instance{suffix}"
 
     request_len = 16
 
@@ -497,102 +584,43 @@ def create_transfer_worker_setup(
             else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY
         )
 
-        if use_v2:
-            ctx_kv_cache_manager = KVCacheManagerV2(
-                KvCacheConfigV2(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                    max_attention_window=max_attention_window_vec,
-                ),
-                cache_type,
-                num_layers=num_layers,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
-                max_seq_len=max_seq_len,
-                max_batch_size=max_batch_size,
-                mapping=ctx_mappings[i],
-                dtype=dtype,
-                vocab_size=vocab_size,
+        ctx_kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfigV2(
+                max_tokens=2048,
+                enable_block_reuse=False,
+                max_attention_window=max_attention_window_vec,
+            ),
+            cache_type,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=ctx_mappings[i],
+            dtype=dtype,
+            vocab_size=vocab_size,
+        )
+        # V2: Initialize pools using page_table
+        random_seed = 0 if is_mla else None
+        page_table = KVRegionExtractorV1(ctx_kv_cache_manager).page_table
+
+        # Collect unique pools (deduplicate by base_address)
+        unique_pools = {}  # base_address -> pool_bytes
+        for pg in page_table.pool_groups:
+            for pool_desc in pg.pools:
+                key = pool_desc.base_address
+                pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
+                if key not in unique_pools or pool_bytes > unique_pools[key]:
+                    unique_pools[key] = pool_bytes
+
+        # Initialize each unique pool with random data
+        element_bytes = get_size_in_bytes(1, ctx_kv_cache_manager.dtype)
+        for pool_base_ptr, pool_size in unique_pools.items():
+            pool_size_elements = pool_size // element_bytes
+            pool_tensor = convert_to_torch_tensor(
+                TensorWrapper(pool_base_ptr, ctx_kv_cache_manager.dtype, [pool_size_elements])
             )
-            # V2: Initialize pools using page_table
-            random_seed = 0 if is_mla else None
-            page_table = KVRegionExtractorV1(ctx_kv_cache_manager).page_table
-
-            # Collect unique pools (deduplicate by base_address)
-            unique_pools = {}  # base_address -> pool_bytes
-            for pg in page_table.pool_groups:
-                for pool_desc in pg.pools:
-                    key = pool_desc.base_address
-                    pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
-                    if key not in unique_pools or pool_bytes > unique_pools[key]:
-                        unique_pools[key] = pool_bytes
-
-            # Initialize each unique pool with random data
-            element_bytes = get_size_in_bytes(1, ctx_kv_cache_manager.dtype)
-            for pool_base_ptr, pool_size in unique_pools.items():
-                pool_size_elements = pool_size // element_bytes
-                pool_tensor = convert_to_torch_tensor(
-                    TensorWrapper(pool_base_ptr, ctx_kv_cache_manager.dtype, [pool_size_elements])
-                )
-                if random_seed is not None:
-                    generator = torch.Generator(device=pool_tensor.device).manual_seed(random_seed)
-                else:
-                    generator = None
-                random_values = torch.rand(
-                    pool_tensor.shape,
-                    dtype=pool_tensor.dtype,
-                    device=pool_tensor.device,
-                    generator=generator,
-                )
-                pool_tensor.copy_(random_values)
-        else:
-            # Construct model_config for VSWA (Variable Sliding Window Attention)
-            is_vswa = max_attention_window_vec and len(set(max_attention_window_vec)) > 1
-            model_config = None
-            if is_vswa:
-                model_config = ModelConfigCpp(
-                    vocab_size=vocab_size,
-                    num_layers=num_layers,
-                    num_attention_layers=num_layers,
-                    num_rnn_layers=0,
-                    num_heads=num_kv_heads,
-                    hidden_size=num_kv_heads * head_dim,
-                    data_type=dtype,
-                )
-                model_config.layer_types = [LayerTypeCpp.ATTENTION] * num_layers
-                model_config.set_num_kv_heads(num_kv_heads)
-                model_config.size_per_head = head_dim
-                model_config.tokens_per_block = tokens_per_block
-
-            if is_vswa:
-                kv_cache_cfg = KvCacheConfig(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                    max_attention_window=max_attention_window_vec,
-                )
-            else:
-                kv_cache_cfg = trtllm.KvCacheConfig(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                    max_attention_window=max_attention_window_vec,
-                )
-            ctx_kv_cache_manager = KVCacheManager(
-                kv_cache_cfg,
-                cache_type,
-                num_layers=num_layers,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
-                max_seq_len=max_seq_len,
-                max_batch_size=max_batch_size,
-                mapping=ctx_mappings[i],
-                dtype=dtype,
-                model_config=model_config,
-            )
-            # V1: Initialize pool using get_unique_primary_pool
-            random_seed = 0 if is_mla else None
-            pool_tensor = ctx_kv_cache_manager.get_unique_primary_pool()
             if random_seed is not None:
                 generator = torch.Generator(device=pool_tensor.device).manual_seed(random_seed)
             else:
@@ -640,87 +668,39 @@ def create_transfer_worker_setup(
             else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY
         )
 
-        if use_v2:
-            gen_kv_cache_manager = KVCacheManagerV2(
-                KvCacheConfigV2(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                    max_attention_window=max_attention_window_vec,
-                ),
-                cache_type,
-                num_layers=num_layers,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
-                max_seq_len=max_seq_len,
-                max_batch_size=max_batch_size,
-                mapping=gen_mappings[i],
-                dtype=dtype,
-                vocab_size=vocab_size,
+        gen_kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfigV2(
+                max_tokens=2048,
+                enable_block_reuse=False,
+                max_attention_window=max_attention_window_vec,
+            ),
+            cache_type,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=gen_mappings[i],
+            dtype=dtype,
+            vocab_size=vocab_size,
+        )
+        # Initialize gen pool to zeros to verify transfer correctness
+        gen_page_table = KVRegionExtractorV1(gen_kv_cache_manager).page_table
+        gen_unique_pools = {}
+        for pg in gen_page_table.pool_groups:
+            for pool_desc in pg.pools:
+                key = pool_desc.base_address
+                pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
+                if key not in gen_unique_pools or pool_bytes > gen_unique_pools[key]:
+                    gen_unique_pools[key] = pool_bytes
+        gen_element_bytes = get_size_in_bytes(1, gen_kv_cache_manager.dtype)
+        for pool_base_ptr, pool_size in gen_unique_pools.items():
+            pool_size_elements = pool_size // gen_element_bytes
+            pool_tensor = convert_to_torch_tensor(
+                TensorWrapper(pool_base_ptr, gen_kv_cache_manager.dtype, [pool_size_elements])
             )
-            # Initialize gen pool to zeros to verify transfer correctness
-            gen_page_table = KVRegionExtractorV1(gen_kv_cache_manager).page_table
-            gen_unique_pools = {}
-            for pg in gen_page_table.pool_groups:
-                for pool_desc in pg.pools:
-                    key = pool_desc.base_address
-                    pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
-                    if key not in gen_unique_pools or pool_bytes > gen_unique_pools[key]:
-                        gen_unique_pools[key] = pool_bytes
-            gen_element_bytes = get_size_in_bytes(1, gen_kv_cache_manager.dtype)
-            for pool_base_ptr, pool_size in gen_unique_pools.items():
-                pool_size_elements = pool_size // gen_element_bytes
-                pool_tensor = convert_to_torch_tensor(
-                    TensorWrapper(pool_base_ptr, gen_kv_cache_manager.dtype, [pool_size_elements])
-                )
-                pool_tensor.zero_()
-        else:
-            # Construct model_config for VSWA
-            is_vswa = max_attention_window_vec and len(set(max_attention_window_vec)) > 1
-            model_config = None
-            if is_vswa:
-                model_config = ModelConfigCpp(
-                    vocab_size=vocab_size,
-                    num_layers=num_layers,
-                    num_attention_layers=num_layers,
-                    num_rnn_layers=0,
-                    num_heads=num_kv_heads,
-                    hidden_size=num_kv_heads * head_dim,
-                    data_type=dtype,
-                )
-                model_config.layer_types = [LayerTypeCpp.ATTENTION] * num_layers
-                model_config.set_num_kv_heads(num_kv_heads)
-                model_config.size_per_head = head_dim
-                model_config.tokens_per_block = tokens_per_block
-
-            if is_vswa:
-                kv_cache_cfg = KvCacheConfig(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                    max_attention_window=max_attention_window_vec,
-                )
-            else:
-                kv_cache_cfg = trtllm.KvCacheConfig(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                    max_attention_window=max_attention_window_vec,
-                )
-            gen_kv_cache_manager = KVCacheManager(
-                kv_cache_cfg,
-                cache_type,
-                num_layers=num_layers,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
-                max_seq_len=max_seq_len,
-                max_batch_size=max_batch_size,
-                mapping=gen_mappings[i],
-                dtype=dtype,
-                model_config=model_config,
-            )
-            # Initialize gen pool to zeros
-            gen_pool_tensor = gen_kv_cache_manager.get_unique_primary_pool()
-            gen_pool_tensor.zero_()
+            pool_tensor.zero_()
         gen_kv_cache_managers.append(gen_kv_cache_manager)
         gen_transfer_workers.append(
             TransferWorker(
@@ -777,76 +757,76 @@ def get_block_data(
     use_v2: bool,
     request_id: Optional[int] = None,
 ) -> torch.Tensor:
-    """Unified block data retrieval for both V1 and V2 KVCacheManager."""
-    if use_v2:
-        layer_grouping = kv_cache_manager.impl.layer_grouping
-        # Read layers in ascending global-layer order so this verification does
-        # not depend on the KV-cache manager's internal layer_grouping order
-        # (an implementation detail, not an API contract). The merge below packs
-        # ranks at ascending layer offsets, so the per-rank stack must also be
-        # ascending by global layer.
-        local_layer_indices = sorted(
-            layer_grouping[layer_group_id],
-            key=lambda lid: kv_cache_manager.pp_layers[lid],
-        )
+    """Retrieve V2 block data.
 
-        all_layer_data = []
-        for local_layer_idx in local_layer_indices:
-            global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
-            all_buffer_indices = kv_cache_manager.get_batch_cache_indices(
-                [request_id], global_layer_idx
-            )[0]
-            valid_buffer_indices = [idx for idx in all_buffer_indices if idx >= 0]
-            num_valid = len(valid_buffer_indices)
-            num_requested = len(block_ids)
-            if num_requested < num_valid:
-                selected_indices = valid_buffer_indices[-num_requested:]
-            else:
-                selected_indices = valid_buffer_indices
+    ``block_ids`` may be a positional table with -1 holes; only held slots are read.
+    """
+    block_ids = [int(b) for b in np.asarray(block_ids, dtype=np.int64).tolist() if b >= 0]
+    layer_grouping = kv_cache_manager.impl.layer_grouping
+    # Read layers in ascending global-layer order so this verification does
+    # not depend on the KV-cache manager's internal layer_grouping order
+    # (an implementation detail, not an API contract). The merge below packs
+    # ranks at ascending layer offsets, so the per-rank stack must also be
+    # ascending by global layer.
+    local_layer_indices = sorted(
+        layer_grouping[layer_group_id],
+        key=lambda lid: kv_cache_manager.pp_layers[lid],
+    )
 
-            layer_buffer = kv_cache_manager.get_buffers(layer_idx=global_layer_idx, kv_layout="HND")
-            layer_data = layer_buffer[selected_indices]
-            layer_data = layer_data.reshape(layer_data.shape[0], layer_data.shape[1], -1)
-            all_layer_data.append(layer_data)
+    all_layer_data = []
+    for local_layer_idx in local_layer_indices:
+        global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
+        all_buffer_indices = kv_cache_manager.get_batch_cache_indices(
+            [request_id], global_layer_idx
+        )[0]
+        valid_buffer_indices = [idx for idx in all_buffer_indices if idx >= 0]
+        num_valid = len(valid_buffer_indices)
+        num_requested = len(block_ids)
+        if num_requested < num_valid:
+            selected_indices = valid_buffer_indices[-num_requested:]
+        else:
+            selected_indices = valid_buffer_indices
 
-        result = torch.stack(all_layer_data, dim=0).permute(1, 0, 2, 3)
-        return result
-    else:
-        pool_tensor = kv_cache_manager.get_unique_primary_pool()
-        block_datas = pool_tensor[block_ids]
-        return block_datas
+        layer_buffer = kv_cache_manager.get_buffers(layer_idx=global_layer_idx, kv_layout="HND")
+        layer_data = layer_buffer[selected_indices]
+        layer_data = layer_data.reshape(layer_data.shape[0], layer_data.shape[1], -1)
+        all_layer_data.append(layer_data)
+
+    result = torch.stack(all_layer_data, dim=0).permute(1, 0, 2, 3)
+    return result
 
 
 def get_block_ids_per_layer_groups(
-    kv_cache_manager, transfer_worker, request_id: int, use_v2: bool, tokens_per_block: int
-) -> List[List[int]]:
-    """Get block_ids for each layer group with window_size filtering."""
+    kv_cache_manager,
+    transfer_worker,
+    request_id: int,
+    use_v2: bool,
+    tokens_per_block: int,
+    prompt_len: int,
+) -> List[np.ndarray]:
+    """Positional block table per layer group, straight from the cache manager.
+
+    Entry i is the pool slot for block ordinal i or -1 (SWA-evicted / unbound),
+    fitted to ceil(prompt_len / tpb) entries -- the same shape
+    KvCacheTransceiverV2._describe_local produces.
+    """
     page_table = transfer_worker._rank_info.page_table
-    block_ids_per_layer_groups: List[List[int]] = []
+    prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+    tables: List[np.ndarray] = []
 
     for group_id, group_meta in enumerate(page_table.layer_groups):
-        if use_v2:
-            block_ids = list(
-                kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
-                    group_id, valid_only=True
-                )
+        ordinals = list(
+            kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
+                group_id, valid_only=False
             )
-        else:
-            first_global_layer_id = group_meta.local_layers[0].global_layer_id
-            block_ids = kv_cache_manager.get_batch_cache_indices(
-                [request_id], first_global_layer_id
-            )[0]
+        )
 
-        # Filter by window_size if request_len > window_size
-        window_size = group_meta.sliding_window_size
-        if window_size is not None:
-            max_blocks_in_window = window_size // tokens_per_block + 1
-            if len(block_ids) > max_blocks_in_window:
-                block_ids = block_ids[-max_blocks_in_window:]
+        table = np.full(prompt_blocks, -1, dtype=np.int64)
+        n = min(len(ordinals), prompt_blocks)
+        table[:n] = ordinals[:n]
+        tables.append(table)
 
-        block_ids_per_layer_groups.append(np.asarray(block_ids, dtype=np.int64))
-
-    return block_ids_per_layer_groups
+    return tables
 
 
 def add_and_verify_request(
@@ -918,18 +898,12 @@ def add_and_verify_request(
 
     # Add sequence to ctx KV cache managers
     ctx_kv_caches = []  # V2: Store kv_cache objects for cleanup
-    if use_v2:
-        for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
-            kv_cache = ctx_kv_cache_manager._create_kv_cache(ctx_request.py_request_id, None, None)
-            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
-            assert success, "Failed to resume kv_cache for ctx request"
-            kv_cache.resize(ctx_request.prompt_len)
-            ctx_kv_caches.append(kv_cache)
-    else:
-        for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
-            ctx_kv_cache_manager.impl.add_sequence_batch(
-                [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request]
-            )
+    for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
+        kv_cache = ctx_kv_cache_manager._create_kv_cache(ctx_request.py_request_id, None, None)
+        success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+        assert success, "Failed to resume kv_cache for ctx request"
+        kv_cache.resize(ctx_request.prompt_len)
+        ctx_kv_caches.append(kv_cache)
 
     gen_request = LlmRequest(
         request_id=gen_request_id,
@@ -949,18 +923,12 @@ def add_and_verify_request(
     )
     # Add sequence to gen KV cache managers
     gen_kv_caches = []
-    if use_v2:
-        for gen_kv_cache_manager in valid_gen_kv_cache_managers:
-            kv_cache = gen_kv_cache_manager._create_kv_cache(gen_request.py_request_id, None, None)
-            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
-            assert success, "Failed to resume kv_cache for gen request"
-            kv_cache.resize(gen_request.prompt_len)
-            gen_kv_caches.append(kv_cache)
-    else:
-        for gen_kv_cache_manager in valid_gen_kv_cache_managers:
-            gen_kv_cache_manager.impl.add_sequence_batch(
-                [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
-            )
+    for gen_kv_cache_manager in valid_gen_kv_cache_managers:
+        kv_cache = gen_kv_cache_manager._create_kv_cache(gen_request.py_request_id, None, None)
+        success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+        assert success, "Failed to resume kv_cache for gen request"
+        kv_cache.resize(gen_request.prompt_len)
+        gen_kv_caches.append(kv_cache)
 
     # Get block_ids per layer_group with window_size filtering
     ctx_block_ids_per_groups = [
@@ -970,6 +938,7 @@ def add_and_verify_request(
             ctx_request.py_request_id,
             use_v2,
             tokens_per_block,
+            ctx_request.prompt_len,
         )
         for ctx_kv_cache_manager, ctx_transfer_worker in zip(
             valid_ctx_kv_cache_managers, valid_ctx_transfer_workers
@@ -983,6 +952,7 @@ def add_and_verify_request(
             gen_request.py_request_id,
             use_v2,
             tokens_per_block,
+            gen_request.prompt_len,
         )
         for gen_kv_cache_manager, gen_transfer_worker in zip(
             valid_gen_kv_cache_managers, valid_gen_transfer_workers
@@ -999,9 +969,11 @@ def add_and_verify_request(
         ]
 
         send_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=ctx_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids_per_group),
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
             )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
@@ -1016,9 +988,11 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=gen_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(gen_block_ids_per_group),
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
             )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
@@ -1031,9 +1005,11 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=gen_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(gen_block_ids_per_group),
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
             )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
@@ -1053,9 +1029,11 @@ def add_and_verify_request(
             assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=ctx_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids_per_group),
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
             )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
@@ -1074,9 +1052,8 @@ def add_and_verify_request(
         for send_aux_task in send_aux_tasks:
             send_aux_task.wait()
 
-    sync_session_status = (
-        SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
-    )
+    # No aux is owed here, so whether the auxiliary task has landed does not change the status.
+    sync_session_status = SessionStatus.TRANSFERRED
     for sender_session in sender_sessions:
         assert sender_session.status == sync_session_status
     if not send_first:
@@ -1094,7 +1071,7 @@ def add_and_verify_request(
         valid_ctx_tp = 1
         valid_gen_tp = 1
 
-    # Unified per-layer-group verification for both V1 and V2
+    # Per-layer-group verification
     def get_layers_in_group_per_pp(kv_cache_managers, pp_size, tp_size, group_id, is_v2):
         """Get the number of layers in a group for each PP rank."""
         layers_per_pp = []
@@ -1214,12 +1191,11 @@ def add_and_verify_request(
         sender_session.close()
 
     # V2: Close kv_caches to release slots
-    if use_v2:
-        torch.cuda.current_stream().synchronize()
-        for kv_cache in ctx_kv_caches:
-            kv_cache.close()
-        for kv_cache in gen_kv_caches:
-            kv_cache.close()
+    torch.cuda.current_stream().synchronize()
+    for kv_cache in ctx_kv_caches:
+        kv_cache.close()
+    for kv_cache in gen_kv_caches:
+        kv_cache.close()
 
 
 # Test configurations as pytest parameters
@@ -1246,40 +1222,6 @@ WINDOW_SIZE_TEST_CONFIGS = [
     (1, 1, False, 1, 2, False, False, [1024, 24], "pp1_to_pp2_window"),
     (1, 2, False, 2, 1, False, False, [1024, 24], "pp2_to_tp2_window"),
 ]
-
-
-@pytest.mark.timeout(120)
-@pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PARALLEL_TEST_CONFIGS],
-    ids=[c[7] for c in PARALLEL_TEST_CONFIGS],
-)
-def test_transfer_worker_v1(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla):
-    """Test transfer worker with KVCacheManager (V1)."""
-    tensorrt_llm.logger.set_level("info")
-    logger.info("Test transfer worker V1 with parallel configurations")
-
-    setup = create_transfer_worker_setup(
-        ctx_tp=ctx_tp,
-        ctx_pp=ctx_pp,
-        ctx_enable_dp=ctx_enable_dp,
-        gen_tp=gen_tp,
-        gen_pp=gen_pp,
-        gen_enable_dp=gen_enable_dp,
-        is_mla=is_mla,
-        use_v2=False,
-    )
-
-    request_len = setup["request_len"]
-    try:
-        add_and_verify_request(setup, 0, 1, request_len, send_first=True)
-        add_and_verify_request(setup, 2, 3, request_len, send_first=True)
-        add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
-    finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
 
 
 @pytest.mark.timeout(120)
@@ -1353,7 +1295,7 @@ def test_transfer_worker_v2_with_window(
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 @pytest.mark.parametrize(
     "chunk_size_blocks",
     [None, 2],
@@ -1362,9 +1304,10 @@ def test_transfer_worker_v2_with_window(
 def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
-    Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
-    gen only provides the suffix block list. The receiver-side prefix is
-    implicit in the block count; the sender derives dst_start from it.
+    Simulates gen-side prefix cache: ctx offers every ordinal of the prompt,
+    while gen masks the reused prefix ordinals to -1 in its positional table.
+    The sender pairs only the ordinals both sides hold, so the prefix is
+    skipped without any length arithmetic.
     """
     tensorrt_llm.logger.set_level("info")
     tokens_per_block = 8
@@ -1420,49 +1363,52 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
 
     # Allocate KV on both sides
     ctx_kv_caches, gen_kv_caches = [], []
-    if use_v2:
-        kv = ctx_mgr._create_kv_cache(0, None, None)
-        kv.resume(torch.cuda.current_stream().cuda_stream)
-        kv.resize(request_len)
-        ctx_kv_caches.append(kv)
+    kv = ctx_mgr._create_kv_cache(0, None, None)
+    kv.resume(torch.cuda.current_stream().cuda_stream)
+    kv.resize(request_len)
+    ctx_kv_caches.append(kv)
 
-        kv = gen_mgr._create_kv_cache(1, None, None)
-        kv.resume(torch.cuda.current_stream().cuda_stream)
-        kv.resize(request_len)
-        gen_kv_caches.append(kv)
-    else:
-        ctx_mgr.impl.add_sequence_batch(
-            [(ctx_request.py_request_id, request_len, 1)], [ctx_request]
-        )
-        gen_mgr.impl.add_sequence_batch(
-            [(gen_request.py_request_id, request_len, 1)], [gen_request]
-        )
+    kv = gen_mgr._create_kv_cache(1, None, None)
+    kv.resume(torch.cuda.current_stream().cuda_stream)
+    kv.resize(request_len)
+    gen_kv_caches.append(kv)
 
     # Get block IDs
-    ctx_block_ids = get_block_ids_per_layer_groups(ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block)
-    gen_block_ids = get_block_ids_per_layer_groups(gen_mgr, gen_tw, 1, use_v2, tokens_per_block)
+    ctx_block_ids = get_block_ids_per_layer_groups(
+        ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block, request_len
+    )
+    gen_block_ids = get_block_ids_per_layer_groups(
+        gen_mgr, gen_tw, 1, use_v2, tokens_per_block, request_len
+    )
 
-    # Gen: only provide suffix block IDs (skip prefix_blocks)
-    gen_suffix_block_ids = [
-        np.asarray(bids[prefix_blocks:], dtype=np.int64) for bids in gen_block_ids
-    ]
+    # Gen already holds the reused prefix: mask those ordinals so the sender
+    # skips them (positional table, -1 == not accepted).
+    gen_suffix_block_ids = []
+    for bids in gen_block_ids:
+        table = np.array(bids, dtype=np.int64)
+        table[:prefix_blocks] = -1
+        gen_suffix_block_ids.append(table)
 
     try:
         tx = ctx_tw.create_tx_session(ctx_request)
 
-        # Gen receives only the suffix list; dst_start is derived from block count.
+        # Gen's table masks the reused prefix; the sender pairs the remaining ordinals.
         rx = gen_tw.create_rx_session(gen_request)
-        recv_slice = KVSlice(
-            is_last_slice=True,
+        recv_slice = Chunk(
             block_ids_per_layer_groups=gen_suffix_block_ids,
+            kind_per_layer_group=[CacheKind.PAGED] * len(gen_suffix_block_ids),
+            token_range=TokenRange(start=0, end=gen_request.prompt_len),
+            is_last=True,
         )
         rx.receive(recv_slice)
 
         if chunk_size_blocks is None:
             tx.send(
-                KVSlice(
-                    is_last_slice=True,
+                Chunk(
                     block_ids_per_layer_groups=ctx_block_ids,
+                    kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids),
+                    token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                    is_last=True,
                 )
             )
         else:
@@ -1481,9 +1427,8 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         # Verify: suffix blocks on gen should match corresponding ctx blocks
         num_layer_groups = len(ctx_block_ids)
         for lg_id in range(num_layer_groups):
-            ctx_all_bids = ctx_block_ids[lg_id]
-            ctx_suffix_bids = ctx_all_bids[prefix_blocks:]
-            gen_suffix_bids = gen_suffix_block_ids[lg_id]
+            ctx_suffix_bids = ctx_block_ids[lg_id][prefix_blocks:]
+            gen_suffix_bids = gen_suffix_block_ids[lg_id][prefix_blocks:]
 
             ctx_data = get_block_data(ctx_mgr, ctx_suffix_bids, lg_id, use_v2, 0)
             gen_data = get_block_data(gen_mgr, gen_suffix_bids, lg_id, use_v2, 1)
@@ -1494,10 +1439,9 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         rx.close()
         tx.close()
     finally:
-        if use_v2:
-            torch.cuda.current_stream().synchronize()
-            for kv in ctx_kv_caches + gen_kv_caches:
-                kv.close()
+        torch.cuda.current_stream().synchronize()
+        for kv in ctx_kv_caches + gen_kv_caches:
+            kv.close()
         ctx_tw.shutdown()
         gen_tw.shutdown()
 
@@ -1603,7 +1547,12 @@ def test_session_cancel_after_send():
         # changed shape across versions).
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
-        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        kv_slice = Chunk(
+            block_ids_per_layer_groups=block_ids_per_groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+            is_last=True,
+        )
         tx_session.send(kv_slice)
 
         # No receiver registered yet; task is INIT.
@@ -1661,33 +1610,27 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
 
     ctx_kv_caches, gen_kv_caches = [], []
     for mgr in ctx_kv_cache_managers:
-        if use_v2:
-            kv = mgr._create_kv_cache(ctx_request.py_request_id, None, None)
-            assert kv.resume(torch.cuda.current_stream().cuda_stream)
-            assert kv.resize(request_len)
-            ctx_kv_caches.append(kv)
-        else:
-            mgr.impl.add_sequence_batch(
-                [(ctx_request.py_request_id, request_len, 1)], [ctx_request]
-            )
+        kv = mgr._create_kv_cache(ctx_request.py_request_id, None, None)
+        assert kv.resume(torch.cuda.current_stream().cuda_stream)
+        assert kv.resize(request_len)
+        ctx_kv_caches.append(kv)
 
     for mgr in gen_kv_cache_managers:
-        if use_v2:
-            kv = mgr._create_kv_cache(gen_request.py_request_id, None, None)
-            assert kv.resume(torch.cuda.current_stream().cuda_stream)
-            assert kv.resize(request_len)
-            gen_kv_caches.append(kv)
-        else:
-            mgr.impl.add_sequence_batch(
-                [(gen_request.py_request_id, request_len, 1)], [gen_request]
-            )
+        kv = mgr._create_kv_cache(gen_request.py_request_id, None, None)
+        assert kv.resume(torch.cuda.current_stream().cuda_stream)
+        assert kv.resize(request_len)
+        gen_kv_caches.append(kv)
 
     ctx_block_ids = [
-        get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
+        get_block_ids_per_layer_groups(
+            mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block, request_len
+        )
         for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
     ]
     gen_block_ids = [
-        get_block_ids_per_layer_groups(mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block)
+        get_block_ids_per_layer_groups(
+            mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block, request_len
+        )
         for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
     ]
 
@@ -1711,9 +1654,9 @@ def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessi
     gen_block_ids = ctx_info["gen_block_ids"]
 
     for session in sender_sessions:
-        assert session.status == SessionStatus.KV_TRANSFERRED
+        assert session.status == SessionStatus.TRANSFERRED
     for session in receiver_sessions:
-        assert session.status == SessionStatus.KV_TRANSFERRED
+        assert session.status == SessionStatus.TRANSFERRED
 
     num_layer_groups = len(ctx_block_ids[0])
     for lg_id in range(num_layer_groups):
@@ -1732,12 +1675,11 @@ def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessi
         s.close()
     for s in sender_sessions:
         s.close()
-    if use_v2:
-        torch.cuda.current_stream().synchronize()
-        for kv in ctx_info["ctx_kv_caches"]:
-            kv.close()
-        for kv in ctx_info["gen_kv_caches"]:
-            kv.close()
+    torch.cuda.current_stream().synchronize()
+    for kv in ctx_info["ctx_kv_caches"]:
+        kv.close()
+    for kv in ctx_info["gen_kv_caches"]:
+        kv.close()
 
 
 @pytest.mark.timeout(60)
@@ -1852,7 +1794,12 @@ def test_session_has_transferring_tasks_false():
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
-        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        kv_slice = Chunk(
+            block_ids_per_layer_groups=block_ids_per_groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+            is_last=True,
+        )
         tx_session.send(kv_slice)
         assert not tx_session.has_transferring_tasks()
         tx_session.close()
@@ -1867,10 +1814,13 @@ def test_session_has_transferring_tasks_false():
 
 
 @pytest.mark.timeout(120)
-def test_incompatible_peer_fails_only_affected_requests():
+@pytest.mark.parametrize("replay_flags", [None, (False, True), (True, False)])
+def test_incompatible_peer_fails_only_affected_requests(
+    replay_flags: tuple[bool, bool] | None,
+) -> None:
     """An incompatible context peer must fail only the requests targeting it.
 
-    When MambaPolicy.validate_peer_compatible rejects a peer during first
+    When peer validation rejects a peer during first
     registration, the receiver must (a) not raise out of receive() — the
     session fails through the normal transfer-error path (WaitResult.FAILED)
     with the diagnostic preserved; (b) cache the incompatibility so later
@@ -1892,6 +1842,18 @@ def test_incompatible_peer_fails_only_affected_requests():
     gen_tw = setup_good["gen_transfer_workers"][0]
     receiver = gen_tw._receiver
     bad_endpoint = setup_bad["ctx_info_endpoint"]
+    expected_error = "synthetic recurrent-state mismatch"
+    expected_validate_calls = 1
+    if replay_flags is not None:
+        local_replay, peer_replay = replay_flags
+        gen_tw._rank_info.bounded_replay_on_generation = local_replay
+        setup_good["ctx_transfer_workers"][0]._rank_info.bounded_replay_on_generation = local_replay
+        setup_bad["ctx_transfer_workers"][0]._rank_info.bounded_replay_on_generation = peer_replay
+        expected_error = (
+            "bounded_replay_on_generation must match between peers "
+            f"(local={local_replay}, peer={peer_replay})"
+        )
+        expected_validate_calls = 0
 
     sampling_params = SamplingParams(temperature=0)
     sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
@@ -1917,9 +1879,11 @@ def test_incompatible_peer_fails_only_affected_requests():
     # dispatch_task fails at peer validation, before any block transfer, so
     # empty per-layer-group block lists suffice (no KV sequence needed).
     page_table = gen_tw._rank_info.page_table
-    empty_slice = KVSlice(
-        is_last_slice=True,
+    empty_slice = Chunk(
         block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=0),
+        is_last=True,
     )
 
     validate_calls = []
@@ -1943,8 +1907,8 @@ def test_incompatible_peer_fails_only_affected_requests():
             assert rx1.has_failed()
             exc = rx1._kv_tasks[0]._exception
             assert exc is not None
-            assert "synthetic recurrent-state mismatch" in str(exc)
-            assert len(validate_calls) == 1
+            assert expected_error in str(exc)
+            assert len(validate_calls) == expected_validate_calls
             rx1.close()
 
             # (b) Second request to the same endpoint: fails fast from the
@@ -1955,8 +1919,8 @@ def test_incompatible_peer_fails_only_affected_requests():
             assert rx2.wait_complete(blocking=True) == WaitResult.FAILED
             assert rx2.wait_complete(blocking=False) == WaitResult.FAILED
             assert rx2.has_failed()
-            assert "synthetic recurrent-state mismatch" in str(rx2._kv_tasks[0]._exception)
-            assert len(validate_calls) == 1
+            assert expected_error in str(rx2._kv_tasks[0]._exception)
+            assert len(validate_calls) == expected_validate_calls
             assert bad_endpoint in receiver._incompatible_peers
             assert bad_endpoint not in receiver._sender_ep_instance_map
             rx2.close()
@@ -2005,9 +1969,11 @@ def add_and_verify_pipelined_request(
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
     ]
     for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids, strict=True):
-        full_slice = KVSlice(
-            is_last_slice=True,
+        full_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            token_range=TokenRange(start=0, end=ctx_info["gen_request"].prompt_len),
+            is_last=True,
         )
         recv_session.receive(full_slice)
 
@@ -2023,9 +1989,7 @@ def add_and_verify_pipelined_request(
 
 PIPELINED_TEST_CONFIGS = [
     (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_pipelined"),
-    (1, 1, False, 1, 1, False, False, False, "v1_tp1_pp1_pipelined"),
     (2, 1, False, 2, 1, False, False, True, "v2_tp2_pp1_pipelined"),
-    (2, 1, False, 2, 1, False, False, False, "v1_tp2_pp1_pipelined"),
 ]
 
 
@@ -2038,11 +2002,11 @@ PIPELINED_TEST_CONFIGS = [
 def test_transfer_worker_pipelined(
     ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
 ):
-    """Test pipelined transfer: chunks sent incrementally for V1 and V2."""
+    """Test pipelined transfer with chunks sent incrementally."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     tensorrt_llm.logger.set_level("info")
-    logger.info(f"Test transfer worker {'V2' if use_v2 else 'V1'} with pipelined transfer")
+    logger.info("Test V2 transfer worker with pipelined transfer")
 
     setup = create_transfer_worker_setup(
         ctx_tp=ctx_tp,
@@ -2165,4 +2129,4 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
 
 
 if __name__ == "__main__":
-    test_transfer_worker_v1(1, 1, False, 1, 1, False, False)
+    test_transfer_worker_v2(1, 1, False, 1, 1, False, False)

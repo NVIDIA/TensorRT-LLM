@@ -20,9 +20,10 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from utils.util import isSM100Family
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
+from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -35,13 +36,14 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
 )
+from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
 
 pytestmark = pytest.mark.cpu_only
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
-    not isSM100Family(),
+    getSMVersion() not in (100, 103),
     reason="PrimTS block-sparse attention requires SM100 or SM103",
 )
 
@@ -113,7 +115,7 @@ def _proxy_reference(
     weights = torch.exp(logits - logits.amax(dim=1, keepdim=True))
     exact_weights, proxy_weights = weights.split((block_size, len(proxy_blocks)), dim=1)
     numerator = exact_weights @ v[0, exact_tokens, 0].float()
-    numerator += proxy_weights @ v_summary[0, proxy_blocks, 0].float()
+    numerator += (proxy_weights * block_size) @ v_summary[0, proxy_blocks, 0].float()
     denominator = exact_weights.sum(dim=1, keepdim=True)
     denominator += proxy_weights.sum(dim=1, keepdim=True) * block_size
     return (numerator / denominator).to(q.dtype)[None, :, None]
@@ -148,7 +150,11 @@ def _contiguous_case():
         num_sparse_topk=0,
         helix_position_offsets=None,
         kv_cache_manager=None,
+        num_contexts=2,
         seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor([64, 64], dtype=torch.int32),
+        seq_lens_kv_cuda=torch.tensor([256, 256], dtype=torch.int32),
+        fmha_plan_caches={},
     )
     args = AttentionForwardArgs(
         output=torch.empty_like(q),
@@ -187,6 +193,7 @@ def _paged_metadata():
         host_kv_cache_pool_pointers=torch.tensor([[1234, 5678]], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
         kv_cache_manager=manager,
+        fmha_plan_caches={},
     )
 
 
@@ -320,7 +327,7 @@ def test_block_sparse_support_rejects_invalid_static_kernel_profile(
 
 
 def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypatch) -> None:
-    _attention, fmha, q, k, v, _metadata, args = _contiguous_case()
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
     wrapper = Mock()
     factory = Mock(return_value=wrapper)
     monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
@@ -337,12 +344,12 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
     ]
     for inputs in bsr_inputs:
         _set_block_sparse_inputs(args, inputs)
-        fmha._forward_contiguous(q, k, v, args)
+        fmha._forward_contiguous(q, k, v, metadata, args)
 
     proxy_inputs = [_bitmask_inputs(proxy=True), _bitmask_inputs(proxy=True)]
     for inputs in proxy_inputs:
         _set_block_sparse_inputs(args, inputs)
-        fmha._forward_contiguous(q, k, v, args)
+        fmha._forward_contiguous(q, k, v, metadata, args)
 
     assert factory.call_count == 2
     assert wrapper.plan.call_count == 2
@@ -385,23 +392,138 @@ def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
     assert _key(first) != _key(second)
 
 
-def test_block_sparse_plan_cache_is_shared_only_when_explicitly_bound() -> None:
-    first = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
-    second = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
+def test_block_sparse_plan_cache_lives_on_the_metadata(monkeypatch) -> None:
+    """Layers that run with one metadata object share its planned wrappers."""
+    wrapper = Mock()
+    factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
+    _attention, first, q, k, v, metadata, args = _contiguous_case()
+    second_attention = _Attention()
+    second = block_sparse_fmha.PrimsTSBlockSparseFmha(second_attention)
 
-    assert first._contiguous_wrappers is not second._contiguous_wrappers
-    assert first._paged_wrappers is not second._paged_wrappers
+    first._forward_contiguous(q, k, v, metadata, args)
+    second._forward_contiguous(q, k, v, metadata, args)
+    assert factory.call_count == 1
+    assert list(metadata.fmha_plan_caches) == [
+        block_sparse_fmha.PrimsTSBlockSparseFmha.PLAN_CACHE_KEY
+    ]
 
-    cache_state = {}
-    first.bind_plan_cache(cache_state)
-    second.bind_plan_cache(cache_state)
+    other_metadata = SimpleNamespace(**{**vars(metadata), "fmha_plan_caches": {}})
+    second._forward_contiguous(q, k, v, other_metadata, args)
+    assert factory.call_count == 2
 
-    assert first._contiguous_wrappers is second._contiguous_wrappers
-    assert first._paged_wrappers is second._paged_wrappers
-    assert cache_state == {
-        "contiguous_wrappers": {},
-        "paged_wrappers": {},
+
+def _set_sage_recipe(args: AttentionForwardArgs) -> None:
+    args.sage_attn_num_elts_per_blk_q = 1
+    args.sage_attn_num_elts_per_blk_k = 16
+    args.sage_attn_num_elts_per_blk_v = 1
+
+
+def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> None:
+    attention, _fmha, q, k, v, metadata, args = _contiguous_case()
+    # The core quantizes whichever libraries the layer has; each library decides whether it
+    # takes the quantized inputs.
+    attention._fmha_manager = SimpleNamespace(fmha_libs=[])
+    quantized = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
+    sage_quantize = Mock(return_value=quantized)
+    monkeypatch.setattr(trtllm_backend, "sage_quantize", sage_quantize)
+
+    def quantize():
+        return trtllm_backend.TrtllmAttention._quantize_sage_inputs(
+            attention, q, k, v, metadata, args
+        )
+
+    assert quantize() is None
+    _set_sage_recipe(args)
+    args.sage_attn_smooth_k = True
+    assert quantize() is quantized
+    (query, key, value, cu_seqlens_q, cu_seqlens_kv), kwargs = sage_quantize.call_args
+    assert query.shape == (128, 2, 128)
+    assert key.shape == value.shape == (512, 1, 128)
+    assert cu_seqlens_q.tolist() == [0, 64, 128]
+    assert cu_seqlens_kv.tolist() == [0, 256, 512]
+    assert kwargs == {
+        "q_block_size": 1,
+        "k_block_size": 16,
+        "qk_quant_dtype": torch.float8_e4m3fn,
+        "smooth_k": True,
+        "smooth_v": False,
     }
+    assert sage_quantize.call_count == 1
+
+    # Proxy summaries are keys of their own, with the V scales and means of the call's own K/V.
+    proxy = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, proxy)
+    summary = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
+    sage_quantize.reset_mock()
+    sage_quantize.side_effect = [quantized, summary]
+    actual = quantize()
+    (query, key, value, cu_seqlens_q, cu_seqlens_blocks), kwargs = sage_quantize.call_args
+    assert query is None and cu_seqlens_q is None
+    assert key.shape == value.shape == (8, 1, 128)
+    assert cu_seqlens_blocks.tolist() == [0, 4, 8]
+    assert kwargs == {"k_block_size": 1, "qk_quant_dtype": torch.float8_e4m3fn, "stats": quantized}
+    assert actual.k_summary is summary.k.view.return_value
+    assert actual.v_summary is summary.v.view.return_value
+    assert actual.k_summary_scale is summary.k_scale
+    sage_quantize.side_effect = None
+
+    # Dense calls keep the attention op's quantization unless they need V smoothing, which
+    # the attention op cannot apply.
+    sage_quantize.reset_mock()
+    _set_block_sparse_inputs(args, None)
+    assert quantize() is None
+    args.sage_attn_smooth_v = True
+    assert quantize() is quantized
+    assert sage_quantize.call_args.kwargs["smooth_v"]
+
+    # Calls with a KV cache quantize nothing.
+    sage_quantize.reset_mock()
+    _set_block_sparse_inputs(args, proxy)
+    metadata.kv_cache_manager = Mock()
+    assert quantize() is None
+    sage_quantize.assert_not_called()
+
+
+def test_contiguous_sage_requires_inputs_quantized_by_the_attention_core() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_sage_recipe(args)
+
+    reason = fmha._contiguous_unsupported_reason(q, k, v, metadata, args)
+
+    assert reason == "SageAttention requires inputs quantized by the attention core"
+
+
+def test_dense_sage_with_v_smoothing_runs_on_a_dense_plan() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_block_sparse_inputs(args, None)
+    _set_sage_recipe(args)
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert not supported
+    assert reason == "block-sparse forward inputs are required"
+
+    args.sage_attn_smooth_v = True
+    args.sage_quantized = Mock()
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert supported, reason
+    key = fmha._make_plan_key(
+        q.view(2, 64, 2, 128),
+        None,
+        batch_size=2,
+        seq_len_q=64,
+        kv_capacity=256,
+        page_size=None,
+        mask_type="dense",
+        sage=block_sparse_fmha._sage_recipe(args),
+    )
+    assert not key.use_block_sparse
+    assert (key.q_block_size, key.kv_block_size, key.max_blocks_per_row) == (128, 128, None)
+    assert key.sage.v_mean
+    assert key.unsupported_reason() is None
 
 
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:
@@ -429,7 +551,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=q,
-        context_buf=args.output,
+        output=args.output,
         sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
@@ -505,7 +627,7 @@ def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=q,
-        context_buf=args.output,
+        output=args.output,
         sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
@@ -541,6 +663,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
         max_num_requests=2,
         tokens_per_block=64,
         num_generations=2,
+        fmha_plan_caches={},
     )
     workspace = torch.empty(0, dtype=torch.uint8)
     monkeypatch.setattr(
@@ -627,7 +750,7 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
     k_blocks = k.float().view(1, 3, 64, 1, 128)
     v_blocks = v.float().view(1, 3, 64, 1, 128)
     initial_k_summary = k_blocks.mean(dim=2).to(k.dtype)
-    initial_v_summary = v_blocks.sum(dim=2).to(v.dtype)
+    initial_v_summary = v_blocks.mean(dim=2).to(v.dtype)
     live_k_summary = initial_k_summary.clone()
     live_v_summary = initial_v_summary.clone()
     live_exact_bits = torch.tensor([[[[1]]]], device="cuda", dtype=torch.uint32)
@@ -654,6 +777,7 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
         is_cross=False,
         kv_cache_manager=None,
         seq_lens=torch.tensor([64], dtype=torch.int32),
+        fmha_plan_caches={},
     )
     flat_q, flat_k, flat_v = (tensor.flatten(0, 2) for tensor in (q, k, v))
 

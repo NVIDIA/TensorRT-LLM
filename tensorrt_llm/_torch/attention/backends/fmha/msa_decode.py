@@ -184,10 +184,25 @@ class MsaDecodeFmha(PhasedFmha):
         head_dim = attn.head_dim
         num_tokens = params.num_tokens
         k_paged, v_paged = msa_paged_kv(params.meta.kv_cache_manager, attn.layer_idx)
+        nvfp4_args = {}
+        manager = params.meta.kv_cache_manager
+        if getattr(manager, "is_nvfp4_layer", lambda _: False)(attn.layer_idx):
+            from .msa_prefill import _aligned_nvfp4_dequant_scales
+
+            if params.fwd.kv_scale_quant_orig is None:
+                raise RuntimeError("NVFP4 sparse decode requires dequantization scales")
+            k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, params.fwd.kv_scale_quant_orig)
+            scales = manager.get_block_scale_buffers(attn.layer_idx, "HND")
+            nvfp4_args = dict(
+                k_block_scale=scales[:, 0],
+                v_block_scale=scales[:, 1],
+                k_global_scale=k_scale,
+                v_global_scale=v_scale,
+            )
         # q may still be FP8 from a fused producer; the kernel widens it
         # in-register, so it is passed through as it arrives.
         minimax_m3_sparse_attn_decode(
-            params.attention_input.view(num_tokens, attn.num_heads, head_dim),
+            params.query_input.view(num_tokens, attn.num_heads, head_dim),
             k_paged,
             v_paged,
             # The kernel reads the top-k table head-major and the indexer
@@ -199,8 +214,9 @@ class MsaDecodeFmha(PhasedFmha):
             block_table,
             seq_lens,
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
-            output=params.context_buf.view(num_tokens, attn.num_heads, head_dim),
+            output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
+            **nvfp4_args,
         )
 
     def _run_dense(
@@ -237,13 +253,13 @@ class MsaDecodeFmha(PhasedFmha):
             )
         workspace, counters = split_dense_decode_workspace(params.workspace, self._dense_layout)
         minimax_m3_trtllm_gen_dense_decode(
-            params.attention_input.view(num_tokens, attn.num_heads, head_dim),
+            params.query_input.view(num_tokens, attn.num_heads, head_dim),
             metadata.kv_cache_manager,
             attn.layer_idx,
             block_table,
             seq_lens,
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
-            output=params.context_buf.view(num_tokens, attn.num_heads, head_dim),
+            output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
             max_seq_len=int(metadata.msa_max_kv_len),
             max_num_requests=int(metadata.max_num_requests),
