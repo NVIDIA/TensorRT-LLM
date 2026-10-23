@@ -1466,6 +1466,7 @@ def _context_projection(device: str,
                         bias: bool = False) -> types.SimpleNamespace:
     model = types.SimpleNamespace(
         num_heads_tp=4,
+        num_context_heads=4,
         qk_nope_head_dim=16,
         qk_rope_head_dim=8,
         qk_head_dim=24,
@@ -1483,6 +1484,8 @@ def _context_projection(device: str,
         mla_module.MLA._use_kvbproj_strided_out, model)
     model._get_kvbproj_head_weights = types.MethodType(
         mla_module.MLA._get_kvbproj_head_weights, model)
+    model._project_context_kv = types.MethodType(
+        mla_module.MLA._project_context_kv, model)
     return model
 
 
