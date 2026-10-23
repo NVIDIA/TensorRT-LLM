@@ -1156,6 +1156,36 @@ def test_stream_reframer_reads_the_upstream_to_its_end_after_done():
     assert after_done == ["ran"]
 
 
+def test_stream_reframer_reads_the_upstream_to_its_end_before_message_stop():
+    """A consumer that stops reading at message_stop still lets the upstream end.
+
+    A client may disconnect as soon as it has message_stop. Had message_stop
+    gone out before the upstream was drained, the chat stream would be left
+    suspended at [DONE] and its metrics never recorded.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def read_until_message_stop():
+        stream = reframe_openai_stream(source(), MODEL)
+        frames = []
+        async for frame in stream:
+            frames.append(frame)
+            if frame.startswith("event: message_stop"):
+                break
+        await stream.aclose()
+        return frames
+
+    events = parse_frames(asyncio.run(read_until_message_stop()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
 def test_stream_reframer_drops_anything_after_done():
     """Lines after [DONE] are read to reach the end, never reframed."""
 
