@@ -15,6 +15,7 @@
 """Selection of the unified target+DFlash KV cache layout."""
 
 import json
+import os
 from types import SimpleNamespace
 
 import click
@@ -277,15 +278,15 @@ def test_shared_cache_requested_with_unsupported_layout_fails_at_startup():
         (
             {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "VANILLA"}},
             {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "VANILLA"}},
-            "attention_backend TRTLLM",
+            "attention_backend AUTO or TRTLLM",
         ),
         (
-            {"speculative_config": {"decoding_type": "DFlash"}},
+            {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "FA4"}},
             {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}},
-            "attention_backend TRTLLM",
+            "attention_backend AUTO or TRTLLM",
         ),
     ],
-    ids=["vanilla_dflash_backend", "default_dflash_backend"],
+    ids=["vanilla_dflash_backend", "fa4_dflash_backend"],
 )
 def test_launcher_rejects_shared_cache_for_ineligible_config(
     monkeypatch, tmp_path, context_servers, generation_servers, match
@@ -296,6 +297,23 @@ def test_launcher_rejects_shared_cache_for_ineligible_config(
 
     with pytest.raises(click.UsageError, match=match):
         _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers)
+
+
+@pytest.mark.parametrize("attention_backend", [None, "AUTO", "TRTLLM"])
+def test_launcher_shares_draft_kv_for_dflash_in_both_sections(
+    monkeypatch, tmp_path, attention_backend
+):
+    """AUTO, the default, resolves to TRTLLM for windowed drafters, so it shares like TRTLLM."""
+    spec = {"decoding_type": "DFlash"}
+    if attention_backend is not None:
+        spec["attention_backend"] = attention_backend
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch, tmp_path, {"speculative_config": spec}, {"speculative_config": spec}
+        )
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "1"
 
 
 @pytest.mark.parametrize(
