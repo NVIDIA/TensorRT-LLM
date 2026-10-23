@@ -44,7 +44,8 @@ from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
-from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
+from ..speculative import (SpecMetadata, SpecWorkerBase,
+                           update_spec_config_from_loaded_model)
 from ..speculative.utils import get_static_draft_len
 from ..tensor_lru_cache import TensorLRUCache
 from ..utils import set_torch_compiling
@@ -302,6 +303,11 @@ class PyTorchModelEngine(ModelEngine):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        if llm_args.sleep_config is not None:
+            # Private draft mailboxes do not participate in sleep/wakeup.
+            for module in self.model.modules():
+                if isinstance(module, SpecWorkerBase):
+                    module.allow_mnnvl_argmax = False
         self._validate_breakable_cuda_graph_compatibility()
         # In-graph sampling needs the full vocabulary: top-k / top-p over a
         # tensor-parallel shard would rank against a slice of the logits and

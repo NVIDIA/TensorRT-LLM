@@ -1628,6 +1628,7 @@ class SpecWorkerBase(nn.Module, ABC):
     def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
+        self.allow_mnnvl_argmax = True
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
         # One-model speculative sampling goes through flashinfer unconditionally
@@ -2876,9 +2877,10 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
-            from ..distributed.ops import allgather
+            from .draft_argmax_exchange import gather_draft_argmax_pairs
             combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, mapping, dim=-1)
+            gathered = gather_draft_argmax_pairs(
+                combined, mapping, allow_mnnvl=self.allow_mnnvl_argmax)
             return self._get_draft_tokens_from_gathered(gathered)
         # No cross-rank gather for plain attention-DP: each rank owns its own
         # requests with replicated full-vocab logits, so a per-rank argmax is
