@@ -545,7 +545,10 @@ The FMHA package is split by role:
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
   batch state, cache storage, and kernels live in `fp4_mla/`. The absorption
   weights follow `kv_b_proj`: BF16, or FP8 with 128x128 block scales as in
-  Kimi K3 checkpoints. Chunked
+  Kimi K3 checkpoints. The only context parallelism FP4 MLA accepts is Helix
+  on generation ranks: each rank keeps rank-local cache positions, while
+  RoPE and the BF16 HP ring use the global position
+  (`helix_position_offsets`). Chunked
   prefill (`MLA.forward_context_with_chunked_prefill_fp4`) appends the chunk
   to the FP4 cache, gathers each cached prefix partition back from it, and
   attends every partition through `Fp4MlaFmha.forward_context_partition`;

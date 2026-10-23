@@ -253,8 +253,10 @@ def validate_fp4_mla_config(model_config: ModelConfig,
         return
     if not supports_fp4_mla_attention(model_config):
         raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+    mapping = model_config.mapping
+    if mapping.cp_size != 1 and not mapping.has_cp_helix():
+        raise ValueError(
+            "FP4 MLA supports context parallelism only through Helix.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
 

@@ -376,6 +376,32 @@ def test_fp4_mla_rope_generation_forwards_helix_cache_ownership(
     assert len(calls) == 3
 
 
+@pytest.mark.parametrize(
+    ("cp_size", "helix", "accepted"),
+    [(1, False, True), (8, True, True), (8, False, False)],
+    ids=["no_cp", "helix", "non_helix_cp"],
+)
+def test_validate_fp4_mla_config_accepts_only_helix_context_parallelism(
+    monkeypatch: pytest.MonkeyPatch, cp_size: int, helix: bool, accepted: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader
+
+    monkeypatch.setattr(model_loader, "supports_fp4_mla_attention", lambda config: True)
+    model_config = SimpleNamespace(
+        sparse_attention_config=None,
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+        mapping=SimpleNamespace(cp_size=cp_size, has_cp_helix=lambda: helix),
+        spec_config=None,
+    )
+    llm_args = SimpleNamespace(kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True))
+    if accepted:
+        model_loader.validate_fp4_mla_config(model_config, llm_args)
+    else:
+        with pytest.raises(ValueError, match="only through Helix"):
+            model_loader.validate_fp4_mla_config(model_config, llm_args)
+
+
 def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
     """Helix generation must reach the fused FP4 RoPE/Q-quant/cache update."""
     num_tokens, num_heads = 2, 2
