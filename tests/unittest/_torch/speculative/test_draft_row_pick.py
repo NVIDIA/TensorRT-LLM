@@ -203,7 +203,7 @@ def _worker(is_mtp_eagle, fast_paths):
     w._d2t = None
     w._draft_folds_kv_lens_increment = False
     w._step0_row_pick = DraftRowPick("test draft layer")
-    w.draft_kv_cache_context = lambda md, mgr: contextlib.nullcontext(md)
+    w.draft_kv_cache_context = lambda md, mgr, **kwargs: contextlib.nullcontext(md)
     w.sample_draft_tokens = _greedy_draft_tokens
     return w
 
@@ -349,7 +349,7 @@ def _mtp_worker(mapping=None):
     w.update_mtp_hidden_states = lambda **kwargs: None
     w.change_attn_metadata = lambda *args: None
     w.get_draft_kv_cache_manager = lambda resource_manager: None
-    w.draft_kv_cache_context = lambda md, mgr: contextlib.nullcontext(md)
+    w.draft_kv_cache_context = lambda md, mgr, **kwargs: contextlib.nullcontext(md)
     w._restore_attn_metadata_from_spec_dec = lambda md: None
     w._prepare_next_new_tokens = lambda *args: None
     w.sample_draft_tokens = lambda logits, spec_metadata, batch_size, draft_step: logits.argmax(

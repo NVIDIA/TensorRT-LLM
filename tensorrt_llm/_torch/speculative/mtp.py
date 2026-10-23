@@ -496,7 +496,10 @@ class MTPWorker(SpecWorkerBase):
                 f"{draft_inputs['input_ids'].shape[0]} rows after attention",
                 key="spec_mtp_pick_rows")
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+                attn_metadata,
+                draft_kv_cache_manager,
+                enable_draft_locality_domain_forkjoin=True):
             for i, mtp_layer in enumerate(
                     draft_model.mtp_layers[:runtime_draft_len]):
                 if self.guided_decoder is not None:
