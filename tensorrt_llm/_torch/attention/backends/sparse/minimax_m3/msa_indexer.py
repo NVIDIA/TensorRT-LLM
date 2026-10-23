@@ -14,11 +14,16 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
+from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_processor_count_for_device
+from tensorrt_llm._utils import async_tensor_h2d
+
 from .kernels.msa_utils import (
+    MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     per_token_valid_blocks,
     require_msa_module,
@@ -153,6 +158,148 @@ def _proxy_max_score(
         sm_scale=sm_scale,
     )
     return max_score
+
+
+# Longest segment of a split proxy plan: fmha_sm100 splits KV only on its 128-query tile.
+_PROXY_SEGMENT_LEN = 128
+# Below this cached prefix the split plan's longer GPU planner pass eats most of the saving.
+_PROXY_SPLIT_MIN_PREFIX = 4096
+# fmha_sm100 allocates about 2.6 MB of plan workspace per split.
+_PROXY_MAX_KV_SPLITS = 16
+
+
+def _proxy_kv_splits(qo_lens: list[int], qo_offsets: list[int], num_index_heads: int) -> int:
+    """KV splits filling about one SM wave with these rows' segments, or 0 to plan them unsplit."""
+    # If every row has <= 64 queries, segments select variants prewarm_split_proxy_variants skips.
+    if max(qo_offsets) < _PROXY_SPLIT_MIN_PREFIX or max(qo_lens) <= 64:
+        return 0
+    num_segments = sum((n + _PROXY_SEGMENT_LEN - 1) // _PROXY_SEGMENT_LEN for n in qo_lens)
+    num_sms = get_multi_processor_count_for_device(torch.cuda.current_device())
+    return min(_PROXY_MAX_KV_SPLITS, num_sms // (num_segments * num_index_heads))
+
+
+def _segmented_proxy_plan(
+    fmha_sm100: ModuleType,
+    qo_lens: list[int],
+    qo_offsets: list[int],
+    *,
+    num_index_heads: int,
+    page_size: int,
+    num_kv_splits: int,
+    kv_indices: torch.Tensor,
+) -> tuple[tuple, torch.Tensor]:
+    """Plan rows as segments of at most _PROXY_SEGMENT_LEN queries, split along KV.
+
+    Each segment keeps its row's causal window and writes each block max once, from the same
+    Q.K products: the scores are bitwise those of the unsplit plan.
+    """
+    seg_qo_lens, seg_kv_lens, seg_offsets = [], [], []
+    # seg_shifts: the row's first page in kv_indices minus the segment's first gathered slot.
+    seg_pages, seg_shifts = [], []
+    row_first_page = num_gathered = 0
+    for qo_len, prefix in zip(qo_lens, qo_offsets):
+        for first in range(0, qo_len, _PROXY_SEGMENT_LEN):
+            n = min(_PROXY_SEGMENT_LEN, qo_len - first)
+            kv_len = prefix + first + n
+            pages = (kv_len + page_size - 1) // page_size
+            seg_qo_lens.append(n)
+            seg_kv_lens.append(kv_len)
+            seg_offsets.append(prefix + first)
+            seg_pages.append(pages)
+            seg_shifts.append(row_first_page - num_gathered)
+            num_gathered += pages
+        row_first_page += (prefix + qo_len + page_size - 1) // page_size
+    plan = fmha_sm100.fmha_sm100_plan(
+        torch.tensor(seg_qo_lens, dtype=torch.int32),
+        torch.tensor(seg_kv_lens, dtype=torch.int32),
+        qo_offset=torch.tensor(seg_offsets, dtype=torch.int32),
+        page_size=page_size,
+        num_kv_splits=num_kv_splits,
+        causal=True,
+        num_qo_heads=num_index_heads,
+        num_kv_heads=1,
+        output_maxscore=True,
+    )
+    # fmha_sm100 sizes a request's page span by its kv_len, so each segment gets its own page copy.
+    staged = async_tensor_h2d([seg_shifts, seg_pages], torch.int64, kv_indices.device)
+    gather = torch.arange(num_gathered, device=kv_indices.device)
+    gather += torch.repeat_interleave(staged[0], staged[1], output_size=num_gathered)
+    return plan, kv_indices.index_select(0, gather)
+
+
+def segmented_proxy_plan(
+    fmha_sm100: ModuleType,
+    qo_lens_cpu: torch.Tensor,
+    qo_offset_cpu: torch.Tensor,
+    *,
+    num_index_heads: int,
+    page_size: int,
+    kv_indices: torch.Tensor,
+) -> Optional[tuple[tuple, torch.Tensor]]:
+    """KV-split proxy plan for these rows and the page table it reads, or None to plan them unsplit.
+
+    Run it over exactly these rows' query tokens: its per-split workspace is strided by that count.
+
+    Args:
+        fmha_sm100: The MSA kernel module.
+        qo_lens_cpu: [rows] host int32 query lengths.
+        qo_offset_cpu: [rows] host int32 cached prefix lengths.
+        num_index_heads: Index heads on this rank.
+        page_size: Tokens per page.
+        kv_indices: Device int32 flattened page table whose prefix holds these rows' pages.
+    """
+    qo_lens, qo_offsets = qo_lens_cpu.tolist(), qo_offset_cpu.tolist()
+    num_kv_splits = _proxy_kv_splits(qo_lens, qo_offsets, num_index_heads)
+    if num_kv_splits == 0:
+        return None
+    return _segmented_proxy_plan(
+        fmha_sm100,
+        qo_lens,
+        qo_offsets,
+        num_index_heads=num_index_heads,
+        page_size=page_size,
+        num_kv_splits=num_kv_splits,
+        kv_indices=kv_indices,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_size: int) -> None:
+    """Load, compiling where missing, the fmha_sm100 variants segmented proxy plans run.
+
+    Warmup never segments, and compiling a variant inline stalls every rank for over a minute.
+
+    Args:
+        dtype: Index-K cache dtype, which index Q is cast to.
+        num_index_heads: Index heads on this rank.
+        page_size: Tokens per page.
+    """
+    fmha_sm100 = require_msa_module()
+    idx_q = torch.zeros(
+        _PROXY_SEGMENT_LEN, num_index_heads, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda"
+    )
+    num_pages = (_PROXY_SEGMENT_LEN + page_size - 1) // page_size
+    idx_k = torch.zeros(num_pages, 1, page_size, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda")
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+    for num_kv_splits in (1, 2):
+        plan, plan_kv_indices = _segmented_proxy_plan(
+            fmha_sm100,
+            [_PROXY_SEGMENT_LEN],
+            [0],
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            num_kv_splits=num_kv_splits,
+            kv_indices=kv_indices,
+        )
+        fmha_sm100.fmha_sm100(
+            idx_q,
+            idx_k,
+            idx_k,
+            plan,
+            kv_indices=plan_kv_indices,
+            output_o=False,
+            output_maxscore=True,
+        )
 
 
 def _combined_topk_table(
@@ -398,4 +545,9 @@ class MsaIndexer:
         )
 
 
-__all__ = ["MsaIndexer", "cutedsl_score_runner"]
+__all__ = [
+    "MsaIndexer",
+    "cutedsl_score_runner",
+    "prewarm_split_proxy_variants",
+    "segmented_proxy_plan",
+]

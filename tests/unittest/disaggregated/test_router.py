@@ -12,6 +12,7 @@ from unittest import mock
 import aiohttp
 import msgpack
 import pytest
+from llmapi.apps.render_helpers import use_harmony_vocab
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.runtime.kv_cache_hash import (hash_v1_block_key,
@@ -1865,7 +1866,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
     tokenize prompts differently from the rest of TRT-LLM when computing
     block hashes for cache hits. The request's model is client-controlled, so
     it must not enable remote tokenizer code unless an operator configured a
-    fixed tokenizer directory.
+    fixed tokenizer directory. The router loads through ``load_hf_tokenizer``,
+    the loader a worker uses, so its tokenizer options (and rendering
+    fingerprint) are the worker's.
     """
 
     class _Probe(BlockHashMixin):
@@ -1881,7 +1884,11 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=wrapper) as routed:
         out = probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("dummy/model", trust_remote_code=False)
+    routed.assert_called_once()
+    assert routed.call_args.args == ("dummy/model", )
+    assert routed.call_args.kwargs["trust_remote_code"] is False
+    # The worker's loader options, which the fingerprint's tokenizer identity includes.
+    assert routed.call_args.kwargs["legacy"] is False
     # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
     # not the TransformersTokenizer wrapper.
     assert out is inner
@@ -1897,7 +1904,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=fixed_wrapper) as routed:
         fixed_out = fixed_probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("/trusted/tokenizer", trust_remote_code=True)
+    routed.assert_called_once()
+    assert routed.call_args.args == ("/trusted/tokenizer", )
+    assert routed.call_args.kwargs["trust_remote_code"] is True
     assert fixed_out is fixed_inner
     assert fixed_probe._tokenizers["dummy/model"] is fixed_inner
 
@@ -1985,8 +1994,13 @@ def test_router_model_type_uses_checkpoint_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
+async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """KV-cache routing must hash the same Harmony tokens used by the server."""
+    use_harmony_vocab(monkeypatch)
+    from tensorrt_llm.serve.chat_tokenization import \
+        tokenize_harmony_chat_request
+    from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     router = KvCacheAwareRouter(server_role=None,
@@ -1996,10 +2010,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
                                 tokens_per_block=32,
                                 model_path="/models/gpt-oss-checkpoint")
     router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
-    harmony_tokens = [100, 101, 102, 103]
-    harmony_adapter = mock.MagicMock()
-    harmony_adapter.openai_to_harmony_tokens.return_value = harmony_tokens
-    harmony_adapter.get_stop_tokens.return_value = [42]
+    harmony_adapter = get_harmony_adapter()
     promise = mock.MagicMock()
     promise.prompt_token_ids = []
 
@@ -2020,6 +2031,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     )
     router_request = copy.deepcopy(request)
     server_request = copy.deepcopy(request)
+    harmony_tokens = tokenize_harmony_chat_request(copy.deepcopy(request))
 
     server = OpenAIServer.__new__(OpenAIServer)
     server.allow_request_chat_template = False
@@ -2033,15 +2045,20 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
         vocab_size=1000))
 
-    with mock.patch.object(
-            router, "_get_tokenizer",
-            return_value=router_tokenizer), mock.patch(
-                "tensorrt_llm.serve.harmony_adapter."
-                "get_harmony_adapter",
-                return_value=harmony_adapter), mock.patch(
-                    "tensorrt_llm.serve.router_utils."
-                    "resolve_model_type_from_config",
-                    return_value="gpt_oss") as resolve_model_type:
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=router_tokenizer), mock.patch(
+                               "tensorrt_llm.serve.router_utils."
+                               "resolve_model_type_from_config",
+                               return_value="gpt_oss") as resolve_model_type:
+        # Tokens are forwarded only to workers that report the router's
+        # rendering fingerprint.
+        router._server_info = {
+            "server1": {
+                "render_fingerprint":
+                router._render_resources(request.model).fingerprint()
+            }
+        }
         router_token_ids = router._tokenize(router_request)[0]
         await server.chat_harmony(server_request, raw_request=None)
 
@@ -2049,9 +2066,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
         "inputs"]
     assert router_token_ids == server_token_ids
     assert router_request.prompt_token_ids == harmony_tokens
-    first_call, second_call = harmony_adapter.openai_to_harmony_tokens.call_args_list
-    assert first_call.args == second_call.args
-    assert first_call.kwargs == second_call.kwargs
+    assert server_token_ids == harmony_tokens
     resolve_model_type.assert_called_once_with("/models/gpt-oss-checkpoint")
     router_tokenizer.apply_chat_template.assert_not_called()
 
@@ -2310,6 +2325,11 @@ class _PrefixCacheFakeTokenizer:
 
     _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
 
+    # A stable serialization of the encoding, so the rendering fingerprint can
+    # identify this tokenizer (one without it is never trusted for write-back).
+    backend_tokenizer = SimpleNamespace(
+        to_str=lambda: '{"fake": "prefix-cache"}')
+
     def apply_chat_template(self,
                             messages,
                             add_generation_prompt=False,
@@ -2373,6 +2393,15 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
                                 tokens_per_block=4)
     tok = _PrefixCacheFakeTokenizer()
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        # Tokens are forwarded only when every active worker reports the
+        # router's rendering fingerprint.
+        fingerprint = router._render_resources("mock").fingerprint()
+        router._server_info = {
+            server: {
+                "render_fingerprint": fingerprint
+            }
+            for server in servers
+        }
         for convo in _grow_conversation():
             req = ChatCompletionRequest(model="mock", messages=convo)
             rendered = tok.apply_chat_template(

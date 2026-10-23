@@ -261,6 +261,38 @@ async def test_coordinator_exposes_role_hash_algorithm():
 
 
 @pytest.mark.asyncio
+async def test_coordinator_publishes_worker_render_fingerprints_to_the_frontend():
+    ctx_server = "127.0.0.1:1234"
+    config = _make_config([ctx_server], [], "kv_cache_aware", "round_robin")
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+    fingerprint = {
+        "digest": "d",
+        "compared": {"tokenizer": {"complete": True, "vocab_sha256": "big"}},
+        "info": {"tool_parser": None, "reasoning_parser": "poolside_v1"},
+    }
+    coordinator.ctx_router._server_info = {ctx_server: {"render_fingerprint": fingerprint}}
+
+    info = await coordinator.cluster_info()
+
+    # Only what the match reads is published, not the whole fingerprint; the worker's
+    # reasoning parser rides along for the router's decision about forwarding ids.
+    assert info["render_fingerprints"]["context"] == {
+        ctx_server: {
+            "digest": "d",
+            "compared": {"use_harmony": False, "tokenizer": {"complete": True}},
+            "reasoning_parser": "poolside_v1",
+        }
+    }
+    assert info["render_fingerprints"]["generation"] == {}
+
+    client = CoordinatorClient("http://coordinator", config)
+    local = client.ctx_router._local
+    client._sync_render_fingerprints(info)
+    assert local._published_render_fingerprints == info["render_fingerprints"]["context"]
+    await client.stop()
+
+
+@pytest.mark.asyncio
 async def test_coordinator_expires_stale_reservation():
     config = _make_config([], ["gen:8000"], "round_robin", "conversation")
     coordinator = DisaggCoordinatorService(
