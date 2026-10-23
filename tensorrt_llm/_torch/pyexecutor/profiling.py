@@ -46,6 +46,7 @@ import os
 import time
 import uuid
 import weakref
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Dict, List, Optional
 
@@ -62,6 +63,14 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_glo
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+
+def _profile_trace_path(
+    path: str, rank: int, start_iter: int, stop_iter: int, multiple_ranges: bool
+) -> str:
+    base, extension = os.path.splitext(path)
+    suffix = f"-iterations-{start_iter}-{stop_iter}" if multiple_ranges else ""
+    return f"{base}-rank-{rank}{suffix}{extension}"
 
 
 @functools.cache
@@ -582,7 +591,7 @@ class PyExecutorProfileManager:
     # ---- per-iteration driver (executor thread) --------------------
 
     @contextmanager
-    def profile_step(self):
+    def profile_step(self) -> Iterator[Callable[[], None]]:
         """Context manager driving per-iteration profile bookkeeping.
 
         Replaces the inline ``_profiler()`` context manager that used
@@ -594,10 +603,21 @@ class PyExecutorProfileManager:
         ``stop`` MUST happen on the same thread, so all of the
         per-iteration ``torch.profiler`` activations live here
         rather than on the HTTP-caller path.
+
+        Execution capture registers lazily at the first non-warmup start,
+        aggregates selected ranges, and unregisters on context exit. Cleanup
+        attempts every resource; a workload or startup exception takes
+        precedence over cleanup failures.
         """
         executor = self._executor
         it = -1
         enabled = False
+        calibrator_started = False
+        cuda_profiler_started = False
+        torch_profiler_started = False
+        execution_trace_observer: torch.profiler.ExecutionTraceObserver | None = None
+        active_profile_start_iter = 0
+        active_env_trace = False
         start_time = None
 
         # These events are used to record the time of the previous
@@ -613,17 +633,12 @@ class PyExecutorProfileManager:
         prev_fetch_requests_cur_rank = 0
 
         env_torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
-        if env_torch_trace_path is not None:
-            # Append the rank so each rank writes to its own file.
-            # Without this, TP/PP/DP > 1 runs have every rank calling
-            # ``torch_profiler.export_chrome_trace()`` on the same
-            # path concurrently, producing interleaved output that
-            # fails to parse in Chrome tracing / Perfetto.
-            trace_base, trace_ext = os.path.splitext(env_torch_trace_path)
-            env_torch_trace_path = f"{trace_base}-rank-{executor.global_rank}{trace_ext}"
+        env_enable_execution_trace = os.environ.get("ENABLE_PYTORCH_EXECUTION_TRACE", "0") == "1"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
-        env_enable_torch_trace = bool(env_torch_trace_path and profile_start_stop)
-        if env_torch_trace_path and profile_start_stop is None:
+        env_enable_torch_trace = bool(
+            (env_torch_trace_path or env_enable_execution_trace) and profile_start_stop
+        )
+        if (env_torch_trace_path or env_enable_execution_trace) and not profile_start_stop:
             logger.warning(
                 f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
                 "needs to be set to enable the torch trace. Example to "
@@ -659,13 +674,72 @@ class PyExecutorProfileManager:
         # method-name lookup per iteration.
         activities_from_names = self._activities_from_names
 
-        def profile_step_fn():
+        def finish_window() -> None:
+            nonlocal enabled, calibrator_started, cuda_profiler_started
+            nonlocal torch_profiler_started
+            nonlocal torch_profiler, active_torch_trace_path, active_enable_torch_trace
+            error: BaseException | None = None
+
+            def attempt(action: Callable[[], None]) -> None:
+                nonlocal error
+                try:
+                    action()
+                except BaseException as caught:
+                    # Cleanup is an observational boundary: release every
+                    # resource, including during cancellation, then report
+                    # the first failure without replacing a workload error.
+                    if error is None:
+                        error = caught
+                    else:
+                        logger.error(f"Additional profiler cleanup failure: {caught!r}")
+
+            if torch_profiler_started and torch_profiler is not None:
+                torch_profiler_started = False
+                attempt(torch_profiler.stop)
+                if error is not None and execution_trace_observer is not None:
+                    # A failed profiler operation may leave its observer
+                    # running even after the window has been abandoned.
+                    attempt(execution_trace_observer.stop)
+                if error is None and active_torch_trace_path:
+                    trace_path = active_torch_trace_path
+                    if active_env_trace:
+                        trace_path = _profile_trace_path(
+                            trace_path,
+                            executor.global_rank,
+                            active_profile_start_iter,
+                            executor.iter_counter,
+                            len(executor.profile_start_iters) > 1,
+                        )
+                    attempt(lambda: torch_profiler.export_chrome_trace(trace_path))
+            if cuda_profiler_started:
+                cuda_profiler_started = False
+                attempt(lambda: torch.cuda.cudart().cudaProfilerStop())
+            if calibrator_started:
+                calibrator_started = False
+                attempt(calibrator.stop)
+            enabled = False
+            torch_profiler = None
+            active_torch_trace_path = None
+            active_enable_torch_trace = False
+            with executor._profile_state_lock:
+                executor._profile_enabled = False
+                executor._runtime_profile_pending_start_iter = None
+                executor._runtime_profile_pending_stop_iter = None
+            if error is not None:
+                raise error
+
+        def profile_step_fn() -> None:
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
+            nonlocal active_profile_start_iter, active_env_trace
+            nonlocal calibrator_started, cuda_profiler_started, torch_profiler_started
+            nonlocal execution_trace_observer
             calibrator.post_step(it)
+            if enabled and torch_profiler is not None:
+                torch_profiler.step()
             if executor.iter_counter in executor.profile_stop_iters and not executor.is_warmup:
                 if not enabled:
                     # Happens when stop_profile() was called before
@@ -681,33 +755,12 @@ class PyExecutorProfileManager:
                         "profiling window - skipping"
                     )
                     executor.profile_stop_iters.discard(executor.iter_counter)
-                else:
-                    if active_enable_torch_trace and torch_profiler is not None:
-                        torch_profiler.stop()
-                        torch_profiler.export_chrome_trace(active_torch_trace_path)
-                        logger.info(
-                            f"Profiling stopped at iteration "
-                            f"{executor.iter_counter}, "
-                            f"trace saved to {active_torch_trace_path}"
-                        )
-                    torch.cuda.cudart().cudaProfilerStop()
-                    calibrator.stop()
-                    enabled = False
-                    # Reset lazy state so a subsequent start/stop
-                    # window can pick up a fresh runtime
-                    # configuration.
-                    torch_profiler = None
-                    active_torch_trace_path = None
                     with executor._profile_state_lock:
-                        executor._profile_enabled = False
-                        # Clear the pending-stop marker so
-                        # ``start_profile()``'s guard no longer sees a
-                        # stale window. Same critical section as
-                        # ``_profile_enabled`` so a caller thread
-                        # cannot observe "not enabled but still
-                        # pending" and reject a legitimate restart.
                         if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
+                            executor._runtime_profile_pending_start_iter = None
                             executor._runtime_profile_pending_stop_iter = None
+                else:
+                    finish_window()
                 active_enable_torch_trace = False
 
             # Capture per-loop timing whenever stats or the iter log
@@ -797,6 +850,8 @@ class PyExecutorProfileManager:
                 runtime_trace_path = executor._runtime_profile_trace_path
                 runtime_cuda_only = executor._runtime_profile_cuda_only
                 runtime_activities = executor._runtime_profile_activities
+                active_profile_start_iter = executor.iter_counter
+                active_env_trace = runtime_trace_path is None
                 if runtime_trace_path is not None:
                     active_torch_trace_path = runtime_trace_path
                     # CUDA_PROFILER only: skip torch.profiler so we
@@ -818,14 +873,34 @@ class PyExecutorProfileManager:
                         torch.profiler.ProfilerActivity.XPU,
                     ]
 
-                calibrator.start()
-                torch.cuda.cudart().cudaProfilerStart()
-                if active_enable_torch_trace:
-                    if torch_profiler is None:
+                try:
+                    calibrator_started = True
+                    calibrator.start()
+                    cuda_profiler_started = True
+                    torch.cuda.cudart().cudaProfilerStart()
+                    if active_enable_torch_trace:
                         torch_profiler = torch.profiler.profile(
-                            activities=torch_activities, record_shapes=True, with_modules=True
+                            activities=torch_activities,
+                            execution_trace_observer=execution_trace_observer,
+                            schedule=lambda _: torch.profiler.ProfilerAction.RECORD,
+                            record_shapes=True,
+                            with_modules=True,
+                            experimental_config=torch._C._profiler._ExperimentalConfig(
+                                enable_cuda_sync_events=True
+                            ),
                         )
-                    torch_profiler.start()
+                        if execution_trace_observer is None:
+                            execution_trace_observer = torch_profiler.execution_trace_observer
+                        torch_profiler_started = True
+                        torch_profiler.start()
+                except BaseException:
+                    # Startup may acquire only part of a window. Roll back
+                    # on the executor thread and retain the startup failure.
+                    try:
+                        finish_window()
+                    except BaseException as cleanup_error:
+                        logger.error(f"Profiler startup rollback failed: {cleanup_error!r}")
+                    raise
                 logger.info(f"Profiling started at iteration {executor.iter_counter}.")
                 enabled = True
                 with executor._profile_state_lock:
@@ -857,23 +932,45 @@ class PyExecutorProfileManager:
                         start_event_2 = torch.cuda.Event(enable_timing=True)
                     start_event_2.record()
 
+        body_failed = False
         try:
             yield profile_step_fn
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            if enabled:
-                # Stop on early exit / exception
-                if active_enable_torch_trace and torch_profiler is not None:
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(active_torch_trace_path)
-                    logger.info(
-                        f"Profiling stopped at iteration "
-                        f"{executor.iter_counter}, "
-                        f"trace saved to {active_torch_trace_path}"
-                    )
-                torch.cuda.cudart().cudaProfilerStop()
-                calibrator.stop()
+            cleanup_error: BaseException | None = None
+            try:
+                if enabled:
+                    finish_window()
+            except BaseException as caught:
+                cleanup_error = caught
+            finally:
+                if execution_trace_observer is not None:
+                    try:
+                        execution_trace_observer.unregister_callback()
+                    except BaseException as caught:
+                        if cleanup_error is None:
+                            cleanup_error = caught
+                        else:
+                            logger.error(f"Observer cleanup failed: {caught!r}")
                 with executor._profile_state_lock:
                     executor._profile_enabled = False
+                    pending_start = executor._runtime_profile_pending_start_iter
+                    pending_stop = executor._runtime_profile_pending_stop_iter
+                    if pending_start is not None:
+                        executor.profile_start_iters.discard(pending_start)
+                    if pending_stop is not None:
+                        executor.profile_stop_iters.discard(pending_stop)
+                    executor._runtime_profile_pending_start_iter = None
+                    executor._runtime_profile_pending_stop_iter = None
+            if cleanup_error is not None:
+                if body_failed:
+                    logger.error(
+                        f"Profiler cleanup failed during executor exception: {cleanup_error!r}"
+                    )
+                else:
+                    raise cleanup_error
 
     # ---- shutdown --------------------------------------------------
 
