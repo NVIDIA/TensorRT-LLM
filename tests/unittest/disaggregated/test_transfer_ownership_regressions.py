@@ -1405,16 +1405,17 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
 
 
 @pytest.mark.cpu_only
-def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> None:
+def test_sender_failed_result_is_queued_on_the_stream_worker_in_order(monkeypatch) -> None:
     rid = 98
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = False
     sender._instance_rank = 5
+    sender._num_threads = 4
+    sender._send_task_queues = [queue.Queue() for _ in range(sender._num_threads)]
     sender._registrar = SimpleNamespace(
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
     )
-    dealer = Mock()
-    sender._get_or_connect_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock()
     info = transfer_mod.RecvReqInfo(
         sender_req_id=18,
         instance_name="gen",
@@ -1434,8 +1435,78 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
     sender._registrar.get_peer_rank_info.assert_called_once_with("gen", 2)
     make_kv_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
     make_aux_result.assert_called_once_with(5, rid, AgentResult.FAILED)
-    sender._get_or_connect_dealer.assert_called_once_with("receiver")
-    assert [send.args[0] for send in dealer.send.call_args_list] == [kv_message, aux_message]
+    # The listener only queues; the stream's worker sends on its own DEALER.
+    sender._get_or_connect_thread_dealer.assert_not_called()
+    stream_queue = sender._send_task_queues[sender._worker_index(rid, info.instance_rank)]
+    assert [stream_queue.get_nowait(), stream_queue.get_nowait()] == [
+        ("receiver", kv_message),
+        ("receiver", aux_message),
+    ]
+    assert all(worker_queue.empty() for worker_queue in sender._send_task_queues)
+
+
+@pytest.mark.cpu_only
+def test_cancel_to_receivers_is_queued_behind_each_stream_earlier_reports() -> None:
+    rid = 99
+    peer_ranks = (0, 1, 2)
+    sender = object.__new__(transfer_mod.Sender)
+    sender._num_threads = 4
+    sender._send_task_queues = [queue.Queue() for _ in range(sender._num_threads)]
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests = {
+        rid: {
+            rank: transfer_mod.RecvReqInfo(
+                sender_req_id=19,
+                instance_name="gen",
+                instance_rank=rank,
+                block_ids_per_layer_groups=[],
+                unique_rid=rid,
+            )
+            for rank in peer_ranks
+        }
+    }
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(
+            side_effect=lambda name, rank: SimpleNamespace(self_endpoint=f"receiver{rank}")
+        )
+    )
+    earlier_report = {rank: ("receiver%d" % rank, [b"earlier report"]) for rank in peer_ranks}
+    for rank in peer_ranks:
+        sender._send_task_queues[sender._worker_index(rid, rank)].put(earlier_report[rank])
+
+    sender.send_cancel_to_receivers(rid)
+
+    cancel = [MessageType.CANCEL_SESSION, str(rid).encode("ascii")]
+    for rank in peer_ranks:
+        stream_queue = sender._send_task_queues[sender._worker_index(rid, rank)]
+        queued = list(stream_queue.queue)
+        assert queued.index(earlier_report[rank]) < queued.index((f"receiver{rank}", cancel))
+
+
+@pytest.mark.cpu_only
+def test_send_task_complete_does_not_overwrite_a_failure() -> None:
+    task = transfer_mod.KVSendTask(
+        _sole_piece(),
+        DisaggregatedParams(disagg_request_id=100),
+        slice_id=0,
+    )
+    failure = RuntimeError("another peer's write failed")
+
+    task.fail(failure)
+    task.complete()
+
+    assert task.is_done
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    assert task._exception is failure
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_threads", [0, -1])
+def test_sender_rejects_fewer_than_one_worker_thread(monkeypatch, num_threads: int) -> None:
+    monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", num_threads)
+
+    with pytest.raises(ValueError, match="TRTLLM_KV_TRANSFER_NUM_THREADS must be at least 1"):
+        transfer_mod.Sender(Mock(), Mock())
 
 
 @pytest.mark.cpu_only
@@ -1737,7 +1808,7 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     sender._agent = Mock()
     sender._bounce = Mock()
     dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     task = transfer_mod.KVSendTask(
         _sole_piece(),
         DisaggregatedParams(disagg_request_id=rid),
@@ -1776,7 +1847,7 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     sender._agent.submit_transfer_requests.assert_not_called()
     assert task.resources_drained
     assert task.status == transfer_mod.TaskStatus.ERROR
-    sender._get_result_dealer.assert_called_once_with("receiver", legacy_shared=True)
+    sender._get_or_connect_thread_dealer.assert_called_once_with("receiver")
     dealer.send.assert_called_once()
     instance_rank, result_rid, result_slice, is_last, status_code, _ = (
         transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])
@@ -1903,7 +1974,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
         submit_transfer_requests=submit,
     )
     dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     request = Mock(op="WRITE", remote_name="gen2")
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
 
@@ -2094,39 +2165,6 @@ def test_sender_registration_does_not_wait_for_active_transfer(
     sender._agent.load_remote_agent.assert_called_once_with("gen2", b"descriptor")
     assert sender._loaded_remote_agents == {"gen2"}
     assert not task.resources_drained
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("ownership_enabled", "legacy_shared", "uses_shared_dealer"),
-    [
-        (False, True, True),
-        (False, False, False),
-        (True, True, False),
-        (True, False, False),
-    ],
-)
-def test_sender_result_dealer_preserves_legacy_early_failure_routing(
-    ownership_enabled: bool,
-    legacy_shared: bool,
-    uses_shared_dealer: bool,
-) -> None:
-    sender = object.__new__(transfer_mod.Sender)
-    sender._enforce_physical_ownership = ownership_enabled
-    shared_dealer = Mock()
-    thread_dealer = Mock()
-    sender._get_or_connect_dealer = Mock(return_value=shared_dealer)
-    sender._get_or_connect_thread_dealer = Mock(return_value=thread_dealer)
-
-    dealer = sender._get_result_dealer("receiver", legacy_shared=legacy_shared)
-
-    assert dealer is (shared_dealer if uses_shared_dealer else thread_dealer)
-    if uses_shared_dealer:
-        sender._get_or_connect_dealer.assert_called_once_with("receiver")
-        sender._get_or_connect_thread_dealer.assert_not_called()
-    else:
-        sender._get_or_connect_dealer.assert_not_called()
-        sender._get_or_connect_thread_dealer.assert_called_once_with("receiver")
 
 
 @pytest.mark.cpu_only

@@ -247,7 +247,7 @@ def test_sender_late_done_reports_physical_failure_only(
     request = SimpleNamespace(op="WRITE", remote_name="gen")
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
     dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     meta = transfer_mod.WriteMeta(
         task=task,
         expected_transfers=1,
@@ -371,7 +371,7 @@ def test_settlement_retries_in_order_without_releasing_twice() -> None:
     initial = transfer_mod._make_kv_result_msg(7, 401, 3, False, transfer_mod.AgentResult.IN_DOUBT)
     dealer = Mock()
     dealer.send.side_effect = [RuntimeError("initial send"), None, RuntimeError("late send"), None]
-    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     sender._retain_in_doubt_transfer(meta, initial, send_slot_id=12)
     status.is_completed.assert_not_called()
     sender._poll_in_doubt_transfers(0)
@@ -458,11 +458,11 @@ def test_committed_session_outcome_survives_late_settlement(
 def test_listener_failure_uses_worker_stream_in_ownership_bridge() -> None:
     sender = _sender()
     sender._send_task_queues = [queue.Queue()]
-    sender._get_or_connect_dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock()
     info = SimpleNamespace(unique_rid=401, instance_rank=7)
     message = [transfer_mod.MessageType.KV_AGENT_RESULT, b"failed"]
-    sender._route_result_messages_to_receiver(info, "receiver", [message], defer_to_worker=False)
-    sender._get_or_connect_dealer.assert_not_called()
+    sender._queue_to_receiver_stream(info, "receiver", [message])
+    sender._get_or_connect_thread_dealer.assert_not_called()
     assert sender._send_task_queues[0].get_nowait() == ("receiver", message)
     sender._shutdown = True
 
@@ -506,7 +506,7 @@ def test_worker_polls_retained_status_when_queue_is_idle(
                 raise RuntimeError("initial send failed")
 
         dealer.send.side_effect = send
-    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     sender._retain_in_doubt_transfer(
         meta,
         transfer_mod._make_kv_result_msg(7, 401, 0, False, transfer_mod.AgentResult.IN_DOUBT),
