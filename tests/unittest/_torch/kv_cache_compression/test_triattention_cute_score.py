@@ -327,21 +327,27 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
     with mock.patch.object(torch.cuda, "mem_get_info", return_value=(0, 1)):
         assert tri._try_score_workspace(2) is None
 
-    # Exercise the actual score -> top-k -> native compact chain on a mixed
-    # cohort, then require the resident path to reproduce its KV bytes without
-    # any device allocation after warmup.
+    # Exercise allocation failure through the scheduling entry point, including
+    # publication and resize, on the first eviction after initialization.
+    from types import SimpleNamespace
+
     from conftest import make_eviction_request, make_request
 
     original_pools = [pool.clone() for pool in tri._target_layout["layer_pools"]]
     original_offsets = tri._block_offsets_device.clone()
-    requests = [
-        make_eviction_request(
-            request=make_request(i, py_prompt_len=int(prompts[i])),
-            source_length=int(lengths[i]),
-        )
-        for i in range(2)
-    ]
+    requests = [make_request(i, py_prompt_len=int(prompts[i])) for i in range(2)]
+    batch = SimpleNamespace(generation_requests=requests)
     tri.kv_cache_manager._stream = torch.cuda.current_stream()
+    tri._prepared_generation_batch = None
+    tri._num_extra_kv_tokens = 0
+    tri._overlap_tail_length = 1
+    tri.beta = 64
+    tri._global_layers = list(range(2))
+    tri._calibration_q_real = tri._score_q_real
+    tri._calibration_q_imag = tri._score_q_imag
+    tri._calibration_mlr_coef = tri._score_mlr_coef
+    tri._omega = tri._phase_omega
+    layout = tri._target_layout
 
     def stage(manager, request_ids, host, device):
         for row, request_id in enumerate(request_ids):
@@ -351,50 +357,67 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
         for mode in ("union", "per_head", "per_layer_perhead"):
             tri.eviction_mode = mode
             tri._selection_width_capacity = 256
-            tri._allocate_selection_buffers(torch.device("cuda"), tp_size=1)
-            tri._build_score_runtime(score_token_capacity=384)
-            for pool, original in zip(tri._target_layout["layer_pools"], original_pools):
+            for pool, original in zip(layout["layer_pools"], original_pools):
                 pool.copy_(original)
-            optional = tri._try_score_workspace(2)
-            assert optional is not None
-            tri._execute_eviction_round(requests, score_workspace=optional)
-            expected_pools = [pool.clone() for pool in tri._target_layout["layer_pools"]]
-            del optional
-            # Compile the single-request top-k/reduction variants before the
-            # allocation check; kernels always write caller-owned outputs.
-            for item in requests:
-                tri._execute_eviction_round([item])
-            for pool, original in zip(tri._target_layout["layer_pools"], original_pools):
-                pool.copy_(original)
+            with mock.patch.object(tri, "_create_kv_layout", return_value=layout):
+                tri._initialize_eviction_state()
+            # Initialization launches the fallback kernels with no KV reads or
+            # moves: the entire nonzero pool must remain unchanged.
+            for pool, original in zip(layout["layer_pools"], original_pools):
+                torch.testing.assert_close(pool, original, rtol=0, atol=0)
+            tri.kv_cache_manager.kv_cache_map = {
+                i: SimpleNamespace(
+                    is_active=True,
+                    capacity=int(lengths[i]),
+                    history_length=int(lengths[i]),
+                    resize=mock.Mock(return_value=True),
+                )
+                for i in range(2)
+            }
+            for request in requests:
+                request.py_num_compressed_tokens = 0
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
-            with mock.patch.object(
-                torch, "empty", side_effect=AssertionError("fallback allocated")
+            with (
+                mock.patch.object(torch.cuda, "mem_get_info", return_value=(2**40, 2**40)),
+                mock.patch.object(torch, "empty", side_effect=torch.OutOfMemoryError) as allocate,
+                mock.patch.object(
+                    tri, "_execute_eviction_round", wraps=tri._execute_eviction_round
+                ) as execute,
             ):
-                for item in requests:
-                    tri._execute_eviction_round([item])
+                tri._evict_due_requests(batch)
             torch.cuda.synchronize()
+            allocate.assert_called_once()
+            assert execute.call_count == 2
+            assert [call.args[0][0].request for call in execute.call_args_list] == requests
+            assert all(
+                len(call.args[0]) == 1 and not call.kwargs for call in execute.call_args_list
+            )
             assert torch.cuda.max_memory_allocated() == allocated
-            for pool, expected in zip(tri._target_layout["layer_pools"], expected_pools):
-                torch.testing.assert_close(pool, expected, rtol=0, atol=0)
-    with (
-        mock.patch.object(torch.cuda, "mem_get_info", return_value=(2**40, 2**40)),
-        mock.patch.object(torch, "empty", side_effect=torch.OutOfMemoryError),
-    ):
-        assert tri._try_score_workspace(2) is None
+            for i, request in enumerate(requests):
+                assert request.py_num_compressed_tokens == 193 - tri.budget
+                tri.kv_cache_manager.kv_cache_map[i].resize.assert_called_once_with(
+                    int(prompts[i]) + tri.budget, None
+                )
+            fallback_pools = [pool.clone() for pool in layout["layer_pools"]]
 
-    # Initialization itself materializes the fallback, before any admission or
-    # eviction. Profiling therefore observes this storage without a synthetic
-    # long-running request or a second explicit reservation.
-    tri._global_layers = list(range(2))
-    tri._calibration_q_real = tri._score_q_real
-    tri._calibration_q_imag = tri._score_q_imag
-    tri._calibration_mlr_coef = tri._score_mlr_coef
-    tri._omega = tri._phase_omega
-    layout = tri._target_layout
-    with mock.patch.object(tri, "_create_kv_layout", return_value=layout):
-        tri._initialize_eviction_state()
+            # The batch reference needs only a small explicit allocation; it
+            # must not depend on the shared GPU's free-memory admission check.
+            for request in requests:
+                request.py_num_compressed_tokens = 0
+            for pool, original in zip(layout["layer_pools"], original_pools):
+                pool.copy_(original)
+            optional = torch.empty(tri._score_scratch.numel() * 2, device="cuda")
+            eviction_requests = [
+                make_eviction_request(request=request, source_length=int(lengths[i]))
+                for i, request in enumerate(requests)
+            ]
+            tri._execute_eviction_round(eviction_requests, score_workspace=optional)
+            for pool, expected in zip(layout["layer_pools"], fallback_pools):
+                torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+            del optional
+
     assert tri._score_scratch.numel() == 8 * 2 * (tri._selection_width_capacity + 128)
     assert tri._score_token_capacity < int(prompts.min())
     ptr = tri._score_scratch.data_ptr()
