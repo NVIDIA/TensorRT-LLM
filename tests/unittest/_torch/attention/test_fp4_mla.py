@@ -1537,6 +1537,39 @@ def _expand_qk_residual_terms(
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
+)
+def test_fp4_mla_pool_views_built_in_inference_mode_can_be_scrubbed(monkeypatch) -> None:
+    """Cached FP4 MLA pool views stay writable outside inference mode.
+
+    Warmup forwards run under ``torch.inference_mode`` and are the first to
+    build and cache these views; the post-warmup KV-cache scrub then zeroes
+    every physical pool outside it.
+    """
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
+    try:
+        with torch.inference_mode():
+            manager.get_fp4_mla_cache_buffers(0)
+            manager.get_fp4_mla_cache_pool_bases()
+            for _ in manager._iter_fp4_mla_physical_pool_views():
+                pass
+        cached = [
+            tensor
+            for value in manager._fp4_mla_view_cache.values()
+            for tensor in (value if isinstance(value, tuple) else (value,))
+        ]
+        assert cached
+        assert not any(tensor.is_inference() for tensor in cached)
+        for view in manager._iter_fp4_mla_physical_pool_views():
+            view.zero_()
+        assert not manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+    finally:
+        manager.shutdown()
+
+
 def _create_fp4_mla_v2_manager(
     *,
     max_tokens: int,

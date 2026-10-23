@@ -48,6 +48,17 @@ from .layout import get_fp4_mla_v_scale_pool_size
 _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
 
 
+def _persistent_cache_view_mode() -> torch.inference_mode:
+    """Context for building cached views of persistent KV-cache storage.
+
+    The views are cached and also written outside inference mode, for
+    example by the post-warmup KV-cache scrub, but are often first built
+    inside a warmup forward. Building them with inference mode disabled keeps
+    them normal tensors.
+    """
+    return torch.inference_mode(False)
+
+
 def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
     """Whether this worker keeps a single-copy FP4 MLA cache.
 
@@ -730,14 +741,15 @@ class Fp4MlaV2CacheLayoutPolicy:
         for dim in reversed(page_shape):
             inner_strides.append(stride)
             stride *= dim
-        view = convert_to_torch_tensor(
-            TensorWrapper(
-                addr,
-                dtype,
-                (page_capacity, *page_shape),
-                (page_elems, *reversed(inner_strides)),
+        with _persistent_cache_view_mode():
+            view = convert_to_torch_tensor(
+                TensorWrapper(
+                    addr,
+                    dtype,
+                    (page_capacity, *page_shape),
+                    (page_elems, *reversed(inner_strides)),
+                )
             )
-        )
         self._fp4_mla_view_cache[cache_key] = view
         return view
 
@@ -882,18 +894,19 @@ class Fp4MlaV2CacheLayoutPolicy:
             inner_strides.append(stride)
             stride *= dim
         addr = int(self.impl.get_mem_pool_base_address(first_layer, role, PageIndexMode.SHARED))
-        view = convert_to_torch_tensor(
-            TensorWrapper(
-                addr,
-                dtype,
-                (len(layer_ids), physical_page_capacity, *page_shape),
-                (
-                    page_elems,
-                    page_elems,
-                    *reversed(inner_strides),
-                ),
+        with _persistent_cache_view_mode():
+            view = convert_to_torch_tensor(
+                TensorWrapper(
+                    addr,
+                    dtype,
+                    (len(layer_ids), physical_page_capacity, *page_shape),
+                    (
+                        page_elems,
+                        page_elems,
+                        *reversed(inner_strides),
+                    ),
+                )
             )
-        )
         self._fp4_mla_view_cache[cache_key] = view
         return view
 
@@ -921,7 +934,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             raise RuntimeError(
                 f"FP4 MLA V2 {role} page stride mismatch: {actual_stride} != {expected_stride}."
             )
-        pool = convert_to_torch_tensor(TensorWrapper(addr, dtype, (page_upper, *page_shape)))
+        with _persistent_cache_view_mode():
+            pool = convert_to_torch_tensor(TensorWrapper(addr, dtype, (page_upper, *page_shape)))
         self._fp4_mla_view_cache[cache_key] = pool
         return pool
 
