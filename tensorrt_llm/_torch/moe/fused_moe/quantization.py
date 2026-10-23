@@ -7248,6 +7248,11 @@ def _import_deep_gemm():
     try:
         from tensorrt_llm import deep_gemm as _dg
     except ImportError as e:
+        # An ImportError chained to an AttributeError (from
+        # tensorrt_llm.__getattr__) means deep_gemm raised while importing;
+        # surface it instead of turning it into _MegaMoEUnavailable.
+        if isinstance(e.__cause__, AttributeError):
+            raise
         raise _MegaMoEUnavailable(
             f"tensorrt_llm.deep_gemm not importable: {e}") from e
 

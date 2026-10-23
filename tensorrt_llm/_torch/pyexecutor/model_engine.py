@@ -16,6 +16,7 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
@@ -49,7 +50,7 @@ from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
-from .engine.lora import make_lora_model_config
+from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
@@ -555,6 +556,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self.iter_states = {}
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self._lora_owner: Optional[DecoderLoraOwner] = None
+        self._lora_model: Optional[torch.nn.Module] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self._model_caller = ModelCaller(
@@ -792,21 +795,25 @@ class PyTorchModelEngine(ModelEngine):
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
 
-    def set_lora_model_config(self,
-                              lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str],
-                              swap_gate_up_proj_lora_b_weight: bool = True):
-        # Called by `_util.py` after model loading, before graph-manager initialization.
-        self.lora_model_config = make_lora_model_config(
-            self.model, lora_target_modules, trtllm_modules_to_hf_modules,
-            swap_gate_up_proj_lora_b_weight)
+    def initialize_lora_owner(self) -> DecoderLoraOwner:
+        """Bind the decoder owner once, across resource-capacity estimation passes."""
+        if self._lora_owner is None:
+            self._lora_owner, self._lora_model = resolve_lora_owner(
+                self.model, self.input_processor)
+        return self._lora_owner
+
+    def set_lora_model_config(self, lora_model_config: LoraModelConfig) -> None:
+        """Share the validated configuration with decoder execution."""
+        self.lora_model_config = lora_model_config
         if isinstance(self._runner, DecoderRunner):
             self._runner.lora_model_config = self.lora_model_config
 
     def init_cuda_graph_lora_manager(self, lora_config: LoraConfig) -> None:
         """Build LoRA preparation state for the current executor resources."""
         if isinstance(self._runner, DecoderRunner):
-            self._runner.init_cuda_graph_lora_manager(lora_config)
+            assert self._lora_model is not None
+            self._runner.init_cuda_graph_lora_manager(lora_config,
+                                                      self._lora_model)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -1046,6 +1053,8 @@ class PyTorchModelEngine(ModelEngine):
         self._runner = None
         self._model_caller = None
         self._mm_item_scheduler = None
+        self._lora_model = None
+        self._lora_owner = None
         self.model = None
 
         self.input_processor = None

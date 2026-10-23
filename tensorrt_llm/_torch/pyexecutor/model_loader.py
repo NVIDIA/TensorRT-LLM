@@ -135,16 +135,22 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
         kv_cache_config.enable_block_reuse = False
 
 
+def effective_mamba_ssm_cache_dtype(config: ModelConfig,
+                                    mamba_ssm_cache_dtype: str) -> torch.dtype:
+    """The recurrent-state cache dtype the engine runs with."""
+    if mamba_ssm_cache_dtype == "auto":
+        return resolve_auto_ssm_cache_dtype(config.pretrained_config,
+                                            config.torch_dtype)
+    return str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+
 def validate_and_set_mamba_ssm_cache_dtype(
         config: ModelConfig,
         mamba_ssm_cache_dtype: str,
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
-    if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
-            config.pretrained_config, config.torch_dtype)
-    else:
-        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
+        config, mamba_ssm_cache_dtype)
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)

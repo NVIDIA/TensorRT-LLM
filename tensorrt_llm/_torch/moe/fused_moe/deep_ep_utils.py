@@ -15,7 +15,12 @@ try:
     from tensorrt_llm import deep_ep
     from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
-except ImportError:
+except ImportError as e:
+    # An ImportError chained to an AttributeError (from
+    # tensorrt_llm.__getattr__) means deep_ep raised while importing; surface
+    # it instead of silently disabling DeepEP.
+    if isinstance(e.__cause__, AttributeError):
+        raise
     deep_ep_installed = False
 
 
