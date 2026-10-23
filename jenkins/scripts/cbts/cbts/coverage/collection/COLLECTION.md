@@ -10,16 +10,28 @@ Consumer side: `../selection/SELECTION.md`. File-by-file roles: `README.md`.
 
 ## 1. What is recorded
 
-One set per test: **which product functions it entered**.
+One set per test: **which configured Python functions it entered**.
 
 ```
 (test, file, qualname)
  │      │      └─ the code object's co_qualname, e.g. "PyExecutor._executor_loop"
- │      └─ product file, canon'd to the tensorrt_llm/... form
+ │      └─ repository-relative source path, e.g. examples/llm.py
  └─ "<STAGE>/<pytest nodeid>"
 ```
 
 No line numbers, no call counts, no call graph.
+
+The default runtime config collects `tensorrt_llm/**/*.py` (from the checkout and the installed
+wheel), `examples/**/*.py`, `scripts/**/*.py`, `tests/test_common/**/*.py`, the checkout's root
+`conftest.py`, and every `tests/**/conftest.py`.
+`[run] source` bounds the physical source trees; the bootstrap resolves `%(repository_root)s` from
+its own checkout location. That root maps checkout paths to stable
+repository-relative names; `include` selects those names using `fnmatch` patterns (`*` also matches
+directory separators). Installed wheel paths still map to `tensorrt_llm/...`, so wheel and checkout
+copies merge into the same file identity. Other Python files under `tests/` are excluded.
+
+Collection scope is independent of selection eligibility: the coverage selector still accepts only
+core Python residuals. Extra rows accumulate evidence for future support.
 
 ## 2. How
 
@@ -145,10 +157,19 @@ would let those changes narrow again.
 |---|---|
 | C++ / nanobind implementations | PY_START only sees Python frames; the C++ side of KV cache manager, scheduler and decoder is invisible |
 | Comprehensions / genexprs / lambdas | skipped explicitly by `_SKIP_QUALNAMES` |
-| Test code itself | `tests/` is outside the source root |
+| Other test bodies and helpers | Under `tests/`, the default include patterns select only `test_common/` and `conftest.py` |
 | A Ray stage's GPU worker | `RayGPUWorker` lives in the opted-out `default_worker.py` |
 | Multi-GPU / multi-node stages | phase 1 collects on single-GPU stages only; the channel design is single-producer, so a multi-node stage would need its address published somewhere shared |
 | A channel failure inside an inner-pytest batch | `test_unittests_v2` has no `cbts_plugin` (§3's `inner_pytest` row), so nothing records a taint if a subscriber it spawns falls behind |
+
+### 5.4 Pytest fixtures and hooks
+
+Function-scoped fixtures and runtest hooks in `conftest.py` are recorded under the current test.
+Outer-pytest imports and collection hooks run before a test context exists, so their rows carry the
+empty context and do not count as per-test coverage. A shared fixture's setup is recorded under its
+first consumer and teardown under its last; cached reuse by another test enters no Python frame.
+These rows describe execution, not every test that depends on a shared fixture. Selecting tests for
+`conftest.py` changes requires additional dependency and scope handling.
 
 ---
 

@@ -6433,6 +6433,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    lm_head_output_dtype: Literal["auto", "float32"] = Field(
+        default="auto",
+        description=
+        "Output dtype written by the LM head GEMM. 'auto' uses the model "
+        "dtype before logits are upcast to float32. 'float32' writes the "
+        "float32 accumulator directly, avoiding intermediate bf16/fp16 "
+        "rounding of logits before logprob computation. Weights and inputs "
+        "remain in the model dtype. Only supported for unquantized LM heads "
+        "of decoder-only models.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'float32']"})
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
