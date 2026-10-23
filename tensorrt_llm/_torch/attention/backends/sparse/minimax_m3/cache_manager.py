@@ -53,6 +53,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
 )
 
+from .common import get_sparse_disable_index_value_layer_ids, get_sparse_layer_ids
+
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
@@ -157,6 +159,47 @@ def shared_draft_layer_count(spec_config, layer_mask) -> int:
     from tensorrt_llm._torch.speculative.utils import get_num_spec_layers
 
     return int(get_num_spec_layers(spec_config))
+
+
+def resolve_sparse_layer_schedule(
+    sparse_layer_ids: Optional[Sequence[int]],
+    disable_index_value_layer_ids: Optional[Sequence[int]],
+    pretrained_config,
+    num_target_layers: Optional[int],
+) -> Tuple[List[int], List[int]]:
+    """Return ``(sparse_layer_ids, disable_index_value_layer_ids)`` for the cache.
+
+    Explicit ids win. Otherwise the checkpoint's attention schedule
+    (``pretrained_config.sparse_attention_config``) decides, which is the
+    schedule the model builds its sparse layers from; it may make every layer
+    sparse, independently of the dense-MLP layers. Without either, the public
+    M3 convention applies: layers 0..2 dense, 3..N-1 sparse and K-only.
+    """
+    if (
+        sparse_layer_ids is None
+        and getattr(pretrained_config, "sparse_attention_config", None) is not None
+    ):
+        _, sparse_layer_ids = get_sparse_layer_ids(pretrained_config)
+        if disable_index_value_layer_ids is None:
+            disable_index_value_layer_ids = get_sparse_disable_index_value_layer_ids(
+                pretrained_config
+            )
+        if num_target_layers is not None and any(
+            not 0 <= int(i) < num_target_layers
+            for i in (*sparse_layer_ids, *disable_index_value_layer_ids)
+        ):
+            raise ValueError(
+                "MiniMax M3 checkpoint attention schedule names layers outside the "
+                f"{num_target_layers} target layers: sparse={sparse_layer_ids}, "
+                f"disable_index_value={disable_index_value_layer_ids}."
+            )
+    if sparse_layer_ids is None:
+        sparse_layer_ids = (
+            list(range(3, num_target_layers)) if num_target_layers is not None else []
+        )
+    if disable_index_value_layer_ids is None:
+        disable_index_value_layer_ids = list(sparse_layer_ids)
+    return list(sparse_layer_ids), list(disable_index_value_layer_ids)
 
 
 def derive_shared_draft_layout(
@@ -280,13 +323,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first, then
-        # from the executor's ``sparse_attention_config`` keyword, then from
-        # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
+        # from the executor's ``sparse_attention_config`` keyword and the
+        # checkpoint's attention schedule (``pretrained_config``, the same
+        # schedule the model builds its sparse layers from), then from the
+        # public M3 convention (layers 0..2 dense, 3..N-1 sparse,
         # disable_index_value=True, sparse_index_dim=128). Honoring the
         # executor keyword also makes non-default sparse_index_dim values
         # authoritative for the cache layout instead of falling back to 128.
         # Peeked (not popped) so the base __init__ still receives them.
         sparse_attention_config = kwargs.get("sparse_attention_config")
+        pretrained_config = kwargs.get("pretrained_config")
         num_layers = kwargs.get("num_layers")
         implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
@@ -310,13 +356,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kwargs.get("num_kv_heads"),
             shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
         )
-        if sparse_layer_ids is None:
-            if num_target_layers is not None:
-                sparse_layer_ids = list(range(3, num_target_layers))
-            else:
-                sparse_layer_ids = []
-        if disable_index_value_layer_ids is None:
-            disable_index_value_layer_ids = list(sparse_layer_ids)
+        sparse_layer_ids, disable_index_value_layer_ids = resolve_sparse_layer_schedule(
+            sparse_layer_ids, disable_index_value_layer_ids, pretrained_config, num_target_layers
+        )
 
         # Must be set BEFORE super().__init__ — the base
         # ``_build_base_config`` invokes ``_extra_buffers_per_layer``
@@ -437,25 +479,36 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
-        if self.dtype != DataType.NVFP4:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
-        if global_layer_idx in self.sparse_layer_ids:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        has_index_k = global_layer_idx in self.sparse_layer_ids
+        if data_role == Role.INDEX_KEY:
+            if not has_index_k:
+                return 0
+            index_dtype = self._torch_dtype_for_index_cache()
+            index_elem_bytes = torch.empty(0, dtype=index_dtype, device="cpu").element_size()
+            return self.sparse_index_dim * index_elem_bytes
 
-        if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
-            return 0
-        if data_role == Role.ALL:
-            kv_factor = self.kv_factor
-        elif data_role in (Role.KEY, Role.VALUE):
-            kv_factor = 1
+        if self.dtype != DataType.NVFP4 or has_index_k:
+            cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         else:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        return (
-            kv_factor
-            * self.num_kv_heads_per_layer[int(local_layer_idx)]
-            * self.head_dim_per_layer[int(local_layer_idx)]
-        )
+            # Existing NVFP4 dense-target / shared-Eagle FP8 cache calculation.
+            if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+                return 0
+            if data_role == Role.ALL:
+                kv_factor = self.kv_factor
+            elif data_role in (Role.KEY, Role.VALUE):
+                kv_factor = 1
+            else:
+                return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+            cache_bytes = (
+                kv_factor
+                * self.num_kv_heads_per_layer[int(local_layer_idx)]
+                * self.head_dim_per_layer[int(local_layer_idx)]
+            )
+
+        if data_role == Role.ALL and has_index_k:
+            cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+        return cache_bytes
 
     def is_nvfp4_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` stores packed NVFP4 data and block scales."""
@@ -621,20 +674,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
     def _extra_buffers_per_layer(self, *, tokens_per_block):
-        """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
-
-        ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_base_config`` iterates local ids, so keying
-        by global ids would silently skip registration on non-trivial
-        PP ranks.
-        """
-        torch_dtype = self._torch_dtype_for_index_cache()
-        elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
-        bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
-        size_per_block = bytes_per_token * tokens_per_block
+        """Register the paged index-K buffer for each sparse local layer."""
         return {
-            self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
+            self.layer_offsets[layer_id]: [
+                BufferConfig(
+                    role=Role.INDEX_KEY,
+                    size=self.get_layer_bytes_per_token(
+                        self.layer_offsets[layer_id], Role.INDEX_KEY
+                    )
+                    * tokens_per_block,
+                )
+            ]
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
