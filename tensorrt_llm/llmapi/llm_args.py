@@ -3305,15 +3305,18 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
-        default="VANILLA",
+    attention_backend: Literal["VANILLA", "TRTLLM", "FA4", "AUTO"] = Field(
+        default="AUTO",
         description=
         "Attention backend for DFlash pooled-context cross-attention, independent "
         "of the drafter's standard attention modules. VANILLA uses FlashAttention "
         "with a contiguous context K/V cache and runs anywhere. TRTLLM uses "
         "TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache "
         "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
-        "on the same paged cache and supports SM90 only.")
+        "on the same paged cache and supports SM90 only. AUTO (the default) "
+        "resolves to TRTLLM where it can run and every drafter layer is "
+        "windowed, and to VANILLA otherwise, including on a disaggregated worker "
+        "and under modeling_v2.")
 
     skip_ctx_buffer_budget_check: bool = Field(
         default=False,
@@ -3343,7 +3346,18 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         if not os.path.exists(draft_config_path):
             return
         with open(draft_config_path) as f:
-            dflash_cfg = json.load(f).get("dflash_config", {})
+            draft_cfg = json.load(f)
+        dflash_cfg = draft_cfg.get("dflash_config", {})
+
+        if self.attention_backend == "AUTO" and torch.cuda.is_available():
+            # Pinned here: the draft KV cache and budget check read it before any drafter exists; the probe needs a GPU.
+            from tensorrt_llm._torch.speculative.dflash import \
+                resolve_dflash_auto_attention_backend
+            self.attention_backend = resolve_dflash_auto_attention_backend(
+                draft_cfg)
+            logger.info(
+                f"DFlash attention_backend AUTO resolved to {self.attention_backend}."
+            )
 
         if self.target_layer_ids is None:
             layer_ids = dflash_cfg.get("target_layer_ids")
@@ -7048,8 +7062,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
-                if (self.cache_transceiver_config is not None
-                        and self.cache_transceiver_config.backend is not None):
+                disagg = (self.cache_transceiver_config is not None
+                          and self.cache_transceiver_config.backend is not None)
+                # TRTLLM's separate draft pool collapses on a disaggregated worker; modeling_v2 drafts on VANILLA.
+                if self.speculative_config.attention_backend == "AUTO" and (
+                        disagg or self.modeling_v2 != "off"):
+                    self.speculative_config.attention_backend = "VANILLA"
+                    logger.info(
+                        "DFlash attention_backend AUTO resolved to VANILLA "
+                        "(disaggregated worker or modeling_v2).")
+                if disagg:
                     # The transceiver moves the target KV cache, but the
                     # drafter's context is built from target hidden states
                     # during prefill and is not transferred with it, so a

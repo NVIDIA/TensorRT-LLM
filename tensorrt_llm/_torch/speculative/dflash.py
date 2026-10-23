@@ -32,6 +32,7 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
+    dflash_trtllm_gen_unavailability_reason,
     get_dflash_paged_append,
     validate_dflash_fa4_runtime,
     validate_dflash_trtllm_gen_runtime,
@@ -77,6 +78,20 @@ def drafter_config_window(draft_config: Optional[dict]) -> Optional[int]:
     ):
         return window
     return None
+
+
+def resolve_dflash_auto_attention_backend(draft_config: Optional[dict]) -> str:
+    """What AUTO means for a DFlash drafter's config.json; DSpark drafters keep their own AUTO."""
+    # TRTLLM runs an unwindowed non-causal layer on its context kernel, 2-9x slower than VANILLA.
+    if drafter_config_window(draft_config) is None:
+        return "VANILLA"
+    if (reason := dflash_trtllm_gen_unavailability_reason()) is not None:
+        logger.info_once(
+            f"DFlash attention_backend AUTO keeps VANILLA: TRTLLM is unavailable ({reason}).",
+            key="dflash_auto_trtllm_unavailable",
+        )
+        return "VANILLA"
+    return "TRTLLM"
 
 
 if TYPE_CHECKING:
@@ -1178,8 +1193,7 @@ class DFlashWorker(SpecWorkerBase):
             ):
                 # Gated on the drafter that actually runs the trtllm-gen ops:
                 # one paging its own block decode the same way is not shaped
-                # like them. No non-causal sliding window there either.
-                draft_model.validate_block_attention_windows()
+                # like them.
                 has_context_attention = any(
                     not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
                 )

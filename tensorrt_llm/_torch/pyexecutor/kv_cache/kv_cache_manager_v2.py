@@ -5424,6 +5424,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         beam_width = max_beam_width
         requests = []
+        # A joint-reuse draft commits history with the target; an unpaired mirror pins every token.
+        draft_commits_history = getattr(
+            draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False
+        )
 
         def release_resources(
             current_request: LlmRequest, free_draft_resources: bool = False
@@ -5466,6 +5470,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
+            draft_history_hint = history_hint if draft_commits_history else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (
                 [1] * encoder_output_len if encoder_output_len is not None else None
@@ -5534,7 +5539,9 @@ class KVCacheManagerV2(BaseResourceManager):
                         release_resources(req, free_draft_resources=True)
                         return None
                     draft_kv_cache.stop_committing()
-                    success = draft_kv_cache.resize(dummy_capacity)
+                    success = draft_kv_cache.resize(
+                        dummy_capacity, history_length=draft_history_hint
+                    )
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
@@ -5574,7 +5581,9 @@ class KVCacheManagerV2(BaseResourceManager):
                         ):
                             release_resources(req, free_draft_resources=True)
                             return None
-                        success = draft_kv_cache.resize(new_capacity)
+                        success = draft_kv_cache.resize(
+                            new_capacity, history_length=draft_history_hint
+                        )
                         if not success:
                             release_resources(req, free_draft_resources=True)
                             return None
@@ -6057,16 +6066,19 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
+        joint_kv_cache_reuse: bool = False,
     ) -> Optional[tuple[List[tuple[int, int, int]], int]]:
         """Per-local-layer ``(layer_size, retained_tokens, intercept_tokens)``
         plus the block-rounded full-sequence token count.
 
         ``retained_tokens`` is the block-rounded token count one max-length
         request pins in this layer's pool: the full sequence for growing
-        layers and every draft mirror (reserved at the request's full context
-        length regardless of the drafter's own windows — resize with
+        layers and every unpaired draft mirror (reserved at the request's full
+        context length regardless of the drafter's own windows — resize with
         ``history = full token count`` is the cache's contract, see
-        ``update_resources``), the retention window otherwise.
+        ``update_resources``), the retention window otherwise. A joint-reuse
+        draft is paired: it is prepared and committed with the target, so its
+        windows bound retention the same way.
         ``intercept_tokens`` is the part of that retention the affine
         intercept of ``get_cache_size_per_token`` already reserves per request
         (its SWA fixed cost uses the same window accounting), so callers can
@@ -6118,11 +6130,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
             backoff = draft_prompt_lookahead(spec_config) or 0
             covered_windows = _extend_swa_windows_for_reuse(covered_windows, backoff, max_seq_len)
-        if is_draft:
-            # Draft mirrors are reserved at the request's full context length
-            # (measured: a 41k-token context charges 41k tokens per mirror
-            # against the draft pool), so the drafter's own windows do not
-            # bound per-request retention.
+        if is_draft and not joint_kv_cache_reuse:
+            # Unpaired draft mirrors are reserved at the request's full context
+            # length (measured: a 41k-token context charges 41k tokens per
+            # mirror against the draft pool), so the drafter's own windows do
+            # not bound per-request retention.
             retained_windows = [None] * len(layer_sizes)
         elif all(window is None for window in covered_windows):
             # The static estimator only sees windows the config carries.
@@ -6197,6 +6209,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
+        joint_kv_cache_reuse: bool = False,
         **kwargs,
     ) -> Optional[int]:
         """Slope-funded pool bytes ONE max-length request pins in this manager.
@@ -6217,7 +6230,7 @@ class KVCacheManagerV2(BaseResourceManager):
         (see ``_get_per_request_layer_tokens``), so the caller keeps the
         per-token split. Zero is a valid weight: a target whose entire
         retention is intercept-funded spends nothing per request from the
-        slope budget. A draft manager always reports: its mirrors are
+        slope budget. A draft manager always reports: unpaired mirrors are
         reserved full-length regardless of the drafter's own windows.
         """
         layer_tokens = cls._get_per_request_layer_tokens(
@@ -6229,6 +6242,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             spec_config=spec_config,
             is_draft=is_draft,
+            joint_kv_cache_reuse=joint_kv_cache_reuse,
         )
         if layer_tokens is None:
             return None
@@ -6257,6 +6271,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
+        joint_kv_cache_reuse: bool = False,
         **kwargs,
     ) -> Optional[int]:
         """Allocator quota ONE max-length request makes this manager insist on.
@@ -6291,6 +6306,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             spec_config=spec_config,
             is_draft=is_draft,
+            joint_kv_cache_reuse=joint_kv_cache_reuse,
         )
         if layer_tokens is None:
             return None

@@ -1203,6 +1203,7 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         is_draft=True,
+                        joint_kv_cache_reuse=self._joint_kv_cache_reuse,
                         include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
@@ -1214,6 +1215,7 @@ class KvCacheCreator:
                         mapping=draft_mapping,
                         num_layers=self._get_num_draft_layers(),
                         is_draft=True,
+                        joint_kv_cache_reuse=self._joint_kv_cache_reuse,
                         include_request_cost=include_request_cost))
         return None
 
