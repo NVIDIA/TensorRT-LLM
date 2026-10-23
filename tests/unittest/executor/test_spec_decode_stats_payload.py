@@ -263,6 +263,7 @@ def _sequence_response(*, sequence_index, is_final, per_pos_drafted, per_pos_acc
         cum_log_probs=None,
         log_probs=None,
         generation_logits=None,
+        time_breakdown_metrics=None,
         context_logits=None,
         request_perf_metrics=None,
         additional_context_outputs=None,

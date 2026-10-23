@@ -1113,6 +1113,7 @@ class KvCacheCreator:
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
+                is_disagg=self._is_disagg,
                 **extra_kwargs))
         if include_request_cost:
             if cost.bytes_per_request is None:
