@@ -20,13 +20,17 @@ The injection variables are set only in this test's MPI workers via
 ``MpiPoolSession(env_overrides=...)``; see the companion test's docstring for
 why the parent environment must stay untouched.
 
-Not wired into any L0 test list; this is a diagnostic for multi-GPU runs.
+No L0 list names this file, but several stages collect the whole
+unittest/_torch/executor directory: it runs on the multi-GPU stages
+(e.g. DGX B300, GB300) and skips on single-GPU stages via the 2-GPU
+guard below.
 """
 
 import os
 import time
 
 import pytest
+import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
@@ -48,6 +52,11 @@ COLLECT_DEADLINE_S = 240
 
 
 @pytest.mark.skipif(mpi_disabled(), reason="needs the MPI worker path to inject via env_overrides")
+# Single-GPU L0 stages collect this directory with markexpr "not cpu_only",
+# which does not exclude gpu2. The gpu2 marker itself does skip there, but
+# only via the pytest.mark.gpu2 monkeypatch in tests/unittest/utils/util.py
+# (import-order dependent); this explicit guard does not rely on it.
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.gpu2
 @pytest.mark.parametrize("overlap", [False, True], ids=["no_overlap", "overlap"])
 @pytest.mark.threadleak(enabled=False)
