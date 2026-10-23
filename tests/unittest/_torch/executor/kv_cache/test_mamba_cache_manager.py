@@ -2671,6 +2671,7 @@ def _build_v2_hybrid_fp4_mla(
     is_disagg: bool = False,
     enable_block_reuse: bool = False,
     periodic_snapshot_interval: int = 0,
+    additional_snapshot_offsets_from_end: tuple[int, ...] = (),
 ) -> MambaHybridCacheManagerV2:
     """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
@@ -2691,7 +2692,8 @@ def _build_v2_hybrid_fp4_mla(
             enable_block_reuse=enable_block_reuse,
             enable_partial_reuse=False,
             mamba_state_config=MambaStateConfig(
-                periodic_snapshot_interval=periodic_snapshot_interval
+                periodic_snapshot_interval=periodic_snapshot_interval,
+                additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end),
             ),
         ),
         kv_cache_type=CacheTypeCpp.SELFKONLY,
@@ -2747,6 +2749,42 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         }
         paged_ids = sorted(ll.global_layer_id for lg in paged_groups for ll in lg.local_layers)
         assert paged_ids == [2, 3]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp4_mla_reuses_prefix_at_aligned_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt_len = 2 * FP4_MLA_TOKENS_PER_BLOCK
+    mgr = _build_v2_hybrid_fp4_mla(
+        monkeypatch,
+        enable_block_reuse=True,
+        # 256 and 156; FP4 MLA moves 156 down to its cache block (128).
+        additional_snapshot_offsets_from_end=(0, 100),
+    )
+    request = _make_v2_conversation_request(1, list(range(prompt_len)), "conv-1")
+    probe = _make_v2_conversation_request(2, list(range(prompt_len + 1)), "conv-2")
+    try:
+        assert mgr.fp4_mla_context_only_cache is False
+        _run_v2_hybrid_context(mgr, request)
+        assert request.expect_snapshot_points == [FP4_MLA_TOKENS_PER_BLOCK, prompt_len]
+        state_index = mgr.get_state_indices([request.py_request_id], [False])[0]
+        mgr.free_resources(request)
+
+        mgr.prepare_expect_snapshot_points([probe])
+        assert mgr.prepare_context(probe)
+        batch = ScheduledRequests()
+        batch.append_context_request(probe)
+        mgr.prepare_resources(batch)
+
+        # The whole first request is reused: FP4 MLA pages, the HP ring page
+        # of its last block, and the recurrent state committed at token 256.
+        assert probe.prepopulated_prompt_len == prompt_len
+        assert probe.prepopulated_prompt_len % FP4_MLA_TOKENS_PER_BLOCK == 0
+        assert mgr.get_state_indices([probe.py_request_id], [False]) == [state_index]
+        mgr.free_resources(probe)
     finally:
         mgr.shutdown()
 

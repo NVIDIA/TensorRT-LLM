@@ -1768,6 +1768,12 @@ class MLA(nn.Module):
             elif trtllm_attention.has_cached_kv_for_mla_context(
                 attn_metadata
             ) or trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata):
+                if trtllm_attention.uses_fp4_mla_attention:
+                    # The cached-KV path writes and reads a dense paged cache.
+                    raise RuntimeError(
+                        "FP4 MLA attends a cached prefix only through chunked-prefill "
+                        "partitions on SM100+; enable chunked prefill."
+                    )
                 return self.forward_context_with_cached_kv(q, latent_cache, attn_metadata, output)
         return self.forward_context_default(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
