@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -58,7 +59,8 @@ def test_input_metrics_survive_headers_disagg_and_jsonl():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_input_metrics_are_request_local_and_exported(stream):
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/health_generate"])
+async def test_input_metrics_are_request_local_and_exported(stream, path):
     async def app(scope, receive, send):
         await asyncio.sleep(0)
         observer = _input_processing_observer.get()
@@ -79,7 +81,10 @@ async def test_input_metrics_are_request_local_and_exported(stream):
         )
         await send({"type": "http.response.body", "body": b"data: [DONE]\n\n" if stream else b"{}"})
 
-    middleware = PerfMetricsMiddleware(app, expose_headers=True)
+    collector = MagicMock()
+    middleware = PerfMetricsMiddleware(
+        app, expose_headers=True, input_processing_observer=collector
+    )
 
     async def request(seconds):
         messages = []
@@ -89,6 +94,7 @@ async def test_input_metrics_are_request_local_and_exported(stream):
 
         scope = {
             "type": "http",
+            "path": path,
             "headers": [(RETURN_METRICS_HEADER.encode(), b"1")],
             "seconds": seconds,
         }
@@ -105,6 +111,7 @@ async def test_input_metrics_are_request_local_and_exported(stream):
         )
 
     await asyncio.gather(request(0.1), request(0.2))
+    assert collector.call_count == (0 if path == "/health_generate" else 2)
     assert _input_processing_observer.get() is None
 
 

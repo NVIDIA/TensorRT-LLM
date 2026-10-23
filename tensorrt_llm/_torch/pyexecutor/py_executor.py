@@ -938,6 +938,7 @@ class PyExecutor:
         self.is_warmup = False
 
         # Install only after warmup/capture so dummy encoder work is excluded.
+        # torch.compile delegates encoder methods with self bound to _orig_mod.
         model = getattr(self.model_engine.model, "_orig_mod",
                         self.model_engine.model)
         if (self.enable_iter_perf_stats and self.dist.rank == 0
