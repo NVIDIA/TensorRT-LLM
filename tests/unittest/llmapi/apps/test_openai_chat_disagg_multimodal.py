@@ -156,6 +156,7 @@ def route_client():
     server.allow_request_chat_template = False
     server.model_config = _StubModelConfig()
     server.processor = None
+    server.metrics_collector = None
     server.tokenizer = SimpleNamespace(
         tokenizer=SimpleNamespace(vocab_size=_StubModelConfig.vocab_size)
     )

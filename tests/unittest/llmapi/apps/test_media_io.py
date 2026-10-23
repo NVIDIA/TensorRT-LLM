@@ -1,14 +1,104 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from unittest.mock import AsyncMock, patch
+import base64
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from io import BytesIO
+from multiprocessing import get_context
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
+from tensorrt_llm.metrics.perf_utils import _input_processing_observer
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content_part
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "media_cls, mime",
+    [(ImageMediaIO, "image/png"), (AudioMediaIO, "audio/wav"), (VideoMediaIO, "video/mp4")],
+)
+@pytest.mark.parametrize("scheme", ["http", "data", "file"])
+async def test_media_metrics_separate_download_decode_and_queue(media_cls, mime, scheme):
+    media = media_cls()
+    observer = MagicMock()
+    token = _input_processing_observer.set(observer)
+    now = [1.0]
+
+    async def open_session():
+        now[0] += 5.0
+
+    async def download(*args, **kwargs):
+        now[0] += 2.0
+        return b"data"
+
+    url, method = {
+        "http": ("http://example.test/media", "load_bytes"),
+        "data": (f"data:{mime};base64,AA==", "load_base64"),
+        "file": ("file:///unused", "load_file"),
+    }[scheme]
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with (
+                patch.object(BaseMediaIO, "_executor", pool),
+                patch.object(media_cls, method, return_value="decoded"),
+                patch(
+                    "tensorrt_llm.metrics.perf_utils.time.perf_counter", side_effect=lambda: now[0]
+                ),
+                patch(
+                    "tensorrt_llm.inputs.media_io._get_aiohttp_session", side_effect=open_session
+                ),
+                patch(
+                    "tensorrt_llm.inputs.media_io._safe_aiohttp_get",
+                    side_effect=download,
+                ),
+            ):
+                assert await media.async_load(url) == "decoded"
+    finally:
+        _input_processing_observer.reset(token)
+    samples = [args.args for args in observer.call_args_list]
+    assert [stage for stage, _, _ in samples] == (["download"] if scheme == "http" else []) + [
+        "decode_queue",
+        "decode",
+    ]
+    assert all(seconds >= 0 and modality == mime.split("/")[0] for _, seconds, modality in samples)
+    if scheme == "http":
+        assert samples[0][1] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_media_decode_failure_is_recorded():
+    observer = MagicMock()
+    token = _input_processing_observer.set(observer)
+    try:
+        with patch.object(ImageMediaIO, "load_base64", side_effect=ValueError("bad media")):
+            with pytest.raises(ValueError, match="bad media"):
+                await ImageMediaIO().async_load("data:image/png;base64,AA==")
+    finally:
+        _input_processing_observer.reset(token)
+    assert [args.args[0] for args in observer.call_args_list] == ["decode_queue", "decode"]
+
+
+@pytest.mark.asyncio
+async def test_media_process_pool_keeps_decode_picklable():
+    data = BytesIO()
+    Image.new("RGB", (2, 3), color="red").save(data, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(data.getvalue()).decode()
+    observer = MagicMock()
+    token = _input_processing_observer.set(observer)
+    try:
+        with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn")) as pool:
+            with patch.object(BaseMediaIO, "_executor", pool):
+                image = await ImageMediaIO(format="pil").async_load(url)
+        assert image.size == (2, 3)
+        assert image.getpixel((0, 0)) == (255, 0, 0)
+        observer.assert_not_called()
+    finally:
+        _input_processing_observer.reset(token)
 
 
 class CustomError(Exception):
