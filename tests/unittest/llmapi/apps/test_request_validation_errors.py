@@ -20,21 +20,21 @@ Anthropic envelope on /v1/messages -- and must not quote the request back:
 pydantic's own rendering repeats every rejected value (an inline image is
 megabytes of base64) and FastAPI's names the endpoint's source file and line.
 
-The server is built by its own constructor, so these requests meet the
-exception handler a deployed server installs; only model loading and the
-full route table are left out.
+Each server is built by its own constructor, so these requests meet the
+exception handler a deployed server installs. The standard server leaves out
+model loading and the full route table; the disaggregated one uses mocks for
+its coordinator and request service.
 """
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
+from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
@@ -160,19 +160,29 @@ def test_messages_route_keeps_the_anthropic_envelope_without_quoting_the_request
     assert ".py" not in response.text
 
 
-def test_disaggregated_server_answers_with_the_same_envelope():
-    server = object.__new__(OpenAIDisaggServer)
-    server._perf_metrics_collector = SimpleNamespace(validation_exceptions=Mock())
-    server._val_err_n = 0
+@pytest.fixture
+def disagg(monkeypatch, tmp_path):
+    """A disaggregated server built by its constructor, and its request service.
 
-    async def chat(request: ChatCompletionRequest):
-        raise AssertionError("an invalid body must not reach the route")
+    The coordinator, the request service and the metrics are mocks, so no
+    worker is contacted; the app, its exception handler and its routes are the
+    ones the constructor installs.
+    """
+    # register_routes mounts a prometheus multiprocess collector, which needs
+    # the directory that startup would otherwise provide.
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    service = Mock()
+    monkeypatch.setattr(openai_disagg_server, "DisaggCoordinatorService", Mock())
+    monkeypatch.setattr(
+        openai_disagg_server, "OpenAIDisaggregatedService", Mock(return_value=service)
+    )
+    monkeypatch.setattr(openai_disagg_server, "DisaggPerfMetricsCollector", Mock())
+    server = OpenAIDisaggServer(DisaggServerConfig(server_configs=[]))
+    return SimpleNamespace(client=TestClient(server.app), server=server, service=service)
 
-    app = FastAPI()
-    app.add_exception_handler(RequestValidationError, server._request_validation_error)
-    app.add_api_route("/v1/chat/completions", chat, methods=["POST"])
 
-    response = TestClient(app).post(
+def test_disaggregated_server_answers_with_the_same_envelope(disagg):
+    response = disagg.client.post(
         "/v1/chat/completions", json=_chat_body(stores=False, huge=PAYLOAD)
     )
 
@@ -182,21 +192,32 @@ def test_disaggregated_server_answers_with_the_same_envelope():
         "param": "stores",
         "code": None,
     }
-    server._perf_metrics_collector.validation_exceptions.inc.assert_called_once()
+    assert PAYLOAD[:64] not in response.text
+    disagg.service.openai_chat_completion.assert_not_called()
+    disagg.server._perf_metrics_collector.validation_exceptions.inc.assert_called_once()
 
 
-def test_disaggregated_server_names_a_missing_body():
-    server = object.__new__(OpenAIDisaggServer)
-    server._perf_metrics_collector = SimpleNamespace(validation_exceptions=Mock())
-    server._val_err_n = 0
+def test_disaggregated_server_names_a_missing_body(disagg):
+    error = _error(disagg.client.post("/v1/chat/completions"))
 
-    async def chat(request: ChatCompletionRequest):
-        raise AssertionError("a request without a body must not reach the route")
-
-    app = FastAPI()
-    app.add_exception_handler(RequestValidationError, server._request_validation_error)
-    app.add_api_route("/v1/chat/completions", chat, methods=["POST"])
-
-    error = _error(TestClient(app).post("/v1/chat/completions"))
     assert error["message"] == "The request body is missing."
     assert error["param"] is None
+    disagg.service.openai_chat_completion.assert_not_called()
+
+
+def test_disaggregated_messages_route_keeps_the_anthropic_envelope(disagg):
+    response = disagg.client.post(
+        "/v1/messages",
+        json={
+            "model": MODEL,
+            "max_tokens": PAYLOAD,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["message"].startswith("Invalid value for 'max_tokens': ")
+    assert PAYLOAD[:64] not in response.text
