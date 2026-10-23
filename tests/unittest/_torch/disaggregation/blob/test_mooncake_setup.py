@@ -13,6 +13,7 @@ import ast
 import pathlib
 import socket
 import sys
+import threading
 import types
 
 import pytest
@@ -29,8 +30,14 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
     open_mooncake_driver,
     open_sdk,
 )
+from tensorrt_llm._torch.disaggregation.blob.store import RegionLayout
+from tensorrt_llm._torch.disaggregation.testing.host_memory import HostBuffer
 
-pytestmark = pytest.mark.cpu_only
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 MASTER = "10.0.0.1:50051"
 DRAIN_S = 5.0  # a drained driver's worker threads have exited
@@ -214,6 +221,10 @@ def test_open_passes_setup_arguments_by_name(
     # The config's own values win over the driver's defaults.
     assert tunings == [{"workers": 4, "rows_per_call": 4, "bytes_per_call": 128 << 20}]
     assert blob == BlobConfig(key_prefix="t")
+    memory = HostBuffer(64)  # the driver works through the client it was given
+    handle = driver.register(memory.address, memory.nbytes, RegionLayout(8, 8))
+    assert store.calls_to("register_buffer")
+    driver.unregister(handle)
     assert driver.drain(DRAIN_S)  # its worker threads exit
 
     open_sdk(MooncakeConfig(MASTER, 1 << 30, "tcp", "eth9", "10.9.9.9", "etcd://m:2379", 0))
@@ -236,6 +247,15 @@ def test_device_detection_picks_the_fastest_active_ib_ports(tmp_path: pathlib.Pa
     ib_device(tmp_path, "mlx5_4", "InfiniBand", "4: ACTIVE", "400 Gb/sec (4X NDR)")
     assert mooncake_setup._fastest_active_ib_devices(str(tmp_path)) == ["mlx5_0", "mlx5_4"]
     assert mooncake_setup._fastest_active_ib_devices(str(tmp_path / "missing")) == []
+
+
+def test_a_configured_device_is_used_as_given(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ib_device(tmp_path, "mlx5_0", "InfiniBand", "4: ACTIVE", "400 Gb/sec (4X NDR)")
+    monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(tmp_path))
+    configured = MooncakeConfig(MASTER, 0, protocol="rdma", device_name="mlx5_9")
+    assert mooncake_setup._rdma_devices(configured) == "mlx5_9"  # not the detected mlx5_0
 
 
 def test_missing_sdk_reports_install_and_shadow_hint(sdk: Sdk, monkeypatch) -> None:
@@ -437,12 +457,49 @@ def test_waiting_for_the_master_ends_when_it_accepts_and_names_it_when_it_never_
         mooncake_setup._wait_for_master(address)  # the port is closed now
 
 
+def test_waiting_for_the_master_outlasts_one_that_comes_up_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as probe:
+        port = probe.getsockname()[1]  # free once the probe closes: nothing listens yet
+    servers: list[socket.socket] = []
+    master_starts = threading.Timer(
+        0.3, lambda: servers.append(socket.create_server(("127.0.0.1", port)))
+    )
+    monkeypatch.setattr(mooncake_setup, "MASTER_WAIT_S", 5.0)
+    monkeypatch.setattr(mooncake_setup, "MASTER_RETRY_S", 0.05)
+    master_starts.start()
+    try:
+        mooncake_setup._wait_for_master(f"127.0.0.1:{port}")
+    finally:
+        master_starts.join()
+        for server in servers:
+            server.close()
+
+
 def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:
     sdk.setup_answer = -1
     with pytest.raises(RuntimeError, match="setup failed with -1"):
         open_mooncake_driver(store_config(), read_blob)
     (store,) = sdk.stores
     assert len(store.calls_to("close")) == 1
+
+
+def test_a_driver_that_cannot_start_closes_the_client_it_was_given(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start = threading.Thread.start
+
+    def refuse_worker_threads(thread: threading.Thread) -> None:
+        if thread.name.startswith("mooncake-driver-"):
+            raise RuntimeError("can't start new thread")
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_worker_threads)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        open_mooncake_driver(store_config(), read_blob)
+    (store,) = sdk.stores
+    assert store.calls_to("setup") and len(store.calls_to("close")) == 1
 
 
 # Layering.

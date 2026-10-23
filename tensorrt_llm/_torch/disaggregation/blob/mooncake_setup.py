@@ -27,7 +27,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import yaml
 
@@ -105,7 +105,7 @@ class MooncakeConfig:
 
     master_server_address: str
     global_segment_size: int
-    protocol: str = "rdma"
+    protocol: Literal["rdma", "tcp"] = "rdma"
     device_name: str = ""
     local_hostname: str = ""
     metadata_server: str = "P2PHANDSHAKE"
@@ -213,7 +213,8 @@ def open_sdk(config: MooncakeConfig) -> Any:
 
 
 def open_mooncake_driver(
-    config: object, read_blob_section: Callable[[Mapping[str, object]], BlobSectionT]
+    config: str | os.PathLike | Mapping,
+    read_blob_section: Callable[[Mapping[str, object]], BlobSectionT],
 ) -> tuple[MooncakeDriver, BlobSectionT]:
     """Opens the Mooncake driver a store config describes, once both its sections are read: opening
     waits for the master and mounts this process's segment, so a bad config fails before that.
@@ -232,12 +233,17 @@ def open_mooncake_driver(
         blob = read_blob_section(blob_section)
     except (TypeError, ValueError) as error:  # an unknown key, or a bad value
         raise ValueError(f"store config section 'blob': {error}") from error
-    driver = MooncakeDriver(
-        open_sdk(mooncake_config),
-        workers=mooncake_config.workers,
-        rows_per_call=mooncake_config.rows_per_call,
-        bytes_per_call=mooncake_config.bytes_per_call,
-    )
+    store = open_sdk(mooncake_config)
+    try:
+        driver = MooncakeDriver(
+            store,
+            workers=mooncake_config.workers,
+            rows_per_call=mooncake_config.rows_per_call,
+            bytes_per_call=mooncake_config.bytes_per_call,
+        )
+    except BaseException:
+        store.close()  # no region was registered and no call made: the client is not in service
+        raise
     return driver, blob
 
 

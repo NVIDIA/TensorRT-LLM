@@ -34,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     RegionHandle,
     RegionLayout,
     RegistrationError,
+    RowBatch,
     RowIO,
     RowResult,
     StoreDriver,
@@ -346,12 +347,12 @@ class DriverSpy:
         self._enter("unregister")
         self.inner.unregister(handle)
 
-    def put(self, rows: Sequence[RowIO], *, on_change: OnChange | None = None) -> OpHandle:
+    def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> OpHandle:
         self._enter("put", rows=rows)
         return self._started(rows, self.inner.put(rows, on_change=on_change), on_change)
 
     def get(
-        self, rows: Sequence[RowIO], hint: Hint = None, *, on_change: OnChange | None = None
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
     ) -> OpHandle:
         self._enter("get", rows=rows)
         if hint is None:

@@ -68,7 +68,11 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
     MemoryStore,
 )
 
-pytestmark = pytest.mark.cpu_only
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 # A test that leaves a call whose access never ends keeps that backend's progress thread alive, as
 # it would in production; the thread-leak check would report it.
@@ -644,7 +648,7 @@ def test_a_call_is_looked_at_only_when_its_driver_tells_of_a_change(store: Memor
     reader.close()
 
 
-def test_a_teardown_polls_the_drain_with_backoff(store: MemoryStore) -> None:
+def test_a_teardown_retries_the_drain_with_backoff(store: MemoryStore) -> None:
     published(store, {"B": b"bbbbbbbb"})
     driver = MemoryDriver(store, controlled=True)
     endpoint = Endpoint(driver, ["A", "B"])
@@ -843,6 +847,60 @@ def test_the_calls_after_a_protocol_violation_never_reach_the_driver(
     assert store_calls(writer) == ["put"]  # Y and Z never reached the driver
     with pytest.raises(SubmissionRejected, match="broke its protocol"):
         writer.backend.publish(writer.view("X"), None)
+
+
+@keeps_backend_threads
+def test_a_violation_told_during_the_hand_over_stops_the_rest_of_it(store: MemoryStore) -> None:
+    capabilities = replace(DEFAULT_CAPABILITIES, max_rows_per_op=1)
+    writer = Endpoint(MemoryDriver(store, capabilities=capabilities), ["A", "B", "C"])
+    for name in "ABC":
+        writer.write(name, name.encode() * SLOT_BYTES)
+    # A's put runs inside put and tells of it there; that look's query raises.
+    writer.driver.fail("access_ended", RuntimeError("flaky"))
+    attempt = writer.backend.publish(writer.view("A", "B", "C"), None)
+    outcome = writer.wait_outcome(attempt)
+    assert store_calls(writer) == ["put"]  # B and C never reached the driver
+    assert masks(outcome) == [[False, False, False]]
+    assert outcome.fault == "group 0 row 0: a store driver query raised " + repr(
+        RuntimeError("flaky")
+    )
+    with pytest.raises(SubmissionRejected, match="broke its protocol"):
+        writer.backend.publish(writer.view("A"), None)
+
+
+@keeps_backend_threads
+def test_a_log_line_that_blocks_never_holds_up_a_submission(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logging_now, let_the_log_go = threading.Event(), threading.Event()
+
+    def blocking_warning_once(*args, **kwargs) -> None:  # as a full log pipe would block
+        logging_now.set()
+        let_the_log_go.wait(10 * WAIT_S)  # outlasts the submitter's wait below
+
+    monkeypatch.setattr(backend_module.logger, "warning_once", blocking_warning_once)
+    driver = MemoryDriver(store, controlled=True)
+    endpoint = Endpoint(driver, ["A", "B"])
+    endpoint.write("A", b"aaaaaaaa")
+    endpoint.write("B", b"bbbbbbbb")
+    endpoint.backend.publish(endpoint.view("A"), None)
+    op = endpoint.op("A")
+    # Its on_change records the call as unprovable, then logs that.
+    marker = threading.Thread(target=driver.mark_unprovable, args=(op,), daemon=True)
+    marker.start()
+    try:
+        assert logging_now.wait(WAIT_S)
+        published: list[object] = []
+        submitter = threading.Thread(
+            target=lambda: published.append(endpoint.backend.publish(endpoint.view("B"), None)),
+            daemon=True,
+        )
+        submitter.start()
+        submitter.join(WAIT_S)
+        assert published, "a submission waited for a log line"
+    finally:
+        let_the_log_go.set()
+        marker.join(WAIT_S)
 
 
 def test_a_wrong_row_count_after_the_access_end_was_recorded_leaves_the_call_provable(
@@ -1393,6 +1451,17 @@ def test_a_binding_with_no_region_to_register_is_rejected_and_lets_the_hold_go(
     regions = (CpuRegion(SLOT_BYTES, 0), CpuRegion(SLOT_BYTES, 1, memory_kind=MemoryKind.DEVICE))
     with pytest.raises(ConstructionRejected, match="no region"):
         RegionBinding(regions, driver, hold).register()
+    assert hold.released and driver.live_registrations() == []
+
+
+def test_a_region_whose_layout_is_refused_registers_nothing_and_lets_the_hold_go(
+    store: MemoryStore,
+) -> None:
+    driver, hold = MemoryDriver(store), FakeHold()
+    refused = CpuRegion(SLOT_BYTES, 4)
+    refused.slot_bytes = 0  # slots of no size: no layout can describe them
+    with pytest.raises(ConstructionRejected, match="region:1"):
+        RegionBinding((CpuRegion(SLOT_BYTES, 4), refused), driver, hold).register()
     assert hold.released and driver.live_registrations() == []
 
 

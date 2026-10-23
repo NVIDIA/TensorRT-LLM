@@ -59,7 +59,11 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
 )
 from tensorrt_llm._torch.disaggregation.testing.object_trailer import encode_trailer
 
-pytestmark = pytest.mark.cpu_only
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 PREFIX = "m"  # the prefix the controlled-mode endpoints below use
 KEY_A, KEY_B, KEY_C = (key_of(label, PREFIX) for label in "ABC")
@@ -209,6 +213,12 @@ class TestMemoryDriverConformance(DriverConformance):
     def make_driver_starting_nothing(self) -> StoreDriver:
         return self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
 
+    def make_results_before_access_end(
+        self,
+    ) -> tuple[StoreDriver, Callable[[OpHandle], None], Callable[[OpHandle], None]]:
+        driver = self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
+        return driver, driver.complete, driver.end_access
+
     def make_failing_presence(self) -> tuple[StoreDriver, str]:
         store = MemoryStore()
         store.fail_next_presence("connection dropped")
@@ -257,6 +267,8 @@ SHARED_STORE = MemoryStore()
 class TestSharedStoreConformance(DriverConformance):
     """Fresh clients of one persistent store: every check finds the previous checks' objects."""
 
+    handles_before_completion = False  # the in-memory driver's automatic mode
+
     def make_driver(self) -> StoreDriver:
         return MemoryDriver(SHARED_STORE)
 
@@ -265,6 +277,7 @@ class TestPoolDriverConformance(DriverConformance):
     """A driver that registered its memory once, when built; endpoints are carved out of it."""
 
     registers_on_demand = False
+    handles_before_completion = False  # the in-memory driver's automatic mode
     POOL_BYTES = 1 << 16
 
     def pool_driver(self) -> MemoryDriver:
@@ -1128,6 +1141,12 @@ def test_each_async_conformance_check_passes_the_driver_and_fails_the_one_breaki
     _run_check(_conformance(MemoryDriver, capabilities, asynchronous), check)
     with pytest.raises(CHECK_FAILED):
         _run_check(_conformance(broken, capabilities, asynchronous), check)
+    # A broken driver may claim an access ended while its own thread still runs it.
+    wait_until(
+        lambda: not any(t.name == "memory-driver-op" for t in threading.enumerate()),
+        "the broken driver's threads to finish",
+        TIMEOUT,
+    )
 
 
 @pytest.mark.parametrize("rule", sorted(BROKEN_MEMORY))
@@ -1148,7 +1167,7 @@ def test_a_skip_on_the_broken_side_is_not_an_expected_failure() -> None:
             _run_check(suite, "test_probe_reports_hit_and_miss")
 
 
-def test_every_check_fails_a_broken_driver_and_each_breaks_one_rule() -> None:
+def test_every_check_has_a_broken_driver_and_each_driver_one_pairing() -> None:
     pairings = [*BROKEN_CONFORMANCE.values(), *BROKEN_ASYNC_CONFORMANCE.values()]
     conformance = [cls for cls, _, _ in pairings]
     memory = [cls for cls, _ in BROKEN_MEMORY.values()]
@@ -1162,7 +1181,7 @@ def test_every_check_fails_a_broken_driver_and_each_breaks_one_rule() -> None:
 
 class TestMemoryDriverOnChange:
     @pytest.mark.parametrize("stop", ["cancel", "drain"])
-    def test_a_cancel_shows_before_on_change_is_called(self, stop: str) -> None:
+    def test_a_cancel_or_drain_shows_before_on_change_is_called(self, stop: str) -> None:
         driver = MemoryDriver(MemoryStore(), controlled=True)
         reader = endpoint(driver, ["A"])
         seen: list[tuple[list[RowStatus], bool]] = []

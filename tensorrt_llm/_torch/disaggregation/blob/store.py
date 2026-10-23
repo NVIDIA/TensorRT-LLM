@@ -211,8 +211,8 @@ class RowBatch(Sequence[RowIO]):
     ``(addresses[i, j], span_bytes[j])`` back to back, in order. ``addresses`` is
     ``int64 [rows, spans_per_row]``, read only. Every row has the same span sizes, so every row
     holds ``row_bytes``. Span ``j`` of every row lies in ``extents[j]``, and each extent lies in one
-    region its maker registered with the driver, so a driver checks a batch's memory once per
-    extent, never per row.
+    region its maker registered with the driver, so a driver can check a batch's memory once per
+    extent instead of once per row.
 
     A batch keeps arrays and builds nothing per row until a driver asks, so handing one over costs
     the same for any number of rows. A driver whose store calls take lists builds them on the
@@ -351,14 +351,15 @@ class OpHandle(Protocol):
 
 
 OnChange = Callable[[OpHandle], None]
-"""What a caller of ``put`` or ``get`` hands the driver to hear of the operation: the driver calls
-it with the operation's handle once every row of the operation concluded, once its access ended
+"""What a caller of ``put`` or ``get`` hands the driver to hear of the operation.
+
+The driver calls it with the operation's handle once every row concluded, once its access ended
 and once its access turned unprovable, each time after the change shows through ``poll``,
-``access_ended`` and ``access_unprovable`` (one call may tell of several). It may also call it at
-other times, such as after some rows concluded. It may be called from any thread, outside the
-driver's locks, possibly before the ``put`` or ``get`` that issued the operation returned. It may
-call the driver's non-blocking queries and ``cancel``; it returns promptly and never raises. A
-caller that passes None polls instead."""
+``access_ended`` and ``access_unprovable`` (one call may tell of several). The driver may also
+call it at other times, such as after some rows concluded, from any thread, outside its locks,
+possibly before the ``put`` or ``get`` that issued the operation returned. The callback may call
+the driver's non-blocking queries and ``cancel``; it returns promptly and never raises. A caller
+that passes None polls instead."""
 
 
 class ProbeStatus(enum.Enum):
@@ -388,7 +389,8 @@ class DriverCapabilities:
         max_rows_per_op: Rows one ``put``/``get`` accepts, or ``None`` for no limit.
         hints: ``get`` and ``probe`` read a caller's hint; without it the backend rejects a
             submission carrying a hint before dispatch and the driver is called without one.
-        absent_is_miss: A get of a key the store does not hold always concludes MISS. Without
+        absent_is_miss: A get of a key the store does not hold concludes MISS, unless an earlier
+            read of that row in the same operation already wrote its memory (a reread). Without
             it the store may not tell absence from failure, and such a get may conclude FAULT.
         device_memory: The driver registers regions whose ``memory_kind`` is DEVICE; without it
             every region handed to it is host memory and it rejects a DEVICE one.
@@ -419,9 +421,11 @@ class StoreDriver(Protocol):
 
     Threads: ``register``, ``unregister``, ``drain`` and ``close`` are called one at a time.
     ``put`` and ``get`` are called on the executor loop's thread, so they only record the
-    operation and queue its work: they never wait on the store, block, start a thread or let go
-    of the GIL, and they do no work per row. A driver whose store calls block runs them on threads
-    of its own, and it alone decides how they are batched and in what order gets and puts run.
+    operation and queue its work: they never wait on the store or start a thread, take only locks
+    that no thread holds while waiting on the store (letting go of the GIL only while such a lock
+    is contended), and do no Python work per row; one list built at C speed, such as a pending
+    result per row, is the most. A driver whose store calls block runs them on threads of its own,
+    and it alone decides how they are batched and in what order gets and puts run.
     ``put``, ``get``, ``cancel`` and ``probe`` may run concurrently with each other and with the
     calls above. ``poll``, ``access_ended`` and ``access_unprovable`` may be called from any
     thread. Locks inside a driver guard its state only and are never held while waiting on the
@@ -556,7 +560,9 @@ class StoreDriver(Protocol):
         access and for the driver's own background work, such as outstanding probes, to finish.
 
         One-way: after the first call the driver rejects new ``put``/``get`` for good, whatever
-        the result. Returns False at once when an operation that cannot prove its end remains.
+        the result. Before it returns, every row no transfer has started concludes CANCELLED,
+        and an operation left with nothing running ends its access. Returns False at once when an operation that cannot
+        prove its end remains.
         True when nothing can still touch memory and nothing is left running; False means keep
         everything registered and try again. Never forces an end.
         """

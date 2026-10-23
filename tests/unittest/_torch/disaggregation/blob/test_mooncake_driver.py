@@ -62,7 +62,13 @@ from tensorrt_llm._torch.disaggregation.testing.host_memory import HostBuffer
 
 # The driver's workers run until it drains; ``driver_workers_return`` drains every driver a test
 # left open and waits for its workers, instead of the thread-leak check.
-pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
+# An exception that escapes a thread fails the test; a test that ends a thread on purpose
+# says so with its own mark.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.threadleak(enabled=False),
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 SLOT = 8
 PUT_START = "batch_put_session_start"
@@ -378,7 +384,7 @@ class Told:
         return self.shown
 
 
-def test_a_cancel_reaches_only_the_parts_no_worker_started() -> None:
+def test_a_cancel_ends_only_the_rows_no_worker_took() -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb", C=b"cccccccc")
     gate = bench.fake.block(GET)
@@ -403,7 +409,7 @@ def test_a_cancel_reaches_only_the_parts_no_worker_started() -> None:
     assert bench.driver.drain(WAIT_S) is True
 
 
-def test_drain_cancels_the_parts_no_worker_started() -> None:
+def test_drain_cancels_the_rows_no_worker_took() -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
     gate = bench.fake.block(GET)
@@ -590,8 +596,24 @@ def test_drain_waits_out_a_budget_of_any_size() -> None:
     assert summary(bench.settle(op)[0]) == [("ready", None)]
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_a_part_whose_worker_thread_stops_faults_and_the_other_workers_go_on() -> None:
+@pytest.fixture
+def thread_escapes(monkeypatch: pytest.MonkeyPatch) -> list[BaseException]:
+    """The exceptions that end threads during a test that ends one on purpose. The test waits for
+    the escape it expects, so none reaches pytest's own hook, which would fail it."""
+    escapes: list[BaseException] = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: escapes.append(args.exc_value))
+    return escapes
+
+
+def escaped_by_system_exit(escapes: list[BaseException]) -> bool:
+    """Once a thread ended, whether every thread that ended did so by ``SystemExit``."""
+    wait_until(lambda: escapes, "a thread to end by an exception")
+    return all(isinstance(escape, SystemExit) for escape in escapes)
+
+
+def test_a_part_whose_worker_thread_stops_faults_and_the_other_workers_go_on(
+    thread_escapes: list[BaseException],
+) -> None:
     bench = Bench(workers=2, bytes_per_call=SLOT)  # a part per row
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
     bench.fake.script(GET, SystemExit())  # escapes every handler: A's worker thread ends
@@ -601,10 +623,12 @@ def test_a_part_whose_worker_thread_stops_faults_and_the_other_workers_go_on() -
         ("ready", None),  # on the other worker
     ]
     assert not access_ended and bench.driver.access_unprovable(bench.last)
+    assert escaped_by_system_exit(thread_escapes)
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected() -> None:
+def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected(
+    thread_escapes: list[BaseException],
+) -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)  # a part per row
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
     bench.fake.script(GET, SystemExit())  # A's part ends the only worker thread
@@ -618,6 +642,7 @@ def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected() 
     assert bench.driver.access_unprovable(op)  # A's SDK call may still touch its slot
     with pytest.raises(DriverRejected, match="no worker thread is left"):
         bench.driver.get(bench.rows("A"))
+    assert escaped_by_system_exit(thread_escapes)
 
 
 def test_a_worker_that_cannot_start_stops_the_ones_already_started(
@@ -641,8 +666,9 @@ def test_a_worker_that_cannot_start_stops_the_ones_already_started(
     assert not first.is_alive()
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_drain_wakes_as_a_worker_thread_leaves_on_an_escape() -> None:
+def test_drain_wakes_as_a_worker_thread_leaves_on_an_escape(
+    thread_escapes: list[BaseException],
+) -> None:
     bench = Bench(workers=1)
     bench.store(A=b"aaaaaaaa")
     leave = threading.Event()
@@ -657,6 +683,7 @@ def test_drain_wakes_as_a_worker_thread_leaves_on_an_escape() -> None:
     started = time.monotonic()
     assert bench.driver.drain(WAIT_S) is True
     assert time.monotonic() - started < WAIT_S / 2  # woken as the thread left, not at the budget
+    assert escaped_by_system_exit(thread_escapes)
 
 
 # Answers to row results.
@@ -903,8 +930,9 @@ def test_sessions_left_open_are_revoked_only_in_drain() -> None:
     assert bench.fake.put_sessions == set()
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_the_sessions_of_a_put_its_worker_thread_left_stay_held() -> None:
+def test_the_sessions_of_a_put_its_worker_thread_left_stay_held(
+    thread_escapes: list[BaseException],
+) -> None:
     bench = Bench()
     bench.write(0, b"aaaaaaaa")
     bench.fake.script(PUT_END, SystemExit())  # escapes every handler: the worker thread ends
@@ -916,6 +944,7 @@ def test_the_sessions_of_a_put_its_worker_thread_left_stay_held() -> None:
     results, _ = bench.run("put", "A")  # the driver holds A's session: it starts no other
     assert summary(results) == [("not_ready", None)]
     assert bench.keys_of(PUT_START).count(key("A")) == 1
+    assert escaped_by_system_exit(thread_escapes)
 
 
 def test_a_key_another_put_of_this_driver_holds_is_not_ready_without_asking_the_sdk() -> None:
@@ -1354,12 +1383,12 @@ def work_per_row_or_thread(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, i
     return done
 
 
-def test_fetch_and_publish_leave_per_row_work_and_thread_starts_off_the_calling_thread(
+def test_fetch_and_publish_build_no_key_or_row_and_start_no_thread_on_the_calling_thread(
     work_per_row_or_thread: list[tuple[str, int]],
 ) -> None:
-    # The calling thread is the executor loop's: what it pays for a submission stays the same
-    # whatever the number of rows. Built without the test endpoint, whose driver spy reads every
-    # row it is handed.
+    # The calling thread is the executor loop's: it builds no store key or RowIO and starts no
+    # thread; keys and rows are built on the driver's threads. Built without the test endpoint,
+    # whose driver spy reads every row it is handed.
     rows = 64
     region = CpuRegion(SLOT, 2 * rows)
     binding = RegionBinding((region,), MooncakeDriver(FakeMooncakeStore()), FakeHold())

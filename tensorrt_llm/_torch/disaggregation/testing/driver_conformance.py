@@ -431,6 +431,13 @@ class DriverConformance:
         a drain ends it."""
         return None
 
+    def make_results_before_access_end(
+        self,
+    ) -> tuple[StoreDriver, Callable[[OpHandle], None], Callable[[OpHandle], None]] | None:
+        """A driver whose operations wait for the check: the first callable concludes every row of
+        an operation and leaves its access open, the second ends its access."""
+        return None
+
     def make_failing_presence(self) -> tuple[StoreDriver, str] | None:
         """A driver whose store fails the next presence query of the returned key."""
         return None
@@ -749,6 +756,30 @@ class DriverConformance:
                 settled = (tuple(h.settle(op)), True)
                 h.settle_access(op)
                 wait_until(lambda: settled in seen, "on_change after the last change", h.timeout)
+
+    def test_on_change_is_called_once_every_row_concluded_while_access_stays_open(self) -> None:
+        """A caller lands an outcome from the rows before their access ends, so the rows' settling
+        is told on its own."""
+        staged = self.make_results_before_access_end()
+        if staged is None:
+            pytest.skip("this driver cannot conclude rows while access stays open")
+        driver, conclude, end_access = staged
+        with self.harness(driver) as h:
+            h.needs(get=True)
+            reader = h.endpoint(["R"], fill=0x2D)
+            told: list[tuple[bool, bool]] = []
+            op = h.get(
+                reader.rows(),
+                on_change=lambda op: told.append(
+                    (concluded(driver.poll(op)), driver.access_ended(op))
+                ),
+            )
+            conclude(op)
+            concluded_open = (True, False)
+            wait_until(
+                lambda: concluded_open in told, "on_change once every row concluded", h.timeout
+            )
+            end_access(op)
 
     def test_an_unprovable_get_makes_drain_return_at_once_and_keeps_its_region(self) -> None:
         staged = self.make_unprovable_get()

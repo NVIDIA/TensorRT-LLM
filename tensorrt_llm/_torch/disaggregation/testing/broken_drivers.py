@@ -10,6 +10,7 @@ a weakened assertion lets both pass is caught there, before a real driver meets 
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -18,10 +19,12 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
     Hint,
+    OnChange,
     OpHandle,
     ProbeStatus,
     RegionHandle,
     RegionLayout,
+    RowBatch,
     RowIO,
     RowResult,
     RowStatus,
@@ -47,7 +50,9 @@ _CANCELLED = RowResult(RowStatus.CANCELLED)
 
 
 class TouchesMemoryBeforeChecking(MemoryDriver):
-    def get(self, rows: Sequence[RowIO], hint: Hint = None, *, on_change=None) -> MemoryOp:
+    def get(
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
+    ) -> MemoryOp:
         for io in rows:
             for span in io.spans:
                 ctypes.memset(span.address, 0, span.nbytes)
@@ -188,18 +193,20 @@ class ProbeCallsAHeldKeyAMiss(MemoryDriver):
         return tuple(ProbeStatus.MISS if a is ProbeStatus.NOT_READY else a for a in answers)
 
 
-class ProbeAnswersHitForEveryKey(MemoryDriver):
+class ProbeCallsAMissAHit(MemoryDriver):
     def probe(self, keys: Sequence[str], budget_s: float, hint: Hint = None):
-        super().probe(keys, budget_s, hint)
-        return tuple(ProbeStatus.HIT for _ in keys)
+        answers = super().probe(keys, budget_s, hint)
+        return tuple(ProbeStatus.HIT if a is ProbeStatus.MISS else a for a in answers)
 
 
 class SplitsAMultiSpanRowEvenly(MemoryDriver):
     """Scatters a multi-span get as if every span had the same size."""
 
     def _get_row(self, io: RowIO) -> RowResult:
+        if len(io.spans) == 1:
+            return super()._get_row(io)
         stored = self.store.get(io.key)
-        if len(io.spans) > 1 and stored is not None and len(stored.payload) == io.nbytes:
+        if stored is not None and len(stored.payload) == io.nbytes:
             share = io.nbytes // len(io.spans)
             for k, span in enumerate(io.spans):
                 ctypes.memmove(
@@ -270,7 +277,9 @@ class GetLetsACrashEscape(MemoryDriver):
 class GetWaitsForTheStore(MemoryDriver):
     """Runs a get on a thread of its own, but returns its handle only once the store answered."""
 
-    def get(self, rows: Sequence[RowIO], hint: Hint = None, *, on_change=None) -> MemoryOp:
+    def get(
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
+    ) -> MemoryOp:
         op = super().get(rows, hint, on_change=on_change)
         while not all(row.published.concluded for row in op.rows):
             time.sleep(0.001)
@@ -300,7 +309,7 @@ class NeverEndsAccess(MemoryDriver):
 
 
 class TellsBeforeTheChangeShows(MemoryDriver):
-    def _run(self, op: MemoryOp, finished) -> None:
+    def _run(self, op: MemoryOp, finished: threading.Event | None) -> None:
         self._call_on_change(op)  # nothing has changed yet, and nothing is told afterwards
         try:
             self._before_execute(op)
@@ -318,6 +327,12 @@ class NeverTellsItTurnedUnprovable(MemoryDriver):
             self._require_open(op)
             op.unprovable = True
             self._lock.notify_all()
+
+
+class TellsOnlyOfAnAccessEnd(MemoryDriver):
+    def _call_on_change(self, op: MemoryOp) -> None:
+        if op.access_ended or op.unprovable:
+            super()._call_on_change(op)
 
 
 class ChangesItsCapabilities(MemoryDriver):
@@ -417,7 +432,7 @@ class UnregisterKeepsTheRange(MemoryDriver):
 class PutWaitsForTheStore(MemoryDriver):
     """Runs a put on a thread of its own, but returns its handle only once the store answered."""
 
-    def put(self, rows, *, on_change=None) -> MemoryOp:
+    def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> MemoryOp:
         op = super().put(rows, on_change=on_change)
         while not all(row.published.concluded for row in op.rows):
             time.sleep(0.001)
@@ -439,6 +454,13 @@ class CancelsStartedRows(MemoryDriver):
         self._settle_untouched(op)
 
 
+class EndsAccessOnceARowStarted(MemoryDriver):
+    def access_ended(self, op: OpHandle) -> bool:
+        with self._lock:
+            recorded = self._op(op)
+            return recorded.access_ended or any(row.started for row in recorded.rows)
+
+
 class CancelEndsAccessWithTheRowInTheStore(MemoryDriver):
     """On cancel, a row the store holds is called FAULT and the access over, as if the transfer
     had been torn down; the transfer in the store goes on regardless."""
@@ -450,12 +472,15 @@ class CancelEndsAccessWithTheRowInTheStore(MemoryDriver):
     def cancel(self, op: OpHandle) -> None:
         with self._lock:
             recorded = self._op(op)
+            if self._cancel_effective:
+                self._cancel_unstarted(recorded)  # as a sound cancel does
             for row in recorded.rows:
                 if row.started and not row.published.concluded:
                     row.published = faulted("torn down")
                     self._torn_down.add(row.io.key)
             recorded.access_ended = True
             self._lock.notify_all()
+        self._call_on_change(recorded)
 
     def _move(self, kind: Kind, io: RowIO) -> RowResult:
         result = super()._move(kind, io)
@@ -559,6 +584,11 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
         TellsBeforeTheChangeShows,
         DEFAULT_CAPABILITIES,
         "test_on_change_is_called_after_each_operation_settles",
+    ),
+    "on_change tells of rows concluded before access ends": (
+        TellsOnlyOfAnAccessEnd,
+        DEFAULT_CAPABILITIES,
+        "test_on_change_is_called_once_every_row_concluded_while_access_stays_open",
     ),
     "on_change tells of an access turned unprovable": (
         NeverTellsItTurnedUnprovable,
@@ -671,7 +701,7 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
         "test_a_key_held_by_an_unfinished_write_is_not_ready_for_get_put_and_probe",
     ),
     "probe tells hit from miss": (
-        ProbeAnswersHitForEveryKey,
+        ProbeCallsAMissAHit,
         DEFAULT_CAPABILITIES,
         "test_probe_reports_hit_and_miss",
     ),
@@ -719,6 +749,11 @@ BROKEN_ASYNC_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities
         CancelEndsAccessWithTheRowInTheStore,
         DEFAULT_CAPABILITIES,
         "test_cancel_of_a_get_inside_the_store_neither_waits_nor_lies",
+    ),
+    "access stays open while a row is in the store": (
+        EndsAccessOnceARowStarted,
+        DEFAULT_CAPABILITIES,
+        "test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls",
     ),
     "get never waits for the store": (
         GetWaitsForTheStore,

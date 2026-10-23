@@ -26,11 +26,11 @@ the driver declares ``cancel``, the progress thread asks it to cancel the calls 
 all concluded. That, and the teardown after a shutdown (draining the driver at once, revoking the
 registrations once every attempt quiesced), is all the progress thread does.
 
-A submission hands its calls over up to the first one the driver does not take; the calls after it
-never reach the driver. A driver that breaks its protocol (a raise other than ``DriverRejected``
-from ``put`` or ``get``, no handle, a raise from a query, or a wrong result count) leaves its call
-held as unprovable, unless the call's access end was recorded already, and every later submission
-is rejected.
+A submission hands its calls over up to the first one the driver does not take, or until a
+protocol violation is recorded; the calls after that never reach the driver. A driver that breaks
+its protocol (a raise other than ``DriverRejected`` from ``put`` or ``get``, no handle, a raise
+from a query, or a wrong result count) leaves its call held as unprovable, unless the call's access
+end was recorded already, and every later submission is rejected.
 """
 
 from __future__ import annotations
@@ -86,13 +86,16 @@ __all__ = [
 ]
 
 # After a shutdown, the progress thread retries what is left of the teardown (an attempt not
-# quiesced yet, a drain that answered False, a revocation that failed) at an interval that doubles
-# from the first to the second, and drops back to the first whenever it is poked.
+# quiesced yet, a drain that answered False, a revocation that failed) at an interval that starts
+# at TEARDOWN_RETRY_MIN_S, doubles up to TEARDOWN_RETRY_MAX_S, and drops back to
+# TEARDOWN_RETRY_MIN_S whenever the thread is poked.
 TEARDOWN_RETRY_MIN_S = 0.001
 TEARDOWN_RETRY_MAX_S = 0.1
 SHUTDOWN_FAULT = "blob backend shut down"
 
-_instance_ids = itertools.count()  # names each backend and binding in thread names and logs
+# Numbers each backend and binding: it names a backend's progress thread and keys each instance's
+# warning_once calls, so one instance's warning never silences another's.
+_instance_ids = itertools.count()
 
 
 @dataclass(frozen=True)
@@ -135,9 +138,11 @@ class RegionBinding:
 
     Registers, once each and on the builder thread, the regions the driver can access; revokes the
     registrations only when nothing can access them, on the backend's progress thread (or on the
-    builder thread when ``register`` rolls back a failed registration); releases the hold only after
-    every registration is confirmed revoked, on the manager's thread. The driver is never called
-    under the binding's lock, so reading the live registrations never waits on a revocation.
+    builder thread when ``register`` rolls back a failed registration); releases the hold only once
+    no registration may be live: through ``release_hold`` on the manager's thread, or inside
+    ``register`` on the builder thread when it raises ``ConstructionRejected``, after which the
+    caller must not call ``release_hold``. The driver is never called under the binding's lock, so
+    reading the live registrations never waits on a revocation.
 
     Args:
         regions: The lender's regions, in its order; region ``i`` is labelled ``region:<i>``.
@@ -176,11 +181,18 @@ class RegionBinding:
         if not self.served_region_indices:  # a backend that could serve no row
             self._hold.release()
             raise ConstructionRejected("no region has slots in memory the store driver can access")
+        layouts = {}
         for index in sorted(self.served_region_indices):
             region = self.regions[index]
-            layout = RegionLayout(
-                region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
-            )
+            try:  # every layout is checked before any region is registered
+                layouts[index] = RegionLayout(
+                    region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
+                )
+            except ValueError as error:
+                self._hold.release()
+                raise ConstructionRejected(f"region:{index}: {error}") from error
+        for index, layout in layouts.items():
+            region = self.regions[index]
             try:
                 handle = self.driver.register(region.address, region.nbytes, layout)
             except Exception as error:
@@ -303,6 +315,13 @@ class _CallResults(NamedTuple):
         return cls(ready, next(faults, None))
 
 
+class _Recorded(NamedTuple):
+    """What a record under the backend's lock leaves to do once the lock is released."""
+
+    wake_due: bool  # the attempt's outcome landed or it quiesced
+    newly_unprovable: bool  # the call turned unprovable with this record
+
+
 class BlobAttempt:
     """The handle of one submission: a ``base.backend.Attempt``.
 
@@ -339,7 +358,8 @@ class BlobAttempt:
         self._calls_awaiting_results = self._calls_awaiting_access_end = len(self._calls)
         # The first row fault; _record_results decides whether it stops the attempt.
         self._first_fault: str | None = None
-        # Set by a cancel, a stopping fault or a shutdown: the calls still running are cancelled.
+        # Set by a cancel, a stopping fault or a shutdown; when the driver declares cancel, the
+        # progress thread then asks it to cancel the calls not concluded.
         self._stopped = False
         self._outcome: Outcome | None = None
         self._quiesced = False
@@ -429,7 +449,8 @@ class BlobBackend:
         self._max_rows_per_op = driver_capabilities.max_rows_per_op
         self._driver_reads_hints = driver_capabilities.hints
         self._driver_cancels = driver_capabilities.cancel
-        # Every call reaches the driver as it is submitted, so a cancel can only be forwarded.
+        # Every call goes to the driver as it is submitted, so the backend can cancel only by
+        # asking the driver: it declares cancel exactly when the driver does.
         self._capabilities = Capabilities(
             fetch=driver_capabilities.get,
             publish=driver_capabilities.put,
@@ -623,9 +644,18 @@ class BlobBackend:
 
     def _hand_over(self, attempt: BlobAttempt, batches: list[RowBatch]) -> None:
         """Hands ``attempt``'s calls to the driver in order, up to the first one the driver does
-        not take; the calls after that one never reach the driver and conclude CANCELLED."""
+        not take, or the first after a protocol violation was recorded (an earlier call's
+        ``on_change`` may record one meanwhile); that call fails as a whole, and the calls after it
+        never reach the driver and conclude CANCELLED."""
         taken: list[tuple[_Call, OpHandle]] = []
         for call, rows in zip(attempt._calls, batches):
+            # Read without the lock: a violation recorded a moment later lets one more call
+            # through, which is then held like any call already in the driver.
+            violation = self._protocol_violation
+            if violation is not None:
+                reason = f"not handed over: the store driver broke its protocol ({violation})"
+                self._fail_call(call, reason, broke_protocol=False)
+                break
             op = self._hand_over_call(call, rows)
             if op is None:
                 break
@@ -692,21 +722,22 @@ class BlobBackend:
         nothing the driver says about it later is taken as evidence. Calls already in the driver
         keep being recorded from its answers, and every later submission is rejected."""
         with self._lock:
-            if broke_protocol and self._protocol_violation is None:
+            first_violation = broke_protocol and self._protocol_violation is None
+            if first_violation:
                 self._protocol_violation = reason
-                logger.warning(
-                    f"blob backend: the store driver broke its protocol ({reason}); every later "
-                    "submission is rejected"
-                )
-            wake_due = self._record_locked(
+            recorded = self._record_locked(
                 call,
                 _CallResults.none_delivered(len(call), reason),
                 access_ended=not broke_protocol,
                 unprovable=broke_protocol,
                 whole_call_failed=True,
             )
-        if wake_due:
-            self._call_wake()
+        if first_violation:
+            logger.warning(
+                f"blob backend: the store driver broke its protocol ({reason}); every later "
+                "submission is rejected"
+            )
+        self._after_record(call.attempt, recorded)
 
     def _record(
         self,
@@ -716,8 +747,20 @@ class BlobBackend:
         unprovable: bool = False,
     ) -> None:
         with self._lock:
-            wake_due = self._record_locked(call, results, access_ended, unprovable)
-        if wake_due:
+            recorded = self._record_locked(call, results, access_ended, unprovable)
+        self._after_record(call.attempt, recorded)
+
+    def _after_record(self, attempt: BlobAttempt, recorded: _Recorded) -> None:
+        """What a record leaves to do once the lock is released: a log line for a call that turned
+        unprovable, and the holder's ``wake``. Neither runs under the lock, so a slow log sink or
+        ``wake`` never holds up the submitting thread."""
+        if recorded.newly_unprovable:
+            logger.warning_once(
+                f"blob backend: a store call of {attempt.label} can never prove its access "
+                "ended; its slots stay held",
+                key=(self._name, "unprovable"),
+            )
+        if recorded.wake_due:
             self._call_wake()
 
     # Bookkeeping, under the lock.
@@ -729,13 +772,12 @@ class BlobBackend:
         access_ended: bool,
         unprovable: bool,
         whole_call_failed: bool = False,
-    ) -> bool:
+    ) -> _Recorded:
         """Records ``call``'s results (None while not all concluded), its access end and whether
         that end can never be proven. Only adds evidence, so a stale or repeated look changes
         nothing; a recorded access end stands against a later claim that it can never be proven,
-        and an unprovable call stays held whatever the driver says of it later. True when the
-        attempt's outcome landed or it quiesced, so the caller calls ``wake`` once it released the
-        lock."""
+        and an unprovable call stays held whatever the driver says of it later. The caller passes
+        what it returns to ``_after_record`` once it released the lock."""
         attempt = call.attempt
         if results is not None and not call.results_recorded:
             call.results_recorded = True
@@ -745,14 +787,10 @@ class BlobBackend:
         if access_ended and not call.access_end_recorded and not call.unprovable:
             call.access_end_recorded = True
             attempt._calls_awaiting_access_end -= 1
-        if unprovable and not call.unprovable and not call.access_end_recorded:
+        newly_unprovable = unprovable and not call.unprovable and not call.access_end_recorded
+        if newly_unprovable:
             call.unprovable = True
-            logger.warning_once(
-                f"blob backend: a store call of {attempt.label} can never prove its access "
-                "ended; its slots stay held",
-                key=(self._name, "unprovable"),
-            )
-        return self._conclude_or_quiesce_and_retire(attempt)
+        return _Recorded(self._conclude_or_quiesce_and_retire(attempt), newly_unprovable)
 
     def _conclude_or_quiesce_and_retire(self, attempt: BlobAttempt) -> bool:
         """Under the lock: lands ``attempt``'s outcome and quiescence once due, and drops it from
@@ -762,7 +800,9 @@ class BlobBackend:
             self._attempts.discard(attempt)
             if self._shutdown_requested:  # the teardown may be one round away
                 self._poke_progress()
-        self._shutdown_recheck.notify_all()  # every change a shutdown waits for passes through here
+        # Every attempt change a shutdown waits for passes through here; the progress thread
+        # notifies the end of the teardown itself.
+        self._shutdown_recheck.notify_all()
         return wake_due
 
     def _cancel(self, attempt: BlobAttempt) -> None:
@@ -854,6 +894,10 @@ class BlobBackend:
     # Shutdown, on the shutdown thread.
 
     def _refuse_new_work_and_force_outcomes(self) -> bool:
+        """Refuses every later submission, forces the shutdown outcome on each attempt not
+        concluded and stops it (its calls are cancelled when the driver declares cancel), and pokes
+        the progress thread to start the teardown. True when an outcome was forced, so the caller
+        calls ``wake``."""
         with self._lock:
             self._shutdown_requested = True
             forced = [attempt for attempt in self._attempts if attempt._outcome is None]

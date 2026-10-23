@@ -7,8 +7,9 @@ the other process's segment and every transfer goes through the transfer engine;
 ``local_buffer_size`` is 0, so a call that needed the SDK's copying path would fail. Runs only with
 ``TRTLLM_MOONCAKE_REAL=1``, on a host with ``mooncake_master`` and ``mooncake.store``. The
 transport is ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) over ``TRTLLM_MOONCAKE_DEVICES`` (default:
-the host's fastest active InfiniBand devices). The master must come from the same pinned SDK build
-as the client; both versions are printed and recorded as test-suite properties. The shared
+the host's fastest active InfiniBand devices). The master must be shipped by one of the pinned SDK
+distributions and report 0.3.13, and every installed pinned client build must be 0.3.13; both
+versions are printed and recorded as test-suite properties. The shared
 ``driver_conformance`` checks run here too, each over a fresh client and under a key prefix of its
 own.
 """
@@ -248,7 +249,8 @@ def test_real_get_lands_a_shorter_object_and_refuses_a_longer_one(clients, reque
 
 class TestRealMooncakeConformance(DriverConformance):
     """The shared driver checks over the real pool, one fresh client per check, with the scenarios
-    a real master can stage: a key another client is writing, and a get held inside the SDK."""
+    a real master can stage: a key another client is writing, and a get or a put held inside the
+    SDK."""
 
     timeout = 30.0
 

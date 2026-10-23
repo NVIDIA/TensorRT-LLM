@@ -61,7 +61,7 @@ write before it lands and is also used toward a process of the pool that runs an
 An operation can never prove its access ended once one of its parts returned from its SDK calls
 with access not ended: it is ``access_unprovable``, and it keeps its region from being unregistered
 and the driver from draining. Its other parts still run: each part's rows stand alone, and a cancel
-or drain stops only those not started.
+or drain ends only the rows no worker took yet.
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ MAX_ROW_BYTES = (1 << 31) - 1  # the put scatter answers each row's bytes as a 3
 _CAPABILITIES = DriverCapabilities(
     get=True,
     put=True,
-    cancel=True,  # cancels the parts not started; the SDK cannot stop a running call
+    cancel=True,  # ends the rows no worker took; the SDK cannot stop a running call
     probe=False,
     max_rows_per_op=None,  # any number: the driver cuts an operation into parts itself
     # The master answers OBJECT_NOT_FOUND for a key it does not hold; failures keep their own
@@ -169,7 +169,8 @@ _SKIP_RESULTS = {
 # Such a session is left for drain and its key is never put again: the master matches an end by key
 # and client only, so a late end would mark complete this client's next object of the key.
 _END_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.METADATA_CALL_FAILED)
-# Retried once: the master ends a session idempotently. A call that raised or miscounted is not.
+# Session-end answers retried once, as the master ends a session idempotently; an end call that
+# raised or miscounted is not retried.
 _END_RETRIED = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT)
 
 
@@ -197,12 +198,15 @@ class _Op:
     region: _Registration  # the registration every row lies in
     rows_per_part: int
     results: list[RowResult]  # per row; each part writes its slice when it ends
-    on_change: OnChange | None  # told once every row concluded and once it turned unprovable
+    # Told once every row concluded (its access ends then too, unless unprovable) and once it
+    # turned unprovable.
+    on_change: OnChange | None
     # Rows from here on wait in the operation's queue; once every row was taken, or ended
     # untaken, it is ``len(rows)`` and the operation has left the queue.
     first_untaken_row: int = 0
     parts_running: int = 0
-    unprovable: bool = False  # a part's access never ended: the region stays busy for good
+    # A part returned with its access not proven ended: the region stays busy for good.
+    unprovable: bool = False
 
     @property
     def all_taken(self) -> bool:
@@ -230,9 +234,8 @@ class _Rows:
         self.keys = keys
         self.addresses = addresses
         self.row_bytes = row_bytes
-        self.sizes = [row_bytes] * len(
-            keys
-        )  # also what a call answers when it moved every row whole
+        # Also what a call answers when it moved every row whole.
+        self.sizes = [row_bytes] * len(keys)
 
     def only(self, keys: list[str]) -> _Rows:
         """The rows of ``keys``, a subset of these in their order."""
@@ -348,7 +351,8 @@ class MooncakeDriver:
         # with none queued; at GETS_BEFORE_PUT_IS_DUE the put is due.
         self._gets_ahead_of_puts = 0
         self._registrations: list[_Registration] = []
-        self._draining = False  # set by the first drain, whatever it returns
+        # Set by the first drain, whatever it returns, or when a worker thread fails to start.
+        self._draining = False
         # A drain returned True: no part ran, no worker thread was left and none was unprovable.
         self._drained = False
         self._closed = False
@@ -359,8 +363,8 @@ class MooncakeDriver:
         # both: a reserved key is left open only as its reservation ends, and is never reserved
         # again.
         self._sessions_left_open: dict[str, _LeftOpen] = {}
-        self._in_flight_op_count = 0  # operations with parts queued or running
-        self._unprovable_op_count = 0  # operations whose access never ended
+        self._in_flight_op_count = 0  # operations with rows queued or parts running
+        self._unprovable_op_count = 0  # operations whose access can never be proven ended
         self._skipped_rows: Counter[str] = Counter()  # by reason
         # Started here, on the builder's thread: starting a thread waits for it to run, which on
         # the executor loop's thread would hand the GIL to every busy thread. If one cannot start,
@@ -465,7 +469,7 @@ class MooncakeDriver:
         return tuple(ProbeStatus.UNKNOWN for _ in keys)
 
     def drain(self, budget_s: float) -> bool:
-        """Refuses new work for good, cancels the parts no worker started, ends the worker threads,
+        """Refuses new work for good, cancels the rows no worker took, ends the worker threads,
         and waits up to ``budget_s`` for the running parts to end and every worker thread to exit.
         Returns False at once while an operation is unprovable.
 
@@ -596,7 +600,9 @@ class MooncakeDriver:
             done: list[_Op] = []
             with self._lock:
                 self._workers_alive -= 1
-                if not self._workers_alive:  # every other worker was stopped by an exception
+                # The last worker to exit ends the rows still queued, since no one will take
+                # them. After a drain nothing is queued; otherwise the others died of exceptions.
+                if not self._workers_alive:
                     done = self._end_untaken_rows(self._queued_ops(), _NO_WORKER_LEFT)
                 self._lock.notify_all()  # drain waits for every worker thread to exit
             for op in done:
