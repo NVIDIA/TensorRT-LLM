@@ -11,7 +11,9 @@ This module tests:
 """
 
 import datetime
+import gc
 import pickle
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -183,7 +185,6 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
     request.py_logprobs_simple_format = enabled
     request.py_return_routed_experts = enabled
     request.py_original_end_id = original_end_id
-    request.py_mm_item_order = [1, 0]
     request.py_arrival_time = 123.0
 
     restored = _broadcast_round_trip(request)
@@ -192,7 +193,6 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
         "py_logprobs_simple_format",
         "py_return_routed_experts",
         "py_original_end_id",
-        "py_mm_item_order",
         "py_arrival_time",
     ):
         assert getattr(restored, attribute) == getattr(request, attribute)
@@ -202,7 +202,6 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
     assert translated.py_logprobs_simple_format is enabled
     assert translated.py_return_routed_experts is enabled
     assert translated.py_original_end_id == original_end_id
-    assert translated.py_mm_item_order == [1, 0]
     translated.finish_by_reason(trtllm.FinishReason.CANCELLED)
     response = translated.create_response()
     assert response is not None
@@ -220,7 +219,6 @@ def test_request_broadcast_preserves_absent_python_input_defaults() -> None:
     assert translated.py_logprobs_simple_format is False
     assert translated.py_return_routed_experts is False
     assert translated.py_original_end_id == 7
-    assert translated.py_mm_item_order is None
 
 
 @pytest.mark.parametrize("position_ids", [None, [4, 5, 6]])
@@ -305,6 +303,199 @@ def test_request_translation_requires_multimodal_encoder_output_length() -> None
     request.py_multimodal_data = {"audio": {"encoder_input_features": torch.ones(12, 8)}}
     with pytest.raises(ValueError, match="without encoder_output_len"):
         executor_request_to_llm_request(42, _broadcast_round_trip(request), [], False)
+
+
+@pytest.mark.parametrize("seed", [None, 11])
+def test_child_factory_owns_inputs_and_resets_execution_state(seed) -> None:
+    features = torch.ones(12, 8)
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(seed=seed, num_return_sequences=3),
+        is_streaming=True,
+        client_id=7,
+        return_log_probs=True,
+        return_generation_logits=True,
+        exclude_last_generation_logits=True,
+        stop_words_list=[[4, 5]],
+        embedding_bias=torch.ones(8),
+        position_ids=[7, 8, 9],
+        encoder_input_features=features,
+        encoder_output_len=6,
+        py_multimodal_data={"embedding": torch.ones(2, 8)},
+        py_lora_ckpt_source="hf",
+        draft_tokens=[10, 11],
+    )
+    parent.py_bad_words = [[6, 7]]
+    parent.py_original_end_id = 99
+    parent.seq_slot = 4
+    parent.py_seq_slot = 4
+    parent.py_batch_idx = 3
+    parent.py_decoding_iter = 5
+    parent.py_total_draft_tokens = 8
+    parent.py_per_pos_drafted[0] = 8
+    parent.py_draft_tokens = [99]
+    parent.py_encoder_output_ready_event = object()
+    parent.py_encoder_output = torch.ones(6, 8)
+    parent.py_perf_timing = object()
+    parent.py_kv_transfer_timed_out = True
+    parent.py_connector_allocation_reported = True
+    parent.py_unclassified_state = object()
+    parent.py_result.diff.context_logits_list.append(torch.ones(3, 8))
+
+    for child_id in (43, 44):
+        parent.create_child_request(child_id)
+    child, sibling = parent.child_requests
+    assert parent._native_child_requests[0] is child
+    assert parent._native_child_requests[1] is sibling
+    assert parent.sampling_config.seed == (seed or 0)
+    assert child.sampling_config.seed == (seed or 0) + 1
+    assert sibling.sampling_config.seed == (seed or 0) + 2
+    assert child.parent_request_id == 42
+    assert child.py_request_id == 43
+    assert child.py_client_id == 7
+    assert child.py_lora_ckpt_source == "hf"
+    assert child.child_requests == []
+    assert child._native_child_requests == []
+    assert child.seq_slot is None
+    assert child.py_seq_slot is None
+    assert child.py_batch_idx is None
+    assert child.py_decoding_iter == 0
+    assert child.py_total_draft_tokens == 0
+    assert child.py_per_pos_drafted[0] == 0
+    assert child.py_draft_tokens == [10, 11]
+    assert child.py_mm_encoder_event is None
+    assert child.py_mm_encoder_state is None
+    assert child.py_encoder_output_ready_event is None
+    assert child.py_encoder_output is None
+    assert child.py_perf_timing is None
+    assert child.py_kv_transfer_timed_out is False
+    assert child.py_connector_allocation_reported is False
+    assert not hasattr(child, "py_unclassified_state")
+    assert child.py_result is not parent.py_result
+    assert child.py_result.diff.context_logits_list == []
+    assert child.py_result._exclude_last_generation_logits is True
+    assert child.py_result._generation_logits is not None
+    assert child.py_result._log_probs is not None
+    assert child.py_result._log_probs is not parent.py_result._log_probs
+    assert child.py_encoder_input_features is features
+    assert sibling.py_encoder_input_features is features
+    assert child.encoder_output_len == 6
+    assert child.py_original_end_id == 99
+    assert (
+        child.py_multimodal_data["embedding"].data_ptr()
+        != parent.py_multimodal_data["embedding"].data_ptr()
+    )
+    child.py_embedding_bias.add_(1)
+    torch.testing.assert_close(parent.py_embedding_bias, torch.ones(8))
+    child.py_position_ids[0] = 100
+    child.py_stop_words_list[0][0] = 100
+    child.py_bad_words[0][0] = 100
+    assert parent.py_position_ids == [7, 8, 9]
+    assert sibling.py_position_ids == [7, 8, 9]
+    assert parent.py_stop_words_list == [[4, 5]]
+    assert parent.py_bad_words == [[6, 7]]
+    child.seq_slot = 9
+    assert parent._native_child_requests[0].seq_slot == 9
+
+
+@pytest.mark.parametrize("runtime_field", ["py_mm_encoder_state", "py_mm_encoder_event"])
+def test_child_factory_rejects_multimodal_encoder_ownership(runtime_field) -> None:
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        is_streaming=False,
+        py_multimodal_data={"embedding": torch.ones(2, 8)},
+    )
+    runtime_value = object()
+    setattr(parent, runtime_field, runtime_value)
+    with pytest.raises(RuntimeError, match="before MM encoder admission"):
+        parent.create_child_request(43)
+    assert parent.child_requests == []
+    assert parent._native_child_requests == []
+    assert parent.sampling_config.seed is None
+    assert getattr(parent, runtime_field) is runtime_value
+
+    setattr(parent, runtime_field, None)
+    parent.create_child_request(43)
+    assert parent.child_requests[0].sampling_config.seed == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_child_factory_shares_only_sequence_group_completion(streaming) -> None:
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+        is_streaming=streaming,
+    )
+    parent.create_child_request(43)
+    parent.create_child_request(44)
+    child, sibling = parent.child_requests
+    assert not parent.is_finished
+    for request, expected_final in ((child, False), (parent, False), (sibling, True)):
+        request.finish_by_reason(trtllm.FinishReason.CANCELLED)
+        response = request.create_response()
+        assert response is not None
+        assert response.request_id == 42
+        assert response.result.get_result().is_sequence_final
+        assert response.result.is_final is expected_final
+    assert child.is_finished
+    assert sibling.is_finished
+
+
+@pytest.mark.parametrize("input_field", ["py_multimodal_data", "py_disaggregated_params"])
+def test_child_factory_failure_does_not_register_a_partial_child(input_field) -> None:
+    class UncopyableInput:
+        def __deepcopy__(self, memo):
+            raise ValueError("input copy failed")
+
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        is_streaming=False,
+    )
+    setattr(parent, input_field, UncopyableInput())
+    with pytest.raises(ValueError, match="input copy failed"):
+        parent.create_child_request(43)
+    assert parent.child_requests == []
+    assert parent._native_child_requests == []
+    assert parent.sampling_config.seed is None
+    setattr(parent, input_field, None)
+    parent.create_child_request(43)
+    assert parent.child_requests[0].sampling_config.seed == 1
+    with pytest.raises(RuntimeError, match="A child request cannot create its own child"):
+        parent.child_requests[0].create_child_request(44)
+    with pytest.raises(RuntimeError, match="Cannot create child requests more than"):
+        parent.create_child_request(44)
+
+
+def test_native_parent_retains_child_python_inputs_without_a_reference_cycle() -> None:
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        is_streaming=False,
+        position_ids=[7, 8, 9],
+    )
+    parent.create_child_request(43)
+    child_ref = weakref.ref(parent.child_requests[0])
+    parent_ref = weakref.ref(parent)
+    parent.child_requests.clear()
+    gc.collect()
+    assert child_ref() is not None
+    assert child_ref().py_position_ids == [7, 8, 9]
+    del parent
+    gc.collect()
+    assert parent_ref() is None
+    assert child_ref() is None
 
 
 def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> None:
@@ -559,21 +750,28 @@ def test_optional_tensor_results_are_python_owned(streaming) -> None:
     torch.testing.assert_close(response.result.additional_generation_outputs["hidden"], generation)
 
 
-def test_executor_request_to_llm_request_copies_uncached_prefill_estimate() -> None:
-    """The ADP router's estimate survives conversion; without one it stays None."""
-    with_estimate = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
-    with_estimate.py_uncached_prefill_tokens = 5000
-    without_estimate = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+@pytest.mark.parametrize("estimate", [None, 0, 5000])
+def test_executor_request_to_llm_request_copies_uncached_prefill_estimate(estimate) -> None:
+    """Router estimates survive conversion and fan-out, with independent aging."""
+    request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+    )
+    if estimate is not None:
+        request.py_uncached_prefill_tokens = estimate
+    parent = executor_request_to_llm_request(
+        42, request, child_req_ids=[43, 44], exclude_last_generation_logits=False
+    )
+    child, sibling = parent.child_requests
+    assert parent.py_uncached_prefill_tokens == estimate
+    assert child.py_uncached_prefill_tokens == estimate
+    assert sibling.py_uncached_prefill_tokens == estimate
 
-    converted = [
-        executor_request_to_llm_request(
-            42, request, child_req_ids=[], exclude_last_generation_logits=False
-        )
-        for request in (with_estimate, without_estimate)
-    ]
-
-    assert converted[0].py_uncached_prefill_tokens == 5000
-    assert converted[1].py_uncached_prefill_tokens is None
+    # The scheduler clears an aged-out request's estimate independently.
+    child.py_uncached_prefill_tokens = None
+    assert parent.py_uncached_prefill_tokens == estimate
+    assert sibling.py_uncached_prefill_tokens == estimate
 
 
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:

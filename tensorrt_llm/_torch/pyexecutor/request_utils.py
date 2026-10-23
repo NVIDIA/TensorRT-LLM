@@ -532,7 +532,6 @@ class RequestBroadcaster:
                 "py_logprobs_mode",
                 "py_logprobs_simple_format",
                 "py_return_routed_experts",
-                "py_mm_item_order",
                 "py_arrival_time",
             )
         ]
