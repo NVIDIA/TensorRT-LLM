@@ -337,6 +337,26 @@ def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("model_config", "separate"),
+    [
+        (_config(), False),
+        (_config().text_config, False),
+        (PretrainedConfig(model_type="deepseek_v3", num_nextn_predict_layers=1), True),
+    ],
+    ids=["glm5_next", "glm5_next_text", "deepseek_v3"],
+)
+def test_mtp_draft_layers_share_the_target_kv_cache(model_config, separate):
+    from tensorrt_llm._torch.speculative import update_spec_config_from_model_config
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    update_spec_config_from_model_config(spec_config, model_config)
+    assert should_use_separate_draft_kv_cache(spec_config) is separate
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
 def test_model_type_recognition_does_not_hide_missing_schedule(model_type):
     config = SimpleNamespace(model_type=model_type, num_hidden_layers=1)

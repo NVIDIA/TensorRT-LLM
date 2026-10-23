@@ -991,8 +991,9 @@ def check_v2_events(llm: LLM,
 
     tokens_per_block = llm.get_kv_cache_capacity()["tokensPerBlock"]
     prompt_length = 127
-    cached_length = prompt_length + sampling_params.max_tokens - 1
-    blocks_per_request = (cached_length + tokens_per_block -
+    # The last sampled token has no KV, so it is never committed.
+    committed_length = prompt_length + sampling_params.max_tokens - 1
+    blocks_per_request = (committed_length + tokens_per_block -
                           1) // tokens_per_block
     num_requests = 1
     cached_blocks = {}
@@ -1060,12 +1061,13 @@ def check_v2_events(llm: LLM,
                     del cached_blocks[block_hash]
                     num_removed_blocks += 1
 
-        # The final sampled token has no KV until another forward pass.
-        cached_tokens = prompt + list(output.outputs[0].token_ids[:-1])
+        # V2 publishes the prompt and the decode tokens, including the partial tail.
+        committed_tokens = (
+            prompt + list(output.outputs[0].token_ids))[:committed_length]
         assert [[token["token_id"] for token in block["tokens"]]
                 for block in stored_blocks] == [
-                    cached_tokens[start:start + tokens_per_block]
-                    for start in range(0, cached_length, tokens_per_block)
+                    committed_tokens[start:start + tokens_per_block]
+                    for start in range(0, committed_length, tokens_per_block)
                 ]
         if request_index == 0:
             assert num_offloaded_blocks == 0

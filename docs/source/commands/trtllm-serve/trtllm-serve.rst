@@ -367,6 +367,7 @@ Start the server and specify the ``--config`` argument with the path to the YAML
 
 After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint.
 Since the statistics are stored in an internal queue and removed once retrieved, it's recommended to poll the endpoint shortly after each request and store the results if needed.
+Each statistic is returned to only one caller, so poll the endpoint from a single client: when several clients poll at once, one of them may receive an empty list.
 
 .. code-block:: bash
 
