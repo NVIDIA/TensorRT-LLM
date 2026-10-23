@@ -231,6 +231,9 @@ def test_mapping_mismatch_coordinates_fallback_before_reader_setup(monkeypatch):
     assert status.selected == "native"
     assert status.effective == "native"
     assert "mapping.world_size" in status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     warning.assert_called_once()
 
@@ -362,6 +365,9 @@ def test_ineligible_request_uses_exact_native_fallback(
     assert not status.activated
     assert status.effective == "native"
     assert status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     if requested_policy == "rank_striped_read_ahead":
         warning.assert_called_once()
@@ -443,7 +449,11 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
         assert "model.norm.weight" in weights
 
     assert stopped.is_set()
-    assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "rank_striped_read_ahead"
+    # Preparation started the readers; finalization waited for them to stop.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds > 0
 
 
 def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch):
@@ -496,6 +506,8 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     assert status.fallback_reason == (
         "model materialization failed: RuntimeError: materialization failed"
     )
+    # Finishing read-ahead is timed even when the with-block fails.
+    assert status.finalization_seconds > 0
     assert "model materialization failed" in error_log.call_args.args[0]
     assert "cleanup failure" not in error_log.call_args.args[0]
 

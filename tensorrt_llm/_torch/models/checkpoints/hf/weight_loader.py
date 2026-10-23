@@ -101,6 +101,14 @@ class _CheckpointIOStatus:
     activated: bool = False
     effective: str = "none"
     fallback_reason: str | None = None
+    # Time `open_weight_session` took to hand out the weights: policy checks
+    # across ranks, file mapping and starting the background readers, or the
+    # native fallback load.
+    preparation_seconds: float = 0.0
+    # Time `open_weight_session` took to close: waiting for every rank and
+    # stopping the background readers. Always 0 without an active
+    # read-ahead session.
+    finalization_seconds: float = 0.0
 
 
 @register_checkpoint_weight_loader(CheckpointFormat.MX)
@@ -465,70 +473,75 @@ class HfWeightLoader(BaseWeightLoader):
                             mapping: Mapping,
                             use_consolidated: bool = False,
                             **kwargs) -> Iterator[dict[str, Any]]:
-        """Keep opt-in read-ahead alive through model materialization."""
+        """Keep opt-in read-ahead alive through model materialization.
+
+        Copy the yielded weights into the model inside the ``with`` block.
+        Every rank must enter and leave the block, because starting and
+        finishing read-ahead are collective. Afterwards,
+        `last_checkpoint_io_status` reports the policy that took effect and
+        how long the session took to start and to finish.
+        """
+        preparation_started = time.perf_counter()
         self._reset_checkpoint_io_status()
+        status = self._last_checkpoint_io_status
+
+        # prepare the weights: native load, native fallback or read-ahead
+        session: RankStripedReadAheadSession | None = None
         if self._checkpoint_io_policy == CheckpointIOPolicy.NATIVE:
             weights = self._load_weights_native(checkpoint_dir, mapping,
                                                 use_consolidated, **kwargs)
-            self._last_checkpoint_io_status.effective = CheckpointIOPolicy.NATIVE
+            status.effective = CheckpointIOPolicy.NATIVE
             self._log_checkpoint_io_status()
-            yield weights
-            return
-
-        active_communicator = self._active_communicator()
-        mapping_error = None
-        communicator_size = (None if active_communicator is None else
-                             active_communicator.Get_size())
-        if (communicator_size is not None
-                and mapping.world_size != communicator_size):
-            mapping_error = RuntimeError(
-                "Rank-striped read-ahead requires mapping.world_size to "
-                "match the active MPI communicator size "
-                f"({communicator_size}); received {mapping.world_size}.")
-        coordinated_mapping_error = coordinate_error(
-            active_communicator,
-            "rank-striped mapping validation",
-            mapping_error,
-        )
-        if coordinated_mapping_error is not None:
-            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
-            weights = self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                str(coordinated_mapping_error),
-                active_communicator=active_communicator,
-                allow_native_prefetch=False,
-                **kwargs,
+        else:
+            active_communicator = self._active_communicator()
+            mapping_error = None
+            communicator_size = (None if active_communicator is None else
+                                 active_communicator.Get_size())
+            if (communicator_size is not None
+                    and mapping.world_size != communicator_size):
+                mapping_error = RuntimeError(
+                    "Rank-striped read-ahead requires mapping.world_size to "
+                    "match the active MPI communicator size "
+                    f"({communicator_size}); received {mapping.world_size}.")
+            coordinated_mapping_error = coordinate_error(
+                active_communicator,
+                "rank-striped mapping validation",
+                mapping_error,
             )
-            yield weights
-            return
-        if mapping.world_size > 1 and active_communicator is None:
-            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
-            weights = self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                "distributed rank-striped read-ahead requires an active MPI communicator",
-                # Ray workers intentionally disable MPI. Preserve the native
-                # path's per-process read-ahead in that supported mode.
-                allow_native_prefetch=mpi_disabled(),
-                **kwargs,
-            )
-            yield weights
-            return
+            if coordinated_mapping_error is not None:
+                status.selected = CheckpointIOPolicy.NATIVE
+                weights = self._fallback_to_native(
+                    checkpoint_dir,
+                    mapping,
+                    use_consolidated,
+                    str(coordinated_mapping_error),
+                    active_communicator=active_communicator,
+                    allow_native_prefetch=False,
+                    **kwargs,
+                )
+            elif mapping.world_size > 1 and active_communicator is None:
+                status.selected = CheckpointIOPolicy.NATIVE
+                weights = self._fallback_to_native(
+                    checkpoint_dir,
+                    mapping,
+                    use_consolidated,
+                    "distributed rank-striped read-ahead requires an active MPI communicator",
+                    # Ray workers intentionally disable MPI. Preserve the native
+                    # path's per-process read-ahead in that supported mode.
+                    allow_native_prefetch=mpi_disabled(),
+                    **kwargs,
+                )
+            else:
+                weights, session = self._start_rank_striped_read_ahead(
+                    checkpoint_dir,
+                    mapping,
+                    use_consolidated,
+                    active_communicator,
+                    **kwargs,
+                )
+        status.preparation_seconds = time.perf_counter() - preparation_started
 
-        weights, session = self._start_rank_striped_read_ahead(
-            checkpoint_dir,
-            mapping,
-            use_consolidated,
-            active_communicator,
-            **kwargs,
-        )
-        if session is None:
-            yield weights
-            return
-
+        # hand the weights to the caller's with-block, then finish read-ahead
         body_error = None
         try:
             yield weights
@@ -536,39 +549,56 @@ class HfWeightLoader(BaseWeightLoader):
             body_error = error
             raise
         finally:
-            try:
-                read_error = session.finish(body_error)
-            except Exception as error:
-                status = self._last_checkpoint_io_status
-                status.effective = "none"
-                if body_error is None:
-                    status.fallback_reason = str(error)
-                    self._log_checkpoint_io_status()
-                    raise
-                status.fallback_reason = (
-                    "model materialization failed: "
-                    f"{type(body_error).__name__}: {body_error}")
+            if session is not None:
+                finalization_started = time.perf_counter()
+                try:
+                    self._finish_read_ahead_session(session, body_error)
+                finally:
+                    status.finalization_seconds = (time.perf_counter() -
+                                                   finalization_started)
+
+    def _finish_read_ahead_session(self, session: RankStripedReadAheadSession,
+                                   body_error: BaseException | None) -> None:
+        """Finish read-ahead after the caller's with-block and record the outcome.
+
+        Called by `open_weight_session` when its with-block ends.
+
+        Raises:
+            - Exception: finishing failed and the with-block itself did not
+              fail. When the with-block failed, its error is kept instead.
+        """
+        status = self._last_checkpoint_io_status
+        try:
+            read_error = session.finish(body_error)
+        except Exception as error:
+            status.effective = "none"
+            if body_error is None:
+                status.fallback_reason = str(error)
                 self._log_checkpoint_io_status()
-                # Preserve the specific local error (for example, CUDA OOM) instead
-                # of finish()'s rank-coordinated wrapper.
-                logger.error(
-                    "Rank-striped model materialization failed; preserving "
-                    "the original exception. Coordinated session result: "
-                    f"{type(error).__name__}: {error}")
-            else:
-                status = self._last_checkpoint_io_status
-                if read_error is None:
-                    status.effective = CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
-                else:
-                    # Read-ahead is advisory. The native mmap/materialization
-                    # path succeeded, so never retry a partially mutated model.
-                    status.effective = CheckpointIOPolicy.NATIVE
-                    status.fallback_reason = str(read_error)
-                    logger.warning(
-                        "Rank-striped read-ahead degraded after activation; "
-                        "keeping the successfully materialized model: "
-                        f"{read_error}")
-                self._log_checkpoint_io_status()
+                raise
+            status.fallback_reason = (
+                "model materialization failed: "
+                f"{type(body_error).__name__}: {body_error}")
+            self._log_checkpoint_io_status()
+            # Preserve the specific local error (for example, CUDA OOM) instead
+            # of finish()'s rank-coordinated wrapper.
+            logger.error(
+                "Rank-striped model materialization failed; preserving "
+                "the original exception. Coordinated session result: "
+                f"{type(error).__name__}: {error}")
+            return
+
+        if read_error is None:
+            status.effective = CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
+        else:
+            # Read-ahead is advisory. The native mmap/materialization
+            # path succeeded, so never retry a partially mutated model.
+            status.effective = CheckpointIOPolicy.NATIVE
+            status.fallback_reason = str(read_error)
+            logger.warning("Rank-striped read-ahead degraded after activation; "
+                           "keeping the successfully materialized model: "
+                           f"{read_error}")
+        self._log_checkpoint_io_status()
 
     @staticmethod
     def _active_communicator():

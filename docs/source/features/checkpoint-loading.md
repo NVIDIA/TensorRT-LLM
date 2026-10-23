@@ -76,6 +76,15 @@ Transforms weights between different naming conventions and applies model-specif
 
 ## Built-in Checkpoint Formats
 
+Select a format with `checkpoint_format` in the LLM API or the YAML config:
+
+| `checkpoint_format` | Checkpoint it loads |
+|---|---|
+| `HF` (default) | Hugging Face checkpoint |
+| `mistral` | Mistral native checkpoint |
+| `mistral_large_3` | Mistral Large 3 native checkpoint |
+| `MX` | ModelExpress peer-to-peer (P2P) weight transfer with Hugging Face checkpoint as fallback |
+
 ### HuggingFace Format
 
 Currently, HF checkpoint loader is the primary built-in format, supporting:
@@ -83,131 +92,27 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 - **Weights loading** (`.safetensors/.bin/.pth`) - Loading HF compatible weights from disk
 - **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
 - **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
+- **Weights Streaming** - Support experimental weight streaming options (see [Checkpoint I/O Policies](#checkpoint-io-policies))
+
+### Mistral Native Format
+
+`checkpoint_format: mistral` loads checkpoints in Mistral's own layout: a
+`params.json` config and `consolidated*.safetensors` weights.
+
+### Mistral Large 3 Format
+
+`checkpoint_format: mistral_large_3` reads the same layout as `mistral`. It
+uses the Mistral Large 3 weight mapper for every architecture in the
+checkpoint, including the multimodal `PixtralForConditionalGeneration`
+wrapper.
 
 ### ModelExpress (MX) Loading Path
 
-The PyTorch backend can use ModelExpress (MX) for peer-to-peer weight transfer
-from a running TensorRT-LLM source instance before falling back to Hugging Face
-checkpoint loading. Selecting MX does not require an MX-specific on-disk
-checkpoint or conversion of the Hugging Face checkpoint. For installation, MX
-service deployment, and configuration details, see
-[ModelExpress (MX) Checkpoint Loading](./model-express.md).
-
-## Checkpoint I/O Policies
-
-Checkpoint format describes how weights are represented and mapped. The
-experimental `checkpoint_io_policy` independently controls how file-backed
-checkpoint bytes reach host memory:
-
-- `auto` (default) selects rank-striped read-ahead for compatible built-in
-  PyTorch/HF loads and selects native I/O for other configurations.
-- `native` always preserves the existing checkpoint loader and its synchronous
-  SafeTensors prefetch when the load group is eligible.
-- `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
-  Node-local ranks issue disjoint background `pread` requests into the Linux
-  page cache while the existing mapping, transformation, and H2D path runs.
-  After every rank finishes materialization, speculative read-ahead work that
-  is still queued or active can no longer improve first-token latency and is
-  stopped. A worker already blocked in a synchronous `pread` must finish its
-  current 8 MiB read before shutdown, so degraded storage can delay the join.
-
-```yaml
-checkpoint_format: HF
-load_format: auto
-checkpoint_io_policy: rank_striped_read_ahead
-```
-
-The optimized path currently requires identical policy configuration across
-all ranks, the automatically constructed built-in HF loader
-(`checkpoint_loader` must be unset), `load_format: auto`, SafeTensors, and an
-active MPI model-load communicator for distributed jobs. Static incompatibility
-such as MX, a custom or explicitly provided loader, a non-automatic
-load format, or known partial-model loading selects native I/O before any
-rank-striped communicator or reader setup. An explicit incompatible
-`rank_striped_read_ahead` request emits a warning instead of failing startup;
-`auto` records the native selection at info level.
-
-Sessionless compatibility is a separate structural fallback:
-
-- Direct `load_weights()` calls use native I/O because they cannot keep
-  `open_weight_session()` alive through model materialization. Current callers
-  include separate draft/MTP checkpoint loading and the GMS restore path; the
-  primary built-in HF path remains eligible for rank-striped read-ahead. This
-  structural fallback is reported at info level even for an explicit
-  `rank_striped_read_ahead` request.
-
-Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
-loading, raw-weight caching, layer overrides, insufficient host-memory
-headroom, and `.bin`/`.pth` select native materialization before readers start
-or the model is mutated. These pre-activation runtime fallbacks log at info
-level for `auto` and warn for an explicit `rank_striped_read_ahead` request.
-With a valid node communicator, fallback preserves native prefetch collectives
-on that load group; if communicator setup failed or its size did not match the
-model-load mapping, native loading safely skips prefetch.
-Memory admission reserves cgroup-aware startup headroom. Reader setup failures
-also clean up and fall back before mapping; mapping, transformation, or H2D
-failure after activation never retries a partially mutated model. A later
-advisory read failure keeps successfully materialized weights.
-
-Read-ahead is intentionally not TP/PP/CP/EP-selective: each active load group
-may warm one logical checkpoint copy per node, although the work stops when
-materialization completes. The 64-reader budget is per active load group per
-node, not a host-wide arbitration mechanism across colocated independent
-TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
-effective policy, so `auto` selection and native fallback remain observable;
-activation logs also report the local reader assignment.
-
-### CI startup experiment
-
-Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
-built-in PyTorch/HF launches to the default `auto` policy, so merge decisions do
-not depend on an unrelated CI identifier. Post-merge telemetry runs use the
-numeric root Jenkins build number modulo 2 to assign `native` to even builds and
-`auto` to odd builds before generated server configs are written. This gives a
-50/50 assignment across consecutive root builds without adding CI stages or
-model launches; successful observations may not be evenly split. Every rank
-and node in one distributed startup receives the same concrete policy. The
-experiment version is `checkpoint-io-v4-postmerge-50-auto-50-native`, distinct
-from the previous 75/25 assignment.
-Non-telemetry runs, invalid or missing post-merge build identities,
-incompatible configurations, and purpose-built configs with an explicit
-`checkpoint_io_policy` are not assigned and retain their normal configuration,
-whose checkpoint I/O default remains `auto`.
-
-Set `TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY=auto` or `native` to reproduce an
-experiment arm without bucket assignment. Uploaded rows record the experiment
-version, bucket, assigned arm, assignment source, PR number or root build
-number, actual checkpoint loader/source metadata,
-requested/selected/activated/effective policy, and a bounded fallback category
-and reason. The primary comparison is intent-to-treat across post-merge rows
-whose assignment source is `postmerge_build_number`: an `auto` assignment that
-executes native I/O remains an auto fallback, not a native control. Pre-merge
-rows use `premerge_default` and are excluded from that comparison.
-Multiple client rows can share one server startup; use
-`s_startup_observation_id` to group them and filter
-`b_startup_observation_primary_row:true` to count each startup once.
-
-To compare rank-striped loading against native loading, separately report
-confirmed effective `rank_striped_read_ahead` observations and native controls
-with matching runtime-image identity, GPU, model/checkpoint, and parallelism
-configuration. Keep auto fallbacks and unknown effective policies separate;
-do not infer activation from the assigned arm. Retain root build IDs when
-grouping repeated observations. This effective-policy comparison is
-observational, not a controlled head-to-head benchmark.
-
-Keep results from the old 75/25 split separate from the new 50/50 split using
-the experiment version, not bucket numbers alone. To check the split, use the
-assigned policy; to compare loading performance, use the loader that actually
-ran.
-
-Even builds use native loading, while odd builds use auto. Before comparing
-performance, check that both groups use comparable runtime images, hardware,
-CI configurations, and cache conditions—otherwise, those differences could be
-mistaken for a loader improvement.
-
-This policy remains separate from ModelStreamer, MX, GMS, or snapshot
-integrations. Those systems may change the source or bypass raw loading without
-requiring a new combined checkpoint format.
+ModelExpress (MX) is a P2P weight transfer service that lets one GPU transfer
+its loaded weights to another, skipping slow weight loading on the second GPU from storage.
+This checkpoint option checks for MX service first for P2P weight transfer, and
+falls back to loading from HuggingFace checkpoint if MX is not available.
+For MX service details, see [ModelExpress (MX) Checkpoint Loading](./model-express.md).
 
 ## Using Checkpoint Loaders
 
@@ -301,6 +206,8 @@ class CustomCheckpointLoader(BaseCheckpointLoader):
 
     def get_default_config_loader(self) -> BaseConfigLoader:
         return CustomConfigLoader()
+    
+    ...
 ```
 
 ### Step 2: Create the Checkpoint Weight Loader
@@ -451,3 +358,54 @@ class CustomWeightMapper(BaseWeightMapper)
 ```
 
 By setting the model name, the registered mapper will be associated with the specific model.
+
+## Checkpoint I/O Policies
+
+The experimental `checkpoint_io_policy` option controls how the built-in HF
+loader reads SafeTensors files from storage into GPU memory. It provides
+options to speed up weight loading via efficient streaming from storage.
+
+- `native`: It reads the checkpoint files into the OS page cache if there is
+  enough CPU memory. It then opens each tensor via mmap and loads them to GPU.
+  There could be many read contentions.
+- `rank_striped_read_ahead`: It divides the checkpoint files into pieces and
+  reads each piece into the OS page cache while copying tensors to GPU at the
+  same time. This assumes most tensors being copied are from the OS page cache.
+  This speeds up loading of large models where the OS page cache can not fit
+  all at once.
+- `auto` (default): use `rank_striped_read_ahead` when the load supports it,
+  and `native` I/O otherwise.
+
+Apart from built-in HF checkpoint and built-in checkpoint loader, to enable
+non-native I/O policy, `load_format` should also be set to `auto`.
+
+### Logs
+
+Each rank logs in one line after model loading is done:
+
+```text
+Checkpoint I/O policy: requested=auto, selected=rank_striped_read_ahead, activated=True, effective=rank_striped_read_ahead, fallback_reason=none.
+```
+
+- `requested`: the configured policy.
+- `selected`: the policy chosen by TRTLLM before loading started. Various checks like
+config incompatibility could lead to `native` fallback.
+- `activated`: whether the background reader threads in `rank_striped_read_ahead`
+started.
+- `effective`: the final policy that read the checkpoint. If there is a runtime issue
+like communication error, it could fall back to `native`.
+- `fallback_reason`: why loading switched to native I/O.
+
+### Load Time Telemetry in CI
+
+We added telemetry in CI to measure non-natice checkpoint I/O policies improve server
+startup time.
+
+CI perf-sanity runs set `checkpoint_io_policy` in the server configs to compare I/O policies:
+
+- Pre-merge runs use `auto`.
+- Post-merge runs with an even Jenkins root build numbers use `native`,
+  ones with an odd number use `auto`.
+
+This I/O policy control is done by setting an env var:
+`TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY` to `auto` or `native`.
