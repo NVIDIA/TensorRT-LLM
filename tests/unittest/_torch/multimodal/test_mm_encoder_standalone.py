@@ -46,6 +46,7 @@ example_images = [
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 ) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
+_QWEN_2_5_VL_3B_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
@@ -1330,3 +1331,41 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
             assert len(decode_outputs[0].outputs) > 0
             text = decode_outputs[0].outputs[0].text
             assert len(text) > 0, f"[req {req_num}] empty output"
+
+
+def _encode_images(model_dir: Path, attn_backend: str,
+                   media: list[list[str]]) -> list[torch.Tensor]:
+    encoder = MultimodalEncoder(model=model_dir,
+                                attn_backend=attn_backend,
+                                max_batch_size=len(media))
+    with encoder:
+        inputs = _load_inputs(encoder, ["Describe the image."] * len(media),
+                              media)
+        outputs = encoder.generate(inputs)
+        embeddings = []
+        for output in outputs:
+            handles = output.disaggregated_params.multimodal_embedding_handles
+            assert handles is not None
+            embeddings.append(
+                torch.cat([
+                    SharedTensorContainer.from_dict(
+                        handle).get_local_view().float().cpu()
+                    for handle in handles
+                ]))
+    return embeddings
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_encoder_flashinfer_attention_matches_trtllm():
+    """The encoder-only engine runs with FLASHINFER attention and matches TRTLLM."""
+    media = [[image] for image in example_images]
+    reference = _encode_images(_QWEN_2_5_VL_3B_DIR, "TRTLLM", media)
+    flashinfer = _encode_images(_QWEN_2_5_VL_3B_DIR, "FLASHINFER", media)
+
+    assert len(flashinfer) == len(reference) == len(media)
+    for ref, test in zip(reference, flashinfer):
+        assert test.shape == ref.shape
+        cos = torch.nn.functional.cosine_similarity(ref.flatten(),
+                                                    test.flatten(),
+                                                    dim=0)
+        assert cos.item() > 0.99, f"cosine similarity {cos.item():.6f}"

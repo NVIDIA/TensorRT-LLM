@@ -12,7 +12,6 @@ from torch import nn
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
@@ -222,13 +221,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
 
         # This is for no-KV-cache attention, not for dummy attention.
         if attn_metadata.kv_cache_manager is None:
-            assert isinstance(
-                attn_metadata,
-                (VanillaAttentionMetadata, TrtllmAttentionMetadata),
-            ), (
-                "Only vanilla and trtllm attention metadata are supported for "
-                "no-KV-cache attention for now"
-            )
             attn_metadata.max_seq_len = runner_config.max_seq_len
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
