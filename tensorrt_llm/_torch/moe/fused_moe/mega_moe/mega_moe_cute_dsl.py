@@ -1195,7 +1195,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             return empty_x, empty_sf
         fc31_act_scale = getattr(self, "fc31_act_scale", None)
         if fc31_act_scale is not None:
-            x_bf16 = (x_bf16 * fc31_act_scale).to(torch.bfloat16)
+            x_bf16 = x_bf16 * fc31_act_scale
         x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
             x_bf16,
             self.fc31_input_scale,

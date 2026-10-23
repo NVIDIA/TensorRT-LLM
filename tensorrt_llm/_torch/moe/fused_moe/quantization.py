@@ -2843,6 +2843,17 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             return
         # Shape: (1, hidden_size) - single vector for all experts (they share
         # the same input).
+        #
+        # ``device='cuda'`` by name, as the whole-checkpoint path has always
+        # created it, because this is the one tensor here that is a forward
+        # operand rather than load scratch: ``quantize_input`` multiplies the
+        # activation by it every call, so it has to end up on the compute
+        # device whichever loader allocated it. The current device is the
+        # right one on both paths -- the whole-checkpoint loader runs on it,
+        # and each streaming loader thread calls ``torch.cuda.set_device``
+        # before it loads an expert. The staged scales filled into it may sit
+        # anywhere, which is why ``_finalize_pre_quant_scales`` moves them
+        # onto THIS parameter's device instead of naming a device again.
         fc31_act_scale = nn.Parameter(torch.empty(1,
                                                   module.hidden_size,
                                                   dtype=module.dtype,
@@ -3081,10 +3092,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     logger.error(msg)
                     raise ValueError(msg)
 
-        # Take the max of w3 and w1 from the first expert. The destination's
-        # device, not a hardcoded 'cuda': the streaming loader stages on the
-        # loader's device, and ``load_quant_scales`` already keys its own
-        # staging off this same parameter.
+        # Take the max of w3 and w1 from the first expert, moved onto the
+        # destination parameter's device rather than naming a device a second
+        # time: ``_ensure_fc31_act_scale`` is the single place that chooses it,
+        # and the staged scales get there from both the host (the streaming
+        # loader) and the device (``load_quant_scales``, which keys its own
+        # staging off this same parameter).
         fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
             dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
