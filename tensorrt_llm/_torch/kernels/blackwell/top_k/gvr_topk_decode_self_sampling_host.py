@@ -37,7 +37,9 @@ so one offset-free hint convention serves all three models. The production
 per-row contract (per-request ``kv_lens`` read on-device, per-row MTP
 offsets — sync-free and CUDA-graph-replay safe with growing KV) is
 implemented by ``run_varlen``, which is the entry the opt-in DSA dispatch
-seam calls. The batch-uniform ``run``/``run_ws`` entries keep the simpler
+seam calls; its gvr_main / gvr_clus plans admit rows far shorter than the
+captured envelope to embedded register-resident engines on device (see
+"live-length admission" below). The batch-uniform ``run``/``run_ws`` entries keep the simpler
 contract (one host-side ``n_valid`` for the whole batch), are exercised for
 unit tests and benchmarking only, and must not be substituted for
 ``run_varlen`` under continuous batching, MTP (``next_n > 1``), or
@@ -46,6 +48,7 @@ CUDA-graph capture.
 
 import math
 import operator
+import os
 import threading
 from collections.abc import Sequence
 
@@ -119,7 +122,7 @@ C-semantics notes encoded here:
 
 # ---- dispatch constants (must match the device kernels) ---------------------
 NB = 1024  # register-path histogram bins
-QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every register plan)
+QUADC = 96  # crossing-bin O(mc^2) rank gate for streaming paths
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
@@ -132,12 +135,9 @@ def route(
     k: int,
     num_sms: int = 148,
     sm_version: int = 100,
+    det: bool = False,
 ) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
-
-    Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
-    register rungs, QC = QUADC for every register plan, NB bins for the
-    not-wide register plans up to n4 <= 2048."""
+    """Select a kernel and launch resources from the shape and device properties."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
@@ -150,22 +150,30 @@ def route(
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    # QC = QUADC for every register plan: the O(mc^2) rank loop is taken only
-    # for mc <= QC, so a wider gate lets one row whose first-k bracket misses
-    # the k-th value stall the whole one-wave launch. Rows with mc <= QUADC
-    # take the same branch under either gate.
-    QC = QUADC
+    QC = 160
     CURE = not (n < 2 * k and b > num_sms)
+    if not wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024:
+        CURE = True
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    # NB bins for the not-wide register plans up to n4 <= 2048 (incl. the
-    # (512, 4, 2) rung below) so IMGOFF == NBH holds at every reg site.
+    long_register = (
+        not wide
+        and sm_version in (100, 103)
+        and n4 > 2048
+        and ((k == 2048 and n4 <= 3072) or (512 < k <= 1024 and n4 <= 5 * 512))
+    )
+    short_wide = wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024
     NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
+    if long_register or short_wide:
+        NBSEL = NB
     IMGOFF = NBSEL
-    smem_reg = (NBSEL + 2 * CMP) * 4
 
     def _reg(BLK, VPT, MINB, NBH):
+        # Deterministic emitters pack one bit per scalar into a 32-bit mask.
+        if det and VPT > 8:
+            BLK *= 2
+            VPT = (VPT + 1) // 2
         # DEG wins over the CUR flag; DEG forces KPT=1, else KPT ladder 1/2/4.
         if DEGE:
             tpl = (BLK, VPT, MINB, 1, CURE, True, False, NBH)
@@ -180,13 +188,13 @@ def route(
                 "npad": npad,
                 "k": k,  # full ABI
                 "CMP": CMP,
-                "IMGOFF": IMGOFF,
+                "IMGOFF": NBH,
                 "QC": QC,
             },
             "grid": (b, 1),
             "cluster": 1,
             "block": BLK,
-            "smem": smem_reg,
+            "smem": (NBH + 2 * CMP) * 4,
             "ws": False,
         }
 
@@ -200,6 +208,8 @@ def route(
         return _reg(512, 1, 4, NB)
     if n4 <= 1024:
         if wide:
+            if short_wide:
+                return _reg(512, 2, 1, NB)
             if IMGE:
                 # regimg launch: gvr_topk_reg<1024,1,2,1,true,false,true,2048>
                 return {
@@ -219,8 +229,25 @@ def route(
                     "smem": smi,
                     "ws": False,
                 }
-            return _reg(1024, 1, 2, 2 * NB)
+            return _reg(1024, 1, 1, 2 * NB)
+        if sm_version in (100, 103) and k == 2048 and n4 <= 768:
+            return _reg(256, 3, 4, NB)
         return _reg(512, 2, 4, NB)
+
+    if k == 1024 and b in (512, 1024) and 1024 < n4 <= 1536 and sm_version in (100, 103):
+        return _reg(256, (n4 + 255) // 256, 4, NB)
+
+    # Seven/eight resident fragments use rematerialized bins in the varlen launcher.
+    if k == 1024 and b in (512, 1024) and 1536 < n4 <= 2048 and sm_version in (100, 103):
+        return _reg(256, (n4 + 255) // 256, 4, NB)
+
+    if k == 512 and sm_version in (100, 103):
+        if b > 6 * num_sms and 1024 < n4 <= 2560:
+            if n4 <= 2048:
+                return _reg(512, (n4 + 511) // 512, 4, NB)
+            return _reg(256, (n4 + 255) // 256, 4, NB)
+        if num_sms < b <= 2 * num_sms and 2048 < n4 <= 3072:
+            return _reg(512, (n4 + 511) // 512, 2, NB)
 
     # ---- clustered register-resident path ----
     if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
@@ -256,26 +283,40 @@ def route(
                 "ws": False,
             }
 
-    # 4K < n <= 8K (n4 in (1024, 2048]): one-wave register rungs. Wide rows:
-    # BLK=1024 x VPT=2 covers n4 <= 2048 exactly (the VPT=4 plan below carries
-    # two empty float4 slots per thread). num_sms < b <= 2*num_sms: two
-    # BLK=512 CTAs per SM form one wave; taller batches keep the main slab.
+    # 4K < n <= 8K: select register geometry from the row count and K.
     if n4 <= 2048:
         if wide:
+            if k == 2048 and sm_version in (100, 103) and n4 <= 1536:
+                return _reg(512, 3, 1, 2 * NB)
             return _reg(1024, 2, 1, 2 * NB)
-        # On SM103 with 148 SMs, the existing register plan remains faster
-        # across the measured b=512..1024, k=2048 range. Keep the exception
-        # architecture- and shape-exact: smaller K and nearby lower batches
-        # have different winners, while SM100 retains its original streaming
-        # route byte-for-byte.
         sm103_large_batch_k2048 = (
-            sm_version == 103 and num_sms == 148 and 512 <= b <= 1024 and k == 2048
+            sm_version in (100, 103) and num_sms == 148 and 512 <= b <= 1024 and k == 2048
         )
         if b <= 2 * num_sms or sm103_large_batch_k2048:
+            if n4 <= 1536:
+                if sm_version in (100, 103) and k == 2048 and n4 <= 1280 and b > 2 * num_sms:
+                    sparse_final_slot = n4 <= 4 * 256 + 128
+                    if b <= 4 * num_sms or (b > 6 * num_sms and sparse_final_slot):
+                        return _reg(256, 5, 4, NB)
+                    if b > 5 * num_sms:
+                        return _reg(256, 5, 3, NB)
+                return _reg(512, 3, 2, NB)
             return _reg(512, 4, 2, NB)
 
     if n4 <= 4096 and wide:
-        return _reg(1024, 4, 1, 2 * NB)
+        vpt = 3 if n4 <= 3072 else 4
+        return _reg(1024, vpt, 1, 2 * NB)
+
+    if long_register:
+        return _reg(512, 5 if n4 <= 2560 else 6, 2, NB)
+
+    if wide and k == 2048 and sm_version in (100, 103) and n4 <= 8192:
+        streaming_splits = min(148 // b, (n4 + 1023) // 1024) if b <= 32 else 1
+        if streaming_splits <= 4 or (b <= 16 and n == 32768):
+            return _reg(1024, (n4 + 1023) // 1024, 1, 2 * NB)
+
+    if n <= 12288:
+        return _reg(512, (n4 + 511) // 512, 2, NBSEL)
 
     # ====================== streaming / collect path ========================
     R = 1
@@ -753,6 +794,135 @@ def route_streaming(
 # (rows, npad, k, n_env, next_n, cr, packed device profile) -> compiled launcher
 _VARLEN_CACHE = {}
 
+# ---- live-length admission -------------------------------------------------
+# A captured varlen plan is frozen from its envelope (max_seq_len), but the rows
+# it serves at replay can be far shorter: under a 1M-token engine a 4K-token row
+# runs the streaming plan sized for 262,144 columns. gvr_main and gvr_clus plans
+# therefore embed a ladder of register-resident engines (the shapes the free
+# route would pick for the live length); on device every row reads its own live
+# n and the first rung that fits takes it, the streaming body otherwise. Rows
+# above the widest rung keep the frozen plan unchanged.
+#
+# Rungs: "deg256" / "deg512" = dense (DEG) engines on the first 256 / 512 threads
+# of the CTA (the tight route's reg(256,1,8) / reg(512,1,4) shapes, named barrier
+# 2); an integer = a sampled engine of that many columns with the plan's own CTA
+# (VPT = ceil(cols / (4*BLK)), capped per BLK). gvr_clus sits against the
+# 64-register wall: a second rung spills and costs its non-admitted rows ~20%,
+# so it embeds the 8K rung only. gvr_reg_clus plans keep the stock kernel: their
+# admitted rows only break even under a cold instruction cache and lose 10-20%
+# once the engines sit behind the streaming body.
+# TRTLLM_GVR_V2_LIVE_ADMISSION=0 compiles every plan without the ladder; the
+# deterministic plans never embed it.
+_LIVE_ADMISSION = os.environ.get("TRTLLM_GVR_V2_LIVE_ADMISSION", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
+_LIVE_LADDERS = {"main": ("deg256", "deg512", "8192", "16384"), "clus": ("8192",)}
+# Live rows with n > 4k take the sampled bracket even when n <= SCAP (the frozen
+# plan stages them unsampled: ~13 us for an 8K row under the 1M envelope).
+_LIVE_SAMPLE_KMULT = 4
+_LIVE_VPT_MAX = {1024: 4, 512: 6, 256: 8}
+
+
+def _live_enabled(family: str, det: bool) -> bool:
+    """Policy gate: does this plan family embed the admission ladder?"""
+    return _LIVE_ADMISSION and not det and family in _LIVE_LADDERS
+
+
+def _reg_engine_cfg(
+    num_rows: int, k: int, blk: int, minb: int, vpt: int, deg: bool, num_sms: int, sm_version: int
+) -> tuple:
+    """One ladder rung: the _varlen_launcher register-branch flags evaluated at this
+    rung's window (n_esc = 4*blk*vpt) with the ENGINE's CTA shape (blk, minb) -- a
+    sub-CTA rung passes its own blk/minb (256/8, 512/4), not the plan's."""
+    n_esc = 4 * blk * vpt
+    kpt = 1 if deg else (1 if k <= blk else (2 if k <= 2 * blk else 4))
+    nbh = 2 * NB if blk == 1024 else NB
+    stage_output = num_rows > num_sms and not (
+        k <= 512 and n_esc <= 2 * k and num_rows <= 2 * num_sms
+    )
+    if k == 2048 and n_esc > k and num_rows <= num_sms and sm_version in (100, 103):
+        stage_output = True
+    small_k_resident = k == 512 and num_rows > num_sms and n_esc > 4096 and sm_version in (100, 103)
+    dense_bracket = k <= 512
+    dense_lower_bound = k > 512 and n_esc < 2 * k
+    bracket_sample_lanes = 32 if (k == 1024 and 6144 < n_esc <= 8192) else 1
+    warp_rank = (
+        ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
+        and n_esc > k
+        and sm_version in (100, 103)
+    )
+    rematerialize_bins = (
+        (small_k_resident and (num_rows > 2 * num_sms or n_esc <= 8192))
+        or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_esc >> 2) <= 2048)
+        or (
+            sm_version in (100, 103)
+            and k == 2048
+            and num_rows > 6 * num_sms
+            and (blk, vpt, minb) == (256, 5, 4)
+        )
+    )
+    return (
+        int(blk),
+        int(minb),
+        int(vpt),
+        int(kpt),
+        int(nbh),
+        bool(deg),
+        bool(stage_output),
+        bool(rematerialize_bins),
+        bool(dense_bracket),
+        bool(warp_rank),
+        int(bracket_sample_lanes),
+        bool(dense_lower_bound),
+        int(k),
+    )
+
+
+def _reg_escape_cfg(
+    num_rows: int,
+    k: int,
+    blk: int,
+    minb: int,
+    num_sms: int,
+    sm_version: int,
+    ladder: tuple[str, ...],
+) -> tuple:
+    """The admission ladder (tuple of rung cfgs, smallest window first) for a
+    streaming plan with CTA shape (blk, minb); see _LIVE_LADDERS for the items."""
+    rungs = []  # (blk_e, minb_e, vpt, deg)
+    seen = set()
+    for item in ladder:
+        item = item.strip().lower()
+        if item.startswith("deg"):
+            # "deg" = dense rung with the plan's CTA; "deg256" / "deg512" = sub-CTA dense
+            # rung on the first 256 / 512 threads (the tight route's reg(256,1,8) /
+            # reg(512,1,4) shape); collapses to "deg" when the plan is not wider
+            blk_e = int(item[3:]) if item[3:] else blk
+            if blk_e >= blk:
+                blk_e, minb_e = blk, minb
+            else:
+                minb_e = {256: 8, 512: 4}[blk_e]
+            key = ("deg", blk_e, 1)
+            if key not in seen:
+                seen.add(key)
+                rungs.append((blk_e, minb_e, 1, True))
+            continue
+        cols = int(item)
+        vpt = min(max((cols + 4 * blk - 1) // (4 * blk), 1), _LIVE_VPT_MAX[blk])
+        key = ("reg", blk, vpt)
+        if key not in seen:
+            seen.add(key)
+            rungs.append((blk, minb, vpt, False))
+    rungs.sort(key=lambda r: (4 * r[0] * r[2], not r[3]))  # by window; dense before same width
+    return tuple(
+        _reg_engine_cfg(num_rows, k, b_, m_, v_, d_, num_sms, sm_version)
+        for b_, m_, v_, d_ in rungs
+    )
+
+
 # ---- prefill launcher cache ------------------------------------------------
 # Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
 # launcher depends only on the row tier, k and the envelope bucket — never on the
@@ -862,8 +1032,9 @@ def _varlen_launcher(
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version)
+    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
     if plan_free["kernel"] == "reg_clus":
+        # gvr_reg_clus keeps the stock kernel (no admission ladder, see _LIVE_LADDERS)
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
             varlen=True,
@@ -883,6 +1054,15 @@ def _varlen_launcher(
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
+        stage_output = num_rows > num_sms and not (
+            k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
+        )
+        if k == 2048 and n_kernel > k and num_rows <= num_sms and sm_version in (100, 103):
+            stage_output = True
+        small_k_resident = (
+            k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
+        )
+        static_k = None if k <= 512 and tuple(plan_free["tpl"][:2]) == (1024, 1) else k
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]),
             varlen=True,
@@ -890,12 +1070,45 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
             det=det,
+            stage_output=stage_output,
+            static_k=static_k,
+            static_npad=npad
+            if (
+                k in (1024, 2048)
+                or small_k_resident
+                or (k == 1024 and plan_free["tpl"][0] == 512 and plan_free["tpl"][1] >= 5)
+                or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
+            )
+            and n_kernel > k
+            and sm_version in (100, 103)
+            else None,
+            dense_bracket=k <= 512,
+            dense_lower_bound=k > 512 and n_kernel < 2 * k,
+            bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8192 else 1,
+            warp_rank=(
+                ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
+                and n_kernel > k
+                and sm_version in (100, 103)
+            ),
+            rematerialize_bins=(small_k_resident and (num_rows > 2 * num_sms or n_kernel <= 8192))
+            or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
+            or (
+                sm_version in (100, 103)
+                and k == 2048
+                and num_rows > 6 * num_sms
+                and tuple(plan_free["tpl"][:3]) == (256, 5, 4)
+            ),
         )
         rt_f = plan_free["rt"]
         lc = (
             "reg",
             fn,
-            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (
+                n_kernel,
+                rt_f["CMP"],
+                rt_f["QC"],
+                dev.STATIC_BYTES + plan_free["smem"] + (4 * k if stage_output else 0),
+            ),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -908,6 +1121,12 @@ def _varlen_launcher(
     # Per-row n / short-row handling in-kernel.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
+        # live-length admission: gvr_clus is always BLK=1024, MINB=1
+        reg_cfg = None
+        if _live_enabled("clus", det):
+            reg_cfg = _reg_escape_cfg(
+                num_rows, k, 1024, 1, num_sms, sm_version, ladder=_LIVE_LADDERS["clus"]
+            )
         fn = dev.get_compiled__clus(
             tuple(plan_free["tpl"]),
             scap=rt_f["SCAP"],
@@ -917,6 +1136,7 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
             det=det,
+            reg_escape=reg_cfg,
         )
         lc = (
             "clus",
@@ -927,13 +1147,32 @@ def _varlen_launcher(
         return lc
     plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
+    if k == 512 and num_rows > 2 * num_sms and sm_version in (100, 103):
+        n4 = n_route >> 2
+        if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
+            tpl = (256, 4, 4, tpl[3], 2, False, False)
     rt = plan["rt"]
     r_const = rt["R"]
+    staged_k = k if k == 2048 and r_const == 1 and sm_version in (100, 103) else 0
+    # live-length admission: embed the ladder unless the plan stages its output
+    # row in smem (k == 2048, R == 1) or is deterministic
+    reg_cfg = None
+    if _live_enabled("main", det) and staged_k == 0:
+        reg_cfg = _reg_escape_cfg(
+            num_rows, k, tpl[0], tpl[2], num_sms, sm_version, ladder=_LIVE_LADDERS["main"]
+        )
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = dev.get_compiled(
-        tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True, det=det, fused_k=k
+        tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+        hint_free=True,
+        det=det,
+        fused_k=k,
+        warp_rank=k == 2048 and sm_version in (100, 103),
+        staged_k=staged_k,
+        reg_escape=reg_cfg,
+        live_sample_kmult=_LIVE_SAMPLE_KMULT if _live_enabled("main", det) else 0,
     )
     big = num_rows * r_const <= 148
     aim_base = (
@@ -1212,7 +1451,7 @@ def _device_num_sms(dev_index: int) -> int:
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
 def _build_launcher(b, n, npad, k, num_sms, sm_version=100, det=False):
-    rd = route(b, n, npad, k, num_sms, sm_version)
+    rd = route(b, n, npad, k, num_sms, sm_version, det=det)
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
@@ -1493,9 +1732,9 @@ def run_varlen(
       not new-token seq_lens); row ``r`` uses
       ``n_r = (kv_lens[r // next_n] - next_n + (r % next_n) + 1) //
       compress_ratio`` valid entries (cr 1 = DSv3.2, 4 = DSv4 Flash/Pro);
-      the bracket is derived from the current row itself (register families:
-      min/max fold of the first k row values; streaming families do not
-      consume a temporal hint on the accept path); ``k`` comes from
+      the bracket is derived from the current row itself (register families
+      use resident scores; streaming families do not consume a temporal
+      hint on the accept path); ``k`` comes from
       ``indices.shape[1]``;
       per-row ``n_r <= k`` takes the short path (identity + ``-1`` tail).
 
@@ -1874,6 +2113,7 @@ def warmup_varlen(
             int(top_k),
             num_sms,
             sm_version,
+            det=bool(deterministic),
         )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
