@@ -35,7 +35,7 @@ class FusedQkNormRope(OpWrapper):
     # heads, 8 key and 8 value, head_dim 64, all of which the cells carry
     # because the op reads them as scalars rather than deriving them. Under
     # attention TP each rank sees its own share of the heads.
-    _GPT_OSS = dict(
+    GPT_OSS = dict(
         num_heads_q=64,
         num_heads_k=8,
         num_heads_v=8,
@@ -53,11 +53,11 @@ class FusedQkNormRope(OpWrapper):
     )
 
     CELLS: tuple[Cell, ...] = (
-        Cell(why="decode: one token", spec=dict(tokens=1, **_GPT_OSS)),
-        Cell(why="prefill-shaped batch", spec=dict(tokens=2048, **_GPT_OSS)),
+        Cell(why="decode: one token", spec=dict(tokens=1, **GPT_OSS)),
+        Cell(why="prefill-shaped batch", spec=dict(tokens=2048, **GPT_OSS)),
         Cell(
             why="a token count that is not a multiple of any tile",
-            spec=dict(tokens=37, **_GPT_OSS),
+            spec=dict(tokens=37, **GPT_OSS),
         ),
     )
 

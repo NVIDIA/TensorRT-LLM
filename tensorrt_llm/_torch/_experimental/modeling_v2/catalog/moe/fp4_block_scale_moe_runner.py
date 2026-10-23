@@ -118,20 +118,20 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     # all 256 experts at 256), so the window cells here and the
     # intermediate-slice ones in its cells.py are the shapes it runs, and the
     # full stack is the single-rank one.
-    _R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
+    R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
 
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="dep4's own call: the 64-wide expert window at offset 0, R1 geometry",
-            spec=dict(tokens=64, local_expert_offset=0, local_num_experts=64, **_R1),
+            spec=dict(tokens=64, local_expert_offset=0, local_num_experts=64, **R1),
         ),
         Cell(
             why="a window at a non-zero offset -- the ids this rank must answer for move with it",
-            spec=dict(tokens=64, local_expert_offset=192, local_num_experts=64, **_R1),
+            spec=dict(tokens=64, local_expert_offset=192, local_num_experts=64, **R1),
         ),
         Cell(
             why="the single-rank shape: all 256 experts local, and one token, the decode row count",
-            spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **_R1),
+            spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **R1),
         ),
     )
 

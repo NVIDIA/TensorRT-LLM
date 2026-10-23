@@ -45,7 +45,7 @@ class MlaRopeGeneration(OpWrapper):
     # single-layer. Fixed by the checkpoint, so the cells vary what a step
     # varies -- how many new tokens, the page size, and whether the scales are
     # passed explicitly.
-    _R1 = dict(
+    R1 = dict(
         num_heads=128,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -62,7 +62,7 @@ class MlaRopeGeneration(OpWrapper):
                 q_scaling=Q_SCALING_R1,
                 write_scale=None,
                 read_scale=None,
-                **_R1,
+                **R1,
             ),
         ),
         Cell(
@@ -73,7 +73,7 @@ class MlaRopeGeneration(OpWrapper):
                 q_scaling=Q_SCALING_R1,
                 write_scale=None,
                 read_scale=None,
-                **_R1,
+                **R1,
             ),
         ),
         Cell(
@@ -84,7 +84,7 @@ class MlaRopeGeneration(OpWrapper):
                 q_scaling=1.0,
                 write_scale=0.5,
                 read_scale=2.0,
-                **_R1,
+                **R1,
             ),
         ),
     )
