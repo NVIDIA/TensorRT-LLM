@@ -156,6 +156,7 @@ from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
 from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
 from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
+from .ops.attention.qsa_paged_index_scores_verify import qsa_paged_index_scores_verify
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
 from .ops.attention.qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4
@@ -5534,6 +5535,21 @@ class DecodeTarget:
                 # Append the fused-norm+rope'd K/V; the selection reads the current
                 # token from the pool. Over an fp8 or NVFP4 pool as in the prefill target.
                 _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
+            rows_per_request = step["predicted_tokens_per_seq"]
+            if scores is None and stage and rows_per_request * core.index_heads <= 16:
+                # A verify step: one gather of each request's compressed keys serves its
+                # rows (bitwise the row-wise entry; its keys are read after the wait).
+                scores = qsa_paged_index_scores_verify(
+                    q_index,
+                    index_cache,
+                    block_table,
+                    logical,
+                    req_idx,
+                    tokens_per_block,
+                    core.compress_ratio,
+                    rows_per_request,
+                    use_pdl=fused_prologue,
+                )
             if scores is None:
                 scores = qsa_paged_index_scores(
                     q=q_index,
