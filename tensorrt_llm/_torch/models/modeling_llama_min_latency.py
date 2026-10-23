@@ -25,7 +25,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
-from ...models.modeling_utils import QuantConfig, moe_experts_quant_config
+from ...models.modeling_utils import QuantConfig
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
@@ -40,6 +40,7 @@ from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
+from .modeling_utils import moe_experts_quant_config
 
 # Perf heuristics thresholds.
 # Use routing gemv kernels when num_tokens <= 8.
