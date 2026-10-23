@@ -4757,6 +4757,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 # target prefix starts the mirror at position > 0 with no pages
                 # of its own, so the resize carries the history itself.
                 history = max(kv_cache.history_length, req.context_current_position)
+                if req.is_disagg_generation_init_state:
+                    # A disaggregated generation worker receives the prompt KV
+                    # instead of prefilling it, and the standalone drafter
+                    # starts this request on a fresh slot (DFlash/DSpark
+                    # prepare): the mirror never holds drafter K/V for the
+                    # transferred prompt. The whole prompt is therefore
+                    # history, so the window trims the mirror to its tail
+                    # plus the generation headroom the pool is funded for,
+                    # instead of one prompt-sized chunk that exceeds it.
+                    history = max(history, req.context_current_position + req.context_chunk_size)
                 if not kv_cache.resize(capacity, history):
                     raise self._mirror_resize_error(req, "context", capacity)
                 self._after_shrink(req.py_request_id, kv_cache)
