@@ -1150,7 +1150,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         super().prepare_expect_snapshot_points(requests)
         if (
             not self.enable_block_reuse
-            or not self.kv_cache_config.mamba_state_config.enable_branch_snapshot
+            or not self.kv_cache_config.block_reuse_config.enable_branch_snapshot
         ):
             return
         for request in requests:
@@ -1166,7 +1166,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
         """Snapshot where this request leaves the reuse tree, for its siblings."""
-        if not self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
+        if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
             return
         if req.is_dummy_request:
             return
