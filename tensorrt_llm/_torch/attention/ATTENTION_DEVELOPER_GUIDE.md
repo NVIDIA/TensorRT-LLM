@@ -547,7 +547,12 @@ The FMHA package is split by role:
   serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
-  (`rebuild_disagg_imported_cache`).
+  (`rebuild_disagg_imported_cache`). Hybrid linear-attention models (Kimi K3)
+  keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
+  `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
+  owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
+  manager keeps the SSM, convolution, and KDA replay state. Disaggregated
+  serving of hybrid FP4 MLA models is not supported yet.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through

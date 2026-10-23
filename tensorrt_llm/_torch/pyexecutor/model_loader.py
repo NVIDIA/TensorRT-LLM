@@ -252,8 +252,7 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
+        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
     if model_config.mapping.cp_size != 1:
         raise ValueError("FP4 MLA does not support context parallelism.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:

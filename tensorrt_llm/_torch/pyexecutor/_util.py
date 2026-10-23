@@ -238,10 +238,20 @@ def get_kv_cache_manager_cls(
                     "cache_transceiver_config backend='NIXL' with "
                     "transceiver_runtime='PYTHON' (got "
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
-        if is_hybrid_linear(config):
-            raise NotImplementedError(
-                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
-                "support hybrid linear-attention models.")
+        if (is_hybrid_linear(config)
+                and model_config.get_num_mamba_layers() > 0):
+            if is_disagg:
+                raise NotImplementedError(
+                    "FP4 MLA disaggregated serving does not support hybrid "
+                    "linear-attention models yet.")
+            # The hybrid V2 manager composes the FP4 MLA cache layout with
+            # its recurrent-state lifecycle; the Kimi K3 manager adds the KDA
+            # replay caches used by fused speculative verification.
+            if is_kimi_linear(config):
+                from ..modules.kimi_kda.cache_manager import \
+                    KimiK3HybridCacheManager
+                return KimiK3HybridCacheManager
+            return MambaHybridCacheManagerV2
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 
@@ -3536,6 +3546,12 @@ def _create_kv_cache_manager(
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True
+        if (not is_glm5_next and issubclass(kv_cache_manager_cls,
+                                            MambaHybridCacheManagerV2)):
+            # The V2 manager reads the MLA geometry and the per-layer KV
+            # dtype policy from the model config when it composes the FP4
+            # MLA cache layout (NVFP4 KV cache).
+            kda_extra_kwargs["pretrained_config"] = config
         if is_glm5_next:
             from ..attention.backends.sparse.glm_kpool import \
                 glm_kpool_cache_row_dim
