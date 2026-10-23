@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
@@ -15,8 +18,9 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
+                                            MultimodalParams,
+                                            _multimodal_embedding_shape)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -29,6 +33,7 @@ from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
+from .modeling_multimodal_mixin import split_multimodal_encoder_outputs
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_attached_multimodal_embeddings,
                                         get_multimodal_embeddings)
@@ -116,7 +121,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     ) -> Tuple[List[int], List[int], List[int]]:
         """
         Shared logic (called by expand_prompt_token_ids_for_mm and
-        build_disagg_prefill_multimodal_inputs):
+        _finalize_multimodal_prompt):
         replace each image placeholder token in prompt_token_ids
         with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
 
@@ -282,9 +287,13 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
-    def build_disagg_prefill_multimodal_inputs(
-            self, inputs: Union[TextPrompt, TokensPrompt],
-            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
+    def _finalize_multimodal_prompt(
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
@@ -292,14 +301,14 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         Args:
             inputs: Inputs containing an already tokenized text prompt or a text prompt string.
-            mm_handles: List of multimodal embedding handles.
+            embeddings: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
+        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if text_prompt:
@@ -309,18 +318,20 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             raise ValueError(
                 "Text prompt or token IDs are required but neither is provided")
 
-        if not isinstance(mm_handles, list):
-            raise ValueError("mm_handles must be a list")
+        if not isinstance(embeddings, list):
+            raise ValueError("embeddings must be a list")
 
         expected_hidden_size = self.config.text_config.hidden_size
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle['tensor_size'][1]
+        for i, embedding in enumerate(embeddings):
+            hidden_size = _multimodal_embedding_shape(embedding)[1]
             if hidden_size != expected_hidden_size:
                 raise RuntimeError(
                     f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
                 )
 
-        num_mm_tokens_per_image = [h["tensor_size"][0] for h in mm_handles]
+        num_mm_tokens_per_image = [
+            _multimodal_embedding_shape(h)[0] for h in embeddings
+        ]
         expanded_ids, mm_token_length, mm_token_offsets = (
             self._expand_image_placeholders_in_token_ids(
                 prompt_token_ids, num_mm_tokens_per_image))
@@ -339,13 +350,18 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
                 f"than or equal to final_length ({final_length})")
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids,
+        return expanded_ids, MultimodalParams.from_embeddings(
+            embeddings,
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(embeddings))],
+                output_embedding_lengths=[
+                    _multimodal_embedding_shape(handle)[0]
+                    for handle in embeddings
+                ],
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=mm_token_length,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[
-                mm_handle["tensor_size"][0] for mm_handle in mm_handles
-            ],
             multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
                                                       1)),
             multimodal_run_positions=mm_token_offsets,
@@ -620,6 +636,14 @@ class LlavaNextVisionModel(nn.Module):
         )
         image_features = torch.cat(image_features, dim=0)
         return [image_features]
+
+    def encode_multimodal_inputs(
+            self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        """Share the encoded-view contract with aggregated model execution."""
+        embeddings = self.forward(multimodal_params)
+        return split_multimodal_encoder_outputs(embeddings[0],
+                                                multimodal_params)
 
 
 @support_multimodal_disaggregated

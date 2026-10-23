@@ -27,18 +27,19 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
+    _Unset,
+    get_multimodal_item_metadata,
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     InputProcessor,
-    get_multimodal_encoder_item_metadata,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, MultimodalEncoderRequestError, _Unset, get_mm_items_for_chunk
+from ..llm_request import LlmRequest, MultimodalEncoderRequestError, get_mm_items_for_chunk
 
 
 def resolve_mm_encoder_token_budget(base_budget: int, model_max_atomic_item_tokens: int) -> int:
@@ -427,12 +428,12 @@ class MultimodalItemScheduler:
             return state.stable_item_cache_keys
         mm_data = request.py_multimodal_data
         try:
-            item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+            item_metadata = get_multimodal_item_metadata(mm_data)
         except (TypeError, ValueError) as error:
             raise MultimodalEncoderRequestError(str(error)) from error
         keys = (
             None
-            if item_metadata is None
+            if item_metadata is None or item_metadata.output_embedding_lengths is None
             else (
                 self.model.build_encoder_cache_item_keys(
                     request.multimodal_hashes,
@@ -491,7 +492,10 @@ class MultimodalItemScheduler:
                     f"Scheduled MM request {request_id} has no encoder item state",
                     request_ids={request_id},
                 )
-            multimodal_param = MultimodalParams(multimodal_data=request.py_multimodal_data)
+            multimodal_param = MultimodalParams(
+                multimodal_data=request.py_multimodal_params.multimodal_data
+            )
+            embedding_lengths = state.embedding_lengths
             for item_idx in item_indices:
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
@@ -501,7 +505,7 @@ class MultimodalItemScheduler:
                     )
                 scheduled_cache_keys.add(cache_key)
                 encoder_items.append((multimodal_param, item_idx))
-                output_targets.append((item_idx, cache_key, state.embedding_lengths[item_idx]))
+                output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
 
         # A batch-level error cannot be traced to one output, so fail only the
         # scheduled producers. Requests that only share a scheduled entry keep
@@ -549,9 +553,10 @@ class MultimodalItemScheduler:
                 # Validate the entire batch before publishing any output. Otherwise a
                 # bad later item could leave earlier items READY and later requests
                 # admitted to prefill without committed outputs.
-                for output, (item_idx, cache_key, expected_rows) in zip(
+                for result, (item_idx, cache_key, expected_rows) in zip(
                     outputs, output_targets, strict=True
                 ):
+                    output = result.multimodal_data.get("multimodal_embedding")
                     if (
                         not isinstance(output, torch.Tensor)
                         or output.shape != (expected_rows, expected_width)
@@ -570,8 +575,8 @@ class MultimodalItemScheduler:
                         break
 
             if pending_error is None:
-                for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
-                    encoder_cache.commit(cache_key, output)
+                for result, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
+                    encoder_cache.commit(cache_key, result.multimodal_data["multimodal_embedding"])
         if pending_error is not None:
             raise pending_error
 

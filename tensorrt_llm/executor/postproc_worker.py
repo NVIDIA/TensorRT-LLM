@@ -202,7 +202,13 @@ class PostprocWorker:
             disaggregated_params = None
             if record.outputs:
                 perf_metrics = record.outputs[0].request_perf_metrics
-                disaggregated_params = record.outputs[0].disaggregated_params
+                # Preserve the canonical result across this internal IPC hop;
+                # the frontend projects it onto its consumer's selected format.
+                export_handoff = getattr(record, "export_multimodal_handoff",
+                                         None)
+                disaggregated_params = (
+                    (export_handoff() if export_handoff else None)
+                    or record.outputs[0].disaggregated_params)
             if postproc_params := record.postproc_params:
                 result_handler, args = postproc_params.post_processor, postproc_params.postproc_args
                 args.tokenizer = self._tokenizer

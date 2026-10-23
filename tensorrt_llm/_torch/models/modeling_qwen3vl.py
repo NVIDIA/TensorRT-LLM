@@ -37,7 +37,12 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
+from ...inputs.multimodal import (
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+    MultimodalParams,
+    _multimodal_embedding_shape,
+)
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -55,13 +60,18 @@ from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    _encode_multimodal_group_tensor,
     encode_multimodal_by_groups,
+    split_multimodal_encoder_outputs,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata,
+    _qwen_encoder_device_paths,
+    _qwen_vision_item_partitions,
+    _qwen_vision_output_metadata,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -75,12 +85,13 @@ from .modeling_utils import (
 
 def _expand_prompt_token_ids_for_mm_handoff(
     input_ids: torch.Tensor,
-    mm_handles: List[Dict[str, Any]],
+    embeddings: List[Dict[str, Any]],
     *,
     image_token_id: int,
     video_token_id: int,
     vision_start_token_id: int,
-) -> DisaggPrefillMultimodalInputs:
+    mm_hashes: list[list[int]] | None = None,
+) -> tuple[list[int], MultimodalParams]:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
 
     Qwen handoff has one coarse <image_pad> or <video_pad> token per item.
@@ -98,20 +109,23 @@ def _expand_prompt_token_ids_for_mm_handoff(
         for pos, token in enumerate(input_ids.tolist())
         if token in (image_token_id, video_token_id)
     ]
-    if len(placeholder_positions) != len(mm_handles):
+    if len(placeholder_positions) != len(embeddings):
         raise ValueError(
-            "Number of multimodal placeholders must match number of mm_handles: "
+            "Number of multimodal placeholders must match number of embeddings: "
             f"placeholders={len(placeholder_positions)}, "
-            f"mm_handles={len(mm_handles)}"
+            f"embeddings={len(embeddings)}"
         )
 
-    total_mm_embed_tokens = sum(mm_handle["tensor_size"][0] for mm_handle in mm_handles)
+    total_mm_embed_tokens = sum(
+        _multimodal_embedding_shape(embedding)[0] for embedding in embeddings
+    )
     final_length = len(input_ids) - len(placeholder_positions) + total_mm_embed_tokens
     expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
 
     mm_token_lengths: List[int] = []
     mm_token_offsets: List[int] = []
-    item_types: List[int] = []
+    item_refs: list[tuple[str, int]] = []
+    local_counts = {"image": 0, "video": 0}
     item_run_cu_offsets: List[int] = [0]
     run_positions: List[int] = []
     run_lengths: List[int] = []
@@ -127,7 +141,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
             write_pos += 1
             continue
 
-        mm_token_num = mm_handles[mm_handle_idx]["tensor_size"][0]
+        mm_token_num = _multimodal_embedding_shape(embeddings[mm_handle_idx])[0]
         has_leading_special = (
             read_pos > 0 and int(input_ids[read_pos - 1].item()) == vision_start_token_id
         )
@@ -138,7 +152,9 @@ def _expand_prompt_token_ids_for_mm_handoff(
         mm_token_offsets.append(run_start)
         mm_token_lengths.append(prompt_mm_length)
         multimodal_embedding_lengths.append(mm_token_num)
-        item_types.append(0 if token_id == image_token_id else 1)
+        modality = "image" if token_id == image_token_id else "video"
+        item_refs.append((modality, local_counts[modality]))
+        local_counts[modality] += 1
         run_positions.append(run_start)
         run_lengths.append(prompt_mm_length)
         item_run_cu_offsets.append(len(run_positions))
@@ -153,17 +169,18 @@ def _expand_prompt_token_ids_for_mm_handoff(
     if write_pos != final_length:
         raise RuntimeError(f"Write position mismatch: {write_pos} != {final_length}")
 
-    return DisaggPrefillMultimodalInputs(
-        prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+    params = MultimodalParams.from_embeddings(
+        embeddings,
+        MultimodalItemMetadata(item_refs, output_embedding_lengths=multimodal_embedding_lengths),
+        multimodal_hashes=mm_hashes,
         multimodal_lengths=mm_token_lengths,
         multimodal_positions=mm_token_offsets,
-        multimodal_embedding_lengths=multimodal_embedding_lengths,
         multimodal_item_run_cu_offsets=item_run_cu_offsets,
         multimodal_run_positions=run_positions,
         multimodal_run_lengths=run_lengths,
         special_token_offsets=special_token_offsets,
-        item_types=item_types,
     )
+    return expanded_ids.to(torch.int32).tolist(), params
 
 
 def _decide_do_sample_frames(
@@ -472,48 +489,58 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # np), the raw side is left at 0-255 and the ViT sees garbage.
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
-    def build_disagg_prefill_multimodal_inputs(
-        self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
-    ) -> DisaggPrefillMultimodalInputs:
+    def _finalize_multimodal_prompt(
+        self,
+        inputs: TextPrompt,
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
-            mm_handles: List of multimodal embedding handles.
+            embeddings: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
+        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is None and not text_prompt:
+            raise ValueError("Prompt token IDs or text are required")
 
-        if not isinstance(mm_handles, list):
-            raise TypeError("mm_handles must be a list")
+        if not isinstance(embeddings, list):
+            raise TypeError("embeddings must be a list")
 
         num_deepstack_levels = len(self.config.vision_config.deepstack_visual_indexes)
         # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
         # feature maps from deepstack layers.
         expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle["tensor_size"][1]
+        for i, embedding in enumerate(embeddings):
+            hidden_size = _multimodal_embedding_shape(embedding)[1]
             if hidden_size != expected_size:
                 raise RuntimeError(
                     f"Expected multimodal embedding {i} to have hidden size {expected_size}, got {hidden_size}."
                 )
 
-        input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
+        input_ids = (
+            torch.tensor(prompt_token_ids)
+            if prompt_token_ids is not None
+            else self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
+        )
 
         return _expand_prompt_token_ids_for_mm_handoff(
             input_ids,
-            mm_handles,
+            embeddings,
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,
+            mm_hashes=mm_hashes,
         )
 
 
@@ -1244,31 +1271,42 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `mm_item_order` reorder before returning.
         """
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [_encode_multimodal_group_tensor(self.mm_encoder_groups, multimodal_params)]
+
+    @property
+    def multimodal_data_device_paths(self) -> list[str]:
+        return _qwen_encoder_device_paths(self.visual)
+
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        """Share the encoded-view contract with aggregated model execution."""
+        embeddings = self.forward(multimodal_params)
+        return split_multimodal_encoder_outputs(
+            embeddings[0], multimodal_params, metadata_fn=_qwen_vision_output_metadata
+        )
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_mm_encoder_item_scheduling = True
 
+    def get_multimodal_item_partitions(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
+
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
-    ) -> torch.Tensor:
-        """Uniform encoder entry (``MultimodalModelMixin`` contract).
-
-        Runs the vision encoder over ``multimodal_params`` and returns the
-        embeddings as a single tensor (Qwen3-VL folds deepstack streams into
-        the hidden dim, so the single-tensor contract holds).
-        """
+    ) -> list[MultimodalParams]:
         if self.mm_encoder is None:
             raise ValueError("Raw multimodal inputs require a local multimodal encoder.")
-
-        mm_embeds = self.mm_encoder.forward(list(multimodal_params), **encoder_kwargs)
-        if len(mm_embeds) != 1:
-            raise ValueError(
-                "Qwen3-VL multimodal encoder must return one packed embedding tensor, "
-                f"but returned {len(mm_embeds)} tensors."
-            )
-        return mm_embeds[0]
+        return encode_multimodal_by_groups(
+            self.mm_encoder.mm_encoder_groups,
+            list(multimodal_params),
+            metadata_fn=_qwen_vision_output_metadata,
+        )
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.

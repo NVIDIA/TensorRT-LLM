@@ -30,9 +30,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalItemPartition, MultimodalParams, _multimodal_embedding_shape)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -71,7 +71,8 @@ from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.gated_mlp import GatedMLP
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (MultimodalModelMixin,
+                                        split_multimodal_encoder_outputs)
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
@@ -246,11 +247,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_mm_encoder_item_metadata(
+    def _build_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
+    ) -> Optional[MultimodalItemMetadata]:
         """Return prompt-ordered Qwen vision items and pre-merger costs."""
         grids_by_modality: Dict[str, torch.Tensor] = {}
         for modality, grid_key in (("image", "image_grid_thw"),
@@ -378,10 +379,37 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             token_length // self.spatial_merge_unit
             for token_length in encoder_token_lengths
         ]
-        return MultimodalEncoderItemMetadata(
+        if any(length <= 0 for length in output_embedding_lengths):
+            raise ValueError(
+                "Processed Qwen items must produce positive embedding lengths")
+        return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = (
+            self._build_mm_item_metadata(prompt_token_ids, multimodal_data)
+            if multimodal_data.get("multimodal_embedding") is None else None)
+        if metadata is None:
+            metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                    multimodal_data,
+                                                    mm_item_order)
+        if metadata is not None:
+            for modality in ("image", "video"):
+                modality_data = multimodal_data.get(modality)
+                grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+                if isinstance(modality_data,
+                              dict) and modality_data.get(grid_key) is not None:
+                    metadata.input_partitions[
+                        modality] = _qwen_vision_input_partitions(
+                            multimodal_data, modality, metadata)
+        return metadata
 
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
@@ -835,6 +863,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         mm_data: Dict[str, Any] = {}
         total_tokens = 0
+        item_refs: list[tuple[str, int]] = []
+        encoder_token_lengths: list[int] = []
         for modality, num_items in mm_counts.items():
             if modality not in ("image", "video"):
                 raise ValueError(f"Unsupported vision modality: {modality}")
@@ -851,7 +881,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(
                     f"Qwen {modality} dummy does not fit within "
                     f"max_num_encoder_tokens={max_num_encoder_tokens}")
-            total_tokens += num_items * math.prod(grid)
+            item_tokens = math.prod(grid)
+            total_tokens += num_items * item_tokens
             if total_tokens > max_num_encoder_tokens:
                 raise ValueError(
                     "Requested multimodal dummy items exceed "
@@ -863,6 +894,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     num_items=num_items,
                     dtype=dtype,
                 ))
+            item_refs.extend((modality, i) for i in range(num_items))
+            encoder_token_lengths.extend([item_tokens] * num_items)
+        if item_refs:
+            metadata = MultimodalItemMetadata(
+                item_refs,
+                encoder_token_lengths,
+                [
+                    tokens // self.spatial_merge_unit
+                    for tokens in encoder_token_lengths
+                ],
+            )
+            for modality in mm_data:
+                metadata.input_partitions[
+                    modality] = _qwen_vision_input_partitions(
+                        mm_data, modality, metadata)
+            mm_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
         return mm_data
 
     def _dummy_mm_data_for_size(
@@ -1209,6 +1256,55 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             llm_grid_w * spatial_merge_size,
         ]
 
+    def finalize_multimodal_prompt(
+        self,
+        inputs: TextPrompt,
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        """Finalize image positions from encoder geometry, retaining completed layouts."""
+        token_ids, result = super().finalize_multimodal_prompt(
+            inputs, params, mm_hashes=mm_hashes)
+        data = result.multimodal_data
+        if "mrope_config" not in data:
+            refs, lengths = result.get_item_layout()
+            if any(modality != "image" for modality, _ in refs):
+                raise ValueError(
+                    "Qwen video handoff requires a finalized request_layout with mrope state"
+                )
+            # Decode only geometry, leaving the primary CUDA item handles deferred.
+            geometry = MultimodalParams(
+                multimodal_data={
+                    "items":
+                    data.get("multimodal_embedding_metadata", [{}] * len(refs))
+                })
+            geometry.to_tensor("multimodal_data")
+            grids = []
+            for item, length in zip(geometry.multimodal_data["items"],
+                                    lengths,
+                                    strict=True):
+                grid = item.get("image", {}).get("image_grid_thw")
+                if grid is None:
+                    # External image embeddings without geometry retain their existing inference rule.
+                    grid = self._infer_image_grid_thw(
+                        length, self.config.vision_config.spatial_merge_size)
+                grids.append(
+                    torch.as_tensor(grid, dtype=torch.long).reshape(-1, 3))
+            ids = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+            data["mrope_config"] = self.get_mrope_config(
+                ids, torch.cat(grids), None, torch.ones_like(ids), None)
+            if "request_layout" in data:
+                data["request_layout"]["model_data"] = {
+                    "mrope_config": data["mrope_config"]
+                }
+        if "request_layout" in data:
+            # Finalized positions supersede encoder geometry. Avoid exporting
+            # a CPU shared-memory handle for every grid in a whole request.
+            data.pop("image", None)
+            data.pop("video", None)
+        return token_ids, result
+
     def _attach_multimodal_embeddings_impl(
         self,
         inputs: TextPrompt,
@@ -1233,41 +1329,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     f"Image embedding {index} must be rank 2, got shape {tuple(image_embedding.shape)}"
                 )
 
-        build_disagg_prefill_multimodal_inputs = getattr(
-            self, "build_disagg_prefill_multimodal_inputs", None)
-        if not callable(build_disagg_prefill_multimodal_inputs):
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support external multimodal embeddings"
-            )
+        prompt_token_ids, multimodal_params = self.finalize_multimodal_prompt(
+            inputs,
+            MultimodalParams(
+                multimodal_data={"multimodal_embedding": image_embeddings}))
 
-        mm_handles = [{
-            "tensor_size": tuple(image_embedding.shape)
-        } for image_embedding in image_embeddings]
-        prompt_token_ids = build_disagg_prefill_multimodal_inputs(
-            inputs, mm_handles).prompt_token_ids
-
-        # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
-        # ``image_token_id`` at mm positions (no legacy OOV remap), so
-        # ``mrope_input_ids`` is fed to ``get_mrope_config`` as-is.
-        mrope_input_ids = torch.tensor(prompt_token_ids,
-                                       dtype=torch.long).unsqueeze(0)
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_grid_thw = torch.tensor(
-            [
-                self._infer_image_grid_thw(image_embedding.shape[0],
-                                           spatial_merge_size)
-                for image_embedding in image_embeddings
-            ],
-            dtype=torch.long,
-        )
-        attention_mask = torch.ones_like(mrope_input_ids)
-        mrope_config = self.get_mrope_config(mrope_input_ids, image_grid_thw,
-                                             None, attention_mask, None)
-
-        multimodal_data = {
-            "multimodal_embedding": image_embeddings,
-            "mrope_config": mrope_config,
-        }
+        multimodal_data = multimodal_params.multimodal_data
         return prompt_token_ids, {"multimodal_data": multimodal_data}
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
@@ -1330,6 +1397,46 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return fused_input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
+
+
+def _qwen_encoder_device_paths(visual: torch.nn.Module) -> list[str]:
+    """Native towers consume host grids; the older HF tower needs device grids."""
+    paths = [
+        "image.pixel_values", "video.pixel_values_videos",
+        "multimodal_embedding", "mrope_config.mrope_position_ids",
+        "mrope_config.mrope_position_deltas"
+    ]
+    if not isinstance(visual, MultimodalEncoderMixin):
+        paths.extend(("image.image_grid_thw", "video.video_grid_thw"))
+    return paths
+
+
+def _qwen_vision_output_metadata(param: MultimodalParams) -> dict[str, Any]:
+    """Keep geometry/timing for prompt finalization without retaining pixel inputs."""
+    result = {}
+    for modality, keys in (
+        ("image", ("image_grid_thw", )),
+        ("video", ("video_grid_thw", "second_per_grid_ts")),
+    ):
+        data = param.multimodal_data.get(modality)
+        if data is not None:
+            result[modality] = {key: data[key] for key in keys if key in data}
+    metadata = param.item_metadata
+    result[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        metadata.item_refs,
+        metadata.encoder_token_lengths,
+        metadata.output_embedding_lengths,
+        input_partitions={
+            modality: {
+                name:
+                metadata.input_partitions.get(modality, {}).get(
+                    name, _QWEN_VISION_BATCHED_FIELD)
+                for name in data
+            }
+            for modality, data in result.items()
+        },
+    )
+    return result
 
 
 class Qwen2VisionModelBase(nn.Module):
@@ -1515,6 +1622,20 @@ class Qwen2VisionModelBase(nn.Module):
                 embed = embed.pooler_output
             embeds.append(embed)
         return embeds
+
+    @property
+    def multimodal_data_device_paths(self) -> list[str]:
+        return _qwen_encoder_device_paths(self.visual)
+
+    def encode_multimodal_inputs(
+            self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        """Share the encoded-view contract with aggregated model execution."""
+        embeddings = self.forward(multimodal_params)
+        return split_multimodal_encoder_outputs(
+            embeddings[0],
+            multimodal_params,
+            metadata_fn=_qwen_vision_output_metadata)
 
 
 class Qwen2_5_VLVisionAttention(Attention):
@@ -2153,8 +2274,58 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states
 
 
+_QWEN_VISION_BATCHED_FIELD = MultimodalItemPartition()
+
+
+def _qwen_vision_item_partitions(
+    param: MultimodalParams,
+    modality: str,
+) -> dict[str, MultimodalItemPartition] | None:
+    if modality not in ("image", "video"):
+        return None
+    metadata = param.item_metadata
+    if metadata is not None and modality in metadata.input_partitions:
+        return metadata.input_partitions[modality]
+    return _qwen_vision_input_partitions(param.multimodal_data, modality,
+                                         metadata)
+
+
+def _qwen_vision_input_partitions(
+    multimodal_data: dict[str, Any],
+    modality: str,
+    metadata: MultimodalItemMetadata | None,
+) -> dict[str, MultimodalItemPartition]:
+    """Declare patch packing once on the producer, with a legacy fallback."""
+    pixel_key, grid_key = (("pixel_values",
+                            "image_grid_thw") if modality == "image" else
+                           ("pixel_values_videos", "video_grid_thw"))
+    grids = multimodal_data[modality][grid_key]
+    if metadata is not None and metadata.encoder_token_lengths is not None:
+        costs = {
+            index: cost
+            for (item_modality, index), cost in zip(
+                metadata.item_refs, metadata.encoder_token_lengths, strict=True)
+            if item_modality == modality
+        }
+        patch_counts = tuple(costs[i] for i in range(grids.shape[0]))
+    else:
+        patch_counts = tuple(t * h * w for t, h, w in grids.tolist())
+    return {
+        pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
+        grid_key: _QWEN_VISION_BATCHED_FIELD,
+        "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+    }
+
+
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supports_mm_encoder_item_scheduling = True
+
+    def get_multimodal_item_partitions(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
 
     def __init__(
         self,
@@ -2280,21 +2451,17 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
-    def encode_multimodal_inputs(self,
-                                 multimodal_params: List[MultimodalParams],
-                                 **encoder_kwargs: Any) -> torch.Tensor:
-        """Uniform encoder entry (``MultimodalModelMixin`` contract).
-
-        Runs the vision encoder over ``multimodal_params`` and returns the
-        embeddings as a single tensor (Qwen folds any deepstack streams into
-        the hidden dim, so the single-tensor contract holds). Used by the
-        startup memory profiler to invoke the encoder directly; the model's
-        own ``forward`` keeps its custom deepstack fusion path.
-        """
-        mm_embeds = get_multimodal_embeddings(
-            encoder_forward_fn=self.mm_encoder.forward,
-            multimodal_params=list(multimodal_params))
-        return mm_embeds[0]
+    def encode_multimodal_inputs(
+            self, multimodal_params: List[MultimodalParams],
+            **encoder_kwargs: Any) -> list[MultimodalParams]:
+        """Return encoded views; DeepStack features remain packed in row width."""
+        embeddings = self.mm_encoder.forward(list(multimodal_params),
+                                             **encoder_kwargs)
+        return split_multimodal_encoder_outputs(
+            embeddings[0],
+            multimodal_params,
+            metadata_fn=_qwen_vision_output_metadata,
+        )
 
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
@@ -2454,38 +2621,44 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
-    def build_disagg_prefill_multimodal_inputs(
-            self, inputs: TextPrompt,
-            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
+    def _finalize_multimodal_prompt(
+        self,
+        inputs: TextPrompt,
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
-            mm_handles: List of multimodal embedding handles.
+            embeddings: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
+        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is None and not text_prompt:
+            raise ValueError("Prompt token IDs or text are required")
 
-        if not isinstance(mm_handles, list):
-            raise TypeError("mm_handles must be a list")
+        if not isinstance(embeddings, list):
+            raise TypeError("embeddings must be a list")
 
         expected_hidden_size = self.config.text_config.hidden_size
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle['tensor_size'][1]
+        for i, embedding in enumerate(embeddings):
+            hidden_size = _multimodal_embedding_shape(embedding)[1]
             if hidden_size != expected_hidden_size:
                 raise RuntimeError(
                     f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
                 )
-        input_ids = self.tokenizer(text_prompt,
-                                   return_tensors="pt").input_ids[0]
+        input_ids = (torch.tensor(prompt_token_ids)
+                     if prompt_token_ids is not None else self.tokenizer(
+                         text_prompt, return_tensors="pt").input_ids[0])
 
         image_token_index = self.config.image_token_id
 
@@ -2493,9 +2666,10 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         image_positions = torch.where(image_mask)[0]
         num_images = len(image_positions)
         assert num_images == len(
-            mm_handles), "Number of images must match number of mm_handles"
-        total_mm_tokens = sum(mm_handle["tensor_size"][0]
-                              for mm_handle in mm_handles)
+            embeddings), "Number of images must match number of embeddings"
+        total_mm_tokens = sum(
+            _multimodal_embedding_shape(embedding)[0]
+            for embedding in embeddings)
         final_length = len(input_ids) - num_images + total_mm_tokens
         # Create output tensor
         expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
@@ -2512,7 +2686,8 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         for read_pos in range(len(input_ids)):
             if input_ids[read_pos] == image_token_index:
                 # Replace with placeholder id
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
+                mm_token_num = _multimodal_embedding_shape(
+                    embeddings[image_cnt])[0]
                 expanded_ids[write_pos:write_pos + mm_token_num] = \
                     placeholder_id
                 mm_token_offsets.append(write_pos)
@@ -2527,18 +2702,24 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
         assert mm_token_length[-1] + mm_token_offsets[
             -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
-            multimodal_lengths=mm_token_length,
-            multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[
-                mm_handle["tensor_size"][0] for mm_handle in mm_handles
-            ],
-            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
-                                                      1)),
-            multimodal_run_positions=mm_token_offsets,
-            multimodal_run_lengths=mm_token_length,
-        )
+        return expanded_ids.to(
+            torch.int32).tolist(), MultimodalParams.from_embeddings(
+                embeddings,
+                MultimodalItemMetadata(
+                    [("image", i) for i in range(len(embeddings))],
+                    output_embedding_lengths=[
+                        _multimodal_embedding_shape(handle)[0]
+                        for handle in embeddings
+                    ],
+                ),
+                multimodal_hashes=mm_hashes,
+                multimodal_lengths=mm_token_length,
+                multimodal_positions=mm_token_offsets,
+                multimodal_item_run_cu_offsets=list(
+                    range(len(mm_token_length) + 1)),
+                multimodal_run_positions=mm_token_offsets,
+                multimodal_run_lengths=mm_token_length,
+            )
 
 
 @support_multimodal_disaggregated

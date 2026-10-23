@@ -28,6 +28,8 @@ from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     video_to_pixel_values,
 )
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
     _compute_mm_masks,
@@ -2519,23 +2521,35 @@ class TestNemotronEpdEvs:
             }
         }
         inputs["prompt_token_ids" if tokenized else "prompt"] = tokens if tokenized else "prompt"
-        handles = [
-            {"tensor_size": [sum(item), 2], "metadata": {"retained_token_counts": item}}
-            for item in counts
-        ]
-        handoff = processor.build_disagg_prefill_multimodal_inputs(inputs, handles)
+        handles = [{"tensor_size": [sum(item), 2]} for item in counts]
+        prompt_token_ids, params = processor._finalize_multimodal_prompt(
+            inputs,
+            MultimodalParams(
+                multimodal_data={
+                    "multimodal_embedding": handles,
+                    "multimodal_embedding_metadata": [
+                        {"retained_token_counts": item} for item in counts
+                    ],
+                }
+            ),
+            mm_hashes=[[i] * 8 for i in range(len(handles))],
+        )
         expected = [101]
         for item in counts:
             for count in item:
                 expected.extend([100, 500, *([20] * count), 501])
         expected.append(102)
-        assert handoff.prompt_token_ids == expected
-        assert handoff.multimodal_embedding_lengths == list(map(sum, counts))
-        assert handoff.multimodal_lengths == [sum(item) + 2 * len(item) for item in counts]
-        assert handoff.multimodal_item_run_cu_offsets == [
+        assert prompt_token_ids == expected
+        assert params.item_metadata.output_embedding_lengths == tuple(map(sum, counts))
+        assert params.multimodal_input.multimodal_lengths == [
+            sum(item) + 2 * len(item) for item in counts
+        ]
+        assert params.multimodal_input.multimodal_item_run_cu_offsets == [
             sum(len(item) for item in counts[:i]) for i in range(len(counts) + 1)
         ]
-        assert handoff.multimodal_run_lengths == [count + 2 for item in counts for count in item]
+        assert params.multimodal_input.multimodal_run_lengths == [
+            count + 2 for item in counts for count in item
+        ]
 
     @pytest.mark.parametrize("item_counts", [None, [3], [-1, 4], [2, 2], [True, 2], [1.0, 2]])
     def test_handoff_rejects_invalid_retained_counts(
@@ -2543,15 +2557,20 @@ class TestNemotronEpdEvs:
     ) -> None:
         processor = self._processor([[2, 1]])
         handle = {"tensor_size": (3, 2)}
-        if item_counts is not None:
-            handle["metadata"] = {"retained_token_counts": item_counts}
         with pytest.raises(ValueError, match="retained_token_counts"):
-            processor.build_disagg_prefill_multimodal_inputs(
+            processor._finalize_multimodal_prompt(
                 {
                     "prompt_token_ids": [600],
                     "multi_modal_data": {"video": [[Image.new("RGB", (32, 32))] * 3]},
                 },
-                [handle],
+                MultimodalParams(
+                    multimodal_data={
+                        "multimodal_embedding": [handle],
+                        "multimodal_embedding_metadata": [
+                            {} if item_counts is None else {"retained_token_counts": item_counts}
+                        ],
+                    }
+                ),
             )
 
     def test_encoder_preserves_counts_per_video_and_request(self) -> None:
@@ -2562,13 +2581,17 @@ class TestNemotronEpdEvs:
             MultimodalParams(
                 multimodal_data={
                     "video": {"video_size": [(3, 1, 32, 32), (5, 1, 32, 32)]},
-                    "multimodal_embedding_lengths": [3, 4],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0), ("video", 1)], output_embedding_lengths=[3, 4]
+                    ),
                 }
             ),
             MultimodalParams(
                 multimodal_data={
                     "image": {},
-                    "multimodal_embedding_lengths": [1],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[1]
+                    ),
                 }
             ),
         ]

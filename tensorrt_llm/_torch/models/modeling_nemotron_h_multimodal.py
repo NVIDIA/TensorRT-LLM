@@ -28,12 +28,15 @@ from PIL import Image
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
-    DisaggPrefillMultimodalInputs,
+    MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     _as_cpu_tensor,
     _compute_mm_masks,
     _find_mm_token_runs_from_mask,
     _find_mm_token_start_pos_from_masks,
+    _multimodal_embedding_shape,
     find_mm_token_lengths,
 )
 
@@ -62,7 +65,9 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
+    _encode_multimodal_group_tensor,
     encode_multimodal_by_groups,
+    split_multimodal_encoder_outputs,
 )
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
@@ -1138,13 +1143,13 @@ class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
                     # Per-item counts travel with the embedding they describe.
                     param.multimodal_data["multimodal_embedding_metadata"] = [
                         {"retained_token_counts": item.tolist()}
-                        for item in counts.split(tubelet_lengths)
+                        for item in counts.cpu().split(tubelet_lengths)
                     ]
             return torch.cat(embeds, dim=0)
 
         pack = lambda params: {"multimodal_params": params}  # noqa: E731
         return [
-            encode_multimodal_by_groups(
+            _encode_multimodal_group_tensor(
                 (
                     EncoderGroup(("image",), partial(_encoder_fn, modality="image"), pack),
                     EncoderGroup(("video",), partial(_encoder_fn, modality="video"), pack),
@@ -1153,11 +1158,58 @@ class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
             )
         ]
 
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        """Keep prompt/geometry metadata on the host during encoder-only work."""
+        return ["image.pixel_values", "video.pixel_values"]
+
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        embeddings = self.forward(multimodal_params)
+        results = split_multimodal_encoder_outputs(embeddings[0], multimodal_params)
+        if self.video_pruning_rate > 0:
+            for source, result in zip(multimodal_params, results, strict=True):
+                video = source.multimodal_data.get("video")
+                if video is not None:
+                    result.multimodal_data["evs_ids"] = video["evs_ids"]
+        return results
+
 
 class NemotronHMultimodalInputProcessor(
     BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
 ):
     supports_token_id_mm_expansion: ClassVar[bool] = True
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        audio = multimodal_data.get("audio")
+        # EVS merge also carries full prompt IDs for image/audio requests.
+        # Selecting individual items would require rebuilding that prompt stream.
+        if metadata is not None and isinstance(audio, dict) and audio.get("evs_ids") is None:
+            # One audio item can contain several clips. Video's embedded audio
+            # stays in its video bucket and retains the model's AV interleave.
+            clip_counts = audio.get("audio_num_clips")
+            if clip_counts is None:
+                return metadata
+            clip_counts = clip_counts.cpu()
+            audio["audio_num_clips"] = clip_counts
+            clips = tuple(clip_counts.tolist())
+            item_count = sum(m == "audio" for m, _ in metadata.item_refs)
+            if len(clips) == item_count:
+                packed = MultimodalItemPartition(item_lengths=clips)
+                metadata.input_partitions["audio"] = {
+                    "input_audio_features": packed,
+                    "feature_attention_mask": packed,
+                    "audio_output_lengths": packed,
+                    "audio_num_clips": MultimodalItemPartition(),
+                }
+        return metadata
 
     def __init__(
         self,
@@ -2484,15 +2536,72 @@ class NemotronHMultimodalInputProcessor(
                 multimodal_data[m]["evs_ids"] = input_ids[0].to(torch.int32)
         return input_ids[0].to(torch.int32).tolist(), {"multimodal_data": multimodal_data}
 
-    def build_disagg_prefill_multimodal_inputs(
-        self, inputs: Union[TextPrompt, TokensPrompt], mm_handles: List[Dict[str, Any]]
-    ) -> DisaggPrefillMultimodalInputs:
+    def finalize_multimodal_prompt(
+        self,
+        inputs: TextPrompt,
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        """Finalize EVS tubelet positions using encoder-reported retained counts."""
+        data = params.multimodal_data
+        if params.multimodal_input is not None and "evs_ids" in data:
+            counts = [
+                count
+                for item in data["multimodal_embedding_metadata"]
+                for count in item["retained_token_counts"]
+            ]
+            evs_ids = data["evs_ids"].tolist()
+            if evs_ids.count(self.video_context_token_id) != len(counts):
+                raise ValueError("EVS retained counts must align with video tubelets")
+            if sum(counts) != sum(params.get_item_layout()[1]):
+                raise ValueError("EVS retained counts must match actual encoder rows")
+            token_ids = []
+            retained = iter(counts)
+            for token_id in evs_ids:
+                if token_id == self.video_context_token_id:
+                    token_ids.extend([self.img_context_token_id] * next(retained))
+                else:
+                    token_ids.append(token_id)
+            mm_input = params.multimodal_input
+            mm_mask, _, special_mask = _compute_mm_masks(
+                _as_cpu_tensor(token_ids),
+                vocab_size=self.get_vocab_size(),
+                mm_token_ids=self.get_mm_token_ids(),
+                mm_special_token_ids=self.get_mm_special_token_ids(),
+            )
+            positions, special_offsets = _find_mm_token_start_pos_from_masks(
+                mm_mask, special_mask, mm_input.multimodal_lengths
+            )
+            runs, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+                mm_mask, mm_input.multimodal_lengths
+            )
+            params.multimodal_input = MultimodalInput.from_components(
+                mm_input.multimodal_hashes,
+                positions,
+                mm_input.multimodal_lengths,
+                mm_item_run_cu_offsets=runs,
+                mm_run_positions=run_positions,
+                mm_run_lengths=run_lengths,
+            )
+            data["special_token_offsets"] = special_offsets
+            inputs = {"prompt_token_ids": token_ids}
+        return super().finalize_multimodal_prompt(inputs, params, mm_hashes=mm_hashes)
+
+    def _finalize_multimodal_prompt(
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if prompt_token_ids is None and not text_prompt:
             raise ValueError("Either prompt_token_ids or text prompt is required")
-        if not isinstance(mm_handles, list):
-            raise TypeError("mm_handles must be a list")
+        if not isinstance(embeddings, list):
+            raise TypeError("embeddings must be a list")
 
         mm_data = inputs.get("multi_modal_data") or {}
         if not mm_data:
@@ -2509,15 +2618,15 @@ class NemotronHMultimodalInputProcessor(
 
         num_mm_tokens_by_key = find_mm_token_lengths(mm_data, self)
         num_mm_tokens = [length for lengths in num_mm_tokens_by_key.values() for length in lengths]
-        if len(num_mm_tokens) != len(mm_handles):
+        if len(num_mm_tokens) != len(embeddings):
             raise RuntimeError(
-                f"Expected {len(num_mm_tokens)} multimodal handles, got {len(mm_handles)}."
+                f"Expected {len(num_mm_tokens)} multimodal handles, got {len(embeddings)}."
             )
 
         expected_hidden_size = self.config.llm_config.hidden_size
         multimodal_embedding_lengths: List[int] = []
-        for i, mm_handle in enumerate(mm_handles):
-            tensor_size = mm_handle["tensor_size"]
+        for i, embedding in enumerate(embeddings):
+            tensor_size = _multimodal_embedding_shape(embedding)
             if len(tensor_size) != 2:
                 raise RuntimeError(
                     f"Expected multimodal embedding {i} to be rank 2, got tensor_size={tensor_size}."
@@ -2542,7 +2651,10 @@ class NemotronHMultimodalInputProcessor(
 
         if modalities[0] == "video":
             retained_counts = [
-                handle.get("metadata", {}).get("retained_token_counts") for handle in mm_handles
+                item.get("retained_token_counts")
+                for item in params.multimodal_data.get(
+                    "multimodal_embedding_metadata", [{}] * len(embeddings)
+                )
             ]
             if self.video_pruning_rate > 0:
                 videos = mm_data["video"]
@@ -2602,11 +2714,15 @@ class NemotronHMultimodalInputProcessor(
             mm_mask, num_mm_tokens
         )
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids,
+        return expanded_ids, MultimodalParams.from_embeddings(
+            embeddings,
+            MultimodalItemMetadata(
+                [(modalities[0], i) for i in range(len(embeddings))],
+                output_embedding_lengths=multimodal_embedding_lengths,
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=num_mm_tokens,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=multimodal_embedding_lengths,
             multimodal_item_run_cu_offsets=item_run_cu_offsets,
             multimodal_run_positions=run_positions,
             multimodal_run_lengths=run_lengths,
@@ -3256,9 +3372,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         padded_features: List[torch.Tensor] = []
         padded_masks: List[torch.Tensor] = []
         clips_per_input: List[int] = []
+        valid_output_lens: List[int] = []
+        has_output_lengths = all(
+            ad.get("audio_output_lengths") is not None for ad in audio_data_list
+        )
         for audio_data in audio_data_list:
             features = audio_data["input_audio_features"].to(dtype=self.model_dtype)
             mask = audio_data["feature_attention_mask"]
+            if has_output_lengths:
+                valid_output_lens.extend(audio_data["audio_output_lengths"].tolist())
             pad_amount = max_time - features.shape[1]
             if pad_amount > 0:
                 features = torch.nn.functional.pad(features, (0, 0, 0, pad_amount))
@@ -3272,10 +3394,12 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         sound_embeds = self.sound_encoder(all_features, all_masks)
 
-        valid_input_lens = all_masks.sum(dim=1)
-        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-            valid_input_lens
-        ).tolist()
+        if not has_output_lengths:
+            # Compatibility for feature dicts not built by ParakeetExtractor.
+            # Keep one batched readback rather than synchronizing per input.
+            valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+                all_masks.sum(dim=1)
+            ).tolist()
 
         per_clip_embeds: List[torch.Tensor] = []
         per_clip_counts: List[int] = []
@@ -3440,7 +3564,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **_: Any
-    ) -> torch.Tensor:
+    ) -> list[MultimodalParams]:
         # Raw encoder hook per the `MultimodalModelMixin` contract. Cache
         # bookkeeping belongs to callers (`_get_or_encode_multimodal_embeddings`,
         # `_dispatch_cross_iter_prefetch`), not here — wrapping in

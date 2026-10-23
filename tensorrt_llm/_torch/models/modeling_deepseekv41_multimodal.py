@@ -20,7 +20,7 @@ from ..model_config import ModelConfig
 from .deepseek_v41_processor import IMAGE_PLACEHOLDER, DeepseekV41InputProcessor
 from .deepseek_v41_vision import DeepseekV41Aligner, DeepseekV41VisionModel
 from .modeling_deepseekv41 import DeepseekV41ForCausalLM
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import MultimodalModelMixin, split_multimodal_encoder_outputs
 from .modeling_utils import register_auto_model
 
 
@@ -188,7 +188,7 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
 
     def encode_multimodal_inputs(
         self, multimodal_params: Sequence[MultimodalParams]
-    ) -> torch.Tensor:
+    ) -> list[MultimodalParams]:
         if self.vision is None or self.aligner is None:
             raise ValueError("Raw images require a local DeepSeek-V4.1 vision encoder")
         embeddings = []
@@ -221,7 +221,7 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
                 )
         if not embeddings:
             raise ValueError("No images supplied to DeepSeek-V4.1 encoder")
-        return torch.cat(embeddings)
+        return split_multimodal_encoder_outputs(torch.cat(embeddings), multimodal_params)
 
     def get_language_model_extra_forward_kwargs(
         self, *, raw_input_ids, position_ids, mm_inputs, **forward_kwargs

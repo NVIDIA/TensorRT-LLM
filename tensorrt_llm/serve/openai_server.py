@@ -2825,7 +2825,7 @@ class OpenAIServer(_VideoRoutesMixin):
             await promise.aresult()
             # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
             mm_embedding_handles = (
-                promise.disaggregated_params.multimodal_embedding_handles
+                promise.disaggregated_params.get_multimodal_embedding_handles()
                 if promise.disaggregated_params else None)
             if not mm_embedding_handles:
                 return self.create_error_response(

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 methods:
   __init__:
     parameters: {}
@@ -11,6 +13,10 @@ methods:
   clear_logprob_params:
     parameters: {}
     return_annotation: None
+  export_multimodal_handoff:
+    parameters: {}
+    return_annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+    status: beta
   record_stats:
     parameters:
       output:

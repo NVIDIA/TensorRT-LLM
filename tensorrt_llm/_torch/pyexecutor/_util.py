@@ -21,6 +21,8 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.models.modeling_multimodal_utils import \
+    _join_embeddings
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
@@ -1498,7 +1500,10 @@ class KvCacheCreator:
                         encoder_inputs)
                     # The runtime store owns detached copies rather than views
                     # of an encoder batch. Reproduce that allocation boundary.
-                    return output.detach().clone()
+                    return _join_embeddings([
+                        result.multimodal_data["multimodal_embedding"]
+                        for result in output
+                    ]).detach().clone()
         finally:
             self._dummy_encoder_inputs = []
 
