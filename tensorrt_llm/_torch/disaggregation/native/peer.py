@@ -186,15 +186,7 @@ class PeerRegistrar:
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
         self._validate_view_head_geometry(peer_ri)
-        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
-            # The layer-count tolerance below would transfer only the target
-            # layers and leave the drafter's prompt KV unset on the receiver.
-            raise ValueError(
-                "PeerRegistrar: unified draft KV layer count differs "
-                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
-                "both peers must use the same speculative decoding KV cache layout; "
-                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
-            )
+        self.validate_draft_layers(self._ri, peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -209,6 +201,25 @@ class PeerRegistrar:
             )
 
         return True
+
+    @staticmethod
+    def validate_draft_layers(self_ri: RankInfo, peer_ri: RankInfo) -> None:
+        """Reject a peer that keeps a different number of draft layers with its target KV.
+
+        The layer-count tolerance of ``_check_peer_compatible`` would transfer
+        only the target layers and leave the drafter's prompt KV unset on the
+        generation side, which costs acceptance length without any error.
+        """
+        if self_ri.num_draft_layers != peer_ri.num_draft_layers:
+            raise ValueError(
+                "PeerRegistrar: unified draft KV layer count differs "
+                f"(local={self_ri.num_draft_layers}, peer={peer_ri.num_draft_layers}), so "
+                "the drafter's prompt KV would not reach the generation worker. Run the "
+                "context and generation workers with the same speculative_config and the "
+                "same TRTLLM_DISAGG_SHARED_DRAFT_KV setting. To draft on the generation "
+                "worker alone, keep its draft KV private with TRTLLM_DISAGG_SHARED_DRAFT_KV=0 "
+                "or attention_backend VANILLA."
+            )
 
     def _validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
         """Check that every matched head-sharded view pair can be resharded.

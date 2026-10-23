@@ -2043,6 +2043,58 @@ def test_incompatible_peer_fails_only_affected_requests():
                 worker.shutdown()
 
 
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(("ctx_draft_layers", "gen_draft_layers"), [(2, 0), (0, 2)])
+def test_draft_layer_mismatch_fails_requests_at_first_transfer(ctx_draft_layers, gen_draft_layers):
+    """Peers that disagree on the draft layers riding the target KV fail each request at once.
+
+    Otherwise the sender only logs its rejection and the request waits out
+    the transfer timeout, or the generation drafter runs without its prompt KV.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    # The context worker's rank-info server publishes this object.
+    ctx_tw._rank_info.num_draft_layers = ctx_draft_layers
+    gen_tw._rank_info.num_draft_layers = gen_draft_layers
+    sc = tensorrt_llm.bindings.SamplingConfig(SamplingParams(temperature=0)._get_sampling_config())
+    request = LlmRequest(
+        request_id=700,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=sc,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=700,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=setup["ctx_info_endpoint"],
+        disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF,
+    )
+    page_table = gen_tw._rank_info.page_table
+    empty_slice = Chunk(
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=0),
+        is_last=True,
+    )
+    try:
+        rx = gen_tw.create_rx_session(request)
+        rx.receive(empty_slice)
+        assert rx.wait_complete(blocking=True) == WaitResult.FAILED
+        message = str(rx._kv_tasks[0]._exception)
+        assert f"local={gen_draft_layers}, peer={ctx_draft_layers}" in message
+        assert "same speculative_config" in message
+        assert setup["ctx_info_endpoint"] in gen_tw._receiver._incompatible_peers
+        rx.close()
+    finally:
+        for worker in setup["ctx_transfer_workers"] + setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
 def add_and_verify_pipelined_request(
     setup,
     ctx_request_id,
