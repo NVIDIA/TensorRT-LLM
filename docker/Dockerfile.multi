@@ -122,6 +122,10 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
+# Scan only image contents, without exposing the persistent package cache mounts.
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    python3 /opt/docker/common/remove_unwanted_ca.py
+
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ARG TARGETARCH
@@ -227,6 +231,10 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
 
+# Scan only image contents, without exposing the persistent package cache mounts.
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    python3 /opt/docker/common/remove_unwanted_ca.py
+
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ARG TARGETARCH
@@ -243,3 +251,7 @@ WORKDIR /app/tensorrt_llm
 COPY ./triton_backend/all_models ./triton_backend/all_models
 COPY ./triton_backend/scripts ./triton_backend/scripts
 COPY ./triton_backend/tools ./triton_backend/tools
+
+# Check the final Triton image after copying its backend files.
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    python3 /opt/docker/common/remove_unwanted_ca.py

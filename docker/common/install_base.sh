@@ -1,4 +1,17 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -ex
 
@@ -77,6 +90,7 @@ init_ubuntu() {
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
+    ca-certificates \
     libtool \
     autoconf \
     automake \
@@ -106,7 +120,7 @@ init_ubuntu() {
   # PEP 668: Allow break system packages for ubuntu24.04,
   # and ubuntu22.04 (currently not used) shouldn't be affected.
   pip3 config set global.break-system-packages true
-  pip3 install pip wheel
+  pip3 install "pip>=26.2.2" "certifi>=2026.10.19" wheel
   # WAR: pin setuptools<80; setuptools>=80 breaks `python setup_library.py develop`
   # used by cutlass. Use --ignore-installed to avoid failing on system setuptools
   # that lack a RECORD file (installed via apt without pip metadata).
@@ -134,6 +148,7 @@ install_python_rockylinux() {
     PYTHON_URL="https://urm.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
   fi
   dnf makecache --refresh
+  dnf upgrade -y ca-certificates
   dnf install \
     epel-release \
     compiler-rt \
@@ -165,7 +180,7 @@ install_python_rockylinux() {
 }
 
 install_pyp_rockylinux() {
-  bash -c "pip3 install pytest"
+  bash -c 'pip3 install "pip>=26.2.2" "certifi>=2026.10.19" pytest'
 }
 
 install_gcctoolset_rockylinux() {
