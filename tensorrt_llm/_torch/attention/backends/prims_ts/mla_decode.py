@@ -1044,11 +1044,35 @@ def _make_mla_decode_compile_spec(
     )
 
 
-@functools.cache
-def _get_compiled_mla_decode(
-    compile_spec: _MLADecodeCompileSpec,
-):
-    """Compile and cache one batch-dynamic TS MLA topology."""
+_COMPILED_MLA_DECODE: dict = {}
+
+
+def _get_compiled_mla_decode(compile_spec: _MLADecodeCompileSpec):
+    """Compile and cache one batch-dynamic TS MLA topology.
+
+    A manual memo rather than ``functools.cache``: under the warm-up precompile
+    modes of ``_compile_cache`` the build returns a placeholder (probe / persist
+    only), which must not be remembered for the serving launches that follow.
+    """
+    compiled = _COMPILED_MLA_DECODE.get(compile_spec)
+    if compiled is None:
+        compiled = _compile_mla_decode(compile_spec)
+        if not _compile_cache_is_placeholder(compiled):
+            _COMPILED_MLA_DECODE[compile_spec] = compiled
+    return compiled
+
+
+_get_compiled_mla_decode.cache_clear = _COMPILED_MLA_DECODE.clear  # type: ignore[attr-defined]
+
+
+def _compile_cache_is_placeholder(compiled) -> bool:
+    from ._compile_cache import is_placeholder
+
+    return is_placeholder(compiled)
+
+
+def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
+    """Build (or load from the on-disk cache) one batch-dynamic TS MLA topology."""
 
     import cutlass
     import cutlass.cute as cute

@@ -601,6 +601,9 @@ class PrimsTSSparseMlaFmha(Fmha):
             spec = mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[2]
             signature = mla_decode._mla_kernel_compile_signature(spec.kernel)
             representative[signature] = rows  # the largest row count of each variant
+        self._precompile_variants(
+            device, heads, plan_kwargs, sorted(representative.values(), reverse=True)
+        )
         for rows in sorted(representative.values(), reverse=True):
             self._get_plan(
                 metadata=metadata,
@@ -614,6 +617,64 @@ class PrimsTSSparseMlaFmha(Fmha):
         logger.debug(
             f"PrimTS sparse MLA warmed {len(representative)} kernel variants for extra={extra} "
             f"(rows scanned up to {max_rows}): {(time.perf_counter() - t_warm) * 1e3:.0f} ms"
+        )
+
+    @staticmethod
+    def _precompile_variants(
+        device: torch.device, heads: int, plan_kwargs: dict, rows_list: list
+    ) -> None:
+        """Populate the on-disk kernel cache for ``rows_list`` with worker subprocesses.
+
+        Skipped when every variant is already cached (a probe plans each row
+        count without compiling), so a warm restart spawns nothing. Otherwise
+        best-effort: on any failure the serial plan loop that follows compiles
+        in-process, exactly as without workers. See ``prims_ts_precompile``.
+        """
+        from tensorrt_llm._torch.attention.backends.prims_ts import _compile_cache, mla_decode
+
+        from . import prims_ts_precompile
+
+        workers = prims_ts_precompile.worker_count(len(rows_list))
+        if workers <= 1:
+            return
+        try:
+            with _compile_cache.probe_cached():
+                for rows in rows_list:
+                    mla_decode.BatchSparseMLADecodePagedTSWrapper().plan(
+                        device, rows, heads, **plan_kwargs
+                    )
+        except _compile_cache.KernelNotCached:
+            pass
+        except Exception as error:  # noqa: BLE001 -- a probe failure only costs the fan-out
+            if prims_ts_precompile.strict():
+                raise
+            logger.warning(
+                f"PrimTS sparse MLA cache probe failed: {error!r}; compiling in-process."
+            )
+            return
+        else:
+            logger.debug("PrimTS sparse MLA kernel variants are all cached; no precompile workers")
+            return
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        payloads = [
+            prims_ts_precompile.encode_payload(device_index, rows, heads, plan_kwargs)
+            for rows in rows_list
+        ]
+        t_pre = time.perf_counter()
+        try:
+            ok = prims_ts_precompile.run_precompile_workers(payloads, workers)
+        except Exception as error:  # noqa: BLE001 -- warmup must not fail on a helper
+            if prims_ts_precompile.strict():
+                raise
+            logger.warning(f"PrimTS sparse MLA parallel precompile skipped: {error!r}")
+            return
+        if not ok and prims_ts_precompile.strict():
+            raise RuntimeError(
+                "PrimTS sparse MLA precompile workers failed (TLLM_PRIMTS_WARM_STRICT=1)"
+            )
+        logger.info(
+            f"PrimTS sparse MLA precompiled {len(payloads)} kernel variants with {workers} workers "
+            f"in {time.perf_counter() - t_pre:.0f} s{'' if ok else ' (some workers failed)'}"
         )
 
     @staticmethod

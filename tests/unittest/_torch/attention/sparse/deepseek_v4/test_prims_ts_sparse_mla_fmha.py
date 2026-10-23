@@ -26,6 +26,13 @@ LATENT = 512
 ROPE = 64
 BLOCK = 128
 
+
+@pytest.fixture(autouse=True)
+def _strict_precompile_workers(monkeypatch):
+    """A precompile worker failure is an error here, not a logged fallback."""
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+
+
 pytestmark = pytest.mark.skipif(
     get_sm_version() not in (100, 103), reason="PrimTS sparse MLA requires SM100 or SM103"
 )
@@ -708,6 +715,7 @@ def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
     monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
     monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
     monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "0")  # in-process planning only
 
     class _Attn:
         num_heads = 16
@@ -749,3 +757,340 @@ def test_index_contract_is_validated_once_per_process(monkeypatch) -> None:
     assert PrimsTSSparseMlaFmha._claim_contract_validation(key) is False
     other_pools = key[:6] + (3, 4096, 4, 4096)
     assert PrimsTSSparseMlaFmha._claim_contract_validation(other_pools) is True
+
+
+def _fake_sparse_plan(monkeypatch, planned, *, signature_div=8):
+    """Replace the sparse wrapper and plan resolver with fakes that record plan() calls."""
+    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
+
+    class _FakeWrapper:
+        def __init__(self, workspace_buffer=None):
+            pass
+
+        def plan(self, device, rows, heads, **kwargs):
+            planned.append((rows, kwargs["max_extra_topk"]))
+
+    class _FakeKernel:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def compile_signature(self):
+            return (self.rows // signature_div,)
+
+    def fake_resolve(device, rows, heads, **kwargs):
+        return (None, None, SimpleNamespace(kernel=_FakeKernel(rows)), None, 1024, None, None)
+
+    monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
+    monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
+    return mla_decode
+
+
+def _attn_and_profile():
+    class _Attn:
+        num_heads = 16
+        sparse_attention_config = SimpleNamespace(
+            window_size=128, enable_kv_cache_offload=False, enable_heuristic_topk=False
+        )
+
+    attn = _Attn()  # the library holds a weak reference to its owner
+    profile = dict(
+        device=torch.device("cuda", 0), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
+    )
+    eager = SimpleNamespace(
+        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=False
+    )
+    return attn, profile, eager
+
+
+def test_warm_up_fans_out_only_when_a_variant_is_missing(monkeypatch) -> None:
+    """The warm-up probes the cache first: all cached -> no workers; a miss -> every
+    representative row count goes to the workers as a JSON-safe payload before the
+    in-process plan loop; a failing helper never breaks the warm-up; strict mode raises."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
+    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
+
+    planned, fanned = [], []
+    _fake_sparse_plan(monkeypatch, planned)
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "2")
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    def fake_workers(payloads, workers):
+        fanned.append((list(payloads), workers))
+        return True
+
+    monkeypatch.setattr(pp, "run_precompile_workers", fake_workers)
+    attn, profile, eager = _attn_and_profile()
+    lib = PrimsTSSparseMlaFmha(attn)
+
+    # 1. Every variant cached: the probe plans (under probe mode) and no worker runs.
+    lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
+    assert fanned == []
+    # probe planned the three variants, then the real loop planned them again
+    assert planned == [(20, 512), (15, 512), (7, 512)] * 2
+
+    # 2. A cache miss during the probe -> workers get every representative row count.
+    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
+
+    real_plan = mla_decode.BatchSparseMLADecodePagedTSWrapper.plan
+
+    def probing_plan(self, device, rows, heads, **kwargs):
+        if cc._PRECOMPILE_MODE.get() == "probe":
+            raise cc.KernelNotCached("missing")
+        return real_plan(self, device, rows, heads, **kwargs)
+
+    monkeypatch.setattr(mla_decode.BatchSparseMLADecodePagedTSWrapper, "plan", probing_plan)
+    planned.clear()
+    lib._warm_kernel_variants(metadata=eager, extra=32, **profile)
+    assert planned == [(20, 32), (15, 32), (7, 32)]
+    assert len(fanned) == 1
+    payloads, workers = fanned[0]
+    assert workers == 2  # capped by the env value, below the three variants
+    assert [p["rows"] for p in payloads] == [20, 15, 7]
+    assert payloads[0]["plan_kwargs"]["q_data_type"] == "bfloat16"  # JSON-safe dtype
+    assert payloads[0]["plan_kwargs"]["max_extra_topk"] == 32
+    assert payloads[0]["device_index"] == 0
+    import json
+
+    json.dumps(payloads)  # every payload field crosses the subprocess boundary
+
+    # 3. A failing helper is logged and the in-process loop still plans everything...
+    def broken_workers(payloads, workers):
+        raise OSError("no subprocesses here")
+
+    monkeypatch.setattr(pp, "run_precompile_workers", broken_workers)
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "0")  # the module fixture sets strict mode
+    planned.clear()
+    fresh = SimpleNamespace(  # a new metadata object: the earlier plans are cached on `eager`
+        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=False
+    )
+    lib._warm_kernel_variants(metadata=fresh, extra=32, **profile)
+    assert planned == [(20, 32), (15, 32), (7, 32)]
+    # ...unless strict mode asks for the failure.
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    with pytest.raises(OSError):
+        lib._warm_kernel_variants(metadata=eager, extra=32, **profile)
+
+
+def test_precompile_worker_count_follows_the_env(monkeypatch) -> None:
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+
+    monkeypatch.delenv("TLLM_PRIMTS_WARM_WORKERS", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    assert pp.worker_count(12) == 4  # default
+    assert pp.worker_count(3) == 3  # never more workers than variants
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "0")
+    assert pp.worker_count(12) == 0
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "8")
+    assert pp.worker_count(12) == 8
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "many")
+    assert pp.worker_count(12) == 4  # unparsable: default with a warning
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    assert pp.worker_count(12) == 0  # nothing to persist into
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE")
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    assert pp.worker_count(12) == 0  # compiling is forbidden
+
+
+def test_precompile_worker_entry_compiles_its_shard_first_then_the_rest(monkeypatch) -> None:
+    """The worker entry point runs the real plan path under precompile_only(): own
+    shard first, the rest afterwards, busy kernels deferred to a blocking pass."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
+
+    planned, modes = [], []
+    mla_decode = _fake_sparse_plan(monkeypatch, planned)
+    real_plan = mla_decode.BatchSparseMLADecodePagedTSWrapper.plan
+    busy_once = {"rows": 15, "armed": True}
+
+    def recording_plan(self, device, rows, heads, **kwargs):
+        modes.append((rows, cc._PRECOMPILE_MODE.get(), cc._SKIP_BUSY.get()))
+        if rows == busy_once["rows"] and busy_once["armed"] and cc._SKIP_BUSY.get():
+            busy_once["armed"] = False
+            raise cc.KernelBusy("another worker owns it")
+        return real_plan(self, device, rows, heads, **kwargs)
+
+    monkeypatch.setattr(mla_decode.BatchSparseMLADecodePagedTSWrapper, "plan", recording_plan)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(cc, "expected_cache_meta", lambda: {"probe": "meta"})
+    payloads = [
+        pp.encode_payload(
+            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_data_type=torch.bfloat16)
+        )
+        for rows in (20, 15, 7, 3)
+    ]
+    import json
+
+    assert pp._main(["worker", json.dumps(payloads), "1", "2"]) == 0
+    # slot 1 of 2 owns rows 15 and 3; 15 was busy once and is retried blocking at the end
+    assert [m[0] for m in modes] == [15, 3, 20, 7, 15]
+    assert all(m[1] == "persist" for m in modes)
+    assert [m[2] for m in modes] == [True, True, True, True, False]
+    assert [r for r, _ in planned] == [3, 20, 7, 15]
+    assert pp.shard_order([0, 1, 2, 3, 4], 1, 2) == [1, 3, 0, 2, 4]
+    assert pp.shard_order([0, 1], 5, 8) == [0, 1]  # a slot past the list owns nothing
+
+
+def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch, tmp_path) -> None:
+    """The runner strips the MPI launcher environment, forwards sys.path and the
+    worker count 0, assigns one slot per worker, kills workers on timeout, and
+    reports a worker whose cache key differs from the parent's."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+
+    spawned = []
+
+    class _FakeProc:
+        def __init__(self, argv, env, stdout, returncode=0, text="", hang=False):
+            self.argv, self.env, self.returncode, self._hang = argv, env, returncode, hang
+            stdout.write(text)
+            self._done = False
+
+        def wait(self, timeout=None):
+            if self._hang and not getattr(self, "killed", False):
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            self._done = True  # like Popen.wait() after kill()
+            return self.returncode
+
+        def poll(self):
+            return None if (self._hang and not self._done) else self.returncode
+
+        def kill(self):
+            self._done = True
+            self.killed = True
+
+    import subprocess
+
+    def make_popen(**behaviour):
+        def fake_popen(argv, env, stdout, stderr, text):
+            proc = _FakeProc(argv, env, stdout, **behaviour)
+            spawned.append(proc)
+            return proc
+
+        return fake_popen
+
+    monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "2")
+    monkeypatch.setenv("SLURM_PROCID", "2")
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "4")
+    monkeypatch.setattr(pp, "_expected_cache_meta", lambda: {"k": 1})
+    meta_ok = "[prims-ts precompile] meta={'k': 1}\n"
+    monkeypatch.setattr(subprocess, "Popen", make_popen(text=meta_ok))
+    payloads = [{"rows": r} for r in (20, 15, 7)]
+    assert pp.run_precompile_workers(payloads, 2) is True
+    assert len(spawned) == 2
+    env = spawned[0].env
+    assert "OMPI_COMM_WORLD_RANK" not in env and "SLURM_PROCID" not in env
+    assert env["TLLM_PRIMTS_WARM_WORKERS"] == "0"
+    import json
+    import sys
+
+    assert json.loads(env["TLLM_PRIMTS_PRECOMPILE_SYS_PATH"]) == sys.path
+    assert [p.argv[-2:] for p in spawned] == [["0", "2"], ["1", "2"]]
+    assert spawned[0].argv[0] == sys.executable and spawned[0].argv[1] == "-c"
+    assert json.loads(spawned[0].argv[3]) == payloads
+
+    spawned.clear()
+    monkeypatch.setattr(
+        subprocess, "Popen", make_popen(text="[prims-ts precompile] meta={'k': 2}\n")
+    )
+    assert pp.run_precompile_workers(payloads, 1 + 1) is False  # cache key mismatch is a failure
+
+    spawned.clear()
+    monkeypatch.setattr(subprocess, "Popen", make_popen(returncode=3, text="boom"))
+    assert pp.run_precompile_workers(payloads, 2) is False
+
+    spawned.clear()
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "0.01")
+    monkeypatch.setattr(subprocess, "Popen", make_popen(hang=True))
+    assert pp.run_precompile_workers(payloads, 2) is False
+    assert all(getattr(p, "killed", False) for p in spawned)  # nothing left running
+    assert pp.run_precompile_workers(payloads, 1) is False  # one worker: nothing to fan out
+
+
+def test_precompile_only_persists_without_loading(monkeypatch) -> None:
+    """Under precompile_only(), build_and_load_attention_kernel compiles and persists
+    through the unlocked path and hands back a placeholder that refuses to launch;
+    under probe_cached() a missing kernel raises; with the cache disabled both refuse."""
+    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
+
+    persisted, probed = [], []
+    monkeypatch.setattr(
+        cc,
+        "_precompile_kernel",
+        lambda module, kernel, fn, files: persisted.append((module, kernel)),
+    )
+    monkeypatch.setattr(
+        cc, "_probe_kernel", lambda module, kernel, fn, files: probed.append(kernel)
+    )
+    monkeypatch.setattr(cc, "_kernel_source_files", lambda: ("a.py",))
+    monkeypatch.setattr(cc, "_compile_cache_key", lambda spec, options, extra: "deadbeef")
+    monkeypatch.setattr(
+        "flashinfer.jit.cute_dsl_core.cute_dsl_cache_disabled", lambda: False, raising=False
+    )
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    compiled = []
+
+    def compile_fn():
+        compiled.append(True)
+        return "kernel"
+
+    with cc.precompile_only():
+        placeholder = cc.build_and_load_attention_kernel(
+            "mla_decode", "main", object(), "", compile_fn
+        )
+    assert persisted and persisted[0][0] == "prims_ts_mla_decode"
+    assert persisted[0][1].startswith("main_sm") and persisted[0][1].endswith("_deadbeef")
+    assert not compiled  # the helper owns the compile; nothing was loaded in-process
+    with pytest.raises(RuntimeError, match="precompile-only"):
+        placeholder()
+    assert cc._PRECOMPILE_MODE.get() is None  # the context manager restores the mode
+    with cc.probe_cached():
+        cc.build_and_load_attention_kernel("mla_decode", "main", object(), "", compile_fn)
+    assert probed == [persisted[0][1]]
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    with cc.precompile_only(), pytest.raises(RuntimeError, match="FLASHINFER_DISABLE_JIT"):
+        cc.build_and_load_attention_kernel("mla_decode", "main", object(), "", compile_fn)
+    # Outside the precompile modes FLASHINFER_DISABLE_JIT keeps the disk-cache path:
+    # the kernel goes through FlashInfer's builder, never a compile_fn() here.
+    loaded = []
+    monkeypatch.setattr(
+        "flashinfer.jit.cute_dsl_core.build_and_load_cute_dsl_kernel",
+        lambda module, kernel, fn, extra_key_files=(): loaded.append((module, kernel)) or "loaded",
+    )
+    assert (
+        cc.build_and_load_attention_kernel("mla_decode", "main", object(), "", compile_fn)
+        == "loaded"
+    )
+    assert loaded == [("prims_ts_mla_decode", persisted[0][1])] and not compiled
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT")
+
+
+def test_precompile_placeholders_are_never_memoized(monkeypatch) -> None:
+    """A probe or persist build must not poison the compiled-kernel memo of the
+    serving process: the next real request compiles / loads the kernel."""
+    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
+    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
+
+    calls = []
+
+    def fake_compile(spec):
+        calls.append(cc._PRECOMPILE_MODE.get())
+        return cc._unloaded_kernel if cc._PRECOMPILE_MODE.get() else "real kernel"
+
+    monkeypatch.setattr(mla_decode, "_compile_mla_decode", fake_compile)
+    mla_decode._get_compiled_mla_decode.cache_clear()
+    spec = ("fake", "compile", "spec")
+    with cc.probe_cached():
+        assert cc.is_placeholder(mla_decode._get_compiled_mla_decode(spec))
+    with cc.precompile_only():
+        assert cc.is_placeholder(mla_decode._get_compiled_mla_decode(spec))
+    assert (
+        mla_decode._get_compiled_mla_decode(spec) == "real kernel"
+    )  # not the memoized placeholder
+    assert mla_decode._get_compiled_mla_decode(spec) == "real kernel"
+    assert calls == ["probe", "persist", None]  # the real result is memoized
+    mla_decode._get_compiled_mla_decode.cache_clear()
