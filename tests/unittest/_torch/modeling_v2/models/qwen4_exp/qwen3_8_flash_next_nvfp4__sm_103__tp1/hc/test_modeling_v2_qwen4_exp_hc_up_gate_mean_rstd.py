@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_hc_up_gate_mean_rstd entries (bf16 and NVFP4):
-`mixed` in the gate band of the float64 reference, the NVFP4 outputs against the
-native-torch quantization of the returned `mixed` outside the reciprocal tie
-window, the NVFP4 build's `mixed` bitwise the bf16 build's, the global-scale
-guard, graph capture.
+`mixed` in the gate band of the float64 reference, the epilogue's fp32 operation
+sequence bitwise (gate at zero logits), the NVFP4 outputs against the native-torch
+quantization of the returned `mixed` outside the reciprocal tie window, the NVFP4
+build's `mixed` bitwise the bf16 build's, the global-scale guard, graph capture.
 """
 
 import zlib
@@ -110,7 +110,28 @@ def test_certified_cells_fp4(cell, certifying) -> None:  # noqa: F811 — fixtur
     _check_quant(mixed, xq, xsf, args[6])
 
 
-@pytest.mark.parametrize("rows", [5, 2048])
+@pytest.mark.parametrize("rows", [5, 300, 4100])
+def test_epilogue_operation_sequence_bitwise(rows) -> None:
+    """With `low = 0` every logit is 0 and `tanh.approx(0) = 0`, so the gate is the
+    folded `rstd / 2C` and `mixed` is the documented fp32 sequence alone:
+    `acc = (rstd_0 / 8) * (x_0 * w1_0)`, then `acc = fma(rstd_s / 8, x_s * w1_s, acc)`
+    in stream order, one bf16 rounding. Each step is emulated in float64 (products
+    of the fp32 operands are exact there) and rounded to fp32.
+    """
+    low, up, hc_out, rstd, w1, c, _ = _build(dict(rows=rows), seed=200 + rows)
+    low = torch.zeros_like(low)
+    mixed = op(low, up, hc_out, rstd, w1, c)
+    x = hc_out.double().unflatten(-1, (c, HIDDEN))
+    xw = (x * w1.double().unflatten(-1, (c, HIDDEN))).float().double()
+    hr = (rstd * (0.5 / c)).double()
+    acc = (hr[:, :1] * xw[:, 0]).float().double()
+    for s in range(1, c):
+        acc = (hr[:, s : s + 1] * xw[:, s] + acc).float().double()
+    want = acc.float().to(torch.bfloat16)
+    assert torch.equal(mixed, want), f"{(mixed != want).sum().item()} elements differ"
+
+
+@pytest.mark.parametrize("rows", [5, 2048, 4100])
 def test_fp4_mixed_is_the_bf16_entry_bitwise(rows) -> None:
     args = _build(dict(rows=rows), seed=100 + rows)
     assert torch.equal(op4(*args)[0], op(*args[:6]))

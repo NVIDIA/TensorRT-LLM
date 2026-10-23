@@ -8,12 +8,18 @@ projection as a 2-CTA tcgen05 GEMM whose epilogue gates `hc_out * rstd * (1 + w)
 Tier 6 (CuTe DSL written for this target). `qwen4_exp_hc_up_gate_mean`'s epilogue
 on a CTA pair: `tcgen05.mma.cta_group::2` with M = 256 (each CTA 128 rows of
 `low`, resident in shared memory for its row tile) and N = 128 (C streams x 32
-hidden columns), each CTA loading half of the up weight's N per k block -- the
-weight stream bounds the single-CTA kernel, and the pair halves it per SM. Tiles
+hidden columns), each CTA loading half of the up weight's N per k block. Tiles
 are walked row-tile-major over a contiguous range per pair (one `low` load per
-row tile). A load warp brings each tile's `hc_out` boxes (TMA) and `(1 + w)`
-slice (bulk copy) to shared memory; each CTA's eight epilogue warps read their
-own 128 rows' accumulator, two warp groups splitting the 32 columns.
+row tile); the MMA runs up to four tiles ahead of the epilogue (four accumulator
+stages).
+
+The epilogue is two sets of eight warps that take alternate tiles. A load warp
+brings each (tile, stream)'s `hc_out` box (TMA) and `(1 + w)` slice (bulk copy) to
+its own shared-memory stage; a set hands a stream's stage back as soon as it has
+consumed it, so the next tile's boxes load under the current tile's math. Within a
+set, warp w and w + 4 read the same 128 accumulator rows and split the tile's 32
+columns; the gate and the stream mean run on packed fp32 pairs (`f32x2`), and each
+thread stores its 16 outputs as one 32-byte sector.
 """
 
 from __future__ import annotations
@@ -51,10 +57,14 @@ _PDL = get_env_enable_pdl()
 #: Hidden columns a tile (MMA N = C * 32 = 128) and a thread's epilogue columns.
 _BLOCK_H = 32
 _SUB = 16
-#: Up-weight ring, hc_out / (1 + w) ring and accumulator stages.
-_B_STAGES = 6
-_N_STAGES = 2
-_ACC_STAGES = 2
+#: Epilogue warp sets (alternate tiles) and warps per set.
+_SETS = 2
+_SET_WARPS = 8
+#: Up-weight ring, accumulator stages, and the hc_out / (1 + w) ring (one stage per
+#: (tile, stream)).
+_B_STAGES = 8
+_ACC_STAGES = 4
+_N_STAGES = 8
 #: NVFP4 block: one e4m3 scale per this many contiguous elements.
 SF_VEC = 16
 
@@ -111,10 +121,58 @@ def _bulk_g2s(dst, src, nbytes: int, mbar, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _tanh(x, *, loc=None, ip=None):
-    return cutlass.Float32(
-        _asm(T.f32(), [cutlass.Float32(x)], "tanh.approx.f32 $0, $1;", "=f,f", loc, ip)
+def _st_global_v8(addr, w, *, loc=None, ip=None):
+    """One 32-byte `st.global.v8.b32` (sm_100+): a thread's 16 bf16 outputs, one
+    full sector.
+    """
+    _asm(
+        T.i32(),
+        [cutlass.Int64(addr)] + [cutlass.Int32(x) for x in w],
+        "{ st.global.v8.b32 [$1], {$2, $3, $4, $5, $6, $7, $8, $9}; mov.u32 $0, 0; }",
+        "=r,l" + ",r" * 8,
+        loc,
+        ip,
+        side_effects=True,
     )
+
+
+@dsl_user_op
+def _gate2(z0, z1, xw, wa, wb, hr, a0, a1, first: bool, *, loc=None, ip=None):
+    """One column pair of one stream on the packed fp32 pipe (`f32x2`: each lane is
+    the scalar `.rn` operation): `t = tanh.approx(z * 0.5)`, `g = fma(t, hr, hr)`,
+    `xw = x * w1`, `acc = fma(g, xw, acc)` (`g * xw` for the first stream). `xw` is
+    the stream's bf16x2 word (element 2j in the low half), widened exactly by bit
+    shifts.
+    """
+    tail = "mul.rn.f32x2 a, t, x; " if first else "mov.b64 a, {$8, $9}; fma.rn.f32x2 a, t, x, a; "
+    text = (
+        "{ .reg .b64 z, h, t, x, w, a; .reg .f32 c, t0, t1; .reg .b32 xl, xh; "
+        "mov.f32 c, 0f3F000000; mov.b64 h, {c, c}; "
+        "mov.b64 z, {$2, $3}; mul.rn.f32x2 z, z, h; "
+        "mov.b64 {t0, t1}, z; tanh.approx.f32 t0, t0; tanh.approx.f32 t1, t1; "
+        "mov.b64 t, {t0, t1}; mov.b64 h, {$7, $7}; fma.rn.f32x2 t, t, h, h; "
+        "shl.b32 xl, $4, 16; and.b32 xh, $4, 0xFFFF0000; mov.b64 x, {xl, xh}; "
+        "mov.b64 w, {$5, $6}; mul.rn.f32x2 x, x, w; " + tail + "mov.b64 {$0, $1}, a; }"
+    )
+    ty = T.f32()
+    res = _asm(
+        llvm.StructType.get_literal([ty, ty]),
+        [
+            cutlass.Float32(z0),
+            cutlass.Float32(z1),
+            cutlass.Int32(xw),
+            cutlass.Float32(wa),
+            cutlass.Float32(wb),
+            cutlass.Float32(hr),
+            cutlass.Float32(a0),
+            cutlass.Float32(a1),
+        ],
+        text,
+        "=f,=f,f,f,r,f,f,f,f,f",
+        loc,
+        ip,
+    )
+    return [cutlass.Float32(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(2)]
 
 
 @dsl_user_op
@@ -123,8 +181,9 @@ def _nvfp4_16(words, gs, rcp_gs, rcp6, *, loc=None, ip=None):
     low half): `(e2m1 word for elements 0..7, e2m1 word for 8..15, e4m3 scale byte)`.
     `qwen4_exp_hc_up_gate_mean`'s recipe (`_absmax16`, `_e4m3_scale`,
     `_e2m1_out_scale`, `_e2m1x8`) on the same bf16-rounded values, with the max taken
-    on the packed bf16 pairs and the bf16 -> fp32 unpack done by bit shifts (both
-    exact): bitwise its outputs.
+    on the packed bf16 pairs, the bf16 -> fp32 unpack done by bit shifts (both exact)
+    and the scaling multiplies on `f32x2` pairs (each lane `mul.rn.f32`): bitwise its
+    outputs.
     """
     amax = "abs.bf16x2 m, $3; " + "".join(
         f"abs.bf16x2 t, ${4 + k}; max.bf16x2 m, m, t; " for k in range(7)
@@ -133,11 +192,15 @@ def _nvfp4_16(words, gs, rcp_gs, rcp6, *, loc=None, ip=None):
         f"shl.b32 a{2 * k}, ${3 + k}, 16; and.b32 a{2 * k + 1}, ${3 + k}, 0xFFFF0000; "
         for k in range(8)
     )
-    muls = "".join(f"mul.rn.f32 a{i}, a{i}, o; " for i in range(16))
+    muls = "mov.b64 oo, {o, o}; " + "".join(
+        f"mov.b64 pp, {{a{2 * k}, a{2 * k + 1}}}; mul.rn.f32x2 pp, pp, oo; "
+        f"mov.b64 {{a{2 * k}, a{2 * k + 1}}}, pp; "
+        for k in range(8)
+    )
     cvts = "".join(f"cvt.rn.satfinite.e2m1x2.f32 b{k}, a{2 * k + 1}, a{2 * k}; " for k in range(8))
     text = (
         "{ .reg .b32 m, t, f2; .reg .b32 a<16>; .reg .f32 x, y, mx, o; .reg .b16 h, l16, h16; "
-        ".reg .pred p; .reg .b8 b<8>; "
+        ".reg .pred p; .reg .b8 b<8>; .reg .b64 oo, pp; "
         + amax
         + "mov.b32 {l16, h16}, m; cvt.f32.bf16 x, l16; cvt.f32.bf16 y, h16; max.f32 mx, x, y; "
         "mul.rn.f32 x, mx, $13; mul.rn.f32 x, $11, x; "
@@ -179,17 +242,26 @@ class HcUpGateMeanRstdKernel:
         self.mma_tiler = (256, hc * self.bh, 64)
         self.cta_group = tcgen05.CtaGroup.TWO
         self.cluster_shape_mn = (2, 1)
-        self.epi_warps = 8
-        self.mma_warp_id = 8
-        self.tma_warp_id = 9
-        self.nrm_warp_id = 10
-        self.threads_per_cta = 32 * 11
+        self.epi_sets = _SETS
+        self.set_warps = _SET_WARPS
+        self.epi_warps = _SETS * _SET_WARPS
+        self.mma_warp_id = self.epi_warps
+        self.tma_warp_id = self.epi_warps + 1
+        self.nrm_warp_id = self.epi_warps + 2
+        self.threads_per_cta = 32 * (self.epi_warps + 3)
         self.num_b_stage = _B_STAGES
         self.num_n_stage = _N_STAGES
         self.num_acc_stage = _ACC_STAGES
+        # The pair's j-th tile uses accumulator stage j % ACC and, for stream s, the
+        # hc_out stage (C * j + s) % NS.
+        assert _ACC_STAGES & (_ACC_STAGES - 1) == 0 and _SETS & (_SETS - 1) == 0
+        assert _N_STAGES >= hc * _SETS
+        self.acc_shift = _ACC_STAGES.bit_length() - 1
+        self.set_shift = _SETS.bit_length() - 1
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
-        # Named barriers 3..6: epilogue warp w and w + 4 (the NVFP4 hand-off).
+        # Named barriers 3..3 + 4 * SETS - 1: a set's epilogue warps w and w + 4 (the
+        # NVFP4 hand-off).
         self.pair_bar_id0 = 3
 
     def _setup(self):
@@ -207,9 +279,9 @@ class HcUpGateMeanRstdKernel:
             cute.make_layout((*self.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
         )
         self.n_box = (128, self.bh)
-        # A stage: this CTA's tile hc_out boxes (C x [128, 32] bf16) and its (1 + w)
-        # slice ([C, 32] fp32).
-        self.num_n_bytes = self.hc * 128 * self.bh * 2 + self.hc * self.bh * 4
+        # A stage: one stream of this CTA's tile, its hc_out box ([128, 32] bf16) and
+        # (1 + w) slice ([32] fp32).
+        self.num_n_bytes = 128 * self.bh * 2 + self.bh * 4
         self.a_smem_layout_staged = utils.sm100.make_smem_layout_a(
             tiled_mma, self.mma_tiler, self.io_dtype, self.kb
         )
@@ -217,7 +289,7 @@ class HcUpGateMeanRstdKernel:
             tiled_mma, self.mma_tiler, self.io_dtype, self.num_b_stage
         )
         self.n_smem_layout_staged = utils.sm100.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR, self.n_box, self.num_n_stage * self.hc
+            self.io_dtype, utils.LayoutEnum.ROW_MAJOR, self.n_box, self.num_n_stage
         )
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         acc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
@@ -376,19 +448,21 @@ class HcUpGateMeanRstdKernel:
             tx_count=self.b_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
         ).make_participants()
+        # An accumulator stage is consumed by one set's warps in each CTA.
         acc_pipeline = PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbar.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2 * self.epi_warps),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2 * self.set_warps),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-        # hc_out / (1 + w) stages are per CTA (each CTA its own rows).
+        # hc_out / (1 + w) stages are per CTA (each CTA its own rows), one set's warps
+        # consuming each.
         n_pipe = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.n_mbar.data_ptr(),
             num_stages=self.num_n_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.epi_warps),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.set_warps),
             tx_count=self.num_n_bytes,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
@@ -423,17 +497,17 @@ class HcUpGateMeanRstdKernel:
             byte_alignment=1024,
             swizzle=n_smem_layout_staged.inner,
         )
-        # NVFP4: the upper warp group hands its half of a row's e2m1 / scale bytes to the
-        # lower group through shared memory (two tile slots), which stores the whole row
-        # piece (one 16-byte e2m1 store, one 2-byte scale store).
+        # NVFP4: a set's upper warp group hands its half of a row's e2m1 / scale bytes to
+        # the lower group through shared memory (two tile slots per set), which stores
+        # the whole row piece (one 16-byte e2m1 store, one 2-byte scale store).
         sX = smem.allocate_tensor(
             element_type=cutlass.Int32,
-            layout=cute.make_layout((2, 128, 4), stride=(512, 4, 1)),
+            layout=cute.make_layout((2 * self.epi_sets, 128, 4), stride=(512, 4, 1)),
             byte_alignment=128,
         )
         sW = smem.allocate_tensor(
             element_type=cutlass.Float32,
-            layout=cute.make_layout((hc, bh, self.num_n_stage), stride=(bh, 1, hc * bh)),
+            layout=cute.make_layout((bh, self.num_n_stage), stride=(1, bh)),
             byte_alignment=128,
         )
 
@@ -519,20 +593,19 @@ class HcUpGateMeanRstdKernel:
                 n_lo = cutlass.max(t0 - mi * nt, 0)
                 n_hi = cutlass.min(t1 - mi * nt, nt)
                 for n in cutlass.range(n_lo, n_hi, 1, unroll=1):
-                    handle = n_producer.acquire_and_advance()
-                    with cute.arch.elect_one():
-                        for s in cutlass.range_constexpr(hc):
+                    for s in cutlass.range_constexpr(hc):
+                        handle = n_producer.acquire_and_advance()
+                        with cute.arch.elect_one():
                             _bulk_g2s(
-                                sw_base + (handle.index * hc + s) * (bh * 4),
+                                sw_base + handle.index * (bh * 4),
                                 w1_base + cutlass.Int64(s * hid + n * bh) * 4,
                                 bh * 4,
                                 cutlass.Int32(handle.barrier.toint()),
                             )
-                    for s in cutlass.range_constexpr(hc):
                         cute.copy(
                             tma_atom_n,
                             tNgN[(None, 2 * mi + v, s * nt + n)],
-                            tNsN[(None, handle.index * hc + s)],
+                            tNsN[(None, handle.index)],
                             tma_bar_ptr=handle.barrier,
                         )
             n_producer.tail()
@@ -584,17 +657,12 @@ class HcUpGateMeanRstdKernel:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            # Thread (grp, lt) owns row lt of the CTA's 128 and columns
-            # [grp * 16, grp * 16 + 16) of every tile's 32: both groups share each tile,
-            # so its stages go back as soon as possible.
+            # Set `eset` takes the pair's tiles t0 + eset, t0 + eset + SETS, ...; thread
+            # (grp, lt) of a set owns row lt of the CTA's 128 and columns
+            # [grp * 16, grp * 16 + 16) of the tile's 32.
+            eset = warp_idx // self.set_warps
             lt = tidx % 128
-            grp = tidx // 128
-            acc_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_acc_stage
-            )
-            n_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_n_stage
-            )
+            grp = (tidx // 128) % 2
             epi_tile = (128, sub)
             copy_atom_t2r = utils.sm100.get_tmem_load_op(
                 (128, self.mma_tiler[1], self.mma_tiler[2]),
@@ -610,92 +678,120 @@ class HcUpGateMeanRstdKernel:
             tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
             tTR_sN = thr_copy_t2r.partition_D(cute.flat_divide(sN, epi_tile))
             sw_addr = cutlass.Int32(sW.iterator.toint())
-            sx_addr = cutlass.Int32(sX.iterator.toint())
+            sx_addr = cutlass.Int32(sX.iterator.toint()) + eset * (2 * 128 * 16)
             frag_shape = tTR_sN[(None, None, None, 0, 0, 0)].shape
-            rAcc = [cute.make_rmem_tensor(frag_shape, self.acc_dtype) for _ in range(hc)]
-            rN = [cute.make_rmem_tensor(frag_shape, self.io_dtype) for _ in range(hc)]
+            rAcc = cute.make_rmem_tensor(frag_shape, self.acc_dtype)
+            rN = cute.make_rmem_tensor(frag_shape, self.io_dtype)
             # sigmoid(z) * r / C = fma(tanh(z / 2), r / 2C, r / 2C): the stream mean and the
             # norm's rstd folded into the gate.
             scale = cutlass.Float32(0.5 / hc)
-            half = cutlass.Float32(0.5)
             if cutlass.const_expr(self.fp4):
                 gs = mGS[0]
                 rcp_gs = _rcp_approx_ftz(gs)
                 rcp6 = _rcp_approx_ftz(cutlass.Float32(6.0))
 
-            for mi in cutlass.range(m_first, m_last + 1, 1, unroll=1):
-                n_lo = cutlass.max(t0 - mi * nt, 0)
-                n_hi = cutlass.min(t1 - mi * nt, nt)
+            # The rows' rstd, reloaded when the row tile changes.
+            mi_cur = cutlass.Int32(-1)
+            rs0 = cutlass.Float32(0.0)
+            rs1 = cutlass.Float32(0.0)
+            rs2 = cutlass.Float32(0.0)
+            rs3 = cutlass.Float32(0.0)
+            for t in cutlass.range(t0 + eset, t1, self.epi_sets, unroll=1):
+                j = t - t0
+                acc_state = pipeline.PipelineState(
+                    self.num_acc_stage,
+                    j,
+                    j & (self.num_acc_stage - 1),
+                    (j >> self.acc_shift) & 1,
+                )
+                mi = t // nt
+                n = t - mi * nt
                 row = mi * 256 + v * 128 + lt
                 row_ok = row < m
-                rs = _ldg_v4_f32(rstd_base + cutlass.Int64(cutlass.min(row, m - 1)) * (hc * 4))
-                hr = [rs[s] * scale for s in range(hc)]
-                for n in cutlass.range(n_lo, n_hi, 1, unroll=1):
-                    col0 = n * bh + grp * sub
-                    acc_pipeline.consumer_wait(acc_state)
-                    for s in cutlass.range_constexpr(hc):
-                        cute.copy(
-                            tiled_copy_t2r,
-                            tTR_tAcc[(None, None, None, 0, 2 * s + grp, acc_state.index)],
-                            rAcc[s],
-                        )
+                if mi != mi_cur:
+                    rs0, rs1, rs2, rs3 = _ldg_v4_f32(
+                        rstd_base + cutlass.Int64(cutlass.min(row, m - 1)) * (hc * 4)
+                    )
+                    mi_cur = mi
+                rs = [rs0, rs1, rs2, rs3]
+                col0 = n * bh + grp * sub
+                acc_pipeline.consumer_wait(acc_state)
+                acc = [cutlass.Float32(0.0)] * sub
+                for s in cutlass.range_constexpr(hc):
+                    cute.copy(
+                        tiled_copy_t2r,
+                        tTR_tAcc[(None, None, None, 0, 2 * s + grp, acc_state.index)],
+                        rAcc,
+                    )
+                    # tcgen05.wait::ld: the stream's accumulator columns are in registers;
+                    # after the last stream the stage goes back before the math.
                     cute.arch.fence_view_async_tmem_load()
-                    n_pipe.consumer_wait(n_state)
-                    for s in cutlass.range_constexpr(hc):
-                        cute.autovec_copy(
-                            tTR_sN[(None, None, None, 0, grp, n_state.index * hc + s)], rN[s]
+                    if cutlass.const_expr(s == hc - 1):
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_state)
+                    hrs = rs[s] * scale
+                    q = j * hc + s
+                    if cutlass.const_expr(self.num_n_stage == hc * self.epi_sets):
+                        # The set's stream-s stage is fixed; its phase flips every own tile.
+                        n_state = pipeline.PipelineState(
+                            self.num_n_stage, q, eset * hc + s, (j >> self.set_shift) & 1
                         )
-                    acc = [cutlass.Float32(0.0)] * sub
-                    for s in cutlass.range_constexpr(hc):
-                        waddr = sw_addr + ((n_state.index * hc + s) * bh + grp * sub) * 4
-                        w1 = []
-                        for q in cutlass.range_constexpr(sub // 4):
-                            w1 += _lds_v4_f32(waddr + q * 16)
-                        for i in cutlass.range_constexpr(sub):
-                            t = _tanh(rAcc[s][i] * half)
-                            g = t * hr[s] + hr[s]
-                            xw = rN[s][i].to(self.acc_dtype) * w1[i]
-                            if cutlass.const_expr(s == 0):
-                                acc[i] = g * xw
-                            else:
-                                acc[i] = g * xw + acc[i]
-                    words = [_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(sub // 2)]
-                    # Every read of the stages (TMEM, hc_out, (1 + w)) is performed before
-                    # they are handed back.
+                    else:
+                        n_state = pipeline.PipelineState(
+                            self.num_n_stage, q, q % self.num_n_stage, (q // self.num_n_stage) & 1
+                        )
+                    n_pipe.consumer_wait(n_state)
+                    cute.autovec_copy(tTR_sN[(None, None, None, 0, grp, n_state.index)], rN)
+                    waddr = sw_addr + (n_state.index * bh + grp * sub) * 4
+                    w1 = []
+                    for c4 in cutlass.range_constexpr(sub // 4):
+                        w1 += _lds_v4_f32(waddr + c4 * 16)
+                    xw = cute.recast_tensor(rN, cutlass.Int32)
+                    for k in cutlass.range_constexpr(sub // 2):
+                        acc[2 * k], acc[2 * k + 1] = _gate2(
+                            rAcc[2 * k],
+                            rAcc[2 * k + 1],
+                            xw[k],
+                            w1[2 * k],
+                            w1[2 * k + 1],
+                            hrs,
+                            acc[2 * k],
+                            acc[2 * k + 1],
+                            s == 0,
+                        )
+                    # Every read of the stage (hc_out, (1 + w)) is performed before it is
+                    # handed back.
                     cute.arch.fence_acq_rel_cta()
                     cute.arch.sync_warp()
                     n_pipe.consumer_release(n_state)  # lane 0 of each warp arrives
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_state)
-                    acc_state.advance()
-                    n_state.advance()
-                    if row_ok:
-                        obase = mixed_base + (cutlass.Int64(row) * hid + col0) * 2
-                        _st_global_v4(obase, *words[0:4])
-                        _st_global_v4(obase + 16, *words[4:8])
-                    if cutlass.const_expr(self.fp4):
-                        q0, q1, sf = _nvfp4_16(words, gs, rcp_gs, rcp6)
-                        slot = sx_addr + (((mi * nt + n) % 2) * 128 + lt) * 16
-                        if grp == 1:
-                            _sts_v4(slot, q0, q1, sf, sf)
-                        cute.arch.barrier(
-                            barrier_id=self.pair_bar_id0 + warp_idx % 4, number_of_threads=64
-                        )
-                        if grp == 0:
-                            pq = _lds_v4(slot)
-                            if row_ok:
-                                row64 = cutlass.Int64(row)
-                                _st_global_v4(
-                                    q_base + row64 * (hid // 2) + cutlass.Int64(n * bh // 2),
-                                    q0,
-                                    q1,
-                                    pq[0],
-                                    pq[1],
-                                )
-                                _st_global_b16(
-                                    sf_base + row64 * (hid // 16) + cutlass.Int64(n * bh // 16),
-                                    sf | (pq[2] << 8),
-                                )
+                words = [_bf16x2(acc[2 * k], acc[2 * k + 1]) for k in range(sub // 2)]
+                if row_ok:
+                    _st_global_v8(mixed_base + (cutlass.Int64(row) * hid + col0) * 2, words)
+                if cutlass.const_expr(self.fp4):
+                    q0, q1, sf = _nvfp4_16(words, gs, rcp_gs, rcp6)
+                    slot = sx_addr + (((t // self.epi_sets) % 2) * 128 + lt) * 16
+                    if grp == 1:
+                        _sts_v4(slot, q0, q1, sf, sf)
+                    cute.arch.barrier(
+                        barrier_id=self.pair_bar_id0 + warp_idx % 4 + 4 * eset,
+                        number_of_threads=64,
+                    )
+                    if grp == 0:
+                        pq = _lds_v4(slot)
+                        if row_ok:
+                            row64 = cutlass.Int64(row)
+                            _st_global_v4(
+                                q_base + row64 * (hid // 2) + cutlass.Int64(n * bh // 2),
+                                q0,
+                                q1,
+                                pq[0],
+                                pq[1],
+                            )
+                            _st_global_b16(
+                                sf_base + row64 * (hid // 16) + cutlass.Int64(n * bh // 16),
+                                sf | (pq[2] << 8),
+                            )
 
             cute.arch.barrier(
                 barrier_id=self.epilog_sync_bar_id, number_of_threads=32 * self.epi_warps
@@ -820,8 +916,11 @@ class Qwen4ExpHcUpGateMeanRstd(OpWrapper):
     The GEMM accumulates in fp32 in tensor memory and is never rounded or written;
     `normed` is fp32 in registers (not rounded to bf16 as a stored normed stream
     is); gate, product and stream mean are fp32 with one rounding to `hc_out`'s
-    dtype. Returns a fresh `[T, H]` tensor. Fusion boundary: the up projection, the
-    grouped norm's scaling, the sigmoid gate and the stream mean.
+    dtype. Per element and stream, in stream order: `t = tanh.approx(z * 0.5)`,
+    `g = fma(t, r, r)` with `r = rstd / 2C`, `xw = hc_out * norm_w1`,
+    `acc = fma(g, xw, acc)` (`g * xw` for stream 0), each a round-to-nearest fp32
+    operation. Returns a fresh `[T, H]` tensor. Fusion boundary: the up projection,
+    the grouped norm's scaling, the sigmoid gate and the stream mean.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -855,19 +954,24 @@ class Qwen4ExpHcUpGateMeanRstd(OpWrapper):
     programmatic dependent launch (TRTLLM_ENABLE_PDL=0 turns it off).
 
     Launch: persistent, one cluster (CTA pair) per two SMs, each walking a
-    contiguous row-tile-major range of (256-row tile, 32-column slice) tiles.
-    GB300, 16384 rows: about 95-100 us, against `qwen4_exp_hc_up_gate_mean`'s
-    105 on a stored `normed`.
+    contiguous row-tile-major range of (256-row tile, 32-column slice) tiles;
+    608 threads a CTA (two sets of eight epilogue warps on alternate tiles, a
+    weight-load, an hc_out-load and an MMA warp), about 217 KB of shared memory
+    (low tile, 8-stage weight ring, 8 per-stream hc_out stages) and all 512
+    tensor-memory columns (4 accumulator stages). GB300, 16 calls chained over
+    distinct weights: 4096 / 8192 / 16384 rows about 24 / 45 / 89 us.
 
     Numerics: the gate is `tanh.approx`-based (as `qwen4_exp_hc_up_gate_mean`'s,
     max relative error 2^-10.99) with rstd / C folded into it; against the float64
     value of the unrounded normed stream the result sits in the gate band at
-    about 0.2 of it (the stored-normed op: 0.3), and is not bitwise
-    `qwen4_exp_hc_up_gate_mean`'s (that op gates the bf16-rounded normed).
+    about 0.1-0.25 of it (the stored-normed op: 0.3), and is not bitwise
+    `qwen4_exp_hc_up_gate_mean`'s (that op gates the bf16-rounded normed). The
+    fp32 sequence above is bitwise what the GPU test emulates (zero logits).
 
     Certified: bf16 at the checkpoint's 4 x 2560, rank 320: 16384, 2048, 5
     rows and a partial last tile (16390); gate band (`rtol = atol / max|ref| =
-    eps`) against the float64 reference; graph replay.
+    eps`) against the float64 reference; the epilogue's fp32 sequence bitwise
+    (5, 300, 4100 rows); graph replay.
 
     Not certified: zero rows, hc_count other than 4, hidden other than 2560,
     rank other than 320.
@@ -945,11 +1049,11 @@ class Qwen4ExpHcUpGateMeanRstdFp4(OpWrapper):
     `qwen4_exp_hc_up_gate_mean_rstd` and `global_scale` one fp32 element on the
     device. Compiles once per `(C, H, R)`; graph-capturable.
 
-    Each thread holds 16 of a row's 32 tile columns (one scale block); the upper
-    warp group hands its e2m1 word pair and scale byte to the lower one through
-    shared memory, which stores the row's 16 e2m1 bytes and 2 scale bytes in one
-    store each. GB300, 16384 rows: 108 us, against
-    `qwen4_exp_hc_up_gate_mean_fp4`'s 120 on a stored `normed`.
+    Each thread holds 16 of a row's 32 tile columns (one scale block); within an
+    epilogue set the upper warp group hands its e2m1 word pair and scale byte to
+    the lower one through shared memory, which stores the row's 16 e2m1 bytes and
+    2 scale bytes in one store each. GB300, 16 calls chained over distinct
+    weights: 4096 / 8192 / 16384 rows about 26 / 53 / 100 us.
 
     Numerics: `mixed` as the bf16 entry. The quantization is the trtllm NVFP4
     recipe instruction for instruction (`rcp.approx.ftz.f32` reciprocals,
