@@ -10,7 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -19,11 +19,8 @@ import torch
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.model_config import (
-    KVCacheLayerSpec,
-    ModelConfig,
-    _get_kv_cache_layer_specs,
-)
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
+from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
@@ -31,16 +28,21 @@ from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
     _derive_v2_layer_type_attention_windows,
     _get_num_pool_groups_for_estimation,
+    _get_num_storage_pool_groups,
     get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
+    Role,
     _get_static_cache_size_layer_components,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
@@ -49,6 +51,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -684,7 +687,7 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         sliding_window=sliding_window,
     )
     hybrid._model_engine.model.model_config.kv_cache_layer_specs = tuple(
-        KVCacheLayerSpec(
+        ModelKVCacheLayerSpec(
             head_dim=256 if layer_type == "sliding_attention" else 128,
             num_kv_heads=1,
             num_q_heads=1,
@@ -832,7 +835,7 @@ def test_pool_group_estimation_uses_resolved_spec_windows(
             sliding_window=512,
         ),
         kv_cache_layer_specs=tuple(
-            KVCacheLayerSpec(
+            ModelKVCacheLayerSpec(
                 head_dim=head_dim, num_q_heads=8, num_kv_heads=2, attention_window=window
             )
             for head_dim, window in [(128, 128), (256, 256), (128, None)]
@@ -884,7 +887,7 @@ def test_estimation_budget_uses_temporary_pool_ratio() -> None:
     model_config.attn_backend = "FLASHINFER"
     model_config.is_encoder_decoder = False
     model_config.kv_cache_layer_specs = tuple(
-        KVCacheLayerSpec(
+        ModelKVCacheLayerSpec(
             head_dim=head_dim,
             num_q_heads=8,
             num_kv_heads=2,
@@ -961,7 +964,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         sliding_window=sliding_window,
     )
     c._model_engine.model.model_config.kv_cache_layer_specs = tuple(
-        KVCacheLayerSpec(
+        ModelKVCacheLayerSpec(
             head_dim=256 if layer_type == "sliding_attention" else 128,
             num_kv_heads=1,
             num_q_heads=1,
@@ -1148,7 +1151,7 @@ def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
     expected_sliding_layer_size: int,
 ) -> None:
     layer_specs = tuple(
-        KVCacheLayerSpec(
+        ModelKVCacheLayerSpec(
             head_dim=256 if (layer_idx + 1) % 6 else 512,
             num_kv_heads=8 if (layer_idx + 1) % 6 else 1,
             num_q_heads=16,
@@ -1247,8 +1250,70 @@ def test_creator_uses_v2_affine_cache_cost():
     assert cost == CacheCost(slope=20, intercept=21)
 
 
+def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
+    windowed = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+        head_dim=16,
+        buffer_roles=(Role.KEY, Role.VALUE),
+        sliding_window_size=128,
+        num_sink_tokens=65,
+    )
+    layers = [
+        windowed,
+        replace(windowed, global_layer_id=1, reuse_policy=AttentionReusePolicy.PRIVATE),
+        replace(windowed, global_layer_id=2, num_sink_tokens=None),
+        replace(windowed, global_layer_id=3, sliding_window_size=None, num_sink_tokens=None),
+    ]
+    config = KvCacheConfig(enable_block_reuse=False, enable_swa_scratch_reuse=True)
+    kwargs = dict(
+        tokens_per_block=64,
+        max_seq_len=4096,
+        kv_cache_config=config,
+        layer_specs=layers,
+    )
+    slope, fixed = KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=256, **kwargs
+    )
+    # Each layer costs 64 bytes/token. Different sinks or policies cannot share scratch.
+    # The SWA layers retain 5, 5, and 3 pages, including two pages for 65 sink tokens.
+    assert slope == 64
+    assert fixed == 256 * 192 + 2 * (320 + 320 + 192) * 64
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = tuple(layers)
+    manager._has_cp_helix = False
+    manager.max_attention_window_vec = [128, 128, 128, None]
+    manager.tokens_per_block = 64
+    manager.max_batch_size = 2
+    manager.max_num_tokens = 256
+    manager._generation_kv_capacity_headroom = 1
+    manager.enable_swa_scratch_reuse = True
+    quota = manager._get_quota_from_max_tokens(512)
+    assert quota == slope * 512 + fixed
+    assert manager._get_max_tokens_from_quota(quota) == 512
+    assert KVCacheManagerV2._get_per_request_layer_tokens(None, Mapping(), **kwargs) == (
+        [(64, 320, 320), (64, 320, 320), (64, 192, 192), (64, 4160, 0)],
+        4160,
+    )
+
+    # Draft lifecycles need 7 and 21 usable slots: separate resume rounding
+    # gives 8 + 23 slots; rounding their average together would give only 30.
+    draft = replace(windowed, owner=KVCacheLayerOwner.DRAFT, num_sink_tokens=0)
+    kwargs.update(
+        layer_specs=[draft, replace(draft, global_layer_id=1, num_sink_tokens=448)],
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_util_for_resume=0.95),
+    )
+    assert KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=64, is_draft=True, **kwargs
+    ) == (0, (8 + 23) * 64 * 64)
+
+
 def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = None
     manager._has_cp_helix = False
     manager.num_local_layers = 3
     manager.pp_layers = [4, 5, 6]
@@ -1760,13 +1825,14 @@ def _create_manager_and_capture_config(
     class _RecordingManager(manager_cls):
         def __init__(self, kv_cache_config: KvCacheConfig, *args: object, **kwargs: object) -> None:
             captured.append(kv_cache_config)
+            assert kwargs.get("layer_specs") is factory_overrides.get("layer_specs")
 
     model_config = Mock()
     model_config.pretrained_config = pretrained
     model_config.quant_config = None
     if publish_layer_specs:
         model_config.kv_cache_layer_specs = tuple(
-            KVCacheLayerSpec(
+            ModelKVCacheLayerSpec(
                 head_dim=256 if layer_type == _SLIDING else 512,
                 num_kv_heads=8 if layer_type == _SLIDING else 1,
                 num_q_heads=16,
@@ -1949,6 +2015,58 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default(
     assert manager_config.max_attention_window is None
 
 
+def _fp8_target_bf16_draft_specs(*, draft_window):
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    return [
+        *(replace(target, global_layer_id=i) for i in range(3)),
+        replace(
+            target,
+            global_layer_id=3,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            sliding_window_size=draft_window,
+        ),
+    ]
+
+
+def test_unified_fp8_target_bf16_draft_scales_by_combined_pool_groups():
+    """The V2 pool-group count comes from the combined target and draft layout.
+
+    The FP8 target and the windowed BF16 draft differ in life cycle and slot
+    size, so they land in two pool groups; counting the target's model config
+    alone gives one.
+    """
+    tpb = 32
+    spec_config = SimpleNamespace(
+        tokens_per_gen_step=1,
+        spec_dec_mode=SimpleNamespace(is_dflash=lambda: True, use_one_engine=lambda: False),
+    )
+    baseline = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    baseline._speculative_config = spec_config
+    baseline._build_unified_dflash_layer_specs = lambda kv_cache_config: ()
+    unified = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    unified._speculative_config = spec_config
+    specs = _fp8_target_bf16_draft_specs(draft_window=128)
+    unified._build_unified_dflash_layer_specs = lambda kv_cache_config: tuple(specs)
+
+    assert _get_num_storage_pool_groups(specs, tpb) == 2
+    assert unified._get_token_num_for_estimation() == 2 * baseline._get_token_num_for_estimation()
+
+
+def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():
+    """Pages of different sizes in one life cycle share a pool group."""
+    specs = _fp8_target_bf16_draft_specs(draft_window=None)
+
+    assert _get_num_storage_pool_groups(specs, 32) == 1
+
+
 @pytest.mark.parametrize("guard", ["draft", "explicit_window"])
 def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) -> None:
     kv_cache_config = KvCacheConfig(
@@ -1964,3 +2082,44 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
+
+
+@pytest.mark.parametrize("publish_layer_specs", [False, True])
+def test_create_kv_cache_manager_preserves_explicit_storage_specs(
+    publish_layer_specs: bool,
+) -> None:
+    """Model geometry must not replace an explicit target and draft storage layout."""
+    specs = tuple(_fp8_target_bf16_draft_specs(draft_window=128))
+    _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_FULL] * 3),
+        KvCacheConfig(),
+        max_seq_len=2048,
+        publish_layer_specs=publish_layer_specs,
+        layer_specs=specs,
+    )
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_unified_layout_uses_model_provided_geometry(attention_dp: bool) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_attention_heads=16, num_key_value_heads=8, head_dim=128
+        ),
+        quant_config=None,
+        kv_cache_layer_specs=(ModelKVCacheLayerSpec(head_dim=256, num_kv_heads=4, num_q_heads=16),)
+        * 3,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = SimpleNamespace(tp_size=2, enable_attention_dp=attention_dp)
+
+    assert creator._dflash_kv_layout(model_config, torch.bfloat16) == (
+        4 if attention_dp else 2,
+        256,
+        DataType.BF16,
+        False,
+    )
+
+    model_config.kv_cache_layer_specs += (
+        ModelKVCacheLayerSpec(head_dim=512, num_kv_heads=4, num_q_heads=16),
+    )
+    assert creator._dflash_kv_layout(model_config, torch.bfloat16) is None
