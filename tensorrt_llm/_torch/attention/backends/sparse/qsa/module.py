@@ -427,7 +427,12 @@ def select_qsa_paged_tokens(
     only_visible_blocks = top_k is not None and q.is_cuda
     from .prims_ts_core import use_prims_ts_indexer
 
-    if use_prims_ts_indexer(params, q, is_decode=not context_rows):
+    if use_prims_ts_indexer(
+        params,
+        q,
+        tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+        is_decode=not context_rows,
+    ):
         from .prims_ts_indexer import prims_ts_qsa_index_scores
 
         logits = prims_ts_qsa_index_scores(
