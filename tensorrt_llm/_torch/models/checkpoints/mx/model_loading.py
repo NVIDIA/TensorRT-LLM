@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from tensorrt_llm._torch.models.checkpoints import model_hooks
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.multimodal import is_multimodal_model
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -321,7 +321,7 @@ def get_post_transform_transfer_scope(model: torch.nn.Module) -> PostTransformTr
     Roots without a registered profile keep the target-model scope without
     querying `language_model`; qualification rejects them by root class.
     """
-    if not isinstance(model, MultimodalModelMixin):
+    if not is_multimodal_model(model):
         return PostTransformTransferScope.TARGET_MODEL
     root_model_class = type(model)
     if not any(

@@ -133,7 +133,8 @@ A target builds its model from operations: catalog operations and its
 family's and its own operations and kernels. From the rest of TensorRT-LLM,
 it uses only runtime interfaces, for example:
 
-* `DecoderModel`, `DecoderModelForCausalLM`, `ModelConfig` and `Mapping`.
+* `DecoderModel`, `DecoderModelForCausalLM`, `SupportsMultimodal`,
+  `ModelConfig` and `Mapping`.
 * Attention and speculative metadata, and the KV cache managers.
 
 A target does not import, subclass or call Modeling V1 model code: the model
