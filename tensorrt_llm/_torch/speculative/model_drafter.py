@@ -717,7 +717,7 @@ class ModelDrafter(Drafter):
         for req_id, tokens in self.draft_tokens_accumulator.items():
             target_model_req = self.req_id_to_old_request[req_id]
             target_model_req.py_draft_tokens = tokens
-            logits_list = self.draft_logits_accumulator.get(req_id)
+            logits_list = self.draft_logits_accumulator.pop(req_id, None)
             target_model_req.py_draft_logits = (
                 torch.stack(logits_list, dim=0) if logits_list else None)
 
@@ -1041,9 +1041,11 @@ class ModelDrafter(Drafter):
             for req_id, tokens in self.draft_tokens_accumulator.items():
                 target_model_req = self.req_id_to_old_request[req_id]
                 target_model_req.py_draft_tokens = tokens
-                logits_list = self.draft_logits_accumulator.get(req_id)
-                target_model_req.py_draft_logits = (
-                    torch.stack(logits_list, dim=0) if logits_list else None)
+                # Rows not yet stacked by process_dynamic_draft_outputs
+                logits_list = self.draft_logits_accumulator.pop(req_id, None)
+                if logits_list:
+                    target_model_req.py_draft_logits = torch.stack(logits_list,
+                                                                   dim=0)
 
             # Record draft latency for stats
             draft_end_time = time.time()
