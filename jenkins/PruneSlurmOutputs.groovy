@@ -94,10 +94,13 @@ def defaultClusterNames() {
 // expands anything.
 def pruneCommands(String homeDir, String days, boolean dryRun) {
     def removeDir = dryRun ? "echo would remove {}" : "(echo removing {} && rm -rf {})"
-    def deleteLog = dryRun ? "-print" : "-print -delete"
+    def deleteLog = dryRun ? "" : "-delete"
+    // Agent logs can number in the hundreds of thousands, so print only the count and
+    // the oldest few / newest one (sorted by mtime) instead of every name.
+    def summarizeLogs = "awk 'NR <= 3 { printf \"  oldest: \"; print } END { if (NR) { printf \"  newest: \"; print } print \"agent logs ${dryRun ? 'to prune' : 'pruned'}: \" NR }'"
     return [
         "find -H ${homeDir}/bloom/scripts -mindepth 1 -maxdepth 1 -type d -name '*-multi_node_test-*' -exec bash -c 'find {} -mtime -${days} -print -quit | grep -q . || ${removeDir}' \\; 2>/dev/null || true",
-        "find -H ${homeDir}/slurm-logs -maxdepth 1 -type f -name 'slurm-*-test-*.out' ! -mtime -${days} ${deleteLog} 2>/dev/null | wc -l | sed 's/^/agent logs ${dryRun ? 'to prune' : 'pruned'}: /'",
+        "find -H ${homeDir}/slurm-logs -maxdepth 1 -type f -name 'slurm-*-test-*.out' ! -mtime -${days} -printf '%TY-%Tm-%Td %p\\n' ${deleteLog} 2>/dev/null | sort | ${summarizeLogs}",
     ].join(" ; ")
 }
 
