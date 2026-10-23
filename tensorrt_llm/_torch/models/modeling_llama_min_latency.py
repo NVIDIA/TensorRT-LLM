@@ -25,7 +25,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
-from ...models.modeling_utils import QuantConfig
+from ...models.modeling_utils import QuantConfig, moe_experts_quant_config
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
@@ -35,7 +35,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
                              FusedMoEQuantScalesFP8,
-                             Llama4RenormalizeMoeRoutingMethod, MoE,
+                             Llama4RenormalizeMoeRoutingMethod,
                              MoEWeightLoadingMode, cutlass_leaf)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
@@ -470,7 +470,6 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
-        layer_idx: Optional[int] = None,
         override_quant_config: Optional[QuantConfig] = None,
     ):
 
@@ -491,7 +490,6 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx,
         )
 
         # Enable min-latency mode for Llama4 Maverick TP8 EP1.
@@ -575,8 +573,15 @@ class Llama4MinLatencyMoE(Llama4MoE):
             dtype=dtype,
             tune_max_num_tokens=tune_max_num_tokens,
             model_config=model_config,
-            layer_idx=layer_idx,
         )
+
+        # ``super().__init__`` is not given ``layer_idx``: that is what puts a
+        # MoE in ``extra_attrs["moe_layers"]``, and the module it builds here
+        # is dropped by the assignment below, so it must not take this layer's
+        # slot. Resolve the layerwise quant entry here instead, so that the
+        # replacement is still built in this layer's checkpoint format.
+        self.experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.feed_forward.experts")
 
         # Then, override modules with min-latency versions.
         self.shared_expert = Llama4MinLatencyGatedMLP(
@@ -587,22 +592,6 @@ class Llama4MinLatencyMoE(Llama4MoE):
             config=model_config,
             overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
-
-        # ``Llama4MoE.__init__`` above already built a MoE for this
-        # ``layer_idx`` and registered it in ``extra_attrs["moe_layers"]``, and
-        # that module is dropped by the assignment below. Give its slot back
-        # first, so the module that actually runs takes the canonical
-        # ``str(layer_idx)`` key instead of a deduplicated one -- that key is
-        # what ``extract_extra_attrs`` resolves, and ``route_capture`` reads
-        # the registry's keys as layer indices (``int(k)``), where a
-        # deduplicated ``"N_0"`` silently parses as a different layer.
-        # ``Llama4MinLatencyDecoderLayer.__init__`` has to do the same for the
-        # base block's experts, which are still alive at this point and still
-        # hold that key unless it gave them back. A ``VanillaMoE`` backend is
-        # an ``nn.ModuleList`` rather than a ``MoE`` and never registered, so
-        # there is nothing to give back.
-        if isinstance(self.experts, MoE):
-            self.experts._unregister_layer(model_config)
 
         self.experts = Llama4MinLatencyFusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
@@ -616,7 +605,6 @@ class Llama4MinLatencyMoE(Llama4MoE):
             model_config=model_config,
             apply_router_weight_on_input=True,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
-            layer_idx=layer_idx,
             override_quant_config=self.experts_quant_config,
         )
 
@@ -752,17 +740,6 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
         else:
-            # ``super().__init__`` above built a generic ``Llama4MoE`` whose
-            # experts hold ``str(layer_idx)`` in ``extra_attrs["moe_layers"]``.
-            # That module only dies once the assignment below rebinds
-            # ``self.feed_forward``, which is after the replacement has already
-            # registered -- so without this the replacement is pushed onto a
-            # deduplicated key and the canonical one keeps a weakref to the
-            # discarded module. Give the slot back first.
-            base_experts = getattr(self.feed_forward, "experts", None)
-            if isinstance(base_experts, MoE):
-                base_experts._unregister_layer(model_config)
-
             self.feed_forward = Llama4MinLatencyMoE(
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,

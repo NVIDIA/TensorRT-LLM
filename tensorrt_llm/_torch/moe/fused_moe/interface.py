@@ -721,28 +721,6 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True
 
-    def _unregister_layer(self, model_config: ModelConfig):
-        """Give back this module's slot in ``extra_attrs["moe_layers"]``.
-
-        For a module that is constructed and then dropped -- a model that
-        builds a generic MoE through its base class and replaces it with a
-        specialized one. Without this, the registry keeps a weakref whose
-        referent dies, and the replacement module is pushed onto a
-        deduplicated key by the loop above while the canonical
-        ``str(layer_idx)`` key stays pointing at the dead one.
-        """
-        if not getattr(self, "register_to_config", False):
-            return
-        moe_layers = (model_config.extra_attrs.get("moe_layers")
-                      if model_config is not None else None)
-        if moe_layers is not None:
-            ref = moe_layers.get(self.layer_idx_str)
-            # Only drop our own slot: the dedup loop above guarantees the key
-            # this module holds is not shared with another live module.
-            if ref is not None and ref() is self:
-                del moe_layers[self.layer_idx_str]
-        self.register_to_config = False
-
     # ``create_weights`` / ``load_weights`` are implemented in
     # ``MoEWeightOwnerMixin``, shared with ``MoEImplBase``.
 

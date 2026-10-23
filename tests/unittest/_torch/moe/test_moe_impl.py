@@ -1666,7 +1666,9 @@ def test_moe_blocks_pass_their_experts_quant_config(
 
 def test_llama4_min_latency_experts_keep_the_layer_quant_config(monkeypatch):
     """The min-latency block replaces Llama4MoE's routed experts with its own
-    layer, which has to be built for the same per-layer format."""
+    layer, which has to be built for the same per-layer format. The generic
+    experts the base class builds are dropped by that replacement, so they are
+    built without this layer's identity."""
     import tensorrt_llm._torch.distributed as distributed
     from tensorrt_llm._torch.models import modeling_llama, modeling_llama_min_latency
 
@@ -1700,7 +1702,9 @@ def test_llama4_min_latency_experts_keep_the_layer_quant_config(monkeypatch):
         layer_idx=3,
     )
 
-    assert modeling_llama.create_moe.call_args.kwargs["override_quant_config"] is nvfp4
+    base_experts = modeling_llama.create_moe.call_args.kwargs
+    assert base_experts["layer_idx"] is None
+    assert base_experts["override_quant_config"] is None
     fused_moe = modeling_llama_min_latency.Llama4MinLatencyFusedMoE
     assert fused_moe.call_args.kwargs["override_quant_config"] is nvfp4
 
