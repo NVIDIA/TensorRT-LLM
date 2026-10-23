@@ -26,6 +26,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_SSM_ROLE,
     AttentionLayerGroup,
     MambaLayerGroup,
+    MapperKind,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
@@ -450,9 +451,7 @@ def test_kimi_fp4_mla_routes_to_hybrid_v2_manager(
     assert manager_cls is KimiK3HybridCacheManager
 
 
-def test_kimi_fp4_mla_rejects_v1_and_disaggregated_serving(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_kimi_fp4_mla_rejects_v1(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
     model_config = _kimi_model_config()
@@ -468,8 +467,24 @@ def test_kimi_fp4_mla_rejects_v1_and_disaggregated_serving(
                 use_kv_cache_manager_v2=False,
             ),
         )
-    with pytest.raises(NotImplementedError, match="hybrid linear-attention"):
-        get_kv_cache_manager_cls(
+
+
+@pytest.mark.parametrize(
+    "runtime,expected",
+    [("PYTHON", KimiK3HybridCacheManager), ("CPP", ValueError)],
+    ids=["python_nixl", "cpp"],
+)
+def test_kimi_fp4_mla_disagg_routes_to_hybrid_v2_manager(
+    monkeypatch: pytest.MonkeyPatch, runtime: str, expected
+) -> None:
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    model_config = _kimi_model_config()
+    model_config.quant_config = _fp4_kv_quant_config()
+    model_config.attn_backend = "TRTLLM"
+
+    def select():
+        return get_kv_cache_manager_cls(
             model_config,
             KvCacheConfig(
                 dtype="nvfp4",
@@ -478,9 +493,17 @@ def test_kimi_fp4_mla_rejects_v1_and_disaggregated_serving(
             ),
             is_disagg=True,
             cache_transceiver_config=CacheTransceiverConfig(
-                backend="NIXL", transceiver_runtime="PYTHON"
+                backend="NIXL", transceiver_runtime=runtime
             ),
         )
+
+    # Only the Python NIXL transceiver moves the composed FP4 MLA and KDA
+    # roles; the hybrid V2 manager declares both.
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="transceiver_runtime='PYTHON'"):
+            select()
+    else:
+        assert select() is expected
 
 
 def test_kimi_fp4_mla_manager_receives_model_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2436,6 +2459,210 @@ def test_v2_hybrid_composes_fp8_fallback_with_fp4_mla_and_ssm_layers(
     )
     assert mgr.get_kv_cache_dtype(1) == DataType.NVFP4
     assert mgr.get_kv_cache_dtype(3) == DataType.FP8
+
+
+def _fp4_mla_hybrid_with_fp8_fallback(monkeypatch: pytest.MonkeyPatch):
+    """KDA layers 0 and 2, FP4 MLA layer 1, FP8-fallback MLA layer 3."""
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
+    mgr = _fp4_mla_hybrid_manager_stub()
+    _configure_fp4_mla_hybrid(
+        mgr,
+        SimpleNamespace(
+            model_type="kimi_linear",
+            num_hidden_layers=4,
+            kv_lora_rank=32,
+            linear_attn_config={"full_attn_layers": [2, 4]},
+        ),
+    )
+    # Lifecycles: SSM layers, FP4 MLA latent cache, FP8 fallback, HP ring.
+    mgr.impl = SimpleNamespace(layer_grouping=[[0, 2], [1], [3], [4]])
+    return mgr
+
+
+def test_v2_hybrid_fp4_disagg_role_mapping_covers_mla_and_ssm_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
+
+    kinds = mgr.get_disagg_role_mapper_kinds()
+
+    # SSM state keeps the INDEXED Role.ALL fallback and convolution state its
+    # SECTIONED reshard, while the MLA roles take the FP4 MLA layout per role.
+    assert kinds[Role.ALL] == MapperKind.INDEXED
+    assert MambaRole.SSM_STATE not in kinds
+    assert kinds[MambaRole.CONV_STATE] == MapperKind.SECTIONED
+    assert kinds[Role.KEY] == MapperKind.NHD
+    assert kinds[Role.KEY_BLOCK_SCALE] == MapperKind.NHD
+    assert kinds[Role.MLA_HP_TAIL] == MapperKind.REPLICATED
+    # INDEXED stays the whole-manager fallback only, as the page-table
+    # builder requires.
+    assert [role for role, kind in kinds.items() if kind == MapperKind.INDEXED] == [Role.ALL]
+
+
+def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = False
+    mgr.local_num_mamba_layers = 1
+
+    kinds = mgr.get_disagg_role_mapper_kinds()
+
+    assert kinds[Role.ALL] == MapperKind.INDEXED
+    assert Role.KEY not in kinds
+    assert Role.MLA_HP_TAIL not in kinds
+    assert mgr.get_disagg_ignored_roles() == frozenset()
+
+
+@pytest.mark.parametrize("kda_replay", [False, True])
+def test_v2_hybrid_fp4_disagg_ignores_derived_mla_and_kda_replay_roles(
+    monkeypatch: pytest.MonkeyPatch, kda_replay: bool
+) -> None:
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
+    replay_layout = {"kda_conv_q": (torch.bfloat16, [1])} if kda_replay else {}
+    mgr._kda_replay_layout = lambda: replay_layout
+
+    ignored = mgr.get_disagg_ignored_roles()
+
+    # The generation worker rebuilds V scales and packed V from K and K
+    # scales, and seeds its KDA replay buffers from the transferred conv
+    # state; neither is transferred.
+    assert {Role.MLA_V_SCALE, Role.MLA_V_PACKED} <= ignored
+    assert (DataRole("kda_conv_q") in ignored) == kda_replay
+    assert ignored.isdisjoint(
+        {
+            Role.KEY,
+            Role.KEY_BLOCK_SCALE,
+            Role.MLA_HP_TAIL,
+            MambaRole.SSM_STATE,
+            MambaRole.CONV_STATE,
+        }
+    )
+
+
+def test_v2_hybrid_fp4_disagg_global_layer_ids_cover_every_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
+
+    ids = [mgr.get_disagg_global_layer_ids(group) for group in range(4)]
+
+    # SSM layers and MLA latent caches (FP4 and FP8 fallback) map to 2 * L,
+    # and the HP ring of FP4 layer 1 to 2 * 1 + 1.
+    assert ids == [[0, 4], [2], [6], [3]]
+    all_ids = [gid for group in ids for gid in group]
+    assert len(set(all_ids)) == len(all_ids)
+
+
+def test_v2_hybrid_fp4_disagg_global_layer_ids_reject_unknown_virtual_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
+    mgr.impl = SimpleNamespace(layer_grouping=[[5]])
+
+    with pytest.raises(ValueError, match="Unknown hybrid FP4 MLA internal layer 5"):
+        mgr.get_disagg_global_layer_ids(0)
+
+
+def test_v2_hybrid_virtual_hp_layers_are_not_recurrent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
+
+    # The page-table builder asks every layer of a lifecycle, including the
+    # HP-ring virtual layers past the model's own, whether it is recurrent.
+    assert [mgr._is_local_mamba_layer(layer) for layer in range(5)] == [
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]
+
+
+def _build_v2_hybrid_fp4_mla(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_disagg: bool = False,
+    enable_block_reuse: bool = False,
+    periodic_snapshot_interval: int = 0,
+) -> MambaHybridCacheManagerV2:
+    """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1."""
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    return MambaHybridCacheManagerV2(
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=1,
+        mamba_head_dim=8,
+        mamba_num_layers=1,
+        mamba_layer_mask=[True, False],
+        mamba_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=1024,
+            dtype="nvfp4",
+            enable_block_reuse=enable_block_reuse,
+            enable_partial_reuse=False,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=periodic_snapshot_interval
+            ),
+        ),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=96,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_seq_len=512,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        layer_mask=[False, True],
+        vocab_size=1024,
+        dtype=DataType.NVFP4,
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=2, kv_lora_rank=32, qk_rope_head_dim=64
+        ),
+        is_disagg=is_disagg,
+    )
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _build_v2_hybrid_fp4_mla(monkeypatch, is_disagg=True)
+    try:
+        assert mgr._attention_cache_layout_policy is Fp4MlaV2CacheLayoutPolicy
+        page_table = build_page_table_from_manager(mgr)
+
+        state_groups = [lg for lg in page_table.layer_groups if isinstance(lg, MambaLayerGroup)]
+        paged_groups = [lg for lg in page_table.layer_groups if isinstance(lg, AttentionLayerGroup)]
+        assert len(state_groups) == 1
+        # The FP4 latent cache and the HP ring are distinct lifecycles.
+        assert len(paged_groups) == 2
+
+        state_kinds = {
+            frozenset(view.pool_role): view.mapper_kind for view in state_groups[0].pool_views
+        }
+        assert state_kinds[MAMBA_SSM_ROLE] == MapperKind.INDEXED
+        assert state_kinds[MAMBA_CONV_ROLE] == MapperKind.SECTIONED
+        assert [ll.global_layer_id for ll in state_groups[0].local_layers] == [0]
+
+        paged_roles = {}
+        for group in paged_groups:
+            for view in group.pool_views:
+                for role in view.pool_role:
+                    paged_roles[role] = view.mapper_kind
+        # V scales are derived on the generation worker and never transferred.
+        assert paged_roles == {
+            str(Role.KEY): MapperKind.NHD,
+            str(Role.KEY_BLOCK_SCALE): MapperKind.NHD,
+            str(Role.MLA_HP_TAIL): MapperKind.REPLICATED,
+        }
+        paged_ids = sorted(ll.global_layer_id for lg in paged_groups for ll in lg.local_layers)
+        assert paged_ids == [2, 3]
+    finally:
+        mgr.shutdown()
 
 
 def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:

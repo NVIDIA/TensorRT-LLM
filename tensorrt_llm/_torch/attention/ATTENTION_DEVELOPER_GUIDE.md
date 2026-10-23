@@ -555,8 +555,13 @@ The FMHA package is split by role:
   keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
   `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
   owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
-  manager keeps the SSM, convolution, and KDA replay state. Disaggregated
-  serving of hybrid FP4 MLA models is not supported yet.
+  manager keeps the SSM, convolution, and KDA replay state. For disaggregated
+  serving the hybrid manager owns the transfer declarations and merges the
+  policy's MLA roles into them: K and K scales map to `NHD` and the HP ring to
+  `REPLICATED` per role, so SSM state keeps the `INDEXED` `Role.ALL` fallback
+  and convolution state stays `SECTIONED`; V scales, packed V, and the KDA
+  replay buffers are not transferred; MLA latent and HP-ring layers take the
+  policy's `2 * L` / `2 * L + 1` transfer IDs and recurrent layers `2 * L`.
   With an NVFP4 KV cache, Kimi K3 keeps the last two MLA layers of the global
   `linear_attn_config.full_attn_layers` schedule in an FP8 KV cache. The model,
   the cache allocation, and the memory estimator share this policy

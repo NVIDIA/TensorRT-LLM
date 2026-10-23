@@ -66,7 +66,23 @@ class Fp4MlaV2CacheLayoutPolicy:
     ``Fp4MlaKVCacheManagerV2`` applies this policy directly for pure MLA
     models. Hybrid linear-attention managers compose the same policy with
     their SSM lifecycle and forward only attention-layout operations here.
+    Such a manager keeps its own disaggregation declarations and merges the
+    policy's attention roles into them (``DISAGG_ROLE_MAPPER_KINDS``,
+    ``DISAGG_IGNORED_ROLES``, ``_fp4_mla_disagg_global_layer_id``), so the
+    recurrent-state roles keep their own transfer mappings.
     """
+
+    # Transfer layout of the MLA roles. FP4 and FP8-fallback latent pages are
+    # written token-major by the FP4 MLA kernels, and every TP rank holds the
+    # same single-head latent state, including its HP ring.
+    DISAGG_ROLE_MAPPER_KINDS: dict[DataRole, MapperKind] = {
+        Role.KEY: MapperKind.NHD,
+        Role.KEY_BLOCK_SCALE: MapperKind.NHD,
+        Role.MLA_HP_TAIL: MapperKind.REPLICATED,
+    }
+    # V scales and packed V derive from K and K scales; the generation worker
+    # rebuilds them locally in rebuild_disagg_imported_cache.
+    DISAGG_IGNORED_ROLES: frozenset[DataRole] = frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
 
     def __init__(self, *args, **kwargs) -> None:
         kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
@@ -216,10 +232,12 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_mla_v_packed_pool_base",
             "get_mla_v_packed_page_offset",
             "get_fp4_mla_hp_pool",
-            "get_disagg_role_mapper_kinds",
-            "get_disagg_ignored_roles",
+            # The lifecycle manager owns the disaggregation declarations and
+            # composes them with its own roles through the policy's
+            # DISAGG_ROLE_MAPPER_KINDS, DISAGG_IGNORED_ROLES, and
+            # _fp4_mla_disagg_global_layer_id.
+            "_fp4_mla_disagg_global_layer_id",
             "rebuild_disagg_imported_cache",
-            "get_disagg_global_layer_ids",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
         )
@@ -936,15 +954,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         ).permute(1, 0, 2, 3)
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        return {
-            Role.ALL: MapperKind.NHD,
-            Role.MLA_HP_TAIL: MapperKind.REPLICATED,
-        }
+        return {Role.ALL: MapperKind.NHD, **self.DISAGG_ROLE_MAPPER_KINDS}
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        # V scales and packed V derive from K and K scales; the generation
-        # worker rebuilds them locally in rebuild_disagg_imported_cache.
-        return frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
+        return self.DISAGG_IGNORED_ROLES
 
     def rebuild_disagg_imported_cache(self, requests: Iterable["LlmRequest"]) -> None:
         """Rebuild the derived V sidecars of requests whose prompt KV was imported."""
@@ -957,28 +970,33 @@ class Fp4MlaV2CacheLayoutPolicy:
             [request.prompt_len for request in requests],
         )
 
+    def _fp4_mla_disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
+        """Collision-free transfer ID of an MLA cache or HP-ring layer.
+
+        A model layer's latent cache (FP4 or FP8 fallback) maps to ``2 * L``
+        and its HP-ring virtual layer to ``2 * L + 1``, where ``L`` is the
+        global model layer. Returns ``None`` for any other internal layer.
+        """
+        internal_layer = int(internal_layer)
+        for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
+            if int(layer_id) == internal_layer:
+                local_layer = self._fp4_mla_compact_to_local[compact_layer]
+                return 2 * int(self.pp_layers[local_layer])
+        if any(int(layer_id) == internal_layer for layer_id in self._fp8_mla_manager_layer_ids):
+            return 2 * int(self.pp_layers[internal_layer])
+        for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids):
+            if int(layer_id) == internal_layer:
+                local_layer = self._fp4_mla_compact_to_local[compact_layer]
+                return 2 * int(self.pp_layers[local_layer]) + 1
+        return None
+
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
-        local_layer_ids = list(self.impl.layer_grouping[layer_group_id])
-        cache_local = {
-            int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
-            for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids)
-        }
-        cache_local.update(
-            {int(layer_id): int(layer_id) for layer_id in self._fp8_mla_manager_layer_ids}
-        )
-        hp_local = {
-            int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
-            for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids)
-        }
         result = []
-        for layer_id in local_layer_ids:
-            internal_layer = int(layer_id)
-            if internal_layer in cache_local:
-                result.append(2 * int(self.pp_layers[cache_local[internal_layer]]))
-            elif internal_layer in hp_local:
-                result.append(2 * int(self.pp_layers[hp_local[internal_layer]]) + 1)
-            else:
-                raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal_layer}.")
+        for layer_id in self.impl.layer_grouping[layer_group_id]:
+            global_layer_id = self._fp4_mla_disagg_global_layer_id(int(layer_id))
+            if global_layer_id is None:
+                raise ValueError(f"Unknown FP4 MLA V2 internal layer {int(layer_id)}.")
+            result.append(global_layer_id)
         return result
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:
