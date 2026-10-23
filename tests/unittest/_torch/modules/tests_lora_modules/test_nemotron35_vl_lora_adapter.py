@@ -245,10 +245,10 @@ def test_alpha_tracks_rank_so_scaling_is_rank_invariant(mini_checkpoint, tmp_pat
         assert config["lora_alpha"] / config["r"] == 2.0
 
 
-def test_vision_qkv_keys_are_rejected_by_decoder_mapping(mini_checkpoint, tmp_path):
-    """Synthetic vision qkv keys are outside the selected decoder module mapping."""
+def test_vision_keys_are_rejected_by_decoder_ownership(mini_checkpoint, tmp_path):
+    """Vision keys are outside the declared decoder checkpoint prefixes."""
     adapter = create_vision_only_lora_adapter(str(tmp_path / "vision"), mini_checkpoint)
-    with pytest.raises(AssertionError, match="dropped by iterate_hf_lora"):
+    with pytest.raises(ValueError, match="outside selected owner 'decoder'"):
         assert_adapter_keys_parse(adapter)
 
 

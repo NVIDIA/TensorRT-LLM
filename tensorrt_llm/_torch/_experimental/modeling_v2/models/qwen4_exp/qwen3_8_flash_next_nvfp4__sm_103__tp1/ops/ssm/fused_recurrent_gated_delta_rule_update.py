@@ -27,11 +27,7 @@ NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 16, 48, 128, 128
 #: Rows of the engine's per-step buffer (`max_num_sequences`), as the
 #: runtime-value dumps record `intermediate_ssm_states`: [32, p, 48, 128, 128].
 ENGINE_VERIFY_ROWS = 32
-#: The recurrent pool's slot count the cache manager allocates (10 .. 461 over
-#: the dumps). The target gathers a batch-scoped copy before this call, so the
-#: write-back mode is bracketed here rather than driven.
-ENGINE_SLOTS = 461
-#: Pool and buffer rows of the small cells.
+#: Default pool and buffer rows of the test's builds.
 SLOTS = 8
 
 
@@ -39,15 +35,11 @@ def _verify(n, p, why, **spec):
     return Cell(why=why, spec=dict(mode="verify", n=n, p=p, **spec))
 
 
-def _write_back(n, p, why, **spec):
-    return Cell(why=why, spec=dict(mode="write_back", n=n, p=p, **spec))
-
-
 class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     """Advance each sequence's `[K, V]` recurrent state by *all* its tokens, in
     order. Per token and v-head `hv` (q/k head `hv // (HV // H)`):
 
-        q, k = q / (||q|| + 1e-6), k / (||k|| + 1e-6)    # if use_qk_l2norm_in_kernel
+        q, k = q / sqrt(q.q + 1e-6), k / sqrt(k.k + 1e-6)    # if use_qk_l2norm_in_kernel
         h *= exp(g);  u = (v - h^T k) * beta;  h += k u^T;  o = h^T (scale * q)
 
     in fp32 throughout. `h` starts at `initial_state_source[idx]` (`[S, HV, V,
@@ -73,111 +65,43 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: mode ("verify": disable_state_update + buffer with cache_steps = p
-    # | "write_back" | "both"), n sequences x p tokens (or lengths for the
-    # varlen form), pool_slots (None: no pool), cache_rows, slots (None:
-    # arange(n)), pool_dtype / cache_dtype, beta ("fp32" | "bf16": sigmoid of
-    # a bf16 projection, as the target passes it | "channel"), qkv ("views"
+    # | "write_back"), n sequences x p tokens, pool_slots, cache_rows, slots
+    # (None: arange(n)), pool_dtype / cache_dtype, beta ("fp32" | "bf16":
+    # sigmoid of a bf16 projection, as the target passes it), qkv ("views"
     # over a packed [T, 10240] row block | "contiguous", as the target passes
-    # them), output (None | "prefix" of a longer buffer | "fp32"),
-    # index_dtype, cu_dtype, pool_view ("layer_major").
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            _verify(
-                n,
-                p,
-                f"target verify: n={n} p={p}, n-row gather, 32-row buffer",
-                pool_slots=n,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                beta="bf16",
-                qkv="contiguous",
-            )
-            for n, p in ((1, 2), (8, 2), (16, 2), (32, 2), (8, 3), (8, 4))
+    # them).
+    CELLS: tuple[Cell, ...] = tuple(
+        _verify(
+            n,
+            p,
+            f"{label}target verify: n={n} p={p}, n-row gather, 32-row buffer",
+            pool_slots=n,
+            cache_rows=ENGINE_VERIFY_ROWS,
+            beta="bf16",
+            qkv="contiguous",
+            pool_dtype=dtype,
+            cache_dtype=dtype,
         )
-        + (
-            _verify(
-                4,
-                2,
-                "verify: rows 0/31/17/3 of the 32-row buffer",
-                pool_slots=ENGINE_VERIFY_ROWS,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                slots=(0, 31, 17, 3),
-            ),
-            _verify(
-                4,
-                2,
-                "verify: -1-padded rows naming 31 and 0",
-                pool_slots=ENGINE_VERIFY_ROWS,
-                cache_rows=ENGINE_VERIFY_ROWS,
-                slots=(31, -1, 0, -1),
-            ),
-        )
-        + tuple(
-            _verify(n, p, f"verify P={p}, n={n}: a state cached per token")
-            for n, p in ((1, 1), (3, 1), (3, 2), (3, 3), (3, 4), (3, 8))
-        )
-        + tuple(_verify(n, 4, f"verify batch width n={n}, P=4") for n in (1, 2, 4, 8))
-        + (
-            _verify(4, 3, "verify scattered slots 7/1/4/0", slots=(7, 1, 4, 0)),
-            _verify(3, 4, "verify slot -1: zero start, no cache row", slots=(2, -1, 5)),
-            _verify(2, 3, "verify into a bf16 per-step buffer", cache_dtype=torch.bfloat16),
-            _verify(2, 3, "verify with no pool: every sequence from zero", pool_slots=None),
-            _write_back(
-                3,
-                2,
-                "write-back into a 461-slot pool: slots 0, 460, 230",
-                pool_slots=ENGINE_SLOTS,
-                slots=(0, ENGINE_SLOTS - 1, 230),
-            ),
-        )
-        + tuple(
-            _write_back(4, p, f"write-back P={p}, scattered slots 7/1/4/0", slots=(7, 1, 4, 0))
-            for p in (1, 2, 3, 4, 8, 16)
-        )
-        + (
-            _write_back(3, 4, "write-back into a prefix of a longer output", output="prefix"),
-            _write_back(2, 1, "write-back P=1 into a prefix of an output", output="prefix"),
-            _write_back(3, 3, "write-back slot -1: no slot written", slots=(2, -1, 5)),
-            _write_back(2, 4, "write-back, every slot -1", slots=(-1, -1)),
-            _write_back(3, 4, "write-back into a bf16 pool", pool_dtype=torch.bfloat16),
-            _write_back(2, 1, "write-back P=1 into a bf16 pool", pool_dtype=torch.bfloat16),
-            _write_back(3, 1, "bf16 beta (the mixer's dtype), P=1", slots=(2, 5, 0), beta="bf16"),
-            _write_back(3, 4, "bf16 beta (the mixer's dtype), P=4", slots=(2, 5, 0), beta="bf16"),
-            _write_back(2, 3, "per-channel beta [N, P, HV, V]", slots=(1, 2), beta="channel"),
-            _write_back(2, 3, "fp32 output buffer against bf16 q", slots=(1, 2), output="fp32"),
-            _write_back(2, 3, "int64 initial_state_indices", slots=(1, 2), index_dtype=torch.int64),
-            _write_back(
-                2,
-                3,
-                "a [layers, S, ...] pool's middle layer",
-                slots=(1, 4),
-                pool_view="layer_major",
-            ),
-            Cell(why="both sinks at once", spec=dict(mode="both", n=2, p=4)),
-            _write_back(3, None, "varlen: ragged lengths 1/5/2", lengths=(1, 5, 2)),
-            _write_back(
-                3,
-                None,
-                "varlen: uniform lengths, scattered slots",
-                lengths=(4, 4, 4),
-                slots=(2, 6, 3),
-            ),
-            _write_back(2, None, "varlen: int32 cu_seqlens", lengths=(2, 4), cu_dtype=torch.int32),
+        for dtype, label, n, p in (
+            (torch.float32, "", 32, 2),
+            (torch.float32, "", 8, 4),
+            (torch.bfloat16, "bf16 state: ", 32, 2),
         )
     )
 
     note = """
     Metadata consumed: none; every piece of state is an argument.
 
-    Call site (`_gdn_verify`), all positional: `(q, k, v, g, beta, src,
-    int_idx, None, True, None, True, False, int_ssm, p, None)` -- q/k/v the
-    contiguous `[n, p, 16|48, 128]` reshapes of `pack_gdn_decode_qkv`'s
-    outputs (so the in-kernel L2 norm is required), `g` fp32 from
-    `fused_gdn_gating`, `beta = sigmoid(b)` bf16, `src` an `[n, 48, 128, 128]`
-    fp32 gather of the live slots, `int_idx = intermediate_state_indices[:n]`
-    (int32 arange), `int_ssm` the layer's `[32, p, 48, 128, 128]` per-step
-    buffer. The buffer's rows are the batch rows `update_mamba_states` reads,
-    not slot ids, and its step axis is `tokens_per_gen_step`: `p` (as
-    `cache_steps`) must equal it.
+    Call site (`_gdn_verify`, the legacy verify path of `TRTLLM_USE_GDN_REPLAY=0`, `p` up
+    to 4), all positional: `(q, k, v, g, beta, src, int_idx, None, True, None, True, False,
+    int_ssm, p, None)` -- q/k/v the contiguous `[n, p, 16|48, 128]` reshapes of
+    `pack_gdn_decode_qkv`'s outputs (so the in-kernel L2 norm is required), `g` fp32 from
+    `fused_gdn_gating`, `beta = sigmoid(b)` bf16, `src` an `[n, 48, 128, 128]` gather of
+    the live slots and `int_ssm` the layer's `[32, p, 48, 128, 128]` per-step buffer, both
+    at the pool's dtype (fp32 or bf16, as `mamba_ssm_cache_dtype` allocated it; the buffer's
+    states are rounded once to it), `int_idx = intermediate_state_indices[:n]` (int32
+    arange). The buffer's rows are the batch rows `update_mamba_states` reads, not slot
+    ids, and its step axis is `tokens_per_gen_step`: `p` (as `cache_steps`) must equal it.
 
     Preconditions not checkable from metadata: `HV % H == 0` (q/k heads are
     repeat_interleaved, not tiled); indices in `[0, S)` and `[0, S')` or
@@ -203,10 +127,17 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     at cache_steps 2, P 4; `cache_steps` other than the buffer's step axis
     misplaces every row past 0 against the buffer's own indexing.
 
-    Deterministic; the first call in a fresh process is bitwise the second.
+    The first call in a fresh process is bitwise the second (measured on the
+    write-back sink; the kernel has no autotuner).
 
-    Not certified: `disable_output_calculation=True` alone (its cached states
-    were never checked); `K` or `V` other than 128; fp16/fp32 q/k/v; P > 16.
+    Certified: the call site's form alone -- the per-step buffer sink with the pool
+    untouched, at 32 sequences of P = 2 and 8 of P = 4 over an fp32 pool and buffer, and
+    32 of P = 2 over a bf16 one. Not certified: the write-back sink
+    (`disable_state_update=False`), alone or with the buffer; the varlen form
+    (`cu_seqlens`); negative, scattered or int64 indices; no pool; fp32 or per-channel
+    `beta`; q/k/v as views of the packed rows; an `output` buffer;
+    `disable_output_calculation=True`; `K` or `V` other than 128; fp16/fp32 q/k/v; P = 3
+    and P outside 2..4; N above 32.
 
     Hard limits
       N * HV  gridDim.z  boundary 65535  probed at N=1300 (62400): runs;
@@ -295,8 +226,8 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
                 q_t = q[b, t].float().repeat_interleave(rep, dim=0)  # [HV, K]
                 k_t = k[b, t].float().repeat_interleave(rep, dim=0)
                 if use_qk_l2norm_in_kernel:
-                    q_t = q_t / (q_t.square().sum(-1, keepdim=True).sqrt() + 1e-6)
-                    k_t = k_t / (k_t.square().sum(-1, keepdim=True).sqrt() + 1e-6)
+                    q_t = q_t / torch.sqrt(q_t.square().sum(-1, keepdim=True) + 1e-6)
+                    k_t = k_t / torch.sqrt(k_t.square().sum(-1, keepdim=True) + 1e-6)
                 q_t = q_t * scale
                 h = h * torch.exp(g[b, t].float())[:, None, None]
                 u = v[b, t].float() - (h * k_t[:, :, None]).sum(1)  # [HV, V]

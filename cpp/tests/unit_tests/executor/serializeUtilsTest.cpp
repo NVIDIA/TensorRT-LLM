@@ -153,6 +153,7 @@ void compareResult(texec::Result res, texec::Result res2)
     EXPECT_EQ(res.logProbs, res2.logProbs);
     EXPECT_EQ(res.finishReasons, res2.finishReasons);
     EXPECT_EQ(res.decodingIter, res2.decodingIter);
+    EXPECT_EQ(res.avgDecodedTokensPerIter, res2.avgDecodedTokensPerIter);
     EXPECT_EQ(res.sequenceIndex, res2.sequenceIndex);
     EXPECT_EQ(res.isSequenceFinal, res2.isSequenceFinal);
 }
@@ -413,9 +414,9 @@ TEST(SerializeUtilsTest, Nested)
 TEST(SerializeUtilsTest, ResultResponse)
 {
     texec::Result res = texec::Result{false, {{1, 2, 3}}, texec::VecLogProbs{1.0, 2.0},
-        std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}}, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}},
         std::vector<texec::FinishReason>{texec::FinishReason::kLENGTH},
-        texec::ContextPhaseParams({9, 37}, 0, VecTokens{1, 2}), 3, 2, true};
+        texec::ContextPhaseParams({9, 37}, 0, VecTokens{1, 2}), 3, 1.5f, 2, true};
     {
         testSerializeDeserialize(res);
     }
@@ -442,8 +443,8 @@ TEST(SerializeUtilsTest, VectorResponses)
         if (i < 5)
         {
             texec::Result res = texec::Result{false, {{i + 1, i + 2, i + 3}}, texec::VecLogProbs{1.0, 2.0},
-                std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}}, std::nullopt, std::nullopt, std::nullopt,
-                std::nullopt, std::vector<texec::FinishReason>{texec::FinishReason::kEND_ID}};
+                std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}},
+                std::vector<texec::FinishReason>{texec::FinishReason::kEND_ID}};
             responsesIn.emplace_back(i, res);
         }
         else if (i < 10)
@@ -729,14 +730,6 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
         EXPECT_EQ(stats.getCtxDpRank(), std::nullopt);
         EXPECT_EQ(stats.getDisaggInfoEndpoint(), "endpoint://test");
     }
-}
-
-TEST(SerializeUtilsTest, SpeculativeDecodingFastLogitsInfo)
-{
-    auto logitsInfo = texec::SpeculativeDecodingFastLogitsInfo{10, 20};
-    auto logitsInfo2 = serializeDeserialize(logitsInfo);
-    EXPECT_EQ(logitsInfo.draftRequestId, logitsInfo2.draftRequestId);
-    EXPECT_EQ(logitsInfo.draftParticipantId, logitsInfo2.draftParticipantId);
 }
 
 TEST(SerializeUtilsTest, GuidedDecodingConfig)
