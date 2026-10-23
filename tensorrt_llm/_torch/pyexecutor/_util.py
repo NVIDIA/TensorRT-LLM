@@ -1113,6 +1113,7 @@ class KvCacheCreator:
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
+                is_disagg=self._is_disagg,
                 **extra_kwargs))
         if include_request_cost:
             if cost.bytes_per_request is None:
@@ -3516,6 +3517,14 @@ def _create_kv_cache_manager(
                 spec_config.tokens_per_gen_step - 1)
             if kda_replay_num_spec is not None:
                 kda_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
+                # A model whose KDA verify replays the accepted drafts from
+                # its own per-draft records (instead of the replay caches)
+                # asks for a buffer of them with `kda_draft_records`.
+                backbone = getattr(getattr(model_engine, "model", None),
+                                   "model", None)
+                if (issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                        and getattr(backbone, "kda_draft_records", False)):
+                    kda_extra_kwargs["kda_draft_records"] = True
         if is_glm5_next:
             # The manager places an indexer buffer on every attention layer.
             from ..attention.backends.sparse.glm_kpool import \

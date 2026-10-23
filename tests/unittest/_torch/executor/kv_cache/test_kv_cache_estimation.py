@@ -1243,6 +1243,7 @@ def test_creator_uses_v2_affine_cache_cost():
     creator._max_num_tokens = 1024
     creator._kv_cache_config = KvCacheConfig()
     creator._speculative_config = None
+    creator._is_disagg = False
 
     cost = creator._per_manager_cache_cost(FakeV2Manager, Mock())
 
