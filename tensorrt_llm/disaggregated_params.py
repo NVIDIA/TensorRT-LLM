@@ -52,6 +52,9 @@ class DisaggregatedParams:
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
         multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
         multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
+        multimodal (Dict[str, Any]): Optional versioned multimodal handoff.
+         New consumers opt in through ``result.export_multimodal_handoff()``.
+         The existing flat fields and default result format remain supported.
     """
 
     request_type: Optional[str] = None
@@ -81,6 +84,23 @@ class DisaggregatedParams:
     )
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
+
+    # Additive E/P format. Keep legacy fields/default output until consumers
+    # have migrated and an announced deprecation period has completed.
+    multimodal: Optional[Dict[str, Any]] = None
+
+    @property
+    def has_multimodal_embeddings(self) -> bool:
+        """Whether either supported handoff format carries encoder outputs."""
+        if self.multimodal is not None:
+            return bool(self.multimodal["items"])
+        return self.multimodal_embedding_handles is not None
+
+    def get_multimodal_embedding_handles(self) -> list[dict[str, Any]]:
+        """Read primary item handles without changing the selected format."""
+        if self.multimodal is None:
+            return self.multimodal_embedding_handles or []
+        return [item["embeddings"]["multimodal_embedding"] for item in self.multimodal["items"]]
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         # Prefer disagg_request_id over ctx_request_id
@@ -112,6 +132,11 @@ class DisaggregatedParams:
             )
 
     def __post_init__(self):
+        if self.multimodal is not None:
+            if self.multimodal.get("schema_version") != 1:
+                raise ValueError("Unsupported multimodal handoff schema_version; expected 1")
+            if not isinstance(self.multimodal.get("items"), list):
+                raise ValueError("Multimodal handoff items must be a list")
         if (self.multimodal_positions is None) != (self.multimodal_lengths is None):
             raise ValueError(
                 "multimodal_positions and multimodal_lengths must be provided together"

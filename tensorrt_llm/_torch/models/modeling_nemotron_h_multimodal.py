@@ -28,6 +28,7 @@ from PIL import Image
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
+    MultimodalInput,
     MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
@@ -35,6 +36,7 @@ from tensorrt_llm.inputs.multimodal import (
     _compute_mm_masks,
     _find_mm_token_runs_from_mask,
     _find_mm_token_start_pos_from_masks,
+    _multimodal_embedding_shape,
     find_mm_token_lengths,
 )
 
@@ -2534,19 +2536,72 @@ class NemotronHMultimodalInputProcessor(
                 multimodal_data[m]["evs_ids"] = input_ids[0].to(torch.int32)
         return input_ids[0].to(torch.int32).tolist(), {"multimodal_data": multimodal_data}
 
-    def build_disagg_prefill_multimodal_inputs(
+    def finalize_multimodal_prompt(
         self,
-        inputs: Union[TextPrompt, TokensPrompt],
-        mm_handles: List[Dict[str, Any]],
+        inputs: TextPrompt,
+        params: MultimodalParams,
         *,
         mm_hashes: list[list[int]] | None = None,
     ) -> tuple[list[int], MultimodalParams]:
+        """Finalize EVS tubelet positions using encoder-reported retained counts."""
+        data = params.multimodal_data
+        if params.multimodal_input is not None and "evs_ids" in data:
+            counts = [
+                count
+                for item in data["multimodal_embedding_metadata"]
+                for count in item["retained_token_counts"]
+            ]
+            evs_ids = data["evs_ids"].tolist()
+            if evs_ids.count(self.video_context_token_id) != len(counts):
+                raise ValueError("EVS retained counts must align with video tubelets")
+            if sum(counts) != sum(params.get_item_layout()[1]):
+                raise ValueError("EVS retained counts must match actual encoder rows")
+            token_ids = []
+            retained = iter(counts)
+            for token_id in evs_ids:
+                if token_id == self.video_context_token_id:
+                    token_ids.extend([self.img_context_token_id] * next(retained))
+                else:
+                    token_ids.append(token_id)
+            mm_input = params.multimodal_input
+            mm_mask, _, special_mask = _compute_mm_masks(
+                _as_cpu_tensor(token_ids),
+                vocab_size=self.get_vocab_size(),
+                mm_token_ids=self.get_mm_token_ids(),
+                mm_special_token_ids=self.get_mm_special_token_ids(),
+            )
+            positions, special_offsets = _find_mm_token_start_pos_from_masks(
+                mm_mask, special_mask, mm_input.multimodal_lengths
+            )
+            runs, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+                mm_mask, mm_input.multimodal_lengths
+            )
+            params.multimodal_input = MultimodalInput.from_components(
+                mm_input.multimodal_hashes,
+                positions,
+                mm_input.multimodal_lengths,
+                mm_item_run_cu_offsets=runs,
+                mm_run_positions=run_positions,
+                mm_run_lengths=run_lengths,
+            )
+            data["special_token_offsets"] = special_offsets
+            inputs = {"prompt_token_ids": token_ids}
+        return super().finalize_multimodal_prompt(inputs, params, mm_hashes=mm_hashes)
+
+    def _finalize_multimodal_prompt(
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if prompt_token_ids is None and not text_prompt:
             raise ValueError("Either prompt_token_ids or text prompt is required")
-        if not isinstance(mm_handles, list):
-            raise TypeError("mm_handles must be a list")
+        if not isinstance(embeddings, list):
+            raise TypeError("embeddings must be a list")
 
         mm_data = inputs.get("multi_modal_data") or {}
         if not mm_data:
@@ -2563,15 +2618,15 @@ class NemotronHMultimodalInputProcessor(
 
         num_mm_tokens_by_key = find_mm_token_lengths(mm_data, self)
         num_mm_tokens = [length for lengths in num_mm_tokens_by_key.values() for length in lengths]
-        if len(num_mm_tokens) != len(mm_handles):
+        if len(num_mm_tokens) != len(embeddings):
             raise RuntimeError(
-                f"Expected {len(num_mm_tokens)} multimodal handles, got {len(mm_handles)}."
+                f"Expected {len(num_mm_tokens)} multimodal handles, got {len(embeddings)}."
             )
 
         expected_hidden_size = self.config.llm_config.hidden_size
         multimodal_embedding_lengths: List[int] = []
-        for i, mm_handle in enumerate(mm_handles):
-            tensor_size = mm_handle["tensor_size"]
+        for i, embedding in enumerate(embeddings):
+            tensor_size = _multimodal_embedding_shape(embedding)
             if len(tensor_size) != 2:
                 raise RuntimeError(
                     f"Expected multimodal embedding {i} to be rank 2, got tensor_size={tensor_size}."
@@ -2596,7 +2651,10 @@ class NemotronHMultimodalInputProcessor(
 
         if modalities[0] == "video":
             retained_counts = [
-                handle.get("metadata", {}).get("retained_token_counts") for handle in mm_handles
+                item.get("retained_token_counts")
+                for item in params.multimodal_data.get(
+                    "multimodal_embedding_metadata", [{}] * len(embeddings)
+                )
             ]
             if self.video_pruning_rate > 0:
                 videos = mm_data["video"]
@@ -2657,9 +2715,9 @@ class NemotronHMultimodalInputProcessor(
         )
 
         return expanded_ids, MultimodalParams.from_embeddings(
-            mm_handles,
+            embeddings,
             MultimodalItemMetadata(
-                [(modalities[0], i) for i in range(len(mm_handles))],
+                [(modalities[0], i) for i in range(len(embeddings))],
                 output_embedding_lengths=multimodal_embedding_lengths,
             ),
             multimodal_hashes=mm_hashes,

@@ -217,16 +217,44 @@ fields. This batching interface does not require Dynamo changes.
 
 ## Encoder/Prefill Handoff
 
-For encoder/prefill disaggregation (E/P), model processor hooks return
-`(prompt_token_ids, MultimodalParams)`. Use `MultimodalParams.from_embeddings`
-to attach embeddings or shared-tensor handles. See
-[inputs/registry.py](source:tensorrt_llm/inputs/registry.py) for the hook contract.
+Existing orchestrators keep using the flat `DisaggregatedParams` fields,
+`result.disaggregated_params`, and the processor's
+`build_disagg_prefill_multimodal_inputs(inputs, mm_handles, mm_hashes=...)` hook.
+That default output remains compatible with existing Dynamo adapters. Legacy
+input is converted into the same execution Params used by the new path.
 
-`DisaggregatedParams` remains the transport envelope used by external
-orchestrators such as Dynamo. The prefill processor still rebuilds model-specific
-prompt layout; its local Params result does not replace the wire protocol.
-Custom E/P hooks must follow the tuple return contract. Review Python hook
-compatibility separately from transport fields when changing this interface.
+New consumers explicitly call `result.export_multimodal_handoff()` after encoding
+to obtain `DisaggregatedParams.multimodal`:
 
-These contracts do not change the supported model/modality matrix or impose a
-common batching policy on every model.
+```text
+schema_version: 1
+items: [item_ref, named embedding handles, output rows, optional hash/model data]
+request_layout: optional finalized prompt IDs, MM positions/lengths/runs, model data
+decode_inputs: optional model-required generation state
+```
+
+Export does not change the result's legacy default or copy tensor storage again.
+Physical encoder results and their local ownership are shared by both projections.
+Raw media, cache references, runtime objects and events remain local. Tensor handles
+use existing CUDA IPC or host shared memory; this format adds no cross-host transport.
+
+P reuses a completed request layout directly. Item-only results use the general
+`finalize_multimodal_prompt` hook with the original request. Model processors own
+prompt expansion and positions, while common code imports handles. The legacy
+processor hook remains available as an adapter to those same model rules.
+Qwen image items can finalize M-RoPE from encoder geometry; video requires completed
+layout/M-RoPE. EVS retains model-owned counts and split runs. Named auxiliary tensors
+may have different leading dimensions; Qwen3-VL keeps its packed DeepStack width.
+The existing primary-tensor cache contract remains unchanged.
+
+Versioned P/D requests export P-owned, model-selected decode state without E item
+handles. Legacy requests retain their existing mRoPE fields and P/D behavior.
+Both the enclosing result and its CompletionOutput expose the selected format,
+including when a postprocessing worker handles the internal response.
+
+Existing APIs are not deprecated in this change. After Dynamo releases and external
+consumers migrate, announce a deprecation period before changing the legacy default
+or removing flat fields/hooks. No per-request deprecation logging is added now.
+The same backend version is required across native workers; this compatibility
+preserves existing orchestrators, not arbitrary mixed TensorRT-LLM worker releases.
+Unsupported model/modality combinations are not enabled by either format.

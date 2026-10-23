@@ -76,7 +76,7 @@ class _MultimodalEncoderPDAdapter:
         disaggregated_params = encoder_output.disaggregated_params
         if disaggregated_params is None:
             raise RuntimeError("Multimodal encoder did not return disaggregated params.")
-        if disaggregated_params.multimodal_embedding_handles is None:
+        if not disaggregated_params.get_multimodal_embedding_handles():
             raise RuntimeError("Multimodal encoder did not return embedding handles.")
 
         disaggregated_params.request_type = "context_and_generation"

@@ -22,7 +22,7 @@ from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue, print_traceback_on_error
+from ..llmapi.utils import AsyncQueue, print_traceback_on_error, set_api_status
 from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
@@ -230,6 +230,8 @@ class GenerationResultBase:
         self.postproc_params = postproc_params
         self._error_msg: Optional[str] = None
         self._disaggregated_params = None
+        self._multimodal: dict | None = None
+        self._multimodal_handoff_requested = False
         self.decoding_iter = 0
         self.cached_tokens = 0
         self.per_pos_drafted = None
@@ -328,6 +330,62 @@ class GenerationResultBase:
     def disaggregated_params(self) -> Optional[DisaggregatedParams]:
         """Returns the disaggregated params."""
         return self._disaggregated_params
+
+    @set_api_status("beta")
+    def export_multimodal_handoff(self) -> Optional[DisaggregatedParams]:
+        """Export the versioned multimodal payload for a compatible consumer.
+
+        Call after the encoder/prefill result completes. This preserves final
+        prompt/layout and model metadata without changing the default legacy
+        ``disaggregated_params`` output. Tensor storage is not copied again.
+
+        Returns:
+            Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]:
+                Versioned handoff, or None when no multimodal payload exists.
+        """
+        if self._multimodal is None:
+            return None
+        return dataclasses.replace(
+            self._disaggregated_params or DisaggregatedParams(),
+            multimodal=self._multimodal,
+            multimodal_embedding_handles=None,
+            multimodal_hashes=None,
+            mrope_position_ids_handle=None,
+            mrope_position_deltas_handle=None,
+            multimodal_positions=None,
+            multimodal_lengths=None,
+        )
+
+    def _set_multimodal_result(self, multimodal: dict) -> None:
+        """Project one internal result onto the consumer's existing wire format."""
+        self._multimodal = multimodal
+        if self._multimodal_handoff_requested:
+            self._disaggregated_params = self.export_multimodal_handoff()
+        else:
+            items = multimodal["items"]
+            handles = []
+            for item in items:
+                handle = dict(item["embeddings"]["multimodal_embedding"])
+                if item.get("model_metadata"):
+                    handle["metadata"] = item["model_metadata"]
+                handles.append(handle)
+            hashes = [item.get("hash") for item in items]
+            model_data = multimodal.get("request_layout",
+                                        {}).get("model_data", {})
+            mrope = multimodal.get("decode_inputs",
+                                   model_data).get("mrope_config", {})
+            self._disaggregated_params = dataclasses.replace(
+                self._disaggregated_params or DisaggregatedParams(),
+                multimodal=None,
+                multimodal_embedding_handles=handles or None,
+                multimodal_hashes=hashes if hashes
+                and all(value is not None for value in hashes) else None,
+                mrope_position_ids_handle=mrope.get("mrope_position_ids"),
+                mrope_position_deltas_handle=mrope.get("mrope_position_deltas"),
+            )
+        # Adapters read CompletionOutput as well as the enclosing result.
+        for output in self._outputs:
+            output.disaggregated_params = self._disaggregated_params
 
     @property
     def error(self) -> Optional[str]:
@@ -586,6 +644,11 @@ class GenerationResultBase:
 
             self._outputs[
                 0].request_perf_metrics = response.request_perf_metrics
+            if getattr(response.disaggregated_params, "multimodal",
+                       None) is not None:
+                self._disaggregated_params = response.disaggregated_params
+                self._set_multimodal_result(
+                    response.disaggregated_params.multimodal)
             if not self._outputs[0].disaggregated_params:
                 disaggregated_params = response.disaggregated_params
 
@@ -665,9 +728,8 @@ class GenerationResultBase:
                 existing_disagg_params = self.disaggregated_params
                 remote_tail_start = getattr(response_result,
                                             "remote_tail_start", None)
-                # Use `replace` to preserve things like `mrope_position_ids_handle` and
-                # `mrope_position_deltas_handle`. However, explicitly set
-                # `multimodal_embedding_handles=None` since they should no longer be needed.
+                # Publish only model-selected decode state below; completed
+                # prefill does not forward the encoder's item handles.
                 self._disaggregated_params = dataclasses.replace(
                     existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
@@ -680,6 +742,7 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
+                    multimodal=None,
                     multimodal_embedding_handles=None,
                 )
 
@@ -724,27 +787,9 @@ class GenerationResultBase:
                     response_result.context_logits) is not None:
                 self._context_logits = context_logits
 
-            if (mm_embedding_handles :=
-                    getattr(response_result, "mm_embedding_handles",
-                            None)) is not None:
-                if self._disaggregated_params is not None:
-                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
-                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
-                else:
-                    self._disaggregated_params = DisaggregatedParams(
-                        multimodal_embedding_handles=mm_embedding_handles,
-                        multimodal_hashes=self._multimodal_hashes)
-
-            # Handle mrope handles for both:
-            # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
-            # 2. Prefill-only EPD requests (mm_embedding_handle is None because embeddings
-            #    were already computed in encode phase, but mrope still needs forwarding)
-            if (getattr(response_result, "mrope_position_ids_handle", None)
-                    is not None and self.disaggregated_params is not None):
-                self._disaggregated_params.mrope_position_ids_handle = (
-                    response_result.mrope_position_ids_handle)
-                self._disaggregated_params.mrope_position_deltas_handle = (
-                    response_result.mrope_position_deltas_handle)
+            if (multimodal := getattr(response_result, "multimodal",
+                                      None)) is not None:
+                self._set_multimodal_result(multimodal)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -1106,6 +1151,9 @@ class GenerationResult(GenerationResultBase):
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
         self._disaggregated_params = disaggregated_params
+        self._multimodal_handoff_requested = (
+            disaggregated_params is not None
+            and disaggregated_params.multimodal is not None)
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
@@ -1117,12 +1165,12 @@ class GenerationResult(GenerationResultBase):
         mm_input = getattr(
             getattr(generation_request, "multimodal_params", None),
             "multimodal_input", None)
-        self._multimodal_hashes = getattr(mm_input, "multimodal_hashes", None)
         mm_positions = getattr(mm_input, "multimodal_positions", None)
         mm_lengths = getattr(mm_input, "multimodal_lengths", None)
         if (self._disaggregated_params is not None
                 and self._disaggregated_params.request_type == "context_only"
-                and mm_positions is not None):
+                and mm_positions is not None
+                and self._disaggregated_params.multimodal is None):
             # Seed before postprocessing workers receive the request metadata.
             self._disaggregated_params = dataclasses.replace(
                 self._disaggregated_params,

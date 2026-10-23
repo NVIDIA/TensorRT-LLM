@@ -231,6 +231,13 @@ A 1024×1024 fp32 patch tensor is ~12 MB; a video clip can be hundreds of MB. Na
 
 **Audit:** payload size in NVTX `broadcast_requests` / `tp_broadcast_requests` ranges should be < 1 MB per rank per request. More means a broadcast leaked raw tensors.
 
+**E/P compatibility.** Keep the existing `build_disagg_prefill_multimodal_inputs`
+hook and flat DisaggregatedParams API. New consumers opt into the versioned payload
+with `result.export_multimodal_handoff()`; the default result remains legacy-compatible.
+A completed layout is reused at P, while item-only results use `finalize_multimodal_prompt`.
+Both projections use the same model prompt rules and encoder result. Keep raw media,
+cache state and events local. Validate both formats before any later announced deprecation.
+
 ### Contract 4 — Batch the multimodal encoder across requests
 
 Implement `MultimodalModelMixin.encode_multimodal_inputs` with the common group dispatcher.

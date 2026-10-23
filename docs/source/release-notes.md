@@ -38,6 +38,13 @@ All published functionality in the Release Notes has been fully tested and verif
   migrate custom model hooks. Existing `DisaggregatedParams` fields and E/P/D
   wire formats remain supported; Dynamo does not need an update for batching.
 
+- Added an opt-in versioned multimodal E/P handoff through
+  `result.export_multimodal_handoff()`. Existing `DisaggregatedParams` constructor
+  fields, default result output, and `build_disagg_prefill_multimodal_inputs()`
+  remain supported. Existing Dynamo adapters can continue using the legacy format;
+  new consumers may reuse finalized prompt layouts and model-selected decode state.
+  Deprecation/removal of the old format requires a later announced transition.
+
 ### Fixed Issues
 
 ### Known Issues

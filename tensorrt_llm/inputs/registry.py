@@ -36,8 +36,8 @@ from .content_format import ContentFormat
 from .data import TextPrompt
 # yapf: disable
 from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
-                         MultimodalItemMetadata, _as_cpu_tensor,
-                         _compute_mm_masks,
+                         MultimodalItemMetadata, MultimodalParams,
+                         _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
@@ -185,6 +185,92 @@ class BaseMultimodalInputProcessor(ABC):
         preparation. Model processors add encoder costs and input partitions.
         """
         return get_multimodal_item_metadata(multimodal_data)
+
+    def build_disagg_prefill_multimodal_inputs(
+        self,
+        inputs: TextPrompt,
+        mm_handles: list[dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        """Preserve the existing E/P processor API using common prompt rules.
+
+        Legacy orchestrators may keep calling this hook. New handoffs use a
+        completed layout or ``finalize_multimodal_prompt``. Both feed the same
+        execution Params; removal requires a later announced deprecation.
+        """
+        return self._finalize_multimodal_prompt(
+            inputs,
+            MultimodalParams(
+                multimodal_data={"multimodal_embedding": mm_handles}),
+            mm_hashes=mm_hashes,
+        )
+
+    def finalize_multimodal_prompt(
+        self,
+        inputs: TextPrompt,
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        """Finalize prompt semantics after encoding, locally or from item results.
+
+        A processed request already has its layout. Item-only results use the
+        model's expansion helper with the original prompt. Transport decoding
+        and handle import are framework responsibilities, not model hooks.
+        """
+        if params.multimodal_input is None:
+            original = params
+            token_ids, params = self._finalize_multimodal_prompt(
+                inputs,
+                params,
+                mm_hashes=mm_hashes,
+            )
+            if original.item_metadata is not None:
+                if original.get_item_layout()[1] != params.get_item_layout()[1]:
+                    raise ValueError(
+                        "Prompt finalization changed encoded item output lengths"
+                    )
+                params.multimodal_data[
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = original.item_metadata
+            for key in ("multimodal_features", "multimodal_embedding_metadata"):
+                if key in original.multimodal_data:
+                    params.multimodal_data[key] = original.multimodal_data[key]
+        else:
+            token_ids = list(inputs["prompt_token_ids"])
+        mm_input = params.multimodal_input
+        if mm_input is not None:
+            layout = {
+                "prompt_token_ids": token_ids,
+                "multimodal_positions": mm_input.multimodal_positions,
+                "multimodal_lengths": mm_input.multimodal_lengths,
+                **mm_input.run_metadata(),
+            }
+            data = params.multimodal_data
+            if "special_token_offsets" in data:
+                layout["special_token_offsets"] = data["special_token_offsets"]
+            if "mrope_config" in data:
+                layout["model_data"] = {"mrope_config": data["mrope_config"]}
+            data["request_layout"] = layout
+        return token_ids, params
+
+    def _finalize_multimodal_prompt(
+        self,
+        inputs: TextPrompt,
+        params: MultimodalParams,
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
+        """Expand an original prompt using encoded items when no layout exists."""
+        raise NotImplementedError(
+            "This processor requires a finalized multimodal request layout")
+
+    def prepare_multimodal_decode_inputs(
+            self, params: MultimodalParams) -> MultimodalParams:
+        """Keep model-required generation state; models may retain other features."""
+        result = MultimodalParams(multimodal_data=dict(params.multimodal_data))
+        result.strip_for_generation()
+        return result
 
     def __init__(self,
                  model_path,
@@ -996,10 +1082,9 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
     validate requirements, and set `support_mm_disagg = True` on both
     the processor class and the model class.
 
-    The processor implements ``build_disagg_prefill_multimodal_inputs(inputs,
-    mm_handles, *, mm_hashes=None)`` and returns ``(prompt_token_ids,
-    MultimodalParams)``. The params hold prompt layout, item metadata, and
-    embedding handles; the worker resolves the handles before model execution.
+    Completed layouts use the common import path. Item-only encoder results
+    use ``finalize_multimodal_prompt`` to apply model prompt rules. Workers
+    resolve tensor handles before model execution.
     """
     processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.get(
         model_cls)
@@ -1011,13 +1096,6 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
         raise TypeError(
             f"{processor_cls.__name__} must inherit from BaseMultimodalInputProcessor to support multimodal disagg"
         )
-    method = getattr(processor_cls, "build_disagg_prefill_multimodal_inputs",
-                     None)
-    if method is None or not callable(method):
-        raise TypeError(
-            f"{processor_cls.__name__} must implement a callable method `build_disagg_prefill_multimodal_inputs` to support multimodal disagg"
-        )
-
     setattr(processor_cls, "support_mm_disagg", True)
     setattr(model_cls, "support_mm_disagg", True)
     return model_cls
