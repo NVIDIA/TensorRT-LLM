@@ -1355,6 +1355,57 @@ def test_flashinfer_provider_nvfp4_matches_reference(tmp_path: Path):
 
 
 # =====================================================================
+# MoE layer registry
+# =====================================================================
+# ``extra_attrs["moe_layers"]`` is keyed by ``layer_idx_str`` and holds
+# weakrefs. A module that is constructed and then replaced -- Llama4
+# min-latency builds a generic MoE through ``Llama4MoE.__init__`` and swaps in
+# ``Llama4MinLatencyFusedMoE`` -- has to give its key back: otherwise
+# ``_register_layer``'s dedup loop pushes the replacement onto ``N_0`` and the
+# canonical ``N`` keeps a weakref to the discarded module.
+@pytest.mark.cpu_only
+def test_unregister_layer_returns_the_canonical_key_to_a_replacement():
+    model_config = ModelConfig(skip_create_weights_in_init=True)
+
+    dropped = torch.nn.Module()
+    dropped.layer_idx = 3
+    dropped.layer_idx_str = "3"
+    MoE._register_layer(dropped, model_config)
+    assert model_config.extra_attrs["moe_layers"]["3"]() is dropped
+
+    MoE._unregister_layer(dropped, model_config)
+    assert model_config.extra_attrs["moe_layers"] == {}
+    assert dropped.register_to_config is False
+
+    replacement = torch.nn.Module()
+    replacement.layer_idx = 3
+    replacement.layer_idx_str = "3"
+    MoE._register_layer(replacement, model_config)
+    assert replacement.layer_idx_str == "3"
+    assert model_config.extra_attrs["moe_layers"]["3"]() is replacement
+
+
+@pytest.mark.cpu_only
+def test_unregister_layer_leaves_another_modules_slot_alone():
+    model_config = ModelConfig(skip_create_weights_in_init=True)
+
+    kept = torch.nn.Module()
+    kept.layer_idx = 3
+    kept.layer_idx_str = "3"
+    MoE._register_layer(kept, model_config)
+
+    dropped = torch.nn.Module()
+    dropped.layer_idx = 3
+    dropped.layer_idx_str = "3"
+    MoE._register_layer(dropped, model_config)
+    assert dropped.layer_idx_str == "3_0"
+
+    MoE._unregister_layer(dropped, model_config)
+    assert list(model_config.extra_attrs["moe_layers"]) == ["3"]
+    assert model_config.extra_attrs["moe_layers"]["3"]() is kept
+
+
+# =====================================================================
 # Staged post-load hook lifecycle tests
 # =====================================================================
 # These tests cover staged hook contracts rather than the common backend matrix

@@ -35,7 +35,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
                              FusedMoEQuantScalesFP8,
-                             Llama4RenormalizeMoeRoutingMethod,
+                             Llama4RenormalizeMoeRoutingMethod, MoE,
                              MoEWeightLoadingMode, cutlass_leaf)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
@@ -470,6 +470,7 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
+        layer_idx: Optional[int] = None,
         override_quant_config: Optional[QuantConfig] = None,
     ):
 
@@ -490,6 +491,7 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
         )
 
         # Enable min-latency mode for Llama4 Maverick TP8 EP1.
@@ -586,6 +588,18 @@ class Llama4MinLatencyMoE(Llama4MoE):
             overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
+        # ``Llama4MoE.__init__`` above already built a MoE for this
+        # ``layer_idx`` and registered it in ``extra_attrs["moe_layers"]``, and
+        # that module is dropped by the assignment below. Give its slot back
+        # first, so the module that actually runs takes the canonical
+        # ``str(layer_idx)`` key instead of a deduplicated one -- otherwise
+        # ``extract_extra_attrs`` and the DWDP/LoRA lookups keyed on it would
+        # see a weakref to the discarded module. ``VANILLA`` resolves to an
+        # ``nn.ModuleList`` that is not a ``MoE`` and never registered, so
+        # there is nothing to give back.
+        if isinstance(self.experts, MoE):
+            self.experts._unregister_layer(model_config)
+
         self.experts = Llama4MinLatencyFusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -598,6 +612,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             model_config=model_config,
             apply_router_weight_on_input=True,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
+            layer_idx=layer_idx,
             override_quant_config=self.experts_quant_config,
         )
 
