@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range
@@ -76,13 +77,18 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
             }
         # For mm_encoder_only mode, we only run the vision encoder part.
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase).
-        mm_embeddings = self._model.forward(mm_params_with_payload)
-        assert len(mm_embeddings) == 1, (
-            "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
-        )
+        # This call bypasses ModelCaller, so scope the TP all-reduce windows here.
+        # The embeddings outlive this step, so keep a clone rather than a window.
+        with discard_nccl_window_tensor_outputs(inputs):
+            mm_embeddings = self._model.forward(mm_params_with_payload)
+            assert len(mm_embeddings) == 1, (
+                "mm_embeddings should be a 1-element list, mix modality (video+image) is not "
+                "supported"
+            )
+            mm_embedding_batch = mm_embeddings[0].clone()
 
         split_lengths = [sum(lengths) for lengths in mm_embedding_lengths]
-        mm_embeddings = list(torch.split(mm_embeddings[0], split_lengths, dim=0))
+        mm_embeddings = list(torch.split(mm_embedding_batch, split_lengths, dim=0))
         if len(mm_embeddings) != len(mm_embedding_lengths):
             raise ValueError(
                 "mm_encoder_only produced an embedding batch that does not match "
@@ -117,6 +123,12 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
             "mm_embedding_request_indices": mm_request_indices_with_payload,
             "mm_embedding_lengths": mm_embedding_lengths,
         }
+        embedding_metadata = [
+            param.multimodal_data.get("multimodal_embedding_metadata")
+            for param in mm_params_with_payload
+        ]
+        if any(metadata is not None for metadata in embedding_metadata):
+            result["mm_embedding_metadata"] = embedding_metadata
         if mrope_position_ids_list:
             result["mrope_position_ids"] = mrope_position_ids_list
         if mrope_position_deltas_list:

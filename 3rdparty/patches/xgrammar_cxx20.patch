@@ -1,0 +1,57 @@
+--- a/cpp/grammar_functor.cc
++++ b/cpp/grammar_functor.cc
+@@ -1750,11 +1750,11 @@
+   void Apply(Grammar* grammar);
+   static std::optional<uint64_t> HashSequence(const Grammar& grammar, int32_t sequence_id);
+
+-  static const int16_t kNotEndStateFlag = -0x100;
+-  static const int16_t kEndStateFlag = -0x200;
+-  static const int16_t kSelfRecursionFlag = -0x300;
+-  static const int16_t kSimpleCycleFlag = -0x400;
+-  static const int16_t kUnKnownFlag = -0x500;
++  static constexpr int16_t kNotEndStateFlag = -0x100;
++  static constexpr int16_t kEndStateFlag = -0x200;
++  static constexpr int16_t kSelfRecursionFlag = -0x300;
++  static constexpr int16_t kSimpleCycleFlag = -0x400;
++  static constexpr int16_t kUnKnownFlag = -0x500;
+
+  private:
+   Grammar* grammar_;
+--- a/cpp/structural_tag.h
++++ b/cpp/structural_tag.h
+@@ -91,7 +91,7 @@
+ struct SequenceFormat {
+   static constexpr const char* type = "sequence";
+   std::vector<Format> elements;
+-  SequenceFormat(std::vector<Format> elements) : elements(std::move(elements)) {}
++  SequenceFormat(std::vector<Format> elements);
+ 
+  private:
+   // Detected in StructuralTagAnalyzer
+@@ -103,7 +103,7 @@
+ struct OrFormat {
+   static constexpr const char* type = "or";
+   std::vector<Format> elements;
+-  OrFormat(std::vector<Format> elements) : elements(std::move(elements)) {}
++  OrFormat(std::vector<Format> elements);
+ 
+  private:
+   // Detected in StructuralTagAnalyzer
+@@ -172,6 +172,17 @@
+   friend class StructuralTagGrammarConverter;
+ };
+ 
++/******************** Recursive Format Constructors ********************/
++
++// Defined out of line: these constructors instantiate std::vector<Format>, which requires every
++// alternative of the recursive variant to be complete. Inside the class bodies the alternatives
++// declared further down are still incomplete, and computing the variant's conditionally-trivial
++// special members then fails.
++inline SequenceFormat::SequenceFormat(std::vector<Format> elements)
++    : elements(std::move(elements)) {}
++
++inline OrFormat::OrFormat(std::vector<Format> elements) : elements(std::move(elements)) {}
++
+ /******************** Top Level ********************/
+ 
+ struct StructuralTag {

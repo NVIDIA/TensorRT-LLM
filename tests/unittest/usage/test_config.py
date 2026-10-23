@@ -22,18 +22,6 @@ pytestmark = pytest.mark.cpu_only
 class TestTelemetryConfigLocation:
     """Verify TelemetryConfig and UsageContext live in tensorrt_llm.usage.config."""
 
-    def test_import_telemetry_config_from_usage_config(self):
-        """TelemetryConfig must be importable from tensorrt_llm.usage.config."""
-        from tensorrt_llm.usage import config
-
-        assert hasattr(config, "TelemetryConfig")
-
-    def test_import_usage_context_from_usage_config(self):
-        """UsageContext must be importable from tensorrt_llm.usage.config."""
-        from tensorrt_llm.usage import config
-
-        assert hasattr(config, "UsageContext")
-
     def test_telemetry_config_defaults(self):
         """TelemetryConfig defaults: disabled=False, usage_context=UNKNOWN."""
         from tensorrt_llm.usage import config
@@ -95,38 +83,20 @@ class TestTelemetryConfigLocation:
 class TestBackwardCompatibility:
     """Verify types are still importable from llm_args for backward compat."""
 
-    def test_telemetry_config_importable_from_llm_args(self):
-        """TelemetryConfig must still be importable from llm_args."""
-        from tensorrt_llm.llmapi import llm_args
+    def test_telemetry_types_preserve_legacy_imports(self) -> None:
+        from tensorrt_llm.llmapi.llm_args import TelemetryConfig as LegacyTelemetryConfig
+        from tensorrt_llm.llmapi.llm_args import UsageContext as LegacyUsageContext
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
 
-        assert hasattr(llm_args, "TelemetryConfig")
-
-    def test_usage_context_importable_from_llm_args(self):
-        """UsageContext must still be importable from llm_args."""
-        from tensorrt_llm.llmapi import llm_args
-
-        assert hasattr(llm_args, "UsageContext")
-
-    def test_same_types_both_locations(self):
-        """Types from both locations must be the same class."""
-        from tensorrt_llm.llmapi import llm_args
-        from tensorrt_llm.usage import config
-
-        assert config.TelemetryConfig is llm_args.TelemetryConfig
-        assert config.UsageContext is llm_args.UsageContext
+        assert LegacyTelemetryConfig is TelemetryConfig
+        assert LegacyUsageContext is UsageContext
 
 
 class TestFieldTelemetryMetadata:
     """Verify llm_args.Field telemetry metadata handling."""
 
     def test_telemetry_false_records_exclude_marker(self):
-        """Field(telemetry=False) records an honored exclude sentinel.
-
-        Under type-driven auto-enroll, telemetry=False is no longer a no-op: it
-        is the explicit opt-out for a type-safe-but-sensitive field, recorded as
-        json_schema_extra['telemetry'] = {"exclude": True} and honored by
-        build_capture_manifest's selection rule.
-        """
+        """Field(telemetry=False) records the explicit exclude sentinel."""
         from tensorrt_llm.llmapi import llm_args
 
         field = llm_args.Field(default=0, telemetry=False)
@@ -154,7 +124,5 @@ class TestTelemetryFieldCategorical:
         field = TelemetryField.categorical("a", "b")
 
         assert field.as_json_schema_extra() == {
-            "kind": "categorical",
-            "converter": "allowlist",
             "allowed_values": ["a", "b"],
         }

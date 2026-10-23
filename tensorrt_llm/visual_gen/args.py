@@ -31,7 +31,11 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
+from .sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
+    VideoSparseAttentionConfig,
+)
 
 # =============================================================================
 # Type aliases
@@ -91,11 +95,19 @@ class QuantAttentionConfig(StrictBaseModel):
             "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
         ),
     )
+    smooth_k: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel K mean before quantizing K, which narrows the range the "
+            "quantized type has to cover. SageAttention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -122,27 +134,49 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends), vsa (CUTEDSL / TRTLLM backends), "
+            "or sol_attn (TRTLLM / CUTEDSL backends)."
         ),
     )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block)).
+        # SAGE supports different recipes for different architectures.
         SAGE_RECIPES = {
-            ("int8", "fp8", (1, 1, 1)),
-            ("int8", "fp8", (1, 4, 1)),
-            ("int8", "fp8", (1, 16, 1)),
-            ("fp8", "fp8", (1, 1, 1)),
-            ("fp8", "fp8", (1, 4, 1)),
+            90: {
+                ("int8", "fp8", (2, 16, 1)),
+            },
+            100: {
+                ("int8", "fp8", (1, 1, 1)),
+                ("int8", "fp8", (1, 4, 1)),
+                ("int8", "fp8", (1, 16, 1)),
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+            },
+            103: {
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+            },
         }
-        # cuDNN fused SDPA quantizes both GEMMs with the same element format.
+        # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
+        PRIMSTS_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
+        # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "mxfp8", (0, 0, 0)),
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
@@ -164,20 +198,24 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            if recipe in SAGE_RECIPES:
-                # int8 Q/K SAGE has a compiled cubin only on SM100.
-                if q_config.qk_dtype == "int8" and get_sm_version() != 100:
-                    raise ValueError(
-                        f"int8 Q/K SAGE quantized attention (backend='TRTLLM', "
-                        f"qk_dtype='int8', v_dtype='{q_config.v_dtype}') only supports sm_100."
-                    )
-            else:
+            sm_version = get_sm_version()
+            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
+            if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes "
-                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(SAGE_RECIPES)}."
+                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
+                    f"{sorted(recipes)}."
                 )
+            if q_config.smooth_k and q_config.q_block_size == 0:
+                raise ValueError(
+                    "smooth_k is a SageAttention option and does not apply to the per-tensor "
+                    f"recipe {recipe!r}."
+                )
+        elif q_config.smooth_k:
+            raise ValueError(
+                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
+                f"backend='{self.backend}'."
+            )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
@@ -219,7 +257,8 @@ class AttentionConfig(StrictBaseModel):
         algo = self.sparse_attention_config.algorithm
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
-            "vsa": ("CUTEDSL",),
+            "vsa": ("CUTEDSL", "TRTLLM"),
+            "sol_attn": ("TRTLLM", "CUTEDSL"),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -234,21 +273,19 @@ class AttentionConfig(StrictBaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # VSA replaces the dense CuTeDSL path and cannot compose with quantized
-        # attention. SkipSoftmax is part of that dense path and can compose.
-        if (
-            self.backend == "CUTEDSL"
-            and self.quant_attention_config is not None
-            and self.sparse_attention_config is not None
-            and self.sparse_attention_config.algorithm == "vsa"
-        ):
-            raise ValueError(
-                "CUTEDSL backend: quant_attention_config and VSA "
-                "sparse_attention_config are mutually exclusive (the "
-                "CuTeDSLAttention dispatcher selects either the dense path "
-                "or the sparse VSA path, not both)."
-            )
+    def _validate_quant_sparse_mutex(self) -> "AttentionConfig":
+        if self.quant_attention_config is None or self.sparse_attention_config is None:
+            return self
+
+        # VSA and SOL replace the dense attention path on every backend that
+        # serves them and never consume quant_attention_config, so accepting a
+        # quantization recipe would silently ignore user configuration.
+        # SkipSoftmax is part of the dense path itself and can compose.
+        algorithm = self.sparse_attention_config.algorithm
+        if algorithm == "vsa":
+            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+        if algorithm == "sol_attn":
+            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
         return self
 
 
@@ -336,6 +373,21 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    tp_layout: Optional[Literal["replicated", "token_sharded"]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Activation layout between TP projections: 'replicated' (all-reduce TP; the default "
+            "when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each "
+            "all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires "
+            "tp_size > 1 and no ulysses/ring/attn2d."
+        ),
+    )
+
+    @property
+    def token_sharded_tp(self) -> bool:
+        """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
+        return self.tp_layout == "token_sharded"
 
     @property
     def seq_parallel_size(self) -> int:
@@ -376,6 +428,25 @@ class ParallelConfig(StrictBaseModel):
                     "async_ulysses forces SEPARATE_QKV which bypasses the "
                     "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
                     f"(got ring_size={self.ring_size})."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tp_layout(self) -> "ParallelConfig":
+        # async_ulysses is excluded transitively (it requires ulysses_size > 1).
+        if self.token_sharded_tp:
+            if self.tp_size == 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' requires tp_size > 1 "
+                    f"(got tp_size={self.tp_size}). Set tp_size > 1 or leave tp_layout unset."
+                )
+            if self.seq_parallel_size > 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' cannot be combined with "
+                    f"ulysses_size/ring_size/attn2d_size yet (got ulysses_size={self.ulysses_size}, "
+                    f"ring_size={self.ring_size}, attn2d_size={tuple(self.attn2d_size)}): both "
+                    "shard the token dimension of the transformer's residual stream. Use "
+                    "cfg_size x tp_size with the token-sharded layout, or unset tp_layout."
                 )
         return self
 
@@ -838,7 +909,9 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "SolAttentionConfig",
     "VideoSparseAttentionConfig",
+    "SolAttentionConfig",
     "AttentionConfig",
     "VAEConfig",
     "ParallelConfig",

@@ -379,8 +379,15 @@ def _make_transport(
 
 
 def _recv_req(block_counts, rid=1, slice_id=0):
+    # Positional block tables: `n` held slots followed by one -1 hole, which
+    # the reserve sizing must not count.
     return SimpleNamespace(
-        block_ids_per_layer_groups=[SimpleNamespace(size=n) for n in block_counts],
+        block_ids_per_layer_groups=[
+            np.concatenate([np.arange(n, dtype=np.int64), np.array([-1], dtype=np.int64)])
+            if n
+            else np.array([], dtype=np.int64)
+            for n in block_counts
+        ],
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
@@ -496,6 +503,22 @@ class TestFanInReserve:
     def test_reserve_oversize_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
         assert t.reserve(_recv_req([2]), num_writers=1) is False  # total 2000 > cap 500
+
+    def test_reserve_does_not_wait_for_recv_space(self, monkeypatch):
+        # The receiver reserves on the executor thread, so a full recv region must fall back to
+        # the per-fragment path at once instead of waiting for space to free up.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        timeouts = []
+
+        def full_region(size, timeout=None):
+            timeouts.append(timeout)
+            return None
+
+        monkeypatch.setattr(t._recv_alloc, "reserve", full_region)
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=1) is False
+        assert timeouts == [0.0]
+        assert req.bounce_dst_base is None
 
     def test_reserve_state_group_fanin_falls_back(self, monkeypatch):
         # STATE groups (None bytes) with num_writers > 1 must disable bounce even
@@ -735,6 +758,7 @@ def _k3_page_table() -> KVCachePageTable:
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=_K3_CONV_SLOT_BYTES,
+            section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,
         ),
         PoolView(
             pool_idx=1,
@@ -744,14 +768,13 @@ def _k3_page_table() -> KVCachePageTable:
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=_K3_SSM_SLOT_BYTES,
+            bytes_per_head=_K3_SSM_SLOT_BYTES // 4,
         ),
     ]
     mamba = MambaLayerGroup(
         pool_group_idx=1,
         local_layers=local_layers,
         pool_views=pool_views,
-        conv_section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,
-        ssm_bytes_per_head=_K3_SSM_SLOT_BYTES // 4,
     )
     return KVCachePageTable(
         tokens_per_block=32,
@@ -780,7 +803,7 @@ class TestHybridK3Bounce:
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
         # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
-        # the mamba layer group (transceiver._create_kv_slice), which used to trip the
+        # the mamba layer group (transceiver._create_chunk), which used to trip the
         # unknown-slot-size guard and silently push every K3 request onto the per-fragment
         # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
         t = _make_transport(
@@ -921,6 +944,12 @@ class TestSlotAllocator:
         a = self._alloc(monkeypatch, cap=512)  # single slot
         a.reserve(512)
         assert a.reserve(512, timeout=0.05) is None  # full -> times out
+
+    def test_zero_timeout_does_not_wait_when_full(self, monkeypatch):
+        a = self._alloc(monkeypatch, cap=512)  # single slot
+        a.reserve(512)
+        monkeypatch.setattr(a._cv, "wait", lambda *args, **kwargs: pytest.fail("reserve waited"))
+        assert a.reserve(512, timeout=0.0) is None
 
 
 # --------------------------------------------------------------------------- #

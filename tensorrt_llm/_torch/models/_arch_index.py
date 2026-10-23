@@ -45,12 +45,14 @@ MODEL_ARCH_TO_MODULE = {
     "DeciLMForCausalLM": "modeling_nemotron_nas",
     "DeepseekV32ForCausalLM": "modeling_deepseekv3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
+    "DeepseekV41ForCausalLM": "modeling_deepseekv41",
+    "DeepseekV41ForConditionalGeneration": "modeling_deepseekv41_multimodal",
     "DeepseekV4ForCausalLM": "modeling_deepseekv4",
     "EAGLE3LlamaForCausalLM": "modeling_speculative",
     "Eagle3DeepSeekV3ForCausalLM": "modeling_speculative",
     "Exaone4ForCausalLM": "modeling_exaone4",
     "Exaone4_5_ForConditionalGeneration": "modeling_exaone4_5",
-    "ExaoneMoEForCausalLM": "modeling_exaone_moe",
+    "ExaoneMoeForCausalLM": "modeling_exaone_moe",
     "Gemma3ForCausalLM": "modeling_gemma3",
     "Gemma3ForConditionalGeneration": "modeling_gemma3vl",
     "Gemma4AssistantForCausalLM": "modeling_gemma4",
@@ -58,12 +60,15 @@ MODEL_ARCH_TO_MODULE = {
     "Gemma4ForConditionalGeneration": "modeling_gemma4mm",
     "Gemma4UnifiedForConditionalGeneration": "modeling_gemma4_unified",
     "Glm4MoeForCausalLM": "modeling_glm",
+    "Glm5NextForCausalLM": "modeling_glm5_next",
+    "Glm5NextForConditionalGeneration": "modeling_glm5_next_vision",
     "GlmMoeDsaForCausalLM": "modeling_deepseekv3",
     "GptOssForCausalLM": "modeling_gpt_oss",
     "HCXVisionForCausalLM": "modeling_hyperclovax",
     "HCXVisionModel": "modeling_hyperclovax",
     "HunYuanDenseV1ForCausalLM": "modeling_hunyuan_dense",
     "HunYuanMoEV1ForCausalLM": "modeling_hunyuan_moe",
+    "K3DsparkForCausalLM": "modeling_dspark",
     "KimiK25ForConditionalGeneration": "modeling_kimi_k25",
     "KimiK3ForConditionalGeneration": "modeling_kimi_k3_vl",
     "KimiLinearForCausalLM": "modeling_kimi_linear",
@@ -86,9 +91,9 @@ MODEL_ARCH_TO_MODULE = {
     "NemotronForCausalLM": "modeling_nemotron",
     "NemotronHForCausalLM": "modeling_nemotron_h",
     "NemotronHPuzzleForCausalLM": "modeling_nemotron_h",
-    "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_nano",
-    "NemotronH_Nano_VL_V2": "modeling_nemotron_nano",
-    "NemotronH_Omni_Reasoning_V3": "modeling_nemotron_nano",
+    "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_h_multimodal",
+    "NemotronH_Nano_VL_V2": "modeling_nemotron_h_multimodal",
+    "NemotronH_Omni_Reasoning_V3": "modeling_nemotron_h_multimodal",
     "Phi3ForCausalLM": "modeling_phi3",
     "Phi4MMForCausalLM": "modeling_phi4mm",
     "PixtralForConditionalGeneration": "modeling_mistral",
@@ -111,7 +116,6 @@ MODEL_ARCH_TO_MODULE = {
     "Qwen3_5MoeForConditionalGeneration": "modeling_qwen3_5",
     "Qwen4ExpForCausalLM": "modeling_qwen4_exp",
     "Qwen4ExpForConditionalGeneration": "modeling_qwen4_exp",
-    "QwenImageBenchForConditionalGeneration": "modeling_qwen_image_bench",
     "SeedOssForCausalLM": "modeling_seedoss",
     "SiglipVisionModel": "modeling_siglip",
     "Starcoder2ForCausalLM": "modeling_starcoder2",
@@ -130,6 +134,8 @@ MODEL_CLASS_TO_MODULE = {
     "Cohere2ForCausalLM": "modeling_cohere2",
     "Cosmos3Model": "modeling_cosmos3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
+    "DeepseekV41ForCausalLM": "modeling_deepseekv41",
+    "DeepseekV41ForConditionalGeneration": "modeling_deepseekv41_multimodal",
     "DeepseekV4ForCausalLM": "modeling_deepseekv4",
     "Exaone4ForCausalLM": "modeling_exaone4",
     "Exaone4_5_ForConditionalGeneration": "modeling_exaone4_5",
@@ -140,10 +146,13 @@ MODEL_CLASS_TO_MODULE = {
     "Gemma4ForConditionalGeneration": "modeling_gemma4mm",
     "Gemma4UnifiedForConditionalGeneration": "modeling_gemma4_unified",
     "Glm4MoeForCausalLM": "modeling_glm",
+    "Glm5NextForCausalLM": "modeling_glm5_next",
+    "Glm5NextVLM": "modeling_glm5_next_vision",
     "GptOssForCausalLM": "modeling_gpt_oss",
     "HCXVisionForCausalLM": "modeling_hyperclovax",
     "HunYuanDenseV1ForCausalLM": "modeling_hunyuan_dense",
     "HunYuanMoEV1ForCausalLM": "modeling_hunyuan_moe",
+    "K3DsparkForCausalLM": "modeling_dspark",
     "KimiK25ForConditionalGeneration": "modeling_kimi_k25",
     "KimiK3ForConditionalGeneration": "modeling_kimi_k3_vl",
     "KimiLinearForCausalLM": "modeling_kimi_linear",
@@ -161,7 +170,7 @@ MODEL_CLASS_TO_MODULE = {
     "MllamaForConditionalGeneration": "modeling_mllama",
     "NemotronForCausalLM": "modeling_nemotron",
     "NemotronHForCausalLM": "modeling_nemotron_h",
-    "NemotronH_Nano_VL_V2": "modeling_nemotron_nano",
+    "NemotronHMultimodalModel": "modeling_nemotron_h_multimodal",
     "NemotronNASForCausalLM": "modeling_nemotron_nas",
     "Phi3ForCausalLM": "modeling_phi3",
     "Phi4MMForCausalLM": "modeling_phi4mm",
@@ -182,7 +191,6 @@ MODEL_CLASS_TO_MODULE = {
     "Qwen3_5VLModel": "modeling_qwen3_5",
     "Qwen4ExpForCausalLM": "modeling_qwen4_exp",
     "Qwen4ExpForConditionalGeneration": "modeling_qwen4_exp",
-    "QwenImageBenchModel": "modeling_qwen_image_bench",
     "SeedOssForCausalLM": "modeling_seedoss",
     "SiglipVisionModel": "modeling_siglip",
     "Starcoder2ForCausalLM": "modeling_starcoder2",
@@ -196,14 +204,14 @@ MODEL_CLASS_TO_MODULE = {
 # Multimodal ``model_type`` (HF ``config.model_type``, as passed to
 # ``register_input_processor`` / ``set_placeholder_metadata``) -> providing
 # module. Lets the multimodal placeholder registry resolve a model type
-# without eagerly importing the zoo. ``qwen3_5`` is also registered by
-# ``modeling_qwen_image_bench`` with byte-identical metadata; the real model's
-# module is indexed.
+# without eagerly importing the zoo.
 MULTIMODAL_MODEL_TYPE_TO_MODULE = {
-    "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_nano",
-    "NemotronH_Nano_VL_V2": "modeling_nemotron_nano",
+    "glm5_next": "modeling_glm5_next_vision",
+    "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_h_multimodal",
+    "NemotronH_Nano_VL_V2": "modeling_nemotron_h_multimodal",
     "cosmos3": "modeling_cosmos3",
     "cosmos3_omni": "modeling_cosmos3",
+    "deepseek_v41": "modeling_deepseekv41_multimodal",
     "exaone4_5": "modeling_exaone4_5",
     "gemma3": "modeling_gemma3vl",
     "gemma4": "modeling_gemma4mm",
@@ -219,7 +227,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "mistral3": "modeling_mistral",
     "mistral_common": "modeling_mistral",
     "mistral_large_3": "modeling_mistral",
-    "nemotron_h_omni": "modeling_nemotron_nano",
+    "nemotron_h_omni": "modeling_nemotron_h_multimodal",
     "phi4mm": "modeling_phi4mm",
     "qwen2_5_vl": "modeling_qwen2vl",
     "qwen2_vl": "modeling_qwen2vl",
@@ -236,7 +244,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
 # model builder (registered via ``@register_draft_model``). Keyed by the enum
 # member *name* rather than the enum itself so this module keeps importing
 # nothing. Modes absent from this table have no one-engine draft model to build
-# (two-model / drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
+# (model-free or drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
 #
 # Adding a speculative decoding mode
 # ----------------------------------

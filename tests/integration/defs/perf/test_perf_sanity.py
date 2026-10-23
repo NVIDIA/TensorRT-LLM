@@ -61,17 +61,82 @@ SUPPORTED_GPU_MAPPING = {
     "B200": "b200",
     "B300": "b300",
     "H200": "h200",
+    "VR200": "vr200",
 }
 
 # benchmark_client value selecting the AgentX trace-replay client
 # (agentx_client.py). Any other non-empty value is rejected at parse time.
 AGENTX_BENCHMARK_CLIENT = "agentx"
 
+# Modes whose measured client sends benchmark_serving's single un-measured test
+# request (it omits --no-test-input). Unrelated to the connection warmup
+# (DisaggTestCmds._run_connection_warmup).
 WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 
 def wants_warmup(benchmark_mode: str) -> bool:
     return benchmark_mode in WARMUP_BENCHMARK_MODES
+
+
+GEN_ONLY_NO_CONTEXT_MODE = "gen_only_no_context"
+
+DISAGG_BENCHMARK_MODES = ("e2e", "gen_only")
+
+AGGREGATED_DISAGG_YAML_MODES = ("ctx_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + AGGREGATED_DISAGG_YAML_MODES
+
+GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+GEN_ONLY_NO_CONTEXT_RUNTIME = "gen_only_no_context_server"
+GEN_ONLY_NO_CONTEXT_ENV = "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"
+
+DISAGG_CONFIG_RUNTIMES = ("multi_node_disagg_server", GEN_ONLY_NO_CONTEXT_RUNTIME)
+
+
+def is_gen_only_no_context(benchmark_mode: Optional[str], config: Optional[dict]) -> bool:
+    """Return True when this case must run with zero context workers."""
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        return True
+    if benchmark_mode != "gen_only":
+        return False
+    benchmark = (config or {}).get("benchmark") or {}
+    return GEN_ONLY_NO_CONTEXT_MODE in str(benchmark.get("mode", ""))
+
+
+def gen_only_no_context_server_counts() -> Tuple[int, int]:
+    """The (num_ctx_servers, num_gen_servers) this mode launches, always (0, 1)."""
+    return 0, 1
+
+
+# DISAGG_SERVING_TYPE of the single MPI step that hosts every context server of
+# a DWDP case. Its ranks publish hostname files as CTX_<rank>.txt, so readers
+# keyed on the "CTX" prefix see one file per context server as usual.
+DWDP_CTX_SERVING_TYPE = "CTX_MPI"
+# jenkins/scripts/perf/disaggregated/dwdp_ctx_rank.sh hides each MPI/Slurm
+# variable of a DWDP ctx task from pytest under this prefix, so pytest's own
+# MPI init cannot claim the rank meant for its trtllm-serve child.
+DWDP_SAVED_ENV_PREFIX = "TLLM_DWDP_SAVED_"
+
+
+def dwdp_saved_env(environ: Dict[str, str]) -> Dict[str, str]:
+    """The MPI/Slurm variables dwdp_ctx_rank.sh saved, under their real names."""
+    return {
+        key[len(DWDP_SAVED_ENV_PREFIX) :]: value
+        for key, value in environ.items()
+        if key.startswith(DWDP_SAVED_ENV_PREFIX)
+    }
+
+
+def dwdp_ctx_size(worker_config: dict) -> int:
+    """DWDP group size of the context side, or 0 when it does not use DWDP.
+
+    jenkins/scripts/perf/benchmark_utils.py:dwdp_ctx_size validates the same
+    field when the launch script is generated; this side only reads it.
+    """
+    ctx_config = (worker_config or {}).get("ctx", {}) or {}
+    dwdp_size = int((ctx_config.get("dwdp_config") or {}).get("dwdp_size", 1) or 1)
+    return dwdp_size if dwdp_size > 1 else 0
 
 
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
@@ -142,6 +207,19 @@ GEN_LOG_SENTINEL_TIMEOUT = 120
 # rather than call-site literals so a test can shorten the window.
 PERF_METRICS_SETTLE_SECONDS = _TB_SETTLE_SECONDS
 PERF_METRICS_SETTLE_TIMEOUT = _TB_SETTLE_TIMEOUT
+# Connection warmup for disagg e2e lanes; see DisaggTestCmds._run_connection_warmup.
+# Shape and count follow ucx_warmup_requests in
+# examples/disaggregated/slurm/benchmark/{submit.py,run_benchmark.sh}.
+CONNECTION_WARMUP_ISL = 100
+CONNECTION_WARMUP_OSL = 10
+CONNECTION_WARMUP_REQUESTS_PER_RANK_PAIR = 2
+# A healthy warmup takes about a minute even on the largest lanes (768 requests to a
+# cold 32-rank gen server finished in 42 s on oci-jhb), so reaching this bound means
+# the servers are wedged.
+CONNECTION_WARMUP_TIMEOUT = 600
+# benchmark_serving's "Failed requests:" summary line, its only failure signal:
+# benchmark_serving exits 0 even when requests fail.
+_FAILED_REQUESTS_RE = re.compile(r"^Failed requests:\s+(\d+)", re.MULTILINE)
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -265,7 +343,7 @@ DEVICE_STEP_TIME_METRICS = (
 #
 # Every name here must also appear in MINIMIZE_METRICS (or MAXIMIZE_METRICS):
 # check_regression only iterates those two lists, so a gated name absent from
-# both is silently never checked. test_perf_sanity_helpers.py pins that.
+# both is silently never checked.
 #
 # gen_only ONLY. The other modes in DEVICE_STEP_TIME_MODES upload the same five
 # statistics but keep the default REGRESSION_METRICS (throughput), so for them
@@ -279,6 +357,30 @@ GEN_ONLY_REGRESSION_METRICS = (
     "d_mean_gen_worker_per_iter_device_step_time",
     "d_median_gen_worker_per_iter_device_step_time",
 )
+
+# Oldest ts_created (epoch ms, 2026-10-01T12:09:03Z) whose gen-worker device step
+# time may enter a gen_only-mode baseline. From that moment on, the gen_only
+# modes describe the expected steady-state num_generation_tokens bucket
+# (expected_gen_only_ngen); rows created earlier describe the modal bucket
+# instead. Where two buckets are near-tied -- a full-batch wave and a short tail
+# wave, both ~420 iterations when concurrency / dp exceeds max_batch_size -- the
+# two definitions publish values 3x apart for the same run, so an older row mixed
+# into the 90-day history drags the P5 baseline down to the tail wave and flags
+# every current run. e2e still describes the modal bucket, so its series is
+# continuous and is not floored.
+#
+# TODO(2026-12-31): remove this floor and GEN_ONLY_METRIC_HISTORY_FLOORS_MS. From
+# that day the 90-day history window (QUERY_LOOKBACK_DAYS) starts after the floor,
+# so it no longer filters any row.
+GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS = 1790856543000
+
+# Metric -> ts_created floor applied when computing gen_only-mode baselines. Every
+# uploaded gen-worker device-step-time statistic is floored, gated or not, so the
+# diagnostic diff lines in s_regression_info describe the same definition the
+# gate uses.
+GEN_ONLY_METRIC_HISTORY_FLOORS_MS = {
+    f"d_{name}": GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS for name in DEVICE_STEP_TIME_METRICS
+}
 
 # Test-id modifier that additionally captures the per-request lifecycle
 # breakdown. It is a segment of its own, between the benchmark mode and the
@@ -314,12 +416,12 @@ TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 # runs the same mode, so it uploads (and gates) exactly as its unmodified
 # sibling does.
 #
-# Only gen_only gates on these (GEN_ONLY_REGRESSION_METRICS); for e2e they are
-# uploaded and baselined but cannot fail a build. In e2e the gen worker still
-# does pure decode -- the ctx workers do the prefill -- so the statistic means
-# the same thing it does in gen_only and is comparable within its own
+# Only the gen_only modes gate on these (GEN_ONLY_REGRESSION_METRICS); for e2e
+# they are uploaded and baselined but cannot fail a build. In e2e the gen worker
+# still does pure decode -- the ctx workers do the prefill -- so the statistic
+# means the same thing it does in gen_only and is comparable within its own
 # s_test_case_name series.
-DEVICE_STEP_TIME_MODES = ("gen_only", "e2e")
+DEVICE_STEP_TIME_MODES = GEN_ONLY_MODES + ("e2e",)
 
 # Config stems that get a time_breakdown test id. Deliberately an allowlist
 # rather than "every disagg yaml": get_disagg_test_cases is a cartesian product,
@@ -626,8 +728,87 @@ def _scan_gen_worker_device_step_time(
     return per_file_rows
 
 
+# The expected steady-state bucket must hold at least this fraction of the
+# modal bucket's rows to be trusted. A config-derived value that the run never
+# settled at (e.g. a scheduler cap the formula does not model) otherwise lands
+# on a handful of transient iterations; below the floor the mode is used.
+_EXPECTED_NGEN_MIN_MODE_FRACTION = 0.5
+
+
+def expected_gen_only_ngen(
+    gen_config: Optional["ServerConfig"],
+    concurrency: int,
+    num_gen_servers: int,
+) -> Optional[int]:
+    """Steady-state num_generation_tokens a gen_only-mode gen worker settles at.
+
+    In the gen_only modes every request is queued on the gen workers before
+    decoding starts, so once the iteration log is stable each rank holds a fixed
+    share of the concurrency, capped by the batch and token budgets, and emits
+    1 + max_draft_len tokens per request:
+
+        per_rank = min(ceil(concurrency / (num_gen_servers * dp)),
+                       max_batch_size,
+                       max_num_tokens // (1 + max_draft_len))
+        ngen     = per_rank * (1 + max_draft_len)
+
+    dp is the attention-DP size (== tp) when enable_attention_dp is on, else 1
+    (every TP rank then sees the whole batch). num_gen_servers is always 1 for
+    gen_only_no_context and hardware.num_gen_servers for gen_only.
+
+    The inputs are read from the configuration the worker actually receives
+    (the perf YAML merged over any extra_llm_api_config_path file), not from
+    ServerConfig's reporting defaults. Returns None -- so the caller falls back
+    to the modal bucket -- when that configuration cannot be loaded, does not
+    set max_batch_size or max_num_tokens, or otherwise cannot determine a value.
+    """
+    if gen_config is None or concurrency <= 0 or num_gen_servers <= 0:
+        return None
+    try:
+        llm_args = gen_config.merged_llm_api_config_data()
+    except (OSError, yaml.YAMLError) as e:
+        print_warning(f"Cannot load the gen worker config for the expected ngen: {e}")
+        return None
+    max_batch_size = llm_args.get("max_batch_size")
+    max_num_tokens = llm_args.get("max_num_tokens")
+    if max_batch_size is None or max_num_tokens is None:
+        return None
+    spec_config = llm_args.get("speculative_config") or {}
+    max_draft_len = spec_config.get("max_draft_len", spec_config.get("num_nextn_predict_layers", 0))
+    tokens_per_request = 1 + max(int(max_draft_len or 0), 0)
+    dp = int(llm_args.get("tensor_parallel_size", 1)) if llm_args.get("enable_attention_dp") else 1
+    per_rank = min(
+        math.ceil(concurrency / (num_gen_servers * max(dp, 1))),
+        int(max_batch_size),
+        int(max_num_tokens) // tokens_per_request,
+    )
+    if per_rank <= 0:
+        return None
+    return per_rank * tokens_per_request
+
+
+def _select_ngen_bucket(
+    by_ngen: Dict[int, List[float]],
+    expected_ngen: Optional[int],
+) -> List[float]:
+    """Pick the steady-state bucket: the expected ngen if trusted, else the mode."""
+    mode_ngen, mode_values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    if expected_ngen is None or expected_ngen == mode_ngen:
+        return mode_values
+    expected_values = by_ngen.get(expected_ngen, [])
+    if len(expected_values) >= _EXPECTED_NGEN_MIN_MODE_FRACTION * len(mode_values):
+        return expected_values
+    print_warning(
+        f"Expected steady-state num_generation_tokens={expected_ngen} has "
+        f"{len(expected_values)} iterations vs {len(mode_values)} at the mode "
+        f"({mode_ngen}); falling back to the modal bucket."
+    )
+    return mode_values
+
+
 def _stats_at_mode_ngen(
     per_file_rows: List[List[_IterRow]],
+    expected_ngen: Optional[int] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Aggregate per-file rows into one set of distribution statistics.
 
@@ -642,6 +823,14 @@ def _stats_at_mode_ngen(
     When a file produced usable rows but no parseable num_generation_tokens on
     any of them, fall back to that file's whole sample so a present metric is
     never lost (nvbugs 6487036 / 6487040).
+
+    When expected_ngen is given (the gen_only modes, see
+    expected_gen_only_ngen) that bucket is described instead of the mode,
+    provided it holds at least _EXPECTED_NGEN_MIN_MODE_FRACTION of the modal
+    bucket's rows. The mode alone is not stable: a workload can have two
+    near-tied buckets with very different step times -- the full-batch plateau
+    and a smaller tail -- and the mode then flips between them run to run
+    (nvbug 6843918: 440 vs 441 iterations, 98 ms vs 32 ms).
 
     Then average each statistic across workers, unweighted -- one vote per
     worker, matching how the mean has always been combined. Averaging a median
@@ -658,7 +847,7 @@ def _stats_at_mode_ngen(
             if row.ngen is not None:
                 by_ngen.setdefault(row.ngen, []).append(row.device_step_time)
         if by_ngen:
-            _mode_ngen, values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
+            values = _select_ngen_bucket(by_ngen, expected_ngen)
         else:
             # No parseable ngen anywhere in this worker; use every row.
             values = [row.device_step_time for row in rows]
@@ -684,13 +873,15 @@ def parse_gen_worker_device_step_time(
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
     end_offsets: Optional[List[int]] = None,
+    expected_ngen: Optional[int] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Per-iter prev_device_step_time statistics (ms) across all gen workers.
 
     For each gen_server_{i}.log, take the iter >= 5 rows that are not the
     successor of an empty (num_scheduled_requests == 0) iteration, bucket them
-    by num_generation_tokens, pick the bucket with the most rows (the mode;
-    ties break to the largest ngen), and describe that bucket with mean,
+    by num_generation_tokens, pick the expected steady-state bucket when
+    expected_ngen is given and trusted, else the bucket with the most rows (the
+    mode; ties break to the largest ngen), and describe that bucket with mean,
     median, stdev, P75 and P99. Then average each statistic across the
     num_gen_servers workers. A worker whose num_generation_tokens never parses
     falls back to its whole sample rather than being dropped to None. Returns
@@ -722,7 +913,39 @@ def parse_gen_worker_device_step_time(
     per_file_rows = _scan_gen_worker_device_step_time(
         output_dir, num_gen_servers, start_offsets, end_offsets
     )
-    return _stats_at_mode_ngen(per_file_rows)
+    return _stats_at_mode_ngen(per_file_rows, expected_ngen)
+
+
+def append_gen_worker_device_step_time(
+    output_dir: str,
+    num_gen_servers: int,
+    pending_device_step_time: List[dict],
+    outputs: List[str],
+) -> None:
+    """Parse each pending client's gen-worker window and append the five lines."""
+    for record in pending_device_step_time:
+        stats = parse_gen_worker_device_step_time(
+            output_dir,
+            num_gen_servers,
+            start_offsets=record["start_offsets"],
+            end_offsets=record.get("end_offsets"),
+            expected_ngen=record.get("expected_ngen"),
+        )
+        if stats is None:
+            continue
+        summary_lines = "\n".join(
+            [
+                f"Average Per Iter Device Step Time (ms): {stats.mean:.2f}",
+                f"Median Per Iter Device Step Time (ms): {stats.median:.4f}",
+                f"Stdev Per Iter Device Step Time (ms): {stats.std:.4f}",
+                f"P75 Per Iter Device Step Time (ms): {stats.p75:.4f}",
+                f"P99 Per Iter Device Step Time (ms): {stats.p99:.4f}",
+            ]
+        )
+        with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+            benchmark_ctx.write(f"\n{summary_lines}\n")
+        idx = record["output_index"]
+        outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
 
 
 def add_perf_metric_value(
@@ -864,9 +1087,9 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
-CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v3-postmerge-75-auto-25-native"
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v4-postmerge-50-auto-50-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
-CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 4
+CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 2
 CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
 CHECKPOINT_IO_FALLBACK_REASON_LIMIT = 256
 CHECKPOINT_IO_FALLBACK_REASON_COUNT_LIMIT = 4
@@ -910,6 +1133,7 @@ def _checkpoint_io_experiment_config_eligible(config_data: dict) -> bool:
         backend == "pytorch"
         and checkpoint_format == "HF"
         and load_format == "auto"
+        and config_data.get("checkpoint_loader") is None
         and not config_data.get("extra_llm_api_config_path")
     )
 
@@ -924,7 +1148,7 @@ def assign_checkpoint_io_experiment(
     """Assign one deterministic policy and write it into generated configs.
 
     Pre-merge runs always exercise auto. Post-merge runs use the root Jenkins
-    build number to select one native bucket and three auto buckets. Explicit
+    build number to select native for even builds and auto for odd builds. Explicit
     config policy remains authoritative and excludes the launch from
     assignment. A valid override is intended for reproduction.
     """
@@ -1380,6 +1604,22 @@ def to_env_dict(env_vars: str) -> Dict[str, str]:
     return env
 
 
+# AgentX knobs a ctx_only lane overrides on top of the yaml's client_env_var.
+# One ctx server must prefill every trajectory's full-length snapshot primer
+# before aiperf measures anything (DSv4 24-GPU: 1232 primers, ~45 min on one
+# 8-GPU server), so the optional cache-pressure warmup stage after them is
+# dropped and the window is halved to fit a CI stage. 1800 s is above the
+# agentx scenario's 900 s minimum, so the export stays submission_valid.
+AGENTX_CTX_ONLY_CLIENT_ENV = {"AGENTX_WARMUP_PER_LANE": "0", "AGENTX_DURATION": "1800"}
+
+
+def agentx_ctx_only_client_env(env_vars: str) -> str:
+    """The yaml's agentx client_env_var with the ctx_only overrides applied."""
+    env = to_env_dict(env_vars)
+    env.update(AGENTX_CTX_ONLY_CLIENT_ENV)
+    return " ".join(f"{key}={value}" for key, value in env.items())
+
+
 def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     """Extract TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS from a space-separated KEY=val env-var string.
 
@@ -1446,6 +1686,31 @@ def reserve_multi_frontend_port(host: str) -> int:
     return port
 
 
+def reserve_mpi_worker_port(host: str) -> int:
+    """Reserve a port for a `trtllm-serve disaggregated_mpi_worker` instance.
+
+    That entry point reads every instance's host:port from its config file and
+    has no --report_addr, so the port has to be chosen on this side. As in
+    reserve_multi_frontend_port, the socket stays bound so nothing else on the
+    node can take the port. It is bound with SO_REUSEADDR and never listen()ed,
+    which lets launch_server's own SO_REUSEADDR bind of the same port succeed
+    while a plain bind() from any other process is still refused.
+    """
+    addr_info = socket.getaddrinfo(host, 0, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    family = (
+        socket.AF_INET6
+        if addr_info and all(info[0] == socket.AF_INET6 for info in addr_info)
+        else socket.AF_INET
+    )
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, 0))
+    port = sock.getsockname()[1]
+    _RESERVED_PORT_SOCKETS.append(sock)
+    print_info(f"Reserved MPI worker port {host}:{port} (holding SO_REUSEADDR socket)")
+    return port
+
+
 def publish_addr_file(path: str, host: str, port: int) -> None:
     """Write "host:port" to *path* the way trtllm-serve's --report_addr does.
 
@@ -1472,8 +1737,24 @@ def publish_addr_file(path: str, host: str, port: int) -> None:
             os.unlink(tmp_path)
 
 
-def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
-    """Run a benchmark while streaming its combined output to an artifact log."""
+def _run_benchmark_with_log(
+    cmd: List[str], env: Dict[str, str], log_path: str, timeout: float = DEFAULT_TIMEOUT
+) -> str:
+    """Run a benchmark while streaming its combined output to an artifact log.
+
+    Args:
+        cmd: Benchmark command line.
+        env: Subprocess environment; PYTHONUNBUFFERED=1 is added if unset.
+        log_path: File that receives the combined stdout and stderr.
+        timeout: Seconds before the benchmark is killed.
+
+    Returns:
+        The combined output, decoded as UTF-8.
+
+    Raises:
+        subprocess.CalledProcessError: The benchmark exited non-zero.
+        subprocess.TimeoutExpired: The benchmark ran longer than ``timeout``.
+    """
     benchmark_env = env.copy()
     benchmark_env.setdefault("PYTHONUNBUFFERED", "1")
     with open(log_path, "wb") as log_file:
@@ -1483,7 +1764,7 @@ def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) 
             stdout=log_file,
             stderr=subprocess.STDOUT,
             check=False,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=timeout,
         )
 
     with open(log_path, "rb") as log_file:
@@ -1729,11 +2010,9 @@ class ServerConfig:
         }
         return db_data
 
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content."""
+    def merged_llm_api_config_data(self) -> dict:
+        """LLM API fields the worker receives: the perf YAML over the external config."""
         config_data = dict(self.extra_llm_api_config_data)
-
-        # Merge external AutoDeploy config if specified
         if self.extra_llm_api_config_path:
             config_path = self.extra_llm_api_config_path
             if not os.path.isabs(config_path):
@@ -1741,8 +2020,12 @@ class ServerConfig:
             with open(config_path, "r") as f:
                 external_config = yaml.safe_load(f) or {}
             # Fields in extra_llm_api_config_data (from perf YAML) take precedence
-            merged = {**external_config, **config_data}
-            config_data = merged
+            config_data = {**external_config, **config_data}
+        return config_data
+
+    def generate_extra_llm_api_config(self) -> str:
+        """Generate extra-llm-api-config.yml content."""
+        config_data = self.merged_llm_api_config_data()
 
         # Handle speculative_model path conversion
         if (
@@ -1998,7 +2281,7 @@ class ClientConfig:
                 f"Client {self.name} uses benchmark_client={AGENTX_BENCHMARK_CLIENT} but sets no "
                 "dataset_file; the agentx scenario has no default corpus."
             )
-        return [
+        cmd = [
             "python",
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentx_client.py"),
             "--model",
@@ -2008,6 +2291,12 @@ class ClientConfig:
             "--dataset",
             self.dataset_file,
         ]
+        # The trace sets each turn's output length, so osl is not passed through
+        # in general. osl == 1 is the ctx_only mode's prefill-only request, which
+        # the client applies to every turn.
+        if self.osl == 1:
+            cmd += ["--max-output-tokens", "1"]
+        return cmd
 
     def _to_sa_benchmark_cmd(self) -> List[str]:
         """Generate SA benchmark command (bench_serving repo)."""
@@ -2162,6 +2451,7 @@ class DisaggConfig:
         gen_router_config: dict | None = None,
         server_config_extra: dict | None = None,
         checkpoint_io_experiment: CheckpointIoExperimentAssignment | None = None,
+        dwdp_size: int = 0,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -2182,12 +2472,17 @@ class DisaggConfig:
         )
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
+        # Non-zero when the ctx servers form a DWDP group, which makes all of
+        # them ranks of one MPI step (DWDP_CTX_SERVING_TYPE) instead of one
+        # srun each.
+        self.dwdp_size = dwdp_size
 
 
 def append_time_breakdown_metrics(
     pending_time_breakdown: List[dict],
     outputs: List[str],
     breakdown_dir: str,
+    leading_lines_to_skip: Optional[Dict[str, int]] = None,
 ) -> None:
     """Aggregate the workers' perf_metrics JSONLs into log lines the parser reads.
 
@@ -2209,6 +2504,10 @@ def append_time_breakdown_metrics(
     parsed ``Time Breakdown ...`` lines is what check_test_failure hard-fails on,
     which keeps the diagnosis in one place instead of tearing down the whole
     session from inside a post-benchmark hook.
+
+    ``leading_lines_to_skip`` maps a JSONL basename to the number of lines it held
+    before the measured clients started (the connection warmup's records); those lines
+    are left out of both the census and the breakdown.
     """
     if not pending_time_breakdown:
         return
@@ -2223,6 +2522,7 @@ def append_time_breakdown_metrics(
         expected_requests=expected_requests or None,
         stable_seconds=PERF_METRICS_SETTLE_SECONDS,
         timeout_seconds=PERF_METRICS_SETTLE_TIMEOUT,
+        leading_lines_to_skip=leading_lines_to_skip,
     )
     for warning in wait_info["warnings"]:
         print_info(f"Time breakdown: {warning}")
@@ -2251,7 +2551,10 @@ def append_time_breakdown_metrics(
             # The client's warmup request is un-measured and absent from every other
             # metric on the row, so it is excluded here too -- see _drop_warmup_record.
             metrics, info = compute_time_breakdown_metrics(
-                paths, case_type, drop_warmup_request=bool(record.get("warmup"))
+                paths,
+                case_type,
+                drop_warmup_request=bool(record.get("warmup")),
+                leading_lines_to_skip=leading_lines_to_skip,
             )
         except (OSError, ValueError, KeyError) as exc:
             print_info(f"Time breakdown aggregation failed for {breakdown_dir}: {exc}")
@@ -2262,6 +2565,11 @@ def append_time_breakdown_metrics(
         print_info(f"Time breakdown ({case_type}) from {len(paths)} file(s): {info['counts']}")
         if info["warmup_dropped"]:
             print_info(f"Time breakdown: excluded the warmup request from {info['warmup_dropped']}")
+        if info["leading_lines_skipped"]:
+            print_info(
+                "Time breakdown: excluded connection-warmup records from "
+                f"{json.dumps(info['leading_lines_skipped'])}"
+            )
 
         summary_lines = "\n".join(format_metric_log_lines(metrics))
         with open(record["benchmark_file_path"], "a") as benchmark_ctx:
@@ -2325,10 +2633,26 @@ class AggrTestCmds(NamedTuple):
             server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
             if os.path.exists(server_addr_path):
                 os.remove(server_addr_path)
-            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
-                "--report_addr",
-                server_addr_path,
-            ]
+            num_frontends = 1
+            if server_idx < len(self.server_configs):
+                num_frontends = (
+                    getattr(self.server_configs[server_idx], "num_serve_frontends", 1) or 1
+                )
+            if num_frontends > 1:
+                # trtllm-serve refuses port 0 / --report_addr with several
+                # frontends (a ctx_only case inherits them from the disagg ctx
+                # worker), so reserve the port here and publish it on the
+                # server's behalf, as DisaggTestCmds does for its workers.
+                server_port = reserve_multi_frontend_port(server_hostname)
+                server_cmd_with_port = add_host_port_to_cmd(
+                    server_cmd, server_hostname, server_port
+                )
+                publish_addr_file(server_addr_path, server_hostname, server_port)
+            else:
+                server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
+                    "--report_addr",
+                    server_addr_path,
+                ]
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
@@ -2433,6 +2757,11 @@ class AggrTestCmds(NamedTuple):
         return ["aggr_server tests, please check config files"]
 
 
+def _attention_dp_size(config: "ServerConfig") -> int:
+    """Attention-DP ranks per worker: its TP size with attention DP, else 1."""
+    return config.tp if config.enable_attention_dp else 1
+
+
 class DisaggTestCmds(NamedTuple):
     """Commands for multi-node disaggregated server perf sanity tests."""
 
@@ -2464,24 +2793,26 @@ class DisaggTestCmds(NamedTuple):
     # server config so the disagg server writes the combined per-request record.
     # That combined file is the only one the benchmark client reads.
     perf_metrics_output_dir: str = ""
+    # DWDP group size of the ctx side, 0 when the ctx servers are separate sruns.
+    dwdp_size: int = 0
 
     def _hostnames_dir(self, server_idx: int) -> str:
         """Directory the disagg tasks exchange bound addresses through.
 
-        Scoped by SLURM job id so a rerun never reads the previous run's files:
-        test_output_dir is derived from the test case name alone and is created
-        with exist_ok=True, so it is reused across runs. The step id is
-        deliberately excluded -- each role runs as a separate srun step within
-        one job, and they must all agree on this path.
+        Reused across runs; slurm_launch_draft.sh clears it before each attempt.
+        The step id is excluded so all roles (separate srun steps) agree on it.
+        A DWDP ctx task sees SLURM_JOB_ID only under DWDP_SAVED_ENV_PREFIX.
         """
-        run_id = os.environ.get("SLURM_JOB_ID", "local")
+        run_id = os.environ.get(
+            "SLURM_JOB_ID", os.environ.get(f"{DWDP_SAVED_ENV_PREFIX}SLURM_JOB_ID", "local")
+        )
         return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
 
-    def _hostname_file(self, server_idx: int) -> str:
-        """Path this task's server reports its bound address to."""
+    def _hostname_file(self, server_idx: int, worker_name: str = "") -> str:
+        """Path a server reports its bound address to; defaults to this task's."""
         hostnames_dir = self._hostnames_dir(server_idx)
         os.makedirs(hostnames_dir, exist_ok=True)
-        return os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
+        return os.path.join(hostnames_dir, f"{worker_name or self.disagg_serving_type}.txt")
 
     def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
@@ -2786,45 +3117,23 @@ class DisaggTestCmds(NamedTuple):
         the gen_only run before results are uploaded. Other modes in
         DEVICE_STEP_TIME_MODES treat the family as diagnostic, so a fallback
         parse that finds nothing simply omits the columns there.
-
-        Five lines are written, one statistic each -- see
-        DEVICE_STEP_TIME_LOG_QUERIES for why they must not share a leading
-        word. The mean keeps its original wording and 2 decimals so existing
-        log readers and dashboards are unaffected; the four new lines use 4
-        decimals because the stdev of a healthy run is O(0.1 ms) and would
-        round to two significant figures away at 2.
         """
         if not pending_device_step_time:
             return
 
         self.wait_for_gen_log_sentinels()
-        for record in pending_device_step_time:
-            stats = parse_gen_worker_device_step_time(
-                self.test_output_dir,
-                self.num_gen_servers,
-                start_offsets=record["start_offsets"],
-                end_offsets=record.get("end_offsets"),
-            )
-            if stats is None:
-                continue
-            summary_lines = "\n".join(
-                [
-                    f"Average Per Iter Device Step Time (ms): {stats.mean:.2f}",
-                    f"Median Per Iter Device Step Time (ms): {stats.median:.4f}",
-                    f"Stdev Per Iter Device Step Time (ms): {stats.std:.4f}",
-                    f"P75 Per Iter Device Step Time (ms): {stats.p75:.4f}",
-                    f"P99 Per Iter Device Step Time (ms): {stats.p99:.4f}",
-                ]
-            )
-            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                benchmark_ctx.write(f"\n{summary_lines}\n")
-            idx = record["output_index"]
-            outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
+        append_gen_worker_device_step_time(
+            self.test_output_dir,
+            self.num_gen_servers,
+            pending_device_step_time,
+            outputs,
+        )
 
     def _append_time_breakdown_metrics(
         self,
         pending_time_breakdown: List[dict],
         outputs: List[str],
+        leading_lines_to_skip: Optional[Dict[str, int]] = None,
     ) -> None:
         """Disagg entry point for the shared aggregation; see the module function.
 
@@ -2838,7 +3147,9 @@ class DisaggTestCmds(NamedTuple):
         not a method here. Calling the method on self would raise AttributeError
         after the whole benchmark has already run.
         """
-        append_time_breakdown_metrics(pending_time_breakdown, outputs, self.perf_metrics_output_dir)
+        append_time_breakdown_metrics(
+            pending_time_breakdown, outputs, self.perf_metrics_output_dir, leading_lines_to_skip
+        )
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -2863,6 +3174,11 @@ class DisaggTestCmds(NamedTuple):
                 )
             )
         )
+        # Listed only when present, like the benchmark logs above. If the connection warmup
+        # fails, report_error then shows its log: the only client-side log at that point.
+        connection_warmup_log = self._connection_warmup_log_path(server_idx)
+        if os.path.exists(connection_warmup_log):
+            server_logs.append(connection_warmup_log)
         return server_logs
 
     @staticmethod
@@ -2878,6 +3194,340 @@ class DisaggTestCmds(NamedTuple):
             print_info(f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s")
             time.sleep(1)
 
+    def _connection_warmup_log_path(self, server_idx: int) -> str:
+        return os.path.join(self.test_output_dir, f"trtllm-connection-warmup.{server_idx}.log")
+
+    def _remove_stale_connection_warmup_log(self, server_idx: int) -> None:
+        """Delete a previous attempt's connection-warmup log.
+
+        A retry reuses test_output_dir, and get_server_logs feeds this log to the readiness
+        wait's error scan, so an error line left by the previous attempt would fail the new
+        attempt before it starts.
+        """
+        log_path = self._connection_warmup_log_path(server_idx)
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
+    def _measured_client_for_connection_warmup(self, server_idx: int) -> Optional["ClientConfig"]:
+        """The measured client whose env, backend and trust_remote_code the warmup reuses.
+
+        Returns None to skip the warmup. Only e2e lanes warm up, as in
+        examples/disaggregated/slurm/benchmark/submit.py; gen_only lanes start measuring
+        only after the gen queue fills, and warmup requests would count toward that fill.
+        AgentX clients run their own warmup phase, and accuracy-only clients measure no
+        performance, so a lane with only those skips it.
+        """
+        configs_for_idx = (
+            self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
+        )
+        if configs_for_idx is None or configs_for_idx[2].benchmark_mode != "e2e":
+            return None
+        return next(
+            (
+                client
+                for client in self.client_configs.get(server_idx, [])
+                if not client.only_run_accuracy
+                and client.benchmark_client != AGENTX_BENCHMARK_CLIENT
+            ),
+            None,
+        )
+
+    def _connection_warmup_num_requests(self, server_idx: int) -> int:
+        """Two connection-warmup requests per (ctx attention-DP rank, gen attention-DP rank) pair.
+
+        This is the count submit.py sends. The router does not guarantee every pair gets
+        one. What matters is that every (gen attention-DP rank, ctx server) pair gets at
+        least one: the first such request makes each rank of that ctx server load the gen
+        rank's transfer agent. This count averages 2 x (ctx attention-DP size) requests per
+        such pair.
+        """
+        ctx_config, gen_config, _ = self.server_configs[server_idx]
+        num_ctx_dp_ranks = self.num_ctx_servers * _attention_dp_size(ctx_config)
+        num_gen_dp_ranks = self.num_gen_servers * _attention_dp_size(gen_config)
+        return CONNECTION_WARMUP_REQUESTS_PER_RANK_PAIR * num_ctx_dp_ranks * num_gen_dp_ranks
+
+    def _connection_warmup_cmd(
+        self, measured_client: "ClientConfig", num_requests: int
+    ) -> List[str]:
+        """benchmark_serving command that sends all warmup requests at once.
+
+        Uses the lane's model and the measured client's backend and trust_remote_code,
+        and tokenizes random ids on the client as the measured client does on the random
+        dataset, so it hits the same endpoint the same way; --no-test-input keeps the
+        request count exact. The caller adds host and port.
+        """
+        model_dir = get_model_dir(self.model_name)
+        model_path = model_dir if os.path.exists(model_dir) else self.model_name
+        cmd = [
+            "python",
+            "-m",
+            "tensorrt_llm.serve.scripts.benchmark_serving",
+            "--model",
+            model_path,
+            "--tokenizer",
+            model_path,
+            "--dataset-name",
+            "random",
+            "--random-ids",
+            "--tokenize-on-client",
+            "--random-input-len",
+            str(CONNECTION_WARMUP_ISL),
+            "--random-output-len",
+            str(CONNECTION_WARMUP_OSL),
+            "--num-prompts",
+            str(num_requests),
+            "--ignore-eos",
+            "--non-streaming",
+            "--no-test-input",
+        ]
+        if measured_client.backend:
+            cmd += ["--backend", measured_client.backend]
+        if measured_client.trust_remote_code:
+            cmd.append("--trust-remote-code")
+        return cmd
+
+    def _run_connection_warmup(
+        self, server_idx: int, hostname: str, port: int, measured_client: "ClientConfig"
+    ) -> int:
+        """Open the KV-cache transfer connections before the measured clients run.
+
+        Each ctx rank loads a gen rank's transfer agent the first time that gen rank
+        requests KV from its ctx server, and it loads agents one at a time on a single
+        listener thread. On a large lane the first measured requests would otherwise wait
+        tens of seconds behind that queue (nvbugs/6564113: 32 gen ranks, about 1.4 s each
+        on oci-jhb). benchmark_serving's single test request (WARMUP_BENCHMARK_MODES)
+        reaches only one ctx/gen pair, so it cannot replace this.
+
+        If only some requests fail, the warmup still opened the connections it reached,
+        so it logs a warning and the measured clients decide whether the test passes. The
+        test fails instead of letting the lane run cold or hang if benchmark_serving exits
+        non-zero, runs past CONNECTION_WARMUP_TIMEOUT (capped by the test timeout), or
+        every request fails.
+
+        Args:
+            server_idx: Index of the disagg server under test.
+            hostname: Disagg server host.
+            port: Disagg server port.
+            measured_client: The client from _measured_client_for_connection_warmup.
+
+        Returns:
+            The number of warmup requests that succeeded.
+
+        Raises:
+            RuntimeError: benchmark_serving exited non-zero, timed out, or had every
+                request fail.
+            OSError: benchmark_serving could not be started or its log could not be opened.
+        """
+        num_requests = self._connection_warmup_num_requests(server_idx)
+        cmd = add_host_port_to_cmd(
+            self._connection_warmup_cmd(measured_client, num_requests), hostname, port
+        )
+        log_path = self._connection_warmup_log_path(server_idx)
+        timeout_seconds = min(CONNECTION_WARMUP_TIMEOUT, self.timeout)
+        # Reuse the measured client's env (proxy settings, HF offline flags, ...):
+        # without it the warmup may not reach the server or load the tokenizer.
+        env = copy.deepcopy(os.environ)
+        env.update(measured_client.to_env())
+
+        print_info(f"Connection warmup: sending {num_requests} short requests. cmd is {cmd}")
+        start = time.monotonic()
+        try:
+            output = _run_benchmark_with_log(cmd, env, log_path, timeout=timeout_seconds)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Connection warmup: benchmark_serving exited with code {e.returncode}. "
+                f"See {log_path}"
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"Connection warmup: {num_requests} short requests did not finish within "
+                f"{timeout_seconds}s, so the servers look wedged. See {log_path}"
+            ) from e
+        elapsed = time.monotonic() - start
+        failed_match = _FAILED_REQUESTS_RE.search(output)
+        failed_count = int(failed_match.group(1)) if failed_match else 0
+        if failed_count >= num_requests:
+            raise RuntimeError(
+                f"Connection warmup: all {num_requests} requests failed. See {log_path}"
+            )
+        if failed_count:
+            print_warning(
+                f"Connection warmup: {failed_count} of {num_requests} requests failed "
+                f"({elapsed:.0f}s); connections they missed will open during the measured "
+                f"run. See {log_path}"
+            )
+        else:
+            print_info(f"Connection warmup: {num_requests} requests done in {elapsed:.0f}s")
+        return num_requests - failed_count
+
+    def _wait_for_connection_warmup_line_counts(
+        self, num_succeeded_requests: int
+    ) -> Dict[str, int]:
+        """Wait for every warmup perf_metrics record to be written; return per-file line counts.
+
+        The time breakdown skips this many leading lines per file, so a warmup record
+        written after this snapshot would count as measured. Each server queues a
+        request's record before it finishes answering that request, so every warmup record
+        is already queued when the warmup client exits; this waits for them to be written.
+        First, the largest file must reach num_succeeded_requests lines. That file belongs
+        to a server that saw every warmup request: the disagg server, or a lone ctx or gen
+        server. Then the files must hold still for PERF_METRICS_SETTLE_SECONDS, so the
+        other servers' queued records are written too.
+
+        Args:
+            num_succeeded_requests: Warmup requests that succeeded.
+
+        Returns:
+            Line count per perf_metrics JSONL basename.
+
+        Raises:
+            RuntimeError: That did not happen within PERF_METRICS_SETTLE_TIMEOUT.
+        """
+        _, settle_info = wait_for_perf_metrics_files(
+            self.perf_metrics_output_dir,
+            expected_requests=num_succeeded_requests,
+            wait_for_expected_requests=True,
+            stable_seconds=PERF_METRICS_SETTLE_SECONDS,
+            timeout_seconds=PERF_METRICS_SETTLE_TIMEOUT,
+        )
+        if not settle_info["stable"]:
+            raise RuntimeError(
+                f"Connection warmup: expected {num_succeeded_requests} warmup records in the "
+                f"largest perf_metrics file under {self.perf_metrics_output_dir}, but the "
+                f"files did not reach that count and stop growing within "
+                f"{PERF_METRICS_SETTLE_TIMEOUT:.0f}s (line counts: "
+                f"{settle_info['line_counts']}). Failing so that late warmup records are "
+                "not counted as measured in d_tb_*."
+            )
+        return settle_info["line_counts"]
+
+    @staticmethod
+    def _dwdp_ctx_rank(saved_env: Dict[str, str]) -> Tuple[int, int]:
+        """(rank, world size) of this task inside the DWDP ctx MPI step."""
+        try:
+            return int(saved_env["SLURM_PROCID"]), int(saved_env["SLURM_NTASKS"])
+        except KeyError as error:
+            raise RuntimeError(
+                f"{DWDP_CTX_SERVING_TYPE} must run under dwdp_ctx_rank.sh inside the DWDP "
+                f"ctx srun step, but {DWDP_SAVED_ENV_PREFIX}{error.args[0]} is unset"
+            ) from error
+
+    def _dwdp_mpi_worker_config_path(self, server_idx: int) -> str:
+        return os.path.join(self.test_output_dir, f"dwdp_ctx_mpi_worker.{server_idx}.yaml")
+
+    def _write_dwdp_mpi_worker_config(
+        self, server_idx: int, ctx_cfg: "ServerConfig", world_size: int
+    ) -> str:
+        """Write the `trtllm-serve disaggregated_mpi_worker` config of the ctx step.
+
+        Rank 0 waits for every rank's reserved address, then lists them as the
+        ctx instance urls in world-rank order. disaggregated_mpi_worker assigns
+        rank r to the r-th url and runs rank r as that instance's leader, so
+        every rank serves the address it reserved itself. Only ctx servers are
+        listed: the gen servers are separate sruns, outside this MPI world.
+        """
+        reserved_dir = os.path.join(self._hostnames_dir(server_idx), "dwdp_reserved")
+        deadline = time.time() + self.timeout
+        urls = []
+        for rank in range(world_size):
+            path = os.path.join(reserved_dir, f"{rank}.txt")
+            urls.append(wait_for_reported_addr(path, max(1, int(deadline - time.time()))))
+
+        # Same LLM args a plain ctx server gets from its --config file, with
+        # the speculative model / load balancer paths already resolved.
+        # model_path is set by to_cmd(), which get_commands() runs first.
+        ctx_args = yaml.safe_load(ctx_cfg.generate_extra_llm_api_config()) or {}
+        ctx_args["backend"] = ctx_cfg.backend
+        worker_config = {
+            "model": ctx_cfg.model_path,
+            "backend": ctx_cfg.backend,
+            "internal_request_auth_key": self.internal_request_auth_key,
+            "context_servers": {**ctx_args, "num_instances": world_size, "urls": urls},
+            "generation_servers": {"num_instances": 0},
+        }
+        config_path = self._dwdp_mpi_worker_config_path(server_idx)
+        tmp_path = f"{config_path}.tmp"
+        with open(tmp_path, "w") as f:
+            yaml.dump(worker_config, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, config_path)
+        print_info(f"DWDP ctx MPI worker config {config_path} generated for {world_size} ranks")
+        return config_path
+
+    def _run_dwdp_ctx_worker(
+        self,
+        server_idx: int,
+        configs_for_idx: Optional[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]],
+        benchmark_status_file: str,
+    ) -> None:
+        """Run one rank of the MPI step hosting every ctx server of a DWDP case.
+
+        DWDP shares expert weights between the ctx servers over MPI, so they
+        must be ranks of one MPI world rather than one srun each. This task is
+        world rank r and ctx server r: it reserves a port, publishes it as
+        CTX_<r>.txt (the hostname file the disagg server reads), and starts
+        `trtllm-serve disaggregated_mpi_worker`, which joins MPI_COMM_WORLD.
+        dwdp_ctx_rank.sh kept this task's MPI identity away from pytest, so it
+        is handed to the child unclaimed.
+        """
+        if configs_for_idx is None:
+            raise RuntimeError(f"No server config for server index {server_idx}")
+        ctx_cfg, _, _ = configs_for_idx
+        saved_env = dwdp_saved_env(os.environ)
+        rank, world_size = self._dwdp_ctx_rank(saved_env)
+        if world_size != self.num_ctx_servers:
+            raise RuntimeError(
+                f"DWDP ctx step has {world_size} tasks but the config declares "
+                f"{self.num_ctx_servers} ctx servers"
+            )
+
+        # disaggregated_mpi_worker needs each instance's port in its config
+        # before any rank starts, so port 0 + --report_addr cannot be used.
+        # The reservation stays bound until the server binds the same port.
+        worker_port = reserve_mpi_worker_port(self.hostname)
+        publish_addr_file(
+            os.path.join(self._hostnames_dir(server_idx), "dwdp_reserved", f"{rank}.txt"),
+            self.hostname,
+            worker_port,
+        )
+        if rank == 0:
+            config_path = self._write_dwdp_mpi_worker_config(server_idx, ctx_cfg, world_size)
+        else:
+            config_path = self._dwdp_mpi_worker_config_path(server_idx)
+            self._wait_for_config_file(config_path, timeout=self.timeout)
+        # The disagg server polls for CTX*/GEN* files; publish only once the
+        # config exists so it never counts a rank whose step cannot start.
+        publish_addr_file(
+            self._hostname_file(server_idx, f"CTX_{rank}"), self.hostname, worker_port
+        )
+
+        server_cmd = []
+        if configs_for_idx[2].numa_bind:
+            server_cmd = ["numactl", "-m 0,1"]
+        server_cmd += ["trtllm-serve", "disaggregated_mpi_worker", "-c", config_path]
+        server_log = os.path.join(self.test_output_dir, f"trtllm-serve.CTX_{rank}.{server_idx}.log")
+        worker_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(DWDP_SAVED_ENV_PREFIX)
+        }
+        worker_env.update(saved_env)
+        worker_env.update(ctx_cfg.to_env())
+        server_proc = None
+        try:
+            print_info(f"Starting DWDP ctx rank {rank}/{world_size}. cmd is {server_cmd}")
+            with open(server_log, "w") as log_file:
+                server_proc = subprocess.Popen(
+                    server_cmd, env=worker_env, stdout=log_file, stderr=subprocess.STDOUT
+                )
+                self.wait_for_benchmark_ready(
+                    benchmark_status_file, server_proc=server_proc, server_log=server_log
+                )
+        finally:
+            print_info(f"DWDP ctx rank {rank} stopped")
+            if server_proc is not None:
+                server_proc.terminate()
+                server_proc.wait()
+
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
@@ -2888,7 +3538,9 @@ class DisaggTestCmds(NamedTuple):
         configs_for_idx = (
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
-        if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
+        if self.disagg_serving_type == DWDP_CTX_SERVING_TYPE:
+            self._run_dwdp_ctx_worker(server_idx, configs_for_idx, benchmark_status_file)
+        elif "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             hostname_file = self._hostname_file(server_idx)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
@@ -2958,11 +3610,7 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
-                # _hostnames_dir is scoped by job, so a new job never sees an
-                # older one's files, but a retry within the same job and the
-                # same server_idx would. Drop the previous attempt's address
-                # first, or the BENCHMARK task connects to a dead port. This
-                # task owns the file exclusively, so removing it here is safe.
+                # Drop a stale address from a retry so BENCHMARK never sees a dead port.
                 disagg_addr_path = self._disagg_server_addr_file(server_idx)
                 if os.path.exists(disagg_addr_path):
                     os.remove(disagg_addr_path)
@@ -3017,7 +3665,10 @@ class DisaggTestCmds(NamedTuple):
             # is the single master switch), so there is no second predicate to
             # keep in sync with it.
             collect_time_breakdown = bool(self.perf_metrics_output_dir)
+            # Filled only when the connection warmup ran with the time breakdown on.
+            connection_warmup_line_counts: Dict[str, int] = {}
             try:
+                self._remove_stale_connection_warmup_log(server_idx)
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
@@ -3031,6 +3682,18 @@ class DisaggTestCmds(NamedTuple):
                 )
                 observations = self._collect_worker_startup_observations(server_idx)
                 write_startup_observations(self.test_output_dir, server_idx, observations)
+
+                measured_client = self._measured_client_for_connection_warmup(server_idx)
+                if measured_client is not None:
+                    num_succeeded_connection_warmup_requests = self._run_connection_warmup(
+                        server_idx, disagg_server_hostname, disagg_server_port, measured_client
+                    )
+                    if collect_time_breakdown:
+                        connection_warmup_line_counts = (
+                            self._wait_for_connection_warmup_line_counts(
+                                num_succeeded_connection_warmup_requests
+                            )
+                        )
 
                 client_configs = self.client_configs.get(server_idx, [])
 
@@ -3099,6 +3762,19 @@ class DisaggTestCmds(NamedTuple):
                                     "benchmark_file_path": benchmark_file_path,
                                     "start_offsets": gen_log_start_offsets,
                                     "end_offsets": None,
+                                    # Only the gen_only modes reach a steady
+                                    # state the config determines; e2e keeps
+                                    # the modal bucket.
+                                    "expected_ngen": (
+                                        expected_gen_only_ngen(
+                                            configs_for_idx[1],
+                                            client_config.concurrency,
+                                            self.num_gen_servers,
+                                        )
+                                        if benchmark_mode_for_idx in GEN_ONLY_MODES
+                                        and client_config is not None
+                                        else None
+                                    ),
                                 }
                             )
                         if collect_time_breakdown:
@@ -3160,12 +3836,291 @@ class DisaggTestCmds(NamedTuple):
             # instead of rescanning the log. Modes outside the tuple leave the
             # queue empty and skip both steps.
             self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
-            self._append_time_breakdown_metrics(pending_time_breakdown, outputs)
+            self._append_time_breakdown_metrics(
+                pending_time_breakdown,
+                outputs,
+                leading_lines_to_skip=connection_warmup_line_counts,
+            )
 
         return outputs
 
     def get_cmd_str(self, server_idx: int) -> List[str]:
         return ["multi-node disaggregated server tests, please check config files"]
+
+
+class AggrGenOnlyNoContextCmds(NamedTuple):
+    """Commands for gen_only_no_context: one gen worker, a proxy, no ctx fleet."""
+
+    server_cmds: List[Tuple[List[str], List[str]]]
+    client_cmds: Dict[int, List[List[str]]]
+    timeout: int
+    num_gen_servers: int
+    output_dir: str
+    test_output_dir: str
+    model_name: str = ""
+    internal_request_auth_key: str = ""
+    client_configs: Dict[int, List["ClientConfig"]] = {}
+    server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
+    router_config: Optional[dict] = None
+    gen_router_config: Optional[dict] = None
+    server_config_extra: Optional[dict] = None
+    perf_metrics_output_dir: str = ""
+
+    def _gen_worker_log(self, server_idx: int, gen_idx: int = 0) -> str:
+        return os.path.join(self.test_output_dir, f"gen_server_{gen_idx}.log")
+
+    def get_server_logs(self, server_idx: int) -> List[str]:
+        """Logs wait_for_endpoint_ready scans for a fatal error while polling."""
+        server_logs = [self._gen_worker_log(server_idx, i) for i in range(self.num_gen_servers)]
+        server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
+        server_logs.extend(
+            sorted(
+                glob.glob(
+                    os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log")
+                )
+            )
+        )
+        return server_logs
+
+    def _write_proxy_config(self, server_idx: int, gen_urls: List[str]) -> str:
+        """Write the proxy's config: zero context servers, one generation server."""
+        server_config = {
+            "hostname": "localhost",
+            "port": 0,
+            "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
+            "context_servers": {
+                "num_instances": 0,
+                "urls": [],
+            },
+            "generation_servers": {
+                "num_instances": self.num_gen_servers,
+                "urls": gen_urls,
+            },
+        }
+        if self.router_config:
+            server_config["generation_servers"]["router"] = copy.deepcopy(self.router_config)
+        if self.gen_router_config:
+            server_config["generation_servers"]["router"] = copy.deepcopy(self.gen_router_config)
+        if self.server_config_extra:
+            reserved = {
+                "port",
+                "hostname",
+                "internal_request_auth_key",
+                "context_servers",
+                "generation_servers",
+            }
+            clobbered = sorted(reserved & set(self.server_config_extra))
+            if clobbered:
+                raise RuntimeError(
+                    f"server_config_extra may not override harness-owned keys {clobbered}: "
+                    "the port is kernel-assigned and reported back via --report_addr, and "
+                    "the server urls are discovered at runtime."
+                )
+            server_config.update(copy.deepcopy(self.server_config_extra))
+        if self.perf_metrics_output_dir:
+            server_config["perf_metrics_output_dir"] = self.perf_metrics_output_dir
+        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+        with open(config_path, "w") as config_file:
+            yaml.dump(server_config, config_file)
+        print_info(f"Server config file {config_path} generated")
+        return config_path
+
+    def run_cmd(self, server_idx: int) -> List[str]:
+        """Start the gen worker, then the proxy, then run every client."""
+        outputs = []
+        gen_cmd, disagg_cmd = self.server_cmds[server_idx]
+        configs_for_idx = (
+            self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
+        )
+        gen_cfg = configs_for_idx[1] if configs_for_idx is not None else None
+        disagg_cfg = configs_for_idx[2] if configs_for_idx is not None else None
+
+        pending_device_step_time: List[dict] = []
+        pending_time_breakdown: List[dict] = []
+        collect_time_breakdown = bool(self.perf_metrics_output_dir)
+
+        gen_proc = None
+        proxy_proc = None
+        try:
+            num_frontends = getattr(gen_cfg, "num_serve_frontends", 1) or 1
+            gen_addr_path = os.path.join(self.test_output_dir, f"GEN_0.{server_idx}.addr")
+            if os.path.exists(gen_addr_path):
+                os.remove(gen_addr_path)
+            if num_frontends > 1:
+                # trtllm-serve refuses port 0 / --report_addr with several
+                # frontends, so reserve the port here and publish it on the
+                # worker's behalf, as DisaggTestCmds does for its workers.
+                gen_port = reserve_multi_frontend_port("localhost")
+                gen_cmd_with_port = add_host_port_to_cmd(gen_cmd, "localhost", gen_port)
+                publish_addr_file(gen_addr_path, "localhost", gen_port)
+            else:
+                gen_cmd_with_port = add_host_port_to_cmd(gen_cmd, "localhost", 0) + [
+                    "--report_addr",
+                    gen_addr_path,
+                ]
+            print_info(f"Starting gen worker. cmd is {gen_cmd_with_port}")
+            gen_log_path = self._gen_worker_log(server_idx)
+            gen_env = copy.deepcopy(os.environ)
+            if gen_cfg is not None:
+                gen_env.update(gen_cfg.to_env())
+            # With zero context servers, both the gen worker and the proxy must run
+            # in benchmark gen-only mode, whichever launcher started this test.
+            gen_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
+            with open(gen_log_path, "a") as gen_ctx:
+                gen_proc = subprocess.Popen(
+                    gen_cmd_with_port,
+                    env=gen_env,
+                    stdout=gen_ctx,
+                    stderr=subprocess.STDOUT,
+                )
+                gen_host, gen_port = wait_for_reported_addr(gen_addr_path, self.timeout, gen_proc)
+
+                self._write_proxy_config(server_idx, [f"{gen_host}:{gen_port}"])
+                proxy_addr_path = os.path.join(
+                    self.test_output_dir, f"DISAGG_SERVER.{server_idx}.addr"
+                )
+                if os.path.exists(proxy_addr_path):
+                    os.remove(proxy_addr_path)
+                proxy_cmd = disagg_cmd + ["--report_addr", proxy_addr_path]
+                print_info(f"Starting disagg proxy. cmd is {proxy_cmd}")
+                proxy_log_path = os.path.join(self.test_output_dir, "disagg_server.log")
+                proxy_env = copy.deepcopy(os.environ)
+                if disagg_cfg is not None:
+                    proxy_env.update(to_env_dict(disagg_cfg.server_env_var))
+                proxy_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
+                with open(proxy_log_path, "w") as proxy_ctx:
+                    proxy_proc = subprocess.Popen(
+                        proxy_cmd,
+                        env=proxy_env,
+                        stdout=proxy_ctx,
+                        stderr=subprocess.STDOUT,
+                    )
+                    proxy_host, proxy_port = wait_for_reported_addr(
+                        proxy_addr_path, self.timeout, proxy_proc
+                    )
+                    wait_for_endpoint_ready(
+                        f"http://{proxy_host}:{proxy_port}/health",
+                        timeout=min(
+                            self.timeout,
+                            server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG"),
+                        ),
+                        check_files=self.get_server_logs(server_idx),
+                        server_proc=proxy_proc,
+                    )
+                    observation = collect_startup_observation(
+                        f"{gen_host}:{gen_port}",
+                        [gen_log_path],
+                        "gen",
+                        "GEN_0",
+                    )
+                    write_startup_observations(self.test_output_dir, server_idx, [observation])
+
+                    client_configs = self.client_configs.get(server_idx, [])
+                    for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
+                        client_config = (
+                            client_configs[client_idx] if client_idx < len(client_configs) else None
+                        )
+                        only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
+                        if only_run_accuracy:
+                            print_info(
+                                f"Skipping perf benchmark for client {client_idx}: "
+                                "only_run_accuracy=True"
+                            )
+                            outputs.append("")
+                            continue
+
+                        benchmark_file_path = os.path.join(
+                            self.test_output_dir,
+                            f"trtllm-benchmark.{server_idx}.{client_idx}.log",
+                        )
+                        client_cmd_with_port = add_host_port_to_cmd(
+                            client_cmd, proxy_host, proxy_port
+                        )
+                        print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
+
+                        gen_log_start_offsets = gen_worker_log_sizes(
+                            self.test_output_dir, self.num_gen_servers
+                        )
+                        if pending_device_step_time:
+                            pending_device_step_time[-1]["end_offsets"] = gen_log_start_offsets
+
+                        bench_env = copy.deepcopy(os.environ)
+                        if client_config:
+                            bench_env.update(client_config.to_env())
+                        bench_env["TRTLLM_AGENTX_ARTIFACT_DIR"] = os.path.join(
+                            self.test_output_dir, f"agentx.{server_idx}.{client_idx}"
+                        )
+                        output = _run_benchmark_with_log(
+                            client_cmd_with_port,
+                            bench_env,
+                            benchmark_file_path,
+                        )
+                        outputs.append(output)
+                        pending_device_step_time.append(
+                            {
+                                "output_index": len(outputs) - 1,
+                                "benchmark_file_path": benchmark_file_path,
+                                "start_offsets": gen_log_start_offsets,
+                                "end_offsets": None,
+                                # One gen worker, by construction of this mode.
+                                "expected_ngen": (
+                                    expected_gen_only_ngen(gen_cfg, client_config.concurrency, 1)
+                                    if client_config is not None
+                                    else None
+                                ),
+                            }
+                        )
+                        if collect_time_breakdown:
+                            pending_time_breakdown.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "benchmark_mode": GEN_ONLY_NO_CONTEXT_MODE,
+                                    "warmup": bool(client_config and client_config.warmup),
+                                    "expected_requests": (
+                                        client_config.num_requests if client_config else 0
+                                    ),
+                                }
+                            )
+
+                    # Prefer the per-client AccuracyConfig, falling back to ACCURACY_CONFIG_JSON.
+                    accuracy_cfg = None
+                    if client_configs and client_configs[0].accuracy_config:
+                        accuracy_cfg = client_configs[0].accuracy_config
+                    else:
+                        acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
+                        if acc_cfg_json:
+                            import json as _json
+
+                            accuracy_cfg = AccuracyConfig.from_dict(_json.loads(acc_cfg_json))
+
+                    if accuracy_cfg and accuracy_cfg.enable_accuracy_test:
+                        accuracy_cfg.run(
+                            model_name=self.model_name,
+                            server_hostname=proxy_host,
+                            server_port=proxy_port,
+                            output_dir=self.test_output_dir,
+                            server_idx=server_idx,
+                        )
+        finally:
+            for proc, name in ((proxy_proc, "disagg proxy"), (gen_proc, "gen worker")):
+                if proc:
+                    print_info(f"Stopping {name}")
+                    proc.terminate()
+                    proc.wait()
+
+        append_gen_worker_device_step_time(
+            self.test_output_dir,
+            self.num_gen_servers,
+            pending_device_step_time,
+            outputs,
+        )
+        append_time_breakdown_metrics(pending_time_breakdown, outputs, self.perf_metrics_output_dir)
+        return outputs
+
+    def get_cmd_str(self, server_idx: int) -> List[str]:
+        return ["gen_only_no_context tests, please check config files"]
 
 
 def parse_select_pattern(select_pattern: str) -> list:
@@ -3200,8 +4155,9 @@ def parse_test_string(test_case_name: str):
 
     Test name formats:
     - Disagg: disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
-    - ctx_only: aggr_upload-ctx_only[-{modifier}]-{config_base} (runs aggr mode
-      but reads disagg config)
+    - ctx_only / gen_only_no_context:
+      aggr_upload-{ctx_only|gen_only_no_context}[-{modifier}]-{config_base}
+      (runs the aggregated launch path but reads a disagg config)
     - Regular aggr: aggr_upload-{config}-{server_name}
 
     The modifier segment is optional and drawn from the closed TEST_ID_MODIFIERS
@@ -3213,7 +4169,7 @@ def parse_test_string(test_case_name: str):
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode,
                 time_breakdown)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (normal aggr)
+            - benchmark_mode: a DISAGG_CONFIG_MODES member, or None (normal aggr)
             - time_breakdown: True when the time_breakdown modifier is present
     """
     labels = test_case_name.split("-")
@@ -3243,16 +4199,20 @@ def parse_test_string(test_case_name: str):
         if len(labels) <= 2:
             raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
         benchmark_mode = labels[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
-            raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
+            raise ValueError(
+                f"Invalid benchmark_mode for disagg: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
+            )
         runtime_mode = "disaggregated"
         time_breakdown, config_base_name = split_modifiers(labels[2:])
         select_pattern = None
     elif is_aggr_prefix:
-        # Check if this is ctx_only (aggr_upload-ctx_only[-{modifier}]-{config_base})
-        if len(labels) > 2 and labels[1] == "ctx_only":
+        # Check if this is a disagg config on the aggregated path
+        # (aggr_upload-{mode}[-{modifier}]-{config_base})
+        if len(labels) > 2 and labels[1] in AGGREGATED_DISAGG_YAML_MODES:
             # Runs in aggregated mode but reads disagg config
-            benchmark_mode = "ctx_only"
+            benchmark_mode = labels[1]
             runtime_mode = "aggregated"
             time_breakdown, config_base_name = split_modifiers(labels[2:])
             select_pattern = None
@@ -3274,12 +4234,12 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
     """Get config directory based on benchmark_mode.
 
     Args:
-        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+        benchmark_mode: a DISAGG_CONFIG_MODES member, or None (for normal aggr)
 
     Returns:
         str: Absolute config directory path
     """
-    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+    if benchmark_mode in DISAGG_CONFIG_MODES:
         config_dir = DISAGG_CONFIG_FOLDER
     else:
         config_dir = AGG_CONFIG_FOLDER
@@ -3336,7 +4296,9 @@ class PerfSanityTestConfig:
         ) = parse_test_string(test_case_name)
 
         # Set runtime based on parsed result
-        if runtime == "disaggregated":
+        if self.benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+            self.runtime = GEN_ONLY_NO_CONTEXT_RUNTIME
+        elif runtime == "disaggregated":
             self.runtime = "multi_node_disagg_server"
         else:
             self.runtime = "aggr_server"
@@ -3356,10 +4318,9 @@ class PerfSanityTestConfig:
         config_file_path = os.path.join(self.config_dir, self.config_file)
 
         # benchmark_mode determines which parser to use:
-        # - e2e, gen_only, ctx_only: use _parse_disagg_config_file (reads disagg
-        #   config)
+        # - DISAGG_CONFIG_MODES: use _parse_disagg_config_file (reads disagg config)
         # - None (normal aggr): use _parse_aggr_config_file
-        if self.benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+        if self.benchmark_mode in DISAGG_CONFIG_MODES:
             self._parse_disagg_config_file(config_file_path, self.config_file)
         else:
             # Normal aggregated mode
@@ -3432,9 +4393,12 @@ class PerfSanityTestConfig:
     def _parse_disagg_config_file(self, config_file_path: str, config_file: str):
         """Parse YAML config file for disaggregated server.
 
-        This method handles e2e, gen_only, and ctx_only modes.
+        This method handles every DISAGG_CONFIG_MODES member: e2e, gen_only,
+        ctx_only and gen_only_no_context.
         For ctx_only: output is on par with _parse_aggr_config_file (single ServerConfig),
                      OSL is set to 1, and cache_transceiver_config is ignored.
+        For gen_only_no_context: both server counts come from
+                     gen_only_no_context_server_counts() rather than the YAML.
         """
         disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK")
 
@@ -3462,11 +4426,12 @@ class PerfSanityTestConfig:
         # The mode segments of the test id, reused verbatim as the config name so
         # s_test_case_name reverses back into a runnable pytest id.
         test_label = format_test_label(benchmark_mode, self.time_breakdown)
-        if benchmark_mode == "gen_only":
-            # Check if it's gen_only_no_context from config
-            config_mode = benchmark.get("mode", "e2e")
-            if "gen_only_no_context" in config_mode:
-                hardware["num_ctx_servers"] = 0
+        # Check if it's gen_only_no_context from the test id or the config
+        if is_gen_only_no_context(benchmark_mode, config):
+            (
+                hardware["num_ctx_servers"],
+                hardware["num_gen_servers"],
+            ) = gen_only_no_context_server_counts()
 
         worker_env_var = environment.get("worker_env_var", "")
         # Optional per-role env vars appended to the shared worker_env_var so
@@ -3500,7 +4465,7 @@ class PerfSanityTestConfig:
             concurrency_values = [int(concurrency_str)]
 
         # Gen only mode only runs the first concurrency
-        if benchmark_mode == "gen_only":
+        if benchmark_mode in GEN_ONLY_MODES:
             concurrency_values = [concurrency_values[0]]
 
         # Handle ctx_only mode specially - output should be on par with _parse_aggr_config_file
@@ -3509,6 +4474,19 @@ class PerfSanityTestConfig:
             ctx_config = dict(worker_config.get("ctx", {}))
             # Ignore cache_transceiver_config for ctx_only
             ctx_config.pop("cache_transceiver_config", None)
+            dwdp_size = dwdp_ctx_size(worker_config)
+            if dwdp_size:
+                # A DWDP ctx side is num_ctx_servers one-GPU servers sharing
+                # experts. Aggregated, the same group is one server with
+                # attention DP over all of them: every rank stays a complete
+                # replica with one expert slice, which DWDP requires. The MoE
+                # parallel sizes stay as configured; DWDP overrides them to 1 in
+                # Mapping. The launch script sizes the job by
+                # ctx_only_world_size().
+                ctx_config.update(
+                    tensor_parallel_size=hardware.get("num_ctx_servers", dwdp_size),
+                    enable_attention_dp=True,
+                )
 
             # Create server config for ctx_only (single ServerConfig, not tuple)
             ctx_server_config_data = {
@@ -3588,17 +4566,24 @@ class PerfSanityTestConfig:
                 gen_router_config=gen_router_config,
                 server_config_extra=server_config_extra,
                 checkpoint_io_experiment=checkpoint_io_experiment,
+                dwdp_size=dwdp_ctx_size(worker_config),
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
             self.server_configs = [(ctx_server_config, gen_server_config, disagg_config)]
 
         # Create client configs for each concurrency value
-        # For ctx_only: OSL is set to 1 and dataset_file is empty
-        osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
-        dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
-        use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
+        # For ctx_only: OSL is set to 1 and dataset_file is empty, except for
+        # the agentx client, whose dataset is the trace being replayed: it keeps
+        # the trace and caps every turn's output to the one token osl == 1 asks for.
         benchmark_client = benchmark.get("benchmark_client", "")
+        osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
+        dataset_file = (
+            ""
+            if benchmark_mode == "ctx_only" and benchmark_client != AGENTX_BENCHMARK_CLIENT
+            else benchmark.get("dataset_file", "")
+        )
+        use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
         if benchmark_client not in ("", AGENTX_BENCHMARK_CLIENT):
             # There is no schema validation on these yamls, so an unrecognised
             # value would otherwise fall through to the default client and
@@ -3653,12 +4638,15 @@ class PerfSanityTestConfig:
         accuracy_data = config.get("accuracy") or None
         only_run_accuracy = bool(benchmark.get("only_run_accuracy", False))
 
+        if benchmark_mode == "ctx_only" and benchmark_client == AGENTX_BENCHMARK_CLIENT:
+            client_env_var = agentx_ctx_only_client_env(client_env_var)
+
         client_configs = []
         for concurrency in concurrency_values:
             client_config_data = {
                 "concurrency": concurrency,
                 "iterations": 1
-                if benchmark_mode == "gen_only"
+                if benchmark_mode in GEN_ONLY_MODES
                 else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
@@ -3768,6 +4756,8 @@ class PerfSanityTestConfig:
         self.test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
         os.makedirs(self.test_output_dir, exist_ok=True)
 
+        if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
+            return self._get_gen_only_no_context_commands(self._output_dir, self.test_output_dir)
         # ctx_only runs in aggregated mode (uses _get_aggr_commands)
         if self.runtime == "aggr_server":
             return self._get_aggr_commands(self._output_dir, self.test_output_dir)
@@ -3884,6 +4874,67 @@ class PerfSanityTestConfig:
             internal_request_auth_key=disagg_config.internal_request_auth_key,
             router_config=disagg_config.router_config,
             ctx_router_config=disagg_config.ctx_router_config,
+            gen_router_config=disagg_config.gen_router_config,
+            server_config_extra=disagg_config.server_config_extra,
+            client_configs=self.server_client_configs,
+            server_configs=list(self.server_configs),
+            perf_metrics_output_dir=self.time_breakdown_dir(),
+            dwdp_size=disagg_config.dwdp_size,
+        )
+
+    def _get_gen_only_no_context_commands(self, output_dir: str, test_output_dir: str):
+        """Get commands for gen_only_no_context: one gen worker plus a proxy."""
+        server_cmds = []
+        client_cmds = {}
+
+        for server_idx, (_ctx_config, gen_config, disagg_config) in enumerate(self.server_configs):
+            numa_bind = disagg_config.numa_bind
+            timeout = disagg_config.timeout
+
+            if disagg_config.num_gen_servers != gen_only_no_context_server_counts()[1]:
+                raise ValueError(
+                    f"{GEN_ONLY_NO_CONTEXT_MODE} launches exactly "
+                    f"{gen_only_no_context_server_counts()[1]} gen server, got "
+                    f"{disagg_config.num_gen_servers}: the config tuple was built "
+                    f"without _parse_disagg_config_file's override."
+                )
+
+            gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
+            config_content = gen_config.generate_extra_llm_api_config()
+            config_path = os.path.join(
+                test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
+            )
+            with open(config_path, "w") as f:
+                f.write(config_content)
+
+            disagg_cmd = [
+                "trtllm-serve",
+                "disaggregated",
+                "-c",
+                f"{test_output_dir}/server_config.{server_idx}.yaml",
+                "-t",
+                str(timeout),
+                "-r",
+                str(timeout),
+            ]
+
+            server_cmds.append((gen_cmd, disagg_cmd))
+
+            client_cmds[server_idx] = []
+            for client_config in self.server_client_configs[server_idx]:
+                client_cmds[server_idx].append(client_config.to_cmd())
+
+        disagg_config = self.server_configs[0][2]
+        return AggrGenOnlyNoContextCmds(
+            server_cmds=server_cmds,
+            client_cmds=client_cmds,
+            timeout=disagg_config.timeout,
+            num_gen_servers=disagg_config.num_gen_servers,
+            output_dir=output_dir,
+            test_output_dir=test_output_dir,
+            model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
+            router_config=disagg_config.router_config,
             gen_router_config=disagg_config.gen_router_config,
             server_config_extra=disagg_config.server_config_extra,
             client_configs=self.server_client_configs,
@@ -4079,17 +5130,17 @@ class PerfSanityTestConfig:
                 # the mean alone is sufficient: all five statistics come from the same
                 # _DeviceStepTimeStats, so the mean is absent only if all of them are.
                 #
-                # Deliberately gen_only and not every mode in
-                # DEVICE_STEP_TIME_MODES. In gen_only this family is the only
-                # regression signal, so losing it makes the run pointless. In e2e
-                # it is diagnostic and throughput still gates, so an absent value
-                # costs five columns on one row; hard-failing there would turn a
-                # diagnostic addition into a new red-build mode for every e2e
-                # case on every cluster, gated on log-scrape plumbing rather than
-                # on performance.
+                # Deliberately GEN_ONLY_MODES and not every mode in
+                # DEVICE_STEP_TIME_MODES. In the gen_only modes this family is
+                # the only regression signal, so losing it makes the run
+                # pointless. In e2e it is diagnostic and throughput still gates,
+                # so an absent value costs five columns on one row; hard-failing
+                # there would turn a diagnostic addition into a new red-build
+                # mode for every e2e case on every cluster, gated on log-scrape
+                # plumbing rather than on performance.
                 if (
-                    self.runtime == "multi_node_disagg_server"
-                    and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
+                    self.runtime in DISAGG_CONFIG_RUNTIMES
+                    and self.server_configs[server_idx][2].benchmark_mode in GEN_ONLY_MODES
                     and (
                         not metrics
                         or metrics.get("mean_gen_worker_per_iter_device_step_time") is None
@@ -4202,9 +5253,12 @@ class PerfSanityTestConfig:
                     startup_primary_row_pending = False
                     cmd_idx += 1
 
-        elif self.runtime == "multi_node_disagg_server":
+        elif self.runtime in DISAGG_CONFIG_RUNTIMES:
             # Only BENCHMARK node uploads
-            if self.server_configs[0][2].disagg_serving_type != "BENCHMARK":
+            if (
+                self.runtime == "multi_node_disagg_server"
+                and self.server_configs[0][2].disagg_serving_type != "BENCHMARK"
+            ):
                 return
 
             new_data_dict = {}
@@ -4241,7 +5295,7 @@ class PerfSanityTestConfig:
 
                     new_data = {
                         "s_gpu_type": self.gpu_type,
-                        "s_runtime": "multi_node_disagg_server",
+                        "s_runtime": self.runtime,
                         # The composed label, not the bare mode, so a
                         # time_breakdown run stays distinguishable by this field
                         # alone. It is reported, never matched on.
@@ -4313,14 +5367,15 @@ class PerfSanityTestConfig:
         # token throughput (token-based numbers are dominated by KV cache transfer
         # time in gen_only mode and are not a useful regression signal there).
         # For all other modes, d_al is added when any client runs spec decoding.
-        if self.runtime == "multi_node_disagg_server" and any(
-            sc[2].benchmark_mode == "gen_only" for sc in self.server_configs
+        if self.runtime in DISAGG_CONFIG_RUNTIMES and any(
+            sc[2].benchmark_mode in GEN_ONLY_MODES for sc in self.server_configs
         ):
             # See GEN_ONLY_REGRESSION_METRICS for why the median is gated too.
             # It has no baseline history yet, and check_regression skips any
             # metric whose baseline is absent or non-positive, so it stays inert
             # until enough runs accrue -- it cannot fail a build before then.
             regression_metrics = list(GEN_ONLY_REGRESSION_METRICS)
+            metric_history_floors_ms = GEN_ONLY_METRIC_HISTORY_FLOORS_MS
         else:
             # e2e lands here and keeps the throughput
             # metrics. They upload the same five device-step-time statistics, but
@@ -4330,6 +5385,7 @@ class PerfSanityTestConfig:
             # meaningful signal and already gates, and device step time is there
             # to attribute a regression rather than to declare one.
             regression_metrics = list(REGRESSION_METRICS)
+            metric_history_floors_ms = None
             has_spec_decoding = any(
                 cc.spec_decoding
                 for clients in self.server_client_configs.values()
@@ -4347,6 +5403,7 @@ class PerfSanityTestConfig:
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
             fail_on_regression=fail_on_regression,
+            metric_history_floors_ms=metric_history_floors_ms,
         )
 
 
@@ -4433,9 +5490,10 @@ def get_disagg_test_cases() -> List[str]:
                 label = format_test_label("e2e", time_breakdown=True)
                 test_cases.append(f"{test_type}-{label}-{config_yml}")
 
-        # ctx_only test cases (uses aggr prefix)
+        # ctx_only and gen_only_no_context test cases (use aggr prefix)
         for test_type in AGG_TEST_TYPES:
             test_cases.append(f"{test_type}-ctx_only-{config_yml}")
+            test_cases.append(f"{test_type}-{GEN_ONLY_NO_CONTEXT_MODE}-{config_yml}")
             # Allowlisted, for the same reason the e2e ids are.
             if config_yml in CTX_ONLY_TIME_BREAKDOWN_CONFIGS:
                 label = format_test_label("ctx_only", time_breakdown=True)

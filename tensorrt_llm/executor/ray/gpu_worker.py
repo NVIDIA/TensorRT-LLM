@@ -15,7 +15,6 @@
 import gc
 import importlib
 import os
-import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
@@ -27,13 +26,13 @@ import torch
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag)
-from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
+                                             control_action_decorator)
 
 from ... import TorchLlmArgs
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
-from ...sampling_params import BatchedLogitsProcessor
 from ..base_worker import BaseWorker
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
@@ -73,9 +72,7 @@ class RayWorkerWrapper:
         self.gpu = int(ray.get_gpu_ids()[0])
         self.local_gpu = self.physical_to_local_id(self.gpu)
 
-        # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
-        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
-            tempfile.gettempdir(), f"deep_gemm_rank{rank}_gpu{self.gpu}")
+        _configure_deep_gemm_cache(rank, self.gpu)
 
         torch.cuda.set_device(self.local_gpu)
 
@@ -256,8 +253,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
     def __init__(
         self,
         device_id: int,
-        engine: Path,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         hf_model_dir: Optional[Path] = None,
@@ -270,8 +265,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         from tensorrt_llm.logger import logger
 
         super().__init__(
-            engine=engine,
-            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
@@ -306,8 +299,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
-    @control_action_decorator
-    def sleep(self, sleep_tags: List[str]):
+    def sleep(self, sleep_tags: List[str]) -> None:
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
 
@@ -315,17 +307,35 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        tags = self._prepare_sleep_tags(tags)
+        if not tags:
+            return
+        self._validate_sleep_tags(tags)
+
+        logger.info(f"Sleep: {tags}")
+        self.engine.begin_sleep_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
-            logger.info(f"Sleep: {tags}")
-            torch.cuda.synchronize()
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Encountered an error in sleep: {e}")
-            raise e
+            with self.engine.control_action():
+                torch.cuda.synchronize()
+                mutation_started = True
+                self._invalidate_v1_prefix_cache_for_sleep(tags)
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_sleep_transition()
+            logger.exception("Encountered an error in sleep")
+            raise
+        try:
+            self.engine.complete_sleep_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
@@ -336,15 +346,30 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        tags = self._prepare_wakeup_tags(tags)
+        if not tags:
+            return
+
+        logger.info(f"Wakeup: {tags}")
+        self.engine.begin_wakeup_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
-            logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
+            mutation_started = True
             materialize_with_tag(*tags)
             torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in wakeup")
-            raise e
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_wakeup_transition()
+            logger.exception("Encountered an error in wakeup")
+            raise
+        try:
+            self.engine.complete_wakeup_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def start(self):
         pass
@@ -391,19 +416,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         logger.debug(f"Worker {self.rank} shutdown done.")
 
-    def _get_comm_ranks_device_id(self):
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        comm_ranks = [None] * world_size
-        device_ids = [None] * world_size
-
-        torch.distributed.all_gather_object(comm_ranks, global_rank)
-        torch.distributed.all_gather_object(device_ids, self.device_id)
-
+    def _configure_device(self):
         configure_cpu_affinity(self.device_id)
-
-        return comm_ranks, device_ids
 
     def __enter__(self):
         return self

@@ -38,8 +38,8 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **High-throughput and low-latency deployments are provided.** DEP16 (`enable_attention_dp: true`, `moe_expert_parallel_size: 16`) is the high-throughput deployment. TEP16 (`enable_attention_dp: false`, `moe_expert_parallel_size: 16`) is the low-latency deployment. An 8-GPU deployment, TEP8 (`enable_attention_dp: false`, `moe_expert_parallel_size: 8`), is also provided. Select the deployment and concurrency appropriate for your workload.
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
-* **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) generation kernels.
-* **Speculative decoding and disaggregated serving are not yet available** for Kimi K3; support is under development. See the "Current limitations" section of `examples/kimi_k3/README.md`.
+* **`kv_cache_config.tokens_per_block` is `64`** — retained as the validated configuration. Earlier releases needed this page size to avoid a legacy MLA fallback that did not support Kimi K3's 96 query heads.
+* **Disaggregated serving and suffix-automaton speculative decoding are available.** Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see `examples/kimi_k3/disagg/README.md`. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the "Current limitations" section of `examples/kimi_k3/README.md` for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).
 
 ## Deployment Steps
 
@@ -201,7 +201,7 @@ These options are set within the YAML file passed to `trtllm-serve` via the `--c
 * **Options:**
   * `enable_block_reuse`: Off by default; set to `true` to enable prefix-cache reuse across requests.
   * `mamba_state_config.periodic_snapshot_interval`: With block reuse on, the KDA recurrent state is snapshotted every this many tokens so prefix hits can restore it (default `0` = snapshots off; hybrid models only expose reusable prefixes at snapshot boundaries, so set e.g. `256` for block reuse to engage; see `examples/kimi_k3/eval_extra_llm_options_reuse.yaml`).
-  * `tokens_per_block`: Must be `64`, required by the MLA (576, 512) generation kernels.
+  * `tokens_per_block`: `64` is the validated configuration; earlier releases needed it to avoid a legacy MLA fallback that did not support Kimi K3's 96 query heads.
   * `free_gpu_memory_fraction`: Fraction of free GPU memory reserved for the paged KV cache after model load. The configuration above uses `0.25` to leave runtime headroom. Lower it if you hit out-of-memory errors.
 
 #### `trust_remote_code`
@@ -281,7 +281,7 @@ sbatch --account <account> --partition batch --qos <qos> --time 04:00:00 \
     --task gsm8k --parallel tep
 ```
 
-The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. `KIMI_K3_FP8_WEIGHT_READ` defaults to `0`, which is the precision the reference scores were measured at.
+The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. The reference scores used BF16 shared/latent MLP projections, which remain the default (`KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0`). Set `KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1` to opt into lossy FP8 conversion of those projections. Attention projection datatypes follow the checkpoint quantization configuration.
 
 Measured on 16 GB200 GPUs (4 nodes, `100-real` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
 
@@ -391,5 +391,5 @@ The TEP16 point illustrates the low-latency deployment at small concurrency. The
 * **Job reaches its Slurm time limit before the model loads:** Weight loading for a checkpoint of this size is dominated by filesystem throughput; request a longer allocation (`--time=...`), particularly with cold caches or a busy filesystem.
 * **Model fails to load:** Make sure `trust_remote_code: true` is set and that the checkpoint path is a complete Hugging Face-format Kimi K3 checkpoint with its tokenizer files.
 * **`fla` / `einops` import errors:** Install the extra dependencies into the in-place environment: `.venv-3.12/bin/python -m pip install fla-core einops`.
-* **Accuracy looks off:** Confirm `tokens_per_block: 64` (a hard constraint for Kimi K3), and that the remaining settings match the tested configuration above.
+* **Accuracy looks off:** Confirm `tokens_per_block: 64` (the validated Kimi K3 page size; other values historically routed MLA decode to a TRTLLM-Gen path that did not support K3's 96 query heads), and that the remaining settings match the tested configuration above.
 * **GPU utilization:** For performance issues, check GPU utilization with `nvidia-smi` on the compute nodes while the server is running.

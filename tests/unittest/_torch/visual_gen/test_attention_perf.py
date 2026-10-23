@@ -36,24 +36,26 @@ from typing import Dict, Optional, Tuple
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention_backend import (
-    VSAMetadataBuilder,
-    set_vsa_forward_context,
-)
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
+    VSAMetadataBuilder,
+    set_vsa_forward_context,
 )
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     QuantAttentionConfig,
@@ -1080,7 +1082,9 @@ class TestVsaVsFa4KernelPerformance:
         block_size: int,
         sparsity: float,
     ):
-        from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import VSA_KERNEL_MAX_CUBES
+        from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.backend import (
+            VSA_KERNEL_MAX_CUBES,
+        )
 
         assert seq_len % block_size == 0, "seq_len must be a multiple of block_size"
         num_cubes = seq_len // block_size

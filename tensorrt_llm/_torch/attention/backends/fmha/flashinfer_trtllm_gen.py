@@ -392,7 +392,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+    def is_environment_available(cls) -> bool:
+        """Check dependencies and architecture before constructing an attention layer."""
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -410,6 +411,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             logger.debug(
                 f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
             )
+            return False
+
+        return True
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not cls.is_environment_available():
             return False
 
         has_skip_softmax = isinstance(attn.sparse_params, SkipSoftmaxParams)
@@ -479,6 +487,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
         tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
@@ -515,6 +524,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # FlashInfer's TRTLLM-Gen MLA decode does not support 64 < H < 128.
+        # Let selection fall through to the legacy TRTLLM-Gen backend.
+        if 64 < num_heads < 128:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                f"for num_heads={num_heads} (64 < num_heads < 128) "
+                "as it may select unsupported kernels.",
             )
 
         if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
@@ -602,11 +621,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and 0 < meta.num_contexts <= 4
             and attn.head_dim != 512
             and not has_q_only
+            and meta.num_generations == 0
+            and not (
+                meta.use_paged_context_fmha
+                and meta.tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK
+            )
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
             # Let the FMHA selector choose the fallback implementation. H512
-            # and Q-only cached-KV requests cannot use that fallback.
+            # and Q-only cached-KV requests cannot use that fallback. Neither
+            # can paged prefill with model-specific page sizes such as M3's 128.
+            # Keep mixed batches on FlashInfer: the monolithic fallback also
+            # switches decoding to C++ kernels that generation-only warmup
+            # does not cover, causing first-use JIT stalls (NVBug 6716104).
             return False, (
                 "small-batch BF16 context attention uses the fallback FMHA for "
                 "performance because the FlashInfer TRTLLM-Gen context path "
@@ -710,7 +738,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
                     return False, "[Context] custom mask."
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] unsupported attention mask: {fwd.attention_mask!r}."
             if has_alibi:
                 return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
@@ -749,6 +777,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
                     tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
@@ -909,6 +938,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
+        attention_input = params.qkv_input if params.qkv_input is not None else params.query_input
+        if attention_input is None:
+            raise RuntimeError("trtllm-gen context requires QKV or query input.")
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
@@ -931,7 +963,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             max_kv_len,
             window_left,
         ) = thop.trtllm_gen_context_preprocess(
-            params.qkv_input,  # qkv_input
+            attention_input,  # qkv_input (also accepts Q-only input for cached KV)
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
             params.context_lengths,  # context_lengths
@@ -1010,7 +1042,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             cum_seq_lens_q=cu_q_seqlens,
             cum_seq_lens_kv=cu_kv_seqlens,
             window_left=window_left,
-            out=params.context_buf,
+            out=params.output,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
             sinks=fwd.attention_sinks,
@@ -1024,7 +1056,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return
 
         thop.trtllm_gen_context_postprocess(
-            params.qkv_input,  # qkv_input
+            attention_input,  # qkv_input
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
             params.context_lengths,  # context_lengths
@@ -1067,6 +1099,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
+        attention_input = params.qkv_input if params.qkv_input is not None else params.query_input
+        if attention_input is None:
+            raise RuntimeError("trtllm-gen generation requires QKV or query input.")
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
@@ -1090,7 +1125,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             window_left,
             is_multi_token_gen,
         ) = thop.trtllm_gen_generation_preprocess(
-            params.qkv_input,  # qkv_input
+            attention_input,  # qkv_input (also accepts Q-only input for cached KV)
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
             params.spec_decoding_generation_lengths,  # spec_decoding_generation_lengths
@@ -1164,7 +1199,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale=gen_bmm1_scale,
             bmm2_scale=gen_bmm2_scale,
             window_left=window_left,
-            out=params.context_buf,
+            out=params.output,
             sinks=fwd.attention_sinks,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
@@ -1198,8 +1233,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.batch_size
-        if params.attention_input is None:
-            raise RuntimeError("MLA generation requires attention_input.")
+        if params.query_input is None:
+            raise RuntimeError("MLA generation requires query_input.")
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1213,7 +1248,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.quant_mode,  # kv_cache_quant_mode
             params.seq_offset,  # batch_start
             batch_beam,  # batch_size
-            params.attention_input.dtype,  # dtype
+            params.query_input.dtype,  # dtype
         )
 
         kv_lora_rank = attn.kv_lora_rank or 0
@@ -1254,7 +1289,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale = bmm1_scale_buffer.flatten()[:1]
             bmm2_scale = bmm2_scale_buffer.flatten()[:1]
         else:
-            query = params.qkv_input.view(
+            query = params.query_input.view(
                 batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk
             )
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
@@ -1272,7 +1307,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.sequence_lengths,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
-            params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
+            params.output.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
             bmm1_scale,  # bmm1_scale
             bmm2_scale,  # bmm2_scale
             fwd.attention_sinks,  # sinks

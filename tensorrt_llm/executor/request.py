@@ -117,7 +117,20 @@ class GenerationRequest:
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
-            self.prompt_token_ids = prompt_token_ids.tolist()
+            if prompt_token_ids.ndim == 1:
+                # A flat array goes straight into the int32 wire buffer that
+                # __setstate__ also produces, so neither this process nor the
+                # pickle path builds one Python int per token; the list is
+                # materialized lazily by the `prompt_token_ids` property.
+                if isinstance(prompt_token_ids, torch.Tensor):
+                    prompt_token_ids = prompt_token_ids.cpu().numpy()
+                self._prompt_token_ids = None
+                # Always a copy: the caller may reuse or mutate its array.
+                self._prompt_token_ids_i32 = np.array(prompt_token_ids,
+                                                      dtype=np.int32,
+                                                      order="C")
+            else:
+                self.prompt_token_ids = prompt_token_ids.tolist()
         else:
             raise TypeError(
                 f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
@@ -213,6 +226,9 @@ class GenerationRequest:
     @prompt_token_ids.setter
     def prompt_token_ids(self, value):
         self._prompt_token_ids = value
+        # base_worker hands the int32 buffer to the engine when it exists, so a
+        # replaced prompt must not leave the old tokens behind in it.
+        self._prompt_token_ids_i32 = None
 
     @staticmethod
     def _enc_tokens(v):

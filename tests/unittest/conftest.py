@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # # Force resource release after test
+import importlib.metadata
 import os
 import signal
 import sys
@@ -32,6 +33,7 @@ import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
+from packaging.version import Version
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.util import get_current_process_gpu_memory
 
@@ -84,6 +86,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
         xml_dir = os.path.dirname(periodic_junit_xmlpath)
         if xml_dir:
             os.makedirs(xml_dir, exist_ok=True)
@@ -96,17 +100,59 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            dump_hang_traceback=periodic_hang_traceback,
         )
-        reporter.pytest_configure(config)
         config.pluginmanager.register(reporter, 'periodic_junit')
         print_info("PeriodicJUnitXML reporter registered (unittest)")
         print_info(f"  XML path: {periodic_junit_xmlpath}")
         print_info(f"  Batch size: {periodic_batch_size}")
 
 
+# pytest-rerunfailures >= 16.7 caches the ExceptionInfo of every failed phase on
+# the item, but clears it only when reruns are configured for that item. The
+# cached traceback pins the failed test's frame locals (e.g. multi-GiB CUDA
+# tensors) for the rest of the session, beyond the reach of gc.collect().
+_RERUNFAILURES_EXCINFOS_ATTR = "_rerun_condition_excinfos"
+_RERUNFAILURES_FIRST_CACHING_VERSION = Version("16.7")
+_RERUNFAILURES_CACHE_CHECKED = pytest.StashKey[bool]()
+
+
+def _warn_rerunfailures_cache_moved(config: pytest.Config) -> None:
+    if not config.pluginmanager.has_plugin("rerunfailures"):
+        return
+    version = Version(importlib.metadata.version("pytest-rerunfailures"))
+    if version < _RERUNFAILURES_FIRST_CACHING_VERSION:
+        return
+    warnings.warn(
+        f"pytest-rerunfailures {version} no longer keeps failed-phase "
+        f"ExceptionInfo in item.{_RERUNFAILURES_EXCINFOS_ATTR}, so "
+        "tests/unittest/conftest.py may no longer release failed tests' frame "
+        "locals (including CUDA tensors). Point _RERUNFAILURES_EXCINFOS_ATTR at "
+        "where this version caches them, or drop the cleanup if the plugin now "
+        "releases them itself.")
+
+
+# The attribute is private to the plugin, so a rename would silently disable the
+# cleanup in pytest_runtest_protocol; warn once when a failed item lacks it.
+# tryfirst makes this the outermost makereport wrapper, so the code after its
+# yield runs after the plugin has recorded the ExceptionInfo of the phase.
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if (report.failed and not hasattr(item, _RERUNFAILURES_EXCINFOS_ATTR)
+            and not item.config.stash.get(_RERUNFAILURES_CACHE_CHECKED, False)):
+        item.config.stash[_RERUNFAILURES_CACHE_CHECKED] = True
+        _warn_rerunfailures_cache_moved(item.config)
+    return report
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     yield
+
+    rerunfailures_excinfos = getattr(item, _RERUNFAILURES_EXCINFOS_ATTR, None)
+    if rerunfailures_excinfos is not None:
+        rerunfailures_excinfos.clear()
 
     import sys
     for m in sys.modules:
@@ -211,6 +257,14 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt shortly before a test timeout. "
+        "Only used with --periodic-junit.",
     )
     # S3 upload options — must be registered here so they are recognized when
     # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
@@ -390,8 +444,18 @@ def mpi_pool_executor(request):
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
-        # make the number of workers visible to tests
-        setattr(executor, "num_workers", num_workers)
+        # mpi4py exposes this as a read-only property in current releases.
+        # Fall back to the requested value for older releases, but reject a
+        # not-yet-populated or mismatched property before a test can submit
+        # zero tasks and pass vacuously.
+        actual_num_workers = getattr(executor, "num_workers", num_workers)
+        if actual_num_workers != num_workers or actual_num_workers <= 0:
+            raise RuntimeError(
+                "MPIPoolExecutor worker count must be positive and match the "
+                f"requested pool size: requested={num_workers}, "
+                f"reported={actual_num_workers}")
+        if not hasattr(executor, "num_workers"):
+            setattr(executor, "num_workers", actual_num_workers)
         yield executor
 
 

@@ -30,14 +30,14 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
 )
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -895,6 +895,23 @@ def _supports_qwen_key_padding_mask(attn_backend: str, attn: Any) -> bool:
     return attn_backend == "VANILLA" and not isinstance(attn, (Attention2DAttention, RingAttention))
 
 
+def _validate_qwen_ulysses_attention_backend(model_config: DiffusionModelConfig) -> None:
+    attention_backend = model_config.attention.backend
+    ulysses_size = getattr(model_config.visual_gen_mapping, "ulysses_size", 1)
+    if ulysses_size > 1 and attention_backend != "VANILLA":
+        # Qwen-Image Ulysses pads text and image token streams before sharding.
+        # The attention backend must consume key_padding_mask to ignore padded
+        # tokens; today only the VANILLA Qwen-Image implementation supports
+        # that mask path. Non-VANILLA backends remain valid when ulysses_size
+        # is 1.
+        raise ValueError(
+            "Qwen-Image Ulysses parallelism requires "
+            "attention_config.backend='VANILLA'. "
+            f"Got attention_config.backend='{attention_backend}' with "
+            f"parallel_config.ulysses_size={ulysses_size}."
+        )
+
+
 def _build_joint_attention_mask(
     encoder_hidden_states_mask: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -936,6 +953,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         attn_backend: str = "sdpa",
     ):
         model_config = model_config or DiffusionModelConfig()
+        _validate_qwen_ulysses_attention_backend(model_config)
         super().__init__(model_config)
         self.attn_backend = attn_backend
 

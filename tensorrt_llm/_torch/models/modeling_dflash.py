@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
 from ...functional import RotaryScalingType
@@ -20,13 +21,14 @@ except ImportError:
     _flashinfer_rope = None
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
+    dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
     get_dflash_paged_append,
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
-from .modeling_utils import get_model_architecture, register_draft_model
+from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
 def dspark_layer_window_size(
@@ -61,15 +63,10 @@ def dspark_layer_window_size(
     return (swa_window - 1, swa_window - 1)
 
 
-def _is_dflash2_architecture(config: PretrainedConfig) -> bool:
-    """Whether a draft checkpoint advertises itself as a DFlash 2 drafter.
-
-    Matches on the "dflash2" stem (released drafters use ``DFlash2DraftModel``)
-    so per-target variants of the label are picked up too.
-    """
-    return any(
-        "dflash2" in str(arch).lower().replace("_", "").replace("-", "")
-        for arch in (getattr(config, "architectures", None) or [])
+def declares_lilicorr(config: PretrainedConfig) -> bool:
+    """Whether the checkpoint requires the LiLiCorr candidate scorer."""
+    return is_lilicorr_checkpoint(
+        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
     )
 
 
@@ -323,7 +320,94 @@ class DFlashForCausalLM(nn.Module):
     Reference: https://arxiv.org/pdf/2602.06036
     """
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    # Whether ``dflash_attention_backend`` drives this drafter's block decode.
+    # Subclasses that bring their own attention set this False: neither backend
+    # can express every drafter shape, the ops behind them are optional
+    # dependencies, and the worker's per-backend shape checks do not apply.
+    _uses_worker_attention_backend = True
+
+    # What ``attention_backend="AUTO"`` resolves to, and what the field may say
+    # at all. Per drafter family, because the fastest kernel that can express
+    # the shape differs: GQA DFlash cross-attention is what the two worker op
+    # sets were built for, while an MLA drafter runs its own block decode and
+    # has a third implementation they cannot express.
+    _default_attention_backend = "VANILLA"
+    _uses_lilicorr = False
+    _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4")
+    # Where AUTO lands when the preferred backend cannot run. None means AUTO
+    # propagates the reason instead: a family whose only deployable target can
+    # run the fast kernel gains nothing from a silently slower path.
+    _auto_fallback_attention_backend = "VANILLA"
+
+    # Whether the drafter's context KV lives in the draft KV cache manager's
+    # paged pool rather than a private arena dense in max_seq_len. Orthogonal
+    # to the attention backend: paging is about where the KV lives, the backend
+    # is about which kernel reads it.
+    _paged_ctx_cache = False
+
+    # Positions the worker will actually serve, published once by
+    # DFlashDrafter._lazy_init_ctx_buffers before the first forward. A drafter
+    # that sizes an absolute-position table reads it in place of its
+    # config-derived cap; None means no worker has run (direct construction in
+    # tests), so the config cap stands.
+    _runtime_position_ceiling = None
+
+    @classmethod
+    def _resolve_auto_attention_backend(cls) -> str:
+        """Turn ``AUTO`` into a concrete backend for this drafter family."""
+        want = cls._default_attention_backend
+        reason = cls._attention_backend_unavailability_reason(want)
+        if reason is None:
+            return want
+        fallback = cls._auto_fallback_attention_backend
+        if fallback is None:
+            raise ValueError(
+                f"{cls.__name__} has no usable attention backend: its default "
+                f"{want!r} is unavailable ({reason}) and this family does not "
+                f"degrade."
+            )
+        logger.info_once(
+            f"{cls.__name__} prefers the {want} attention backend but it is "
+            f"unavailable ({reason}); falling back to {fallback}.",
+            key=f"dflash_auto_backend_fallback_{cls.__name__}",
+        )
+        return fallback
+
+    @classmethod
+    def _attention_backend_unavailability_reason(cls, backend: str) -> Optional[str]:
+        """Why this build cannot run ``backend``, or None. Overridden per family.
+
+        The same backend NAME resolves to different kernels per drafter family
+        -- GQA TRTLLM is the trtllm-gen FMHA op set, MLA TRTLLM is flashinfer's
+        absorbed-MLA paged decode -- so the probe belongs to the class rather
+        than to the resolver, which only knows the name.
+        """
+        if backend == "TRTLLM":
+            return dflash_trtllm_gen_unavailability_reason()
+        return None
+
+    @classmethod
+    def check_valid_attention_backend(cls, backend: str) -> None:
+        """Raise unless this build can actually run ``backend``.
+
+        Both halves are fatal on an EXPLICIT request: a typo, and a backend the
+        build cannot serve. Silently running something else is what this
+        replaces -- the MLA drafter used to fall through to its eager reference,
+        correct but orders slower, with nothing raised.
+        """
+        if backend not in cls._supported_attention_backends:
+            raise ValueError(
+                f"{cls.__name__} attention backend must be one of "
+                f"{list(cls._supported_attention_backends)}, got {backend!r}."
+            )
+        reason = cls._attention_backend_unavailability_reason(backend)
+        if reason is not None:
+            raise ValueError(
+                f"attention_backend={backend!r} was requested but it is "
+                f"unavailable for {cls.__name__}: {reason}."
+            )
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Build the draft model, resolving its architecture from the draft config
         (falling back to a model_type-derived name when the checkpoint uses a
         custom DFlash architecture label)."""
@@ -348,6 +432,9 @@ class DFlashForCausalLM(nn.Module):
 
         # Remove spec_config to prevent recursive spec-dec initialization
         draft_config_no_spec = replace(draft_config, spec_config=None, lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -360,23 +447,37 @@ class DFlashForCausalLM(nn.Module):
 
         # Get mask_token_id from dflash_config
         pretrained_config = draft_config.pretrained_config
-        dflash_config = getattr(pretrained_config, "dflash_config", {})
+        dflash_config = getattr(pretrained_config, "dflash_config", None) or {}
         self.mask_token_id = dflash_config.get(
             "mask_token_id",
             getattr(pretrained_config, "mask_token_id", pretrained_config.vocab_size),
         )
 
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
+        # Upstream keeps the dflash_config override; rubin-advance dropped it.
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        if dflash_attention_backend == "AUTO":
+            dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
+        self.check_valid_attention_backend(self.dflash_attention_backend)
         # Each backend loads only its own ops; the rest stay None so the
         # shared paged prologue can read them unconditionally.
+        self._dflash_flash_attention = None
         self._dflash_trtllm_gen_ops = None
         self._dflash_fa4_fwd = None
         self._dflash_paged_append = None
-        if self.dflash_attention_backend == "VANILLA":
+        if not self._uses_worker_attention_backend:
+            # Still validated above so a typo fails here rather than silently,
+            # but no op set is loaded: this drafter calls none of them.
+            logger.info_once(
+                f"{type(self).__name__} brings its own block decode; "
+                f"attention_backend={self.dflash_attention_backend!r} selects "
+                f"among its implementations, not the shared DFlash op sets.",
+                key=f"dflash_own_attention_{type(self).__name__}",
+            )
+        elif self.dflash_attention_backend == "VANILLA":
             self._dflash_flash_attention = get_dflash_flash_attention()
         elif self.dflash_attention_backend == "TRTLLM":
             self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
@@ -384,9 +485,14 @@ class DFlashForCausalLM(nn.Module):
             self._dflash_fa4_fwd = get_dflash_fa4_fwd()
             self._dflash_paged_append = get_dflash_paged_append()
         else:
+            # Not the user's typo -- check_valid_attention_backend rejected
+            # those above. This is a subclass that widened
+            # _supported_attention_backends without adding the branch that
+            # loads the ops, which a bare else would answer by silently
+            # handing it FA4's.
             raise ValueError(
-                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
-                f"{self.dflash_attention_backend!r}."
+                f"{type(self).__name__} allows attention_backend="
+                f"{self.dflash_attention_backend!r} but loads no op set for it."
             )
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
@@ -428,10 +534,9 @@ class DFlashForCausalLM(nn.Module):
         self._dflash2_conv_group_size = int(dflash_config.get("conv_group_size", 0) or 0)
         self._dflash2_selector_rank = int(dflash_config.get("selector_rank", 0) or 0)
         self._dflash2_selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
-        self._is_dflash2 = (
-            self._dflash2_conv_taps > 0
-            or self._dflash2_selector_rank > 0
-            or _is_dflash2_architecture(pretrained_config)
+        # LiLiCorr supplies its own scorer and permits convolution-free checkpoints.
+        self._is_dflash2 = not self._uses_lilicorr and is_dflash2_checkpoint(
+            getattr(pretrained_config, "architectures", None), dflash_config
         )
         if self._is_dflash2:
             self._validate_dflash2_config()
@@ -466,6 +571,11 @@ class DFlashForCausalLM(nn.Module):
         self._num_heads = 0
         self._head_dim = 0
         self._num_kv_heads = 0
+        # Cache halves per token per layer: K and V for a GQA drafter, one MLA
+        # latent (and no V) for an MLA one. The worker sizes its context arena
+        # and validates the managed pool against this, so a drafter that stores
+        # a single tensor must override it (see MLADSparkForCausalLM).
+        self._kv_factor = 2
         self._has_qk_norm = False
         self._use_fused_qk_norm_rope = False
         # Laguna-specific draft-layer behaviors, disabled by default so generic
@@ -622,6 +732,10 @@ class DFlashForCausalLM(nn.Module):
             )
 
     @property
+    def is_dflash2(self) -> bool:
+        return self._is_dflash2
+
+    @property
     def has_block_conv(self) -> bool:
         return self.attention_convs is not None
 
@@ -714,7 +828,7 @@ class DFlashForCausalLM(nn.Module):
         # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
         remapped = {}
         for key, value in weights.items():
-            if key in ("fc.weight", "hidden_norm.weight"):
+            if key.startswith("fc.") or key == "hidden_norm.weight":
                 # DFlash-specific projection weights - store directly
                 remapped[key] = value
             elif key == "norm.weight":
@@ -724,17 +838,19 @@ class DFlashForCausalLM(nn.Module):
             else:
                 remapped[key] = value
 
-        # Load DFlash-specific weights directly
-        if "fc.weight" in remapped:
-            self.fc = nn.Linear(
-                remapped["fc.weight"].shape[1],
-                remapped["fc.weight"].shape[0],
-                bias=False,
-                device="cuda",
-                dtype=remapped["fc.weight"].dtype,
+        # Wrapper-owned and built FROM the checkpoint, so they are never in
+        # draft_model_full's module tree for _assert_backbone_complete to walk.
+        # Without fc the drafter has no capture projection and drafts from an
+        # empty context forever.
+        wrapper_missing = [k for k in self.WRAPPER_OWNED_WEIGHTS if k not in remapped]
+        if wrapper_missing:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint is missing {wrapper_missing}, "
+                "which this wrapper owns and builds from the checkpoint."
             )
-            self.fc.weight.data.copy_(remapped["fc.weight"])
-            del remapped["fc.weight"]
+
+        # Load DFlash-specific weights directly
+        self._load_target_projection(remapped)
 
         if "hidden_norm.weight" in remapped:
             rms_norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
@@ -748,14 +864,24 @@ class DFlashForCausalLM(nn.Module):
             self.hidden_norm.weight.data.copy_(remapped["hidden_norm.weight"])
             del remapped["hidden_norm.weight"]
 
-        # Load remaining weights into the draft model.
-        # DFlash checkpoints don't include embed_tokens or lm_head, so allow partial loading
-        # since those modules won't find matching weights.
+        # allow_partial_loading is what lets the shared modules below be absent.
+        # It is also why a truncated checkpoint loads clean, so gate it on the
+        # subclass's own declaration of what may legitimately be missing.
+        self._assert_backbone_complete(remapped, weight_mapper)
         self.draft_model_full.load_weights(
             weights=remapped, weight_mapper=weight_mapper, allow_partial_loading=True
         )
 
-    def _load_dflash2_weights(self, weights: Dict) -> Dict:
+    def _load_target_projection(self, weights: Dict) -> None:
+        if "fc.weight" not in weights:
+            return
+        weight = weights.pop("fc.weight")
+        self.fc = nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
+        )
+        self.fc.weight.data.copy_(weight)
+
+    def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
         """Build the DFlash 2 convolutions and candidate selector.
 
         Returns ``weights`` minus the keys consumed here.
@@ -788,19 +914,83 @@ class DFlashForCausalLM(nn.Module):
                     )
                 )
 
-        selector = DFlash2CandidateSelector(
-            predecessor_codebook=take("candidate_selector.predecessor_codebook"),
-            successor_codebook=take("candidate_selector.successor_codebook"),
-            hidden_projection_weight=take("candidate_selector.hidden_projection.weight"),
-            top_k=self._dflash2_selector_top_k,
-            vocab_size=self.config.vocab_size,
-            rank=self._dflash2_selector_rank,
-        )
-
         self.attention_convs = attention_convs
         self.mlp_convs = mlp_convs
-        self.candidate_selector = selector
+        if load_selector:
+            self.candidate_selector = DFlash2CandidateSelector(
+                predecessor_codebook=take("candidate_selector.predecessor_codebook"),
+                successor_codebook=take("candidate_selector.successor_codebook"),
+                hidden_projection_weight=take("candidate_selector.hidden_projection.weight"),
+                top_k=self._dflash2_selector_top_k,
+                vocab_size=self.config.vocab_size,
+                rank=self._dflash2_selector_rank,
+            )
         return {k: v for k, v in weights.items() if k not in consumed}
+
+    #: Tensors the wrapper itself owns: not in draft_model_full, built from the
+    #: checkpoint in load_weights, and required.
+    WRAPPER_OWNED_WEIGHTS = ("fc.weight", "hidden_norm.weight")
+
+    #: Parameter-name prefixes this drafter takes from the target instead of its
+    #: own checkpoint. Everything else in ``draft_model_full`` must be provided.
+    #: GQA DFlash checkpoints ship neither embedding nor head; an MLA drafter
+    #: ships its own embedding and overrides this.
+    WEIGHTS_SHARED_WITH_TARGET = ("embed_tokens", "lm_head")
+
+    def _assert_backbone_complete(self, weights: Dict, weight_mapper=None) -> None:
+        """Fail on a checkpoint missing weights the drafter does not share.
+
+        The truth is the constructed module tree, not a hand-kept list that
+        rots as the backbone changes.
+
+        Module granularity. A PLAIN module is the hole `allow_partial_loading`
+        cannot close -- the loader skips one whose subtree filters to nothing
+        (modeling_utils.py `if module_weights:`). A FUSED module would be caught by
+        `allow_partial_loading=False`, but the flag must stay True for the
+        target-shared modules, so this requires every component rather than any.
+
+        Missing parameters INSIDE a present component stay tolerated: all three
+        weights but only `q_proj.bias` leaves the rest at `torch.empty`.
+        """
+        provided = set(weights)
+
+        # Whichever fusion table the load below uses, not a third copy:
+        # _load_weights_impl_v2 takes the mapper's, _load_weights_impl takes
+        # FUSED_MODULE_COMPONENTS. An empty mapping means the mapper has none yet.
+        fusion = dict(getattr(weight_mapper, "mapping", None) or FUSED_MODULE_COMPONENTS)
+
+        def _has(prefix: str) -> bool:
+            return any(k == prefix or k.startswith(prefix + ".") for k in provided)
+
+        def _supplied(module_name: str) -> bool:
+            # A fused module is named once here and stored unfused in the
+            # checkpoint. ALL components must be present, not any: the fused
+            # load path is happy with a subset under allow_partial_loading
+            # (linear.py load_weights_fused_qkv_helper) and leaves the absent
+            # shards at torch.empty -- uninitialised device memory, not zeros.
+            if _has(module_name):
+                return True
+            for fused, parts in fusion.items():
+                if fused in module_name:
+                    return all(_has(module_name.replace(fused, p)) for p in parts)
+            return False
+
+        missing = sorted(
+            {
+                name.rsplit(".", 1)[0]
+                for name, _ in self.draft_model_full.named_parameters()
+                if not any(part in name for part in self.WEIGHTS_SHARED_WITH_TARGET)
+                and not _supplied(name.rsplit(".", 1)[0])
+            }
+        )
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint provides no weights for "
+                f"{missing[:8]}{' ...' if len(missing) > 8 else ''}. These are "
+                f"not in WEIGHTS_SHARED_WITH_TARGET "
+                f"({', '.join(self.WEIGHTS_SHARED_WITH_TARGET)}), so loading "
+                "would leave them randomly initialized."
+            )
 
     def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
         """Share embed_tokens and lm_head from the target model."""
@@ -1082,12 +1272,13 @@ class DFlashForCausalLM(nn.Module):
         sliding_window = get_layer_attention_window(self.config, layer_idx)
         is_sliding_layer = is_sliding_layer or sliding_window is not None
 
-        # A DFlash 2 checkpoint's top-level is_causal wins over the layer-type
-        # default (which would read an all-sliding drafter as causal). Only
-        # consulted for DFlash 2: is_causal is common enough elsewhere that
-        # honoring it everywhere could silently retarget an older drafter.
+        # LiLiCorr uses non-causal block attention with symmetric sliding windows.
+        # DFlash 2 honors explicit is_causal metadata when present; otherwise,
+        # causality follows the layer-type default.
         explicit_causal = getattr(self.config, "is_causal", None) if self._is_dflash2 else None
-        if explicit_causal is not None:
+        if self._uses_lilicorr:
+            causal = False
+        elif explicit_causal is not None:
             causal = bool(explicit_causal)
         elif not is_sliding_layer:
             return False, (-1, -1)
@@ -1104,6 +1295,39 @@ class DFlashForCausalLM(nn.Module):
         if not causal:
             return False, (sliding_window - 1, sliding_window - 1)
         return True, (sliding_window - 1, 0)
+
+    def _resolve_block_attention(self, layer_idx: int) -> tuple[bool, tuple[int, int]]:
+        causal, window_size = self._get_attention_mask_args(layer_idx)
+        swa_window = (
+            self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+        )
+        if swa_window != (-1, -1):
+            window_size = swa_window
+        return causal, window_size
+
+    def validate_block_attention_windows(self) -> None:
+        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+
+        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
+        rejects ``causal=False`` with any finite ``window_left`` outright. A
+        non-causal windowed layer must therefore run on VANILLA or FA4, which
+        take a two-sided window.
+        """
+        if self.dflash_attention_backend != "TRTLLM":
+            return
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = len(self.model.layers)
+        for layer_idx in range(num_layers):
+            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
+            if causal or window_left < 0:
+                continue
+            raise ValueError(
+                f"DFlash draft layer {layer_idx} attends non-causally within a "
+                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
+                "attention backend does not support non-causal sliding-window "
+                "attention. Use attention_backend=VANILLA or FA4."
+            )
 
     def _prepare_dflash_trtllm_gen_buffers(
         self,
@@ -1451,12 +1675,7 @@ class DFlashForCausalLM(nn.Module):
                 v_noise_bshd = v_noise_all.reshape(B, block_size, num_kv_heads_per_rank, head_dim)
 
             # Per-layer view into the pooled ctx cache.
-            causal, window_size = self._get_attention_mask_args(layer_idx)
-            swa_window = (
-                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
-            )
-            if swa_window != (-1, -1):
-                window_size = swa_window
+            causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
                 trtllm_gen_ops.append_paged_kv_cache(
@@ -1702,11 +1921,11 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         if getattr(config, "mlp_layer_types", None) is None:
             config.mlp_layer_types = ["dense"] * config.num_hidden_layers
         if getattr(config, "block_size", None) is None:
-            dflash_config = getattr(config, "dflash_config", {})
+            dflash_config = getattr(config, "dflash_config", None) or {}
             if isinstance(dflash_config, dict):
                 config.block_size = dflash_config.get("block_size", None)
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
         (context input_layernorm, causal sliding blocks); reject non-per-head
         gating."""
@@ -1837,6 +2056,15 @@ def _build_dflash_draft(model_config, draft_config, lm_head, model):
         )
     draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
     dflash_attention_backend = model_config.spec_config.attention_backend
+    if declares_lilicorr(draft_config.pretrained_config):
+        if any("Laguna" in arch for arch in draft_arches):
+            raise NotImplementedError(
+                "LiLiCorr currently requires the generic GQA DFlash backbone; "
+                "Laguna's draft-layer specialization is not supported."
+            )
+        from .modeling_lilicorr import LiLiCorrForCausalLM
+
+        return LiLiCorrForCausalLM(draft_config, dflash_attention_backend=dflash_attention_backend)
     if any("Laguna" in arch for arch in draft_arches):
         return DFlashLagunaForCausalLM(
             draft_config,

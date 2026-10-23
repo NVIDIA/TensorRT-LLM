@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
+from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -22,6 +25,8 @@ from tensorrt_llm._torch.speculative.utils import (
     uses_mtp_head_checkpoint,
 )
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 class _ExternalDraftModelTarget:
@@ -37,6 +42,147 @@ def _resolve_as_head_checkpoint(spec_config):
     update_spec_config_from_model_config(
         spec_config, pretrained_config, _EmbeddedOrHeadReplacementTarget
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_algo", [QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4])
+def test_replacement_mtp_loads_quantized_lm_head(monkeypatch, head_algo):
+    from tensorrt_llm._torch.models import modeling_utils
+
+    loaded = {}
+    monkeypatch.setattr(
+        modeling_utils,
+        "_load_weights_impl_v2",
+        lambda model, weights, mapper, **kwargs: loaded.update(weights=weights, **kwargs),
+    )
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=1, speculative_model="/path/to/mtp"), num_hidden_layers=52
+    )
+    model.draft_model.owns_lm_head = True
+    model.draft_model.lm_head = SimpleNamespace(quant_config=QuantConfig(quant_algo=head_algo))
+    mapper = _PassthroughMtpMapper(52)
+    head_weights = {"lm_head.weight": torch.ones(4, 4), "lm_head.weight_scale": torch.ones(1)}
+    if head_algo == QuantAlgo.W4A16_NVFP4:
+        head_weights["lm_head.weight_scale_2"] = torch.ones(1)
+    weights = {
+        **_nemotron_style_mtp_weights(include_shared_head=False),
+        **head_weights,
+        "model.embed_tokens.weight": torch.zeros(4, 4),
+    }
+
+    model.load_draft_weights(weights, mapper)
+
+    assert loaded["allow_partial_loading"] is False
+    assert loaded["skip_modules"] == ["shared_head"]
+    assert "mtp_layers.0.layers.0.enorm.weight" in loaded["weights"]
+    assert "model.embed_tokens.weight" not in loaded["weights"]
+    for name, value in head_weights.items():
+        assert loaded["weights"][name] is value
+        with pytest.raises(ValueError, match="missing " + name):
+            model.load_draft_weights({k: v for k, v in weights.items() if k != name}, mapper)
+
+    model.draft_model.owns_lm_head = False
+    model.load_draft_weights(weights, mapper)
+    assert not any(name.startswith("lm_head.") for name in loaded["weights"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_algo", [QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4])
+@pytest.mark.parametrize(
+    "target_has_scale,draft_has_scale,exclude_head",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_homogeneous_replacement_head_uses_its_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    head_algo: QuantAlgo,
+    target_has_scale: bool,
+    draft_has_scale: bool,
+    exclude_head: bool,
+) -> None:
+    from tensorrt_llm._torch.models import modeling_utils
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.NemotronHMTP", lambda *args: nn.Identity()
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.modules.linear.get_sm_version", lambda: 100)
+    target_dir, draft_dir = tmp_path / "target", tmp_path / "draft"
+    head_weights = {}
+    for directory, has_scale in ((target_dir, target_has_scale), (draft_dir, draft_has_scale)):
+        directory.mkdir()
+        tensors = {"lm_head.weight": torch.ones(32, 16, dtype=torch.bfloat16)}
+        if has_scale:
+            tensors["lm_head.weight_scale"] = torch.ones(1)
+            if head_algo == QuantAlgo.W4A16_NVFP4:
+                tensors["lm_head.weight_scale_2"] = torch.ones(1)
+        save_file(tensors, str(directory / "model.safetensors"))
+        if directory == draft_dir:
+            head_weights = tensors
+    (draft_dir / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "quantization": {
+                    "quant_algo": head_algo,
+                    "group_size": 16,
+                    "exclude_modules": ["lm_head"] if exclude_head else [],
+                }
+            }
+        )
+    )
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=1, speculative_model=str(draft_dir)), num_hidden_layers=2
+    )
+    pretrained = PretrainedConfig(
+        architectures=["NemotronHForCausalLM"],
+        num_hidden_layers=2,
+        num_nextn_predict_layers=1,
+        hidden_size=16,
+        vocab_size=32,
+        torch_dtype=torch.bfloat16,
+        tie_word_embeddings=False,
+        _name_or_path=str(target_dir),
+    )
+    pretrained.model_type = "nemotron_h"
+    target_config = ModelConfig(
+        pretrained_config=pretrained,
+        spec_config=model.spec_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+    )
+    draft_config = modeling_speculative._replacement_mtp_model_config(target_config)
+    with torch.device("cpu"):
+        target_head = nn.Linear(16, 32, bias=False)
+        target = SimpleNamespace(aux_stream_dict={}, embed_tokens=nn.Embedding(32, 16))
+        draft = modeling_speculative.MTPForCausalLM(draft_config, 2, target_head, target)
+    owns_head = draft_has_scale and not exclude_head
+    assert draft.owns_lm_head == owns_head
+    assert (draft.lm_head is target_head) == (not owns_head)
+    if owns_head:
+        assert draft.lm_head.quant_config.quant_algo == head_algo
+        packed = head_algo == QuantAlgo.W4A16_NVFP4
+        assert draft.lm_head.weight.shape == (32, 8 if packed else 16)
+        assert draft.lm_head.weight.dtype == (torch.uint8 if packed else torch.float8_e4m3fn)
+    assert draft_config.quant_config_dict is None
+    assert draft_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert draft_config.spec_config is target_config.spec_config
+    assert target_config.quant_config.quant_algo is None
+    assert pretrained._name_or_path == str(target_dir)
+
+    loaded = {}
+    monkeypatch.setattr(
+        modeling_utils,
+        "_load_weights_impl_v2",
+        lambda model, weights, mapper, **kwargs: loaded.update(weights=weights, **kwargs),
+    )
+    model.draft_model = draft
+    model.load_draft_weights(
+        {**_nemotron_style_mtp_weights(include_shared_head=False), **head_weights},
+        _PassthroughMtpMapper(2),
+    )
+    assert loaded["allow_partial_loading"] is False
+    assert any(name.startswith("lm_head.") for name in loaded["weights"]) == owns_head
+    if owns_head:
+        for name, tensor in head_weights.items():
+            assert loaded["weights"][name] is tensor
 
 
 def test_needs_separate_draft_weights_for_mtp_with_speculative_model():
@@ -90,7 +236,7 @@ def test_mtp_checkpoint_type_selects_draft_model_constructor(
     monkeypatch.setattr(
         modeling_speculative,
         "MTPForCausalLM",
-        lambda *args: replacement_mtp_heads,
+        lambda *args, **kwargs: replacement_mtp_heads,
     )
 
     draft_config = object() if expected_checkpoint_type == "external_draft_model" else None
@@ -233,6 +379,46 @@ def test_update_spec_config_uses_mtp_layers_block_type_when_present(tmp_path):
     assert model_config.mtp_layers_block_type == ["attention", "moe"]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("architecture", ["NemotronHForCausalLM", "Qwen3NextForCausalLM"])
+def test_replacement_without_head_count_uses_shared_head(tmp_path, architecture):
+    (tmp_path / "config.json").write_text(json.dumps({"mtp_hybrid_override_pattern": "*E"}))
+    language_config = SimpleNamespace(
+        architectures=[architecture],
+        hybrid_override_pattern="*E",
+        num_nextn_predict_layers=0,
+        mtp_layers_block_type=None,
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=str(tmp_path))
+
+    update_spec_config_from_model_config(spec_config, language_config)
+
+    assert language_config.num_nextn_predict_layers == 1
+    assert spec_config.num_nextn_predict_layers == 1
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.max_draft_len == 3
+    assert language_config.mtp_layers_block_type == ["attention", "moe"]
+
+
+@pytest.mark.cpu_only
+def test_nemotron_embedded_multimodal_mtp_uses_language_config() -> None:
+    language_config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        num_nextn_predict_layers=2,
+        hybrid_override_pattern="*E",
+        mtp_layers_block_type=["attention", "moe"],
+    )
+    config = SimpleNamespace(llm_config=language_config)
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+
+    update_spec_config_from_model_config(spec_config, config)
+
+    assert spec_config.num_nextn_predict_layers == 2
+    assert spec_config.spec_dec_mode.is_mtp_vanilla()
+    assert spec_config.max_draft_len == 2
+    assert not spec_config.uses_replacement_heads
+
+
 def test_remap_preprocessed_mtp_weights_for_draft_model():
     from tensorrt_llm._torch.speculative.utils import remap_preprocessed_mtp_weights_for_draft_model
 
@@ -365,6 +551,109 @@ def test_separate_mtp_target_load_skips_heads_without_partial_loading(monkeypatc
     assert "backbone.layers.0.norm.weight" in captured["weights"]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("materialize", [False, True])
+@pytest.mark.parametrize("pp_size,owns_layer", [(1, True), (2, True), (2, False)])
+def test_qwen4_replacement_loads_mtp_and_hyper_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    materialize: bool,
+    pp_size: int,
+    owns_layer: bool,
+) -> None:
+    from tensorrt_llm._torch.models import modeling_utils
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
+        Qwen4ExpHfWeightMapper,
+    )
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    captured = {}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def capture_load(model, weights, mapper, **kwargs) -> None:
+        captured.update(model=model, weights=weights, mapper=mapper, **kwargs)
+
+    monkeypatch.setattr(modeling_utils, "_load_weights_impl_v2", capture_load)
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=1, speculative_model=str(tmp_path)), num_hidden_layers=2
+    )
+    target_config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["Qwen4ExpForCausalLM"],
+            num_hidden_layers=2,
+            num_nextn_predict_layers=1,
+            linear_key_head_dim=4,
+            linear_num_key_heads=1,
+            linear_value_head_dim=4,
+            linear_num_value_heads=1,
+            tie_word_embeddings=False,
+        ),
+        spec_config=model.spec_config,
+        mapping=Mapping(world_size=pp_size, rank=pp_size - 1, tp_size=1, pp_size=pp_size),
+    )
+    config = modeling_speculative._replacement_mtp_model_config(target_config)
+    model.draft_config = config
+    model.draft_model.model_config = config
+    model.draft_model.config = config.pretrained_config
+    model.draft_model.owns_lm_head = False
+    layer = model.draft_model.mtp_layers[0]
+    layer._weights_removed = not owns_layer
+    with torch.device("cpu"):
+        layer.attn_hyper_connection = nn.Module()
+        hc = layer.attn_hyper_connection
+        hc.input_mix_weight_down_block_inject = nn.Linear(4, 16, bias=False)
+        hc.input_mix_injection_offset = 6
+        hc.hc_count = 2
+        layer.shared_head = nn.Module()
+        layer.shared_head.hyper_connection_mixer = nn.Module()
+        layer.shared_head.hyper_connection_mixer.input_mix_weight_down = nn.Linear(4, 6, bias=False)
+
+    down = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    inject = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 100
+    final_down = torch.full((6, 4), 7.0)
+    weights = {
+        "mtp.fc_embedding.weight": torch.ones(4, 4),
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight": down,
+        "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight": inject,
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight": final_down,
+    }
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader.spec_config = model.spec_config
+    loader.mapping = config.mapping
+    loader.weight_mapper = object()
+    checkpoint_loader = SimpleNamespace(
+        checkpoint_format="HF", load_weights=lambda *args, **kwargs: weights
+    )
+
+    if materialize:
+        loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+    else:
+        loader._load_separate_draft_weights(model, checkpoint_loader)
+
+    assert isinstance(captured["mapper"], Qwen4ExpHfWeightMapper)
+    assert captured["mapper"].config is config
+    assert captured["mapper"].config.spec_config is model.spec_config
+    assert captured["mapper"].model is model.draft_model
+    assert captured["model"] is model.draft_model
+    assert captured["allow_partial_loading"] is False
+    mapped = captured["weights"]
+    if owns_layer:
+        assert mapped["mtp_layers.0.fc_embedding.weight"] is weights["mtp.fc_embedding.weight"]
+        packed = mapped[
+            "mtp_layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"
+        ]
+        torch.testing.assert_close(packed[:6], down)
+        torch.testing.assert_close(packed[6:8], inject)
+        torch.testing.assert_close(packed[8:], torch.zeros(8, 4))
+        assert (
+            mapped["mtp_layers.0.shared_head.hyper_connection_mixer.input_mix_weight_down.weight"]
+            is final_down
+        )
+    else:
+        assert mapped == {}
+
+
 def test_embedded_mtp_target_load_is_unchanged(monkeypatch):
     captured = _capture_parent_load_weights(monkeypatch)
 
@@ -488,3 +777,214 @@ def test_separate_mtp_draft_load_skip_shared_head_scales(monkeypatch):
     )
     assert captured["skip_modules"] == []
     assert "mtp_layers.0.shared_head.norm.weight" in captured["weight_keys"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_count", [0, 2])
+def test_replacement_explicit_head_count_is_authoritative(tmp_path, draft_count):
+    (tmp_path / "config.json").write_text(json.dumps({"num_nextn_predict_layers": draft_count}))
+    config = PretrainedConfig(architectures=["TargetModel"], num_nextn_predict_layers=0)
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=str(tmp_path))
+    if draft_count == 0:
+        with pytest.raises(ValueError, match="at least one head"):
+            update_spec_config_from_model_config(
+                spec_config, config, _EmbeddedOrHeadReplacementTarget
+            )
+    else:
+        update_spec_config_from_model_config(spec_config, config, _EmbeddedOrHeadReplacementTarget)
+        assert spec_config.num_nextn_predict_layers == draft_count
+        assert spec_config.max_draft_len == draft_count
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "architecture,checkpoint_name,runtime_name",
+    [
+        (
+            "NemotronHForCausalLM",
+            "mtp.layers.1.mixer.q_proj",
+            "model.layers.2.layers.1.mixer.q_proj",
+        ),
+        (
+            "Qwen3NextForCausalLM",
+            "mtp.layers.1.self_attn.q_proj",
+            "model.layers.3.self_attn.q_proj",
+        ),
+        ("Qwen3NextForCausalLM", "mtp.fc", "model.layers.2.fc"),
+    ],
+)
+def test_replacement_quantization_uses_architecture_name_mapping(
+    tmp_path, architecture, checkpoint_name, runtime_name
+):
+    from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
+
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {checkpoint_name: {"quant_algo": "FP8"}},
+                    "exclude_modules": ["mtp.norm"],
+                }
+            }
+        )
+    )
+    target = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=[architecture], num_hidden_layers=2, num_nextn_predict_layers=1
+        ),
+        spec_config=SimpleNamespace(speculative_model=tmp_path),
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+    )
+    draft = modeling_speculative._replacement_mtp_model_config(target)
+    mapper = AutoCheckpointMapper.get("HF", architecture)
+    assert list(draft.quant_config_dict) == [runtime_name]
+    assert mapper.map_mtp_module_name(checkpoint_name + ".weight", 2) == runtime_name + ".weight"
+    assert draft.quant_config.exclude_modules == [mapper.map_mtp_module_name("mtp.norm", 2)]
+    assert draft.quant_config_dict[runtime_name].kv_cache_quant_algo == QuantAlgo.FP8
+    assert target.quant_config_dict is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("owns_head", [False, True])
+def test_replacement_post_init_isolates_quantization_across_module_aliases(monkeypatch, owns_head):
+    from torch import nn
+
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+    monkeypatch.setattr("tensorrt_llm._torch.modules.linear.get_sm_version", lambda: 100)
+
+    def linear():
+        return Linear(
+            16,
+            16,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(),
+            skip_create_weights_in_init=True,
+        )
+
+    def mtp_layer(config, layer_idx, aux):
+        layer = nn.Module()
+        layer.proj = linear()
+        layer.unquantized_proj = linear()
+        assert config.spec_config.max_draft_len == 3
+        return layer
+
+    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_qwen3_next.Qwen3NextMTP", mtp_layer)
+    spec_config = SimpleNamespace(
+        uses_replacement_heads=True,
+        max_draft_len=3,
+        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+    )
+    pretrained = PretrainedConfig(
+        model_type="qwen3_next",
+        num_hidden_layers=1,
+        num_nextn_predict_layers=1,
+        hidden_size=16,
+        vocab_size=16,
+        torch_dtype=torch.bfloat16,
+        tie_word_embeddings=False,
+    )
+    pretrained.model_type = "qwen3_next"
+    target_config = ModelConfig(
+        pretrained_config=pretrained,
+        spec_config=spec_config,
+        quant_config=QuantConfig(exclude_modules=["model.layers.1*", "draft_model*"]),
+        quant_config_dict={"model.layers.0": QuantConfig(quant_algo=QuantAlgo.FP8)},
+    )
+    draft_entries = {"model.layers.1.proj": QuantConfig(quant_algo=QuantAlgo.FP8)}
+    if owns_head:
+        draft_entries["lm_head"] = QuantConfig(quant_algo=QuantAlgo.FP8)
+    draft_config = ModelConfig(
+        pretrained_config=pretrained,
+        spec_config=spec_config,
+        quant_config_dict=draft_entries,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        skip_create_weights_in_init=True,
+    )
+    with torch.device("cpu"):
+        target = nn.Module()
+        target.layers = nn.ModuleList([linear()])
+        target.embed_tokens = nn.Embedding(16, 16)
+        target.aux_stream_dict = {}
+        head = linear()
+        draft = modeling_speculative.MTPForCausalLM(draft_config, 1, head, target)
+        model = object.__new__(modeling_speculative.SpecDecOneEngineForCausalLM)
+        nn.Module.__init__(model)
+        model.model_config = target_config
+        model.model = target
+        model.lm_head = head
+        model.spec_config = spec_config
+        model.draft_model = draft
+        target.layers.extend(draft.mtp_layers)
+        model.__post_init__()
+
+    assert target.layers[1] is draft.mtp_layers[0]
+    assert target.layers[0].quant_config.quant_algo == QuantAlgo.FP8
+    assert draft.mtp_layers[0].proj.quant_config.quant_algo == QuantAlgo.FP8
+    assert draft.mtp_layers[0].proj.weight.dtype == torch.float8_e4m3fn
+    assert draft.mtp_layers[0].unquantized_proj.weight.dtype == torch.bfloat16
+    assert head.quant_config.quant_algo is None
+    assert head.weight.dtype == torch.bfloat16
+    assert draft.embed_tokens is target.embed_tokens
+    assert (draft.lm_head is head) == (not owns_head)
+    if owns_head:
+        assert draft.lm_head.weight.dtype == torch.float8_e4m3fn
+    assert draft.model_config.spec_config is spec_config
+    assert target_config.quant_config_dict.keys() == {"model.layers.0"}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("materialize", [False, True])
+def test_replacement_loader_initializes_independent_architecture_mapper(monkeypatch, materialize):
+    from tensorrt_llm._torch.models import modeling_utils
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    captured = {}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def capture_load(model, weights, mapper, **kwargs):
+        captured.update(model=model, weights=weights, mapper=mapper, **kwargs)
+
+    monkeypatch.setattr(modeling_utils, "_load_weights_impl_v2", capture_load)
+    config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["NemotronHForCausalLM"],
+            num_hidden_layers=52,
+            mamba_head_dim=64,
+            mamba_num_heads=8,
+            n_groups=8,
+            ssm_state_size=128,
+            num_key_value_heads=2,
+            tie_word_embeddings=False,
+        )
+    )
+    model = _make_one_engine_stub(MTPDecodingConfig(max_draft_len=1, speculative_model="/draft"))
+    model.draft_config = config
+    model.draft_model.model_config = config
+    model.draft_model.config = config.pretrained_config
+    model.draft_model.owns_lm_head = False
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader.spec_config = model.spec_config
+    loader.mapping = config.mapping
+    loader.weight_mapper = object()
+    checkpoint_loader = SimpleNamespace(
+        checkpoint_format="HF",
+        load_weights=lambda *args, **kwargs: _nemotron_style_mtp_weights(include_shared_head=False),
+    )
+
+    if materialize:
+        loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+    else:
+        loader._load_separate_draft_weights(model, checkpoint_loader)
+
+    assert isinstance(captured["mapper"], NemotronHHfWeightMapper)
+    assert captured["mapper"].config is config
+    assert captured["mapper"].model is model.draft_model
+    assert captured["mapper"] is not loader.weight_mapper
+    assert captured["model"] is model.draft_model
+    assert "mtp_layers.0.layers.0.enorm.weight" in captured["weights"]
+    assert captured["allow_partial_loading"] is False

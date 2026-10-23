@@ -12,112 +12,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from fake_executor_effects import FakeExecutorEffects, FakeRequestRegistry
-from fake_kv_cache_transceiver import FakeKvCacheTransceiver
+from coordinator_harness import CoordinatorHarness as _Harness
+from coordinator_harness import TransferRequest as _Request
+from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
-from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
-
-
-class _Request(SimpleNamespace):
-    """Request stub with the attributes the transfer paths read."""
-
-    def __init__(self, rid: int, **overrides) -> None:
-        defaults = dict(
-            py_request_id=rid,
-            request_id=rid,
-            parent_request_id=None,
-            is_child=False,
-            state=LlmRequestState.CONTEXT_INIT,
-            is_context_only_request=True,
-            is_context_finished=True,
-            is_finished_due_to_length=False,
-            is_finished_due_to_cancellation=False,
-            is_disagg_generation_init_state=False,
-            is_disagg_generation_transmission_in_progress=False,
-            py_kv_transfer_start_time=None,
-            py_kv_transfer_timed_out=False,
-            py_disaggregated_params=None,
-            cached_tokens=0,
-            response=None,
-        )
-        defaults.update(overrides)
-        super().__init__(**defaults)
-        self.state_at_response_creation = None
-
-    def create_response(self, _use_fast_logits, _rank):
-        self.state_at_response_creation = self.state
-        return self.response
-
-    @property
-    def is_generation_only_request(self) -> bool:
-        return not self.is_context_only_request
-
-
-class _Harness:
-    def __init__(
-        self,
-        *,
-        kv_transfer_timeout_ms=None,
-        supports_inflight_cancellation=False,
-        enable_attention_dp=False,
-        world_size=1,
-        tp_size=1,
-        force_terminate_ctx_for_partial_reuse=False,
-        draft_kv_cache_manager=None,
-    ) -> None:
-        self.transceiver = FakeKvCacheTransceiver(
-            kv_transfer_timeout_ms=kv_transfer_timeout_ms,
-            supports_inflight_cancellation=supports_inflight_cancellation,
-        )
-        self.transceiver.has_retired_send_session = lambda req: False
-        self.kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
-        self.kv_cache_manager.store_blocks_for_reuse.side_effect = lambda req, _: req.py_request_id
-        resource_manager = SimpleNamespace(
-            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: self.kv_cache_manager}
-        )
-        self.transfers = AsyncTransferManager(resource_manager)
-        self.active = []
-        self.registry = FakeRequestRegistry(self.active)
-        self.effects = FakeExecutorEffects()
-        self.dist = Mock(rank=0, tp_size=tp_size, world_size=world_size)
-        self.delegates = Mock()
-        self.delegates.requests_in_error_state.return_value = []
-        self.coordinator = DisaggTransferCoordinator(
-            transceiver=self.transceiver,
-            transfer_manager=self.transfers,
-            kv_cache_manager=self.kv_cache_manager,
-            dist=self.dist,
-            effects=self.effects,
-            registry=self.registry,
-            enable_attention_dp=enable_attention_dp,
-            force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
-            delegates=self.delegates,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-        )
-
-    def send(self, *requests: _Request) -> None:
-        self.coordinator.send_completed_context(list(requests))
-
-    def in_transfer(self, req: _Request) -> bool:
-        return req.py_request_id in self.transfers.requests_in_transfer()
-
-
-@pytest.fixture
-def inflight_cancel(monkeypatch):
-    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: True)
-
-
-@pytest.fixture
-def clock(monkeypatch):
-    now = {"t": 100.0}
-    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: now["t"])
-    return now
 
 
 # -- sending -----------------------------------------------------------------
@@ -273,8 +175,9 @@ def test_fast_completion_without_a_response_terminates_immediately() -> None:
 
 
 def test_failed_send_releases_its_claim_but_leaves_the_request_to_the_error_path() -> None:
-    """The transfer ends (blocks unpinned) but the request stays active so the
-    rank-synchronized error pass can respond; nothing is terminated here."""
+    """The transfer ends (blocks unpinned) and the still-active request is
+    handed to the executor's error path as a context failure; the reap itself
+    terminates nothing."""
     h = _Harness()
     req = _Request(1)
     h.active.append(req)
@@ -288,7 +191,7 @@ def test_failed_send_releases_its_claim_but_leaves_the_request_to_the_error_path
     assert not h.in_transfer(req)
     assert h.effects.terminated == []
     assert h.effects.staged_responses == []
-    h.delegates.check_transfer_errors.assert_called_once_with("context requests")
+    assert h.effects.failed == [("Error in kv cache transfer for context requests", [req], False)]
 
 
 def test_failure_reported_after_release_is_kept_for_the_synced_error_pass() -> None:
@@ -373,6 +276,7 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
         _Request(1, is_context_only_request=False),
         _Request(2, is_context_only_request=False),
     )
+    h.active.extend([remote, user])
     h.registry.canceled = [2]
     h.transceiver.request_and_receive_async(remote)
     h.transceiver.request_and_receive_async(user)
@@ -383,17 +287,22 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
 
     assert remote.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert user.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-    h.delegates.check_transfer_errors.assert_called_once_with("generation requests")
+    assert h.effects.failed == [
+        ("Error in kv cache transfer for generation requests", [remote], False)
+    ]
 
 
 def test_gen_reap_leaves_error_handling_to_the_consensus_path_under_inflight_cancel(
     inflight_cancel,
 ) -> None:
     h = _Harness(supports_inflight_cancellation=True)
+    h.active.append(
+        _Request(1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
+    )
 
     h.coordinator.reap_gen_receives(0)
 
-    h.delegates.check_transfer_errors.assert_not_called()
+    assert h.effects.failed == []
 
 
 # -- timeouts ----------------------------------------------------------------
@@ -585,7 +494,7 @@ def test_peer_rank_timeout_decision_is_mirrored_locally(inflight_cancel, clock) 
 def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_cancel) -> None:
     h = _Harness(supports_inflight_cancellation=True, tp_size=2)
     error_req = _Request(1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
-    h.delegates.requests_in_error_state.return_value = [error_req]
+    h.active.append(error_req)
     h.dist.tp_allgather.return_value = [[], []]  # no timed-out receives on any rank
 
     h.dist.tp_allreduce.return_value = 0
@@ -597,6 +506,244 @@ def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_
     assert h.effects.failed == [
         ("Error in kv cache transfer for generation requests", [error_req], False)
     ]
+
+
+# -- settling cancellations and hangs ----------------------------------------
+#
+# The cases above stop where the coordinator asks for something (a cancel, a
+# retry) or keeps waiting. These follow each scenario through to its end: the
+# transceiver finally reports, the executor cleans up, and nothing is
+# released, failed or cancelled a second time.
+
+_GEN_ERROR = "Error in kv cache transfer for generation requests"
+_CTX_ERROR = "Error in kv cache transfer for context requests"
+
+
+def _keep_session_on_cancel(h: _Harness, *, refuse_first: int = 0) -> list:
+    """Model in-flight cancellation: ``cancel_request`` is accepted after
+    ``refuse_first`` refusals, but the session stays owned by the transceiver
+    until a later status poll reports it. Tests script that report with
+    ``cancel_recv_remotely`` / ``finish_send``. Returns the attempt log."""
+    attempts = []
+
+    def cancel(request):
+        attempts.append(request.py_request_id)
+        return len(attempts) > refuse_first
+
+    h.transceiver.cancel_request = cancel
+    return attempts
+
+
+def _executor_cleans_up(h: _Harness, req: _Request) -> None:
+    """What the executor's error path does after ``fail_requests``: the request
+    leaves active_requests and the coordinator drops its bookkeeping."""
+    h.active.remove(req)
+    h.coordinator.forget_request(req.py_request_id)
+
+
+def test_refused_cancellation_is_settled_once_after_the_retry_is_accepted(
+    inflight_cancel, clock
+) -> None:
+    """A refusal leaves the receive owned and untouched; the accepted retry is
+    not repeated; the request fails exactly once when the transceiver reports
+    the cancelled session, and nothing happens to it after that."""
+    h = _Harness(kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True)
+    req = _receiving(h, 1, started_at=clock["t"])
+    clock["t"] += 2.0
+    attempts = _keep_session_on_cancel(h, refuse_first=1)
+
+    h.coordinator.poll_gen_transfers()  # refused
+    assert attempts == [1]
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert not h.transceiver.check_gen_transfer_complete()
+    assert h.effects.history == []
+
+    h.coordinator.poll_gen_transfers()  # accepted; the session is still owned
+    h.coordinator.poll_gen_transfers()  # nothing left to ask for
+    assert attempts == [1, 1]
+    assert not h.transceiver.check_gen_transfer_complete()
+    assert h.effects.history == []
+
+    h.transceiver.cancel_recv_remotely(req)
+    h.coordinator.poll_gen_transfers()
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.transceiver.check_gen_transfer_complete()
+    assert h.effects.failed == [(_GEN_ERROR, [req], False)]
+
+    _executor_cleans_up(h, req)
+    h.coordinator.poll_gen_transfers()
+    assert attempts == [1, 1]
+    assert h.effects.history == [("fail", _GEN_ERROR)]
+
+
+@pytest.mark.parametrize("outcome", ["error", "complete"])
+def test_timed_out_send_is_settled_once_when_the_transceiver_finally_reports(
+    inflight_cancel, clock, outcome
+) -> None:
+    """After the in-flight cancel the send stays owned until the transceiver
+    reports. A late failure releases the blocks once and fails the request
+    once; a completion that beat the cancel releases once and terminates
+    normally, with no error."""
+    h = _Harness(kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True)
+    req = _Request(1)
+    h.active.append(req)
+    h.send(req)
+    clock["t"] += 2.0
+    h.coordinator.check_transfer_timeouts()
+    attempts = _keep_session_on_cancel(h)
+    h.coordinator.reap_context_sends(0)  # cancels once, ownership kept
+    assert attempts == [1]
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+    h.transceiver.finish_send(req, outcome=outcome)
+    h.coordinator.reap_context_sends(0)
+
+    assert not h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
+    assert attempts == [1]
+    if outcome == "error":
+        assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert h.effects.history == [("fail", _CTX_ERROR)]
+        assert h.effects.failed == [(_CTX_ERROR, [req], False)]
+        _executor_cleans_up(h, req)
+    else:
+        assert req.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+        assert h.effects.history == [("terminate", req)]
+        assert h.active == []
+
+    h.coordinator.reap_context_sends(0)
+    assert attempts == [1]
+    assert len(h.effects.history) == 1
+
+
+def test_mirrored_timeout_cancels_and_fails_each_replica_once_across_ranks(
+    inflight_cancel, clock
+) -> None:
+    """Under TP the peer's timeout is mirrored: both ranks cancel their replica
+    once, keep polling in lockstep while the transceiver still owns it, fail
+    it once when the cancelled session is reported, and stay quiet once the
+    executor cleaned up. Both ranks enter the same collectives throughout."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [
+        _Harness(
+            kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True, dist=group.rank(rank)
+        )
+        for rank in range(2)
+    ]
+    expired = _receiving(ranks[0], 1, started_at=clock["t"])
+    fresh = _receiving(ranks[1], 1, started_at=clock["t"] + 1.5)
+    attempts = [_keep_session_on_cancel(h) for h in ranks]
+    clock["t"] += 2.0
+
+    def poll(rank):
+        ranks[rank].coordinator.poll_gen_transfers()
+
+    group.run(poll)  # rank 0 expired; rank 1 mirrors the decision
+    group.run(poll)  # nothing to repeat
+    assert attempts == [[1], [1]]
+    assert expired.py_kv_transfer_timed_out and fresh.py_kv_transfer_timed_out
+    assert [h.effects.history for h in ranks] == [[], []]
+
+    for h, req in zip(ranks, (expired, fresh)):
+        h.transceiver.cancel_recv_remotely(req)
+    group.run(poll)
+    assert [h.effects.failed for h in ranks] == [
+        [(_GEN_ERROR, [expired], False)],
+        [(_GEN_ERROR, [fresh], False)],
+    ]
+
+    for h, req in zip(ranks, (expired, fresh)):
+        _executor_cleans_up(h, req)
+    group.run(poll)
+    assert attempts == [[1], [1]]
+    assert [len(h.effects.history) for h in ranks] == [1, 1]
+    collectives = [[name for name, _ in h.dist.calls] for h in ranks]
+    assert collectives[0] == collectives[1]
+    assert collectives[0].count("tp_allgather") == 1  # the id union, once
+
+
+@pytest.mark.parametrize("direction", ["context_send", "generation_receive"])
+def test_a_hanging_transfer_keeps_its_resources_until_the_transceiver_settles(
+    direction,
+) -> None:
+    """A transfer that reports nothing for many polls is left exactly as it
+    is: still owned, blocks still pinned, no error, no termination. Holding on
+    is the correct outcome of a hang, not releasing. Once the transceiver
+    settles it, the request is released exactly once."""
+    h = _Harness()
+    if direction == "context_send":
+        req = _Request(1)
+        h.active.append(req)
+        h.send(req)
+        pending_state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+        def poll():
+            h.coordinator.reap_context_sends(0)
+
+        def settle():
+            h.transceiver.finish_send(req)
+    else:
+        req = _receiving(h, 1, started_at=None)
+        pending_state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        poll = h.coordinator.poll_gen_transfers
+
+        def settle():
+            h.transceiver.finish_recv(req)
+
+    for _ in range(3):
+        poll()
+
+    assert req.state == pending_state
+    assert h.active == [req]
+    assert h.effects.history == []
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    assert "cancel_request:1" not in h.transceiver.call_log
+    if direction == "context_send":
+        assert h.in_transfer(req)
+    else:
+        assert not h.transceiver.check_gen_transfer_complete()
+
+    settle()
+    poll()
+
+    if direction == "context_send":
+        assert not h.in_transfer(req)
+        h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
+        assert h.effects.history == [("terminate", req)]
+        assert h.active == []
+    else:
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert h.transceiver.check_gen_transfer_complete()
+        assert h.effects.history == []
+
+
+def test_consecutive_sends_release_every_pinned_block_exactly_once() -> None:
+    """Context requests hold their blocks only while a send is in flight. With
+    several sends settling out of order across polls, one of them failing,
+    every block is unpinned exactly once and nothing stays in transfer, so the
+    capacity a context worker lent to transfers comes back in full."""
+    h = _Harness()
+    first, second, third, fourth = requests = [_Request(rid) for rid in (1, 2, 3, 4)]
+    h.active.extend(requests)
+    h.send(*requests)
+    assert sorted(h.transfers.requests_in_transfer()) == [1, 2, 3, 4]
+
+    h.transceiver.finish_send(third)
+    h.coordinator.reap_context_sends(0)
+    h.transceiver.finish_send(first, outcome="error")
+    h.transceiver.finish_send(fourth)
+    h.coordinator.reap_context_sends(0)
+    _executor_cleans_up(h, first)
+    h.transceiver.finish_send(second)
+    h.coordinator.reap_context_sends(0)
+
+    assert h.transfers.requests_in_transfer() == {}
+    unpinned = sorted(call.args[0] for call in h.kv_cache_manager.unpin_blocks_by_id.call_args_list)
+    assert unpinned == [1, 2, 3, 4]
+    assert h.effects.terminated == [third, fourth, second]
+    assert h.effects.failed == [(_CTX_ERROR, [first], False)]
+    assert h.active == []
 
 
 # -- pacing ------------------------------------------------------------------

@@ -19,6 +19,7 @@ from typing import TypeAlias
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .prims_ts import PrimsTSFmha
 from .triton_custom_mask import TritonCustomMaskFmha
@@ -39,6 +40,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 
     return {
+        "fp4_mla": Fp4MlaFmha,
         "triton_custom_mask": TritonCustomMaskFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
         # A pair, not a priority: msa_decode serves a MiniMax-M3 MSA layer's

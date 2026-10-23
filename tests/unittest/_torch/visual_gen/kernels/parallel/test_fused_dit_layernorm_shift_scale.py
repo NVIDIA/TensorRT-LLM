@@ -75,15 +75,13 @@ def _make_inputs(M, B, has_ln_affine, has_modulation, seed=42):
     ln_weight = ln_bias = scale_msa = shift_msa = None
     seq_len_per_batch = M  # default (B=1 case)
     if has_ln_affine:
-        ln_weight = (torch.ones(D, device=device) + torch.randn(D, device=device) * 0.1).to(
-            torch.bfloat16
-        )
-        ln_bias = (torch.randn(D, device=device) * 0.1).to(torch.bfloat16)
+        ln_weight = torch.ones(D, device=device) + torch.randn(D, device=device) * 0.1
+        ln_bias = torch.randn(D, device=device) * 0.1
         ref = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
     elif has_modulation:
         seq_len_per_batch = M // B
-        scale_msa = (torch.randn(B, D, device=device) * 0.2).to(torch.bfloat16)
-        shift_msa = (torch.randn(B, D, device=device) * 0.2).to(torch.bfloat16)
+        scale_msa = torch.randn(B, D, device=device) * 0.2
+        shift_msa = torch.randn(B, D, device=device) * 0.2
         ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, seq_len_per_batch, EPS)
     else:
         ref = _ref_layernorm_plain(x, EPS)
@@ -129,8 +127,7 @@ def test_bf16_correctness(M, B, has_ln_affine, has_modulation):
     assert out.shape == (M, D)
     assert out.dtype == torch.bfloat16
 
-    # bf16 accumulation gives ~1e-3 max absolute error vs fp32 reference.
-    torch.testing.assert_close(out.float(), ref.to(torch.bfloat16).float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -149,36 +146,29 @@ def test_adaln_batch_modulation_correctness():
     torch.manual_seed(0)
 
     x = torch.randn(M, D, device=device).to(torch.bfloat16)
-    # Very distinct scale/shift per batch element.
-    scale_msa = torch.stack([torch.ones(D, device=device) * (i * 0.5) for i in range(B)]).to(
-        torch.bfloat16
-    )
-    shift_msa = torch.stack([torch.ones(D, device=device) * (i * 1.0) for i in range(B)]).to(
-        torch.bfloat16
-    )
+    scale_msa = torch.stack([torch.ones(D, device=device) * (i * 0.5) for i in range(B)])
+    shift_msa = torch.stack([torch.ones(D, device=device) * (i * 1.0) for i in range(B)])
 
     out = torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale_msa, shift_msa, S, EPS)
-    ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, S, EPS).to(torch.bfloat16)
+    ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, S, EPS)
 
-    # Cross-batch: rows from different batch elements should be measurably different.
     out_b0 = out[:S].float().mean()
     out_b1 = out[S : 2 * S].float().mean()
     assert abs(out_b0.item() - out_b1.item()) > 0.1, (
         "Batch elements have indistinguishable outputs — modulation broadcast may be broken"
     )
 
-    # Still matches reference row-by-row.
-    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
 
 
 # ---------------------------------------------------------------------------
-# Affine fp32->bf16 downcast: model keeps norm2 weight/bias in float32; the op
-# reads them as bf16. Verify the downcast matches the float32-weight reference.
+# Affine FP32 weight/bias: kernel reads them in fp32; verify the output matches
+# the FP32 reference closely (not limited by a bf16 downcast of weights).
 # ---------------------------------------------------------------------------
 
 
-def test_affine_fp32_weight_downcast_matches_eager():
-    """fp32 weight/bias downcast to bf16 matches the float32-weight reference."""
+def test_affine_fp32_weight_matches_eager():
+    """fp32 weight/bias passed directly to kernel match the fp32 reference."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     device = torch.device("cuda")
@@ -189,20 +179,9 @@ def test_affine_fp32_weight_downcast_matches_eager():
     ln_weight = torch.ones(D, device=device) + torch.randn(D, device=device) * 0.1
     ln_bias = torch.randn(D, device=device) * 0.1
 
-    # The op reads weight/bias as bf16 (kernel ABI); mimic the model's downcast.
-    out = torch.ops.trtllm.fused_adaptive_layernorm(
-        x, ln_weight.to(torch.bfloat16), ln_bias.to(torch.bfloat16), None, None, M, EPS
-    )
-    ref_fp32 = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
-    torch.testing.assert_close(
-        out.float(), ref_fp32.to(torch.bfloat16).float(), rtol=2e-2, atol=2e-2
-    )
-
-    # Isolated fp32->bf16 weight-downcast error stays well below the bf16 output tol.
-    ref_bf16 = _ref_layernorm_affine(
-        x, ln_weight.to(torch.bfloat16), ln_bias.to(torch.bfloat16), EPS
-    )
-    assert (ref_fp32 - ref_bf16).norm() / ref_fp32.norm() < 5e-3
+    out = torch.ops.trtllm.fused_adaptive_layernorm(x, ln_weight, ln_bias, None, None, M, EPS)
+    ref = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +269,10 @@ def test_validation_mutual_exclusivity():
         pytest.skip("CUDA not available")
     device = torch.device("cuda")
     x = torch.randn(32, D, device=device).to(torch.bfloat16)
-    ln_w = torch.ones(D, device=device).to(torch.bfloat16)
-    ln_b = torch.zeros(D, device=device).to(torch.bfloat16)
-    scale = torch.zeros(1, D, device=device).to(torch.bfloat16)
-    shift = torch.zeros(1, D, device=device).to(torch.bfloat16)
+    ln_w = torch.ones(D, device=device)
+    ln_b = torch.zeros(D, device=device)
+    scale = torch.zeros(1, D, device=device)
+    shift = torch.zeros(1, D, device=device)
     with pytest.raises(RuntimeError, match="mutually exclusive"):
         torch.ops.trtllm.fused_adaptive_layernorm(x, ln_w, ln_b, scale, shift, 32, EPS)
 
@@ -544,11 +523,14 @@ def test_adaln_production_modulator_extraction():
     assert scale_msa.is_contiguous()
     assert scale_msa.shape == (B, D)  # T=1 so T*D == D
 
-    out = torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale_msa, shift_msa, S, EPS)
-    ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, S, EPS).to(torch.bfloat16)
+    # utils_wan.py casts to float32 before the kernel; mimic that here.
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
+        x, None, None, scale_msa.float(), shift_msa.float(), S, EPS
+    )
+    ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, S, EPS)
 
     assert out.shape == (M, D)
-    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
 
 
 def test_adaln_rejects_non_contiguous_modulators():
@@ -561,8 +543,8 @@ def test_adaln_rejects_non_contiguous_modulators():
     device = torch.device("cuda")
     x = torch.randn(M, D, device=device).to(torch.bfloat16)
 
-    # chunk produces non-contiguous views
-    temb = torch.randn(B, 6, D, device=device).to(torch.bfloat16)
+    # chunk produces non-contiguous views; float32 so dtype check doesn't fire first
+    temb = torch.randn(B, 6, D, device=device).to(torch.float32)
     chunks = temb.chunk(6, dim=1)
     scale_nc = chunks[0].squeeze(1)  # [B, D], non-contiguous
     shift_nc = chunks[1].squeeze(1)

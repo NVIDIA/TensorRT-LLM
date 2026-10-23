@@ -10,17 +10,17 @@ coordinator; a changed sequence is a review signal, not necessarily a bug.
 
 Rank symmetry is checked only in the narrow form that fits one process: the
 first and a non-first PP rank must issue the same collective-sensitive calls in
-the same order during an idle iteration. Real multi-rank blocking semantics are
-covered elsewhere (Gloo tests; FakeDist arrives with CS-2). Regular disagg PP
+the same order during an idle iteration. Rank skew inside the coordinator is
+covered by the FakeDist tests (test_disagg_coordinator_progress.py); real
+multi-process blocking semantics only by multi-GPU E2E. Regular disagg PP
 termination advances from executed-batch handling; a recompute-pause fallback
 can call the same termination handler from an idle iteration. Neither path is
-covered here (nothing is pending in these iterations); both belong to the
-executed-batch/lifecycle transcripts of PR-5.
+covered here (nothing is pending in these iterations); both belong to
+executed-batch and lifecycle transcripts, which do not exist yet.
 """
 
 import inspect
 import queue
-from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -31,7 +31,6 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggLoopDelegates,
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
@@ -39,17 +38,19 @@ from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorEffects,
     PyExecutorRequestRegistry,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager
 
 pytestmark = pytest.mark.cpu_only
 
-# Coordinator entry points whose delegates run a rank-consensus collective.
-# Derived from the delegate targets in PyExecutor._build_disagg_coordinator;
-# update alongside them.
+# Coordinator entry points that run a rank-consensus collective. Maintained by
+# hand as entry points move.
 _COLLECTIVE_COORDINATOR_CALLS = {
     "handle_errors_synced",  # dist.allreduce / tp_allgather under ADP
     "prepare_context_schedulable",  # transceiver.prepare_context_requests consensus
@@ -113,6 +114,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.kv_cache_transceiver = Mock()
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.has_any_inflight_requests.return_value = False
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
     executor.kv_connector_manager = None
 
     executor.device_id = 0
@@ -121,6 +123,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor._profiler = Mock(return_value=profiler)
     executor.hang_detector = MagicMock()
     executor.enable_iter_perf_stats = False
+    executor.enable_kv_cache_events = False
     executor.enable_attention_dp = False
     executor.is_benchmark_disagg = False
     executor.iter_counter = 0
@@ -257,6 +260,137 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     assert calls == idle_pass + _SHUTDOWN_PASS
 
 
+@pytest.mark.parametrize(
+    "states",
+    [("absent", "processed"), ("processed", "deferred"), ("deferred", "absent")],
+    ids=["absent-processed", "processed-deferred", "deferred-absent"],
+)
+def test_overlap_kv_events_keep_adp_collectives_aligned(
+    monkeypatch, states: tuple[str, str]
+) -> None:
+    """Buffered V2 events occupy the same collective slot despite rank-local batch state."""
+    transcripts = []
+    for rank, state in enumerate(states):
+        calls = []
+        gathered_events = []
+
+        def gather(local_events: list) -> list:
+            calls.append(("kv_event_allgather",))
+            gathered_events.append(list(local_events))
+            return [local_events, []] if rank == 0 else [[], local_events]
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.event_manager = KVCacheEventManager(
+            max_kv_event_entries=8, attention_dp_rank=rank, attention_dp_gather=gather
+        )
+        executor = _idle_executor(monkeypatch, calls)
+        executor.enable_attention_dp = True
+        executor.enable_kv_cache_events = True
+        executor._is_kv_manager_v2 = True
+        executor.kv_cache_manager = manager
+        executor.enable_kv_pool_rebalance = False
+        executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
+        executor.speculation_gate = None
+        executor.use_spec_decode = False
+        executor._pause_recompute_paused_requests = Mock()
+        executor._commit_kv_cache_stats = Mock()
+        executor._update_requests = Mock()
+        executor._send_kv_async = Mock()
+        executor._handle_canceled_requests = Mock()
+        executor.perf_manager = Mock()
+        executor.resource_manager = Mock()
+        executor.resource_manager.resource_managers = {
+            ResourceManagerType.KV_CACHE_MANAGER: manager
+        }
+        executor._enqueue_responses = lambda responses: calls.append(("enqueue_responses",))
+
+        def handle_responses(*, emit_first_iter: bool) -> list:
+            executor._enqueue_responses([])
+            return []
+
+        def update_generation_resources(*args) -> None:
+            calls.append(("update_generation_resources",))
+            manager.event_manager.add_created_event([1])
+
+        def update_resources(*args, skip_kv_cache_manager: bool) -> None:
+            assert skip_kv_cache_manager is True
+            calls.append(("update_resources",))
+
+        manager.update_resources = Mock(side_effect=update_generation_resources)
+        executor._handle_responses = handle_responses
+        executor.resource_manager.update_resources.side_effect = update_resources
+        if state != "absent":
+            executor.previous_batch = SimpleNamespace(
+                scheduled_requests=ScheduledRequests(), sample_state=Mock()
+            )
+        # A locally ready rank defers its previous batch while a peer cannot queue.
+        executor._can_queue.return_value = (False, state == "deferred")
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        assert calls[-len(_SHUTDOWN_PASS) :] == _SHUTDOWN_PASS
+        iteration_calls = calls[: -len(_SHUTDOWN_PASS)]
+        assert len(gathered_events) == 1
+        assert len(gathered_events[0]) == (1 if state == "processed" else 0)
+        if state == "processed":
+            manager.update_resources.assert_called_once()
+            assert iteration_calls.index(("update_generation_resources",)) < iteration_calls.index(
+                ("enqueue_responses",)
+            )
+            assert iteration_calls.index(("enqueue_responses",)) < iteration_calls.index(
+                ("update_resources",)
+            )
+            assert iteration_calls.index(("update_resources",)) < iteration_calls.index(
+                ("kv_event_allgather",)
+            )
+            executor._update_requests.assert_called_once()
+        else:
+            manager.update_resources.assert_not_called()
+            executor._update_requests.assert_not_called()
+            executor.resource_manager.update_resources.assert_not_called()
+
+        collective_names = _COLLECTIVE_SENSITIVE | {"enqueue_responses", "kv_event_allgather"}
+        transcript = [call for call in iteration_calls if call[0] in collective_names]
+        assert transcript[-4:] == [
+            ("flush_pending_transfer_responses",),
+            ("enqueue_responses",),
+            ("kv_event_allgather",),
+            ("handle_timeouts_synced",),
+        ]
+        transcripts.append(transcript)
+
+    assert transcripts[0] == transcripts[1]
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [PyExecutor._executor_loop, PyExecutor._executor_loop_overlap],
+    ids=["executor_loop", "executor_loop_overlap"],
+)
+def test_insufficient_kv_fail_fast_ends_the_loop_before_the_benchmark_gate(
+    monkeypatch, loop
+) -> None:
+    """Once the ranks agree the benchmark fill can no longer fit KV, the
+    iteration fails every active request, flushes buffered responses and leaves
+    the loop: the benchmark gate and everything behind it (resource
+    preparation, forward, sampling) never run for the doomed batch."""
+    calls = []
+    executor = _idle_executor(monkeypatch, calls)
+    executor.dist = Mock(tp_size=1, world_size=1)
+    executor.active_requests = [Mock(), Mock()]
+    executor.benchmark_req_queues_size = 2  # quoted in the error message
+    executor._sync_gen_only_benchmark_has_insufficient_kv = Mock(return_value=True)
+    executor._handle_errors = lambda error_msg, *, requests: calls.append(
+        ("fail_requests", len(requests))
+    )
+
+    loop(executor)
+
+    assert calls == _SCHEDULE_HEAD + [("fail_requests", 2), ("flush_pending_transfer_responses",)]
+    executor._check_benchmark_disagg_gate.assert_not_called()
+    assert executor._event_loop_completed
+
+
 def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
     """The PP loop admits inside schedule propagation, checks transfer timeouts
     only on the retry and executed-batch paths, and flushes responses only from
@@ -319,18 +453,16 @@ def test_pp_ranks_issue_the_same_collective_sensitive_calls(monkeypatch) -> None
 def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExecutor:
     """Idle executor on a two-rank ADP group with the coordinator the executor
     would really build: the no-op one without a transceiver, otherwise a real
-    one whose CS-1 paths run against a quiet transceiver (the still-delegated
-    entry points are stubbed)."""
+    one running against a quiet transceiver."""
     executor = _idle_executor(monkeypatch, calls)
     executor.enable_attention_dp = True
     executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
     executor.dist.tp_allgather_int64.return_value = Mock(any=lambda: False)
+    # The real error vote iterates the gathered votes; echo this rank's twice.
+    executor.dist.tp_allgather.side_effect = lambda obj: [obj, obj]
     executor.kv_cache_transceiver = transceiver
     del executor._disagg_coordinator
     if transceiver is not None:
-        # admit is the one delegate whose return value the loop unpacks.
-        delegates = {f.name: (lambda *a, **k: None) for f in fields(DisaggLoopDelegates)}
-        delegates["admit"] = lambda fitting: (fitting, False)
         executor._disagg_coordinator = DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=executor.async_transfer_manager,
@@ -340,7 +472,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
             force_terminate_ctx_for_partial_reuse=False,
-            delegates=DisaggLoopDelegates(**delegates),
         )
     return executor
 

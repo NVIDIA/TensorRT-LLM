@@ -29,7 +29,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
-from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -122,7 +122,6 @@ def _make_reap_coordinator(*, requests_in_transfer, inflight_cancel_supported=Tr
         registry=_registry_over([]),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=Mock(),
     )
     return coordinator, transceiver, effects
 
@@ -299,27 +298,6 @@ def test_context_transfer_error_keeps_request_active_until_all_owners_release():
     effects.terminate_request.assert_not_called()
 
 
-def test_context_transfer_error_cleanup_waits_for_async_owners():
-    request = SimpleNamespace(
-        state=LlmRequestState.DISAGG_TRANS_ERROR,
-        py_request_id=7,
-        is_child=False,
-        is_context_only_request=True,
-    )
-    executor = object.__new__(PyExecutor)
-    executor.active_requests = [request]
-    executor.canceled_req_ids = []
-    executor.async_transfer_manager = Mock()
-    executor.async_transfer_manager.requests_in_transfer.return_value = {
-        request.py_request_id: request
-    }
-
-    assert PyExecutor._get_disagg_reqs_in_error_state(executor) == []
-
-    executor.async_transfer_manager.requests_in_transfer.return_value = {}
-    assert PyExecutor._get_disagg_reqs_in_error_state(executor) == [request]
-
-
 def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     request = SimpleNamespace(
         state=LlmRequestState.DISAGG_TRANS_ERROR,
@@ -370,34 +348,6 @@ def test_flag_unset_generation_driver_skips_cancel_pipeline():
     # Neither the timeout-cancel vote nor the error consensus is entered.
     coordinator._dist.tp_allreduce.assert_not_called()
     effects.fail_requests.assert_not_called()
-
-
-def test_peer_buffer_poison_triggers_world_consistent_fatal_cleanup(monkeypatch):
-    executor = object.__new__(PyExecutor)
-    executor.kv_cache_transceiver = Mock()
-    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
-    executor.kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
-    executor.enable_attention_dp = False
-    executor.dist = SimpleNamespace(
-        world_size=2,
-        allreduce=Mock(return_value=1),
-    )
-    executor._fatal_error = None
-    executor.is_shutdown = False
-    executor._handle_errors = Mock()
-    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: True)
-
-    PyExecutor._handle_disagg_cache_errors_synced(executor)
-
-    executor.dist.allreduce.assert_called_once_with(0, op=executor_module.ReduceOp.MAX)
-    assert isinstance(executor._fatal_error, RuntimeError)
-    assert executor.is_shutdown
-    executor._handle_errors.assert_called_once_with(
-        "Disagg KV cache transfer buffer is poisoned; process restart is required",
-        requests=None,
-        charge_budget=False,
-        fatal_is_collective_aligned=True,
-    )
 
 
 def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned():
@@ -539,7 +489,7 @@ def test_direct_cpp_wrapper_rejects_python_runtime_opt_in(monkeypatch):
 
 
 def test_flag_unset_preserves_existing_backend_selection(monkeypatch):
-    config = CacheTransceiverConfig(backend="UCX")
+    config = CacheTransceiverConfig(backend="UCX", transceiver_runtime="CPP")
     expected = object()
     constructor = Mock(return_value=expected)
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
@@ -558,7 +508,9 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
     monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
 
-    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    result = transceiver_module.create_kv_cache_transceiver(
+        Mock(), Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
+    )
 
     assert result is expected
     constructor.assert_called_once()
@@ -619,7 +571,7 @@ def test_cpp_runtime_keeps_cpp_mamba_manager(monkeypatch, runtime):
 
 def test_flag_unset_preserves_libfabric_selection(monkeypatch):
     monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, "LIBFABRIC")
-    config = CacheTransceiverConfig(backend="NIXL")
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
     expected = object()
     constructor = Mock(return_value=expected)
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
@@ -641,7 +593,7 @@ def test_flag_unset_preserves_libfabric_selection(monkeypatch):
 )
 def test_flag_unset_preserves_legacy_backend_env(monkeypatch, selector, expected_backend):
     monkeypatch.setenv(selector, "1")
-    config = CacheTransceiverConfig(backend="DEFAULT")
+    config = CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
     constructor = Mock(return_value=object())
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
 
@@ -659,7 +611,7 @@ def test_flag_unset_preserves_legacy_backend_env_precedence(monkeypatch):
         "TRTLLM_USE_NIXL_KVCACHE",
     ):
         monkeypatch.setenv(selector, "1")
-    config = CacheTransceiverConfig(backend="DEFAULT")
+    config = CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", Mock())
 
     transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)

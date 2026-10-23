@@ -12,6 +12,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -35,19 +36,21 @@ from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
-from tensorrt_llm.inputs.utils import (ConversationMessage,
-                                       async_apply_chat_template)
+from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
@@ -79,28 +82,28 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
 from tensorrt_llm.serve.chat_tokenization import (
     render_chat_request_for_tokenizer, tokenize_harmony_chat_request)
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines,
-                                           resolve_top_level_model_type)
+                                           parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import (
-    extract_subagent_affinity_id_from_headers, resolve_request_conversation_id)
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request)
+    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionMessageParam, ChatCompletionNamedToolChoiceParam,
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
+    ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, StartProfileRequest,
-    StreamOptions, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
+    ResponseFormat, ResponsesRequest, ResponsesResponse,
+    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
+    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
@@ -113,6 +116,11 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
+from tensorrt_llm.serve.render import (RenderResources, UnsupportedRenderError,
+                                       legacy_render_enabled,
+                                       mount_render_endpoints,
+                                       prepare_chat_request, render_chat,
+                                       render_conversation)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
@@ -122,6 +130,9 @@ from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
+from tensorrt_llm.serve.runtime_control_auth import (
+    RuntimeControlReplayCache, validate_runtime_control_request)
+from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -215,183 +226,6 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "a relayed mode from a context worker. Reasoning content will not be "
         "separated correctly. Check that the context worker is running a "
         "build that relays 'resolved_thinking'.")
-
-
-def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
-    """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
-
-    Kimi's API pins top_p, the penalties, and n, and bounds temperature to
-    [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
-    generate. top_p unset or the OpenAI-default 1.0 is coerced to the pinned
-    0.95 instead of rejected. Off by default so existing K3 deployments keep
-    accepting the requests they accept today (review feedback); a Kimi
-    Vendor Verifier certification run must opt in with
-    TRTLLM_KIMI_PARAM_POLICY=1.
-    """
-    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
-        return
-    if request.top_p is None or request.top_p == 1.0:
-        # Kimi pins top_p at 0.95. None would fall back to 1.0 in
-        # to_sampling_params; an explicit 1.0 is the OpenAI SDK default many
-        # clients send unconditionally — coerce both to the pinned value
-        # rather than rejecting (review feedback).
-        request.top_p = 0.95
-    if request.temperature is not None and not (0.0 <= request.temperature <=
-                                                1.0):
-        raise ValueError("temperature must be within [0, 1] for this model; "
-                         f"got {request.temperature}.")
-    if request.top_p is not None and request.top_p != 0.95:
-        raise ValueError(
-            f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
-    if request.presence_penalty:
-        raise ValueError("presence_penalty is fixed at 0 for this model; "
-                         f"got {request.presence_penalty}.")
-    if request.frequency_penalty:
-        raise ValueError("frequency_penalty is fixed at 0 for this model; "
-                         f"got {request.frequency_penalty}.")
-    if request.n != 1:
-        raise ValueError(f"n is fixed at 1 for this model; got {request.n}.")
-
-
-# Valid function-tool name: no leading digit, word chars/dash only, at most
-# 256 chars (Kimi Vendor Verifier contract for message-level tools).
-_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
-
-
-def _dynamic_tool_dicts(
-        messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
-    """Collect message-level (dynamic) tool declarations from system messages."""
-    tools: list[dict] = []
-    for msg in messages or []:
-        if isinstance(
-                msg, dict) and msg.get("role") == "system" and msg.get("tools"):
-            tools.extend(msg["tools"])
-    return tools
-
-
-def _validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
-    """Validate message-level (dynamic) tool declarations for kimi_k3.
-
-    Kimi-style dynamic tools ride on system messages. Enforce the contract
-    checked by the Kimi Vendor Verifier: system-only carrier, empty content,
-    function-typed tools with valid unique names (unique also against
-    request-level tools). Only called for kimi_k3 deployments; other models
-    keep ignoring the key as before.
-    """
-    seen_names = set()
-    for tool in request.tools or []:
-        seen_names.add(tool.function.name)
-    for message in request.messages or []:
-        # A null tools key is treated as absent (some SDKs serialize
-        # optional fields as null); only declared tools are validated.
-        if not isinstance(message, dict) or message.get("tools") is None:
-            continue
-        if message.get("role") != "system":
-            raise ValueError(
-                "Message-level `tools` are only allowed on system messages.")
-        if message.get("content"):
-            raise ValueError(
-                "A system message carrying `tools` must have empty content.")
-        message_tools = message["tools"]
-        if not isinstance(message_tools, list):
-            raise ValueError("Message-level `tools` must be an array.")
-        for tool in message_tools:
-            if not isinstance(tool, dict):
-                raise ValueError("Each message-level tool must be an object.")
-            if tool.get("type") != "function":
-                raise ValueError(f"Unsupported message-level tool type: "
-                                 f"{tool.get('type')!r}.")
-            function = tool.get("function")
-            if not isinstance(function, dict):
-                raise ValueError(
-                    "Message-level tools must carry a `function` object.")
-            name = function.get("name")
-            if not isinstance(name,
-                              str) or not _DYNAMIC_TOOL_NAME_RE.match(name):
-                raise ValueError(f"Invalid message-level tool name: {name!r}.")
-            if name in seen_names:
-                raise ValueError(f"Duplicate tool name: {name!r}.")
-            seen_names.add(name)
-
-
-def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
-                                model_type: Optional[str]) -> None:
-    """Apply Kimi/Moonshot API semantics to a chat request for kimi_k3.
-
-    The kimi_k3 checkpoint template natively renders control messages for
-    thinking effort, tool_choice, and response_format, but only reads them
-    from chat-template kwargs. Derive those kwargs from the request-level
-    fields so the OpenAI-style API surface drives the template; explicit
-    client-supplied `chat_template_kwargs` win over derived values. The
-    merged kwargs also steer the kimi_k3 reasoning parser's initial channel,
-    the guided-decoding structural tag, and the thinking-budget logits
-    processor downstream.
-
-    Kimi's API also reports usage in the final streaming chunk without the
-    client opting in, so default `stream_options` for streaming requests.
-    """
-    if model_type != "kimi_k3":
-        return
-    _validate_kimi_dynamic_tools(request)
-    _enforce_kimi_param_policy(request)
-    if request.stream and request.stream_options is None:
-        # StreamOptions defaults: include_usage=True, continuous off.
-        request.stream_options = StreamOptions()
-    derived: dict[str, Any] = {}
-    if request.thinking is not None:
-        enabled = request.thinking.type != "disabled"
-        derived["thinking"] = enabled
-        if enabled and request.thinking.effort is not None:
-            derived["thinking_effort"] = request.thinking.effort
-    if ("reasoning_effort" in request.model_fields_set
-            and request.reasoning_effort is not None
-            and "thinking_effort" not in derived and
-        (request.thinking is None or request.thinking.type != "disabled")):
-        # Kimi semantics: an explicit thinking.effort wins, and an explicit
-        # thinking object also wins the on/off axis — reasoning_effort only
-        # supplies the effort when thinking.effort is absent, and
-        # reasoning_effort="none" only disables thinking when no thinking
-        # object was sent. No effort is ever derived for an explicitly
-        # disabled request. (KVV test_reasoning_effort_ignored_when_effort_
-        # present / test_reasoning_effort_effective_when_effort_absent.)
-        effort = getattr(request.reasoning_effort, "value",
-                         request.reasoning_effort).lower()
-        if effort == "none":
-            if request.thinking is None:
-                derived["thinking"] = False
-        elif effort in ("low", "high", "max"):
-            derived["thinking_effort"] = effort
-        # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
-        # leave the template default.
-    if ("tool_choice" in request.model_fields_set
-            and (request.tools or _dynamic_tool_dicts(request.messages))
-            and request.tool_choice in ("required", "none")):
-        derived["tool_choice"] = request.tool_choice
-    response_format = request.response_format
-    if response_format is not None and response_format.type in ("json_object",
-                                                                "json_schema"):
-        derived["response_format"] = response_format.type
-        if response_format.type == "json_schema":
-            # Kimi requires the OpenAI wrapper shape: {name, schema[, strict]}.
-            json_schema = response_format.json_schema
-            if not isinstance(json_schema, dict) or not isinstance(
-                    json_schema.get("name"), str) or not json_schema["name"]:
-                raise ValueError(
-                    "response_format.json_schema requires a non-empty "
-                    "`name` string.")
-            if not isinstance(json_schema.get("schema"), dict):
-                raise ValueError(
-                    "response_format.json_schema requires a `schema` object.")
-            if "strict" in json_schema and not isinstance(
-                    json_schema["strict"], bool):
-                raise ValueError(
-                    "response_format.json_schema.strict must be a boolean.")
-            derived["response_schema"] = json_schema["schema"]
-    if derived:
-        request.chat_template_kwargs = {
-            **derived,
-            **(request.chat_template_kwargs or {}),
-        }
 
 
 def _configure_parser_special_token_decoding(
@@ -611,6 +445,48 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
     return begin_prefix, guided
 
 
+def _new_media_dir(root: Path) -> Path:
+    """Create a directory under ``root`` stamped with the current time.
+
+    ``mkdir`` without ``exist_ok`` is what makes this safe: the kernel either
+    creates the directory or raises, so two servers starting in the same
+    second take separate names instead of sharing one.
+    """
+    stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    root.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        candidate = root / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            n += 1
+
+
+def _resolve_media_dir() -> Path:
+    """Create and return the directory to store generated media in.
+
+    ``TRTLLM_MEDIA_STORAGE_PATH`` names the directory outright, empty meaning
+    unset. Otherwise it goes beside the working directory, and where that
+    cannot be written it goes to a private temporary one: a shared ``/tmp``
+    holds directories owned by other users, so the fallback takes a name
+    nobody else can hold rather than a fixed one.
+    """
+    explicit = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
+    if explicit:
+        path = Path(explicit)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    try:
+        return _new_media_dir(Path.cwd() / "trtllm_generated")
+    except OSError:
+        # OSError rather than PermissionError: a read-only mount raises
+        # EROFS, which is not one.
+        stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+        return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -647,6 +523,21 @@ def _image_output_size(image) -> Optional[str]:
     return f"{width}x{height}"
 
 
+def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
+    """Fixed per-step draft bound to report, or None when there is not one.
+
+    Emitted as ``num_spec_tokens`` and used to size the acceptance histogram, so
+    a wrong answer here makes every histogram the wrong width. Returns None both
+    when speculative decoding is off and when ``draft_len_schedule`` is set --
+    the bound genuinely varies by batch size there, and None is the honest
+    answer rather than reporting whichever value happened to be configured.
+    """
+    spec_config = getattr(args, "speculative_config", None) if args else None
+    if spec_config is None or getattr(spec_config, "draft_len_schedule", None):
+        return None
+    return getattr(spec_config, "max_draft_len", None)
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -675,14 +566,46 @@ class OpenAIServer(_VideoRoutesMixin):
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None,
             enable_rl_control_endpoints: bool = False,
-            rl_control_api_key: Optional[str] = None):
+            rl_control_api_key: Optional[str] = None,
+            enable_runtime_control_endpoints: bool = False,
+            runtime_control_api_key: Optional[str] = None):
+        if enable_rl_control_endpoints:
+            logger.warning(
+                "RL control endpoints are deprecated; use generic runtime "
+                "control endpoints for memory checkpointing.")
+        if enable_rl_control_endpoints and enable_runtime_control_endpoints:
+            raise ValueError(
+                "Legacy RL control and runtime control endpoints cannot both "
+                "be enabled.")
         if enable_rl_control_endpoints and not rl_control_api_key:
             raise ValueError(
                 "rl_control_api_key is required when RL control endpoints are enabled"
             )
         if enable_rl_control_endpoints and not isinstance(generator, AsyncLLM):
             raise ValueError("RL control endpoints require AsyncLLM")
+        if (enable_runtime_control_endpoints
+                and server_role is ServerRole.EMBEDDING):
+            raise ValueError(
+                "Runtime control endpoints are not supported for embedding servers"
+            )
+        if enable_runtime_control_endpoints and not runtime_control_api_key:
+            raise ValueError(
+                "runtime_control_api_key is required when runtime control "
+                "endpoints are enabled")
+        if enable_runtime_control_endpoints and not isinstance(generator, LLM):
+            raise ValueError("Runtime control endpoints require LLM")
+        if (enable_runtime_control_endpoints
+                and generator.args.sleep_config is None):
+            raise ValueError("Runtime control endpoints require sleep_config")
+        if (enable_runtime_control_endpoints
+                and generator.args.num_serve_frontends > 1):
+            raise ValueError(
+                "Runtime control endpoints require num_serve_frontends=1 "
+                "because replay protection is local to each frontend.")
 
+        # A broken built-in extension module must fail the server start, not
+        # the first request that consults it.
+        load_builtin_extensions()
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
@@ -709,6 +632,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
         self._rl_control_api_key = rl_control_api_key
+        self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
+        self._runtime_control_api_key = runtime_control_api_key
+        self._runtime_control_replay_cache = RuntimeControlReplayCache()
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -742,6 +668,13 @@ class OpenAIServer(_VideoRoutesMixin):
                                            None) if args else None)
         self._collect_perf_metrics = (self._expose_perf_metrics
                                       or perf_metrics_output_dir is not None)
+        # Per-request spec-decode acceptance stats. Deliberately independent of
+        # return_perf_metrics: coupling them would mean asking for acceptance
+        # numbers silently mounts the Prometheus endpoint too.
+        self._per_request_spec_decode_stats = bool(
+            args and getattr(args, "per_request_spec_decode_stats", False))
+        self._spec_decode_num_spec_tokens = resolve_spec_decode_num_spec_tokens(
+            args)
         # AsyncLLM uses this flag to request engine-level snapshots. Preserve the
         # original value separately because only it controls public headers.
         if self._collect_perf_metrics and args is not None:
@@ -816,8 +749,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         self.energy_monitor = None
 
                 # Start background iteration stats collector if metrics are enabled
-                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-                # tensorrt backend does not have this attribute but it always has iter stats enabled.
+                # The PyTorch backend args include `enable_iter_perf_stats`.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
                     # The background loop becomes the sole consumer of the
@@ -924,10 +856,8 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = Path(
-            os.getenv("TRTLLM_MEDIA_STORAGE_PATH",
-                      "/tmp/trtllm_generated"))  # nosec B108
-        self.media_storage_path.mkdir(exist_ok=True, parents=True)
+        self.media_storage_path = _resolve_media_dir()
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
 
     def _supports_image_edit(self) -> bool:
@@ -1080,6 +1010,16 @@ class OpenAIServer(_VideoRoutesMixin):
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
 
+    def _get_scheduling_params(
+            self, request: ChatCompletionRequest,
+            raw_request: Optional[Request]) -> SchedulingParams:
+        return SchedulingParams(
+            agent_hierarchy=request.agent_hierarchy,
+            subagent_affinity_id=validate_subagent_affinity(
+                getattr(self, "_internal_disagg_auth_key", None), request,
+                getattr(self, "server_role", None),
+                None if raw_request is None else raw_request.headers))
+
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
             getattr(self.generator, "args", None), "cache_transceiver_config",
@@ -1220,11 +1160,17 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        # Over-length prompts are detected from the message text because they
+        # cross the executor IPC boundary as plain strings (RequestError), so
+        # no exception type survives to here.
+        code: Union[int, str] = status_code.value
+        if is_context_length_exceeded_message(message):
+            code = CONTEXT_LENGTH_EXCEEDED_CODE
         error_response = ErrorResponse(message=message,
                                        type=err_type,
-                                       code=status_code.value)
+                                       code=code)
         return JSONResponse(content=error_response.model_dump(),
-                            status_code=error_response.code)
+                            status_code=status_code.value)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1327,6 +1273,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 allow_request_chat_template=self.allow_request_chat_template,
                 harmony_adapter_factory=get_harmony_adapter
                 if self.use_harmony else None,
+                chat_template=self.chat_template,
             )
             self.resource_governor.register_routes(self.app)
         else:
@@ -1403,10 +1350,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.stop_profile,
                                methods=["POST"])
 
+        self._register_runtime_control_routes()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
+        # The render and generate routes are a separate exposed surface: off
+        # unless TRTLLM_ENABLE_RENDER_ENDPOINTS=1.
+        mount_render_endpoints(self.app, self)
         if self.generator.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -1453,6 +1404,45 @@ class OpenAIServer(_VideoRoutesMixin):
         except ValueError as e:
             raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED,
                                 detail=str(e)) from e
+
+    async def _require_runtime_control_auth(self, raw_request: Request) -> None:
+        body = await raw_request.body()
+        try:
+            route = raw_request.scope.get("route")
+            route_path = getattr(route, "path", None)
+            if route_path is None:
+                raise ValueError("Runtime control route is unavailable.")
+            validate_runtime_control_request(
+                self._runtime_control_api_key,
+                raw_request.method,
+                route_path,
+                body,
+                raw_request.headers,
+                self._runtime_control_replay_cache,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=HTTPStatus.UNAUTHORIZED,
+                detail=str(error),
+            ) from error
+
+    def _register_runtime_control_routes(self) -> None:
+        if not self._enable_runtime_control_endpoints:
+            return
+
+        dependencies = [Depends(self._require_runtime_control_auth)]
+        self.app.add_api_route("/release_memory",
+                               self.runtime_release_memory,
+                               methods=["POST"],
+                               dependencies=dependencies)
+        self.app.add_api_route("/resume_memory",
+                               self.runtime_resume_memory,
+                               methods=["POST"],
+                               dependencies=dependencies)
+        self.app.add_api_route("/memory_status",
+                               self.runtime_memory_status,
+                               methods=["GET"],
+                               dependencies=dependencies)
 
     def _register_rl_control_routes(self) -> None:
         if not self._enable_rl_control_endpoints:
@@ -1927,6 +1917,30 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info("Iteration stats collector loop cancelled")
             raise
 
+    def _apply_spec_decode_stats_opt_in(self,
+                                        postproc_args: PostprocArgs) -> None:
+        """Enable per-request spec-decode stats when the server opted in.
+
+        Server-side only, deliberately: per_request_spec_decode_stats in the
+        YAML config is the entire opt-in, and a client sends nothing extra.
+        This differs from return_perf_metrics, which additionally requires a
+        per-request X-TRTLLM-return-metrics header.
+
+        The reason is that benchmarking clients discover this payload by shape
+        rather than being told which engine they are talking to -- requiring a
+        vendor-specific request header would mean the client has to know it is
+        talking to TensorRT-LLM before it can find out, which it does not. The
+        cost stays opt-in because an operator who does not set the YAML field
+        pays nothing, and one who does has asked for exactly this.
+        """
+        # getattr: servers built without __init__ (object.__new__, as tests
+        # do) must behave as not opted in rather than fail every request.
+        if not getattr(self, "_per_request_spec_decode_stats", False):
+            return
+        postproc_args.return_spec_decode_stats = True
+        postproc_args.spec_decode_num_spec_tokens = getattr(
+            self, "_spec_decode_num_spec_tokens", None)
+
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
 
@@ -1967,26 +1981,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
-            ensure_request_chat_template_allowed(
-                request, self.allow_request_chat_template)
-            model_type = resolve_top_level_model_type(self.model_config)
-            is_kimi_k3 = model_type == "kimi_k3"
-            _apply_kimi_chat_extensions(request, model_type)
-            if request.tool_choice == "required" and not is_kimi_k3:
-                # Schema-accepting "required" everywhere but enforcing it only
-                # for kimi_k3 would silently degrade to "auto" elsewhere;
-                # reject loudly for models that cannot honor it.
-                raise ValueError(
-                    "tool_choice='required' is not supported for this model.")
+            # Extension preprocessing, the required-tool check and tool dumping
+            # are the first stage of the shared prompt-preparation pipeline.
+            render_resources = RenderResources.from_server(self)
+            extension = render_resources.extension
+            tool_dicts = prepare_chat_request(request,
+                                              render_resources).tool_dicts
             conversation: List[ConversationMessage] = []
-            # exclude_none for kimi_k3: pydantic-injected null defaults
-            # (strict, description, parameters) would otherwise leak into the
-            # rendered tool-declare JSON and skew prompt-token parity. Other
-            # models keep their historical rendering.
-            tool_dicts = None if request.tools is None else [
-                tool.model_dump(exclude_none=is_kimi_k3)
-                for tool in request.tools
-            ]
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             vocab_size = getattr(self.tokenizer.tokenizer,
@@ -2090,11 +2091,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 forced_tool_name = request.tool_choice.function.name
 
             reasoning_parser_name = self.generator.args.reasoning_parser
-            # Message-level (dynamic) tools are a Kimi API extension; only
-            # kimi_k3 templates render them, so other models keep ignoring
-            # the key entirely.
-            dynamic_tools = _dynamic_tool_dicts(
-                request.messages) if is_kimi_k3 else []
+            # Message-level (dynamic) tools are a model extension (Kimi API);
+            # only models whose extension declares them render them, so other
+            # models keep ignoring the key entirely.
+            dynamic_tools = extension.dynamic_tools(request.messages)
             dynamic_tool_params: List[ChatCompletionToolsParam] = []
             if dynamic_tools:
                 try:
@@ -2161,20 +2161,16 @@ class OpenAIServer(_VideoRoutesMixin):
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
             postproc_args = ChatPostprocArgs.from_request(request)
-            if (is_kimi_k3 and request.add_generation_prompt
-                    and request.prompt_token_ids is None
-                    and request.prompt_token_ids_b64 is None
-                    and request.chat_template is None
-                    and self.chat_template is None):
-                # Kimi's prompt-token accounting excludes the trailing 3-token
-                # generation channel opener (<|open|>think|response<|sep|>);
-                # the model still sees the full rendered prompt. b64-relayed
-                # token ids (decoded later) must behave like plain
-                # prompt_token_ids: no rendering here, so no stub to exclude.
-                # The offset presumes the checkpoint's native K3 renderer; an
-                # explicit request- or server-level chat template may end
-                # differently, so report unadjusted usage for those.
-                postproc_args.num_prompt_tokens_offset = 3
+            self._apply_spec_decode_stats_opt_in(postproc_args)
+            # Some models' prompt-token accounting excludes trailing rendered
+            # tokens (kimi_k3: the generation channel opener); the model still
+            # sees the full prompt. The extension decides from the request; a
+            # server-level chat template may end differently, so report
+            # unadjusted usage when one is configured.
+            excluded_tokens = extension.prompt_tokens_excluded_from_usage(
+                request)
+            if excluded_tokens and self.chat_template is None:
+                postproc_args.num_prompt_tokens_offset = excluded_tokens
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their
                 # calls in the model output.
@@ -2233,29 +2229,32 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt_task = async_apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
+                # Render (and append the forced named-tool prefix, see
+                # ``_build_forced_tool_call_decoding``) while the media loads.
+                # Tokenization stays with the engine's input processor.
+                render_task = render_conversation(
+                    render_resources,
                     conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
                     mm_placeholder_counts=mm_placeholder_counts,
+                    add_generation_prompt=request.add_generation_prompt,
                     tools=tool_dicts,
                     documents=request.documents,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
+                    chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    injected_chat_template_kwargs=request.
+                    injected_chat_template_kwargs,
+                    forced_prefix=forced_tool_begin_prefix,
                 )
-                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
-                    prompt_task, mm_coroutines)
-                if isinstance(prompt, str):
+                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
+                    render_task, mm_coroutines)
+                if rendered.text is None:
+                    prompt = rendered.token_ids
+                else:
+                    prompt = rendered.text
                     # Captured before the forced-tool prefix is appended:
                     # resolve_prefilled_thinking() inspects what the chat
                     # template rendered, and the prefix is not part of it.
-                    rendered_prompt = prompt
-                if forced_tool_begin_prefix is not None:
-                    # Force the model to start generation inside the tool call.
-                    # See ``_build_forced_tool_call_decoding`` for details.
-                    prompt = prompt + forced_tool_begin_prefix
+                    rendered_prompt = rendered.template_text
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -2318,10 +2317,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
-                    None if raw_request is None else raw_request.headers))
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -2456,23 +2453,18 @@ class OpenAIServer(_VideoRoutesMixin):
                                             400)
 
         try:
-            # Resolve the template the way openai_chat does (see the
-            # `request.chat_template or self.chat_template` at the chat path):
-            # the renderer only consults request.chat_template, so a server
-            # started with --chat_template would otherwise count a prompt it
-            # never builds, which is exactly the drift this endpoint exists to
-            # eliminate. getattr keeps this working for servers constructed
-            # without _init_llm, as the route tests do.
-            if chat_request.chat_template is None:
-                chat_request.chat_template = getattr(self, "chat_template",
-                                                     None)
-            # Both the render and the encode are synchronous and both scale
-            # with prompt size. Claude Code calls this before most turns with
-            # the whole conversation attached, so running them inline would
-            # block the event loop -- and therefore every other in-flight
-            # request on this server -- for a full template render plus a
-            # tokenizer pass. The chat path avoids this the same way.
-            def _count() -> int:
+
+            def _count_estimate() -> int:
+                # The simplified renderer: used for requests the shared
+                # pipeline cannot render (media) and under
+                # TRTLLM_RENDER_LEGACY=1. Resolve the template the way
+                # openai_chat does, or a server started with --chat_template
+                # would count a prompt it never builds. getattr keeps this
+                # working for servers constructed without _init_llm, as the
+                # route tests do.
+                if chat_request.chat_template is None:
+                    chat_request.chat_template = getattr(
+                        self, "chat_template", None)
                 rendered = render_chat_request_for_tokenizer(
                     chat_request, self.tokenizer)
                 # The renderer returns token ids when the template tokenizes
@@ -2480,6 +2472,32 @@ class OpenAIServer(_VideoRoutesMixin):
                 if isinstance(rendered, str):
                     return len(self.tokenizer.encode(rendered))
                 return len(rendered)
+
+            # Both the render and the encode are synchronous and both scale
+            # with prompt size. Claude Code calls this before most turns with
+            # the whole conversation attached, so running them inline would
+            # block the event loop -- and therefore every other in-flight
+            # request on this server -- for a full template render plus a
+            # tokenizer pass. The chat path avoids this the same way.
+            def _count() -> int:
+                if legacy_render_enabled():
+                    return _count_estimate()
+                # The count is over the prompt tokens the chat route would
+                # execute: same pipeline, same template, same tokenization.
+                resources = RenderResources.from_server(self)
+                try:
+                    rendered = render_chat(chat_request,
+                                           resources,
+                                           tokenize=True)
+                except UnsupportedRenderError:
+                    return _count_estimate()
+                except RuntimeError:
+                    # Harmony cannot convert some messages (a tool without a
+                    # description); the count used to come from the template.
+                    if not resources.use_harmony:
+                        raise
+                    return _count_estimate()
+                return len(rendered.token_ids)
 
             input_tokens = await asyncio.to_thread(_count)
         except Exception:
@@ -2730,8 +2748,14 @@ class OpenAIServer(_VideoRoutesMixin):
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
+            # Same pipeline as the chat route: the server template and the
+            # model extension's tool serialization apply here too.
+            render_resources = RenderResources.from_server(self)
+            if legacy_render_enabled():
+                render_resources = render_resources.legacy_view()
             tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
+                render_resources.extension.serialize_tool(tool)
+                for tool in request.tools
             ]
 
             try:
@@ -2755,20 +2779,22 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt_task = async_apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
+                render_task = render_conversation(
+                    render_resources,
                     conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
                     mm_placeholder_counts=mm_placeholder_counts,
+                    add_generation_prompt=request.add_generation_prompt,
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    injected_chat_template_kwargs=request.
+                    injected_chat_template_kwargs,
                 )
-                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
-                    prompt_task, mm_coroutines)
+                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
+                    render_task, mm_coroutines)
+                prompt = (rendered.text
+                          if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -2904,6 +2930,8 @@ class OpenAIServer(_VideoRoutesMixin):
             yield "data: [DONE]\n\n"
 
         try:
+            if isinstance(request.prompt, list) and not request.prompt:
+                return self.create_error_response("'prompt' must not be empty.")
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
@@ -2942,6 +2970,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.conversation_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
+                self._apply_spec_decode_stats_opt_in(postproc_args)
                 postproc_args.prompt_idx = idx
                 postproc_args.stream_response_id = stream_response_id
                 postproc_args.stream_created = stream_created
@@ -3114,6 +3143,14 @@ class OpenAIServer(_VideoRoutesMixin):
                              tracing.extract_trace_headers(raw_request.headers))
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
+            # No spec-decode opt-in here on purpose. The Harmony handlers build
+            # their choices in harmony_adapter, which carries no per-request
+            # spec-decode data at all -- avg_decoded_tokens_per_iter is absent
+            # from that path too -- so setting the flag would configure
+            # something nothing reads. Extending Harmony should cover both
+            # fields together; handle_non_streaming_response would need the
+            # GenerationResult threaded through, as it currently receives only
+            # the outputs.
             postproc_params = PostprocParams(
                 post_processor=chat_harmony_streaming_post_processor
                 if request.stream else chat_harmony_post_processor,
@@ -3124,10 +3161,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
-                    None if raw_request is None else raw_request.headers))
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             # Generate
             promise = self.generator.generate_async(
@@ -3270,6 +3305,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 processor=self.processor if not self.use_harmony else None,
                 reasoning_parser=self.generator.args.reasoning_parser
                 if not self.use_harmony else "gpt_oss",
+                multimodal_server_config=self.multimodal_server_config,
+                chat_template=self.chat_template
+                if not self.use_harmony else None,
             )
 
             streaming_processor = None
@@ -3482,6 +3520,68 @@ class OpenAIServer(_VideoRoutesMixin):
 
         return JSONResponse(content={"message": "Profiling stopped"})
 
+    @staticmethod
+    def _runtime_control_error_response(error: Exception) -> JSONResponse:
+        if isinstance(error, ValueError):
+            status_code = HTTPStatus.BAD_REQUEST
+        elif (isinstance(error, RuntimeError) and
+              ("already parked" in str(error) or "while state is" in str(error)
+               or "admission transition" in str(error))):
+            status_code = HTTPStatus.CONFLICT
+        else:
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        return JSONResponse(status_code=status_code,
+                            content={"error": {
+                                "message": str(error)
+                            }})
+
+    async def _call_runtime_memory_method(self, method: str,
+                                          tags: Optional[List[str]]) -> object:
+        operation = getattr(self.generator, method)
+        if isinstance(self.generator, AsyncLLM):
+            return await operation(tags)
+        return await asyncio.to_thread(operation, tags)
+
+    async def runtime_release_memory(
+        self,
+        request: Optional[RuntimeMemoryUpdateRequest] = None,
+    ) -> JSONResponse:
+        try:
+            if request is not None and request.tags == []:
+                raise ValueError("Runtime memory tags must not be empty.")
+            tags = None if request is None else request.tags
+            await self._call_runtime_memory_method("release", tags)
+        except Exception as error:
+            return self._runtime_control_error_response(error)
+        return JSONResponse(content={"status": "success"})
+
+    async def runtime_resume_memory(
+        self,
+        request: Optional[RuntimeMemoryUpdateRequest] = None,
+    ) -> JSONResponse:
+        try:
+            if request is not None and request.tags == []:
+                raise ValueError("Runtime memory tags must not be empty.")
+            tags = None if request is None else request.tags
+            await self._call_runtime_memory_method("resume", tags)
+        except Exception as error:
+            return self._runtime_control_error_response(error)
+        return JSONResponse(content={"status": "success"})
+
+    async def runtime_memory_status(self) -> JSONResponse:
+        try:
+            if isinstance(self.generator, AsyncLLM):
+                status = await self.generator.get_memory_status()
+            else:
+                status = await asyncio.to_thread(
+                    self.generator.get_memory_status)
+        except Exception as error:
+            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                                content={"error": {
+                                    "message": str(error)
+                                }})
+        return JSONResponse(content=status.model_dump(mode="json"))
+
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:
         assert isinstance(
@@ -3506,11 +3606,45 @@ class OpenAIServer(_VideoRoutesMixin):
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})
 
+    async def _live_tokens_per_block(self) -> Optional[int]:
+        """Return the runtime's effective KV block size, or None if unknown.
+
+        The executor layer already turns RPC failures into an empty dict, so
+        the only failure left to absorb here is ``encode_only``, which rejects
+        the call outright. Generators without a KV cache (VisualGen) have no
+        such method. Both mean "fall back to the configured value".
+        """
+        get_capacity = getattr(self.generator, "get_kv_cache_capacity", None)
+        if get_capacity is None:
+            return None
+        try:
+            # Off-loop: the RPC blocks, and this worker's own heartbeat task
+            # shares this loop, so stalling it here can lapse its registration.
+            capacity = await asyncio.to_thread(get_capacity)
+        except RuntimeError as e:
+            logger.debug(f"Could not read live tokens_per_block: {e}")
+            return None
+        return capacity.get("tokensPerBlock") or None
+
     async def get_server_info(self) -> JSONResponse:
         # Note: calling self.generator.disaggregated_params and startup_metrics below
         # may trigger an RPC sync call, blocking the server event loop. Since this server_info
         # is usually called only once before accepting requests, it's not a big concern.
         content = {"disaggregated_params": self.generator.disaggregated_params}
+        # A router or caller checks this before trusting prompt token ids that
+        # another process rendered; it is computed once, then reused.
+        render_fingerprint = getattr(self, "_render_fingerprint", None)
+        if render_fingerprint is None:
+            try:
+                # Hashing the vocabulary takes a moment; keep the event loop free.
+                render_fingerprint = await asyncio.to_thread(
+                    lambda: RenderResources.from_server(self).fingerprint())
+                self._render_fingerprint = render_fingerprint
+            except Exception:
+                logger.warning("Could not compute the rendering fingerprint:\n"
+                               f"{traceback.format_exc()}")
+        if render_fingerprint is not None:
+            content["render_fingerprint"] = render_fingerprint
         args = getattr(self.generator, "args", None)
         if args is not None:
             if args.max_batch_size is not None:
@@ -3524,6 +3658,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 if kv_cache_config.tokens_per_block is not None:
                     content[
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
+            # The runtime may override the configured block size (e.g. FlashMLA
+            # forces 64) in the worker process, so args.kv_cache_config still
+            # holds the pre-override value here. A kv-cache-aware router hashes
+            # prompts in whatever block size this endpoint publishes, so a
+            # stale value makes every block hash miss. Prefer the live value.
+            live_tokens_per_block = await self._live_tokens_per_block()
+            if live_tokens_per_block is not None:
+                content["tokens_per_block"] = live_tokens_per_block
         content["startup_metrics"] = getattr(self.generator, "startup_metrics",
                                              {})
         return JSONResponse(content=content)
@@ -3903,11 +4045,15 @@ class OpenAIServer(_VideoRoutesMixin):
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():
-            while not server.started:
-                await asyncio.sleep(0.1)
+            with _StartupTimer("http_server_start"):
+                while not server.started:
+                    await asyncio.sleep(0.1)
             if self.disagg_cluster_worker:
                 try:
-                    await self.disagg_cluster_worker.register_worker()
+                    with _StartupTimer(
+                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                    ):
+                        await self.disagg_cluster_worker.register_worker()
                 except Exception as e:
                     logger.error(f"Worker registration failed: {e}")
                     server.should_exit = True

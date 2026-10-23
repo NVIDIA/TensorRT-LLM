@@ -46,6 +46,8 @@ class TopK(nn.Module):
         decode_implementation: TopKImplementation | None = None,
         compress_ratio: int = 1,
         gvr_self_sampling: bool = True,
+        gvr_deterministic: bool = False,
+        gvr_sorting: str | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -59,6 +61,13 @@ class TopK(nn.Module):
         # Second-level GVR dispatch for CUTE_DSL_GVR: True selects the
         # hint-free self-sampling engine, False the temporal-hint engine.
         self.gvr_self_sampling = gvr_self_sampling
+        # self-sampling GVR only: deterministic selection / order, optional ascending rows
+        self.gvr_deterministic = gvr_deterministic
+        self.gvr_sorting = gvr_sorting
+        # forwarded only when enabled so the default path's calls are unchanged
+        self._gvr_det_kwargs = (
+            {"deterministic": True, "sorting": gvr_sorting} if gvr_deterministic else {}
+        )
         # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
         # owns the closed-loop emission state; only reachable on the temporal
         # (gvr_self_sampling=False) V1 path.
@@ -84,6 +93,7 @@ class TopK(nn.Module):
         row_ends: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor | None = None,
         scan_lengths: torch.Tensor | None = None,
+        row_kv_lens: torch.Tensor | None = None,
         next_n: int = 1,
         max_seq_len: int | None = None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
@@ -100,6 +110,11 @@ class TopK(nn.Module):
             row_ends: Per-row exclusive ends for prefill.
             sequence_lengths: Per-request logical KV lengths for decode.
             scan_lengths: Per-request score-column lengths for decode.
+            row_kv_lens: Optional int32 logical KV lengths in uncompressed
+                token units, with shape ``[num_rows]`` on ``scores.device``,
+                for ragged decode. The kernel divides by ``compress_ratio``.
+                When present, dispatches the CUDA radix kernel;
+                uniform ``next_n`` implementations cannot represent this map.
             next_n: Number of decode rows per request.
             max_seq_len: Maximum decode score width used for GVR kernel tuning.
             gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
@@ -127,6 +142,7 @@ class TopK(nn.Module):
             scores,
             sequence_lengths,
             scan_lengths,
+            row_kv_lens,
             output_indices,
             next_n,
             max_seq_len,
@@ -164,13 +180,15 @@ class TopK(nn.Module):
                 # zero-work self-sampling launch. Deliberate, no warning.
                 pass
             elif self._selfsampling_prefill_ok(scores):
-                from ..cute_dsl_kernels.blackwell.top_k import (
+                from ..kernels.blackwell.top_k import (
                     selfsampling_topk_prefill_ready,
                     selfsampling_topk_run_prefill,
                 )
 
                 if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
-                    scores, output_indices
+                    scores,
+                    output_indices,
+                    **({"deterministic": True} if self.gvr_deterministic else {}),
                 ):
                     # the engine never JIT-compiles under capture; an engine
                     # missed by warmup takes the exact radix path in the graph
@@ -189,7 +207,9 @@ class TopK(nn.Module):
                     # ks/ke are already in compressed column units; run_prefill
                     # writes the local (column - ks) frame with -1 pad and no
                     # host reads (envelope from scores.shape[1]).
-                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    selfsampling_topk_run_prefill(
+                        scores, row_starts, row_ends, output_indices, **self._gvr_det_kwargs
+                    )
                     return output_indices
             else:
                 # engine hardware-format gate missed (e.g. a non-fp4 layer with
@@ -244,6 +264,7 @@ class TopK(nn.Module):
         scores: torch.Tensor,
         sequence_lengths: torch.Tensor,
         scan_lengths: torch.Tensor,
+        row_kv_lens: torch.Tensor | None,
         output_indices: torch.Tensor,
         next_n: int,
         max_seq_len: int | None,
@@ -251,6 +272,27 @@ class TopK(nn.Module):
         radix_aux_indices: torch.Tensor | None,
         radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if row_kv_lens is not None:
+            if (
+                self.decode_implementation != TopKImplementation.CUDA_RADIX
+                and not torch.compiler.is_dynamo_compiling()
+            ):
+                logger.info_once(
+                    "Ragged per-row KV lengths require CUDA radix decode Top-K; "
+                    f"using it instead of {self.decode_implementation.value}.",
+                    key="ragged_decode_radix_fallback",
+                )
+            return self._forward_decode_radix(
+                scores,
+                sequence_lengths,
+                scan_lengths,
+                output_indices,
+                next_n,
+                radix_aux_indices,
+                radix_aux_logits,
+                row_kv_lens=row_kv_lens,
+            )
+
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
 
@@ -285,9 +327,12 @@ class TopK(nn.Module):
         next_n: int,
         radix_aux_indices: torch.Tensor | None,
         radix_aux_logits: torch.Tensor | None,
+        row_kv_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        use_cute_dsl = self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX and not (
-            self.compress_ratio > 1 and next_n > 1
+        use_cute_dsl = (
+            row_kv_lens is None
+            and self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX
+            and not (self.compress_ratio > 1 and next_n > 1)
         )
         if use_cute_dsl:
             torch.ops.trtllm.cute_dsl_indexer_topk_decode(
@@ -311,6 +356,7 @@ class TopK(nn.Module):
             compress_ratio=self.compress_ratio,
             radix_aux_indices=radix_indices,
             radix_aux_logits=radix_values,
+            row_kv_lens=row_kv_lens,
         )
         return output_indices
 
@@ -366,7 +412,7 @@ class TopK(nn.Module):
             ):
                 # hint-free k derives from the output width; pin it to the module's k
                 assert output_indices.shape[1] == self.top_k
-                from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
+                from ..kernels.blackwell.top_k import selfsampling_topk_run_varlen
 
                 logger.info_once(
                     "self-sampling GVR top-K engaged "
@@ -388,6 +434,7 @@ class TopK(nn.Module):
                     next_n=next_n,
                     compress_ratio=self.compress_ratio,
                     max_seq_len=max_seq_len * self.compress_ratio,
+                    **self._gvr_det_kwargs,
                 )
                 return output_indices
             logger.warning_once(
@@ -468,10 +515,7 @@ class TopK(nn.Module):
         # schema note), so the tier is eager / CUDA-graph only
         if torch.compiler.is_dynamo_compiling():
             return {}
-        from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
-            LIST_EMIT_MIN_N,
-            GvrEmissionState,
-        )
+        from ..kernels.blackwell.top_k.gvr_emission import LIST_EMIT_MIN_N, GvrEmissionState
 
         if self._gvr_emission_state is None:
             self._gvr_emission_state = GvrEmissionState(

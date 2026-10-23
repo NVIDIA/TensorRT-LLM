@@ -9,7 +9,6 @@ common-files: &common_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
         cpp/kernels/fmha_v2/setup.py |
@@ -28,7 +27,6 @@ common-files: &common_files |
         cpp/kernels/xqa/gen_cpp_header.py |
         cpp/kernels/xqa/gen_cubins.py |
         cpp/kernels/xqa/ref.py |
-        cpp/libnuma_conan.py |
         cpp/micro_benchmarks/gen-moe-benchmark-file.py |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
@@ -111,6 +109,9 @@ common-files: &common_files |
         tensorrt_llm/_torch/attention/backends/trtllm.py |
         tensorrt_llm/_torch/attention/backends/utils.py |
         tensorrt_llm/_torch/attention/backends/vanilla.py |
+        tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py |
+        tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py |
+        tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py |
         tensorrt_llm/_torch/attention/qk_norm_attention.py |
         tensorrt_llm/_torch/attention/rotary_embedding.py |
         tensorrt_llm/_torch/autotuner.py |
@@ -134,33 +135,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/custom_ops/torch_custom_ops.py |
         tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py |
         tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp16.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp8.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/epilogue_refactor.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/fc1_fc2_fuse_sched.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/grid_sync.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/iket_compat.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_constants.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_kernel.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_persistent_scheduler.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/ptx_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sf_swizzle.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sym_buffer.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/token_comm.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/topk_reduce.py |
         tensorrt_llm/_torch/cute_dsl_utils.py |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
@@ -172,6 +146,9 @@ common-files: &common_files |
         tensorrt_llm/_torch/distributed/pg_utils.py |
         tensorrt_llm/_torch/flashinfer_utils.py |
         tensorrt_llm/_torch/hostfunc.py |
+        tensorrt_llm/_torch/kernels/blackwell/custom_pipeline.py |
+        tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py |
+        tensorrt_llm/_torch/kernels/blackwell/utils.py |
         tensorrt_llm/_torch/llm.py |
         tensorrt_llm/_torch/memory_buffer_utils.py |
         tensorrt_llm/_torch/metadata.py |
@@ -273,7 +250,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/modules/triton_linear.py |
         tensorrt_llm/_torch/moe/expert_statistic.py |
         tensorrt_llm/_torch/moe/fused_moe/__init__.py |
-        tensorrt_llm/_torch/moe/fused_moe/communication/moe_alltoall.py |
         tensorrt_llm/_torch/moe/fused_moe/create_moe.py |
         tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py |
@@ -479,7 +455,6 @@ common-files: &common_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/ci_profiler.py |
@@ -497,7 +472,6 @@ common-files: &common_files |
         tests/integration/defs/examples/run_llm_quickstart_atexit.py |
         tests/integration/defs/examples/serve/test_serve.py |
         tests/integration/defs/examples/serve/test_serve_negative.py |
-        tests/integration/defs/examples/test_ad_guided_decoding.py |
         tests/integration/defs/examples/test_gpt.py |
         tests/integration/defs/examples/test_llm_api_with_mpi.py |
         tests/integration/defs/examples/test_phi.py |
@@ -561,6 +535,29 @@ common-files: &common_files |
         tests/unittest/_torch/executor/test_resource_manager.py |
         tests/unittest/_torch/executor/test_router_dealer_ipc.py |
         tests/unittest/_torch/helpers.py |
+        tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py |
+        tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_dsv3_router_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_finegrained_mixed_dtype_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_bmm_quantize.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_calculate_global_scale.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_gemm_quantize.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_swizzle.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_block_scale_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_per_tensor_scale_tllmg_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_quantize.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_rowwise_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_scaled_mm.py |
+        tests/unittest/_torch/kernels/parallel/test_selective_scan_op.py |
+        tests/unittest/_torch/kernels/parallel/test_tinygemm2.py |
+        tests/unittest/_torch/kernels/parallel/test_tllmg_bmm.py |
+        tests/unittest/_torch/kernels/parallel/test_w4a16_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_w4a8_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_w4a8_mxfp4_mxfp8_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_weight_only_quant_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_weight_only_quant_linear.py |
         tests/unittest/_torch/misc/test_autotuner.py |
         tests/unittest/_torch/misc/test_share_tensor.py |
         tests/unittest/_torch/misc/test_virtual_memory.py |
@@ -584,7 +581,8 @@ common-files: &common_files |
         tests/unittest/_torch/modeling/test_modeling_vila.py |
         tests/unittest/_torch/modules/test_group_rmn_norm.py |
         tests/unittest/_torch/modules/test_triton_linear.py |
-        tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py |
+        tests/unittest/_torch/moe/kernels/serial/test_moe.py |
+        tests/unittest/_torch/moe/kernels/serial/test_moe_alltoall.py |
         tests/unittest/_torch/moe/test_fused_moe.py |
         tests/unittest/_torch/moe/test_moe_host_sharer.py |
         tests/unittest/_torch/moe/test_moe_load_balancer.py |
@@ -616,31 +614,6 @@ common-files: &common_files |
         tests/unittest/_torch/speculative/test_eagle3.py |
         tests/unittest/_torch/test_connector.py |
         tests/unittest/_torch/test_torch_multi_arange.py |
-        tests/unittest/_torch/thop/parallel/deep_gemm_tests.py |
-        tests/unittest/_torch/thop/parallel/test_dsv3_fused_a_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_dsv3_router_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_finegrained_mixed_dtype_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_bmm_quantize.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_calculate_global_scale.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_gemm_quantize.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_linear.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_swizzle.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_linear.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_per_tensor_scale_tllmg_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_quantize.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py |
-        tests/unittest/_torch/thop/parallel/test_scaled_mm.py |
-        tests/unittest/_torch/thop/parallel/test_selective_scan_op.py |
-        tests/unittest/_torch/thop/parallel/test_tinygemm2.py |
-        tests/unittest/_torch/thop/parallel/test_tllmg_bmm.py |
-        tests/unittest/_torch/thop/parallel/test_w4a16_linear.py |
-        tests/unittest/_torch/thop/parallel/test_w4a8_linear.py |
-        tests/unittest/_torch/thop/parallel/test_w4a8_mxfp4_mxfp8_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_weight_only_quant_linear.py |
-        tests/unittest/_torch/thop/serial/test_moe.py |
-        tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
         tests/unittest/bindings/test_bindings_moe.py |
@@ -686,7 +659,6 @@ common-files: &common_files |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
         tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
-        tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py |
@@ -767,7 +739,6 @@ legacy-files: &legacy_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
         cpp/kernels/fmha_v2/setup.py |
@@ -786,7 +757,6 @@ legacy-files: &legacy_files |
         cpp/kernels/xqa/gen_cpp_header.py |
         cpp/kernels/xqa/gen_cubins.py |
         cpp/kernels/xqa/ref.py |
-        cpp/libnuma_conan.py |
         cpp/micro_benchmarks/gen-moe-benchmark-file.py |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
@@ -869,6 +839,9 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/attention/backends/trtllm.py |
         tensorrt_llm/_torch/attention/backends/utils.py |
         tensorrt_llm/_torch/attention/backends/vanilla.py |
+        tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py |
+        tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py |
+        tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py |
         tensorrt_llm/_torch/attention/qk_norm_attention.py |
         tensorrt_llm/_torch/attention/rotary_embedding.py |
         tensorrt_llm/_torch/autotuner.py |
@@ -892,33 +865,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/custom_ops/torch_custom_ops.py |
         tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py |
         tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp16.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp8.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/epilogue_refactor.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/fc1_fc2_fuse_sched.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/grid_sync.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/iket_compat.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_constants.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_kernel.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_persistent_scheduler.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/ptx_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sf_swizzle.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sym_buffer.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/token_comm.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/topk_reduce.py |
         tensorrt_llm/_torch/cute_dsl_utils.py |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
@@ -930,6 +876,9 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/distributed/pg_utils.py |
         tensorrt_llm/_torch/flashinfer_utils.py |
         tensorrt_llm/_torch/hostfunc.py |
+        tensorrt_llm/_torch/kernels/blackwell/custom_pipeline.py |
+        tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py |
+        tensorrt_llm/_torch/kernels/blackwell/utils.py |
         tensorrt_llm/_torch/llm.py |
         tensorrt_llm/_torch/memory_buffer_utils.py |
         tensorrt_llm/_torch/metadata.py |
@@ -1031,7 +980,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/modules/triton_linear.py |
         tensorrt_llm/_torch/moe/expert_statistic.py |
         tensorrt_llm/_torch/moe/fused_moe/__init__.py |
-        tensorrt_llm/_torch/moe/fused_moe/communication/moe_alltoall.py |
         tensorrt_llm/_torch/moe/fused_moe/create_moe.py |
         tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py |
@@ -1237,7 +1185,6 @@ legacy-files: &legacy_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/ci_profiler.py |
@@ -1255,7 +1202,6 @@ legacy-files: &legacy_files |
         tests/integration/defs/examples/run_llm_quickstart_atexit.py |
         tests/integration/defs/examples/serve/test_serve.py |
         tests/integration/defs/examples/serve/test_serve_negative.py |
-        tests/integration/defs/examples/test_ad_guided_decoding.py |
         tests/integration/defs/examples/test_gpt.py |
         tests/integration/defs/examples/test_llm_api_with_mpi.py |
         tests/integration/defs/examples/test_phi.py |
@@ -1319,6 +1265,29 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/executor/test_resource_manager.py |
         tests/unittest/_torch/executor/test_router_dealer_ipc.py |
         tests/unittest/_torch/helpers.py |
+        tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py |
+        tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_dsv3_router_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_finegrained_mixed_dtype_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_bmm_quantize.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_calculate_global_scale.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_gemm_quantize.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_fp4_swizzle.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_block_scale_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_per_tensor_scale_tllmg_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_quantize.py |
+        tests/unittest/_torch/kernels/parallel/test_fp8_rowwise_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_scaled_mm.py |
+        tests/unittest/_torch/kernels/parallel/test_selective_scan_op.py |
+        tests/unittest/_torch/kernels/parallel/test_tinygemm2.py |
+        tests/unittest/_torch/kernels/parallel/test_tllmg_bmm.py |
+        tests/unittest/_torch/kernels/parallel/test_w4a16_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_w4a8_linear.py |
+        tests/unittest/_torch/kernels/parallel/test_w4a8_mxfp4_mxfp8_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_weight_only_quant_gemm.py |
+        tests/unittest/_torch/kernels/parallel/test_weight_only_quant_linear.py |
         tests/unittest/_torch/misc/test_autotuner.py |
         tests/unittest/_torch/misc/test_share_tensor.py |
         tests/unittest/_torch/misc/test_virtual_memory.py |
@@ -1342,7 +1311,8 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/modeling/test_modeling_vila.py |
         tests/unittest/_torch/modules/test_group_rmn_norm.py |
         tests/unittest/_torch/modules/test_triton_linear.py |
-        tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py |
+        tests/unittest/_torch/moe/kernels/serial/test_moe.py |
+        tests/unittest/_torch/moe/kernels/serial/test_moe_alltoall.py |
         tests/unittest/_torch/moe/test_fused_moe.py |
         tests/unittest/_torch/moe/test_moe_host_sharer.py |
         tests/unittest/_torch/moe/test_moe_load_balancer.py |
@@ -1374,31 +1344,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/speculative/test_eagle3.py |
         tests/unittest/_torch/test_connector.py |
         tests/unittest/_torch/test_torch_multi_arange.py |
-        tests/unittest/_torch/thop/parallel/deep_gemm_tests.py |
-        tests/unittest/_torch/thop/parallel/test_dsv3_fused_a_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_dsv3_router_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_finegrained_mixed_dtype_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_bmm_quantize.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_calculate_global_scale.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_gemm_quantize.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_linear.py |
-        tests/unittest/_torch/thop/parallel/test_fp4_swizzle.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_linear.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_per_tensor_scale_tllmg_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_quantize.py |
-        tests/unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py |
-        tests/unittest/_torch/thop/parallel/test_scaled_mm.py |
-        tests/unittest/_torch/thop/parallel/test_selective_scan_op.py |
-        tests/unittest/_torch/thop/parallel/test_tinygemm2.py |
-        tests/unittest/_torch/thop/parallel/test_tllmg_bmm.py |
-        tests/unittest/_torch/thop/parallel/test_w4a16_linear.py |
-        tests/unittest/_torch/thop/parallel/test_w4a8_linear.py |
-        tests/unittest/_torch/thop/parallel/test_w4a8_mxfp4_mxfp8_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py |
-        tests/unittest/_torch/thop/parallel/test_weight_only_quant_linear.py |
-        tests/unittest/_torch/thop/serial/test_moe.py |
-        tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
         tests/unittest/bindings/test_bindings_moe.py |
@@ -1444,7 +1389,6 @@ legacy-files: &legacy_files |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
         tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
-        tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py |
@@ -1525,7 +1469,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1557,18 +1501,6 @@ repos:
     -   id: trailing-whitespace
         exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
-    -   id: mixed-line-ending
-        args: [--fix=lf]
-        files: ".*/auto_deploy/.*"
-    -   id: debug-statements
-        files: ".*/auto_deploy/.*"
-    -   id: check-json
-        files: ".*/auto_deploy/.*"
-        exclude: >
-          (?x)^(
-            .*\.vscode/.*\.json | # vscode files can take comments
-            .*\.devcontainer/.*\.json # devcontainer json files can take comments
-          )$
     -   id: file-contents-sorter
         files: ^tests/integration/test_lists/waives\.txt$
 -   repo: https://github.com/PyCQA/autoflake
@@ -1605,23 +1537,8 @@ repos:
         exclude: *legacy_files
     -   id: ruff-format
         exclude: *legacy_files
--   repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.17
-    hooks:
-    -   id: mdformat
-        additional_dependencies:
-        - mdformat_frontmatter
-        files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
-    -   id: model-registry-check
-        name: Validate AutoDeploy model registry
-        entry: python scripts/check_model_registry.py
-        language: python
-        additional_dependencies:
-        - PyYAML
-        files: ^examples/auto_deploy/model_registry/models\.yaml$
-        pass_filenames: false
     -   id: ruff-legacy
         name: ruff-legacy (baseline-gated lint for legacy files)
         entry: python scripts/legacy_utils.py lint-precommit
@@ -1638,11 +1555,23 @@ repos:
         pass_filenames: false
     -   id: vendor-sources-check
         name: verify vendored sources are in sync
-        entry: python scripts/vendor_sources.py check
+        entry: python scripts/vendor/manage.py check
         language: python
         additional_dependencies: [PyYAML]
         always_run: true
         pass_filenames: false
+    -   id: openengine-bindings-check
+        name: verify generated OpenEngine bindings are in sync
+        entry: python scripts/generate_openengine_protos.py --check
+        language: python
+        # Keep these pins in sync with requirements-build-openengine.txt.
+        additional_dependencies:
+        - grpcio==1.67.1
+        - grpcio-tools==1.67.1
+        - protobuf==5.27.2
+        - setuptools==84.0.0
+        pass_filenames: false
+        files: ^(requirements\.txt|requirements-build-openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py
@@ -1668,11 +1597,6 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
-    -   id: auto-deploy-import-discipline
-        name: Enforce relative imports inside auto_deploy
-        entry: python scripts/check_auto_deploy_imports.py
-        language: python
-        files: ^tensorrt_llm/_torch/auto_deploy/.*\.py$
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py

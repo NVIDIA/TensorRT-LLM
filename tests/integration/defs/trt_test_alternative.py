@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # An alternative lib to trt_test to let TRT_LLM developer run test using pure pytest command
 import contextlib
 import logging
@@ -8,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import warnings
 from collections.abc import Generator
 from typing import List, Optional
@@ -286,8 +301,13 @@ def popen(*popenargs,
             yield p
             if start_new_session:
                 cleanup_process_tree(p, True, True)
-        except Exception as e:
-            cleanup_process_tree(p, start_new_session)
+        except BaseException as e:
+            try:
+                cleanup_process_tree(p, start_new_session)
+            except Exception as ee:
+                print(
+                    f"cleanup_process_tree failed while handling exception: {''.join(traceback.format_exception(ee))}"
+                )
             if isinstance(e, subprocess.TimeoutExpired):
                 print("Process timed out.")
                 stdout, stderr = p.communicate()
@@ -403,20 +423,3 @@ def print_error(message: str) -> None:
     print(f"[ERROR] {message}")
     sys.stdout.flush()
     general_logger.error(message)
-
-
-# custom test checker
-def check_call_negative_test(*popenargs, **kwargs):
-    print(f"Start subprocess with check_call_negative_test("
-          f"{redact_popenargs(popenargs)}, {redact_kwargs(kwargs)})")
-    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
-    if retcode:
-        return 0
-    else:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        print(
-            f"Subprocess expected to fail with check_call_negative_test({popenargs}, {kwargs}), but passed."
-        )
-        raise subprocess.CalledProcessError(1, cmd)

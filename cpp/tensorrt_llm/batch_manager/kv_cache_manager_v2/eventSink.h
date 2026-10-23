@@ -31,6 +31,12 @@ class EventSink
 public:
     virtual ~EventSink() = default;
 
+    //! Whether blocks should retain the latest digest token in their prefix for event decoding.
+    virtual bool needsTokenDigestContext() const
+    {
+        return false;
+    }
+
     virtual void addStoredBlock(Block const& block) = 0;
     virtual void addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle) = 0;
     virtual void addRemovedBlock(Digest const& blockKey) = 0;
@@ -38,6 +44,9 @@ public:
     virtual void addCacheLevelUpdated(
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle)
         = 0;
+
+    //! Protocols that expose retention metadata receive native page priority changes.
+    virtual void addPriorityUpdated(Digest const&, Priority, Priority, LifeCycleId) {}
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

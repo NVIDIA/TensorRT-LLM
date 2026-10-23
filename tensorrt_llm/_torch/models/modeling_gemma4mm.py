@@ -904,6 +904,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             attn_backend=attn_backend,
             quant_config=quant_config,
         )
+        # extra_attrs is init=False and would otherwise be reset by replace().
+        # All submodels execute under the top-level engine registry.
+        sub_config.extra_attrs = model_config.extra_attrs
         if (
             hasattr(sub_config.pretrained_config, "torch_dtype")
             and sub_config.pretrained_config.torch_dtype is None
@@ -914,6 +917,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        layer_specs = self.llm.model_config.kv_cache_layer_specs
+        if layer_specs is not None:
+            self.model_config.set_kv_cache_layer_specs(layer_specs)
 
     @property
     def draft_config(self):
@@ -1072,6 +1078,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
         model_config_cp = copy.deepcopy(model_config)
+        model_config_cp.extra_attrs = model_config.extra_attrs
         self.model_config = model_config_cp
 
         # --- Language model ---

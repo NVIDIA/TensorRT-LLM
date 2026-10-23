@@ -1,5 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import random
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -16,15 +31,47 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # https://nvbugs/6426834).
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
+from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, request_block_data
+
 import tensorrt_llm
 import tensorrt_llm.bindings
-import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm import DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import MpiTopology as Mapping
+
+
+class _GlooQuotaSync:
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self.group = group
+
+    def allreduce(self, value: float, op: object) -> float:
+        del op
+        tensor = torch.tensor(value, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.group)
+        return tensor.item()
+
+
+def _create_cache_manager(group: dist.ProcessGroup, *args, **kwargs) -> KVCacheManagerV2:
+    """Synchronize the V2 constructor's capacity within this instance's Gloo group."""
+    with patch(
+        "tensorrt_llm._torch.distributed.communicator.Distributed.get",
+        return_value=_GlooQuotaSync(group),
+    ):
+        return KVCacheManagerV2(*args, **kwargs)
+
+
+def _instance_mapping(**kwargs) -> Mapping:
+    """Use explicit instance-local ranks for the ctx/gen Gloo process groups."""
+    mapping = object.__new__(Mapping)
+    Mapping.__init__(mapping, **kwargs)
+    return mapping
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -159,14 +206,20 @@ def worker_fn(
     dtype = DataType.FLOAT
     request_len = 16
 
-    ctx_instance_name = "ctx_instance"
-    gen_instance_name = "gen_instance"
+    # NIXL agent names share one namespace per node, and this file and the multi-process one both
+    # used to name themselves the same thing. Two xdist workers then registered one name twice and
+    # the loser's transfer came back "remote agent was invalidated" -- a red that reads like a
+    # transport bug. The worker id is inherited by any process this test spawns, so every rank of
+    # one test agrees while two concurrent tests do not.
+    suffix = os.environ.get("PYTEST_XDIST_WORKER", "")
+    ctx_instance_name = f"ctx_instance{suffix}"
+    gen_instance_name = f"gen_instance{suffix}"
 
     if is_ctx:
         # Create ctx mapping
         _ = local_rank // ctx_tp
         tp_rank = local_rank % ctx_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=ctx_instance_num,
             rank=local_rank,
             tp_size=ctx_tp,
@@ -174,8 +227,9 @@ def worker_fn(
         )
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManager(
-            trtllm.KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -185,14 +239,11 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Initialize with random data
-        block_data_pool = kv_cache_manager.get_unique_primary_pool()
-        random_values = torch.rand(
-            block_data_pool.shape, dtype=torch.float32, device=block_data_pool.device
-        )
-        block_data_pool.copy_(random_values)
+        initialize_cache(kv_cache_manager)
 
         # Create TransferWorker
         transfer_worker = TransferWorker(
@@ -235,7 +286,7 @@ def worker_fn(
         # Create gen mapping
         _ = local_rank // gen_tp  # pp_rank (unused)
         tp_rank = local_rank % gen_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=gen_instance_num,
             rank=local_rank,
             tp_size=gen_tp,
@@ -243,8 +294,9 @@ def worker_fn(
         )
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManager(
-            trtllm.KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -254,6 +306,7 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Create TransferWorker
@@ -330,30 +383,30 @@ def worker_fn(
             ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence_batch(
-                [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request]
-            )
+            allocate_request(kv_cache_manager, ctx_request)
 
             # Create sender session
             sender_session = transfer_worker.create_tx_session(ctx_request)
 
             # Get block ids and send
             block_ids = np.asarray(
-                kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
+                kv_cache_manager.get_page_indices_by_layer_group(ctx_request)[0],
                 dtype=np.int64,
             )
-            send_kv_slice = KVSlice(
-                is_last_slice=True,
+            send_kv_slice = Chunk(
                 block_ids_per_layer_groups=[block_ids],
+                kind_per_layer_group=[CacheKind.PAGED],
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
             )
             sender_session.send(send_kv_slice)
 
             # Wait for send to complete
             sender_session.wait_complete()
-            assert sender_session.status == SessionStatus.KV_TRANSFERRED
+            assert sender_session.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
-            block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]
+            block_data = request_block_data(kv_cache_manager, ctx_request)
 
         else:  # gen process
             # Create gen request
@@ -375,30 +428,30 @@ def worker_fn(
             )
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence_batch(
-                [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
-            )
+            allocate_request(kv_cache_manager, gen_request)
 
             # Create receiver session
             receiver_session = transfer_worker.create_rx_session(gen_request)
 
             # Get block ids and receive
             block_ids = np.asarray(
-                kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
+                kv_cache_manager.get_page_indices_by_layer_group(gen_request)[0],
                 dtype=np.int64,
             )
-            recv_kv_slice = KVSlice(
-                is_last_slice=True,
+            recv_kv_slice = Chunk(
                 block_ids_per_layer_groups=[block_ids],
+                kind_per_layer_group=[CacheKind.PAGED],
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
             )
             receiver_session.receive(recv_kv_slice)
 
             # Wait for receive to complete
             receiver_session.wait_complete(blocking=True)
-            assert receiver_session.status == SessionStatus.KV_TRANSFERRED
+            assert receiver_session.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
-            block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]
+            block_data = request_block_data(kv_cache_manager, gen_request)
 
         # Synchronize before verification
         dist.barrier()
@@ -550,6 +603,8 @@ def worker_fn(
         print(f"\n[Rank {rank}] All requests verified successfully!")
 
     # Cleanup
+    transfer_worker.shutdown()
+    kv_cache_manager.shutdown()
     dist.destroy_process_group()
 
 
@@ -612,8 +667,13 @@ MP_TEST_CONFIGS = [
     [(c[0], c[1], c[2], c[3]) for c in MP_TEST_CONFIGS],
     ids=[c[4] for c in MP_TEST_CONFIGS],
 )
-def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp):
+def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp, monkeypatch):
     """Test transfer worker with multi-process configurations."""
+    # Gloo workers own their rank identities and must not inherit the enclosing MPI job.
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    for name in list(os.environ):
+        if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
+            monkeypatch.delenv(name)
     # Set multiprocessing start method
     try:
         mp.set_start_method("spawn", force=True)

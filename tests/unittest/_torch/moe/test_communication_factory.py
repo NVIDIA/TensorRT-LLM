@@ -21,8 +21,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from packaging.version import Version
 
-from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
+from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard, nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_two_sided as two_sided_module
@@ -33,6 +34,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def _make_model_config(
@@ -62,6 +65,36 @@ def _make_model_config(
 
 def _strategy_unavailable(*args, **kwargs):
     raise RuntimeError("strategy unavailable")
+
+
+def _mock_nccl_ep_v02(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the v0.2 runtime contract required by these factory tests."""
+    monkeypatch.setattr(communication_factory, "nccl_ep_supports_version", lambda _: True)
+    monkeypatch.setattr(communication_factory, "nccl_ep_supports_group_timeout", lambda: True)
+
+
+def test_create_strategy_rejects_invalid_comm_timeout_before_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selection treats constructor errors as "unavailable", so validation must come first."""
+    guard = moe_comm_timeout_guard.MoECommTimeoutGuard(
+        environ={moe_comm_timeout_guard.SERVING_TIMEOUT_ENV: "soon"}
+    )
+    monkeypatch.setattr(moe_comm_timeout_guard, "_DEFAULT_GUARD", guard)
+    one_sided = Mock(side_effect=AssertionError("backend construction reached"))
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
+
+    with pytest.raises(ValueError, match=moe_comm_timeout_guard.SERVING_TIMEOUT_ENV):
+        communication_factory.CommunicationFactory.create_strategy(
+            _make_model_config(),
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            hidden_size=4096,
+        )
+
+    one_sided.assert_not_called()
 
 
 @pytest.mark.parametrize("use_flashinfer", [False, True])
@@ -175,12 +208,13 @@ def test_auto_selection_rejects_unrepurposed_helix(
 
 
 def _install_failing_nccl_module(monkeypatch: pytest.MonkeyPatch, error: BaseException):
-    def fail_get_version():
+    def fail_get_lib_version():
         raise error
 
     monkeypatch.setattr(nccl_ep_utils, "_nccl_ep_installed", None)
-    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(get_version=fail_get_version))
-    monkeypatch.delitem(sys.modules, "nccl.ep", raising=False)
+    fake_ep = SimpleNamespace(get_lib_version=fail_get_lib_version)
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
 
 
 def test_nccl_ep_installed_handles_runtime_probe_failure(monkeypatch: pytest.MonkeyPatch):
@@ -188,6 +222,68 @@ def test_nccl_ep_installed_handles_runtime_probe_failure(monkeypatch: pytest.Mon
 
     assert nccl_ep_utils.is_nccl_ep_installed() is False
     assert nccl_ep_utils._nccl_ep_installed is False
+
+
+@pytest.mark.parametrize(
+    ("installed_version", "supported"),
+    [("0.1", False), ("0.2", True), ("0.2.1", True)],
+)
+def test_nccl_ep_version_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    installed_version: str,
+    supported: bool,
+):
+    """NCCL-EP v0.2 features must never silently enable on an older wheel."""
+    fake_ep = SimpleNamespace(get_lib_version=lambda: Version(installed_version))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+
+    assert nccl_ep_utils.nccl_ep_supports_version("0.2") is supported
+
+
+def test_nccl_ep_invalid_version_is_unavailable(monkeypatch: pytest.MonkeyPatch):
+    """A malformed version must allow CommunicationFactory to fall back."""
+    fake_ep = SimpleNamespace(get_lib_version=lambda: "not-a-version")
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+
+    assert nccl_ep_utils.get_nccl_ep_version() is None
+    assert not nccl_ep_utils.nccl_ep_supports_version("0.2")
+
+    quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_any_quant=lambda **_: True))
+    assert (
+        communication_factory.CommunicationFactory._get_nccl_ep_unavailable_reason(
+            torch.bfloat16, quant_config, 32, 4096, 1024, 1024, 8
+        )
+        == "NcclEP v0.1 does not support quantized MoE communication."
+    )
+
+
+@pytest.mark.parametrize(("has_setter", "supported"), [(False, False), (True, True)])
+def test_nccl_ep_group_timeout_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    has_setter: bool,
+    supported: bool,
+):
+    methods = {"set_timeout_ns": lambda self, timeout_ns: None} if has_setter else {}
+    fake_ep = SimpleNamespace(Group=type("Group", (), methods))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+
+    assert nccl_ep_utils.nccl_ep_supports_group_timeout() is supported
+
+
+def test_nccl_ep_without_runtime_group_timeout_is_unavailable(monkeypatch: pytest.MonkeyPatch):
+    """A wheel without the carried nccl-extensions patch cannot follow warmup timeouts."""
+    _mock_nccl_ep_v02(monkeypatch)
+    monkeypatch.setattr(communication_factory, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(communication_factory, "nccl_ep_supports_group_timeout", lambda: False)
+
+    reason = communication_factory.CommunicationFactory._get_nccl_ep_unavailable_reason(
+        torch.bfloat16, None, 32, 4096, 1024, 1024, 8
+    )
+
+    assert reason is not None and "set_timeout_ns" in reason
 
 
 class _FakeNcclEP:
@@ -199,6 +295,8 @@ class _FakeNcclEP:
         max_num_tokens,
         moe_max_num_tokens,
         top_k=8,
+        quant_config=None,
+        use_low_precision_combine=False,
     ):
         self.mapping = mapping
         self.num_slots = num_slots
@@ -206,11 +304,7 @@ class _FakeNcclEP:
         self.max_num_tokens = max_num_tokens
         self.moe_max_num_tokens = moe_max_num_tokens
         self.top_k = top_k
-
-
-class _FakeDeepEP:
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        pass
+        self.use_low_precision_combine = use_low_precision_combine
 
 
 @pytest.mark.parametrize(
@@ -241,60 +335,41 @@ def test_forced_nccl_ep_validates_preconditions(
         )
 
 
-def test_forced_nccl_ep_rejects_more_than_14_warp_groups(
+def test_forced_nccl_ep_does_not_apply_host_smem_gate(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_config = _make_model_config()
-    assert (
-        communication_factory._get_nccl_ep_ll_combine_smem_requirement(
-            num_slots=15,
-            hidden_size=4096,
-            num_device_sms=1,
-        )
-        is None
-    )
+):
+    """NCCL-EP v0.2 owns LL kernel and shared-memory selection."""
+    _mock_nccl_ep_v02(monkeypatch)
+    model_config = _make_model_config(torch.bfloat16, 1024)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _: SimpleNamespace(
-            multi_processor_count=1,
-            shared_memory_per_block_optin=102400,
-            shared_memory_per_block=102400,
-        ),
+        lambda _: pytest.fail("NCCL-EP factory must not probe host SMEM limits"),
+    )
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory._create_forced_method(
+        "NCCL_EP",
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        payload_in_workspace=False,
+        alltoall_result_do_sum=True,
+        use_flashinfer=False,
+        hidden_size=4096,
     )
 
-    with pytest.raises(ValueError, match="at most 14 expert warp groups"):
-        communication_factory.CommunicationFactory._create_forced_method(
-            "NCCL_EP",
-            model_config,
-            num_experts=16,
-            num_slots=15,
-            top_k=8,
-            expert_size_per_partition=8,
-            payload_in_workspace=False,
-            alltoall_result_do_sum=True,
-            use_flashinfer=False,
-            hidden_size=4096,
-        )
+    assert isinstance(strategy, _FakeNcclEP)
 
 
 def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    _mock_nccl_ep_v02(monkeypatch)
     model_config = _make_model_config(torch.bfloat16, None)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(
-            multi_processor_count=72,
-            shared_memory_per_block_optin=232448,
-            shared_memory_per_block=102400,
-        ),
-    )
     monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
 
     strategy = communication_factory.CommunicationFactory._create_forced_method(
@@ -315,25 +390,126 @@ def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
     assert strategy.moe_max_num_tokens is None
 
 
+def test_nccl_ep_downgrades_unsupported_low_precision_combine(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Strategy selection may request combine quantization for BF16 workloads."""
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+
+    strategy = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+        use_low_precision_combine=True,
+    )
+
+    assert not strategy.use_low_precision_combine
+
+
+def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A rejected NCCL window must not replace the buffer written by dispatch."""
+
+    class FakeTensor:
+        def __init__(self, tensor, **_):
+            self.tensor = tensor
+
+    class FakeHandle:
+        def dispatch(self, _, outputs, **__):
+            assert outputs is context.dispatch_outputs
+            context.output_tokens_buf.fill_(7)
+
+    fake_ep = SimpleNamespace(
+        DispatchInputs=lambda **kwargs: SimpleNamespace(**kwargs),
+        DispatchOutputs=lambda **kwargs: SimpleNamespace(**kwargs),
+        Tensor=FakeTensor,
+    )
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(ep=fake_ep))
+    monkeypatch.setitem(sys.modules, "nccl.ep", fake_ep)
+
+    persistent_tokens = torch.zeros(1, 1, 4, dtype=torch.bfloat16)
+    context = SimpleNamespace(
+        get_stream=lambda: None,
+        output_tokens_buf=persistent_tokens,
+        recv_topk_idx_buf=torch.full((1, 1, 1), -1, dtype=torch.int32),
+        recv_topk_weights_buf=torch.zeros(1, 1, 1),
+        recv_topk_weights_nd=object(),
+        recv_topk_idx_nd=object(),
+        scales_nd=None,
+        topk_idx_dtype=torch.int32,
+        kernel_resets_recv_topk_idx=True,
+        kernel_writes_global_ids=True,
+        zerocopy_enabled=True,
+        dispatch_outputs=SimpleNamespace(tokens=object()),
+        layout=object(),
+        dispatch_layout_info=object(),
+        dispatch_config=object(),
+    )
+    comm = NcclEP.__new__(NcclEP)
+    comm.mapping = SimpleNamespace(moe_ep_group=[0])
+    comm.ep_size = comm.ep_rank = 1
+    comm.num_local_experts = comm.max_top_k = 1
+    comm.max_tokens_per_rank = comm.max_recv_tokens = 1
+    comm.hidden_size = 4
+    comm.use_fp8 = comm.uses_internal_fp8_dispatch = False
+    comm.use_external_fp8 = comm.use_external_nvfp4 = False
+    comm._dispatch_state = {}
+    monkeypatch.setattr(comm, "_get_context", lambda: context)
+    monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fallback_tokens = torch.zeros_like(persistent_tokens)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "allocate_output_with_nccl_window",
+        lambda *_: (fallback_tokens, 0, 0),
+    )
+
+    recv_hs, *_ = comm.dispatch(
+        torch.zeros(1, 4, dtype=torch.bfloat16),
+        None,
+        torch.zeros(1, 1, dtype=torch.int32),
+        torch.ones(1, 1),
+        [1],
+    )
+
+    assert torch.equal(recv_hs, torch.full_like(recv_hs, 7))
+
+
+def test_forced_nccl_ep_forwards_low_precision_combine(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _mock_nccl_ep_v02(monkeypatch)
+    model_config = _make_model_config(torch.bfloat16, 1024)
+    model_config.use_low_precision_moe_combine = True
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory._create_forced_method(
+        "NCCL_EP",
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        payload_in_workspace=False,
+        alltoall_result_do_sum=True,
+        use_flashinfer=False,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, _FakeNcclEP)
+    assert strategy.use_low_precision_combine
+
+
 def test_auto_selection_uses_nccl_ep_with_missing_moe_max_num_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    _mock_nccl_ep_v02(monkeypatch)
     model_config = _make_model_config(torch.bfloat16, None)
 
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
     monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
     monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(
-            multi_processor_count=72,
-            shared_memory_per_block_optin=232448,
-            shared_memory_per_block=102400,
-        ),
-    )
     monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
 
     strategy = communication_factory.CommunicationFactory.create_strategy(
@@ -384,120 +560,97 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     assert isinstance(strategy, AllGatherReduceScatter)
 
 
-def test_auto_selection_skips_nccl_ep_for_quantized_moe(
+_NCCL_EP_QUANT_ALGOS = [
+    None,
+    QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
+    QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.FP8,
+    QuantAlgo.FP8_BLOCK_SCALES,
+    QuantAlgo.NVFP4,
+]
+
+
+@pytest.mark.parametrize("quant_algo", _NCCL_EP_QUANT_ALGOS)
+@pytest.mark.parametrize("low_precision_combine", [False, True])
+def test_nccl_ep_quantized_transport_selection(
     monkeypatch: pytest.MonkeyPatch,
-):
-    model_config = _make_model_config()
-    model_config.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(has_any_quant=lambda **_: True)
+    quant_algo: QuantAlgo | None,
+    low_precision_combine: bool,
+) -> None:
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    strategy = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=128,
+        hidden_size=3072,
+        top_k=4,
+        quant_config=QuantConfig(quant_algo=quant_algo),
+        use_low_precision_combine=low_precision_combine,
     )
+    assert strategy.use_external_fp8 == (quant_algo == QuantAlgo.FP8)
+    assert strategy.use_external_nvfp4 == (quant_algo == QuantAlgo.NVFP4)
+    assert not strategy.uses_internal_dispatch_quantization()
+    assert strategy.supports_post_quant_dispatch() == (
+        quant_algo in (QuantAlgo.FP8, QuantAlgo.NVFP4)
+    )
+    assert strategy.use_low_precision_combine == (
+        low_precision_combine and quant_algo == QuantAlgo.NVFP4
+    )
+
+
+@pytest.mark.parametrize("force_nccl_ep", [False, True], ids=["auto", "forced"])
+@pytest.mark.parametrize("quant_algo", _NCCL_EP_QUANT_ALGOS)
+@pytest.mark.parametrize("low_precision_combine", [False, True])
+@pytest.mark.parametrize(
+    ("hidden_size", "supported"),
+    [(2880, False), (3328, False), (3072, True)],
+    ids=["gpt_oss", "dispatch_aligned_only", "dispatch_and_combine_aligned"],
+)
+def test_nccl_ep_hidden_size_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    force_nccl_ep: bool,
+    quant_algo: QuantAlgo | None,
+    hidden_size: int,
+    supported: bool,
+    low_precision_combine: bool,
+) -> None:
+    _mock_nccl_ep_v02(monkeypatch)
+    model_config = _make_model_config()
+    model_config.quant_config = QuantConfig(quant_algo=quant_algo)
+    model_config.use_low_precision_moe_combine = low_precision_combine
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
     monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
     monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
-    monkeypatch.setattr(
-        communication_factory,
-        "NcclEP",
-        lambda *args, **kwargs: pytest.fail("NcclEP should not be constructed for quantized MoE"),
-    )
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    if force_nccl_ep:
+        monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "NCCL_EP")
+    constructor = Mock(side_effect=_FakeNcclEP)
+    monkeypatch.setattr(communication_factory, "NcclEP", constructor)
 
-    strategy = communication_factory.CommunicationFactory.create_strategy(
-        model_config,
-        num_experts=32,
-        num_slots=32,
-        top_k=8,
-        expert_size_per_partition=16,
-        hidden_size=4096,
-    )
-
-    assert isinstance(strategy, AllGatherReduceScatter)
-
-
-def test_nccl_ep_ll_combine_smem_requirement() -> None:
-    assert (
-        communication_factory._get_nccl_ep_ll_combine_smem_requirement(
-            num_slots=72,
-            hidden_size=2560,
-            num_device_sms=72,
+    def create_strategy() -> _FakeNcclEP | AllGatherReduceScatter:
+        return communication_factory.CommunicationFactory.create_strategy(
+            model_config,
+            num_experts=128,
+            num_slots=128,
+            top_k=4,
+            expert_size_per_partition=64,
+            hidden_size=hidden_size,
         )
-        == 200704
-    )
 
+    if force_nccl_ep and not supported:
+        with pytest.raises(
+            ValueError, match=f"hidden_size divisible by 512, got hidden_size={hidden_size}"
+        ):
+            create_strategy()
+    else:
+        strategy = create_strategy()
+        assert isinstance(strategy, _FakeNcclEP if supported else AllGatherReduceScatter)
 
-@pytest.mark.parametrize(
-    "device_properties",
-    [
-        SimpleNamespace(
-            multi_processor_count=72,
-            shared_memory_per_block_optin=200704,
-            shared_memory_per_block=102400,
-        ),
-        SimpleNamespace(
-            multi_processor_count=72,
-            shared_memory_per_block=200704,
-        ),
-    ],
-    ids=["optin_shared_memory", "legacy_shared_memory"],
-)
-def test_forced_nccl_ep_accepts_supported_ll_combine_dynamic_smem(
-    monkeypatch: pytest.MonkeyPatch,
-    device_properties: SimpleNamespace,
-) -> None:
-    model_config = _make_model_config()
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: device_properties)
-    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
-
-    strategy = communication_factory.CommunicationFactory._create_forced_method(
-        "NCCL_EP",
-        model_config,
-        num_experts=72,
-        num_slots=72,
-        top_k=6,
-        expert_size_per_partition=18,
-        payload_in_workspace=False,
-        alltoall_result_do_sum=True,
-        use_flashinfer=False,
-        hidden_size=2560,
-    )
-
-    assert isinstance(strategy, _FakeNcclEP)
-
-
-def test_auto_selection_skips_nccl_ep_when_ll_combine_exceeds_dynamic_smem(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_config = _make_model_config()
-    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
-    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(
-            multi_processor_count=72,
-            shared_memory_per_block_optin=102400,
-            shared_memory_per_block=102400,
-        ),
-    )
-    monkeypatch.setattr(
-        communication_factory,
-        "NcclEP",
-        lambda *args, **kwargs: pytest.fail("NcclEP should not be constructed"),
-    )
-    monkeypatch.setattr(communication_factory, "DeepEP", _FakeDeepEP)
-
-    strategy = communication_factory.CommunicationFactory.create_strategy(
-        model_config,
-        num_experts=72,
-        num_slots=72,
-        top_k=6,
-        expert_size_per_partition=18,
-        hidden_size=2560,
-    )
-
-    assert isinstance(strategy, _FakeDeepEP)
+    if supported:
+        constructor.assert_called_once()
+    else:
+        constructor.assert_not_called()
 
 
 def test_auto_selection_falls_back_when_nccl_probe_runtime_fails(

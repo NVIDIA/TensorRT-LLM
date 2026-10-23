@@ -59,9 +59,6 @@ LMBENCHMARK_SHA = "c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb"
 LMBENCHMARK_SCRIPT = ""
 _LMBENCHMARK_PACKAGE = "benchmark"
 _LMBENCHMARK_SCRIPT_IN_PACKAGE = "synthetic-multi-round-qa/multi-round-qa.py"
-_LMBENCHMARK_INSTALL_SPEC = (
-    f"{_LMBENCHMARK_PACKAGE} @ git+https://github.com/LMCache/LMBenchmark.git@{LMBENCHMARK_SHA}"
-)
 CsvMetrics: TypeAlias = dict[str, int | float]
 _SERVER_HOST = "0.0.0.0"
 _SERVER_START_MAX_ATTEMPTS = 5
@@ -135,7 +132,7 @@ SCHED_CONFIGS = [
         },
         id="guaranteed-no-chunked",
     ),
-    # ── Pure-Python scheduler (parity with C++ path) ─────────────────────────
+    # ── Explicit Python scheduler preference (V2 still selects its scheduler) ──
     pytest.param(
         {
             "kv_cache_config": {"max_tokens": 200000},
@@ -592,7 +589,13 @@ def _stage_debug_context(
 
 
 def _write_config(tmp_path: Path, cfg: dict[str, object], name: str = "config.yml") -> str:
-    """Serialise *cfg* to YAML in *tmp_path* and return the file path."""
+    """Write a serving config that explicitly exercises KV cache manager V2."""
+    kv_cache_config = cfg["kv_cache_config"]
+    assert isinstance(kv_cache_config, dict)
+    cfg = {
+        **cfg,
+        "kv_cache_config": {**kv_cache_config, "use_kv_cache_manager_v2": True},
+    }
     path = str(tmp_path / name)
     with open(path, "w") as f:
         yaml.dump(cfg, f)
@@ -620,9 +623,10 @@ def _run_lmbenchmark(
 ) -> int:
     """Run the LMBenchmark multi-round-qa script and return the exit code.
 
-    stdout and stderr are drained in background threads so that the main
-    watchdog loop can run deadline / server-log / /health checks on a fixed
-    cadence regardless of how chatty the benchmark is.  A blocking readline
+    stdout and stderr are saved beside the output CSV and drained in
+    background threads so that the main watchdog loop can run deadline /
+    server-log / /health checks on a fixed cadence regardless of how chatty
+    the benchmark is.  A blocking readline
     in the main loop would otherwise stall indefinitely when the benchmark
     goes quiet (which is exactly what happens when the server stalls),
     defeating the point of the watchdog.
@@ -657,6 +661,9 @@ def _run_lmbenchmark(
         str(duration),
     ]
     print_info(f"Running LMBenchmark: {' '.join(cmd)}")
+    stdout_log = Path(output_csv).with_suffix(".stdout.log")
+    stderr_log = Path(output_csv).with_suffix(".stderr.log")
+    print_info(f"Full LMBenchmark logs: stdout={stdout_log}, stderr={stderr_log}")
 
     t_start = time.time()
     benchmark_debug_context = _stage_debug_context(debug_context, port, server_log, output_csv)
@@ -683,28 +690,30 @@ def _run_lmbenchmark(
 
     def _drain_stdout() -> None:
         try:
-            for line in iter(proc.stdout.readline, ""):
-                stdout_q.put(line)
+            with stdout_log.open("w", buffering=1) as log_f:
+                for line in iter(proc.stdout.readline, ""):
+                    log_f.write(line)
+                    stdout_q.put(line)
         finally:
             stdout_q.put(None)  # EOF sentinel
 
     def _drain_stderr() -> None:
-        for line in iter(proc.stderr.readline, ""):
-            stderr_lines.append(line)
+        with stderr_log.open("w", buffering=1) as log_f:
+            for line in iter(proc.stderr.readline, ""):
+                log_f.write(line)
+                stderr_lines.append(line)
 
     stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stdout_thread.start()
     stderr_thread.start()
 
-    # Grace window above the scripted duration. LMBenchmark keeps requests
-    # in flight after `--time` expires, and at higher QPS the backlog the
-    # server still has to drain scales roughly linearly with offered load.
-    # Observed worst-case drain on H100 PCIe + Qwen3-0.6B (5 scheduler
-    # variants, 3 stages each): drain ≈ 1.7·qps + 1 s. The coefficient below
-    # gives ≥2.8× margin over the observed worst case at every tested qps
-    # while still catching genuine stalls within a few minutes.
-    grace_s = max(45, int(qps * 5))
+    # The submission window does not include draining all multi-round requests.
+    # Non-overlapping and offloaded execution can keep making progress beyond
+    # the drain time of the baseline scheduler. Allow a bounded backlog drain
+    # proportional to offered load; health and error checks remain independent
+    # of this overall deadline.
+    grace_s = max(90, int(qps * 10))
     deadline = time.time() + duration + grace_s
     last_health_ok = time.time()
     last_poll = time.time()
@@ -984,7 +993,7 @@ try:
     dist = importlib.metadata.distribution(package)
 except importlib.metadata.PackageNotFoundError:
     raise SystemExit(
-        "LMBenchmark package is not installed after fixture setup. "
+        "LMBenchmark package is not installed. Install requirements-dev.txt before running tests. "
         f"Expected {{script_in_package}}."
     )
 
@@ -1013,10 +1022,9 @@ print(
 
 @pytest.fixture(scope="module")
 def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
-    """Install and resolve the pinned LMBenchmark script used by this module."""
+    """Verify and resolve the preinstalled LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
-    llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
     LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_install(llm_venv)
     return llm_venv
 
@@ -1027,7 +1035,7 @@ def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
 
 
 class TestServePrefixAwareScheduling:
-    """E2E: trtllm-serve with shared prefixes.
+    """E2E: trtllm-serve with KV cache manager V2 and shared prefixes.
 
     Tests prefix-aware scheduling under shared-prefix workloads that
     originally triggered the total_num_tokens > max_num_tokens over-admission
@@ -1155,8 +1163,8 @@ class TestServePrefixAwareScheduling:
           * the CSV contains no NaN ttft values
           * the server log is free of error patterns
 
-        NOTE: This test is intended for post-merge / nightly CI due to its
-        ~10 min runtime per config.
+        This is a correctness stress test; request latency is reported but is
+        not a pass/fail threshold.
         """
         config_path = _write_config(tmp_path, sched_cfg)
         server_log_base = str(tmp_path / "server.log")

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import inspect
@@ -6,7 +9,7 @@ import os
 import weakref
 from dataclasses import replace
 from enum import IntEnum
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -20,6 +23,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
@@ -410,7 +414,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        checkpoint_loader = _construct_checkpoint_loader(None, "HF")
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
@@ -773,19 +777,25 @@ class Runner:
             kwargs["mamba_metadata"] = mamba_metadata
 
         def run_pack(*, check=False):
-            with model_extra_attrs(self.model_config.extra_attrs):
+            # The layers run outside `ModelCaller`, so this harness owns the NCCL-window lease
+            # scope. Window-backed outputs are released at scope exit; validate them inside it.
+            # Returned tensors are benchmark scratch and must not be read after the call.
+            with (
+                model_extra_attrs(self.model_config.extra_attrs),
+                discard_nccl_window_tensor_outputs((position_ids, hidden_states, residual)),
+            ):
                 get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
                     hidden_states_out, residual_out = self.model(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
-            if check and isinstance(hidden_states_out, torch.Tensor):
-                if hidden_states_out.isnan().any():
-                    raise ValueError("Has nan, please fix weights initialization")
-                if hidden_states_out.isinf().any():
-                    raise ValueError("Has inf, please fix weights initialization")
-                if (hidden_states_out == 0).sum() > 0.5 * hidden_states_out.numel():
-                    raise ValueError("Too many zeros, please fix weights initialization")
+                if check and isinstance(hidden_states_out, torch.Tensor):
+                    if hidden_states_out.isnan().any():
+                        raise ValueError("Has nan, please fix weights initialization")
+                    if hidden_states_out.isinf().any():
+                        raise ValueError("Has inf, please fix weights initialization")
+                    if (hidden_states_out == 0).sum() > 0.5 * hidden_states_out.numel():
+                        raise ValueError("Too many zeros, please fix weights initialization")
             return hidden_states_out, residual_out
 
         return run_pack
@@ -887,6 +897,7 @@ class Runner:
         enable_swa_scratch_reuse=False,
         spec_config: Optional[DecodingBaseConfig] = None,
         vision_config: Optional[str] = None,
+        use_kv_cache_manager_v2: bool | Literal["auto"] = "auto",
     ) -> KVCacheManager:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         with Runner.vision_config_ctx(vision_config):
@@ -898,8 +909,7 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
-        # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
-        # request to capacity + 1; without the extra token the last block rounds down.
+        # Reserve one token of headroom before rounding to a block boundary.
         # kv_pool_headroom oversizes max_tokens when the manager splits it across
         # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
         # on its previous allocation.
@@ -909,6 +919,9 @@ class Runner:
             * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            # Every dummy request uses max_seq_len tokens, so this is the actual average.
+            avg_seq_len=max_seq_len,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
@@ -966,11 +979,12 @@ class Runner:
                 # Multi-token verify reads per-slot replay caches when the fused
                 # kernel is available, else the legacy per-step buffers.
                 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-                    is_kda_mtp_verify_available,
+                    kda_mtp_replay_num_spec,
                 )
 
-                if is_kda_mtp_verify_available():
-                    kimi_extra_kwargs["kda_replay_num_spec"] = spec_config.tokens_per_gen_step - 1
+                kda_replay_num_spec = kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
+                if kda_replay_num_spec is not None:
+                    kimi_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
             kv_cache_manager = kv_cache_manager_cls(
                 # mamba (KDA) cache parameters
                 mamba_params.state_size,

@@ -27,7 +27,8 @@ import triton_kernels.swiglu
 from triton_kernels.matmul import (FlexCtx, FnSpecs, FusedActivation,
                                    PrecisionConfig, matmul)
 from triton_kernels.numerics import InFlexData
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+from triton_kernels.numerics_details.mxfp import (MXFP_BLOCK_SIZE,
+                                                  downcast_to_mxfp_torch)
 from triton_kernels.reduce import reduce as triton_reduce
 from triton_kernels.tensor import FP4, DataType, RaggedTensorMetadata
 from triton_kernels.tensor import Storage as TritonStorage
@@ -39,6 +40,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
                                                 load_weight_shard)
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
@@ -1463,6 +1465,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         else:
             flex_ctx_1 = FlexCtx()
         pc1 = PrecisionConfig(b_mx_scale=gemm1_scales,
+                              b_microblock_size=MXFP_BLOCK_SIZE.value,
                               flex_ctx=flex_ctx_1,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1511,6 +1514,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         else:
             flex_ctx_2 = FlexCtx()
         pc2 = PrecisionConfig(b_mx_scale=gemm2_scales,
+                              b_microblock_size=MXFP_BLOCK_SIZE.value,
                               flex_ctx=flex_ctx_2,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1562,6 +1566,20 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
 
 class TritonFusedMoE(MoE):
+    """Hopper-only (SM90) Triton MoE backend.
+
+    Deprecated in TensorRT-LLM 1.3 (2026-09). The class remains functional
+    during the 3-month migration period in the project deprecation policy,
+    then it is scheduled for removal. Construction logs a one-time warning.
+
+    What it is kept for until then is one scenario: a modest performance edge
+    for gpt-oss on Hopper with ``W4A16_MXFP4``, which is what ``AUTO`` resolves
+    to TRITON for and the format an MXFP4 gpt-oss checkpoint takes on SM90.
+    ``CutlassFusedMoE`` serves that format on SM90 too, so
+    ``moe_config.backend="CUTLASS"`` replaces this backend functionally and is
+    already the automatic degradation target when a layer is declined here.
+    See https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy
+    """
 
     capabilities = MoEStaticCapability(supports_expert_bias=True)
 
@@ -1671,6 +1689,17 @@ class TritonFusedMoE(MoE):
         layer_idx: Optional[int] = None,
         activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     ):
+        # One warning per process: gpt-oss constructs one module per layer.
+        logger.warning_once(
+            "TritonFusedMoE (moe_config.backend='TRITON') is deprecated as of "
+            "TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month "
+            "migration period, during which it stays functional on Hopper "
+            "(SM90). It is kept only for a modest performance edge on gpt-oss "
+            "W4A16_MXFP4; moe_config.backend='CUTLASS' serves that format on "
+            "SM90 and replaces this backend functionally. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="triton_fused_moe_deprecated",
+        )
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,

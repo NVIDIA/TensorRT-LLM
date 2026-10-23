@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/funcGuard.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
@@ -32,7 +33,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -41,6 +44,111 @@ namespace
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
+
+TEST(KvCacheManagerV2ConcurrencyTest, LevelStatsAreConservedAcrossConcurrentDrains)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeTieredConfig();
+    config.enableStats = true;
+    auto manager = std::make_shared<KvCacheManager>(config);
+
+    constexpr int kNumWriters = 4;
+    constexpr int kIterations = 1000;
+    CountsByLevel const tokensPerCommit{4, 8};
+    ReusedBlocksByLevel const blocksPerCommit{{1, 2}, {0, 1}};
+    ReusedBlocksByLevelByLifeCycle const reusePerCommit{{LifeCycleId{0}, blocksPerCommit}};
+    std::promise<void> start;
+    auto const ready = start.get_future().share();
+    std::atomic<int> writersRemaining{kNumWriters};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < kNumWriters; ++writer)
+    {
+        writers.emplace_back(
+            [&]
+            {
+                ready.wait();
+                for (int iteration = 0; iteration < kIterations; ++iteration)
+                {
+                    // Internal recorders use the caller's lock, as in commitPendingStats()/prefetch().
+                    auto const apiLock = manager->lockExclusive();
+                    manager->commitCachedTokensByLevel(tokensPerCommit);
+                    manager->commitReusedBlocksByLevel(reusePerCommit);
+                    manager->recordDiskPrefetchBlocks(2);
+                }
+                --writersRemaining;
+            });
+    }
+
+    CountsByLevel tokens;
+    ReusedBlocksByLevel blocks;
+    int64_t diskBlocks = 0;
+    auto drain = [&]
+    {
+        addCountsByLevel(tokens, manager->getAndResetIterationCachedTokensByLevel());
+        for (auto const& [lifeCycle, byLevel] : manager->getAndResetIterationReusedBlocksByLevel())
+        {
+            EXPECT_EQ(lifeCycle, LifeCycleId{0});
+            blocks.add(byLevel);
+        }
+        diskBlocks += manager->getAndResetIterationDiskPrefetchBlocks();
+    };
+    start.set_value();
+    while (writersRemaining.load() != 0)
+    {
+        drain();
+    }
+    for (auto& writer : writers)
+    {
+        writer.join();
+    }
+    drain();
+
+    constexpr int64_t kCommits = kNumWriters * kIterations;
+    EXPECT_EQ(tokens, (CountsByLevel{4 * kCommits, 8 * kCommits}));
+    EXPECT_EQ(blocks.full, (CountsByLevel{kCommits, 2 * kCommits}));
+    EXPECT_EQ(blocks.partial, (CountsByLevel{0, kCommits}));
+    EXPECT_EQ(diskBlocks, 2 * kCommits);
+    EXPECT_TRUE(manager->getAndResetIterationCachedTokensByLevel().empty());
+    EXPECT_TRUE(manager->getAndResetIterationReusedBlocksByLevel().empty());
+    EXPECT_EQ(manager->getAndResetIterationDiskPrefetchBlocks(), 0);
+}
+
+TEST(KvCacheManagerV2ConcurrencyTest, PageStorageSnapshotWaitsForSharedApiReaders)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto destroyStream = FuncGuard([&]() { EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess); });
+    auto config = makeTieredConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = true;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(cache->resize(4, 4));
+    ASSERT_TRUE(cache->enterDecode());
+
+    std::promise<void> started;
+    auto startedFuture = started.get_future();
+    std::future<PageStorageSnapshot> snapshotFuture;
+    {
+        auto const apiLock = manager->lockShared();
+        snapshotFuture = std::async(std::launch::async,
+            [&]
+            {
+                started.set_value();
+                return cache->getPageStorageSnapshot(LifeCycleId{0});
+            });
+        EXPECT_EQ(startedFuture.wait_for(std::chrono::seconds{5}), std::future_status::ready);
+        // Inspecting a locked host page changes non-atomic holder refcounts, so even a
+        // shared API reader must exclude the snapshot until it releases its lock.
+        EXPECT_EQ(snapshotFuture.wait_for(std::chrono::milliseconds{100}), std::future_status::timeout);
+    }
+    auto const snapshot = snapshotFuture.get();
+    EXPECT_EQ(snapshot.eligibleHistoryBlocks(), 1);
+    EXPECT_EQ(snapshot.cacheLevels(), (std::vector<std::optional<CacheLevel>>{kSparseHistoryLevel}));
+}
 
 // Creates `count` roots and proposes all of them for erasure, leaving that many pending entries and
 // an unchanged root map. Returns the number of roots now present.
@@ -51,13 +159,13 @@ size_t seedPendingRootErases(BlockRadixTree& tree, size_t count)
     for (size_t index = 0; index < count; ++index)
     {
         ReuseScope scope;
-        scope.salt = static_cast<std::uint64_t>(index) + 1;
+        scope.salt = std::to_string(index + 1);
         tree.addOrGetExisting(scope);
     }
     for (size_t index = 0; index < count; ++index)
     {
         ReuseScope scope;
-        scope.salt = static_cast<std::uint64_t>(index) + 1;
+        scope.salt = std::to_string(index + 1);
         // Freshly created roots are childless, which is exactly the state the drain acts on.
         tree.proposeToEraseEmptyRoot(RootBlock::makeKey(scope));
     }
@@ -88,16 +196,21 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseDoesNotMutateTheRadixTree)
     for (int attempt = 0; attempt < 4; ++attempt)
     {
         ReuseScope scope;
-        scope.salt = 1;
+        scope.salt = "1";
         EXPECT_EQ(manager->probeReuse(scope, toSpan(tokens), /*knownNoDigest=*/true), 0);
         EXPECT_EQ(tree.roots().size(), kNumRoots) << "probeReuse() drained pending root erases on attempt " << attempt;
     }
 
     // The drain still happens, just at an exclusive-locked entry point.
     ReuseScope fresh;
-    fresh.salt = 9999;
+    fresh.salt = "9999";
     tree.addOrGetExisting(fresh);
     EXPECT_EQ(tree.roots().size(), 1U) << "addOrGetExisting() must drain the pending root erases";
+
+    // Committing a block is what creates a root in production, so every root has a child and is
+    // proposed for erase when that child goes. This test drives the bookkeeping directly and
+    // leaves a childless root that nothing proposed, which tree teardown asserts against.
+    tree.proposeToEraseEmptyRoot(RootBlock::makeKey(fresh));
 }
 
 // Stress form of the above: with pending erases present, concurrent probes must neither corrupt the
@@ -124,11 +237,14 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
     // would pass having never had two probes in flight at once -- which is the whole point.
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
-    std::vector<std::thread> threads;
-    threads.reserve(kNumThreads);
+    std::vector<std::future<void>> workers;
+    workers.reserve(kNumThreads);
     for (int threadIndex = 0; threadIndex < kNumThreads; ++threadIndex)
     {
-        threads.emplace_back(
+        // std::async, not std::thread: probeReuse() can throw, and an exception escaping a thread
+        // body terminates the process, taking every other test in the binary with it. get() below
+        // rethrows it on this thread, where gtest reports it as an ordinary failure.
+        workers.push_back(std::async(std::launch::async,
             [&manager, &tokens, &nonZeroMatches, &ready, &go, threadIndex]
             {
                 ready.fetch_add(1, std::memory_order_relaxed);
@@ -141,13 +257,13 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
                 for (int iteration = 0; iteration < kIterations; ++iteration)
                 {
                     ReuseScope scope;
-                    scope.salt = static_cast<std::uint64_t>((threadIndex + iteration) % kNumRoots) + 1;
+                    scope.salt = std::to_string((threadIndex + iteration) % kNumRoots + 1);
                     if (manager->probeReuse(scope, toSpan(tokens), /*knownNoDigest=*/true) != 0)
                     {
                         nonZeroMatches.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
-            });
+            }));
     }
 
     auto const readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
@@ -155,14 +271,14 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
     {
         std::this_thread::yield();
     }
-    // EXPECT, not ASSERT: the workers are joinable, and returning here would terminate. Release
-    // unconditionally either way, so nobody waits on a barrier that never opens.
+    // EXPECT, not ASSERT: returning here would block in ~future until every worker reached its own
+    // deadline. Release unconditionally either way, so nobody waits on a barrier that never opens.
     EXPECT_EQ(ready.load(), kNumThreads) << "not every prober reached the start barrier";
     go.store(true, std::memory_order_release);
 
-    for (auto& thread : threads)
+    for (auto& worker : workers)
     {
-        thread.join();
+        worker.get(); // joins, and rethrows whatever the worker threw
     }
 
     EXPECT_EQ(nonZeroMatches.load(), 0);
@@ -188,7 +304,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
     // stream of shared acquisitions could in principle starve the writer; without the deadline the
     // writer's next exclusive call would block forever and hang CI instead of failing.
     auto const proberDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-    std::thread prober(
+    auto prober = std::async(std::launch::async,
         [&]
         {
             while (!stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < proberDeadline)
@@ -206,7 +322,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
     {
         std::this_thread::yield();
     }
-    // EXPECT, not ASSERT: `prober` is joinable, and returning here would terminate on its destructor.
+    // EXPECT, not ASSERT: returning here would block in ~future until the prober's own deadline.
     bool const proberRan = probeCount.load(std::memory_order_relaxed) > 0;
     EXPECT_TRUE(proberRan) << "prober never ran";
 
@@ -230,7 +346,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
     }
 
     stop.store(true, std::memory_order_relaxed);
-    prober.join();
+    prober.get(); // joins, and rethrows whatever the prober threw
 
     if (proberRan)
     {
