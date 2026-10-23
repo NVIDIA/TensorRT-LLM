@@ -72,7 +72,7 @@ from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .model_loader import ModelLoader, construct_checkpoint_loader
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
@@ -209,7 +209,7 @@ class PyTorchModelEngine(ModelEngine):
                                        is not None else self.max_num_tokens)
 
         if checkpoint_loader is None:
-            checkpoint_loader = _construct_checkpoint_loader(
+            checkpoint_loader = construct_checkpoint_loader(
                 llm_args.checkpoint_loader,
                 llm_args.checkpoint_format,
                 mx_config=llm_args.mx_config,

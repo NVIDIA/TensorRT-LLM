@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -84,7 +85,7 @@ def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
             quant_path, checkpoint_dir, model_config.moe_backend)
 
     mapper = AutoCheckpointMapper.get(
-        "HF", model_config.pretrained_config.architectures[0])
+        CheckpointFormat.HF, model_config.pretrained_config.architectures[0])
     start_layer_idx = model_config.pretrained_config.num_hidden_layers
     if layer_configs is not None:
         normalized = {}

@@ -56,7 +56,7 @@ from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
-from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -365,7 +365,7 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 def _load_config_and_create_checkpoint_loader(
         llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
     torch.cuda.set_per_process_memory_fraction(1.0)
-    checkpoint_loader = _construct_checkpoint_loader(
+    checkpoint_loader = construct_checkpoint_loader(
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,

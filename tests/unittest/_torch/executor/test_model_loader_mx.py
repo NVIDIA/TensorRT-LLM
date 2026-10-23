@@ -712,7 +712,7 @@ def test_construct_checkpoint_loader_passes_mx_config():
         server_query_timeout_s=17,
     )
 
-    checkpoint_loader = model_loader_mod._construct_checkpoint_loader(
+    checkpoint_loader = model_loader_mod.construct_checkpoint_loader(
         None,
         "MX",
         mx_config=mx_config,
