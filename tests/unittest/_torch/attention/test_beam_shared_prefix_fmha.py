@@ -136,8 +136,7 @@ def _run_beam_search(model_path, prompts, beam_width, max_tokens, env):
                 max_tokens=max_tokens,
                 ignore_eos=True,
                 end_id=-1,
-                logprobs=1,
-            )
+            )  # the LLM API rejects top-k logprobs for beam search
             outputs = llm.generate(prompts, sampling_params=sampling)
         return [
             [(tuple(beam.token_ids), beam.cumulative_logprob) for beam in out.outputs]
@@ -583,7 +582,7 @@ def test_sampling_merge_is_as_accurate_as_one_decode_kernel():
     assert merged_err <= 1.15 * single_err, (merged_err, single_err)
 
 
-def _run_n_sampling(model_path, prompts, n, max_tokens, env, cuda_graph=False):
+def _run_n_sampling(model_path, prompts, n, max_tokens, env, cuda_graph=False, with_logprobs=False):
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
@@ -605,9 +604,25 @@ def _run_n_sampling(model_path, prompts, n, max_tokens, env, cuda_graph=False):
         )
         with llm:
             sampling = SamplingParams(
-                n=n, top_k=1, max_tokens=max_tokens, ignore_eos=True, end_id=-1
+                n=n,
+                top_k=1,
+                max_tokens=max_tokens,
+                ignore_eos=True,
+                end_id=-1,
+                logprobs=2 if with_logprobs else None,
             )
             outputs = llm.generate(prompts, sampling_params=sampling)
+        if with_logprobs:
+            return [
+                [
+                    (
+                        tuple(c.token_ids),
+                        [sorted((v.logprob for v in d.values()), reverse=True) for d in c.logprobs],
+                    )
+                    for c in out.outputs
+                ]
+                for out in outputs
+            ]
         return [[tuple(c.token_ids) for c in out.outputs] for out in outputs]
     finally:
         for key, value in previous.items():
@@ -659,6 +674,54 @@ def test_n_sampling_shared_prefix_matches_fallback_e2e(cuda_graph, gate_tokens):
         # late token, so require the first tokens to agree.
         for ref_tokens, cand_tokens in zip(ref_samples, cand_samples):
             assert cand_tokens[:8] == ref_tokens[:8]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(_qwen3_small_path() is None, reason="Qwen3-0.6B checkpoint not available")
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+def test_n_sampling_shared_prefix_diverges_only_at_near_ties_e2e(cuda_graph):
+    """The library is a different bf16 rounding path, not bit-identical to the
+    regular kernel, so a greedy child may leave the regular kernel's sequence.
+    That may only happen where the regular kernel's own top-2 logprob gap is
+    within two bf16 steps of the logits (0.25 nats at logits of 16-32); any
+    divergence at a clear margin is a real error (wrong page, position or
+    merge), not rounding. Prompts end at and around page boundaries."""
+    model_path = _qwen3_small_path()
+    vocab = 150000
+    # 32-token pages: 31, 32 and 33 tokens past a page multiple.
+    prompts = [
+        [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
+        for i, n in enumerate((511, 512, 513))
+    ]
+    n, max_tokens = 6, 40
+    base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1", "TLLM_ALLOW_N_GREEDY_DECODING": "1"}
+    reference = _run_n_sampling(
+        model_path, prompts, n, max_tokens, base_env, cuda_graph, with_logprobs=True
+    )
+    candidate = _run_n_sampling(
+        model_path,
+        prompts,
+        n,
+        max_tokens,
+        base_env
+        | {
+            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
+            "TLLM_BEAM_SHARED_PREFIX_MIN_SHARED_TOKENS": "0",
+            "TLLM_BEAM_SHARED_PREFIX_MIN_GROUP": "1",
+        },
+        cuda_graph,
+        with_logprobs=True,
+    )
+    for ref_samples, cand_samples in zip(reference, candidate):
+        assert len(cand_samples) == n
+        for (ref_tokens, ref_lp), (cand_tokens, _) in zip(ref_samples, cand_samples):
+            assert len(cand_tokens) == len(ref_tokens)
+            if cand_tokens == ref_tokens:
+                continue
+            pos = next(i for i, (a, b) in enumerate(zip(ref_tokens, cand_tokens)) if a != b)
+            gap = ref_lp[pos][0] - ref_lp[pos][1] if len(ref_lp[pos]) > 1 else 0.0
+            assert gap <= 0.25, (pos, gap)
 
 
 def test_sampling_plan_reads_kv_manager_v2_block_table():
