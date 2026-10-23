@@ -27,9 +27,11 @@ from typing import Optional
 
 import torch
 
+from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.runtime_hooks import SpecStepFold
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
     AsyncWorkerMixin,
@@ -164,6 +166,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     i.e. the target's per-step input width minus one, which is exactly the
     draft length every mode used to compute for itself.
     """
+
+    # The model's speculative step-input staging, when it opted into one (bind_spec_step_fold).
+    spec_step_fold: Optional[SpecStepFold] = None
+    # Copy the per-slot store to the host on the D2H side stream (RuntimeHooks.sampler_d2h_side_stream).
+    d2h_side_stream_copies: bool = False
+    # Keep the stored rows' slot ids in a device buffer re-uploaded only when they change
+    # (RuntimeHooks.spec_small_h2d).
+    static_slot_ids: bool = False
+    _slot_ids_host: Optional[list[int]] = None
+    _slot_ids_cuda: Optional[torch.Tensor] = None
 
     SampleState = SampleStateSpec
 
@@ -313,6 +325,76 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens_lens=int_tensor((seq_slots,)),
         )
 
+    def _device_slot_ids(self, seq_slots: list[int]) -> torch.Tensor:
+        """The slot ids on the device, uploaded only when they differ from the last upload.
+
+        The buffer is this sampler's own: only this method writes it, so the last uploaded
+        list describes its contents, and the stream orders each upload after the scatter that
+        read the previous ids.
+        """
+        n = len(seq_slots)
+        if self._slot_ids_cuda is None or self._slot_ids_cuda.numel() < n:
+            self._slot_ids_cuda = torch.empty(max(n, 8), dtype=torch.long, device="cuda")
+            self._slot_ids_host = None
+        if self._slot_ids_host != list(seq_slots):
+            self._slot_ids_cuda[:n].copy_(
+                torch.tensor(seq_slots, dtype=torch.long, pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+            self._slot_ids_host = list(seq_slots)
+        return self._slot_ids_cuda[:n]
+
+    def _copy_outputs_to_host(
+        self,
+        o_verify_lens: Optional[torch.Tensor],
+        store_copies_on_side_stream: bool,
+        store_copies_done: Optional[torch.cuda.Event] = None,
+    ) -> tuple[SampleStateTensorsSpec, Optional[torch.cuda.Event]]:
+        """Host copies of the step's stored outputs, and the side-stream event to await them by (or None).
+
+        With ``d2h_side_stream_copies`` the per-slot store is copied on the D2H side stream, so the copies
+        overlap the next step's input staging instead of preceding it on the main stream. That is sound
+        only while nothing rewrites the store before the sampler event is synchronized host-side, which
+        holds when this sampler stored the rows itself: the store is next written by the following
+        ``sample_async``, after the loop has synchronized this step. ``verify_lens`` is a forward output
+        buffer the next replay rewrites, so it is always copied on the main stream.
+
+        ``store_copies_done`` (a step fold's ``store_copies_done``) is recorded on the side stream after the copies:
+        a forward that stores into the store waits on it first, which keeps the side-stream copies sound when the
+        next replay rather than the next ``sample_async`` writes the store.
+        """
+        if not (
+            self.d2h_side_stream_copies
+            and store_copies_on_side_stream
+            and not self._async_worker_active()
+        ):
+            # The stock copies, in the stock order.
+            host = SampleStateTensorsSpec(
+                new_tokens=self._copy_to_host(self.store.new_tokens),
+                new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+                verify_lens=(
+                    self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+                ),
+            )
+            return host, None
+        verify_lens = self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+        with self._make_side_stream_copier() as copier:
+            host = SampleStateTensorsSpec(
+                new_tokens=copier.stage_copy_to_host(self.store.new_tokens),
+                new_tokens_lens=copier.stage_copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=copier.stage_copy_to_host(self.store.next_draft_tokens),
+                verify_lens=verify_lens,
+            )
+        if store_copies_done is not None and copier.event is not None:
+            store_copies_done.record(self._d2h_side_stream)
+        return host, copier.event
+
+    def bind_spec_step_fold(self, spec_step_fold: SpecStepFold) -> None:
+        """Let the model's forward store into this sampler's per-slot store (see SpecStepFold)."""
+        self.spec_step_fold = spec_step_fold
+        spec_step_fold.bind_sampler_store(self.store)
+
     def _request_common_handling(
         self,
         request: LlmRequest,
@@ -396,6 +478,57 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
+    def _store_outputs(
+        self,
+        seq_slots: list[int],
+        o_new_tokens: torch.Tensor,
+        o_next_new_tokens: torch.Tensor,
+        o_new_tokens_lens: torch.Tensor,
+        o_next_draft_tokens: torch.Tensor,
+    ) -> None:
+        """Store one step's worker outputs into the per-slot store."""
+        if self.static_slot_ids:
+            slots = self._device_slot_ids(seq_slots)
+        else:
+            slots = torch.as_tensor(seq_slots, dtype=torch.long)
+            slots = slots.to(device="cuda", non_blocking=True)
+        step_fold = self.spec_step_fold
+        if step_fold is not None and step_fold.scatter(
+            slots, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
+        ):
+            return
+
+        # Pad or truncate to match fixed-size store buffers for index_copy_.
+        # The worker output width tracks runtime_draft_len, which dynamic draft
+        # length shrinks below the statically allocated store width.
+        new_tokens_width = self.store.new_tokens.shape[0]
+        next_new_tokens_width = self.store.next_new_tokens.shape[0]
+        draft_tokens_width = self.store.next_draft_tokens.shape[1]
+        if o_new_tokens.shape[1] < new_tokens_width:
+            o_new_tokens = torch.nn.functional.pad(
+                o_new_tokens, (0, new_tokens_width - o_new_tokens.shape[1])
+            )
+        elif o_new_tokens.shape[1] > new_tokens_width:
+            o_new_tokens = o_new_tokens[:, :new_tokens_width]
+        if o_next_draft_tokens.shape[1] < draft_tokens_width:
+            o_next_draft_tokens = torch.nn.functional.pad(
+                o_next_draft_tokens, (0, draft_tokens_width - o_next_draft_tokens.shape[1])
+            )
+        elif o_next_draft_tokens.shape[1] > draft_tokens_width:
+            o_next_draft_tokens = o_next_draft_tokens[:, :draft_tokens_width]
+        if o_next_new_tokens.shape[1] < next_new_tokens_width:
+            o_next_new_tokens = torch.nn.functional.pad(
+                o_next_new_tokens, (0, next_new_tokens_width - o_next_new_tokens.shape[1])
+            )
+        elif o_next_new_tokens.shape[1] > next_new_tokens_width:
+            o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
+
+        # Use index_copy_ for efficient copying (slots are unique)
+        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
+        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
+        self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
+        self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
@@ -442,8 +575,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             for r in sampling_requests
         ]
 
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
-        slots = slots.to(device="cuda", non_blocking=True)
+        seq_slots = [r.py_seq_slot for r in sampling_requests]
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -489,36 +621,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 raise ValueError("verify_lens must contain one int32 token window per output row")
             o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
 
-        # Pad or truncate to match fixed-size store buffers for index_copy_.
-        # The worker output width tracks runtime_draft_len, which dynamic draft
-        # length shrinks below the statically allocated store width.
-        new_tokens_width = self.store.new_tokens.shape[0]
-        next_new_tokens_width = self.store.next_new_tokens.shape[0]
-        draft_tokens_width = self.store.next_draft_tokens.shape[1]
-        if o_new_tokens.shape[1] < new_tokens_width:
-            o_new_tokens = torch.nn.functional.pad(
-                o_new_tokens, (0, new_tokens_width - o_new_tokens.shape[1])
+        step_fold = self.spec_step_fold
+        stored_here = step_fold is None or not step_fold.sampler_rows_stored(
+            outputs, num_skip, seq_slots
+        )
+        if stored_here:
+            self._store_outputs(
+                seq_slots, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
             )
-        elif o_new_tokens.shape[1] > new_tokens_width:
-            o_new_tokens = o_new_tokens[:, :new_tokens_width]
-        if o_next_draft_tokens.shape[1] < draft_tokens_width:
-            o_next_draft_tokens = torch.nn.functional.pad(
-                o_next_draft_tokens, (0, draft_tokens_width - o_next_draft_tokens.shape[1])
-            )
-        elif o_next_draft_tokens.shape[1] > draft_tokens_width:
-            o_next_draft_tokens = o_next_draft_tokens[:, :draft_tokens_width]
-        if o_next_new_tokens.shape[1] < next_new_tokens_width:
-            o_next_new_tokens = torch.nn.functional.pad(
-                o_next_new_tokens, (0, next_new_tokens_width - o_next_new_tokens.shape[1])
-            )
-        elif o_next_new_tokens.shape[1] > next_new_tokens_width:
-            o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
-
-        # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
-        self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
-        self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -527,13 +637,20 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_tensors = SampleStateTensorsSpec(
-            new_tokens=self._copy_to_host(self.store.new_tokens),
-            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-            verify_lens=(self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None),
+        # A fold whose forward waits for the store copies (store_copies_done) lets them go on the side stream
+        # on the steps its forward stored the rows too.
+        store_copies_done = getattr(step_fold, "store_copies_done", None) if step_fold else None
+        host_tensors, side_stream_event = self._copy_outputs_to_host(
+            o_verify_lens,
+            store_copies_on_side_stream=stored_here or store_copies_done is not None,
+            store_copies_done=store_copies_done,
         )
-        sampler_event = self._record_sampler_event()
+        # Without side-stream copies the call is the stock one (no argument).
+        sampler_event = (
+            self._record_sampler_event(side_stream_event)
+            if side_stream_event is not None
+            else self._record_sampler_event()
+        )
 
         # Add dummy draft tokens to context requests for KV cache preparation
         for request in finished_context_requests:

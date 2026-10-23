@@ -76,6 +76,38 @@ add_th_common_family(
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
 
+# MiniMax-M3.1 GB300 native dependencies; explicit to avoid duplicate
+# registrations.
+target_sources(
+  th_common_attention
+  PRIVATE minimaxM31/minimaxM31ChainSpecSamplingMcOp.cpp
+          minimaxM31/minimaxM31Sm103CtxNormMxfp8Op.cpp
+          minimaxM31/minimaxM31Sm103SelectPrefillTileOp.cpp
+          minimaxM31/minimaxM31SoftmaxMcOp.cpp
+          minimaxM31/minimaxM31ToppRenormDetOp.cpp
+          minimaxM31/minimaxM31ToppRenormDetV3Op.cpp
+          minimaxM31/minimaxM31Tp4SparseDecodeLcOp.cpp
+          minimaxM31/minimaxM31Tp8SparseDecodeLc8Op.cpp
+          chainSpeculativeSamplingOp.cpp
+          minimaxM3/minimaxM3AttnC1Op.cpp
+          minimaxM3/minimaxM3AttnMegaOp.cpp
+          minimaxM3/minimaxM3DraftStepOp.cpp
+          minimaxM3/minimaxM3FusedDecodeAttnOp.cpp
+          minimaxM3/minimaxM3McAllreduceNormOp.cpp
+          minimaxM3/minimaxM3MsaKvUpdateOp.cpp
+          minimaxM3/minimaxM3Mxfp8LowMGemmOp.cpp
+          minimaxM3/minimaxM3ProducerPwOp.cpp
+          minimaxM3/minimaxM3RouterGemvOp.cpp
+          minimaxM3/minimaxM3SampledAcceptOp.cpp
+          minimaxM3/minimaxM3SelectLongOp.cpp
+          minimaxM3/minimaxM3ShardAcceptOp.cpp
+          minimaxM3/minimaxM3SparseDecodeLcOp.cpp
+          minimaxM3/minimaxM3SpecTailOp.cpp
+          minimaxM3/minimaxM3TargetHeadOp.cpp
+          minimaxM3/minimaxM3Tp8FusedScoreSelectOp.cpp
+          minimaxM3/minimaxM3Tp8SparseDecodeLc8Op.cpp
+          minimaxM3/stepInputsScatterOp.cpp)
+
 add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp
