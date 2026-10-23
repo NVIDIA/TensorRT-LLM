@@ -1,0 +1,40 @@
+# Example brief for the modeling-v2-onboard workflow. Copy it, fill it in, and run:
+#
+#     modeling-v2-onboard --task path/to/task.yaml --workspace /path/outside/the/checkout
+#
+# The schema is the same as modeling-bringup's. The three paths are required
+# and must exist.
+
+reference_code_path: /path/to/transformers/src/transformers/models/<model>/modeling_<model>.py
+checkpoint_path:     /path/to/checkpoints/<Model>-<Variant>
+# A clean, dedicated TensorRT-LLM checkout: every task branches from its HEAD,
+# and the final task commits the result onto its current branch.
+trtllm_repo_path:    /path/to/TensorRT-LLM
+
+# Optional. When present, workers run GPU work through Slurm in this container.
+# slurm-environment:
+#   slurm_partition: <partition>
+#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+#   # Optional: a pool of whole nodes the run holds for its workers, asked for
+#   # as soon as the run starts. Workers run GPU commands in it, served by
+#   # their task's priority, instead of submitting their own jobs.
+#   gpu_pool:
+#     nodes: 4                  # holder jobs kept submitted at first
+#     max_nodes: 8              # the most the planner may grow it to; default: the worker count
+#     account: <account>
+#     partition: <partition>    # default: slurm_partition
+#     qos: <qos>                # optional
+#     gpus_per_node: 4          # default 4
+#     hours: 24                 # time limit of one holder job; default 24
+#     reserve: 2                # free GPUs perf work may not take; default 2
+#     container_mounts: [/path/to/models]   # besides the workspace and checkout
+
+# What the run must prove. The planner plans the tasks that prove each item,
+# and the run ends when they are DONE.
+completion_criteria:
+  - "A modeling_v2 target for <checkpoint> on sm_103, tp1, routed under modeling_v2=require"
+  - "GSM8K via trtllm-eval under modeling_v2=require is within the reference tolerance"
+
+# Optional free-form guidance for the planner and the workers.
+implements_tips:
+  - "gpt_oss/gpt_oss_120b__sm_103__tp1 is the closest existing target"

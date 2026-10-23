@@ -304,6 +304,7 @@ class ClaudeCodeClient(BackendClient):
                         is_error=bool(sdk_message.is_error),
                         errors=list(sdk_message.errors or []),
                         permission_denials=list(sdk_message.permission_denials or []),
+                        session_id=sdk_message.session_id,
                     )
         except Exception:
             if not got_result:
@@ -541,6 +542,7 @@ class ClaudeCodeBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
         # External MCP server configs (e.g. ``{"knowledge-base": {"type":
         # "http", "url": ...}}``) are layered alongside the in-process
@@ -584,6 +586,10 @@ class ClaudeCodeBackend(Backend):
             # Forward the CLI's stderr so startup failures are diagnosable
             # instead of vanishing with the subprocess.
             stderr=lambda line: print(f"[claude-cli stderr] {line}", file=sys.stderr, flush=True),
+            # A fork may run in another cwd than the session it copies: the
+            # CLI finds that session by id and writes the fork under its own cwd.
+            resume=fork_from,
+            fork_session=fork_from is not None,
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
