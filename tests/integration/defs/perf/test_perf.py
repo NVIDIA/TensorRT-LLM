@@ -80,7 +80,6 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
-    "glm_5_fp8",
     "glm_5.3_fp8",
     "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
@@ -1429,6 +1428,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
                 server_timeout = 1800
             elif self._config.model_name == "glm_5.3_flash_fp8":
+                # Weight loading and executor warmup can exceed 10 minutes.
                 server_timeout = 3600
             else:
                 server_timeout = 600
