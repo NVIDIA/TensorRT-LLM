@@ -156,7 +156,6 @@ def _make_creator(
     creator = KvCacheCreator.__new__(KvCacheCreator)
     creator._is_disagg = False
     creator._model_engine = model_engine
-    creator._draft_model_engine = None
     creator._mapping = mapping if mapping is not None else Mapping()
     creator._kv_cache_config = kv_cache_config
     creator._max_kv_tokens_in = kv_cache_config.max_tokens

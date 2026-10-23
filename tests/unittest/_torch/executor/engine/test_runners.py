@@ -259,6 +259,7 @@ def _model_engine_with_runner(
     if runner is None:
         runner = object.__new__(DecoderRunner)
         runner.model = engine.model
+        runner._trtllm_gen_jit_warmup = False
     engine._runner = runner
     engine.enable_spec_decode = False
     engine.runtime_draft_len = 0
@@ -341,7 +342,7 @@ def test_model_engine_releases_runner_owned_graphs() -> None:
 
     engine._release_cuda_graphs()
 
-    engine._runner.release_graphs.assert_called_once_with()
+    engine._runner.release_graphs.assert_called_once_with(release_nccl_window_owners=True)
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
@@ -379,7 +380,7 @@ def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     assert first.kv_cache_manager is None
     assert first.max_num_requests == 4
     assert first.max_num_sequences == 4
-    assert first.num_heads_per_kv == 4
+    assert first.max_num_heads_per_kv == 4
     assert first.block_ids_per_seq is None
     assert first.kv_block_ids_per_seq is None
 

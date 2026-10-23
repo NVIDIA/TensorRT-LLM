@@ -58,6 +58,14 @@ from .routing import BaseMoeRoutingMethod
 # Kill switch for CuteDslFusedMoE.quantize_input_async (fork the NVFP4 input
 # quantization onto the MoE aux stream so it overlaps top-k + moe_sort).
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
+# Largest token count quantized on the aux stream. The overlap only pays off
+# for latency-bound decode batches (the in-tree Kimi K3 decode configs run at
+# most 896 tokens per step). On a prefill batch the quantization is a
+# bandwidth-bound kernel that gains nothing from the overlap, while the
+# cross-stream record_stream of its GB-sized input and output keeps the caching
+# allocator from reusing those blocks, which forces synchronizing cudaFree
+# calls.
+ASYNC_INPUT_QUANT_MAX_TOKENS = 1024
 
 # These runners are defined inside cute_dsl_custom_ops' ``if
 # IS_CUTLASS_DSL_AVAILABLE:`` block, which has no else-branch, so importing them
@@ -708,8 +716,8 @@ class CuteDslFusedMoE(MoEImplBase):
 
     # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
     # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
-    #   cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
-    #   cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
+    #   moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+    #   moe/kernels/rubin/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
     # SiTU is enabled here only for the Blackwell path. The Rubin kernels
     # also expose SiTU, but their end-to-end integration is outside this
     # enablement; ``can_implement`` keeps that path gated by SM.
@@ -1086,12 +1094,14 @@ class CuteDslFusedMoE(MoEImplBase):
         before routing; the consumer joins via the returned event right before
         the first kernel that reads ``x``/``x_sf`` (``run_moe_nvfp4_impl``,
         after ``moe_sort``). Falls back to the synchronous ``quantize_input``
-        (event ``None``) when disabled, not NVFP4, already quantized, or no aux
-        stream is available. The stream running the quantization joins
+        (event ``None``) when disabled, not NVFP4, already quantized, larger
+        than ``ASYNC_INPUT_QUANT_MAX_TOKENS`` tokens, or no aux stream is
+        available. The stream running the quantization joins
         ``input_ready_event`` (``x`` written on another stream).
         """
         if (not ASYNC_INPUT_QUANT or not self.has_nvfp4
                 or isinstance(x, Fp4QuantizedTensor)
+                or x.shape[0] > ASYNC_INPUT_QUANT_MAX_TOKENS
                 or not self._has_moe_output_memset_aux_stream()):
             if input_ready_event is not None:
                 input_ready_event.wait()

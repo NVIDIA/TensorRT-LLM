@@ -20,6 +20,8 @@ stub model and real ``LlmRequest`` objects. End-to-end perf validation is
 out of scope here; this just verifies the plumbing.
 """
 
+import contextlib
+
 import pytest
 import torch
 
@@ -352,6 +354,51 @@ def test_cross_iter_prefetch_materializes_on_side_stream(monkeypatch):
     assert embedding.shape == (4, 8)
     assert isinstance(req.py_mm_encoder_event, torch.cuda.Event)
     req.py_mm_encoder_event.synchronize()
+
+
+@requires_cuda
+def test_cross_iter_prefetch_scopes_encoder_and_stores_clone(monkeypatch):
+    """Prefetch runs outside `ModelCaller`, so it owns the NCCL-window tensor scope.
+
+    Window leases end with that scope while the stored embedding is read next iteration, so the
+    request must hold a clone rather than a view of the encoder output.
+    """
+    active = []
+    anchored_on_cuda = []
+
+    @contextlib.contextmanager
+    def discard(inputs):
+        anchored_on_cuda.append(
+            [param.multimodal_data["image"]["pixel_values"].is_cuda for param in inputs]
+        )
+        active.append(True)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    monkeypatch.setattr(mm_mixin, "discard_nccl_window_tensor_outputs", discard)
+    model = _StubModel(hidden_size=8, tokens_per_image=4)
+    stub_encode = model.encode_multimodal_inputs
+    encoder_outputs = []
+
+    def encode(multimodal_params, **kwargs):
+        assert active, "prefetch encoder must run inside an NCCL-window tensor scope"
+        output = stub_encode(multimodal_params, **kwargs)
+        encoder_outputs.append(output)
+        return output
+
+    model.encode_multimodal_inputs = encode
+    req = _make_request(request_id=0, num_tokens=4)
+
+    assert maybe_prefetch_mm_encoder_for_next_iter(model, [req], max_prefetch_ahead=1) == 1
+    req.py_mm_encoder_event.synchronize()
+
+    assert anchored_on_cuda == [[True]]
+    (encoder_output,) = encoder_outputs
+    embedding = req.py_multimodal_data["multimodal_embedding"]
+    assert embedding.untyped_storage().data_ptr() != encoder_output.untyped_storage().data_ptr()
+    torch.testing.assert_close(embedding, encoder_output)
 
 
 @requires_cuda
