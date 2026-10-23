@@ -1350,6 +1350,141 @@ class MLA(nn.Module):
 
         return attn_output
 
+    def forward_context_with_chunked_prefill_fp4(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run dense FP4 MLA chunked prefill through FP8 context partitions.
+
+        The current chunk is appended to the FP4 cache first. Each cached
+        prefix partition is then gathered from the FP4 cache, expanded, and
+        attended with a full mask; the current chunk is attended causally
+        last, and the partial outputs are merged with their softmax stats.
+        """
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        if latent_cache is None:
+            raise RuntimeError("FP4 MLA chunked prefill requires latent_cache.")
+
+        # Match the FP8 KV path: fuse Q/K RoPE with the cache append, then
+        # consume the rotated current K directly from latent_cache.
+        trtllm_attention.append_fp4_mla_context_cache(q, latent_cache, attn_metadata)
+        current_k_pe = latent_cache.reshape(
+            -1,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )[:, self.kv_lora_rank :]
+
+        self.softmax_stats_tensor = torch.empty(
+            (attn_metadata.num_ctx_tokens, self.num_context_heads, 2),
+            dtype=torch.float,
+            device=q.device,
+        )
+        self.temp_softmax_stats_tensor = torch.empty_like(self.softmax_stats_tensor)
+        attn_output = output
+        temp_attn_output = q.new_empty(
+            (q.size(0), self.num_context_heads * self.v_head_dim),
+        )
+
+        def expand_kv(
+            partition_compressed_kv: torch.Tensor,
+            partition_k_pe: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            partition_kv = self._project_context_kv(partition_compressed_kv)
+            partition_k_nope, partition_v = partition_kv.split(
+                [
+                    self.num_context_heads * self.qk_nope_head_dim,
+                    self.num_context_heads * self.v_head_dim,
+                ],
+                -1,
+            )
+            partition_k_nope = partition_k_nope.view(
+                -1,
+                self.num_context_heads,
+                self.qk_nope_head_dim,
+            )
+            partition_k_pe = partition_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            partition_k = maybe_compiled_cat(
+                (
+                    partition_k_nope,
+                    partition_k_pe.expand(-1, self.num_context_heads, -1),
+                ),
+                dim=-1,
+            )
+            return (
+                partition_k.view(-1, self.num_context_heads * self.qk_head_dim),
+                partition_v,
+            )
+
+        def partition_forward_args(attention_mask) -> AttentionForwardArgs:
+            return AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=self.out_scale,
+                attention_mask=attention_mask,
+                softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                chunked_prefill_buffer_batch_size=(
+                    attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
+                ),
+                output=temp_attn_output,
+            )
+
+        for loop_idx in range(attn_metadata.chunked_loop_num):
+            total_chunked_tokens = int(
+                attn_metadata.host_cu_chunked_seq_len[
+                    loop_idx,
+                    attn_metadata.num_contexts,
+                ]
+            )
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                num_ctx_cached_tokens=total_chunked_tokens,
+                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
+                chunked_max_seq_len=int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
+                out_dtype=q.dtype,
+            )
+            chunked_k, chunked_v = expand_kv(chunked_compressed_kv, chunked_k_pe)
+            temp_attn_output = trtllm_attention.forward_fp4_mla_context_partition(
+                q,
+                chunked_k,
+                chunked_v,
+                attn_metadata,
+                partition_forward_args(PredefinedAttentionMask.FULL),
+                kv_lens_cuda=attn_metadata.chunked_seq_len[loop_idx],
+                kv_lens_cpu=attn_metadata.host_chunked_seq_len[loop_idx],
+            )
+            trtllm_attention.merge_attention_for_mla(
+                attn_output,
+                temp_attn_output,
+                self.softmax_stats_tensor,
+                self.temp_softmax_stats_tensor,
+                attn_metadata.merge_op_tensor[loop_idx],
+                attn_metadata,
+            )
+
+        current_k, current_v = expand_kv(compressed_kv, current_k_pe)
+        temp_attn_output = trtllm_attention.forward_fp4_mla_context_partition(
+            q,
+            current_k,
+            current_v,
+            attn_metadata,
+            partition_forward_args(PredefinedAttentionMask.CAUSAL),
+            kv_lens_cuda=attn_metadata.prompt_lens_cuda_runtime,
+            kv_lens_cpu=attn_metadata.prompt_lens_cpu_runtime,
+        )
+        trtllm_attention.merge_attention_for_mla(
+            attn_output,
+            temp_attn_output,
+            self.softmax_stats_tensor,
+            self.temp_softmax_stats_tensor,
+            attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
+            attn_metadata,
+        )
+        return attn_output
+
     def forward_context_with_chunked_prefill(
         self,
         q: torch.Tensor,
@@ -1623,6 +1758,10 @@ class MLA(nn.Module):
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
             ):
+                if trtllm_attention.uses_fp4_mla_attention:
+                    return self.forward_context_with_chunked_prefill_fp4(
+                        q, compressed_kv, latent_cache, attn_metadata, output
+                    )
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output
                 )

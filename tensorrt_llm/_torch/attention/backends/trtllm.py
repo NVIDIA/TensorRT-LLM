@@ -46,9 +46,10 @@ from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, populate_helix_spec_buffers,
-                      scatter_fp4_mla_kv_cache)
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+                      populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -2700,6 +2701,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
+        if self.uses_fp4_mla_attention:
+            return load_fp4_mla_chunked_kv_cache(
+                metadata,
+                self.layer_idx,
+                num_ctx_cached_tokens=num_ctx_cached_tokens,
+                cu_chunked_seq_len=cu_chunked_seq_len,
+                chunked_global_offset=chunked_global_offset,
+                chunked_max_seq_len=chunked_max_seq_len,
+                out_dtype=out_dtype,
+                kv_lora_rank=self.mla_params.kv_lora_rank,
+                qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
+            )
+
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
                                    dtype=out_dtype,
@@ -2731,6 +2745,70 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
         )
         return output_kv, output_k_pe
+
+    def append_fp4_mla_context_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        """Apply Q/K RoPE and append one context chunk to FP4 MLA V2 storage."""
+        if not self.uses_fp4_mla_attention or self.mla_params is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires dense FP4 MLA attention.")
+        if (metadata.fp4_mla_state is None
+                or metadata.fp4_mla_state.positions is None):
+            raise RuntimeError(
+                "FP4 MLA context append requires token positions.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache[:metadata.num_ctx_tokens],
+            self.layer_idx,
+            token_offset=0,
+            phase="context",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.mla_params.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_context=q,
+            q_nope_head_dim=self.mla_params.qk_nope_head_dim,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA context scatter did not update the HP pool.")
+
+    def forward_fp4_mla_context_partition(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one explicit-KV chunked-prefill partition of dense FP4 MLA.
+
+        The partition attends through the FP8 MLA context kernel. Returns the
+        attention output of the partition.
+        """
+        for fmha in self._fmha_manager.fmha_libs:
+            if isinstance(fmha, Fp4MlaFmha):
+                output = fmha.forward_context_partition(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    kv_lens_cuda=kv_lens_cuda,
+                    kv_lens_cpu=kv_lens_cpu,
+                )
+                if isinstance(output, tuple):
+                    output = output[0]
+                return output
+        raise RuntimeError(
+            "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
 
     def mla_rope_append_paged_kv_assign_q(
         self,

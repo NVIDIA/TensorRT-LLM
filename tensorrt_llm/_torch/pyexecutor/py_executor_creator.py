@@ -72,6 +72,20 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FP4_MLA_TOKENS_PER_BLOCK = 128
+# NVFP4 MLA quantizes the latent cache in 16-token tiles.
+FP4_MLA_QUANTIZATION_TILE_SIZE = 16
+
+
+def _validate_fp4_mla_chunk_size(model_config, *, enable_chunked_prefill: bool,
+                                 max_num_tokens: int) -> None:
+    """Require tile-aligned non-final chunks for dense FP4 MLA cache writes."""
+    if (enable_chunked_prefill and uses_fp4_mla_attention(model_config)
+            and max_num_tokens % FP4_MLA_QUANTIZATION_TILE_SIZE != 0):
+        raise ValueError(
+            "Dense NVFP4 MLA chunked prefill requires max_num_tokens to be "
+            f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
+            f"{max_num_tokens}. Only the final chunk of a request may end "
+            "inside an FP4 quantization tile, which the HP pool holds.")
 
 
 class _ExecutorMemoryMonitor:
@@ -922,6 +936,11 @@ def _create_py_executor(
                            f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
+        _validate_fp4_mla_chunk_size(
+            model_engine.model.model_config,
+            enable_chunked_prefill=enable_chunked_context,
+            max_num_tokens=max_num_tokens,
+        )
 
     if (kv_cache_config.enable_block_reuse
             and model_engine.model.model_config.is_encoder_decoder

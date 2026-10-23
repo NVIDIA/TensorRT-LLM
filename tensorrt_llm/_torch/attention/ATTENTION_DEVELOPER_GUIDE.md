@@ -543,7 +543,11 @@ The FMHA package is split by role:
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
-  batch state, cache storage, and kernels live in `fp4_mla/`. Disaggregated
+  batch state, cache storage, and kernels live in `fp4_mla/`. Chunked
+  prefill (`MLA.forward_context_with_chunked_prefill_fp4`) appends the chunk
+  to the FP4 cache, gathers each cached prefix partition back from it, and
+  attends every partition through `Fp4MlaFmha.forward_context_partition`;
+  non-final chunks must cover whole 16-token FP4 tiles. Disaggregated
   serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache

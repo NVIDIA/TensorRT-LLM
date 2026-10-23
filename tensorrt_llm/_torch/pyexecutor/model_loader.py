@@ -257,10 +257,6 @@ def validate_fp4_mla_config(model_config: ModelConfig,
         raise ValueError("FP4 MLA does not support context parallelism.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
