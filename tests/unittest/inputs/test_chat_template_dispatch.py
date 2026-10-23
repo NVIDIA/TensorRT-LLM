@@ -21,6 +21,7 @@ from tensorrt_llm.inputs.utils import (
     apply_chat_template,
     async_apply_chat_template,
     interleave_mm_placeholders,
+    resolve_hf_chat_template,
 )
 from tensorrt_llm.tokenizer import TransformersTokenizer
 
@@ -556,3 +557,35 @@ class TestServingChatTemplateGather:
         assert token_ids == [1, 2, 3]
         # mm_data is the data dict, not the (mm_data, mm_embeddings) tuple.
         assert mm_data == {"image": ["data"]}
+
+
+class TestResolveHfChatTemplate:
+    def test_processor_without_a_template_falls_back_to_the_tokenizer(self):
+        """A processor with ``chat_template`` None has no template of its own.
+
+        The MiniMax-M3 VL processor loads that way; the tokenizer's template (``chat_template.jinja``) is
+        used instead of None.
+        """
+
+        class Tokenizer:
+            def get_chat_template(self, chat_template=None, tools=None):
+                return "tokenizer-template"
+
+        class Processor:
+            chat_template = None
+
+        assert (
+            resolve_hf_chat_template(Tokenizer(), Processor(), None, None) == "tokenizer-template"
+        )
+
+    def test_processor_template_wins_without_tools(self):
+        class Tokenizer:
+            def get_chat_template(self, chat_template=None, tools=None):
+                raise AssertionError("the processor's template should be used")
+
+        class Processor:
+            chat_template = "processor-template"
+
+        assert (
+            resolve_hf_chat_template(Tokenizer(), Processor(), None, None) == "processor-template"
+        )

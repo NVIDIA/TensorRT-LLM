@@ -42,3 +42,35 @@ def test_hf_decode_incrementally_recovers_from_invalid_prefix() -> None:
         text, states = tokenizer.hf_decode_incrementally([token_id], text, states)
 
     assert text == "\N{NO-BREAK SPACE}»"
+
+
+def _byte_fallback_tokenizer() -> TransformersTokenizer:
+    """A tokenizer with one added special token, wrapped the way the LLM API wraps it."""
+    backend = Tokenizer(
+        WordLevel(
+            {
+                "<0xC2>": 0,
+                "<0xA0>": 1,
+                "»": 2,
+                "<unk>": 3,
+                "</s>": 4,
+            },
+            unk_token="<unk>",
+        )
+    )
+    backend.decoder = Sequence([ByteFallback(), Fuse()])
+    backend.add_special_tokens(["</s>"])
+    return TransformersTokenizer(PreTrainedTokenizerFast(tokenizer_object=backend))
+
+
+def test_num_special_tokens_to_add_delegates_to_the_wrapped_tokenizer() -> None:
+    """The wrapper answers from the tokenizer it wraps.
+
+    ``PreTrainedTokenizerBase.num_special_tokens_to_add`` raises NotImplementedError; the MiniMax-M3 input
+    processor's tokenization-cache check calls it on the wrapper.
+    """
+    tokenizer = _byte_fallback_tokenizer()
+    assert tokenizer.num_special_tokens_to_add() == tokenizer.tokenizer.num_special_tokens_to_add()
+    assert tokenizer.num_special_tokens_to_add(
+        pair=True
+    ) == tokenizer.tokenizer.num_special_tokens_to_add(True)
