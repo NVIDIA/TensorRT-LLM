@@ -136,8 +136,9 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   # modeling_v2 unit tests, one entry per catalog op test and one per model
-  # family, so CBTS can select the ones a change reaches. The whole-tree
-  # tests that need no GPU are in l0_cpu; the comm tests in l0_gb300_multi_gpus.
+  # family that has unit tests, so CBTS can select the ones a change reaches.
+  # The whole-tree tests that need no GPU are in l0_cpu; the comm tests in
+  # l0_gb300_multi_gpus.
   - unittest/_torch/modeling_v2/activation/test_modeling_v2_flashinfer_silu_and_mul.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
@@ -155,7 +156,6 @@ l0_b300:
   - unittest/_torch/modeling_v2/quantization/test_modeling_v2_fp4_quantize.py
   - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py
   - unittest/_torch/modeling_v2/models/deepseek_v3
-  - unittest/_torch/modeling_v2/models/gpt_oss
   - unittest/_torch/modeling_v2/models/qwen4_exp
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_weight_table.py
   - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py

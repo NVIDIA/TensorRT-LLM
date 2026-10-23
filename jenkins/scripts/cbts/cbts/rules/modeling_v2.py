@@ -114,9 +114,10 @@ _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
     "test_modeling_v2_",
 )
 
-# A family's `routing.py` imports each target it routes to by this line; the
-# claims test reads the same line.
-_TARGET_IMPORT = re.compile(r"^\s*from \.([\w.]+)\.modeling import (\w+)$", re.MULTILINE)
+# A family's `routing.py` imports each target it routes to by this line, from
+# the target directory directly under the family. The claims test reads the
+# same line with the same pattern.
+_TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULTILINE)
 
 
 def _is_mv2_claim(path: str) -> bool:
@@ -193,8 +194,8 @@ class ModelingV2Rule(Rule):
         if not routing.is_file():
             return None
         gates = set()
-        for dotted, target_cls in _TARGET_IMPORT.findall(routing.read_text(encoding="utf-8")):
-            leaf = Path(family, *dotted.split("."))
+        for target, target_cls in _TARGET_IMPORT.findall(routing.read_text(encoding="utf-8")):
+            leaf = Path(family, target)
             if leaf == node or node in leaf.parents:
                 gates.add(f"{_ACCURACY_ROOT}/test_{family}.py::Test{target_cls}")
         return gates

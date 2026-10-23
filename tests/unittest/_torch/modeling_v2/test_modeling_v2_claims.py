@@ -248,7 +248,8 @@ def test_every_unit_test_is_in_a_test_list():
     """The modeling_v2 unit tests are listed per file or per family directory.
 
     Lists that name files do not pick up a new file by themselves, and a test
-    no list reaches never runs in CI.
+    no list reaches never runs in CI. The other way round, an entry naming a
+    path with no test at it fails its CI stage: pytest finds nothing to run.
     """
     listed = set()
     for path in (_TESTS_ROOT / "integration/test_lists/test-db").glob("l0_*.yml"):
@@ -265,6 +266,16 @@ def test_every_unit_test_is_in_a_test_list():
         if not candidates & listed:
             unlisted.append(rel.as_posix())
     assert not unlisted, f"unit tests no test-db list reaches: {unlisted}"
+
+    # A directory left behind with only `__pycache__` in it exists on disk but
+    # holds no test, so require a test file at or under each entry.
+    empty = sorted(
+        entry
+        for entry in listed
+        if entry.startswith("unittest/_torch/modeling_v2/")
+        and not ((_TESTS_ROOT / entry).is_file() or any((_TESTS_ROOT / entry).rglob("test_*.py")))
+    )
+    assert not empty, f"test-db entries with no modeling_v2 unit test at them: {empty}"
 
 
 # The phase a step runs at is resolved once, at the dispatcher, and a target is

@@ -28,7 +28,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             spec=dict(
                 tokens=64,
                 **{
-                    **FusedQkNormRope._GPT_OSS,
+                    **FusedQkNormRope.GPT_OSS,
                     "num_heads_q": 8,
                     "num_heads_k": 1,
                     "num_heads_v": 1,
@@ -94,7 +94,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 routed_by_kernel=True,
                 local_expert_offset=0,
                 local_num_experts=128,
-                **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
             ),
         ),
         Cell(
@@ -104,7 +104,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 routed_by_kernel=True,
                 local_expert_offset=64,
                 local_num_experts=32,
-                **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
             ),
         ),
         Cell(
@@ -114,7 +114,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 routed_by_kernel=True,
                 local_expert_offset=112,
                 local_num_experts=16,
-                **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
             ),
         ),
         Cell(
@@ -125,7 +125,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 local_expert_offset=0,
                 local_num_experts=128,
                 **{
-                    **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
                     "intermediate": 1440,
                     "intermediate_pad": 1536,
                 },
@@ -139,7 +139,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 local_expert_offset=0,
                 local_num_experts=128,
                 **{
-                    **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
                     "intermediate": 768,
                     "intermediate_pad": 768,
                 },
@@ -153,7 +153,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 local_expert_offset=0,
                 local_num_experts=128,
                 **{
-                    **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
                     "intermediate": 576,
                     "intermediate_pad": 768,
                 },
@@ -167,7 +167,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 local_expert_offset=0,
                 local_num_experts=128,
                 **{
-                    **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
                     "intermediate": 384,
                     "intermediate_pad": 384,
                 },
@@ -181,7 +181,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 local_expert_offset=0,
                 local_num_experts=128,
                 **{
-                    **Mxe4m3Mxe2m1BlockScaleMoeRunner._GPT_OSS,
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
                     "intermediate": 192,
                     "intermediate_pad": 384,
                 },

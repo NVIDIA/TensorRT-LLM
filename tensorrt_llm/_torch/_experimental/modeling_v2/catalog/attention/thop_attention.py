@@ -35,7 +35,7 @@ QM_NVFP4_KV_CACHE = 8192
 #: the paged-context path on (the target serves with block reuse and chunked
 #: prefill). Pool sizes are chosen, not dumped: 128 pages of 32 tokens and 4
 #: block-offset rows, larger than any cell's batch.
-_QWEN4_DENSE = dict(
+QWEN4_DENSE = dict(
     input_type=STANDARD,
     num_heads=24,
     num_kv_heads=2,
@@ -54,7 +54,7 @@ _QWEN4_DENSE = dict(
 #: qwen4_exp's vision tower: the no-KV-cache mode, one context sequence per
 #: frame, MHA 16/16 at head_size 72 (hidden 1152 over 16 heads), padding mask.
 #: `max_num_requests` is the segment count, as the target passes it.
-_QWEN4_VISION = dict(
+QWEN4_VISION = dict(
     input_type=STANDARD,
     kv_cache="none",
     num_heads=16,
@@ -68,7 +68,7 @@ _QWEN4_VISION = dict(
 )
 
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
-#: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
+#: the production kv scale 1.0. Same chosen pool sizes as `QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
     input_type=STANDARD,
     num_heads=24,
@@ -115,7 +115,7 @@ class ThopAttention(OpWrapper):
             why="48-layer single pool, identity mapping: row 47 = layer-in-pool 47, "
             "24 rows over a 40-token cached prefix",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 pool_layout="identity48",
                 local_layer_idx=47,
                 cached=(40,),
@@ -126,39 +126,39 @@ class ThopAttention(OpWrapper):
         ),
         Cell(
             why="encoder-only, d72 causal: measured, not what the tower passes",
-            spec=dict(_QWEN4_VISION, mask_type=1, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, mask_type=1, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="encoder-only, d128 padding: the tower's other admitted width",
-            spec=dict(_QWEN4_VISION, head_size=128, v_head_dim=128, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, head_size=128, v_head_dim=128, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="encoder-only, d128 causal",
             spec=dict(
-                _QWEN4_VISION, head_size=128, v_head_dim=128, mask_type=1, seg_lens=(27, 9, 41)
+                QWEN4_VISION, head_size=128, v_head_dim=128, mask_type=1, seg_lens=(27, 9, 41)
             ),
         ),
         Cell(
             why="encoder-only, a single one-token frame",
-            spec=dict(_QWEN4_VISION, seg_lens=(1,)),
+            spec=dict(QWEN4_VISION, seg_lens=(1,)),
         ),
         # A vision-tower call is one frame per frame group, at most 32768 rows per call.
         Cell(
             why="video: 384 frame groups of 64 rows (8x8 patches), the untiled "
             "kernel's longest frame",
-            spec=dict(_QWEN4_VISION, seg_lens=(64,) * 384),
+            spec=dict(QWEN4_VISION, seg_lens=(64,) * 384),
         ),
         Cell(
             why="video: 256 frame groups of 128 rows, the 32768-row ceiling",
-            spec=dict(_QWEN4_VISION, seg_lens=(128,) * 256),
+            spec=dict(QWEN4_VISION, seg_lens=(128,) * 256),
         ),
         Cell(
             why="video: 2 frame groups of 16384 rows (128x128), the longest frame at the ceiling",
-            spec=dict(_QWEN4_VISION, seg_lens=(16384, 16384)),
+            spec=dict(QWEN4_VISION, seg_lens=(16384, 16384)),
         ),
         Cell(
             why="video: 8192 frame groups of 2x2 patches, the most a 32768-row call can carry",
-            spec=dict(_QWEN4_VISION, seg_lens=(4,) * 8192),
+            spec=dict(QWEN4_VISION, seg_lens=(4,) * 8192),
         ),
         Cell(
             why="fp8 pool packed prefill, GQA 24q/4kv d256: the FMHA reads the "

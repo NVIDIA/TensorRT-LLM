@@ -15,10 +15,10 @@ import torch
 from ....catalog._op import Cell, OpWrapper
 from ....catalog.attention.fused_qk_norm_rope import FusedQkNormRope
 from ....catalog.attention.thop_attention import (
-    _QWEN4_DENSE,
-    _QWEN4_VISION,
     QM_FP8_KV_CACHE,
     QM_NVFP4_KV_CACHE,
+    QWEN4_DENSE,
+    QWEN4_VISION,
     ThopAttention,
 )
 from ....catalog.moe.fp4_block_scale_moe_runner import Fp4BlockScaleMoeRunner
@@ -67,19 +67,19 @@ _QWEN4_EXP = dict(
 #: The qwen4_exp full-attention call over an fp8-e4m3 pool at the production kv
 #: scale 1.0 (fp32 [1] scale tensors, quant_mode 128): what the trunk layers and
 #: the MTP draft layer pass when the engine serves an fp8 KV cache. Same chosen
-#: pool sizes as `_QWEN4_DENSE`.
-_QWEN4_FP8 = dict(_QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
+#: pool sizes as `QWEN4_DENSE`.
+_QWEN4_FP8 = dict(QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
 
 #: The same call over an NVFP4 pool: e2m1 data and a second pool of e4m3 block
 #: scales, fp32 [3] unit kv scales, `[1, 2, 2]` pool pointers, bf16 output --
 #: what the trunk layers and the MTP draft layer pass when the engine serves an
-#: NVFP4 KV cache. Same chosen pool sizes as `_QWEN4_DENSE`.
-_QWEN4_NVFP4 = dict(_QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
+#: NVFP4 KV cache. Same chosen pool sizes as `QWEN4_DENSE`.
+_QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
 
-#: `_QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
+#: `QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
 #: ceiling: one block-offset row per request and pages for 32 histories (the largest cell
 #: needs 133 of the 144).
-_QWEN4_DENSE_G32 = dict(_QWEN4_DENSE, max_num_requests=32, num_blocks=144)
+_QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
 _QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
 
 
@@ -175,7 +175,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
             "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(0, 48),
                 new=(70, 33),
                 num_contexts=2,
@@ -186,7 +186,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp decode P=1: one row per generation sequence over "
             "page-crossing histories (70, 35)",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(70, 35),
                 new=(1, 1),
                 num_contexts=0,
@@ -197,7 +197,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp MTP verify P=2 (max_draft_len 1): draft row t attends "
             "[0, L-P+t], bottom-right causal within the block",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(70, 35),
                 new=(2, 2),
                 num_contexts=0,
@@ -208,7 +208,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp MTP verify P=3 (max_draft_len 2): a separate decode "
             "compile, P reaches the kernel as maxSeqLenQ",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(70, 35),
                 new=(3, 3),
                 num_contexts=0,
@@ -218,7 +218,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
         Cell(
             why="qwen4_exp MTP verify P=4 (max_draft_len 3)",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(70, 35),
                 new=(4, 4),
                 num_contexts=0,
@@ -230,7 +230,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
                 why=f"qwen4_exp MTP verify P={p} (max_draft_len {p - 1})"
                 + (": the target's ceiling" if p == 8 else ""),
                 spec=dict(
-                    _QWEN4_DENSE,
+                    QWEN4_DENSE,
                     cached=(70, 35),
                     new=(p, p),
                     num_contexts=0,
@@ -242,7 +242,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
         Cell(
             why="qwen4_exp P=8 G=1: one draft block from row 95, across the page edge at 96",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(95,),
                 new=(8,),
                 num_contexts=0,
@@ -284,7 +284,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp mixed step: a fresh 20-row context ahead of two P=2 "
             "draft blocks, generation rows token-major after the context rows",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(0, 70, 35),
                 new=(20, 2, 2),
                 num_contexts=1,
@@ -295,7 +295,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp mixed step P=8: a fresh 20-row context ahead of two P=8 "
             "draft blocks over histories 70 and 35",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 cached=(0, 70, 35),
                 new=(20, 8, 8),
                 num_contexts=1,
@@ -306,7 +306,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp hybrid pool: row 47 of the 48-row two-pool mapping "
             "(pool 0, layer-in-pool 11), P=2 verify",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 pool_layout="hybrid48",
                 local_layer_idx=47,
                 cached=(64, 25),
@@ -319,7 +319,7 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
             why="qwen4_exp P=8 hybrid pool: row 47 of the 48-row two-pool mapping "
             "(pool 0, layer-in-pool 11), P=8 verify",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 pool_layout="hybrid48",
                 local_layer_idx=47,
                 cached=(64, 25),
@@ -331,32 +331,32 @@ CELLS: dict[type[OpWrapper], tuple[Cell, ...]] = {
         Cell(
             why="qwen4_exp vision tower: no KV cache, MHA 16/16 d72, padding mask, "
             "frames of 27/9/41 rows each attending only to itself",
-            spec=dict(_QWEN4_VISION, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="mmmu serving shape: one 5580-row frame, the 62x90 patch grid",
-            spec=dict(_QWEN4_VISION, seg_lens=(5580,)),
+            spec=dict(QWEN4_VISION, seg_lens=(5580,)),
         ),
         Cell(
             why="mmmu serving shape: one 8160-row frame, the largest single-segment call",
-            spec=dict(_QWEN4_VISION, seg_lens=(8160,)),
+            spec=dict(QWEN4_VISION, seg_lens=(8160,)),
         ),
         Cell(
             why="mmmu serving shape: 2204 rows in four frames",
-            spec=dict(_QWEN4_VISION, seg_lens=(728, 728, 460, 288)),
+            spec=dict(QWEN4_VISION, seg_lens=(728, 728, 460, 288)),
         ),
         Cell(
             why="mmmu serving shape: 1892 rows in five frames, the most segments per call",
-            spec=dict(_QWEN4_VISION, seg_lens=(480, 480, 400, 352, 180)),
+            spec=dict(QWEN4_VISION, seg_lens=(480, 480, 400, 352, 180)),
         ),
         Cell(
             why="mmmu serving shape: 9008 rows in two frames",
-            spec=dict(_QWEN4_VISION, seg_lens=(8000, 1008)),
+            spec=dict(QWEN4_VISION, seg_lens=(8000, 1008)),
         ),
         Cell(
             why="mmmu serving shape: 22144 rows in two frames, the largest call; its "
             "12544-row frame is the longest segment",
-            spec=dict(_QWEN4_VISION, seg_lens=(12544, 9600)),
+            spec=dict(QWEN4_VISION, seg_lens=(12544, 9600)),
         ),
         # qwen4_exp's own geometry over an fp8 pool: the kv head count changes the compiled
         # decode kernel, so the 24/4/256 cells above do not cover it.

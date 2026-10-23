@@ -173,7 +173,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     # (moe_tp), which is what its cells.py covers. `intermediate` is
     # the slice's real width and `intermediate_pad` the width every rank
     # declares (see the default target's weights.py).
-    _GPT_OSS = dict(hidden=2880, intermediate=2880, num_experts=128, top_k=4)
+    GPT_OSS = dict(hidden=2880, intermediate=2880, num_experts=128, top_k=4)
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -183,7 +183,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 routed_by_kernel=True,
                 local_expert_offset=0,
                 local_num_experts=128,
-                **_GPT_OSS,
+                **GPT_OSS,
             ),
         ),
         Cell(
@@ -193,7 +193,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 routed_by_kernel=False,
                 local_expert_offset=32,
                 local_num_experts=32,
-                **_GPT_OSS,
+                **GPT_OSS,
             ),
         ),
     )
