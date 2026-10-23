@@ -214,6 +214,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
                 rank_info_auth_key=cache_transceiver_config._rank_info_auth_key,
+                rank_info_error_sync=self._sync_rank_info_error,
             )
         )
         if enforce_physical_ownership:
@@ -538,6 +539,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             ready_ids = _find_consensus_request_ids(pp_all_ranks, self._mapping.pp_size)
 
         return ready_ids
+
+    def _sync_rank_info_error(self, error: Optional[str]) -> Optional[str]:
+        """Agree on peer admission before any generation rank publishes a receive."""
+        errors = self._gen_allgather(error) if self._gen_need_sync else [error]
+        return next((message for message in errors if message is not None), None)
 
     def _gen_consensus(self, local_ids: list) -> list:
         sync_size = (

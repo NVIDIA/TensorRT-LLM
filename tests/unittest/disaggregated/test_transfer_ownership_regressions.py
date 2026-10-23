@@ -874,6 +874,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
             instance_rank=0,
         ),
     )
+    receiver._rank_info_error_sync = None
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={rank: f"tcp://sender-{rank}" for rank in range(4)},
@@ -1033,6 +1034,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         self_extractor=SimpleNamespace(page_table=_paged_receive_table()),
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
     )
+    receiver._rank_info_error_sync = None
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0", 1: "tcp://sender-1"},
@@ -1213,6 +1215,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
         self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(cp_size=1),
     )
+    receiver._rank_info_error_sync = None
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0"},

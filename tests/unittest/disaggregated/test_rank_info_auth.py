@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -18,6 +21,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     _rank_info_auth_tag,
     _validate_rank_info_auth_key,
 )
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -140,6 +144,7 @@ def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key)
 def test_authentication_failure_fails_only_affected_task(ownership):
     receiver = Receiver.__new__(Receiver)
     receiver._build_recv_req_info = Mock()
+    receiver._rank_info_error_sync = None
     receiver._get_sender_info = Mock(side_effect=RankInfoAuthenticationError("wrong key"))
     receiver._enforce_physical_ownership = ownership
     session = Mock()
@@ -284,3 +289,84 @@ def test_receiver_rejects_mismatched_authentication_modes(key, reply):
         decode.assert_not_called()
     messenger.send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
     messenger.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("rejected_rank", [None, 0, 1])
+@pytest.mark.parametrize("ownership", [False, True])
+def test_rank_info_admission_is_collective_before_request_data(rejected_rank, ownership):
+    # Two generation ranks overlap one context rank. A partial fan-in must
+    # never be published when only one RankInfo request is rejected.
+    barrier = threading.Barrier(2, timeout=5)
+    errors = [None, None]
+    arrived = [False, False]
+    receivers, tasks = [], []
+
+    def gather(rank, error):
+        errors[rank] = error
+        arrived[rank] = True
+        barrier.wait()
+        return list(errors)
+
+    for rank in range(2):
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._gen_need_sync = True
+        transceiver._gen_allgather = lambda error, rank=rank: gather(rank, error)
+        receiver = object.__new__(Receiver)
+        receiver._shutdown = True
+        receiver._enforce_physical_ownership = ownership
+        receiver._rank_info_error_sync = transceiver._sync_rank_info_error
+        receiver._build_recv_req_info = Mock(
+            return_value=SimpleNamespace(unique_rid=1, slice_id=0, to_bytes=lambda: b"request")
+        )
+        receiver._get_sender_info = Mock(
+            return_value=SimpleNamespace(
+                sender_endpoints={0: "tcp://context"}, cp_size=1, dp_size=1
+            )
+        )
+        if rank == rejected_rank:
+            receiver._get_sender_info.side_effect = RankInfoAuthenticationError("cache full")
+        receiver._registrar = SimpleNamespace(
+            self_rank_info=SimpleNamespace(cp_size=1),
+            get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0])),
+        )
+        receiver._get_mamba_slot = Mock(return_value=None)
+        receiver._bounce = Mock(reserve=Mock(return_value=False))
+        session = Mock()
+        session._sender_endpoints = set()
+        session.try_begin_transfer.side_effect = lambda *args, **kwargs: (
+            kwargs["publish"]() or True
+        )
+        receiver._get_session = Mock(return_value=session)
+        receiver._acquire_ownership_admission = lambda: lambda: None
+
+        def publish(_endpoint, _payload):
+            assert all(arrived), "REQUEST_DATA escaped before every rank checked RankInfo"
+            assert not any(errors)
+
+        receiver._request_sender_data = Mock(side_effect=publish)
+        task = Mock(
+            _unique_rid=1, slice_id=0, _perf_timer=None, _params=SimpleNamespace(ctx_dp_rank=0)
+        )
+        receivers.append(receiver)
+        tasks.append(task)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(receiver.dispatch_task, task) for receiver, task in zip(receivers, tasks)
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    for receiver, task in zip(receivers, tasks):
+        if rejected_rank is None:
+            task.fail.assert_not_called()
+            receiver._request_sender_data.assert_called_once_with("tcp://context", b"request")
+        else:
+            task.fail.assert_called_once()
+            assert isinstance(task.fail.call_args.args[0], RankInfoAuthenticationError)
+            receiver._request_sender_data.assert_not_called()
+            receiver._bounce.reserve.assert_not_called()
+            if ownership:
+                receiver._get_session.return_value.cancel_unpublished_task.assert_called_once_with(
+                    task
+                )

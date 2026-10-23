@@ -476,11 +476,12 @@ def test_rank_info_key_is_carried_by_transceiver_config():
 
 @pytest.mark.parametrize("protocol", ["openengine", "smg"])
 @pytest.mark.parametrize("key", [None, "deployment-key"])
-def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key):
+@pytest.mark.parametrize("with_transceiver", [False, True])
+def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key, with_transceiver):
     config = tmp_path / "worker.yaml"
     config.write_text(
         (f"internal_request_auth_key: {key}\n" if key is not None else "")
-        + "cache_transceiver_config:\n  backend: NIXL\n"
+        + ("cache_transceiver_config:\n  backend: NIXL\n" if with_transceiver else "")
     )
     launch = mock.Mock()
     module = SimpleNamespace(launch_server=launch, launch_smg_server=launch)
@@ -496,8 +497,10 @@ def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key)
 
     launch.assert_called_once()
     llm_args = launch.call_args.args[2]
-    transceiver = llm_args["cache_transceiver_config"]
-    if key is None:
+    transceiver = llm_args.get("cache_transceiver_config")
+    if not with_transceiver:
+        assert transceiver is None
+    elif key is None:
         assert transceiver == {"backend": "NIXL"}
     else:
         assert transceiver.backend == "NIXL"

@@ -2617,6 +2617,7 @@ class Receiver(ReceiverBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         rank_info_auth_key: Optional[bytes] = None,
+        rank_info_error_sync: Optional[Callable[[Optional[str]], Optional[str]]] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
@@ -2625,6 +2626,7 @@ class Receiver(ReceiverBase):
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
         self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_error_sync = rank_info_error_sync
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -2822,23 +2824,21 @@ class Receiver(ReceiverBase):
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
+        peer_error = None
         try:
             peer_infos: RankInfo = self._get_sender_info(params)
         except (PeerIncompatibleError, RankInfoAuthenticationError) as e:
-            # Fail only this request via the normal transfer-error path
-            # (task ERROR -> session ERROR -> WaitResult.FAILED ->
-            # DISAGG_TRANS_ERROR), so one incompatible context peer does not
-            # take down the whole generation worker. The async path's
-            # cross-rank consensus unions failed rids, so the request fails
-            # globally once any rank fails here — ranks whose page table has
-            # no recurrent layers (e.g. a hybrid-model PP stage) pass
-            # validation and may still run a transfer that is then
-            # discarded. The task is already in the session's _kv_tasks, no
-            # bounce reservation exists yet, and session._sender_endpoints
-            # is still empty, so the unpublished owner can close locally.
+            peer_error = e
+        if self._rank_info_error_sync is not None:
+            error = self._rank_info_error_sync(str(peer_error) if peer_error is not None else None)
+            if error is not None:
+                peer_error = RankInfoAuthenticationError(error)
+        if peer_error is not None:
+            # Every participating rank rejects before REQUEST_DATA can publish
+            # a destination. No sibling can be left waiting for a partial fan-in.
             logger.error(
                 "dispatch_task: context peer rejected, failing request "
-                f"unique_rid={task._unique_rid}: {e}"
+                f"unique_rid={task._unique_rid}: {peer_error}"
             )
             if self._enforce_physical_ownership:
                 session = self._get_session(task._unique_rid)
@@ -2846,7 +2846,7 @@ class Receiver(ReceiverBase):
                     task.cancel_unpublished()
                 else:
                     session.cancel_unpublished_task(task)
-            task.fail(e)
+            task.fail(peer_error)
             return
 
         if sender_dp_rank is not None:
@@ -4195,6 +4195,7 @@ class TransferWorkerConfig:
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
     rank_info_auth_key: Optional[bytes] = None
+    rank_info_error_sync: Optional[Callable[[Optional[str]], Optional[str]]] = None
 
 
 class TransferWorker:
@@ -4312,6 +4313,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 rank_info_auth_key=self._rank_info_auth_key,
+                rank_info_error_sync=self._config.rank_info_error_sync,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint

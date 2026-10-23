@@ -264,6 +264,13 @@ Without a key, workers warn and retain unauthenticated RankInfo exchange.
 No key is generated automatically, and configured peers never downgrade to an
 unauthenticated exchange.
 
+Upgrade communicating context and generation workers together before enabling
+native authentication. Existing deployments that already set
+`internal_request_auth_key` for HTTP hand-off signing enable native authentication
+on upgrade as well. Set the same key on all communicating context/generation
+workers, or leave it unset on all of them; mixed configurations fail KV transfers.
+Older generation workers cannot decode the authenticated challenge.
+
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
 server config and in each context/generation worker config. The proxy signs internal
