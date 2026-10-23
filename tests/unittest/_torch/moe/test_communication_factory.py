@@ -453,7 +453,8 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     comm.max_tokens_per_rank = comm.max_recv_tokens = 1
     comm.hidden_size = 4
     comm.use_fp8 = comm.uses_internal_fp8_dispatch = False
-    comm.use_external_fp8 = comm.use_external_nvfp4 = False
+    comm._ctx = None
+    comm.set_quant_config(None)
     comm._dispatch_state = {}
     monkeypatch.setattr(comm, "_get_context", lambda: context)
     monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
@@ -704,3 +705,63 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+def test_nccl_ep_rejects_format_change_after_context_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allocated context cannot switch to a different transport format."""
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+    )
+    context = comm._ctx = object()
+    comm.set_quant_config(QuantConfig())  # An unchanged transport remains valid.
+    with pytest.raises(RuntimeError, match="after context initialization"):
+        comm.set_quant_config(QuantConfig(quant_algo=QuantAlgo.NVFP4))
+    assert comm._ctx is context
+    assert not comm.supports_post_quant_dispatch()
+
+
+@pytest.mark.parametrize(
+    ("quant_algo", "version_supported", "hidden_size", "reason"),
+    [
+        (QuantAlgo.FP8, False, 4096, "libnccl_ep >= 0.2"),
+        (QuantAlgo.NVFP4, False, 4096, "libnccl_ep >= 0.2"),
+        (QuantAlgo.NVFP4, True, 384, "hidden_size divisible by 256"),
+    ],
+)
+def test_nccl_ep_falls_back_for_unsupported_quantized_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo,
+    version_supported: bool,
+    hidden_size: int,
+    reason: str,
+) -> None:
+    """Unsupported quantized transport keeps BF16 dispatch and disables LP combine."""
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: version_supported)
+    warning = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep.logger.warning", warning
+    )
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=hidden_size,
+        use_low_precision_combine=True,
+    )
+    comm.set_quant_config(QuantConfig(quant_algo=quant_algo))
+    assert not comm.supports_post_quant_dispatch()
+    assert not comm.use_low_precision_combine
+    warning.assert_called_once()
+    assert reason in warning.call_args.args[0]
+    assert "falling back to BF16" in warning.call_args.args[0]
+
+    # Reapplying a config that resolves to the same transport preserves the context.
+    context = comm._ctx = object()
+    comm.set_quant_config(QuantConfig(quant_algo=quant_algo))
+    assert comm._ctx is context

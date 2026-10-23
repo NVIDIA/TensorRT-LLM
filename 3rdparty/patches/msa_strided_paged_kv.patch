@@ -745,3 +745,24 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
+diff --git a/python/fmha_sm100/cute/src/common/tma_utils.py b/python/fmha_sm100/cute/src/common/tma_utils.py
+index 5bdc19a..9df4699 100644
+--- a/python/fmha_sm100/cute/src/common/tma_utils.py
++++ b/python/fmha_sm100/cute/src/common/tma_utils.py
+@@ -118,9 +118,15 @@ def prefetch_tma_desc_raw(tma_desc_ptr, *, loc=None, ip=None):
+     ptr_i64 = tma_desc_ptr.toint().ir_value(loc=loc, ip=ip)
+     ptr_i64_align_ty = cute_ir.ConstrainedIntType.get(128, ptr_i64.type.width)
+     ptr_i64_align = cute_ir.assume(ptr_i64_align_ty, ptr_i64, loc=loc, ip=ip)
++    # `arch.prefetch_tma_desc` is defined to take a *generic*-addressing pointer
++    # (no specific state space). Building it in the gmem address space instead
++    # passes MLIR verification -- nothing checks the address space here -- but
++    # leaves the NVVM backend with no ISel pattern for the tensormap-prefetch
++    # intrinsic on addrspace(1), so libNVVM aborts with a bare "NVVM backend
++    # compilation failed" and no location or instruction name.
+     ptr_ty = cute_ir.PtrType.get(
+         cute_nvgpu_ir.TmaDescriptorTiledType.get(),
+-        cute_ir.AddressSpace.gmem,
++        cute_ir.AddressSpace.generic,
+         128,
+     )
+     desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)
