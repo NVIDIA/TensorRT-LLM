@@ -20,7 +20,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     _cutedsl_backend_available,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
-from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
@@ -266,11 +266,15 @@ def _load_mla_checkpoint_every_layer(
     model.load_weights(weights)
 
 
-def _k3_mla_nvfp4_kv_errors(gate: bool, fp8: bool, num_mla_layers: int = 1) -> tuple[float, float]:
+def _k3_mla_nvfp4_kv_errors(
+    gate: bool, fp8: bool, num_mla_layers: int = 1, cached_prefix: int = 0
+) -> tuple[float, float]:
     """Run K3 MLA layer 0 on an NVFP4-KV cache manager; return (context, generation) errors.
 
     With ``num_mla_layers`` > 1 the cache manager holds every MLA layer, so an
     FP8-fallback selection can put layer 0 in the FP8 pool of the FP4 MLA cache.
+    With ``cached_prefix`` > 0 the context runs as two chunks; the second one
+    attends the first from the cache through chunked-prefill partitions.
     """
     torch.manual_seed(42)
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
@@ -354,25 +358,35 @@ def _k3_mla_nvfp4_kv_errors(gate: bool, fp8: bool, num_mla_layers: int = 1) -> t
             req.prompt_len = context_length
             req.py_prompt_len = context_length
         backend = get_attention_backend("TRTLLM")
-        metadata = backend.Metadata(
-            seq_lens=torch.tensor([context_length] * batch, dtype=torch.int),
-            request_ids=list(range(batch)),
-            max_num_requests=batch,
-            num_contexts=batch,
-            prompt_lens=[context_length] * batch,
-            max_num_tokens=batch * context_length,
-            kv_cache_manager=manager,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0] * batch),
-            mapping=mapping,
-        )
-        metadata.prepare()
-        context = hidden[:, :context_length].reshape(-1, config.hidden_size).contiguous()
         extra_attrs = {
-            "attention_metadata": weakref.ref(metadata),
             "mla_layers": {runtime.mixer.layer_idx_str: weakref.ref(runtime.mixer)},
         }
-        with model_extra_attrs(extra_attrs):
-            actual = runtime(context, metadata).view(batch, context_length, -1)
+        chunk_bounds = [0, cached_prefix, context_length] if cached_prefix else [0, context_length]
+        context_outputs = []
+        for start, end in zip(chunk_bounds[:-1], chunk_bounds[1:]):
+            metadata = backend.Metadata(
+                seq_lens=torch.tensor([end - start] * batch, dtype=torch.int),
+                request_ids=list(range(batch)),
+                max_num_requests=batch,
+                num_contexts=batch,
+                prompt_lens=[context_length] * batch,
+                max_num_tokens=batch * context_length,
+                kv_cache_manager=manager,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=[start] * batch
+                ),
+                mapping=mapping,
+                enable_context_mla_with_cached_kv=bool(cached_prefix),
+                runtime_features=AttentionRuntimeFeatures(
+                    chunked_prefill=bool(cached_prefix), chunk_size=context_length
+                ),
+            )
+            metadata.prepare()
+            chunk = hidden[:, start:end].reshape(-1, config.hidden_size).contiguous()
+            extra_attrs["attention_metadata"] = weakref.ref(metadata)
+            with model_extra_attrs(extra_attrs):
+                context_outputs.append(runtime(chunk, metadata).view(batch, end - start, -1))
+        actual = torch.cat(context_outputs, dim=1)
         context_error = _relative_l2(actual, expected[:, :context_length])
 
         metadata = backend.Metadata(
@@ -458,3 +472,22 @@ def test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface(
     # (about 0.15 on this fixture), so the bound also shows the layer ran on FP8.
     assert context_error < 0.1, errors
     assert generation_error < 0.1, errors
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (10, 7)
+    or not _cutedsl_backend_available(),
+    reason="FP4 MLA requires Rubin SM107 and the CuTe DSL runtime",
+)
+def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second context chunk attends the first through FP4 chunked-prefill partitions."""
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "")
+    context_error, generation_error = _k3_mla_nvfp4_kv_errors(
+        gate=False, fp8=True, cached_prefix=64
+    )
+    errors = f"relative L2: context {context_error:.4f}, generation {generation_error:.4f}"
+    assert context_error < 0.1, errors
+    assert generation_error < 0.2, errors
