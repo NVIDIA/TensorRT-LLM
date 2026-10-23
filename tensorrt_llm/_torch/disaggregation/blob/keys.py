@@ -18,6 +18,18 @@ _PREFIX = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _SEPARATOR = "/"
 
 
+def key_stem(prefix: str) -> str:
+    """``"<prefix>/v<FORMAT_VERSION>/"``, how every key under ``prefix`` starts. A caller encoding
+    many names checks the prefix once and appends each name's hex to the stem.
+
+    Args:
+        prefix: As for ``encode_key``.
+    """
+    if not _PREFIX.fullmatch(prefix):
+        raise ValueError(f"bad key prefix {prefix!r}: expected [A-Za-z0-9_-]{{1,64}}")
+    return f"{prefix}{_SEPARATOR}v{FORMAT_VERSION}{_SEPARATOR}"
+
+
 def encode_key(prefix: str, name: bytes) -> str:
     """``"<prefix>/v<FORMAT_VERSION>/<hex of name>"``.
 
@@ -26,8 +38,7 @@ def encode_key(prefix: str, name: bytes) -> str:
             ``[A-Za-z0-9_-]{1,64}``.
         name: The lender's opaque object name; encoded whole, never parsed.
     """
-    if not _PREFIX.fullmatch(prefix):
-        raise ValueError(f"bad key prefix {prefix!r}: expected [A-Za-z0-9_-]{{1,64}}")
+    stem = key_stem(prefix)
     if not name:
         raise ValueError("an object name is non-empty")
-    return f"{prefix}{_SEPARATOR}v{FORMAT_VERSION}{_SEPARATOR}{name.hex()}"
+    return stem + name.hex()
