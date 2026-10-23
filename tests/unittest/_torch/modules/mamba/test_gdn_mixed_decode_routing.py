@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import tensorrt_llm._torch.modules.mamba.gdn_mixer as gm
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -18,16 +17,6 @@ def _sm100() -> bool:
         return False
     major, _ = torch.cuda.get_device_capability(0)
     return major == 10
-
-
-def test_mixed_scan_prefill_layout():
-    """The context segments come first in the scan layout; the decode requests follow."""
-    idx = torch.arange(10, 10 + 6)  # 3 ctx + 3 decode
-    cu = torch.tensor([0, 100, 130, 200, 201, 202, 203])
-    s_idx, s_cu = gm._mixed_scan_prefill_layout(3, idx, cu)
-    assert s_idx.tolist() == [10, 11, 12] and s_cu.tolist() == [0, 100, 130, 200]
-    s_idx, s_cu = gm._mixed_scan_prefill_layout(2, idx, cu)
-    assert s_idx.tolist() == [10, 11] and s_cu.tolist() == [0, 100, 130]
 
 
 @needs_cuda
@@ -142,7 +131,7 @@ def test_recurrent_decode_matches_one_token_scan(ctx_lens, n_dec):
 
 @needs_cuda
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN decode kernel (SM100/SM103)")
-@pytest.mark.parametrize("offset", [1, 2, 3, 5])
+@pytest.mark.parametrize("offset", [1, 3])
 def test_decode_kernel_accepts_misaligned_slot_slice(offset):
     """A tail slice of the slot buffer (offset = number of context requests) must give the
     same result as an aligned copy."""

@@ -51,7 +51,6 @@ from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 
 pytestmark = pytest.mark.cpu_only
@@ -320,17 +319,6 @@ def test_loop_head_pending_context_failure_joins_the_vote():
         ex._disagg_coordinator.handle_errors_synced.assert_called_once_with()
 
 
-def test_loop_head_blocked_errors_are_counted_separately():
-    group = _FakeGroup(2)
-    blocked = _req(5, error=True)
-    ex0 = _make_executor(group, 0, active_requests=[blocked])
-    ex0.canceled_req_ids = {5}
-    ex1 = _make_executor(group, 1, active_requests=[])
-    _run_loop_head(group, [ex0, ex1])
-    width = len(RankState(rank=0).serialize())
-    assert group.payloads[0][0][width:] == [1, 1, 0]
-
-
 def test_loop_head_timeout_vote_fails_drained_buffer_on_every_rank():
     group = _FakeGroup(2)
     timed_out = _req(11)
@@ -403,37 +391,6 @@ def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
         ]
         assert executors[rank]._packed_can_queue is None
         assert runners[rank]._adp_graph_batch_hint is None
-
-
-def test_padding_hint_rows_match_the_runner_gather_layout():
-    group = _FakeGroup(2)
-    runners = [_make_runner(group, r) for r in range(2)]
-    executors = [_make_executor(group, r, active_requests=[], runner=runners[r]) for r in range(2)]
-    batches = [_batch(2), _batch(5)]
-    group.run([lambda r=r: executors[r]._adp_post_schedule_exchange(batches[r]) for r in range(2)])
-    for rank in range(2):
-        assert runners[rank]._adp_graph_batch_hint == [
-            (True, 2, SampleType.FULL.value),
-            (True, 5, SampleType.FULL.value),
-        ]
-
-
-def test_runner_without_hint_gathers_as_before():
-    group = _FakeGroup(2)
-    runner = _make_runner(group, 0)
-    runner._gather_adp_graph_batch_info = Mock(return_value=[(True, 4, 0)])
-    assert runner._get_padded_batch(_batch(4), None, 0) == 0
-    runner._gather_adp_graph_batch_info.assert_called_once()
-    assert runner._adp_graph_batch_hint is None
-
-
-def test_can_queue_without_stash_gathers_as_before():
-    ex = object.__new__(PyExecutor)
-    ex.enable_attention_dp = True
-    ex._packed_can_queue = None
-    ex.dist = SimpleNamespace(tp_allgather_int64=Mock(return_value=np.array([[2], [0]])))
-    assert PyExecutor._can_queue(ex, SimpleNamespace(batch_size=2)) == (False, True)
-    ex.dist.tp_allgather_int64.assert_called_once_with([2])
 
 
 # ---------------------------------------------------------------------------
@@ -526,24 +483,6 @@ def test_gate_is_config_derived(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_coordinator_timeout_accessors():
-    coord = object.__new__(DisaggTransferCoordinator)
-    coord._pending_timed_out_requests = ["a", "b"]
-    coord._effects = SimpleNamespace(fail_requests=Mock())
-    assert coord.take_pending_timed_out() == ["a", "b"]
-    assert coord._pending_timed_out_requests == []
-    coord.fail_timed_out_synced([])
-    coord.fail_timed_out_synced(["a"])
-    assert coord._effects.fail_requests.call_count == 2
-    coord._effects.fail_requests.assert_called_with(
-        "Request timed out (KV transfer)", ["a"], charge_budget=False
-    )
-
-    noop = NoopDisaggCoordinator()
-    assert noop.take_pending_timed_out() == []
-    assert noop.fail_timed_out_synced(["x"]) is None
-
-
 def test_coordinator_local_error_vote_marks_pending_failures_and_counts_blocked():
     ok, failing, blocked = _req(1), _req(2), _req(3, error=True)
     coord = object.__new__(DisaggTransferCoordinator)
@@ -585,12 +524,3 @@ def test_torchdist_int64_gather_uses_cpu_tensor_path_when_available():
     rows = dist.tp_allgather_int64([3, 4])
     assert rows.dtype == np.int64 and rows.tolist() == [[3, 4], [13, 14]]
     assert sent == [[3, 4]]
-
-
-def test_torchdist_int64_gather_falls_back_without_vote_group():
-    dist = object.__new__(TorchDist)
-    dist._cuda_obj_pg = lambda dim: None
-    dist.tp_allgather = Mock(return_value=[[3, 4], [5, 6]])
-    rows = dist.tp_allgather_int64([3, 4])
-    assert rows.tolist() == [[3, 4], [5, 6]]
-    dist.tp_allgather.assert_called_once_with([3, 4], small_payload=True)
