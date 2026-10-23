@@ -6,6 +6,23 @@ l0_dgx_b300:
 - condition:
     ranges:
       system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4 TIMEOUT (180)
+- condition:
+    ranges:
+      system_gpu_count:
         gte: 4
         lte: 4
     wildcards:
