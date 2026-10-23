@@ -71,7 +71,12 @@ from .modeling_speculative import (
     SpecDecOneEngineForCausalLM,
     _slice_spec_position_ids,
 )
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    moe_experts_quant_config,
+    register_auto_model,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -741,6 +746,9 @@ class Gemma4MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=True,
             model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.moe.experts"
+            ),
             layer_idx=layer_idx,
             activation=SimpleActivation(kind=ActivationType.Geglu),
             # VANILLA mode: preprocess_weights splits 3D gate_up_proj into per-expert w1/w3

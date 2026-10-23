@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -79,7 +80,13 @@ from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_co
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    ModelConfig,
+    filter_weights,
+    layerwise_moe_quant_config,
+    register_auto_model,
+)
 
 # Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
@@ -734,7 +741,12 @@ class MiniMaxM3MoE(nn.Module):
             return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         if getattr(model_config, "quant_config_dict", None) is None:
             return quant_config
-        return model_config.quant_config_dict.get(experts_name, quant_config)
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict, experts_name
+        )
+        if experts_quant_config is None:
+            return quant_config
+        return experts_quant_config
 
     def __init__(
         self,
@@ -1299,6 +1311,11 @@ class MiniMaxM3Attention(Attention):
             # A fallback-first policy cannot serve P128 cached prefill safely.
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():
+            return
+        if get_sm_version() == 107:
+            # SM107 admits the library only for the KV manager's extra page sizes
+            # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
+            # there, as before SM107 was admitted.
             return
         # Q/K norm and partial RoPE run in the model before backend dispatch.
         native_attn = TrtllmAttention(
