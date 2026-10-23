@@ -31,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     pack_nvfp4_swiglu_weight,
     pack_swiglu_weight,
     prepare_nvfp4_gemm,
+    qkv_planes,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
     Flux3FP8RowwiseLinearMethod,
@@ -514,8 +515,10 @@ def qkv_forward(
     attn: nn.Module,
     x: PrimsTSInput,
     freqs: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor | None:
-    """Return fused QKV, or None when the input requires native dispatch."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Return Q, K and V after the fused projection, or None when the input
+    requires native dispatch. Each is ``[..., heads * head_dim]`` and the tuned
+    configs make them contiguous."""
     adapter = getattr(attn, "_flux3_primsts_nvfp4_qkv", None)
     if adapter is None:
         if not getattr(attn, "_primsts_fp8_qkv_rope", False):
@@ -547,4 +550,7 @@ def qkv_forward(
         )
     else:
         output = fp8_qkv_qknorm_rope(*args, None)
-    return output.reshape(*original.shape[:-1], output.shape[-1])
+    planes = qkv_planes(
+        output, data, adapter.weight, 128, qkv_scale=getattr(adapter, "qkv_scale", None) is not None
+    )
+    return tuple(t.reshape(*original.shape[:-1], t.shape[-1]) for t in planes)

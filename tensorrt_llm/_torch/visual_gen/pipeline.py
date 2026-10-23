@@ -36,6 +36,7 @@ from tensorrt_llm.visual_gen.params import MediaRole
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .denoise_step import set_denoise_step
 from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
@@ -170,10 +171,19 @@ class BasePipeline(nn.Module):
 
             for i, t in self._profile_denoise_steps(timesteps):
                 ...
+
+        It also records the current step for the attention recipes whose
+        preparation follows the step schedule, and clears it when the loop
+        ends.
         """
-        if self._is_warmup:
-            return enumerate(timesteps)
-        return self._profiler.steps(timesteps)
+        steps = list(timesteps)
+        enumerated = enumerate(steps) if self._is_warmup else self._profiler.steps(steps)
+        try:
+            for i, t in enumerated:
+                set_denoise_step(i, len(steps))
+                yield i, t
+        finally:
+            set_denoise_step(None)
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.

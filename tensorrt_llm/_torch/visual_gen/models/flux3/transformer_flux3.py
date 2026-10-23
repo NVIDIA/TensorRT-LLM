@@ -455,13 +455,13 @@ class Flux3Attention(Attention):
             num_attention_heads=num_heads,
             head_dim=head_dim,
             qkv_mode=qkv_mode,
+            separate_qkv_is_self_attention=True,
             qk_norm=True,
             qk_norm_mode="per_head",
             eps=eps,
             bias=bias,
             interleave=True,
             fuse_qk_norm_rope=fuse_qk_norm_rope,
-            separate_qkv_is_self_attention=True,
             config=config,
             module_name=module_name,
         )
@@ -506,7 +506,8 @@ class Flux3Attention(Attention):
                 fc = cos.reshape(-1, self.head_dim).contiguous()
                 fs = sin.reshape(-1, self.head_dim).contiguous()
                 self.apply_packed_qk_norm_rope(qkv, fc, fs)
-            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+                qkv = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+            q, k, v = qkv
             attn = self._attend(q, k, v, sample_bounds, timestep)
             if need_v:
                 v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -545,7 +546,7 @@ class Flux3Attention(Attention):
     ) -> Tensor:
         if sample_bounds is None:
             return self._attn_impl(q, k, v, timestep=timestep)
-        if isinstance(self.attn, VanillaAttention) and q.shape[0] == 1 and len(sample_bounds) > 1:
+        if q.shape[0] == 1 and len(sample_bounds) > 1:
             length = sample_bounds[0][1]
             if (
                 length > 0
@@ -555,7 +556,7 @@ class Flux3Attention(Attention):
                     for i, (start, end) in enumerate(sample_bounds)
                 )
             ):
-                # Equal packed segments are independent batch rows.
+                # Equal packed segments are independent batch rows for every backend.
                 return self._attn_impl(
                     *(x.view(len(sample_bounds), length, x.shape[-1]) for x in (q, k, v)),
                     timestep=timestep,
@@ -1099,6 +1100,20 @@ class Flux3Model(BaseDiffusionModel):
             return (tuple(layers), float(strength))
 
         runner.register_extra_key_fn("flux3_pag", _pag_key)
+
+        quant_attention = self.model_config.attention.quant_attention_config
+        if (
+            quant_attention is not None
+            and quant_attention.vc_attention
+            and not quant_attention.vc_repair_budget
+        ):
+            # The tile-mean recipe follows the V-Smooth step schedule, so each phase gets its own graph.
+            from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import vc_smooth_phase
+            from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
+
+            runner.register_extra_key_fn(
+                "flux3_vc_phase", lambda *args, **kwargs: vc_smooth_phase(get_denoise_step())
+            )
         runner.register_extra_key_fn(
             "flux3_layout",
             lambda *args, **kwargs: (kwargs.get("layout"), kwargs.get("pag_samples", (0,))),

@@ -79,6 +79,7 @@ def _make_core_forward_metadata():
 def _make_wrapper(cls=visual_trtllm.TrtllmAttention, *, quant_attention_config=None):
     attention = object.__new__(cls)
     attention.quant_attention_config = quant_attention_config
+    attention._no_fallback_fmha = False
     attention.layer_idx = 0
     attention.sparse_params = None
     attention.metadata = visual_trtllm.TrtllmAttentionMetadata(
@@ -312,6 +313,7 @@ def test_forward_reaches_core_fmha_with_module_predicted_routes(
         fmha_libs=[object()],
         select=select_fmha,
     )
+    attention._no_fallback_fmha = True
     carrier = _make_block_sparse_inputs() if has_block_sparse_inputs else None
     backend_args = SparseBackendForwardArgs(block_sparse_inputs=carrier)
     q = torch.randn(1, 4, 2, 8)

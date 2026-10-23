@@ -93,6 +93,12 @@ def test_fp8_fake_output_contracts():
         assert output.dtype == torch.bfloat16 and output.is_contiguous()
 
 
+def _qkv_as_packed(out, activation, weight, qkv_scale=False):
+    """Undo the Q, K and V planes when the config the op ran with writes them."""
+    q, k, v = ops.qkv_planes(out, activation, weight, 128, qkv_scale=qkv_scale)
+    return torch.cat((q, k, v), dim=-1)
+
+
 @pytest.mark.parametrize("epilogue", ["linear", "swiglu", "qkv"])
 def test_fp8_ops_math_and_registration(epilogue):
     """L1 T1: PrimsTS versus FP32 math, including BF16 QKV epilogue rounding."""
@@ -131,7 +137,10 @@ def test_fp8_ops_math_and_registration(epilogue):
         )
     with torch.no_grad():
         snapshots = [tensor.view(torch.uint8).clone() for tensor in args]
-        _assert_fp8_parity(op(*args), reference.bfloat16())
+        out = op(*args)
+        _assert_fp8_parity(
+            _qkv_as_packed(out, a, w) if epilogue == "qkv" else out, reference.bfloat16()
+        )
         # Torch's schema checker uses unsupported FP8 allclose; compare bytes instead.
         for tensor, snapshot in zip(args[: len(snapshots)], snapshots, strict=True):
             assert torch.equal(tensor.view(torch.uint8), snapshot)
@@ -369,6 +378,7 @@ def test_prims_ts_tuning_options(monkeypatch, tmp_path, raw, expected):
     from contextlib import nullcontext
 
     import flashinfer
+
     from tensorrt_llm._torch.visual_gen.models.flux3.flux3_gemm_config import (
         _gemm_source_digest,
         autotune_context,
@@ -426,6 +436,7 @@ def test_prims_ts_invalid_tuning_buckets(monkeypatch, tmp_path, raw):
 def test_prims_ts_autotune_dispatch(monkeypatch, tmp_path, precision):
     """L1 T1: unpinned dispatch profiles real tactics and preserves GEMM output."""
     from flashinfer.autotuner import AutoTuner
+
     from tensorrt_llm._torch.visual_gen.models.flux3.flux3_gemm_config import autotune_context
     from tensorrt_llm._torch.visual_gen.prims_ts.gemm.runner import PrimsTsGemmRunner
 
@@ -748,7 +759,13 @@ def test_nvfp4_kernel_math_and_registration(epilogue, k, n):
             ).flatten(-2)
         reference = qkv.reshape(m, n)
     with torch.no_grad():
-        _assert_nvfp4_parity(op(*args), reference.bfloat16())
+        out = op(*args)
+        _assert_nvfp4_parity(
+            _qkv_as_packed(out, a, w, epilogue == "qkv_scales")
+            if epilogue.startswith("qkv")
+            else out,
+            reference.bfloat16(),
+        )
         torch.library.opcheck(op, args)
         if epilogue == "qkv_scales":
             from tensorrt_llm._torch.visual_gen.prims_ts import gemm
@@ -782,7 +799,7 @@ def test_nvfp4_kernel_math_and_registration(epilogue, k, n):
                 head_dim=128,
                 qkv_scale=qkv_scale,
             )
-            _assert_nvfp4_parity(op(*args), expected)
+            _assert_nvfp4_parity(_qkv_as_packed(op(*args), a, w, True), expected)
 
 
 def test_nvfp4_quantize_and_packed_swiglu():
@@ -790,6 +807,7 @@ def test_nvfp4_quantize_and_packed_swiglu():
     _require_nvfp4_gpu()
     from flashinfer import SfLayout
     from flashinfer import nvfp4_quantize as reference_quantize
+
     from tensorrt_llm._torch.visual_gen.prims_ts import gemm
 
     torch.manual_seed(32)

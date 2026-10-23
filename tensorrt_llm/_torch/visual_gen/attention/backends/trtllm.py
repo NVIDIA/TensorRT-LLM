@@ -19,10 +19,12 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Optional, Union
+import math
+from typing import Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -37,7 +39,42 @@ from ....attention.backends.sparse.timestep_phase import graph_phase_for_timeste
 from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ...cuda_graph_runner import resolved_extra_key
+from ...denoise_step import get_denoise_step
 from .interface import AttentionBackend, AttentionTensorLayout
+
+
+def vc_smooth_phase(denoise_step: Optional[Tuple[int, int]]) -> Tuple[bool, bool]:
+    """V-Smooth phase of a denoise step as (smooth, refresh), the VCAttentionPreprocessor schedule.
+
+    No step, as in warm-up, counts as a refreshing smooth step. The CUDA graph runner keys the
+    transformer graph on this value so each phase replays its own capture.
+    """
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
+        VC_PERM_REFRESH_EVERY,
+        VC_SMOOTH_STEP_FRACTION,
+    )
+
+    if denoise_step is None:
+        return (True, True)
+    step_idx, num_steps = denoise_step
+    smooth = step_idx < math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps)
+    return (smooth, smooth and step_idx % VC_PERM_REFRESH_EVERY == 0)
+
+
+def vc_denoise_step() -> Optional[Tuple[int, int]]:
+    """The denoise step that puts the VC preprocessor in the phase of the current graph key.
+
+    Under CUDA graph replay the real step is unknown to the captured code, so the phase the
+    runner resolved on the host selects a representative step. Outside the runner the real step
+    is used.
+    """
+    phase = resolved_extra_key("flux3_vc_phase")
+    if phase is None:
+        return get_denoise_step()
+    smooth, refresh = phase
+    if not smooth:
+        return (7, 8)
+    return (0, 8) if refresh else (1, 8)
 
 
 class TrtllmAttentionMetadata:
@@ -191,6 +228,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Metadata creation and preparation
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
+    - PrimTS per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV)
+    - VC-Attention recipes (quant_attention_config with vc_attention, requires unfused QKV)
     - Separate-QKV forwarding for generic block-sparse attention and backends that reject fused QKV
     """
 
@@ -233,6 +272,28 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
+        # Without the trtllm-gen fallback library (TLLM_FMHA_LIBS=prims_ts) dense attention
+        # is served by a cache-free FMHA that takes separate Q, K and V.
+        self._no_fallback_fmha = not any(
+            isinstance(fmha, FallbackFmha) for fmha in self._fmha_manager.fmha_libs
+        )
+        if quant_attention_config is not None and quant_attention_config.vc_attention:
+            if not any(fmha.supports_vc_attention for fmha in self._fmha_manager.fmha_libs):
+                raise RuntimeError(
+                    "The VC-Attention recipe needs the PrimTS FMHA library "
+                    "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                    "platform."
+                )
+        elif (
+            quant_attention_config is not None
+            and quant_attention_config.q_block_size == 0
+            and not any(fmha.supports_per_tensor_fp8 for fmha in self._fmha_manager.fmha_libs)
+        ):
+            raise RuntimeError(
+                "The per-tensor FP8 attention recipe needs the PrimTS FMHA library "
+                "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                "platform."
+            )
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -378,6 +439,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             block_sparse_inputs is not None
             or self.quant_attention_config is not None
             or (not self.support_fused_qkv() and self.should_use_sparse(sparse_attn_phase))
+            or self._no_fallback_fmha
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")
@@ -392,13 +454,23 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         if use_separate_qkv:
             q, k, v = self._compact_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
             quant_cfg = self.quant_attention_config
-            if quant_cfg is not None:
+            if quant_cfg is not None and quant_cfg.vc_attention:
+                sage_kwargs = {
+                    "vc_attention": True,
+                    "vc_attention_qk_fp8": quant_cfg.qk_dtype == "fp8",
+                    "vc_repair_budget": quant_cfg.vc_repair_budget,
+                    "vc_denoise_step": vc_denoise_step(),
+                }
+            elif quant_cfg is not None:
                 sage_kwargs = {
                     "sage_attn_num_elts_per_blk_q": quant_cfg.q_block_size,
                     "sage_attn_num_elts_per_blk_k": quant_cfg.k_block_size,
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
                     "sage_attn_qk_int8": quant_cfg.qk_dtype == "int8",
                     "sage_attn_smooth_k": quant_cfg.smooth_k,
+                    "qk_fp8_per_tensor": quant_cfg.q_block_size == 0
+                    and quant_cfg.qk_dtype == "fp8",
+                    "v_fp8_per_tensor": quant_cfg.v_block_size == 0 and quant_cfg.v_dtype == "fp8",
                 }
         else:
             if k is None and v is None:
