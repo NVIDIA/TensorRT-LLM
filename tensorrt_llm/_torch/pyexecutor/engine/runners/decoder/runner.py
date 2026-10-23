@@ -216,6 +216,7 @@ class DecoderRunner(ScheduledModelRunner):
             torch_compile_bypass=self._bypass_torch_compile,
             context_warmups_supported=self._context_warmups_supported,
             eager_workspace_reclaimable=self._eager_workspace_reclaim_supported,
+            warmup_inputs=self._buffers.input_ids_cuda,
         )
 
     def _make_dummy_requests(self) -> DummyRequestFactory:
@@ -280,6 +281,7 @@ class DecoderRunner(ScheduledModelRunner):
             forward_warmup=self._forward_warmup,
             torch_compile_bypass=self._bypass_torch_compile,
             context_promotion_supported=self._context_graph_promotion_supported,
+            warmup_inputs=self._buffers.input_ids_cuda,
         )
 
     @property
@@ -379,8 +381,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = None
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
-    def release_graphs(self) -> None:
-        self._graphs.release()
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        self._graphs.release(release_nccl_window_owners=release_nccl_window_owners)
 
     def wait_for_input_copy(self) -> None:
         self._inputs.wait_for_input_copy()
@@ -464,6 +466,18 @@ class DecoderRunner(ScheduledModelRunner):
             kv_cache_manager_key=self.kv_cache_manager_key,
             sparse_attention_config=self.sparse_attention_config,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
+            # Speculative steps rewrite every input token and position, so
+            # captured graphs can read the persistent buffers directly.
+            static_input_ids=(
+                self._buffers.input_ids_cuda
+                if self._config.is_spec_decode and not self._config.use_mrope
+                else None
+            ),
+            static_position_ids=(
+                self._buffers.position_ids_cuda
+                if self._config.is_spec_decode and not self._config.use_mrope
+                else None
+            ),
         )
 
     def _initialize_breakable_cuda_graph_runner(
@@ -859,6 +873,31 @@ class DecoderRunner(ScheduledModelRunner):
             return
 
         logits_tensor = outputs["logits"]
+        if outputs.get("logits_vocab_shard", False):
+            # The spec worker kept the logits vocabulary-sharded (this TP
+            # rank's columns). A post-processor sees the whole vocabulary, so
+            # gather them first, only when a request has one. Every TP rank
+            # schedules the same requests, so all of them take the gather;
+            # under attention DP they would not.
+            if self.mapping.enable_attention_dp:
+                raise RuntimeError(
+                    "vocabulary-sharded spec-worker logits need every TP rank "
+                    "to schedule the same requests, which attention DP does "
+                    "not"
+                )
+            if not any(
+                getattr(request, "py_logits_post_processors", None)
+                for request in scheduled_requests.all_requests()
+            ):
+                return
+            from tensorrt_llm._torch.distributed import allgather
+
+            logits_tensor = allgather(logits_tensor, self.mapping, dim=-1).float()
+            # Drop the vocabulary's TP padding, as the LM head's own gather
+            # does.
+            vocab_size = getattr(getattr(self.model, "lm_head", None), "num_embeddings", None)
+            if vocab_size is not None:
+                logits_tensor = logits_tensor[..., :vocab_size]
 
         logits_row_offset = 0
         request_groups = (

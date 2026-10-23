@@ -3248,14 +3248,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE (two-model) feeds captured target hidden states into the
-        # separate draft engine, so the shared Eagle3ResourceManager must
-        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
-        # the target model's hidden_states straight to the MTP layer
-        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
-        # both gated on self.is_mtp_eagle), so no capture buffer is needed
-        # and we should skip allocation to avoid disabling post-MLP/MoE
-        # fusion via the layer-capture hook.
+        # MTP_EAGLE_ONE_MODEL passes the target model's hidden_states straight
+        # to the MTP layer (see Eagle3OneModelWorker.prepare_1st_drafter_inputs
+        # / _run_draft_forward, both gated on self.is_mtp_eagle), so no capture
+        # buffer is needed and we skip allocation to avoid disabling
+        # post-MLP/MoE fusion via the layer-capture hook.
         return 0
 
     @property
@@ -3395,14 +3392,17 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
             "speculators DSpark drafters are supported with a qwen3 backbone; "
             f"this one has model_type {layer.get('model_type')!r}")
     aux_layer_ids = config_dict.get("aux_hidden_state_layer_ids")
-    if not aux_layer_ids or min(aux_layer_ids) < 1:
+    if (not isinstance(aux_layer_ids, list) or not aux_layer_ids or any(
+            type(layer_id) is not int or layer_id < 1
+            for layer_id in aux_layer_ids)):
         raise ValueError(
-            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids to be "
+            "a non-empty list of positive integers (>= 1, excluding bool) "
             "(layer 0's input is the embedding output, which is not captured); "
             f"got {aux_layer_ids}")
     num_layers = layer["num_hidden_layers"]
     dflash_config = {
-        "target_layer_ids": [int(layer_id) - 1 for layer_id in aux_layer_ids]
+        "target_layer_ids": [layer_id - 1 for layer_id in aux_layer_ids]
     }
     if config_dict.get("mask_token_id") is not None:
         dflash_config["mask_token_id"] = config_dict["mask_token_id"]
@@ -6432,6 +6432,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "alignment in MoE reinforcement learning. Zero overhead when disabled. "
         "Separated-routing MoE backends only.",
         status="beta")
+
+    lm_head_output_dtype: Literal["auto", "float32"] = Field(
+        default="auto",
+        description=
+        "Output dtype written by the LM head GEMM. 'auto' uses the model "
+        "dtype before logits are upcast to float32. 'float32' writes the "
+        "float32 accumulator directly, avoiding intermediate bf16/fp16 "
+        "rounding of logits before logprob computation. Weights and inputs "
+        "remain in the model dtype. Only supported for unquantized LM heads "
+        "of decoder-only models.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'float32']"})
 
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",

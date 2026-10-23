@@ -19,6 +19,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
@@ -254,6 +255,7 @@ class DecoderWarmup:
         torch_compile_bypass: Callable[[], contextlib.AbstractContextManager[None]],
         context_warmups_supported: bool,
         eager_workspace_reclaimable: bool,
+        warmup_inputs: torch.Tensor | None = None,
     ) -> None:
         self._config = config
         self.mapping = mapping
@@ -270,6 +272,7 @@ class DecoderWarmup:
         self._graphs = graphs
         self._inputs = inputs
         self._forward_warmup = forward_warmup
+        self._warmup_inputs = warmup_inputs
         self._torch_compile_bypass = torch_compile_bypass
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
@@ -956,12 +959,15 @@ class DecoderWarmup:
                         record=False,
                         log_start=False,
                     ):
-                        self._forward_warmup(
-                            batch,
-                            resource_manager,
-                            enable_spec_decode=self._config.is_spec_decode,
-                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                        )
+                        with discard_nccl_window_tensor_outputs(
+                            (getattr(self, "_warmup_inputs", None), batch)
+                        ):
+                            self._forward_warmup(
+                                batch,
+                                resource_manager,
+                                enable_spec_decode=self._config.is_spec_decode,
+                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                            )
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._agreement.is_distributed_forward():
@@ -1081,13 +1087,14 @@ class DecoderWarmup:
                     record=False,
                     log_start=True,
                 ):
-                    self._forward_warmup(
-                        batch,
-                        resource_manager,
-                        enable_spec_decode=self._config.is_spec_decode,
-                        runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                        trtllm_gen_jit_warmup=gen_fmha_grid,
-                    )
+                    with discard_nccl_window_tensor_outputs(getattr(self, "_warmup_inputs", None)):
+                        self._forward_warmup(
+                            batch,
+                            resource_manager,
+                            enable_spec_decode=self._config.is_spec_decode,
+                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                            trtllm_gen_jit_warmup=gen_fmha_grid,
+                        )
                     torch.cuda.synchronize()
 
     @staticmethod
@@ -1279,12 +1286,17 @@ class DecoderWarmup:
                             record=False,
                             log_start=True,
                         ):
-                            self._forward_warmup(
-                                batch,
-                                resource_manager,
-                                enable_spec_decode=self._config.is_spec_decode,
-                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                            )
+                            with discard_nccl_window_tensor_outputs(
+                                (getattr(self, "_warmup_inputs", None), batch)
+                            ):
+                                self._forward_warmup(
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=self._config.is_spec_decode,
+                                    runtime_draft_len=get_static_draft_len(
+                                        self._config.spec_config
+                                    ),
+                                )
                             ran_forward = True
                             torch.cuda.synchronize()
 
@@ -1565,12 +1577,17 @@ class DecoderWarmup:
                                 batch, num_tokens_i, shape
                             ):
                                 continue
-                            self._forward_warmup(
-                                batch,
-                                resource_manager,
-                                enable_spec_decode=self._config.is_spec_decode,
-                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                            )
+                            with discard_nccl_window_tensor_outputs(
+                                (getattr(self, "_warmup_inputs", None), batch)
+                            ):
+                                self._forward_warmup(
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=self._config.is_spec_decode,
+                                    runtime_draft_len=get_static_draft_len(
+                                        self._config.spec_config
+                                    ),
+                                )
 
                             if autotuner_enabled:
                                 AutoTuner.get().cache_pp_recv()
