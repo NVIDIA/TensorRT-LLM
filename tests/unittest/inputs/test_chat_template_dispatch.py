@@ -468,15 +468,12 @@ class TestProcessorWithoutChatTemplate:
         class JinjaTokenizer:
             chat_template = template
 
-            def __init__(self):
-                self.captured = None
-
             def get_chat_template(self, chat_template=None, tools=None):
                 return self.chat_template
 
             def apply_chat_template(self, **kwargs):
-                self.captured = kwargs
-                return "rendered"
+                # Return the template it was asked to render, so the result names the winner.
+                return kwargs["chat_template"]
 
         return JinjaTokenizer()
 
@@ -495,17 +492,15 @@ class TestProcessorWithoutChatTemplate:
         class Processor:
             chat_template = None
 
-        tokenizer = self._tokenizer("{{ messages }}")
-        assert self._render(tokenizer, Processor()) == "rendered"
-        assert tokenizer.captured["chat_template"] == "{{ messages }}"
+        tokenizer = self._tokenizer("{{ 'tokenizer template' }}")
+        assert self._render(tokenizer, Processor()) == "{{ 'tokenizer template' }}"
 
     def test_processor_template_is_still_preferred(self):
         class Processor:
-            chat_template = "{{ 'processor' }}"
+            chat_template = "{{ 'processor template' }}"
 
-        tokenizer = self._tokenizer("{{ messages }}")
-        assert self._render(tokenizer, Processor()) == "rendered"
-        assert tokenizer.captured["chat_template"] == "{{ 'processor' }}"
+        tokenizer = self._tokenizer("{{ 'tokenizer template' }}")
+        assert self._render(tokenizer, Processor()) == "{{ 'processor template' }}"
 
 
 class TestServingChatTemplateGather:
