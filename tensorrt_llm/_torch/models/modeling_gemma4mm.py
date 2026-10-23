@@ -23,8 +23,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-from collections.abc import Sequence
-from itertools import groupby
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -47,7 +45,7 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...inputs.multimodal import MultimodalParams
+from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
@@ -57,8 +55,10 @@ from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_mixin import (
     EncoderCachePartition,
+    EncoderGroup,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    encode_multimodal_by_groups,
 )
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -200,6 +200,42 @@ def _normalize_audio_inputs(audios, target_sr: int = 16000):
 # ---------------------------------------------------------------------------
 
 
+def _gemma4_input_partitions(
+    multimodal_data: dict[str, Any],
+    metadata: MultimodalItemMetadata,
+) -> dict[str, dict[str, MultimodalItemPartition]]:
+    """Declare item-major fields; video frame grouping stays model-owned."""
+    partitions = {}
+    for modality, fields in (
+        ("image", ("pixel_values", "image_position_ids", "image_seq_lens")),
+        ("audio", ("audio_features", "audio_features_mask")),
+    ):
+        data = multimodal_data.get(modality)
+        if not isinstance(data, dict):
+            continue
+        item_count = sum(m == modality for m, _ in metadata.item_refs)
+        value = data.get(fields[0])
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == item_count:
+            modality_partitions = {}
+            for name in fields:
+                value = data.get(name)
+                if value is None:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    size = value.shape[0] if value.ndim > 0 else None
+                elif isinstance(value, (list, tuple)):
+                    size = len(value)
+                else:
+                    size = None
+                if size != item_count:
+                    raise ValueError(
+                        f"{modality}.{name} must have {item_count} items on its leading axis"
+                    )
+                modality_partitions[name] = MultimodalItemPartition()
+            partitions[modality] = modality_partitions
+    return partitions
+
+
 class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Preprocesses image inputs for Gemma4.
 
@@ -207,6 +243,17 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     transformers; otherwise falls back to manual tokenization + image
     processing using the image processor saved in the model directory.
     """
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        if metadata is not None:
+            metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
+        return metadata
 
     # Default class-level fallback. Real value computed per-instance below
     # from text_config.use_bidirectional_attention. Only 26B/31B set
@@ -642,7 +689,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "video.pixel_values",
             "video.image_position_ids",
             "audio.audio_features",
-            "audio.audio_features_mask",
         ]
 
     # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
@@ -702,64 +748,110 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 )
         return partition
 
-    def build_multimodal_encoder_input(
+    def get_multimodal_item_partitions(
         self,
         param: MultimodalParams,
-        item_indices: Sequence[int],
-    ) -> MultimodalParams:
-        """Build a Gemma4 image or audio input containing selected items.
+        modality: str,
+    ) -> dict[str, MultimodalItemPartition] | None:
+        partitions = super().get_multimodal_item_partitions(param, modality)
+        if partitions is not None:
+            return partitions
+        metadata = param.item_metadata
+        if metadata is None:
+            return None
+        return _gemma4_input_partitions(param.multimodal_data, metadata).get(modality)
 
-        The generic implementation recognizes item-major images through a parallel `image_sizes`
-        field and item-major audio through the `input_features` key. Gemma4 instead provides
-        fixed-size `pixel_values` without `image_sizes` and uses `audio_features`.
+    @property
+    def mm_encoder_groups(self) -> tuple[EncoderGroup, ...]:
+        def pack(params: list[MultimodalParams]) -> dict:
+            return {"multimodal_params": params}
 
-        Partial encoder-cache hits therefore need this override to slice those tensors, together
-        with their per-item position, length, and mask fields.
-        """
-        modality = self._encoder_cache_modality(param)
-        # Partial video partitions are converted to full misses above, so they cannot call this
-        # hook. Delegate unexpected direct calls to the generic validation so they fail instead of
-        # returning an incorrectly unsliced input.
-        if modality not in ("image", "audio"):
-            return super().build_multimodal_encoder_input(param, item_indices)
-        input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
-
-        modality_data = param.multimodal_data[modality]
-        if not isinstance(modality_data, dict):
-            raise TypeError(
-                f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
-            )
-
-        item_count = len(param.multimodal_data.get("multimodal_embedding_lengths") or ())
-        input_tensor = modality_data.get(input_key)
-        # Only slice dim 0 after confirming it is the per-item axis declared by the cache metadata.
-        # Let the generic implementation handle any other recognized layout, or reject an
-        # inconsistent Gemma4 payload.
-        if (
-            not isinstance(input_tensor, torch.Tensor)
-            or input_tensor.dim() == 0
-            or input_tensor.shape[0] != item_count
-        ):
-            return super().build_multimodal_encoder_input(param, item_indices)
-
-        indices = list(item_indices)
-        sliced = {input_key: input_tensor[indices]}
-        sliced = {
-            **modality_data,
-            **sliced,
-            **self._slice_per_item_sibling_fields(
-                modality_data, item_count, indices, sliced.keys()
+        token_limit = self.model_config.extra_attrs.get(
+            "encoder_max_num_tokens", self.model_config.max_num_tokens
+        )
+        return (
+            EncoderGroup(
+                ("image",),
+                self._encode_multimodal_tensor,
+                pack,
+                self._encoder_batch_key,
+                token_limit,
+                self._encoder_batch_tokens,
             ),
-        }
-        residual_input = (
-            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
-        )
-        return MultimodalParams(
-            multimodal_data={**param.multimodal_data, modality: sliced},
-            multimodal_input=residual_input,
+            EncoderGroup(
+                ("video",),
+                self._encode_multimodal_tensor,
+                pack,
+                self._encoder_batch_key,
+                token_limit,
+                self._encoder_batch_tokens,
+            ),
+            EncoderGroup(
+                ("audio",),
+                self._encode_audio_params,
+                pack,
+                self._encoder_batch_key,
+                token_limit,
+                self._encoder_batch_tokens,
+            ),
         )
 
-    def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        for param in multimodal_params:
+            if (
+                sum(param.multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
+                > 1
+            ):
+                raise ValueError(
+                    "Gemma4 requests containing multiple multimodal input types are not supported."
+                )
+        return encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)
+
+    @staticmethod
+    def _encoder_batch_tokens(param: MultimodalParams) -> int:
+        """Bound padded attention rows using shapes, without reading CUDA data."""
+        audio = param.multimodal_data.get("audio")
+        if audio is not None:
+            features = audio["audio_features"]
+            # The audio tower's two stride-2 stages precede its attention blocks.
+            return features.shape[0] * ((features.shape[1] + 3) // 4)
+        data = param.multimodal_data.get("image") or param.multimodal_data["video"]
+        pixels = data["pixel_values"]
+        return pixels.shape[0] * pixels.shape[1]
+
+    @staticmethod
+    def _encoder_batch_key(param: MultimodalParams) -> tuple:
+        """Only batch equal padded shapes with the same mask/position inputs."""
+        for modality in ("image", "video", "audio"):
+            data = param.multimodal_data.get(modality)
+            if data is not None:
+                fields = (
+                    ("audio_features", "audio_features_mask")
+                    if modality == "audio"
+                    else ("pixel_values", "image_position_ids")
+                )
+                return tuple(
+                    None
+                    if data.get(key) is None
+                    else (tuple(data[key].shape[1:]), data[key].dtype, data[key].device)
+                    for key in fields
+                ) + (data.get("image_seq_lens") is not None,)
+        raise ValueError("Gemma4 encoder input has no modality payload")
+
+    def _encode_audio_params(self, multimodal_params: list[MultimodalParams]) -> torch.Tensor:
+        """Run one compatible audio batch, preserving clip and request order."""
+        data = [param.multimodal_data["audio"] for param in multimodal_params]
+        features = torch.cat([item["audio_features"] for item in data], dim=0)
+        mask = (
+            torch.cat([item["audio_features_mask"] for item in data], dim=0)
+            if data[0].get("audio_features_mask") is not None
+            else None
+        )
+        return self._get_audio_features(features, mask)
+
+    def _encode_multimodal_tensor(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Encode uncached Gemma4 image, video, and audio payloads."""
         modality_inputs = (
             ("image", "pixel_values"),
@@ -779,23 +871,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             raise ValueError(
                 "Gemma4 requests containing multiple multimodal input types are not supported."
             )
-
-        # The cache helper splits this tensor by request. Preserve that order while still batching
-        # consecutive requests with the same modality.
-        if (
-            all(len(modalities) == 1 for modalities in param_modalities)
-            and len({modalities[0] for modalities in param_modalities}) > 1
-        ):
-            embeddings = []
-            for _, param_group in groupby(
-                zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
-            ):
-                embeddings.append(
-                    self.encode_multimodal_inputs(
-                        [multimodal_param for _, multimodal_param in param_group]
-                    )
-                )
-            return torch.cat(embeddings, dim=0)
 
         pixel_values_list = []
         image_position_ids_list = []
@@ -1240,11 +1315,21 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         that it can be concatenated with image features before being fused
         into the LLM input embeddings.
         """
+        num_audio_tokens = None
+        if (
+            audio_features_mask is not None
+            and audio_features_mask.device.type == "cpu"
+            and audio_features_mask.dtype == torch.bool
+        ):
+            # The audio tower samples the mask through two stride-2 stages.
+            # Read its output size before H2D, avoiding CUDA nonzero's host sync.
+            num_audio_tokens = int(audio_features_mask[:, ::4].sum().item())
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
             if audio_features_mask is not None:
                 output = self.audio_tower(
-                    audio_features, attention_mask=audio_features_mask.to(audio_features.device)
+                    audio_features,
+                    attention_mask=audio_features_mask.to(audio_features.device, non_blocking=True),
                 )
             else:
                 output = self.audio_tower(audio_features)
@@ -1252,8 +1337,19 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
             projected = self.embed_audio(hidden.to(target_dtype))  # (B, T, H_text)
         # Optionally drop padding frames reported by the audio tower.
         tower_mask = getattr(output, "attention_mask", None)
-        if tower_mask is not None and tower_mask.dtype == torch.bool:
-            projected = projected[tower_mask]
+        if (
+            tower_mask is not None
+            and tower_mask.dtype == torch.bool
+            and audio_features_mask is not None
+        ):
+            if num_audio_tokens is None:
+                # Direct callers may already have placed the mask on CUDA.
+                projected = projected[tower_mask]
+            else:
+                indices = torch.nonzero_static(
+                    tower_mask.reshape(-1), size=num_audio_tokens
+                ).flatten()
+                projected = projected.reshape(-1, projected.shape[-1]).index_select(0, indices)
         else:
             projected = projected.reshape(-1, projected.shape[-1])
         return projected.contiguous()

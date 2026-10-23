@@ -48,8 +48,14 @@ pytest.importorskip(
     "transformers", minversion="5.5.0", reason="Gemma4 requires transformers>=5.5.0"
 )
 
-from transformers import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig  # noqa: E402
+from transformers import (  # noqa: E402
+    Gemma4AudioConfig,
+    Gemma4Config,
+    Gemma4TextConfig,
+    Gemma4VisionConfig,
+)
 from transformers import Gemma4ForConditionalGeneration as HFGemma4ForConditionalGeneration
+from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 from transformers.models.gemma4.modeling_gemma4 import (  # noqa: E402
     Gemma4MultimodalEmbedder as HFGemma4MultimodalEmbedder,
 )
@@ -70,7 +76,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     get_multimodal_embeddings,
 )
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
+    MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -198,7 +206,10 @@ def _make_keyed_image_param(
                 "image_position_ids": image_position_ids,
                 "image_seq_lens": [1] * item_count,
             },
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -220,7 +231,10 @@ def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
         ),
         multimodal_data={
             "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("video", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -245,7 +259,10 @@ def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
                 "audio_features": torch.arange(item_count * 2).reshape(item_count, 1, 2),
                 "audio_features_mask": torch.ones(item_count, 1),
             },
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("audio", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -905,13 +922,17 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         """Gemma4 audio features and their mask remain item-aligned."""
         audio_features = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
         audio_mask = torch.arange(12).reshape(3, 4)
+        shared_stats = torch.arange(3)
         param = MultimodalParams(
             multimodal_data={
                 "audio": {
                     "audio_features": audio_features,
                     "audio_features_mask": audio_mask,
+                    "shared_stats": shared_stats,
                 },
-                "multimodal_embedding_lengths": [1, 1, 1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("audio", 0), ("audio", 1), ("audio", 2)], output_embedding_lengths=[1, 1, 1]
+                ),
             }
         )
 
@@ -920,6 +941,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         residual_audio = residual.multimodal_data["audio"]
         torch.testing.assert_close(residual_audio["audio_features"], audio_features[[2, 0]])
         torch.testing.assert_close(residual_audio["audio_features_mask"], audio_mask[[2, 0]])
+        assert residual_audio["shared_stats"] is shared_stats
 
     def test_encoder_cache_partial_hit_slices_gemma4_audio_input(self):
         """A partial hit encodes only the missing Gemma4 audio item."""
@@ -935,6 +957,24 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
         torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    @pytest.mark.cpu_only
+    def test_build_multimodal_encoder_input_uses_typed_audio_item_count(self):
+        features = torch.arange(24).reshape(3, 4, 2)
+        param = MultimodalParams(
+            multimodal_data={
+                "audio": {"audio_features": features},
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("audio", 0), ("audio", 1), ("audio", 2)], [8, 8, 8], [1, 1, 1]
+                ),
+            }
+        )
+
+        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+
+        torch.testing.assert_close(
+            residual.multimodal_data["audio"]["audio_features"], features[[2, 0]]
+        )
 
     def test_encoder_cache_partial_hit_with_unsupported_item_axis_becomes_full_miss(self):
         """Unexpected Gemma4 image and audio layouts bypass partial cache reuse."""
@@ -998,9 +1038,12 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         embed_mask_cumsum = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
         multimodal_param = MultimodalParams(
             multimodal_data={
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[4]
+                ),
                 "image": {
                     "pixel_values": torch.zeros(1, 1, 1, device="cuda"),
-                }
+                },
             },
             multimodal_runtime=MultimodalRuntimeData(
                 past_seen_token_num=0,
@@ -1052,7 +1095,12 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         model = self._make_model()
         params = [
             MultimodalParams(
-                multimodal_data={"video": {"pixel_values": torch.tensor([[[2.0]]])}},
+                multimodal_data={
+                    "video": {"pixel_values": torch.tensor([[[2.0]]])},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0)], output_embedding_lengths=[1]
+                    ),
+                },
                 multimodal_runtime=MultimodalRuntimeData(
                     past_seen_token_num=0,
                     chunk_end_pos=1,
@@ -1060,7 +1108,12 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 ),
             ),
             MultimodalParams(
-                multimodal_data={"image": {"pixel_values": torch.tensor([[[1.0]]])}},
+                multimodal_data={
+                    "image": {"pixel_values": torch.tensor([[[1.0]]])},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[1]
+                    ),
+                },
                 multimodal_runtime=MultimodalRuntimeData(
                     past_seen_token_num=0,
                     chunk_end_pos=1,
@@ -1068,7 +1121,12 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 ),
             ),
             MultimodalParams(
-                multimodal_data={"video": {"pixel_values": torch.tensor([[[3.0]]])}},
+                multimodal_data={
+                    "video": {"pixel_values": torch.tensor([[[3.0]]])},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0)], output_embedding_lengths=[1]
+                    ),
+                },
                 multimodal_runtime=MultimodalRuntimeData(
                     past_seen_token_num=0,
                     chunk_end_pos=1,
@@ -1866,6 +1924,67 @@ class TestGemma4VisionHeadDimPadding(unittest.TestCase):
             torch.allclose(hf_flat, trt_out, atol=atol, rtol=rtol),
             f"head_dim=72 padded-to-80 diverges from HF: "
             f"max diff={diff.max().item():.4f} mean diff={diff.mean().item():.4f}",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_audio_batch_matches_serial_for_padded_inputs() -> None:
+    torch.manual_seed(1)
+    config = Gemma4AudioConfig(
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        subsampling_conv_channels=(128, 4),
+        conv_kernel_size=3,
+        output_proj_dims=64,
+        use_clipped_linears=False,
+        attention_chunk_size=4,
+        attention_context_left=5,
+    )
+    model = object.__new__(Gemma4ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_config = ModelConfig(max_num_tokens=64)
+    model.model_dtype = torch.bfloat16
+    model.audio_tower = Gemma4AudioModel(config).cuda().to(model.model_dtype).eval()
+    model.embed_audio = (
+        Gemma4MultimodalEmbedder(
+            mm_hidden_size=64, text_hidden_size=32, eps=1e-6, dtype=model.model_dtype
+        )
+        .cuda()
+        .eval()
+    )
+    for parameter in model.embed_audio.parameters():
+        torch.nn.init.normal_(parameter, std=0.02)
+    params = []
+    for length in (60, 52):
+        mask = torch.arange(64).unsqueeze(0) < length
+        features = torch.randn(1, 64, 128, device="cuda", dtype=model.model_dtype)
+        params.append(
+            MultimodalParams(
+                multimodal_data={
+                    "audio": {"audio_features": features, "audio_features_mask": mask},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("audio", 0)], output_embedding_lengths=[(length + 3) // 4]
+                    ),
+                }
+            )
+        )
+    expected = [
+        model._get_audio_features(
+            param.multimodal_data["audio"]["audio_features"],
+            param.multimodal_data["audio"]["audio_features_mask"],
+        )
+        for param in params
+    ]
+    with mock.patch.object(
+        model.audio_tower, "forward", wraps=model.audio_tower.forward
+    ) as forward:
+        results = model.encode_multimodal_inputs(params)
+    forward.assert_called_once()
+    for reference, result in zip(expected, results, strict=True):
+        torch.testing.assert_close(
+            result.multimodal_data["multimodal_embedding"], reference, rtol=1e-2, atol=1e-2
         )
 
 

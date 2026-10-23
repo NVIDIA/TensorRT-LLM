@@ -376,6 +376,8 @@ class PyTorchModelEngine(ModelEngine):
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
         if isinstance(self.model,
                       MultimodalModelMixin) and mapping.is_first_pp_rank():
+            self.model.model_config.extra_attrs[
+                "encoder_max_num_tokens"] = self.encoder_max_num_tokens
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
                                     if self.model.encoder_cache_active else 0)

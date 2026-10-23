@@ -37,6 +37,11 @@ from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     EncodeCudaGraphConfig,
@@ -452,6 +457,7 @@ def test_mm_encoder_runner_forward_step_returns_empty_result_without_multimodal_
         "mm_embeddings": [],
         "mm_embedding_request_indices": [],
         "mm_embedding_lengths": [],
+        "logits": None,
     }
 
 
@@ -459,7 +465,7 @@ def test_mm_encoder_runner_forward_step_rejects_payload_request_count_mismatch()
     request = SimpleNamespace(py_multimodal_data={"image": object()})
     runner = _make_runner(MultimodalEncoderRunner, SimpleNamespace())
 
-    with pytest.raises(ValueError, match="one multimodal payload per context"):
+    with pytest.raises(ValueError, match="align with multimodal context requests"):
         runner._forward_step(
             {"multimodal_params": [SimpleNamespace(), SimpleNamespace()]},
             SimpleNamespace(context_requests=[request]),
@@ -473,17 +479,19 @@ def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_r
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
             },
             multimodal_lengths=[2],
         ),
     ]
-    params = [
-        SimpleNamespace(multimodal_data={}),
-        SimpleNamespace(multimodal_data={}),
-        SimpleNamespace(multimodal_data={}),
-    ]
-    model = SimpleNamespace(forward=Mock(return_value=[torch.arange(4).reshape(2, 2)]))
+    params = [MultimodalParams(multimodal_data=request.py_multimodal_data) for request in requests]
+    model = SimpleNamespace(
+        encode_multimodal_inputs=Mock(
+            return_value=[params[2].with_encoder_output(torch.arange(4).reshape(2, 2))]
+        )
+    )
     runner = _make_runner(MultimodalEncoderRunner, model)
 
     result = runner._forward_step(
@@ -491,7 +499,7 @@ def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_r
         SimpleNamespace(context_requests=requests),
     )
 
-    model.forward.assert_called_once_with([params[2]])
+    model.encode_multimodal_inputs.assert_called_once_with([params[2]])
     assert result["logits"] is None
     assert result["mm_embedding_request_indices"] == [2]
     assert result["mm_embedding_lengths"] == [[2]]
@@ -499,7 +507,7 @@ def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_r
 
 
 def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> None:
-    first_param = SimpleNamespace(
+    first_param = MultimodalParams(
         multimodal_data={
             "image": object(),
             "mrope_config": {
@@ -508,7 +516,7 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
             },
         }
     )
-    second_param = SimpleNamespace(
+    second_param = MultimodalParams(
         multimodal_data={
             "image": object(),
             "mrope_config": {
@@ -521,20 +529,37 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
             },
             multimodal_lengths=[1],
         ),
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
             },
             multimodal_lengths=[2],
         ),
     ]
     embeddings = torch.arange(6).reshape(3, 2)
-    model = SimpleNamespace(forward=Mock(return_value=[embeddings]))
+    first_param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = requests[
+        0
+    ].py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    second_param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = requests[
+        1
+    ].py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    model = SimpleNamespace(
+        encode_multimodal_inputs=Mock(
+            return_value=[
+                first_param.with_encoder_output(embeddings[:1]),
+                second_param.with_encoder_output(embeddings[1:]),
+            ]
+        )
+    )
     runner = _make_runner(MultimodalEncoderRunner, model)
 
     result = runner._forward_step(
@@ -542,7 +567,7 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
         SimpleNamespace(context_requests=requests),
     )
 
-    model.forward.assert_called_once_with([first_param, second_param])
+    model.encode_multimodal_inputs.assert_called_once_with([first_param, second_param])
     assert result["logits"] is None
     assert result["mm_embedding_request_indices"] == [0, 1]
     assert result["mm_embedding_lengths"] == [[1], [2]]
@@ -764,12 +789,22 @@ def test_model_caller_requires_streams_with_compile_backend():
 def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> None:
     requests = [
         SimpleNamespace(
-            py_multimodal_data={"image": object(), "multimodal_embedding_lengths": [1]},
+            py_multimodal_data={
+                "image": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
+            },
             multimodal_lengths=[1],
         ),
         SimpleNamespace(py_multimodal_data=None),
         SimpleNamespace(
-            py_multimodal_data={"video": object(), "multimodal_embedding_lengths": [3, 2]},
+            py_multimodal_data={
+                "video": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("video", 0), ("video", 1)], output_embedding_lengths=[3, 2]
+                ),
+            },
             multimodal_lengths=[7, 6],
         ),
     ]
@@ -777,7 +812,7 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
         request.py_result = PyResult(prompt_len=1, max_new_tokens=1)
         request.set_finished_reason = Mock()
     params = [
-        SimpleNamespace(multimodal_data=request.py_multimodal_data)
+        MultimodalParams(multimodal_data=request.py_multimodal_data)
         for request in requests
         if request.py_multimodal_data is not None
     ]
@@ -786,14 +821,18 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
     )
     embeddings = torch.arange(12, dtype=torch.float32).reshape(6, 2)
 
-    def encode(batch_params: list[SimpleNamespace]) -> list[torch.Tensor]:
+    def encode(batch_params: list[MultimodalParams]) -> list[MultimodalParams]:
+        from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+            split_multimodal_encoder_outputs,
+        )
+
         batch_params[1].multimodal_data["multimodal_embedding_metadata"] = [
             {"retained_token_counts": [2, 1]},
             {"retained_token_counts": [2, 0]},
         ]
-        return [embeddings]
+        return split_multimodal_encoder_outputs(embeddings, batch_params)
 
-    runner = _make_runner(MultimodalEncoderRunner, SimpleNamespace(forward=encode))
+    runner = _make_runner(MultimodalEncoderRunner, SimpleNamespace(encode_multimodal_inputs=encode))
     result = runner._forward_step(
         {"multimodal_params": params},
         scheduled_requests,
