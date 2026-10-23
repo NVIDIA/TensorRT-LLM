@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
@@ -61,7 +59,16 @@ class HfCheckpointLoader(BaseCheckpointLoader):
     def get_default_weight_loader(self) -> HfWeightLoader:
         return HfWeightLoader()
 
-    def _uses_context_only_lazy_loading(self, model: Any) -> bool:
+    def uses_context_only_lazy_loading(self, model: Any) -> bool:
+        """Whether reading for this model keeps the tensors it does not own lazy.
+
+        Only the built-in HF checkpoint and weight loaders do this, and only
+        for a context-only worker. Such a read must not read the whole
+        checkpoint ahead.
+
+        Args:
+            model: target model passed to the read, or None
+        """
         return (type(self) is HfCheckpointLoader
                 and type(self.weight_loader) is HfWeightLoader
                 and getattr(getattr(model, "model", None),
@@ -70,7 +77,7 @@ class HfCheckpointLoader(BaseCheckpointLoader):
     def load_weights(self, checkpoint_dir: str, mapping: Mapping,
                      **kwargs) -> dict[str, Any]:
         """Keep omitted decoder tensors lazy on a context-only worker."""
-        if self._uses_context_only_lazy_loading(kwargs.get("model")):
+        if self.uses_context_only_lazy_loading(kwargs.get("model")):
             # The model remapper drops unowned keys before touching their
             # slices. Eager loading or read-ahead would read those bytes anyway.
             loader = self.weight_loader
@@ -87,28 +94,6 @@ class HfCheckpointLoader(BaseCheckpointLoader):
             loader._log_checkpoint_io_status()
             return weights
         return super().load_weights(checkpoint_dir, mapping=mapping, **kwargs)
-
-    @contextmanager
-    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
-                            **kwargs) -> Iterator[dict[str, Any]]:
-        """Delegate the optimized session only for the built-in HF path."""
-        if (type(self) is HfCheckpointLoader
-                and type(self.weight_loader) is HfWeightLoader
-                and self.weight_loader.checkpoint_io_policy
-                != CheckpointIOPolicy.NATIVE and
-                not self._uses_context_only_lazy_loading(kwargs.get("model"))):
-            with self.weight_loader.open_weight_session(checkpoint_dir,
-                                                        mapping=mapping,
-                                                        **kwargs) as weights:
-                yield weights
-            return
-
-        # MX, Mistral, and custom subclasses retain their polymorphic
-        # load_weights implementations.
-        with super().open_weight_session(checkpoint_dir,
-                                         mapping=mapping,
-                                         **kwargs) as weights:
-            yield weights
 
     def get_default_config_loader(self) -> HfConfigLoader:
         return HfConfigLoader()

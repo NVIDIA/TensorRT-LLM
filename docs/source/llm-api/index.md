@@ -182,8 +182,8 @@ The `py_executor.model_engine_creation_seconds` timing includes the total `model
 | `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
 | `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
 | `draft_checkpoint_finalization_seconds` | Checkpoint finalization time for draft weights loaded as part of the model loader. |
-| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup. |
-| `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
+| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization, memory cleanup and other work. |
+| `total_model_loading_seconds` | Overall model loading interval, from loading and validating the checkpoint configuration to the end of post-load processing. It includes the named phases above. |
 
 `trtllm-serve` exposes the same rank-0 payload in the `startup_metrics` field of the
 `GET /server_info` response:
