@@ -231,9 +231,10 @@ class TestRenderChat:
 
 
 class TestExtensions:
-    @pytest.fixture
-    def extension_model(self):
+    @pytest.fixture(params=["template", "grammar"])
+    def extension_model(self, request):
         key = "render-core-test-model"
+        mode = request.param
 
         @register_serving_extension(model_types=(key,))
         class TestExtension(ServingExtension):
@@ -241,7 +242,12 @@ class TestExtensions:
                 request.chat_template_kwargs = {**(request.chat_template_kwargs or {}), "ran": 1}
 
             def allows_required_tool_choice(self) -> bool:
-                return True
+                return mode == "template"
+
+            def required_tool_choice_mode(self) -> serving_extensions.RequiredToolChoiceMode | None:
+                if mode == "grammar":
+                    return "grammar"
+                return super().required_tool_choice_mode()
 
             def serialize_tool(self, tool) -> dict:
                 return {"type": "function", "function": {"name": "renamed_" + tool.function.name}}

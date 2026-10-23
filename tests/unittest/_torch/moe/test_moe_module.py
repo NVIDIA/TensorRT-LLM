@@ -110,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
@@ -673,6 +674,8 @@ def _test_moe_worker_impl(
         )
 
         with (
+            # Standalone outputs remain live through reference and accuracy checks.
+            nccl_window_tensor_scope(x),
             moe_load_balancer,
             create_moe(
                 routing_method=routing_method,

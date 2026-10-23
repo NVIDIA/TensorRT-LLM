@@ -57,4 +57,24 @@ static constexpr int SmallTokenKernelSingleTokenPerExpertMaxNumExperts = 256;
 bool prefersSmallTokenKernel(RoutingPreprocessType preprocessType, RoutingPostprocessType postprocessType,
     int32_t numTokens, int32_t dispatchedMaxExperts);
 
+//! Whether TLLM_ROUTING_DISABLE_COOP_LAUNCH forbids the grid-cooperative routing kernel.
+//!
+//! routingIndicesCoopKernel is launched with cudaLaunchAttributeCooperative over smCount - 8
+//! blocks, so the driver holds the launch until that whole grid can be co-resident. A
+//! deployment that keeps blocks resident for unrelated work (DWDP weight prefetch, a
+//! persistent collective) therefore serializes routing behind it. Setting the variable to 1
+//! removes the cooperative launch from every routing path: shapes within the cluster kernel's
+//! capacity keep using it, and the rest take the histogram + offsets pipeline that already
+//! serves launches too large for the cooperative kernel.
+//!
+//! Unlike the escape hatches above, this one reads the environment itself, because the three
+//! dispatch sites it gates (routingCustom, routingDeepSeek and the shared post-top-k pipeline)
+//! live in different translation units and must agree. It is read once, so it must be set
+//! before the first routing launch.
+//!
+//! Not to be confused with TLLM_ROUTING_DISABLE_COOP_BLOCK, which gates
+//! routingIndicesCoopBlockKernel: a single-block, non-cooperative launcher whose name refers
+//! to cooperative groups within one block, and which only runs for a handful of tokens.
+bool coopLaunchDisabled();
+
 } // namespace moe::dev::routing::routingCustom

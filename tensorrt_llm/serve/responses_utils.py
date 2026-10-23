@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
@@ -1719,6 +1719,8 @@ def _apply_tool_parser(
     text: str,
     streaming: bool,
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
+    finished: bool = False,
+    partial: bool = False,
 ) -> Tuple[str, list[ToolCallItem]]:
     tool_parser: Optional[BaseToolParser] = None
     if tool_parser_id is not None and tools is not None:
@@ -1734,10 +1736,15 @@ def _apply_tool_parser(
 
     if tool_parser is not None and tools is not None:
         if not streaming:
-            result = tool_parser.detect_and_parse(text, tools)
+            result = (tool_parser.parse_partial(text, tools)
+                      if partial else tool_parser.detect_and_parse(text, tools))
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
+        if streaming and finished:
+            tail = tool_parser.finish(tools)
+            normal_text += tail.normal_text
+            calls += tail.calls
         if not streaming:
             warn_if_tool_call_unparsed(tool_parser_id, tool_parser, text, calls)
     else:
@@ -2767,6 +2774,9 @@ def _generate_streaming_event(
         _accumulate_tool_call_fragments(call_fragments, flushed.calls)
         final_calls = _assembled_tool_calls(call_fragments)
     elif tool_parser is not None:
+        # The whole-text parse below decides; finish() only clears what the
+        # incremental parser still holds.
+        tool_parser.finish(available_tools)
         released_text, final_calls = _whole_text_tool_calls(
             output, request, streaming_events_helper, reasoning_parser_id,
             tool_parser_id, available_tools)
