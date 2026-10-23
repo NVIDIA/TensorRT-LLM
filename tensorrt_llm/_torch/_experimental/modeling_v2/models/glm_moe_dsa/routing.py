@@ -11,7 +11,7 @@ raises that error.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -22,6 +22,10 @@ from ..._router_index import NoTarget
 # fine-tunes of the same shape; the accuracy gate pins identity.
 _SHAPE = (78, 6144, 256, 2048)
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 
 def route(
     pretrained_config: Any,
@@ -29,11 +33,14 @@ def route(
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
     kv_cache_quant_algo: Optional[Any],
+    model_config: Optional[ModelConfig] = None,
+    llm_args: Optional[TorchLlmArgs] = None,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     Each target is imported where it is returned, so declining costs no import
-    of modeling code.
+    of modeling code. No engine choice in ``model_config`` or ``llm_args`` changes
+    which target runs, so neither is read.
     """
     shape = (
         pretrained_config.num_hidden_layers,

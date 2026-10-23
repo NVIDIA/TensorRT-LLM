@@ -20,7 +20,10 @@ These tests allocate device memory pools.
 """
 
 import gc
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Callable, Iterator
 
 import pytest
 import torch
@@ -29,6 +32,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import valid_page_slots
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind, RowSelection
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -273,13 +277,12 @@ def test_a_served_cache_is_allocated_off_the_execution_stream(connector):
         manager.report_batch_to_connector(batch)
         assert kv_cache.cuda_stream == execution_stream.cuda_stream
 
-        with torch.cuda.stream(execution_stream):
-            torch.cuda._sleep(1 << 31)
+        with _held_stream(execution_stream) as open_gate:
             forward_done = torch.cuda.Event()
             forward_done.record(execution_stream)
-        manager.wait_allocation_fences([request.py_request_id])
-        assert not forward_done.query(), "the fence waited for the execution stream"
-        execution_stream.synchronize()
+            manager.wait_allocation_fences([request.py_request_id])
+            assert not forward_done.query(), "the fence waited for the execution stream"
+            open_gate()
     finally:
         manager.shutdown()
 
@@ -890,3 +893,101 @@ def test_real_kv_pressure_rejects_reserved_prefix_without_transmission() -> None
         if blocker is not None:
             blocker.close()
         manager.shutdown()
+
+
+def _lender_beside(manager):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import StagingOptions, attach_lender
+
+    return attach_lender(manager, scope=b"beside-a-connector", staging=StagingOptions(PROMPT_LEN))
+
+
+@contextmanager
+def _held_stream(stream: torch.cuda.Stream) -> Iterator[Callable[[], None]]:
+    """Hold a CUDA stream on a host flag until the caller opens it."""
+    from cuda.bindings import driver
+
+    flag = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+    (error,) = driver.cuStreamWaitValue32(
+        driver.CUstream(stream.cuda_stream),
+        driver.CUdeviceptr(flag.data_ptr()),
+        1,
+        driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
+    )
+    if error == driver.CUresult.CUDA_ERROR_NOT_SUPPORTED:
+        pytest.skip("this device cannot hold a stream on a host flag")
+    assert error == driver.CUresult.CUDA_SUCCESS, error
+
+    def open_gate() -> None:
+        flag.numpy()[0] = 1
+
+    timed_out = threading.Event()
+
+    def release_after_timeout() -> None:
+        timed_out.set()
+        open_gate()
+
+    watchdog = threading.Timer(120.0, release_after_timeout)
+    watchdog.start()
+    try:
+        yield open_gate
+    finally:
+        open_gate()
+        watchdog.cancel()
+        watchdog.join()
+        stream.synchronize()
+    assert not timed_out.is_set(), "the stream stayed held: something waited on it"
+
+
+def _waits_for_side_stream(manager, lend, request, end, rows, ready):
+    """A device lend gives no view before work queued on the allocation side stream completed."""
+    ready_event = None
+    if ready == "event":
+        ready_event = torch.cuda.Event()
+        ready_event.record(manager._stream)
+    with _held_stream(manager._allocation_stream) as open_gate:
+        lease = lend(
+            request, 0, end, memory_kind=MemoryKind.DEVICE, rows=rows, ready_event=ready_event
+        )
+        assert lease.failure is None, lease.failure
+        manager._stream.synchronize()
+        assert lease.poll() is None, "a view went out before the work on the allocation side stream"
+        open_gate()
+    assert lease.poll() is not None
+    lease.release()
+
+
+@pytest.mark.parametrize("ready", ["none", "event"])
+@pytest.mark.parametrize("rows", [RowSelection.ALL, RowSelection.NAMED], ids=["all", "named"])
+def test_a_write_in_place_waits_for_the_allocation_side_stream(manager, connector, rows, ready):
+    """A write in place into a cache allocated on the side stream waits for that stream's work."""
+    lender = _lender_beside(manager)
+    connector.prefix_reservations_enabled = False
+    request = make_request(request_id=3)
+    assert schedule(manager, request)
+    assert request.py_request_id in manager._on_allocation_stream
+    _waits_for_side_stream(manager, lender.lend_write, request, 2 * TOKENS_PER_BLOCK, rows, ready)
+
+
+@pytest.mark.parametrize("ready", ["none", "event"])
+def test_a_read_in_place_of_a_reused_prefix_waits_for_the_allocation_side_stream(
+    manager, connector, ready
+):
+    """A read in place of a reused prefix of a cache allocated on the side stream waits for it."""
+    lender = _lender_beside(manager)
+    connector.num_matched = 0  # reuse alone gives the prefix
+    first = make_request(request_id=4)
+    assert schedule(manager, first)
+    batch = run(manager, first)
+    manager.report_batch_to_connector(batch)
+    first.context_chunk_size = first.context_remaining_length
+    first.move_to_next_context_chunk()
+    manager.update_context_resources(batch)
+    manager._stream.synchronize()
+    manager.free_resources(first)
+    second = make_request(request_id=5)
+    assert schedule(manager, second)
+    assert second.py_request_id in manager._on_allocation_stream
+    reused = manager.kv_cache_map[second.py_request_id].history_length
+    assert reused >= TOKENS_PER_BLOCK, "the second request reused no block"
+    end = reused // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+    _waits_for_side_stream(manager, lender.lend_read, second, end, RowSelection.ALL, ready)
