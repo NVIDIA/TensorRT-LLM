@@ -198,6 +198,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_media_io.py::test_media_metrics_separate_download_decode_and_queue
   - unittest/llmapi/apps/test_media_io.py::test_media_decode_failure_is_recorded
+  - unittest/llmapi/apps/test_media_io.py::test_media_process_pool_keeps_decode_picklable
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_input_metrics.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
