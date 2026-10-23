@@ -102,6 +102,16 @@ public:
     //! expected failure and callers are required to handle it.
     void commit(size_t offset, size_t size);
 
+    //! The first two steps of commit(): open() makes the range reachable and
+    //! populate() allocates its pages, so a later commit() finds them present.
+    //! Neither unwinds on failure; decommit() releases what they took.
+    //!
+    //! open() changes the mapping, which waits for every populate() in flight
+    //! on any thread: open a range once, then populate it in parallel. Both
+    //! are safe to call while another thread commits a disjoint range.
+    void open(size_t offset, size_t size);
+    void populate(size_t offset, size_t size) const;
+
     //! Releases the physical backing of [offset, offset + size), which stays
     //! reserved and may be committed again. Both bounds must be multiples of
     //! commitGranularity().

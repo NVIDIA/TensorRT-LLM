@@ -156,6 +156,15 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
 // HostMem implementation
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+//! Threads that populate the initial fill alongside the one committing it.
+//! Populating scales with threads until the kernel's page allocator saturates.
+constexpr int kInitialFillHelpers = 7;
+
+} // namespace
+
 size_t HostMem::chunkCount() const noexcept
 {
     return mChunkSize == 0 ? 0 : divUp(mSize, mChunkSize);
@@ -168,8 +177,53 @@ size_t HostMem::chunkCount() const noexcept
 //! resumes at the old size, which need not fall on a chunk boundary. The step
 //! that straddles the boundary is committed as a short range, so no byte is
 //! ever committed twice.
-void HostMem::commitRange(size_t beginOffset)
+//!
+//! With `helperCount` > 0 the range is opened up front and that many threads
+//! populate it chunk by chunk ahead of the commits, which then find the pages
+//! present. Populating in parallel slows everything else in the process, so
+//! only the initial fill, which runs before serving, uses helpers. Until it
+//! ends, a reader that skips waitUsable() reads zeros past the watermark
+//! instead of faulting.
+void HostMem::commitRange(size_t beginOffset, int helperCount)
 {
+    std::atomic<size_t> nextHelperOffset{beginOffset};
+    // Declared after what they use: destruction stops and joins them on every
+    // way out of this function.
+    std::vector<std::jthread> helpers;
+    if (helperCount > 0 && mSize - beginOffset > mChunkSize)
+    {
+        mBacking.open(beginOffset, mSize - beginOffset);
+        try
+        {
+            for (int i = 0; i < helperCount; ++i)
+            {
+                helpers.emplace_back(
+                    [this, &nextHelperOffset](std::stop_token stop)
+                    {
+                        try
+                        {
+                            TLLM_CUDA_CHECK(cudaSetDevice(mDevice));
+                            runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
+                            for (size_t begin;
+                                 !stop.stop_requested() && (begin = nextHelperOffset.fetch_add(mChunkSize)) < mSize;)
+                            {
+                                mBacking.populate(begin, std::min(begin + mChunkSize, mSize) - begin);
+                            }
+                        }
+                        catch (...)
+                        {
+                            // commit() populates whatever a helper leaves and
+                            // reports any failure itself.
+                        }
+                    });
+            }
+        }
+        catch (std::system_error const&)
+        {
+            // Out of threads: those running and commit() cover the range.
+        }
+    }
+
     size_t offset = beginOffset;
     while (offset < mSize)
     {
@@ -184,10 +238,10 @@ void HostMem::commitRange(size_t beginOffset)
     }
 }
 
-void HostMem::startFill(size_t beginOffset)
+void HostMem::startFill(size_t beginOffset, int helperCount)
 {
     mFillWorker = std::thread(
-        [this, beginOffset]
+        [this, beginOffset, helperCount]
         {
             // A new thread starts on device 0 whatever the creator selected, and
             // registration needs a context on the right one. Selecting it here
@@ -203,10 +257,17 @@ void HostMem::startFill(size_t beginOffset)
                 cudaStreamCaptureMode captureMode = cudaStreamCaptureModeRelaxed;
                 TLLM_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&captureMode));
                 runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
-                commitRange(beginOffset);
+                commitRange(beginOffset, helperCount);
             }
             catch (...)
             {
+                if (helperCount > 0 && mSize - beginOffset > mChunkSize)
+                {
+                    // Helpers may have populated past the failed commit, which
+                    // released only its own step.
+                    size_t const committed = mFilledChunks.load(std::memory_order_relaxed) * mChunkSize;
+                    mBacking.decommit(committed, mSize - committed);
+                }
                 // Stored before the sentinel: a waiter that observes the
                 // sentinel through an acquire load is guaranteed to see it.
                 mFillFailure = std::current_exception();
@@ -268,7 +329,7 @@ HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const&
         mVmSize = roundUp(vmSize, granularity);
         mSize = initialSize;
         mAddr = mBacking.reserve(mVmSize);
-        startFill(0);
+        startFill(0, kInitialFillHelpers);
         if (mWaitForFill)
         {
             waitUsable(mSize);
@@ -352,7 +413,7 @@ void HostMem::resize(size_t newSize)
     mFilledChunks.store(static_cast<uint32_t>(oldSize / mChunkSize), std::memory_order_release);
     try
     {
-        startFill(oldSize);
+        startFill(oldSize, 0);
     }
     catch (...)
     {
