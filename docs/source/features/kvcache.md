@@ -153,6 +153,30 @@ prefix matching. It excludes dummy and draft requests. The default, `0`, disable
 the entire endpoint-priority callback, including its preference for the final window.
 This option requires V2, block reuse, and the `all_reusable` policy.
 
+### Branch Snapshots
+
+Sliding-window attention (SWA) layers can reuse a cached prefix only up to a
+point where V2 kept the SWA window. The `per_request` and `per_conversation`
+policies keep this window only at the prompt end. SWA scratch reuse keeps it
+only at each context chunk end. So when a request shares a prefix with an
+earlier request and then diverges, it cannot reuse up to the fork. The prototype
+`kv_cache_config.block_reuse_config.enable_branch_snapshot` option makes V2 also
+keep the SWA window at the fork:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    policy: per_conversation
+    enable_branch_snapshot: true
+```
+
+The fork is aligned down to a block boundary and becomes a context chunk
+boundary, so the executor uses the `FORCE_CHUNK` chunking policy. The option
+requires V2 and block reuse. It has no effect on models without SWA layers or on
+SWA layers with joint target/draft KV cache reuse.
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the
@@ -201,6 +225,10 @@ Mamba models select V2 by default (see
 compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
+
+For hybrid Mamba models, `block_reuse_config.enable_branch_snapshot` also
+snapshots the recurrent state at the fork. The deprecated
+`mamba_state_config.enable_branch_snapshot` alias turns on the same option.
 
 ### KV Cache Salting for Secure Reuse
 
