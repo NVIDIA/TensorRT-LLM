@@ -22,11 +22,12 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     DFlash2CandidateSelector,
     DFlashForCausalLM,
     dflash2_grouped_conv,
+    dflash2_sample_candidate_paths,
     dflash2_score_edges,
     dflash2_walk_candidate_paths,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
-from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, is_dflash2_checkpoint
 
 # ---------------------------------------------------------------------------
 # Two-tap dynamic depthwise convolution
@@ -436,6 +437,118 @@ def test_global_top_k_rejects_a_width_it_cannot_interpret():
             top_k=TOP_K,
             full_vocab=VOCAB,
         )
+
+
+# ---------------------------------------------------------------------------
+# Sampled drafts (rejection sampling)
+# ---------------------------------------------------------------------------
+
+
+def _sampling_metadata(slot_ids, num_contexts=0, device="cpu", mode=None):
+    batch_size = num_contexts + B
+    return SimpleNamespace(
+        request_temperatures=torch.ones(batch_size, device=device),
+        request_top_ks=torch.zeros(batch_size, dtype=torch.int32, device=device),
+        request_top_ps=torch.ones(batch_size, device=device),
+        request_min_ps=torch.zeros(batch_size, device=device),
+        batch_slot_ids=slot_ids,
+        draft_probs=torch.full((8, K, VOCAB), 7.0, device=device),
+        draft_probs_last_dim=0,
+        advanced_sampling_mode=mode,
+        rng_draft_slot=lambda step: step,
+    )
+
+
+def test_sampled_walk_scores_each_step_under_the_drawn_candidate():
+    generator = torch.Generator().manual_seed(21)
+    edge_scores = torch.randn(B, K, TOP_K, TOP_K, generator=generator)
+    rows = []
+
+    def argmin_step(step, scores):
+        rows.append(scores)
+        return scores.argmin(-1), F.one_hot(scores.argmin(-1), TOP_K).float()
+
+    chosen, proposal = dflash2_sample_candidate_paths(edge_scores, argmin_step)
+
+    predecessor = torch.zeros(B, dtype=torch.long)
+    for step in range(K):
+        torch.testing.assert_close(rows[step], edge_scores[torch.arange(B), step, predecessor])
+        predecessor = chosen[:, step]
+    torch.testing.assert_close(proposal, F.one_hot(chosen, TOP_K).float())
+
+
+def test_sample_dflash2_block_stores_each_draft_with_its_proposal():
+    """Each gen request's draft_probs rows hold the distribution its tokens were drawn from:
+    the selector row under the previous draw, zero off the candidates."""
+    selector = _selector()
+    wrapper = _dflash2_wrapper(candidate_selector=selector)
+    generator = torch.Generator().manual_seed(26)
+    gen_logits = torch.randn(B, K, VOCAB, generator=generator)
+    hidden_states = torch.randn(B, K, HID, generator=generator)
+    anchors = torch.randint(VOCAB, (B,), generator=generator)
+    slot_ids = torch.tensor([6, 2, 5, 3])  # slot 6 belongs to the context request
+    spec_metadata = _sampling_metadata(slot_ids, num_contexts=1)
+
+    def sampler(mode, scores, *params, seed, offset):  # CPU stand-in for the seeded sampler
+        probs = scores.softmax(-1)
+        return torch.multinomial(probs, 1, generator=generator).squeeze(-1), probs
+
+    with (
+        patch.object(DFlashWorker, "_rng_state_per_request", return_value=(None, None)),
+        patch.object(DFlashWorker, "_sample_from_logits_with_probs", staticmethod(sampler)),
+    ):
+        tokens, vocab_size = _worker()._sample_dflash2_block(
+            wrapper, gen_logits, hidden_states, anchors, spec_metadata, 1, 1 + B
+        )
+
+    unary, candidate_ids = torch.topk(gen_logits, TOP_K, dim=-1)
+    is_drawn = candidate_ids == tokens[..., None]
+    assert vocab_size == spec_metadata.draft_probs_last_dim == VOCAB
+    assert is_drawn.any(-1).all()
+    edge_scores = selector(candidate_ids, unary, hidden_states, anchors)
+    predecessors = F.pad(is_drawn.int().argmax(-1)[:, :-1], (1, 0))
+    rows = edge_scores.gather(2, predecessors[..., None, None].expand(-1, -1, 1, TOP_K))
+    expected = torch.zeros(B, K, VOCAB).scatter_(-1, candidate_ids, rows.squeeze(2).softmax(-1))
+    torch.testing.assert_close(spec_metadata.draft_probs[slot_ids[1:]], expected)
+    assert (spec_metadata.draft_probs[[0, 1, 4, 6, 7]] == 7.0).all()  # other slots untouched
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs CUDA")
+def test_sample_dflash2_block_captures_in_a_cuda_graph_with_nan_padding_rows():
+    selector = _selector().cuda()
+    wrapper = _dflash2_wrapper(candidate_selector=selector)
+    generator = torch.Generator().manual_seed(28)
+    gen_logits = torch.randn(B, K, VOCAB, generator=generator).cuda()
+    hidden_states = torch.randn(B, K, HID, generator=generator).cuda()
+    hidden_states[0] = float("nan")  # a CUDA-graph padding request
+    anchors = torch.randint(VOCAB, (B,), generator=generator).cuda()
+    slot_ids = torch.tensor([2, 5, 3], device="cuda")
+    spec_metadata = _sampling_metadata(slot_ids, device="cuda", mode=AdvancedSamplingMode.FULL)
+    rng = (torch.arange(1, B + 1, device="cuda"), torch.zeros(B, dtype=torch.int64, device="cuda"))
+
+    def sample_block():
+        return _worker()._sample_dflash2_block(
+            wrapper, gen_logits, hidden_states, anchors, spec_metadata, 0, B
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with patch.object(DFlashWorker, "_rng_state_per_request", return_value=rng):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            sample_block()  # warm up outside the graph
+        torch.cuda.current_stream().wait_stream(stream)
+        with torch.cuda.graph(graph):
+            tokens, _ = sample_block()
+    spec_metadata.draft_probs.fill_(7.0)
+    graph.replay()
+
+    _, candidate_ids = torch.topk(gen_logits, TOP_K, dim=-1)
+    stored = spec_metadata.draft_probs[slot_ids]
+    ones = torch.ones(B, K, device="cuda")
+    assert (candidate_ids == tokens[..., None]).any(-1).all()
+    torch.testing.assert_close(stored.sum(-1), ones)
+    torch.testing.assert_close(stored.gather(-1, candidate_ids).sum(-1), ones)
 
 
 def _bind_drafter(is_dflash2: bool, d2t):

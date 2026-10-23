@@ -1766,7 +1766,19 @@ class DFlashWorker(SpecWorkerBase):
 
                 # DFlash 2: replace the independent per-position picks with one
                 # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "lilicorr", None) is not None:
+                has_selector = getattr(draft_model, "has_candidate_selector", False)
+                sample_block = has_selector and spec_metadata.wants_advanced_draft_sampling
+                if sample_block:
+                    gen_draft_tokens, vocab_size = self._sample_dflash2_block(
+                        draft_model,
+                        gen_logits,
+                        gen_hidden_states.reshape(num_gens, K, -1),
+                        inputs["first_prev_tokens"],
+                        spec_metadata,
+                        num_contexts,
+                        batch_size,
+                    )
+                elif getattr(draft_model, "lilicorr", None) is not None:
                     gen_logits = self._apply_lilicorr(
                         draft_model,
                         gen_logits,
@@ -1775,7 +1787,7 @@ class DFlashWorker(SpecWorkerBase):
                         spec_metadata,
                     )
                     vocab_size = gen_logits.shape[-1]
-                elif getattr(draft_model, "has_candidate_selector", False):
+                elif has_selector:
                     gen_logits = self._apply_dflash2_selector(
                         draft_model,
                         gen_logits,
@@ -1785,12 +1797,13 @@ class DFlashWorker(SpecWorkerBase):
                     )
                     vocab_size = gen_logits.shape[-1]
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                if not sample_block:
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits,
+                        spec_metadata,
+                        batch_size,
+                        num_contexts=num_contexts,
+                    )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -1896,6 +1909,64 @@ class DFlashWorker(SpecWorkerBase):
         """
         return gen_logits
 
+    def _sample_dflash2_block(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        block_hidden_states: torch.Tensor,
+        anchor_tokens: torch.Tensor,
+        spec_metadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Sample DFlash 2 drafts ancestrally for rejection sampling.
+
+        Each position is drawn under the token drawn before it, and the distribution it was
+        drawn from is stored in ``draft_probs``. Returns the ``[num_gens, K]`` int32 tokens and
+        the vocab size.
+        """
+        selector = draft_model.candidate_selector
+        full_vocab = selector.predecessor_codebook.shape[0]
+        candidate_ids, unary_logits, _ = self._dflash2_global_top_k(
+            gen_logits, spec_metadata, top_k=selector.top_k, full_vocab=full_vocab
+        )
+        gen = slice(num_contexts, batch_size)
+        sampling_params = (
+            spec_metadata.request_temperatures[gen],
+            spec_metadata.request_top_ks[gen],
+            spec_metadata.request_top_ps[gen],
+            spec_metadata.request_min_ps[gen],
+        )
+
+        def sample_step(step: int, scores: torch.Tensor):
+            # CUDA-graph padding rows can be NaN; neutralize them so every draw stays in the row.
+            scores = scores.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            seed, offset = self._rng_state_per_request(
+                spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(step)
+            )
+            return self._sample_from_logits_with_probs(
+                spec_metadata.advanced_sampling_mode,
+                scores,
+                *sampling_params,
+                seed=seed,
+                offset=offset,
+            )
+
+        tokens, proposal = draft_model.sample_candidate_path(
+            candidate_ids, unary_logits, block_hidden_states, anchor_tokens.long(), sample_step
+        )
+        if spec_metadata.draft_probs is not None:
+            draft_probs = spec_metadata.draft_probs
+            slots = spec_metadata.batch_slot_ids[gen]
+            num_steps = tokens.shape[1]
+            # A device-side zero: CUDA graph capture rejects copying a Python scalar.
+            draft_probs[slots, :num_steps, :full_vocab] = draft_probs.new_zeros(())
+            steps = torch.arange(num_steps, device=tokens.device)
+            draft_probs[slots[:, None, None], steps[:, None], candidate_ids] = proposal
+            spec_metadata.draft_probs_last_dim = full_vocab
+        # DFlash 2 drafters share the target vocabulary, so there is no d2t to apply.
+        return tokens.to(torch.int32), full_vocab
+
     def _apply_dflash2_selector(
         self,
         draft_model,
@@ -1905,17 +1976,11 @@ class DFlashWorker(SpecWorkerBase):
         spec_metadata,
     ) -> torch.Tensor:
         """Replace DFlash's independent per-position picks with the DFlash 2
-        candidate selector's chosen path.
+        candidate selector's chosen path, for argmax drafting.
 
         Returns full-vocab ``[num_gens, K, vocab]`` logits carrying only each
         position's top-k candidates, scored under the predecessor the walk
-        settled on. Downstream sampling is unchanged and stays lossless: each
-        row is the distribution its draft token was drawn from.
-
-        The walk always chains through the greedy successor, so under sampling
-        a draft token can differ from the predecessor the next position was
-        scored under. That costs acceptance rate, not correctness — same
-        trade-off as ``_apply_dspark_markov_bias``.
+        settled on. Sampled drafts go through ``_sample_dflash2_block``.
         """
         selector = draft_model.candidate_selector
         candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(
