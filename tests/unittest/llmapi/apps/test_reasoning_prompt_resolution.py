@@ -153,11 +153,13 @@ class _FakeResult:
     ("template_kwargs", "expected"),
     [(None, True), ({"enable_thinking": False}, False)],
 )
+@pytest.mark.parametrize("parser_name", ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone"])
 def test_context_worker_stamps_the_resolved_mode(
-    template_kwargs: dict[str, bool] | None, expected: bool
+    template_kwargs: dict[str, bool] | None, expected: bool, parser_name: str
 ) -> None:
     """Calls the real handler, so dropping the stamp fails this test."""
     args = build_args(render(template_kwargs), template_kwargs)
+    args.reasoning_parser = parser_name
 
     response = chat_response_post_processor(_FakeResult("hidden</think>visible"), args)
 
@@ -175,7 +177,8 @@ def test_context_worker_does_not_stamp_for_other_parsers() -> None:
 
 
 @pytest.mark.parametrize("relayed", [True, False])
-def test_relayed_mode_drives_the_parser(relayed: bool) -> None:
+@pytest.mark.parametrize("parser_name", ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone"])
+def test_relayed_mode_drives_the_parser(relayed: bool, parser_name: str) -> None:
     """Contract the generation worker relies on, given a relayed value.
 
     The generation-side block lives in `openai_server` and needs a live
@@ -186,7 +189,7 @@ def test_relayed_mode_drives_the_parser(relayed: bool) -> None:
         model="test-model",
         chat_template_kwargs={"thinking": relayed, "enable_thinking": relayed},
     )
-    args.reasoning_parser = "poolside_v1"
+    args.reasoning_parser = parser_name
     content, reasoning = apply_reasoning_parser(args, 0, "hidden</think>visible", streaming=False)
 
     if relayed:

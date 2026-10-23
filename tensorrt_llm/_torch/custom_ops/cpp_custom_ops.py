@@ -384,6 +384,11 @@ def _register_fake():
     def _(dest, src, dim1_start, dim1_end):
         pass
 
+    @torch.library.register_fake("trtllm::dwdp_fabric_gather")
+    def _(dst_ptrs, src_ptrs, lines, row_starts, blocks_per_row, threads):
+        # Copies through raw device pointers; no return value.
+        pass
+
     @torch.library.register_fake("trtllm::indexer_topk_prefill")
     def _(logits, row_starts, row_ends, indices, index_topk):
         # In-place operation, no return value (void function)

@@ -179,8 +179,7 @@ class BaseReasoningParser(ABC):
     def finish(self) -> ReasoningParserResult:
         """Called when the stream ends. Subclasses may override to flush
         buffered state or reclassify accumulated content. The default
-        implementation returns an empty result.
-        """
+        implementation returns an empty result."""
         return ReasoningParserResult()
 
 
@@ -211,7 +210,8 @@ class IdentityReasoningParser(BaseReasoningParser):
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
-    """Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
+    """
+    Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
     Since the latest official tokenizer_config.json initially adds "<think>\\n" at the end of the prompt
     (https://huggingface.co/deepseek-ai/DeepSeek-R1/blob/main/tokenizer_config.json),
     treat all the text before the </think> tag as `reasoning_content` and the text after as `content`.
@@ -839,6 +839,10 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
     The `enable_thinking` flag is read from `chat_template_kwargs`.
     """
 
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
     def __init__(self,
                  *,
                  reasoning_at_start: bool = True,
@@ -865,8 +869,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         reasoning_content into content so the response always has content.
 
         Whitespace-only content (e.g. a newline after the closing think tag) is
-        treated as empty so the swap still runs (NVBug 6060281).
-        """
+        treated as empty so the swap still runs (NVBug 6060281)."""
         content = result.content or ""
         if self._force_nonempty_content and not content.strip(
         ) and result.reasoning_content:
@@ -875,33 +878,35 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return result
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        """Wraps the parent parse_delta to also treat `<tool_call>` as an
-        implicit end-of-reasoning marker.  When the model omits `</think>`
-        before generating a tool call, the tag would otherwise be absorbed
-        into reasoning_content and the downstream tool parser would never
-        see it (NVBug 6082303).
-
-        `<tool_call>` is a special token that always arrives as a single
-        atomic delta, so we only need to check `delta_text` (not the
-        parent's internal buffer).
-        """
-        if (self.in_reasoning and self._tool_call_start in delta_text
-                and self.reasoning_end not in self._buffer):
-            remaining = self._buffer
+        """End reasoning at the first closing marker or tool-call opener."""
+        buffered = self._buffer + delta_text
+        tool_idx = buffered.find(self._tool_call_start)
+        end_idx = buffered.find(self.reasoning_end)
+        if self.in_reasoning and tool_idx != -1 and (end_idx == -1
+                                                     or tool_idx < end_idx):
             self._buffer = ""
             self.in_reasoning = False
-            # Guaranteed non-negative: guarded by `in delta_text` above.
-            tool_idx = delta_text.find(self._tool_call_start)
-            reasoning = remaining + delta_text[:tool_idx]
-            content = delta_text[tool_idx:]
+            reasoning = buffered[:tool_idx]
+            content = buffered[tool_idx:]
             if self._force_nonempty_content:
                 self._found_closing_tag = True
                 self._accumulated_reasoning = ""
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning)
 
+        pending = ""
+        if self.in_reasoning and end_idx == -1 and tool_idx == -1:
+            for size in range(
+                    min(len(buffered),
+                        len(self._tool_call_start) - 1), 0, -1):
+                if buffered.endswith(self._tool_call_start[:size]):
+                    pending = buffered[-size:]
+                    self._buffer = ""
+                    delta_text = buffered[:-size]
+                    break
         was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
+        self._buffer += pending
         if self._force_nonempty_content:
             if result.reasoning_content:
                 self._accumulated_reasoning += result.reasoning_content
@@ -920,8 +925,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         as reasoning_content since we are still in reasoning mode.
 
         If the closing tag was already found (or reasoning was never
-        entered), flushes any remaining buffer as content.
-        """
+        entered), flushes any remaining buffer as content."""
         if self.in_reasoning and not self._found_closing_tag:
             remaining = self._buffer
             self._buffer = ""
@@ -942,14 +946,19 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return ReasoningParserResult()
 
     def parse(self, text: str) -> ReasoningParserResult:
-        result = super().parse(text)
-        tc = (result.reasoning_content.find(self._tool_call_start)
-              if result.reasoning_content else -1)
-        if tc != -1:
-            result = ReasoningParserResult(
-                content=result.reasoning_content[tc:] + result.content,
-                reasoning_content=result.reasoning_content[:tc])
-        return self._maybe_swap_content(result)
+        start = 0 if self.reasoning_at_start else text.find(
+            self.reasoning_start)
+        if start != -1:
+            if not self.reasoning_at_start:
+                start += len(self.reasoning_start)
+            tool_idx = text.find(self._tool_call_start, start)
+            end_idx = text.find(self.reasoning_end, start)
+            if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
+                return self._maybe_swap_content(
+                    ReasoningParserResult(
+                        content=text[tool_idx:],
+                        reasoning_content=text[start:tool_idx]))
+        return self._maybe_swap_content(super().parse(text))
 
 
 @register_reasoning_parser("gemma4")

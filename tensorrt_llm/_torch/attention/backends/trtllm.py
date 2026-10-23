@@ -44,7 +44,8 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.manager import FmhaManager
-from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, populate_helix_spec_buffers,
+                      scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -784,21 +785,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
           * kv_lens_cuda is BATCH-indexed, hence the num_contexts offset on
             the write below.
         """
-        pos = self.helix_position_offsets[:num_gen_tokens]
-        phys = self.kv_cache_manager.tokens_per_block
-        cp_rank = self.mapping.cp_rank
-        cp_size = self.mapping.cp_size
-        owner = torch.div(pos, phys, rounding_mode='floor') % cp_size
-        active = owner == cp_rank
-        local_before = self.helix_local_len_vec(pos)
-        # Scalar overload: no per-step allocation (CUDA-graph capture treats
-        # these ops as part of the graph; keep them allocation-free).
-        self.helix_local_slots[:num_gen_tokens].copy_(
-            torch.where(active, local_before, -1))
-        self.helix_kv_bounds[:num_gen_tokens].copy_(
-            self.helix_local_len_vec(pos + 1))
-        # Per-sequence rank-local kv length = bound of the sequence's last
-        # token (attention over committed + owned in-flight tokens).
         assert num_gen_tokens % tokens_per_gen_seq == 0, (
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens not divisible by group size {tokens_per_gen_seq}")
@@ -810,10 +796,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens over {self.num_generations} generation rows do not all "
             f"have width {tokens_per_gen_seq}")
-        last_bounds = self.helix_kv_bounds[:num_gen_tokens].view(
-            num_gen_seqs, tokens_per_gen_seq)[:, -1]
-        self.kv_lens_cuda[self.num_contexts:self.num_contexts +
-                          num_gen_seqs].copy_(last_bounds)
+        # One launch derives the write slots, the attention bounds and the
+        # per-sequence rank-local kv length (the bound of the sequence's last
+        # token: committed + owned in-flight tokens) from the positions; it
+        # replaces a chain of elementwise ops on the step's critical path.
+        # Static shapes and allocation-free, so it is safe under CUDA graph
+        # capture.
+        populate_helix_spec_buffers(
+            self.helix_position_offsets[:num_gen_tokens],
+            self.helix_local_slots[:num_gen_tokens],
+            self.helix_kv_bounds[:num_gen_tokens],
+            self.kv_lens_cuda[self.num_contexts:self.num_contexts +
+                              num_gen_seqs],
+            num_tokens=num_gen_tokens,
+            tokens_per_seq=tokens_per_gen_seq,
+            tokens_per_block=self.kv_cache_manager.tokens_per_block,
+            cp_size=self.mapping.cp_size,
+            cp_rank=self.mapping.cp_rank)
 
     def _bind_runtime_views(
         self,
