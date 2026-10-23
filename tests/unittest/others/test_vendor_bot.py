@@ -1869,7 +1869,268 @@ def test_tracked_pr_retargeted_to_another_base_is_ignored(monitor: b.Monitor) ->
         "state": "ignored",
         "reason": "PR targets a different consumer base branch",
     }
+    assert monitor.store.get("tracked") == []
     assert not monitor.gh.writes
+
+
+@pytest.mark.parametrize(
+    "base", ["dev", "feat/flux3-image-klein", "release", "release/", "main-other"]
+)
+def test_cli_rejects_development_base_before_initializing_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, base: str
+) -> None:
+    state = tmp_path / "not-created"
+    result = b.main(
+        [
+            "run",
+            "--workdir",
+            str(state),
+            "--vendor",
+            "toy",
+            "--upstream-repo",
+            "org/library",
+            "--canonical-repo",
+            "operator/library",
+            "--canonical-branch",
+            "dev",
+            "--fork",
+            "operator/consumer",
+            "--base-branch",
+            base,
+            "--once",
+        ]
+    )
+    assert result == 1
+    assert "--base-branch must be main or release/<name>" in caplog.text
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("base", ["main", "release/1.3", "release/1.4"])
+def test_monitor_accepts_only_explicit_supported_base(monitor: b.Monitor, base: str) -> None:
+    monitor.gh.base_branch = base
+    with contextlib.closing(b.Store(":memory:")) as store:
+        instance = b.Monitor(monitor.args, monitor.gh, store)
+        monitor.gh.pr["base"]["ref"] = "feat/development"
+        assert instance._discover() == []
+        monitor.gh.pr["base"]["ref"] = "release/9.9"
+        assert instance._discover() == []
+        monitor.gh.pr["base"]["ref"] = base
+        assert instance._discover() == [7]
+    assert not monitor.gh.writes
+
+
+@pytest.mark.parametrize("base", ["main", "release/1.3"])
+def test_retargeted_pr_cleanup_untracks_and_rediscovery_revalidates(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, base: str
+) -> None:
+    gh = monitor.gh
+    gh.base_branch = gh.pr["base"]["ref"] = base
+    assert monitor._discover() == [7]
+    monitor._feedback(gh.pr, _issue())
+    original = copy.deepcopy(gh.comments[0])
+    gh.pr["base"]["ref"] = "feat/development"
+    monkeypatch.setattr(monitor, "_inputs", lambda pr: pytest.fail("Must not validate dev PRs"))
+    monitor.poll()
+    assert monitor.store.get("tracked") == []
+    assert monitor.store.get("problem:7") is None
+    assert gh.comments[0] == original and len(gh.comments) == 2
+    assert "now targets <code>feat/development</code>" in gh.comments[-1]["body"]
+    assert "Supersedes" in gh.comments[-1]["body"]
+    assert "not** a code-review approval" in gh.comments[-1]["body"]
+    assert gh.reviews[0]["state"] == "DISMISSED"
+    assert "#issuecomment-2" in gh.reviews[0]["body"]
+    assert not any(payload.get("event") == "APPROVE" for _, _, payload in gh.writes)
+    writes = copy.deepcopy(gh.writes)
+    monitor.poll()
+    assert gh.writes == writes
+    assert monitor.store.get("health")["counts"]["processed"] == 0
+    gh.pr["base"]["ref"] = base
+    assert monitor._discover() == [7]
+    monitor._feedback(gh.pr, _issue())
+    assert len(gh.comments) == 3
+    assert gh.reviews[-1]["state"] == "CHANGES_REQUESTED"
+
+
+@pytest.mark.parametrize("remaining", ["comment", "review", "both", "neither"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_cold_start_recovers_retarget_cleanup_without_sqlite(
+    monitor: b.Monitor, remaining: str, legacy: bool
+) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue())
+    if legacy:
+        for item in gh.comments + gh.reviews:
+            item["body"] = f"{monitor.marker}\nLegacy objection"
+    if remaining in ("review", "neither"):
+        gh.comments.clear()
+    if remaining in ("comment", "neither"):
+        gh.reviews.clear()
+    gh.writes.clear()
+    gh.pr["base"]["ref"] = "feat/development"
+    gh.pr["updated_at"] = "2020-01-01T00:00:00Z"
+    args = copy.copy(monitor.args)
+    args.since = "2026-01-01T00:00:00Z"
+    for _ in range(2):
+        with contextlib.closing(b.Store(":memory:")) as store:
+            b.Monitor(args, gh, store).poll()
+            assert store.get("tracked") == []
+            assert store.get("health")["counts"]["errors"] == 0
+    if remaining == "neither":
+        assert not gh.writes
+    else:
+        assert len(gh.comments) == (1 if remaining == "review" else 2)
+        assert all(review["state"] == "DISMISSED" for review in gh.reviews)
+        assert len(gh.writes) == (3 if remaining in ("review", "both") else 1)
+
+
+@pytest.mark.parametrize("existing", ["manual", "other-actor", "other-vendor"])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_retarget_cleanup_preserves_unrelated_feedback(
+    monitor: b.Monitor, existing: str, mixed: bool
+) -> None:
+    gh = monitor.gh
+    actor = "human" if existing == "other-actor" else monitor.actor
+    body = (
+        "Manual objection"
+        if existing == "manual"
+        else "<!-- vendor-bot:other -->"
+        if existing == "other-vendor"
+        else monitor.marker
+    )
+    gh.comments.append({"id": 1, "user": {"login": actor}, "body": body})
+    gh.reviews.append(
+        {"id": 1, "user": {"login": actor}, "body": body, "state": "CHANGES_REQUESTED"}
+    )
+    before = copy.deepcopy((gh.comments, gh.reviews))
+    if mixed:
+        monitor._feedback(gh.pr, _issue())
+    gh.pr["base"]["ref"] = "feat/development"
+    monitor.poll()
+    assert monitor.store.get("tracked") == []
+    if mixed:
+        assert gh.comments[:1] == before[0] and gh.reviews[:1] == before[1]
+        if len(gh.reviews) > 1:
+            assert "not applicable on this target branch" in gh.reviews[-1]["body"]
+            assert gh.reviews[-1]["state"] == "DISMISSED"
+    else:
+        assert not gh.writes and (gh.comments, gh.reviews) == before
+
+
+@pytest.mark.parametrize("stage", ["post-response", "dismissal-response", "review-update"])
+def test_retarget_cleanup_recovers_partial_writes_without_sqlite(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue())
+    gh.pr["base"]["ref"] = "feat/development"
+    original = gh.api
+
+    def fail(endpoint, **kwargs):
+        if stage == "review-update" and endpoint.endswith("/reviews/1"):
+            raise RuntimeError("Injected review failure")
+        result = original(endpoint, **kwargs)
+        if (
+            stage == "post-response"
+            and endpoint.endswith("/comments")
+            and kwargs.get("method") == "POST"
+        ) or (stage == "dismissal-response" and endpoint.endswith("/dismissals")):
+            raise RuntimeError("Injected lost response")
+        return result
+
+    monkeypatch.setattr(gh, "api", fail)
+    monitor.poll()
+    assert monitor.store.get("tracked") == [7]
+    assert monitor.store.get("health")["counts"]["errors"] == 1
+    monkeypatch.setattr(gh, "api", original)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, gh, store)
+        restarted.poll()
+        assert store.get("tracked") == []
+        writes = copy.deepcopy(gh.writes)
+        restarted.poll()
+        assert gh.writes == writes
+    assert len(gh.comments) == 2
+    assert gh.reviews[0]["state"] == "DISMISSED"
+    assert "#issuecomment-2" in gh.reviews[0]["body"]
+
+
+def test_retarget_cleanup_retries_denied_dismissal_without_repeating_comment(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gh = monitor.gh
+    monitor._feedback(gh.pr, _issue())
+    gh.pr["base"]["ref"] = "feat/development"
+    original = gh.api
+
+    def denied(endpoint, **kwargs):
+        if endpoint.endswith("/dismissals"):
+            raise RuntimeError("HTTP 403")
+        return original(endpoint, **kwargs)
+
+    monkeypatch.setattr(gh, "api", denied)
+    monitor.poll()
+    monitor.poll()
+    assert monitor.store.get("tracked") == [7]
+    assert len(gh.comments) == 2
+    assert "authorized reviewer" in gh.comments[-1]["body"]
+    assert gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+    monkeypatch.setattr(gh, "api", original)
+    monitor.poll()
+    assert monitor.store.get("tracked") == []
+    assert gh.reviews[0]["state"] == "DISMISSED"
+
+
+@pytest.mark.parametrize("change", ["head", "body", "base", "closed", "dry-run"])
+def test_retarget_cleanup_defers_concurrent_changes_and_dry_run(
+    monitor: b.Monitor, change: str
+) -> None:
+    gh = monitor.gh
+    monitor._discover()
+    monitor._feedback(gh.pr, _issue())
+    gh.pr["base"]["ref"] = "feat/development"
+    snapshot = copy.deepcopy(gh.pr)
+    if change == "head":
+        gh.pr["head"]["sha"] = "b" * 40
+    elif change == "body":
+        gh.pr["body"] = "edited"
+    elif change == "base":
+        gh.pr["base"]["ref"] = "main"
+    elif change == "closed":
+        gh.pr["state"] = "closed"
+    else:
+        monitor.args.publish = False
+    writes = copy.deepcopy(gh.writes)
+    monitor._retargeted(snapshot)
+    assert gh.writes == writes
+    assert monitor.store.get("tracked") == [7]
+    assert gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+
+
+def test_retarget_between_monitors_hands_off_without_dismissing_current_review(
+    monitor: b.Monitor,
+) -> None:
+    gh = monitor.gh
+    monitor._discover()
+    monitor._feedback(gh.pr, _issue())
+    gh.pr["base"]["ref"] = "release/1.3"
+    writes = copy.deepcopy(gh.writes)
+    monitor.inspect(7)
+    assert not monitor.store.get("tracked") and gh.writes == writes
+    with contextlib.closing(b.Store(":memory:")) as store:
+        release_gh = copy.copy(gh)
+        release_gh.base_branch = "release/1.3"
+        release = b.Monitor(monitor.args, release_gh, store)
+        assert release._discover() == [7]
+        release._feedback(gh.pr, _issue())
+        gh.pr["base"]["ref"] = "feat/development"
+        assert monitor._discover() == []
+        release.poll()
+        assert store.get("tracked") == []
+        assert len(gh.comments) == 3
+        assert gh.reviews[0]["state"] == "DISMISSED"
+        writes = copy.deepcopy(gh.writes)
+        monitor.poll()
+        assert gh.writes == writes
 
 
 def test_feedback_rechecks_consumer_base_before_writing(monitor: b.Monitor) -> None:
