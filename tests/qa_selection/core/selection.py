@@ -139,9 +139,9 @@ class SelectionRequest:
 
     @staticmethod
     def ladder_for(text: Optional[str], profile: MachineProfile) -> Ladder:
-        """The parsed `--ladder`, or `[max_gpu_per_node]` when absent; no rung may exceed it."""
+        """The parsed `--ladder`, or the profile's default ladder; no rung may exceed the node."""
         if text is None:
-            return Ladder.of([profile.max_gpu_per_node])
+            return profile.default_ladder
         try:
             ladder = Ladder.parse(text)
         except ValueError as error:

@@ -21,11 +21,12 @@ The ladder chooses the question:
 
 | question | options | writes |
 |---|---|---|
-| what can this machine run? | `--machine=B200` | `B200.json`, `B200-8gpu.ids` |
+| what can this machine run? | `--machine=B200 --ladder=8` | `B200.json`, `B200-8gpu.ids` |
 | what can one N-GPU allocation of it run? | `--machine=B200 --ladder=N` | `B200.json`, `B200-<N>gpu.ids` |
 | how does an allocation policy divide it? | `--machine=B200 --ladder=1,4,8` | `B200.json`, one list per rung |
 
-Without `--selection-out-dir` nothing is written.
+Without `--ladder`, the machine's profile answers: its `ladder` (`1,4,8` for B200), or one rung of
+its GPUs per node when it has none. Without `--selection-out-dir` nothing is written.
 
 `pytest -p qa_selection.plugin --help` documents the three options. `-p` needs `tests/`
 importable: the integration suite's ini `pythonpath` provides it, elsewhere set
@@ -50,8 +51,8 @@ and reports that error as a `pytest.UsageError`.
 
 ## How the pieces connect
 
-**Before collection** the options become a request: the machine's profile and a ladder,
-`[max_gpu_per_node]` when `--ladder` is absent. An unknown machine, a rung above the node, or a
+**Before collection** the options become a request: the machine's profile and a ladder, the
+profile's own when `--ladder` is absent. An unknown machine, a rung above the node, or a
 leftover list of this machine's in the output directory is a usage error, raised before any test
 module is imported.
 
@@ -74,7 +75,7 @@ counts the test-list and waive filtering.
 ## Acceptance tests
 
 ```bash
-pytest tests/qa_selection/tests      # 36 tests, no GPU, no container, no wheel
+pytest tests/qa_selection/tests      # 55 tests, no GPU, no container, no wheel
 ```
 
 Each test states a command line and the answer expected back, derived from the production
@@ -85,6 +86,7 @@ decorators.
 | **Before collection** | A machine and a ladder are the whole command, and without a machine the plugin changes nothing | AC-4 [`test_options.py`](tests/test_options.py) (5), AC-6 [`test_inert.py`](tests/test_inert.py) (2) |
 | **During collection** | The target decides, never the collecting host: its architecture, wherever the mark sits, and its largest rung as the GPU count; a test above that rung is deselected with one reason | AC-1 [`test_arch.py`](tests/test_arch.py) (7), AC-2 [`test_gpu_count.py`](tests/test_gpu_count.py) (7), AC-5 [`test_largest_rung.py`](tests/test_largest_rung.py) (4) |
 | **After collection** | Each kept test is in exactly one list, its smallest rung's, and the terminal explains the run | AC-3 [`test_ladder.py`](tests/test_ladder.py) (6), AC-7 [`test_summary.py`](tests/test_summary.py) (5) |
+| **Catalogue** | Each profile holds its machine's measured facts, and its ladder ends at the node; a run without `--ladder` uses it | [`test_profiles.py`](tests/test_profiles.py) (19) |
 
 ## Config
 
@@ -95,6 +97,6 @@ pre-commit and fails when they drift.
 
 | file | holds |
 |---|---|
-| `profiles.json` | one entry per machine: `sm`, `device_name`, `device_memory_mib`, `max_gpu_per_node`, `cpu_arch` |
+| `profiles.json` | one entry per machine: `sm`, `device_name`, `device_memory_mib`, `max_gpu_per_node`, `cpu_arch`, and an optional `ladder`, the default `--ladder`, whose largest rung is `max_gpu_per_node` |
 | `rules.json` | one rule per `skipif` reason: the profile values that skip it |
 | `markers.json` | each resource marker's declaration, the profile fact it bounds, and whether the conftest reads its closest mark or every level's |
