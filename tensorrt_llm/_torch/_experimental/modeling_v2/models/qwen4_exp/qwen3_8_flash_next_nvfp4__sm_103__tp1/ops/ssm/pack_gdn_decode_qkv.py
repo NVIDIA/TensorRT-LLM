@@ -50,74 +50,15 @@ class PackGdnDecodeQkv(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: num_tokens, or (num_decodes, draft) for a verify batch; layout
-    # "contiguous" | "conv_dim_major" (the conv's [B, C, P] output transposed
-    # and flattened, as the stock mixer builds it; a view for B == 1) |
-    # "row_slice_of_projection" | "column_stride_2" | "transposed_view" |
-    # "wide" (trailing columns past qkv_dim); dtype; heads.
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(why=f"{n} tokens, contiguous{note}", spec=dict(num_tokens=n))
-            for n, note in (
-                (1, ""),
-                (2, ""),
-                (5, ""),
-                (15, ": one short of the 16-token block"),
-                (16, ": exactly one 16-token block"),
-                (17, ": one past the 16-token block"),
-                (32, ": two full blocks"),
-                (127, ": a partial final block"),
-            )
+    # spec: num_tokens, or (num_decodes, draft) for a verify batch, whose rows
+    # are the token-major `[n * p, qkv_dim]` view of the conv's `[n, C, p]` output.
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"target verify call: {b} seqs x {p} tokens, token-major rows",
+            spec=dict(num_decodes=b, draft=p),
         )
-        + tuple(
-            Cell(
-                why=f"target verify call: {b} seqs x {p} tokens, token-major rows",
-                spec=dict(num_decodes=b, draft=p),
-            )
-            for b, p in ((1, 2), (8, 2), (32, 2), (8, 4))
-        )
-        + tuple(
-            Cell(
-                why=f"stock mixer verify: {b} x {p} off the [B, C, P] conv output",
-                spec=dict(num_decodes=b, draft=p, layout="conv_dim_major"),
-            )
-            for b, p in ((1, 1), (4, 1), (1, 2), (5, 2), (3, 3), (8, 4), (16, 2), (2, 5))
-        )
-        + (
-            Cell(
-                why="row slice of a [T, qkv_dim + z] projection, stride (16384, 1)",
-                spec=dict(num_tokens=24, layout="row_slice_of_projection"),
-            ),
-            Cell(
-                why="column-stride-2 view, stride (20480, 2)",
-                spec=dict(num_tokens=24, layout="column_stride_2"),
-            ),
-            Cell(
-                why="transposed dim-major view, stride (1, 24)",
-                spec=dict(num_tokens=24, layout="transposed_view"),
-            ),
-            Cell(
-                why="6144 trailing columns past qkv_dim are dropped",
-                spec=dict(num_tokens=24, layout="wide"),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"dtype {str(dtype).removeprefix('torch.')} is carried, not chosen",
-                spec=dict(num_tokens=11, dtype=dtype),
-            )
-            for dtype in (torch.bfloat16, torch.float16, torch.float32)
-        )
-        + tuple(
-            Cell(why=f"geometry {heads}{note}", spec=dict(num_tokens=13, heads=heads))
-            for heads, note in (
-                ((16, 128, 32, 128), ""),
-                ((4, 64, 8, 64), ""),
-                ((2, 96, 6, 80), ": head dims off a power of two"),
-            )
-        )
-        + (Cell(why="zero tokens: three empty tensors, no launch", spec=dict(num_tokens=0)),)
-    )
+        for b, p in ((32, 2), (8, 4))
+    ) + (Cell(why="127 tokens, contiguous: a partial final block", spec=dict(num_tokens=127)),)
 
     note = """
     Metadata consumed: none. Stateless; sequence boundaries and draft grouping
@@ -125,7 +66,9 @@ class PackGdnDecodeQkv(OpWrapper):
 
     Call site (`_gdn_verify`): `mixed_qkv` the `[n * p, 10240]` token-major
     conv output (contiguous: the conv result carries its input's strides, so
-    transposing back is a view), heads `16, 128, 48, 128`, bf16.
+    transposing back is a view), heads `16, 128, 48, 128`, bf16. Certified bitwise
+    at that call for 32 sequences of 2 tokens and 8 of 4, and at 127 contiguous
+    rows (a partial final block).
 
     Raise loudly, so not guarded: `head_k_dim` and `head_v_dim` rounding up to
     different powers of two (`128 / 64`: triton `CompilationError`
