@@ -25,6 +25,7 @@ import click
 import yaml
 
 import tensorrt_llm.usage as usage
+from tensorrt_llm._startup_errors import log_startup_error
 from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
 from tensorrt_llm.usage.schema import TerminationComponent
 
@@ -166,7 +167,11 @@ def run_with_terminal_reporting(
     default_usage_context: str = "",
     infer_signal_from_exit_code: bool = False,
 ) -> _T:
-    """Run one process boundary and report its terminal outcome."""
+    """Run one process boundary and report its terminal outcome.
+
+    An uncaught exception also gets one classified ERROR line with a hint,
+    unless an inner boundary (e.g. ``LLM`` initialization) already logged it.
+    """
 
     def report(outcome: usage.TerminalOutcome) -> None:
         try:
@@ -222,7 +227,8 @@ def run_with_terminal_reporting(
             )
         )
         raise
-    except Exception:
+    except Exception as exc:
+        log_startup_error(exc, "Command failed")
         signal_number = usage.get_observed_signal()
         report(
             usage.TerminalOutcome(

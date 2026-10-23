@@ -27,6 +27,7 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
+from .._startup_errors import classify_startup_error, wrap_worker_startup_error
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
@@ -449,14 +450,24 @@ def worker_main(
             rpc_addr=rpc_addr,
             hmac_key=hmac_key)
     except Exception as e:
-        logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
+        # Classify here: the cause chain and traceback are lost once the
+        # exception is pickled to the proxy.
+        info = classify_startup_error(e, rank=mpi_rank())
+        stage = f" during {info.stage}" if info.stage else ""
+        logger.error(f"Failed to initialize executor on rank {mpi_rank()}"
+                     f"{stage}: {info.summary}")
         logger.error(traceback.format_exc())
         logger_debug(f"error: {traceback.format_exc()}", "red")
-        if is_leader:
-            # Send error message with confirmation
-            error_msg = (e, traceback.format_exc())
-            if not worker_init_status_queue.notify_with_retry(error_msg):
-                logger.error("Failed to deliver error message to proxy")
+        if not is_leader:
+            # Only the leader has a status queue. The proxy sees a non-leader's
+            # failure through the rank's MPI future, or through the launcher,
+            # which forwards only the type and message of a raised exception.
+            raise wrap_worker_startup_error("Executor worker returned error",
+                                            info) from None
+        # Send error message with confirmation
+        error_msg = (e, traceback.format_exc(), info)
+        if not worker_init_status_queue.notify_with_retry(error_msg):
+            logger.error("Failed to deliver error message to proxy")
         return
 
     # Optionally disable GC (default: not disabled)

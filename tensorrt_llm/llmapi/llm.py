@@ -37,6 +37,7 @@ from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
+from .._startup_errors import log_startup_error, tag_startup_error
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
@@ -63,11 +64,14 @@ from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .startup_checks import (check_architecture_registered,
+                             check_quantization_compute_capability,
+                             check_visible_gpus)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (append_docstring, exception_handler, get_device_count,
-                    logger_debug, set_api_status)
+from .utils import (append_docstring, exception_handler, logger_debug,
+                    set_api_status)
 
 _RUNTIME_MEMORY_TYPES = tuple(
     memory_type for memory_type in ExecutorMemoryType
@@ -470,13 +474,18 @@ class BaseLLM:
         # they must not spawn an MPI session (see GenerationExecutor.create).
         self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
+        # Ray places workers in GPU actors, so a single-GPU Ray driver needs no
+        # local GPU and a multi-GPU world may span nodes. Without Ray, an LLM
+        # that creates its own MPI pool spawns every rank on this node.
+        is_ray = self.args.orchestrator_type == "ray"
+        if (not self._is_attached_frontend
+                and os.getenv("RAY_LOCAL_WORLD_SIZE") is None
+                and (self.args.parallel_config.is_multi_gpu or not is_ray)):
+            check_visible_gpus(self.args.parallel_config,
+                               all_ranks_local=not is_ray
+                               and self.mpi_session is None
+                               and not get_spawn_proxy_process_env())
         if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
-            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
-            ) < self.args.parallel_config.world_size_per_node:
-                raise RuntimeError(
-                    f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
-                )
-
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
@@ -1892,9 +1901,10 @@ class _TorchLLM(BaseLLM):
                              tokenizer_revision,
                              backend=backend,
                              **kwargs)
-        except Exception:
+        except Exception as exc:
             if self._usage_attempt_tracked and _usage is not None:
                 _usage.record_llm_initialization_failure()
+            log_startup_error(exc, "LLM initialization failed")
             raise
 
         try:
@@ -2104,6 +2114,10 @@ class _TorchLLM(BaseLLM):
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
         )
+        # The checkpoint's quantization config is merged by now; fail before
+        # any worker loads weights.
+        check_quantization_compute_capability(self.args)
+        check_architecture_registered(self.args, self._hf_model_config)
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
@@ -2186,9 +2200,10 @@ class _TorchLLM(BaseLLM):
         unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
-            raise ValueError(
-                f"The following arguments are not supported by the PyTorch backend: {unsupported_args}."
-            )
+            raise tag_startup_error(
+                ValueError(
+                    f"The following arguments are not supported by the PyTorch backend: {unsupported_args}."
+                ), "config_input")
 
 
 class LLM(_TorchLLM):
