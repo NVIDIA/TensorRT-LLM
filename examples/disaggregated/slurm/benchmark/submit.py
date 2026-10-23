@@ -69,13 +69,8 @@ def get_server_health_timeout(env_config: Dict[str, Any]) -> int:
     return timeout
 
 
-def save_worker_config(worker_config,
-                       output_path,
-                       internal_request_auth_key=None):
+def save_worker_config(worker_config, output_path):
     """Save worker config to a separate YAML file."""
-    if internal_request_auth_key is not None:
-        worker_config = dict(
-            worker_config, internal_request_auth_key=internal_request_auth_key)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         yaml.dump(worker_config, f, default_flow_style=False)
@@ -587,10 +582,8 @@ def submit_job(config, log_dir, dry_run):
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
-    auth_key = config.get('server_config_extra',
-                          {}).get('internal_request_auth_key')
-    save_worker_config(worker_config['ctx'], ctx_config_path, auth_key)
-    save_worker_config(worker_config['gen'], gen_config_path, auth_key)
+    save_worker_config(worker_config['ctx'], ctx_config_path)
+    save_worker_config(worker_config['gen'], gen_config_path)
 
     # Prepare allocation template
     allocations = allocate_gpus(

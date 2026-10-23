@@ -33,12 +33,6 @@ Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-
 
 ### Disaggregated serving
 
-Native Python RankInfo authentication can be enabled by setting the same
-`internal_request_auth_key` in both workers' `--config` files; the gRPC
-entrypoint forwards it before constructing the LLM. If omitted, workers warn
-and retain unauthenticated RankInfo exchange. Both communicating workers must
-support authentication and use matching keys when it is enabled.
-
 A context worker returns its handoff as a `PrefillReady` event carrying a
 `KvSessionRef`; a generation worker resumes it by echoing that `KvSessionRef`
 back in `GenerateRequest.kv.session`. A request carrying a session is always

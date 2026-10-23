@@ -256,20 +256,13 @@ generation_servers:
       - "localhost:8003"
 ```
 
-Native Python RankInfo authentication is optional. Without a configured key,
-workers log a warning and retain the unauthenticated RankInfo exchange; anyone
-who can reach the RankInfo endpoint can retrieve its transfer metadata.
-To enable authentication, set `internal_request_auth_key` once in the shared
-disaggregated serving YAML. The MPI launcher reads it directly; the simple SLURM
-and Ray example scripts copy it into generated worker configs. For the Ray
-example, pass that YAML using the script's `--disagg_config <path>` option.
-Benchmark configs set `server_config_extra.internal_request_auth_key`, which is
-forwarded to the proxy and workers. No LLM API parameter or generated key is required.
-
-When authentication is enabled, both peers must support the authenticated
-protocol and use the same key; a configured receiver never falls back to an
-unauthenticated response. When neither peer configures a key, the legacy
-RankInfo protocol remains available, including interoperability with older workers.
+Native Python RankInfo authentication is optional. When `internal_request_auth_key`
+is configured, HTTP/gRPC serving forwards it to the native transfer workers;
+communicating peers must use the same key. The MPI launcher reads it from the
+disaggregated serving config; separately launched servers read their own configs.
+Without a key, workers warn and retain unauthenticated RankInfo exchange.
+No key is generated automatically, and configured peers never downgrade to an
+unauthenticated exchange.
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
