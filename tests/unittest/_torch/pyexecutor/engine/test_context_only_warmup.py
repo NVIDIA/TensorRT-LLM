@@ -24,6 +24,7 @@ def _warmup_fixture(context_only: bool, available: int = 64):
         context_swa_layer_limit=20 if context_only else None,
         tokens_per_block=128,
         num_extra_kv_tokens=0,
+        num_locality_domains=1,
         _has_cp_helix=False,
         _stream=SimpleNamespace(cuda_stream=0),
         _create_kv_cache=Mock(
