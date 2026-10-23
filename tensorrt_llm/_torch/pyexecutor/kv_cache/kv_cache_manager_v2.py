@@ -4123,18 +4123,33 @@ class KVCacheManagerV2(BaseResourceManager):
         return clamped
 
     def get_num_free_blocks(self) -> int:
-        # NOTE This method is used to get the number of blocks in the primary pool not the FREE blocks.
-        # However, since we only use this function when the kv cache manager is empty, so it is safe to do so.
-        #
-        # "Empty" means no request holds a cache. The guard page, when it is
-        # enabled, is held by a permanent reservation made at construction, not
-        # by a request, so it is excluded from the check and subtracted from
-        # the count: a caller sizing itself off this number must not plan to
-        # use the page the guard owns.
+        """Estimate warmup block capacity when only permanent reservations remain.
+
+        Explicit specs count independent one-block sequences across all required
+        GPU pools. Longer sequences and resume limits are checked during allocation.
+        """
         reserved = set(self.kv_cache_map) & _RESERVED_REQUEST_IDS
         assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
+        if self.layer_specs is not None:
+            # Each lifecycle needs one slot per block. Coalesced layers share a
+            # lifecycle, while separate lifecycles can compete for the same pool.
+            slots_per_block: dict[int, int] = defaultdict(int)
+            for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
+                slots_per_block[int(pool_id)] += 1
+
+            # Available slots already exclude the guard's permanent reservation.
+            stats = self._get_storage_statistics(GPU_LEVEL)
+            return min(
+                (
+                    int(stats[pool_id].available) // slot_count
+                    for pool_id, slot_count in slots_per_block.items()
+                ),
+                default=0,
+            )
+
+        # Legacy managers estimate primary-pool capacity from page indices.
         max_num_pages = max(
             [
                 self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
