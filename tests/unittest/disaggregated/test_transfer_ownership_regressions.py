@@ -2211,6 +2211,7 @@ def test_bounce_rejects_unregistered_final_destination_before_build() -> None:
         receiver_slice_id=7,
         is_last_slice=False,
         bounce_dst_base=0x3000,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
     sender._deliver_kv_to_agent(write_meta)
