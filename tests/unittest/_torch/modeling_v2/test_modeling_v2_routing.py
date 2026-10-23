@@ -31,7 +31,10 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    modeling_v2_resolve,
+    resolved_max_batch_size,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
@@ -168,6 +171,18 @@ def test_gpt_oss_tp1_matches(mode):
 def test_r1_dep4_matches(mode):
     config = _model_config(_r1_config(), **_DEP4)
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _R1_TARGET
+
+
+def test_the_resolver_records_the_max_batch_size_for_the_target_it_returns():
+    """Not a routing input: the same target at any ``max_batch_size``, which the
+    target reads back at construction."""
+    config = _model_config(_gpt_oss_config())
+    small = modeling_v2_resolve(config, _llm_args(max_batch_size=4))
+    assert resolved_max_batch_size(small) == 4
+    large = modeling_v2_resolve(config, _llm_args(max_batch_size=64))
+    assert large is small
+    assert resolved_max_batch_size(large) == 64
+    assert resolved_max_batch_size(type("NeverResolved", (), {})) is None
 
 
 def test_resolve_class_reads_the_decision_off_the_config():

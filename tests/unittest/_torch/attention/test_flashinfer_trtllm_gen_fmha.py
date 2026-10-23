@@ -169,3 +169,50 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
 
         assert supported, reason
         assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "env,batch,q_len,window_left,expected",
+    [
+        (None, 40, 8, -1, None),
+        ("0", 40, 8, -1, None),
+        ("8", 8, 8, -1, None),
+        ("8", 40, 8, 2047, None),
+        ("8", 40, None, -1, None),
+        ("8", 9, 8, -1, [(0, 4), (4, 9)]),
+        ("8", 40, 8, -1, [(0, 8), (8, 16), (16, 24), (24, 32), (32, 40)]),
+        ("4", 10, 8, -1, [(0, 3), (3, 6), (6, 10)]),
+    ],
+)
+def test_decode_launch_groups(
+    monkeypatch: pytest.MonkeyPatch, env, batch, q_len, window_left, expected
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
+
+    if env is None:
+        monkeypatch.delenv("TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH", env)
+    fi._decode_seqs_per_launch.cache_clear()
+    rows = batch * (q_len or 1)
+    try:
+        groups = fi._decode_launch_groups(batch, q_len, rows, rows, window_left)
+    finally:
+        fi._decode_seqs_per_launch.cache_clear()
+    assert groups == expected
+    if groups is not None:
+        assert groups[0][0] == 0 and groups[-1][1] == batch
+        assert all(a < b for a, b in groups)
+        assert all(b == c for (_, b), (c, _) in zip(groups, groups[1:]))
+
+
+def test_decode_launch_groups_requires_exact_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
+
+    monkeypatch.setenv("TRTLLM_GEN_DECODE_SEQS_PER_LAUNCH", "4")
+    fi._decode_seqs_per_launch.cache_clear()
+    try:
+        assert fi._decode_launch_groups(16, 8, 16 * 8 - 1, 16 * 8, -1) is None
+        assert fi._decode_launch_groups(16, 8, 16 * 8, 16 * 8 + 8, -1) is None
+    finally:
+        fi._decode_seqs_per_launch.cache_clear()

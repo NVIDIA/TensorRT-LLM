@@ -411,6 +411,7 @@ class FullAttnSplitKvFoldAttention:
             or getattr(self, "_preattn_prep", None) is None
             or not self._fits_preattn_prep(qkv, position_ids)
             or self._prep_append_decline(qkv, md) is not None
+            or self._prep_append_requests(md) != 1
         ):
             # Not a step the prep append folds: its own path decides (and records) what runs.
             return super().preprocess_qkv(qkv, position_ids)
@@ -479,7 +480,7 @@ class FullAttnSplitKvFoldAttention:
             dtype=torch.bfloat16,
             device=call.qkv.device,
         )
-        self._split_kv_pending = (part_o, part_lse, rows, out.data_ptr(), call.seq_lens)
+        self._split_kv_pending = (part_o, part_lse, rows, out.data_ptr(), call.seq_lens, 1)
         self._prep_fold_record(FOLD)
         if self._split_kv_census is not None:
             self._split_kv_census.record(self.layer_idx, _split_kv.V4)

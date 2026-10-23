@@ -50,6 +50,8 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             fc_shard,
             fused_accept,
             fixed_gemms,
+            # Passed only when selected, as the load-phase installers' keywords are.
+            **({"fc_inbox": True} if plan.enabled("drafter_fc_inbox") else {}),
         )
     if plan.enabled("context_kv_fork"):
         # Derives from the class draft_head / fused_accept left the worker with;

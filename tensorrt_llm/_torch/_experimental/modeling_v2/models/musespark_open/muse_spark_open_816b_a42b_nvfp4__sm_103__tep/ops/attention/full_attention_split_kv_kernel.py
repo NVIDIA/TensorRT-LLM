@@ -79,6 +79,8 @@ RAW_WIDTH = 2 * (HQ + HKV) * D
 APPEND_THREADS = 64
 #: Query rows the row map is written for: one accepted token and up to 7 drafts.
 MAX_ROWS = 8
+#: Sequences the multi-sequence build (``reqs``) serves in one launch.
+MAX_REQS = 4
 PAGES_PER_TILE = 4
 TILE_KEYS = PAGE * PAGES_PER_TILE
 ROWS = HKV * D  # 128 query rows per CTA (64 per KV head)
@@ -284,6 +286,7 @@ class FullAttnSplitKvKernel:
         rescale_cols: int = D,
         kv_heads: int = HKV,
         max_cta_pages: int = MAX_CTA_PAGES,
+        reqs: int = 1,
     ):
         self.enable_pdl = enable_pdl
         self.prefetch = prefetch and enable_pdl
@@ -323,6 +326,36 @@ class FullAttnSplitKvKernel:
         self.max_cta_pages = max_cta_pages
         self.qkv_width = (self.hq + 2 * kv_heads) * D
         self.raw_width = 2 * (self.hq + kv_heads) * D
+        # The multi-sequence build: ``reqs`` sequences of ``rows`` rows each, the grid's splits
+        # shared among them in proportion to their pages (``request_of``); 1 is the op's build.
+        assert 1 <= reqs <= MAX_REQS, reqs
+        self.reqs = reqs
+
+    @cute.jit
+    def request_of(self, seq_lens, split, nsplit):
+        """(sequence, split among its splits, its splits) of CTA ``split`` in the multi-sequence
+        build: sequence ``i`` of pages ``n_i`` (of ``N`` in all) takes splits from
+        ``start_i = i + (nsplit - reqs) * (n_0 + ... + n_{i-1}) // N``, so each sequence has at
+        least one and the rest follow its share of the pages (``request_splits`` on the host)."""
+        R = self.reqs
+        pages = [(seq_lens[i] + PAGE - 1) // PAGE for i in range(R)]
+        total = pages[0]
+        for i in cutlass.range_constexpr(1, R):
+            total = total + pages[i]
+        starts = [Int32(0)]
+        cum = Int32(0)
+        for i in cutlass.range_constexpr(1, R):
+            cum = cum + pages[i - 1]
+            starts.append(i + (nsplit - R) * cum // total)
+        req = Int32(0)
+        lo = Int32(0)
+        for i in cutlass.range_constexpr(1, R):
+            req = cutlass.select_(split >= starts[i], Int32(i), req)
+            lo = cutlass.select_(split >= starts[i], starts[i], lo)
+        hi = nsplit
+        for i in cutlass.range_constexpr(R - 1, 0, -1):
+            hi = cutlass.select_(split < starts[i], starts[i], hi)
+        return req, split - lo, hi - lo
 
     def pair_index(self):
         """This CTA's pair of KV heads: ``blockIdx.y``, or the constant 0 of a one-pair build
@@ -337,12 +370,12 @@ class FullAttnSplitKvKernel:
         self,
         qkv_ptr: cute.Pointer,  # BF16 [rows, qkv_width], row stride qkv_stride
         pool_ptr: cute.Pointer,  # F8 [num_blocks, kv_heads, 32, 64], contiguous
-        table_ptr: cute.Pointer,  # Int32 [2, table_width], row stride table_stride
-        seq_lens_ptr: cute.Pointer,  # Int32 [1]
+        table_ptr: cute.Pointer,  # Int32 [reqs, 2, table_width], row stride table_stride
+        seq_lens_ptr: cute.Pointer,  # Int32 [reqs]
         kv_scale_ptr: cute.Pointer,  # Float32 [1] (kv_scale_orig_quant)
-        part_o_ptr: cute.Pointer,  # F16 [hq * MAX_ROWS rows, num_splits, 64]
-        part_lse_ptr: cute.Pointer,  # Float32 [hq * MAX_ROWS rows, num_splits]
-        rows: Int32,
+        part_o_ptr: cute.Pointer,  # F16 [reqs * hq * MAX_ROWS rows, num_splits, 64]
+        part_lse_ptr: cute.Pointer,  # Float32 [reqs * hq * MAX_ROWS rows, num_splits]
+        rows: Int32,  # per sequence
         qkv_stride: Int32,
         num_blocks: Int32,
         table_width: Int32,
@@ -363,8 +396,13 @@ class FullAttnSplitKvKernel:
         )
         seq_lens = cute.make_tensor(seq_lens_ptr, cute.make_layout(1))
         kv_scale = cute.make_tensor(kv_scale_ptr, cute.make_layout(1))
-        part_o = cute.make_tensor(part_o_ptr, cute.make_layout(self.hq * MAX_ROWS * num_splits * D))
-        part_lse = cute.make_tensor(part_lse_ptr, cute.make_layout(self.hq * MAX_ROWS * num_splits))
+        if cutlass.const_expr(self.reqs > 1):
+            seq_lens = cute.make_tensor(seq_lens_ptr, cute.make_layout(self.reqs))
+            part_rows = self.reqs * self.hq * MAX_ROWS
+        else:
+            part_rows = self.hq * MAX_ROWS
+        part_o = cute.make_tensor(part_o_ptr, cute.make_layout(part_rows * num_splits * D))
+        part_lse = cute.make_tensor(part_lse_ptr, cute.make_layout(part_rows * num_splits))
 
         one = tcgen05.CtaGroup.ONE
         K = OperandMajorMode.K
@@ -622,7 +660,30 @@ class FullAttnSplitKvKernel:
 
         # Before the dependency wait: the sequence length and the KV scale. No kernel of the
         # step writes either (the op's PDL record), so every warp reads them now.
-        L = seq_lens[0]
+        lsplit = split
+        lcount = nsplit
+        if cutlass.const_expr(self.reqs > 1):
+            # The multi-sequence build: this CTA's sequence and its splits among that sequence's
+            # (every length is a pre-wait read like the one-sequence build's), then that
+            # sequence's rows of Q and of the partials and its row of the block table.
+            req, lsplit, lcount = self.request_of(seq_lens, split, nsplit)
+            L = seq_lens[req]
+            # Each sequence's base keeps the 16-byte alignment of the launch's pointers (the op
+            # requires a qkv row stride of a multiple of 8 elements; the partial blocks are
+            # multiples of 8 H rows), so the Q loads and the partial O stores stay vectorized.
+            q_base = cute.assume(req * rows * qkv.stride[0], divby=8)
+            qkv = cute.make_tensor((qkv.iterator + q_base).align(16), qkv.layout)
+            table = cute.make_tensor(table.iterator + req * 2 * table.stride[0], table.layout)
+            part_o = cute.make_tensor(
+                (part_o.iterator + req * (self.hq * MAX_ROWS * D) * nsplit).align(16),
+                part_o.layout,
+            )
+            part_lse = cute.make_tensor(
+                (part_lse.iterator + req * (self.hq * MAX_ROWS) * nsplit).align(16),
+                part_lse.layout,
+            )
+        else:
+            L = seq_lens[0]
         scale = kv_scale[0]
         cute.arch.barrier()  # barrier inits visible to all warps
 
@@ -634,9 +695,9 @@ class FullAttnSplitKvKernel:
         M = rows
         past = L - M
         n_pages = (L + PAGE - 1) // PAGE
-        eff = cutlass.min(nsplit, (n_pages + self.min_pages - 1) // self.min_pages)
-        p_lo = split * n_pages // eff
-        p_hi = (split + 1) * n_pages // eff
+        eff = cutlass.min(lcount, (n_pages + self.min_pages - 1) // self.min_pages)
+        p_lo = lsplit * n_pages // eff
+        p_hi = (lsplit + 1) * n_pages // eff
         key_lo = p_lo * PAGE
         key_hi = cutlass.min(p_hi * PAGE, L)
         n_tiles = (p_hi - p_lo + PAGES_PER_TILE - 1) // PAGES_PER_TILE
@@ -647,7 +708,7 @@ class FullAttnSplitKvKernel:
 
         bars = (kv_full, kv_empty, s_full, p_full, o_done, q_full, p_full2)
         geo = (L, M, past, p_lo, p_hi, key_lo, key_hi, n_tiles, last_page_tail, last_idx,
-               vfix_tile, split, nsplit)  # fmt: skip
+               vfix_tile, lsplit, nsplit)  # fmt: skip
         # Everything derived from the tiled MMAs is built here, before any role region: the
         # MMA role mutates the tiled MMAs (ACCUMULATE field) and later regions must not use
         # values defined inside it.
@@ -706,7 +767,7 @@ class FullAttnSplitKvKernel:
             cute.make_layout((2, self.max_cta_pages), stride=(self.max_cta_pages, 1)),
         )
 
-        if split < eff:
+        if lsplit < eff:
             # setmaxnreg sits inside each role's branch so ptxas allocates per role.
             if warp == self.load_warp:
                 cute.arch.setmaxregister_decrease(self.regs_other)
@@ -771,7 +832,7 @@ class FullAttnSplitKvKernel:
                         geo,
                     )
                 tmem_bar.arrive_and_wait()
-        if split >= eff:
+        if lsplit >= eff:
             # A split with no keys: its rows' log2-sum-exp is -inf (weight 0 in the combine);
             # thread i writes the row of token i // 16 and query head 16 pair + i % 16.
             # The store waits for the predecessor like every other global write here.
@@ -782,7 +843,7 @@ class FullAttnSplitKvKernel:
                     row_r = tidx
                 else:
                     row_r = (tidx // HQ) * self.hq + pair * HQ + tidx % HQ
-                part_lse[row_r * nsplit + split] = -Float32.inf
+                part_lse[row_r * nsplit + lsplit] = -Float32.inf
         if cutlass.const_expr(self.fold is not None and self.enable_pdl):
             # The fold build waits before it exits, on every path of every thread: its
             # predecessor is the QKV projection, which releases it early, and kernels after
@@ -809,18 +870,34 @@ class FullAttnSplitKvKernel:
         # then the stores): the block table of the sequence is not written by any kernel of the
         # step.
         nj = MAX_CTA_PAGES // 32
-        for ps in cutlass.range_constexpr(self.max_cta_pages // MAX_CTA_PAGES):
-            rk = cute.make_rmem_tensor((nj,), Int32)
-            rv = cute.make_rmem_tensor((nj,), Int32)
-            for j in cutlass.range_constexpr(nj):
-                src = cutlass.min(p_lo + ps * MAX_CTA_PAGES + j * 32 + lane, p_hi - 1)
-                rk[j] = table[0, src]
-                rv[j] = table[1, src]
-            for j in cutlass.range_constexpr(nj):
-                i = ps * MAX_CTA_PAGES + j * 32 + lane
-                if i < n_mine:
-                    ids[0, i] = rk[j]
-                    ids[1, i] = rv[j]
+        if cutlass.const_expr(self.reqs > 1):
+            # The multi-sequence build stages up to MULTI_CTA_PAGES_FACTOR times as many ids:
+            # only the passes this CTA's range needs.
+            for ps in cutlass.range((n_mine + MAX_CTA_PAGES - 1) // MAX_CTA_PAGES, unroll=1):
+                rk = cute.make_rmem_tensor((nj,), Int32)
+                rv = cute.make_rmem_tensor((nj,), Int32)
+                for j in cutlass.range_constexpr(nj):
+                    src = cutlass.min(p_lo + ps * MAX_CTA_PAGES + j * 32 + lane, p_hi - 1)
+                    rk[j] = table[0, src]
+                    rv[j] = table[1, src]
+                for j in cutlass.range_constexpr(nj):
+                    i = ps * MAX_CTA_PAGES + j * 32 + lane
+                    if i < n_mine:
+                        ids[0, i] = rk[j]
+                        ids[1, i] = rv[j]
+        else:
+            for ps in cutlass.range_constexpr(self.max_cta_pages // MAX_CTA_PAGES):
+                rk = cute.make_rmem_tensor((nj,), Int32)
+                rv = cute.make_rmem_tensor((nj,), Int32)
+                for j in cutlass.range_constexpr(nj):
+                    src = cutlass.min(p_lo + ps * MAX_CTA_PAGES + j * 32 + lane, p_hi - 1)
+                    rk[j] = table[0, src]
+                    rv[j] = table[1, src]
+                for j in cutlass.range_constexpr(nj):
+                    i = ps * MAX_CTA_PAGES + j * 32 + lane
+                    if i < n_mine:
+                        ids[0, i] = rk[j]
+                        ids[1, i] = rv[j]
         cute.arch.sync_warp()
         # Pages from this one on may hold a key of the step's own rows, which the step's prep
         # writes: they are loaded only after the dependency wait.

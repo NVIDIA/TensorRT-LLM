@@ -44,6 +44,8 @@ HEADS = 16
 RANK_HEADS = {8: HEADS, 4: 2 * HEADS}
 #: Rows of a decode step: one request's last token and 7 drafts.
 MAX_ROWS = 8
+#: Sequences one call merges (``requests``): ``full_attention_split_kv_multi``'s partials.
+MAX_REQUESTS = 4
 #: Largest number of splits the kernel reads.
 MAX_SPLITS = 512
 
@@ -70,11 +72,32 @@ def _combine_norm_gate_pdl_kernel(
     KEYED_BY_LENGTH: tl.constexpr,
     PAGE: tl.constexpr,
     MIN_PAGES: tl.constexpr,
+    REQS: tl.constexpr = 1,
+    ROWS_PER_REQ: tl.constexpr = 8,
 ):
     if TRIGGER == 2:
         tl.extra.cuda.gdc_launch_dependents()
     keyed = splits
-    if KEYED_BY_LENGTH:
+    if REQS > 1:
+        # Several sequences (full_attention_split_kv_multi): this row's sequence, its splits
+        # (request_of: at least one each, the rest in proportion to the pages; every length is
+        # a pre-wait read as below) and its keyed ones, and its row of the partials.
+        req_token = tl.program_id(0) // HEADS
+        req = req_token // ROWS_PER_REQ
+        total = 0
+        before = 0
+        mine = 0
+        for i in tl.static_range(REQS):
+            n_i = (tl.load(seq_lens + i) + PAGE - 1) // PAGE
+            total += n_i
+            before += tl.where(i < req, n_i, 0)
+            mine += tl.where(i == req, n_i, 0)
+        lo = req + (splits - REQS) * before // total
+        hi = tl.where(req + 1 < REQS, req + 1 + (splits - REQS) * (before + mine) // total, splits)
+        keyed = tl.minimum(hi - lo, (mine + MIN_PAGES - 1) // MIN_PAGES)
+        # A sequence's block of partial rows is 8 tokens (MAX_ROWS) x HEADS.
+        part_row = req * (8 * HEADS) + (req_token % ROWS_PER_REQ) * HEADS + tl.program_id(0) % HEADS
+    elif KEYED_BY_LENGTH:
         # Before the wait: the context length, which no kernel of the step writes. The keyed
         # splits are the first min(splits, ceil(pages / MIN_PAGES)), as full_attention_split_kv cuts them.
         pages = (tl.load(seq_lens) + PAGE - 1) // PAGE
@@ -86,13 +109,15 @@ def _combine_norm_gate_pdl_kernel(
     row = tl.program_id(0)
     token = row // HEADS
     head = row % HEADS
+    if REQS == 1:
+        part_row = row
     offsets = tl.arange(0, HEAD_DIM)
     s = tl.arange(0, SPLITS_P2)
     in_range = s < keyed
     # Every keyed split's log2-sum-exp and O of this row, issued together.
-    lse = tl.load(part_lse + row * splits + s, mask=in_range, other=float("-inf"))
+    lse = tl.load(part_lse + part_row * splits + s, mask=in_range, other=float("-inf"))
     o = tl.load(
-        part_o + (row * splits + s)[:, None] * HEAD_DIM + offsets[None, :],
+        part_o + (part_row * splits + s)[:, None] * HEAD_DIM + offsets[None, :],
         mask=in_range[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -122,7 +147,17 @@ def gate_head_stride(gate: torch.Tensor) -> int:
 
 
 def _launch(
-    out, part_o, part_lse, rows, gate, eps, trigger, combine_only, seq_lens=None, heads=HEADS
+    out,
+    part_o,
+    part_lse,
+    rows,
+    gate,
+    eps,
+    trigger,
+    combine_only,
+    seq_lens=None,
+    heads=HEADS,
+    requests=1,
 ):
     splits = part_lse.shape[1]
     _combine_norm_gate_pdl_kernel[(rows * heads,)](
@@ -145,17 +180,23 @@ def _launch(
         MIN_PAGES=MIN_PAGES,
         num_warps=4,
         launch_pdl=True,
+        # Passed only for several sequences: one sequence launches the kernel without them.
+        **({"REQS": requests, "ROWS_PER_REQ": rows // requests} if requests > 1 else {}),
     )
     return out
 
 
-def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None, heads=HEADS):
+def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None, heads=HEADS, requests=1):
     splits = part_lse.shape[1] if part_lse.dim() == 2 else 0
+    per_req = rows // requests if 1 <= requests <= MAX_REQUESTS else 0
     bad = (
         heads not in RANK_HEADS.values()
+        or not 1 <= requests <= MAX_REQUESTS
+        or rows % max(requests, 1) != 0
+        or (requests > 1 and (seq_lens is None or splits <= requests))
         or part_o.dtype != torch.float16
         or part_o.dim() != 3
-        or part_o.shape[0] < rows * heads
+        or part_o.shape[0] < (rows * heads if requests == 1 else requests * MAX_ROWS * heads)
         or part_o.shape[2] != HEAD_DIM
         or not part_o.is_contiguous()
         or part_lse.dtype != torch.float32
@@ -163,7 +204,7 @@ def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None, heads=HEA
         or not part_lse.is_contiguous()
         or part_o.shape[:2] != part_lse.shape
         or not 1 <= splits <= MAX_SPLITS
-        or not 1 <= rows <= MAX_ROWS
+        or not 1 <= per_req <= MAX_ROWS
         or trigger not in TRIGGERS
     )
     if gate is not None:
@@ -184,12 +225,14 @@ def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None, heads=HEA
     if seq_lens is not None:
         bad = bad or (
             seq_lens.dtype != torch.int32
-            or seq_lens.numel() < 1
+            or seq_lens.numel() < max(requests, 1)
             or seq_lens.device != part_o.device
         )
     if bad:
         raise ValueError(
-            f"combine_norm_gate takes H query heads in {sorted(RANK_HEADS.values())}, contiguous "
+            f"combine_norm_gate takes H query heads in {sorted(RANK_HEADS.values())}, 1.."
+            f"{MAX_REQUESTS} requests (more than one: with seq_lens, more splits than requests, "
+            f"partials of [requests * {MAX_ROWS} * H, ...]), contiguous "
             f"partials FP16 [>= rows * H, splits, "
             f"{HEAD_DIM}] and fp32 [same, splits] (1..{MAX_SPLITS} splits), 1..{MAX_ROWS} rows, "
             f"a BF16 gate [rows, H * {HEAD_DIM}] or [rows, H, {HEAD_DIM}] with unit "
@@ -197,7 +240,7 @@ def _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens=None, heads=HEA
             f"partials' device; got H {heads}, part_o {part_o.dtype} "
             f"{tuple(part_o.shape)}, part_lse {part_lse.dtype} {tuple(part_lse.shape)}, rows "
             f"{rows}, gate {None if gate is None else (gate.dtype, tuple(gate.shape))}, "
-            f"trigger {trigger!r}, seq_lens "
+            f"trigger {trigger!r}, requests {requests}, seq_lens "
             f"{None if seq_lens is None else (seq_lens.dtype, tuple(seq_lens.shape))}"
         )
 
@@ -213,6 +256,11 @@ class CombineNormGate(OpWrapper):
     it changes nothing the kernel computes. ``seq_lens`` (the int32 tensor ``full_attention_split_kv`` read;
     optional) lets the kernel skip the key-less splits' loads; it changes no bit when the
     partials are ``full_attention_split_kv``'s of that context.
+
+    ``requests`` (R, 2..4, with ``seq_lens``): ``full_attention_split_kv_multi``'s partials of R
+    sequences of ``rows / R`` rows each (sequence ``r``'s rows at ``r * 8 H + token * H + head``,
+    its ``request_splits`` count of splits first on the split axis); output and gate rows are
+    the step's rows in order.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -237,11 +285,14 @@ class CombineNormGate(OpWrapper):
         out: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         heads: int = HEADS,
+        requests: int = 1,
     ) -> torch.Tensor:
-        _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens, heads)
+        _checks(part_o, part_lse, rows, gate, trigger, out, seq_lens, heads, requests)
         if out is None:
             out = torch.empty(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=part_o.device)
-        return _launch(out, part_o, part_lse, rows, gate, eps, trigger, False, seq_lens, heads)
+        return _launch(
+            out, part_o, part_lse, rows, gate, eps, trigger, False, seq_lens, heads, requests
+        )
 
     def reference(
         self,
@@ -254,12 +305,32 @@ class CombineNormGate(OpWrapper):
         out: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         heads: int = HEADS,
+        requests: int = 1,
     ) -> torch.Tensor:
         """fp64 merge, rounded to BF16 as the op does, then fp64 between the norm-gate's BF16
         rounding points. ``trigger`` and ``out`` change when and where, not what; with
-        ``seq_lens`` only the keyed splits are merged."""
-        from .full_attention_split_kv import keyed_splits, merge_partials
+        ``seq_lens`` only the keyed splits are merged; several ``requests`` are each merged
+        over their own splits (``request_splits``)."""
+        from .full_attention_split_kv import keyed_splits, merge_partials, request_splits
 
+        if requests > 1:
+            per_req = rows // requests
+            block = MAX_ROWS * heads
+            spans = request_splits(seq_lens[:requests].tolist(), part_lse.shape[1])
+            return torch.cat(
+                [
+                    self.reference(
+                        part_o[r * block : (r + 1) * block, :n],
+                        part_lse[r * block : (r + 1) * block, :n],
+                        per_req,
+                        gate[r * per_req : (r + 1) * per_req],
+                        eps,
+                        seq_lens=seq_lens[r : r + 1],
+                        heads=heads,
+                    )
+                    for r, (_, n) in enumerate(spans)
+                ]
+            )
         if seq_lens is not None:
             keyed = keyed_splits(int(seq_lens[0]), part_lse.shape[1])
             part_o, part_lse = part_o[:, :keyed], part_lse[:, :keyed]
@@ -278,12 +349,13 @@ def combine_only(
     trigger: str = "exit",
     seq_lens: Optional[torch.Tensor] = None,
     heads: int = HEADS,
+    requests: int = 1,
 ) -> torch.Tensor:
     """The merged attention output ``[rows, H * 64]`` BF16 of ``full_attention_split_kv``'s partials
-    (``seq_lens`` and ``heads`` as in ``combine_norm_gate``)."""
-    _checks(part_o, part_lse, rows, None, trigger, None, seq_lens, heads)
+    (``seq_lens``, ``heads`` and ``requests`` as in ``combine_norm_gate``)."""
+    _checks(part_o, part_lse, rows, None, trigger, None, seq_lens, heads, requests)
     out = torch.empty(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=part_o.device)
-    return _launch(out, part_o, part_lse, rows, None, 0.0, trigger, True, seq_lens, heads)
+    return _launch(out, part_o, part_lse, rows, None, 0.0, trigger, True, seq_lens, heads, requests)
 
 
 combine_norm_gate = CombineNormGate()

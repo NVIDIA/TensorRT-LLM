@@ -81,8 +81,15 @@ def block_of(ranks: int) -> int:
     raise ValueError(f"ring_buddy_assign serves rings of {sorted(RING_SIZES)} ranks, got {ranks}")
 
 
-#: Largest ``M * TOP_K`` one program handles (M <= 16 decode rows).
-MAX_SLOTS = 128
+#: Largest ``M * TOP_K`` one program handles (M <= 32 decode rows: four requests'
+#: K = 7 verify steps).
+MAX_SLOTS = 256
+
+#: The half window (``half_window_experts``, tep4): a block's upper half starts at this
+#: local index, and the stack ``[own block | the predecessor's upper half]`` holds
+#: this many local experts.
+HALF_FROM = 32
+HALF_SPAN = 96
 
 
 #: Warps of the one program at every slot tile. The kernel is a chain of small
@@ -132,9 +139,13 @@ def _ring_buddy_assign_kernel(
     BLOCK: tl.constexpr,
     BALANCE: tl.constexpr,
     STATIC_FROM: tl.constexpr,
+    HALF: tl.constexpr,
 ):
     tl.static_assert(BLOCK == 32 or BLOCK == 64, "one 32- or 64-bit presence word per block")
+    tl.static_assert(not HALF or (BLOCK == 64 and BALANCE), "the half window: tep4, balanced")
     WIDE: tl.constexpr = BLOCK == 64
+    UPPER: tl.constexpr = BLOCK // 2  # HALF_FROM
+    SPAN: tl.constexpr = BLOCK + BLOCK // 2  # HALF_SPAN
     s = tl.arange(0, SLOTS)
     smask = s < num_slots
     g = tl.load(selected_ptr + s, mask=smask, other=0)
@@ -168,6 +179,12 @@ def _ring_buddy_assign_kernel(
             (arc + RANKS - 1) // RANKS,
             (arc + span[None, :]) // (span[None, :] + 1),
         )
+        if HALF:
+            # Only block r's upper half crosses the edge r -> r + 1, so every arc of n
+            # blocks ending at r also needs T >= ceil((arc - movable[r]) / n)
+            # (``ring_windows.half_smallest_max``); arc >= movable[r].
+            movable = _popc(word >> UPPER, WIDE)  # [RANKS]
+            need = tl.maximum(need, (arc - movable[:, None] + span[None, :] - 1) // span[None, :])
         t = tl.max(tl.max(need, axis=1), axis=0)
         x = tl.max(tl.maximum(arc - span[None, :] * t, 0), axis=1)  # [RANKS]
     elif STATIC_FROM < BLOCK:
@@ -185,11 +202,20 @@ def _ring_buddy_assign_kernel(
     x_blk = tl.sum(tl.where(in_rank, x[None, :], 0), axis=1)  # [SLOTS]
     er = (blk + (above < x_blk).to(tl.int32)) % RANKS
 
-    local = tl.where(
-        er == rank,
-        tl.where(blk == rank, i, BLOCK + i),
-        2 * BLOCK + g % (EXPERTS - 2 * BLOCK),
-    )
+    if HALF:
+        # A moved expert lies in its block's upper half, whose copy sits at local ids
+        # BLOCK..HALF_SPAN-1 (``ring_windows.place_half``).
+        local = tl.where(
+            er == rank,
+            tl.where(blk == rank, i, BLOCK - UPPER + i),
+            SPAN + g % (EXPERTS - SPAN),
+        )
+    else:
+        local = tl.where(
+            er == rank,
+            tl.where(blk == rank, i, BLOCK + i),
+            2 * BLOCK + g % (EXPERTS - 2 * BLOCK),
+        )
     tl.store(local_ids_ptr + s, local, mask=smask)
     tl.store(weights_bf16_ptr + s, w.to(tl.bfloat16), mask=smask)
 
@@ -233,14 +259,17 @@ class RingBuddyAssign(OpWrapper):
     (or the owner-only window); with ``balance=False`` and ``static_from`` below
     the block size, local experts ``static_from..`` of every block run on the
     successor at every step instead (a routing-independent regrouping, the
-    static placement). ``static_from`` defaults to the block size.
+    static placement). ``static_from`` defaults to the block size. ``half=True``
+    (tep4, ``half_window_experts``) is the balanced placement onto the successor's
+    copy of each block's upper half only (``ring_windows.place_half``): its ids
+    address the 96-expert ``[own block | predecessor's experts 32..63]`` stack.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Pure function of ``selected`` and ``rank``; one program, so it is meant for
-    decode rows (``M * 8 <= 128``). Duplicate ids within a row are not expected
+    decode rows (``M * 8 <= 256``). Duplicate ids within a row are not expected
     (top-k selection is distinct) and are counted once in the census.
 
     The rewritten ids are meaningful only for an expert call with
@@ -259,6 +288,7 @@ class RingBuddyAssign(OpWrapper):
         balance: bool = True,
         static_from: Optional[int] = None,
         ranks: int = RANKS,
+        half: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         block = block_of(ranks)
         static_from = block if static_from is None else static_from
@@ -279,8 +309,9 @@ class RingBuddyAssign(OpWrapper):
             EXPERTS=EXPERTS,
             RANKS=ranks,
             BLOCK=block,
-            BALANCE=balance,
+            BALANCE=balance or half,
             STATIC_FROM=static_from,
+            HALF=half,
             num_warps=NUM_WARPS,
         )
         return local_ids, weights_bf16, stats
@@ -293,8 +324,21 @@ class RingBuddyAssign(OpWrapper):
         balance: bool = True,
         static_from: Optional[int] = None,
         ranks: int = RANKS,
+        half: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The placement in plain Python over the host copy of ``selected``."""
+        """The placement in plain Python over the host copy of ``selected``
+        (``ring_windows.place_half`` with ``half``)."""
+        if half:
+            from ...kernels.replicated_experts import windows as _windows
+
+            flat = [int(v) for v in selected.reshape(-1).tolist()]
+            local, stats = _windows.place_half(flat, rank)
+            device = selected.device
+            return (
+                torch.tensor(local, dtype=torch.int32, device=device).reshape(selected.shape),
+                weights.to(torch.bfloat16),
+                torch.tensor(stats, dtype=torch.int32, device=device),
+            )
         size = block_of(ranks)
         static_from = size if static_from is None else static_from
         flat = [int(v) for v in selected.reshape(-1).tolist()]
@@ -339,8 +383,10 @@ class RingBuddyAssign(OpWrapper):
         balance: bool = True,
         static_from: Optional[int] = None,
         ranks: int = RANKS,
+        half: bool = False,
     ) -> None:
         """Inputs the kernel would read past or misplace without an error."""
+        assert not half or ranks == 4, "the half window is a tep4 placement"
         assert ranks in RING_SIZES, f"ranks must be one of {sorted(RING_SIZES)}, got {ranks}"
         block = block_of(ranks)
         static_from = block if static_from is None else static_from
@@ -351,7 +397,7 @@ class RingBuddyAssign(OpWrapper):
             f"selected must be [M, {TOP_K}], got {tuple(selected.shape)}"
         )
         assert 0 < selected.numel() <= MAX_SLOTS, (
-            f"one program covers at most {MAX_SLOTS} slots (M <= 16), got {selected.numel()}"
+            f"one program covers at most {MAX_SLOTS} slots (M <= 32), got {selected.numel()}"
         )
         assert weights.dtype == torch.float32 and weights.is_contiguous(), (
             "weights must be contiguous float32"

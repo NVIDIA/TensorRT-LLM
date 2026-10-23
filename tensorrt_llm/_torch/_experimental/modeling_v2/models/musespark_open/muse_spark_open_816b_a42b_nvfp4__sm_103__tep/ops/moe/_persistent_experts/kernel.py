@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Persistent NVFP4 expert kernel for M <= 8 decode rows (CuTe DSL, SM100 family).
 
+Wide builds (``ntok`` 16): the same kernel with ``ntok`` token columns -- MMA N, the B
+operand stages, the compact SFB chunk, the FC1 staging tile and the tagged hand-off words
+scale with it (``geometry``); everything below is written for the ``ntok = 8`` build,
+whose constants are the module's ``NTOK`` ones.
+
 One launch per MoE layer replaces TRTLLM-gen's routing-indices kernel, FC1
 and FC2 for the rows of one expert-parallel window of ``L`` local experts
 (32 = this rank's own block, 64 = the ring-buddy stack, 96 = the
@@ -131,6 +136,70 @@ HSTAGE_BYTES = HSTAGE_SF + NTOK * 4
 #: Workspace bytes per slot, enough for either hand-off.
 WS_SLOT_BYTES = max(IMG_BYTES, TAG_SLOT_BYTES)
 
+#: Token columns a build is compiled for: the 8-row decode step, and the wide build of a
+#: TP4 decode step of two requests.
+NTOKS = (8, 16)
+
+
+class Geometry:
+    """The ``ntok``-dependent sizes of a build; ``Geometry(NTOK)`` is the module constants.
+
+    B operand stages of ``ntok`` rows x 128 FP4 bytes; the compact SFB keeps token rows
+    ``0 .. ntok - 1`` of each 128-row scale chunk (``16 ntok`` bytes apart); the FC1 tile's
+    staged output is ``ntok`` rows x 32 code bytes then ``ntok`` x 4 scale bytes; a tagged
+    tile is those ``9 ntok`` words.
+    """
+
+    def __init__(self, ntok: int):
+        assert ntok in NTOKS, ntok
+        self.ntok = ntok
+        self.route = ntok * TOP_K  # (token, k) routing lanes
+        self.b_stage_bytes = ntok * KTILE // 2
+        self.sfb_chunk = 16 * ntok
+        self.sfb_stage = 4 * self.sfb_chunk
+        self.sfb_bytes = (B_STAGES - 1) * self.sfb_stage + 3 * self.sfb_chunk + 512
+        self.img_b_bytes = FC2_KB * self.b_stage_bytes
+        self.img_sf_bytes = FC2_KB * self.sfb_stage
+        self.img_bytes = self.img_b_bytes + self.img_sf_bytes
+        self.img_kb_tx = self.b_stage_bytes + self.sfb_stage
+        self.tag_code_words = 8 * ntok
+        self.tag_tile_words = 9 * ntok
+        self.tag_tile_bytes = self.tag_tile_words * 8
+        self.tag_kb_bytes = 4 * self.tag_tile_bytes
+        self.tag_slot_bytes = 64 * self.tag_tile_bytes
+        self.tag_lane_words = self.tag_kb_bytes // 8 // 32
+        self.hstage_sf = ntok * 32
+        self.hstage_bytes = self.hstage_sf + ntok * 4
+        self.ws_slot_bytes = max(self.img_bytes, self.tag_slot_bytes)
+
+
+_G8 = Geometry(NTOK)
+assert (
+    _G8.b_stage_bytes,
+    _G8.sfb_chunk,
+    _G8.sfb_stage,
+    _G8.sfb_bytes,
+    _G8.img_bytes,
+    _G8.img_kb_tx,
+    _G8.tag_tile_words,
+    _G8.tag_lane_words,
+    _G8.hstage_sf,
+    _G8.hstage_bytes,
+    _G8.ws_slot_bytes,
+) == (
+    B_STAGE_BYTES,
+    SFB_CHUNK_STRIDE,
+    SFB_STAGE_STRIDE,
+    SFB_BYTES,
+    IMG_BYTES,
+    IMG_KB_TX,
+    TAG_TILE_WORDS,
+    TAG_LANE_WORDS,
+    HSTAGE_SF,
+    HSTAGE_BYTES,
+    WS_SLOT_BYTES,
+)
+
 # Warp roles
 EPI_WARPS = 4
 MMA_WARP = 4
@@ -214,12 +283,17 @@ class PersistentExpertsKernel:
         early_fallbacks: int = 0,
         early_deadline_ns: int = 100_000,
         early_poll_ns: int = 32,
+        ntok: int = NTOK,
     ):
         assert num_ctas <= MAX_CTAS
         assert num_local in (32, 64, 96)
         # fastroute's warp-local bit set is two words wide
         assert num_local <= 64 or fastroute == 0, "fastroute supports windows up to 64"
-        assert acc_stages * NTOK <= TMEM_SFA_COL
+        self.g = Geometry(ntok)
+        self.ntok = ntok
+        assert acc_stages * ntok <= TMEM_SFA_COL
+        # A wide build's slot table keeps 64 slots: at most 64 distinct local experts.
+        assert ntok == NTOK or (num_local <= 64 and early_ids == 0)
         if early_ids != 0 and (fastroute != 0 or early_fallbacks == 0):
             # The fast route reads the ids from global memory in the TMA warp,
             # which never waits in early mode.
@@ -249,8 +323,17 @@ class PersistentExpertsKernel:
         self.early_poll_ns = early_poll_ns
         self.sf_vec_size = 16
         self.cta_group = tcgen05.CtaGroup.ONE
-        self.mma_inst_mn = (128, NTOK)
-        self.mma_tiler = (128, NTOK, KTILE)
+        self.mma_inst_mn = (128, ntok)
+        self.mma_tiler = (128, ntok, KTILE)
+
+    def _sw(self, r):
+        """The 128-byte swizzle's XOR row of operand row ``r`` (rows 8 apart share one).
+
+        A plain Python method: the ``ntok = 8`` build traces ``r`` itself.
+        """
+        if self.ntok == NTOK:
+            return r
+        return r % 8
 
     def _setup(self):
         self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -275,13 +358,13 @@ class PersistentExpertsKernel:
             self.tiled_mma, self.mma_tiler, cutlass.Float4E2M1FN, B_STAGES
         )
         # Standard SFB layout (defines the TMEM layout) and the compact SMEM
-        # layout actually used for storage (see SFB_CHUNK_STRIDE).
+        # layout actually used for storage (see SFB_CHUNK_STRIDE and ``Geometry``).
         self.sfb_smem_layout_std = blockscaled_utils.make_smem_layout_sfb(
             self.tiled_mma, self.mma_tiler, self.sf_vec_size, B_STAGES
         )
         self.sfb_smem_layout_staged = cute.make_layout(
             self.sfb_smem_layout_std.shape,
-            stride=((((16, 4), 0), (0, 1)), 0, SFB_CHUNK_STRIDE, SFB_STAGE_STRIDE),
+            stride=((((16, 4), 0), (0, 1)), 0, self.g.sfb_chunk, self.g.sfb_stage),
         )
 
     @cute.jit
@@ -354,13 +437,15 @@ class PersistentExpertsKernel:
             acc_mbar: cute.struct.MemRange[cutlass.Int64, 2 * self.acc_stages]
             b_mbar: cute.struct.MemRange[cutlass.Int64, NUM_BAR]
             tmem_holding: cutlass.Int32
-            hstage: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, HSTAGE_BYTES // 8], 16]
+            hstage: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int64, self.g.hstage_bytes // 8], 16
+            ]
             misc: cute.struct.MemRange[cutlass.Int32, 8]
             bitmap: cute.struct.MemRange[cutlass.Uint32, self.bitmap_words]
-            slot_ids: cute.struct.MemRange[cutlass.Int32, MAX_SLOTS]
+            slot_ids: cute.struct.MemRange[cutlass.Int32, self.g.route]
             slot_expert: cute.struct.MemRange[cutlass.Int32, MAX_SLOTS]
             slot_mask: cute.struct.MemRange[cutlass.Uint32, MAX_SLOTS]
-            slot_k: cute.struct.MemRange[cutlass.Int32, MAX_SLOTS * NTOK]
+            slot_k: cute.struct.MemRange[cutlass.Int32, MAX_SLOTS * self.ntok]
             expert_slot: cute.struct.MemRange[cutlass.Int32, self.expert_slots]
             slot_scalars: cute.struct.MemRange[cutlass.Float32, 3 * MAX_SLOTS]
             sA: cute.struct.Align[
@@ -381,7 +466,9 @@ class PersistentExpertsKernel:
                 ],
                 1024,
             ]
-            sSFB: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, SFB_BYTES], 1024]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN, self.g.sfb_bytes], 1024
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -499,10 +586,10 @@ class PersistentExpertsKernel:
 
         s_misc = storage.misc.get_tensor(cute.make_layout(8))
         s_bitmap = storage.bitmap.get_tensor(cute.make_layout(self.bitmap_words))
-        s_ids = storage.slot_ids.get_tensor(cute.make_layout(MAX_SLOTS))
+        s_ids = storage.slot_ids.get_tensor(cute.make_layout(self.g.route))
         s_slot_expert = storage.slot_expert.get_tensor(cute.make_layout(MAX_SLOTS))
         s_slot_mask = storage.slot_mask.get_tensor(cute.make_layout(MAX_SLOTS))
-        s_slot_k = storage.slot_k.get_tensor(cute.make_layout(MAX_SLOTS * NTOK))
+        s_slot_k = storage.slot_k.get_tensor(cute.make_layout(MAX_SLOTS * self.ntok))
         s_expert_slot = storage.expert_slot.get_tensor(cute.make_layout(self.expert_slots))
         if tidx < MAX_SLOTS:
             s_slot_mask[tidx] = Uint32(0)
@@ -510,7 +597,7 @@ class PersistentExpertsKernel:
         if cutlass.const_expr(self.expert_slots > MAX_SLOTS):
             if (tidx >= MAX_SLOTS) & (tidx < self.expert_slots):
                 s_expert_slot[tidx] = Int32(-1)
-        for i in cutlass.range_constexpr(MAX_SLOTS * NTOK // NUM_THREADS):
+        for i in cutlass.range_constexpr(MAX_SLOTS * self.ntok // NUM_THREADS):
             s_slot_k[tidx + i * NUM_THREADS] = Int32(TOP_K)  # above every slot index (atomic min)
         if tidx < self.bitmap_words:
             s_bitmap[tidx] = Uint32(0)
@@ -542,7 +629,7 @@ class PersistentExpertsKernel:
 
         # -------- window ids -> sorted slots of the active local experts --------
         # Warps 0-1, one lane per (token, slot).
-        if tidx < MAX_SLOTS:
+        if tidx < self.g.route:
             t = tidx // TOP_K
             gid = Int32(-1)
             if t < num_tokens:
@@ -580,7 +667,7 @@ class PersistentExpertsKernel:
                 s_slot_expert[prefix] = e
                 s_expert_slot[e] = prefix
         self._route_barrier(warp_idx)
-        if tidx < MAX_SLOTS:
+        if tidx < self.g.route:
             lid = s_ids[tidx]
             if lid >= 0:
                 t = tidx // TOP_K
@@ -589,7 +676,7 @@ class PersistentExpertsKernel:
                 # to it once, through its first such slot (TRTLLM-gen's routing
                 # also lays out one row per (token, expert)): the smallest k wins.
                 ptx.atom_min_shared_s32(
-                    Int32(storage.slot_k.data_ptr().toint()) + (sl * NTOK + t) * 4,
+                    Int32(storage.slot_k.data_ptr().toint()) + (sl * self.ntok + t) * 4,
                     tidx % TOP_K,
                 )
                 ptx.atom_or_shared_u32(
@@ -793,13 +880,13 @@ class PersistentExpertsKernel:
         routing barriers; the finalize reads the map only after this grid has
         completed.
         """
-        if tidx < MAX_SLOTS:
+        if tidx < self.g.route:
             t = tidx // TOP_K
             if t < num_tokens:
                 out = Int32(-1)
                 lid = s_ids[tidx]
                 if lid >= 0:
-                    if s_slot_k[s_expert_slot[lid] * NTOK + t] == tidx % TOP_K:
+                    if s_slot_k[s_expert_slot[lid] * self.ntok + t] == tidx % TOP_K:
                         out = tidx
                 ptx.st_u32(index_addr + tidx * 4, Uint32(out))
 
@@ -821,14 +908,14 @@ class PersistentExpertsKernel:
         if r >= num_slots:
             words = FC1_MT
             if cutlass.const_expr(self.handoff != 0):
-                words = FC1_MT * TAG_TILE_WORDS
+                words = FC1_MT * self.g.tag_tile_words
             # word w of the slot goes to CTA w % grid0, epilogue thread (w // grid0) % 128
             i = Int32(tidx)
             while i * grid0 + cta < words:
                 w = i * grid0 + cta
                 if cutlass.const_expr(self.handoff != 0):
                     ptx.st_relaxed_gpu_u64_pair(
-                        img_addr + Int64(r) * TAG_SLOT_BYTES + Int64(w) * 8,
+                        img_addr + Int64(r) * self.g.tag_slot_bytes + Int64(w) * 8,
                         Uint32(0),
                         epoch,
                     )
@@ -879,7 +966,7 @@ class PersistentExpertsKernel:
         """
         n_ids = num_tokens * TOP_K
         gids = []
-        for i in cutlass.range_constexpr(MAX_SLOTS // 32):
+        for i in cutlass.range_constexpr(self.g.route // 32):
             idx = lane + 32 * i
             src = idx
             if idx >= n_ids:
@@ -887,7 +974,7 @@ class PersistentExpertsKernel:
             gids.append(Int32(ptx.ld_u32(ids_addr + src * 4)))
         lo = Uint32(0)
         hi = Uint32(0)
-        for i in cutlass.range_constexpr(MAX_SLOTS // 32):
+        for i in cutlass.range_constexpr(self.g.route // 32):
             gid = gids[i]
             if (lane + 32 * i < n_ids) & (gid >= 0) & (gid < self.num_local):
                 if gid < 32:
@@ -1254,7 +1341,7 @@ class PersistentExpertsKernel:
         # L2 round trip instead of one per load.
         last = num_tokens - 1
         codes = []
-        for i in cutlass.range_constexpr(X_ROW_BYTES * NTOK // 16 // 64):
+        for i in cutlass.range_constexpr(X_ROW_BYTES * self.ntok // 16 // 64):
             c = q + 64 * i
             n = c // (X_ROW_BYTES // 16)
             cc = c - n * (X_ROW_BYTES // 16)
@@ -1263,7 +1350,7 @@ class PersistentExpertsKernel:
                 nn = last
             codes.append(ptx.ld_v4_u32(x_addr + nn * X_ROW_BYTES + cc * 16))
         scales = []
-        for i in cutlass.range_constexpr(X_SF_ROW_BYTES * NTOK // 4 // 64):
+        for i in cutlass.range_constexpr(X_SF_ROW_BYTES * self.ntok // 4 // 64):
             w = q + 64 * i
             n = w // (X_SF_ROW_BYTES // 4)
             j = w - n * (X_SF_ROW_BYTES // 4)
@@ -1271,7 +1358,7 @@ class PersistentExpertsKernel:
             if n > last:
                 nn = last
             scales.append(ptx.ld_u32(xsf_addr + nn * X_SF_ROW_BYTES + j * 4))
-        for i in cutlass.range_constexpr(X_ROW_BYTES * NTOK // 16 // 64):
+        for i in cutlass.range_constexpr(X_ROW_BYTES * self.ntok // 16 // 64):
             c = q + 64 * i
             n = c // (X_ROW_BYTES // 16)
             cc = c - n * (X_ROW_BYTES // 16)
@@ -1288,16 +1375,20 @@ class PersistentExpertsKernel:
                 d2 = Uint32(0)
                 d3 = Uint32(0)
             ptx.sts_v4_u32(
-                sb + (X_STAGE0 + kb) * B_STAGE_BYTES + n * 128 + ((c16 ^ n) * 16), d0, d1, d2, d3
+                sb + (X_STAGE0 + kb) * self.g.b_stage_bytes + n * 128 + ((c16 ^ self._sw(n)) * 16),
+                d0,
+                d1,
+                d2,
+                d3,
             )
-        for i in cutlass.range_constexpr(X_SF_ROW_BYTES * NTOK // 4 // 64):
+        for i in cutlass.range_constexpr(X_SF_ROW_BYTES * self.ntok // 4 // 64):
             w = q + 64 * i
             n = w // (X_SF_ROW_BYTES // 4)
             j = w - n * (X_SF_ROW_BYTES // 4)
             v = scales[i]
             if n > last:
                 v = Uint32(0)
-            ptx.sts_u32(ssfb + X_STAGE0 * SFB_STAGE_STRIDE + j * SFB_CHUNK_STRIDE + n * 16, v)
+            ptx.sts_u32(ssfb + X_STAGE0 * self.g.sfb_stage + j * self.g.sfb_chunk + n * 16, v)
         ptx.fence_proxy_async_shared()
         ptx.bar_sync(BAR_X, 64)
         if q == 0:
@@ -1375,19 +1466,19 @@ class PersistentExpertsKernel:
                             # CTAs; the bulk copy reads it through the async proxy
                             ptx.fence_proxy_async_global()
                             bar = full0 + (buf * FC2_KB + kb) * 8
-                            ptx.mbar_arrive_expect_tx(bar, Int32(IMG_KB_TX))
+                            ptx.mbar_arrive_expect_tx(bar, Int32(self.g.img_kb_tx))
                             stage = IMG_STAGE0 + buf * FC2_KB + kb
-                            src = img_addr + Int64(slot) * IMG_BYTES
+                            src = img_addr + Int64(slot) * self.g.img_bytes
                             ptx.bulk_g2s(
-                                sb + stage * B_STAGE_BYTES,
-                                src + kb * B_STAGE_BYTES,
-                                Int32(B_STAGE_BYTES),
+                                sb + stage * self.g.b_stage_bytes,
+                                src + kb * self.g.b_stage_bytes,
+                                Int32(self.g.b_stage_bytes),
                                 bar,
                             )
                             ptx.bulk_g2s(
-                                ssfb + stage * SFB_STAGE_STRIDE,
-                                src + IMG_B_BYTES + kb * SFB_STAGE_STRIDE,
-                                Int32(SFB_STAGE_STRIDE),
+                                ssfb + stage * self.g.sfb_stage,
+                                src + self.g.img_b_bytes + kb * self.g.sfb_stage,
+                                Int32(self.g.sfb_stage),
                                 bar,
                             )
                     issued = issued | new
@@ -1437,18 +1528,18 @@ class PersistentExpertsKernel:
         src_off = []
         dst_off = []
         is_sf = []
-        for i in cutlass.range_constexpr(TAG_LANE_WORDS):
+        for i in cutlass.range_constexpr(self.g.tag_lane_words):
             gw = lane + 32 * i
-            t4 = gw // TAG_TILE_WORDS
-            w = gw - t4 * TAG_TILE_WORDS
+            t4 = gw // self.g.tag_tile_words
+            w = gw - t4 * self.g.tag_tile_words
             r = w // 8
             wr = w - r * 8
             c16 = 2 * t4 + wr // 4
-            off_b = r * 128 + ((c16 ^ r) * 16) + (wr % 4) * 4
-            off_s = t4 * SFB_CHUNK_STRIDE + (w - 64) * 16
+            off_b = r * 128 + ((c16 ^ self._sw(r)) * 16) + (wr % 4) * 4
+            off_s = t4 * self.g.sfb_chunk + (w - self.g.tag_code_words) * 16
             sf = Int32(0)
             off = off_b
-            if w >= 64:
+            if w >= self.g.tag_code_words:
                 sf = Int32(1)
                 off = off_s
             src_off.append(gw * 8)
@@ -1465,7 +1556,7 @@ class PersistentExpertsKernel:
                     cute.arch.mbarrier_wait(b_mbar + IMG_EMPTY_BAR + buf, (use - 1) % 2)
                 if cutlass.const_expr(self.delay & DELAY_CONSUMER):
                     self._delay_spin(DELAY_CONSUMER * 53, cta)
-                slot_base = img_addr + Int64(slot) * TAG_SLOT_BYTES
+                slot_base = img_addr + Int64(slot) * self.g.tag_slot_bytes
                 for ps in cutlass.range_constexpr(FC2_KB // 2 // TAG_PASS_KB):
                     kb0 = half * (FC2_KB // 2) + ps * TAG_PASS_KB
                     delivered = Int32(0)
@@ -1473,10 +1564,10 @@ class PersistentExpertsKernel:
                         payload = []
                         valid = []
                         for q in cutlass.range_constexpr(TAG_PASS_KB):
-                            src = slot_base + Int64((kb0 + q) * TAG_KB_BYTES)
+                            src = slot_base + Int64((kb0 + q) * self.g.tag_kb_bytes)
                             ok = Int32(1)
                             pl = []
-                            for i in cutlass.range_constexpr(TAG_LANE_WORDS):
+                            for i in cutlass.range_constexpr(self.g.tag_lane_words):
                                 lo, hi = ptx.ld_relaxed_gpu_u64_pair(src + Int64(src_off[i]))
                                 pl.append(lo)
                                 if hi != epoch:
@@ -1487,15 +1578,15 @@ class PersistentExpertsKernel:
                             if ((delivered >> q) & 1) == 0:
                                 if ptx.ballot_u32(valid[q]) == Uint32(0xFFFFFFFF):
                                     stage = IMG_STAGE0 + buf * FC2_KB + kb0 + q
-                                    for i in cutlass.range_constexpr(TAG_LANE_WORDS):
+                                    for i in cutlass.range_constexpr(self.g.tag_lane_words):
                                         if is_sf[i] != 0:
                                             ptx.sts_u32(
-                                                ssfb + stage * SFB_STAGE_STRIDE + dst_off[i],
+                                                ssfb + stage * self.g.sfb_stage + dst_off[i],
                                                 payload[q][i],
                                             )
                                         else:
                                             ptx.sts_u32(
-                                                sb + stage * B_STAGE_BYTES + dst_off[i],
+                                                sb + stage * self.g.b_stage_bytes + dst_off[i],
                                                 payload[q][i],
                                             )
                                     ptx.fence_proxy_async_shared()
@@ -1562,7 +1653,7 @@ class PersistentExpertsKernel:
         acc_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.acc_stages
         )
-        v = cute.make_rmem_tensor((NTOK,), Float32)
+        v = cute.make_rmem_tensor((self.ntok,), Float32)
         # FC2: physical row 32 w + lane of a tile holds hidden index
         # 32 w + 4 (lane % 8) + lane // 8 (TRTLLM-gen's 32-row shuffle).
         hid_in_tile = warp_idx * 32 + (lane % 8) * 4 + lane // 8
@@ -1576,10 +1667,14 @@ class PersistentExpertsKernel:
                     jt = (p - cta) // grid
                     if jt < TR_MAX_TILES:
                         self._stamp(trace_addr, cta, TR_EPI0 + 3 * jt)
-            vals = ptx.tmem_ld_32x32b_x8(
+            taddr = (
                 Int32(tCtAcc_base[(None, None, None, acc_state.index)].iterator.toint()) + lane_off
             )
-            for n in cutlass.range_constexpr(NTOK):
+            if cutlass.const_expr(self.ntok == NTOK):
+                vals = ptx.tmem_ld_32x32b_x8(taddr)
+            else:
+                vals = ptx.tmem_ld_32x32b_xn(taddr, self.ntok)
+            for n in cutlass.range_constexpr(self.ntok):
                 v[n] = vals[n]
             cute.arch.fence_view_async_tmem_load()
             with cute.arch.elect_one():
@@ -1589,9 +1684,9 @@ class PersistentExpertsKernel:
                 # TRTLLM-gen's FC2 epilogue: FMUL2 (IEEE) then cvt.rn.satfinite.bf16
                 a2 = s_scal[2 * MAX_SLOTS + slot]
                 col = mt * 128 + hid_in_tile
-                for n in cutlass.range_constexpr(NTOK):
+                for n in cutlass.range_constexpr(self.ntok):
                     if ((mask >> Uint32(n)) & Uint32(1)) != Uint32(0):
-                        row = n * TOP_K + s_slot_k[slot * NTOK + n]
+                        row = n * TOP_K + s_slot_k[slot * self.ntok + n]
                         ptx.st_u16(
                             rows_addr + (Int64(row) * HIDDEN + col) * 2,
                             ptx.bf16_bits(ptx.mul_rn(v[n], a2)),
@@ -1611,15 +1706,30 @@ class PersistentExpertsKernel:
                 if cutlass.const_expr(self.handoff != 0):
                     # tagged words: a reader takes a word exactly when its tag
                     # is this launch's epoch, so there is no flag and no fence
-                    if tidx < TAG_TILE_WORDS:
-                        word = ptx.lds_u32(hst + tidx * 4)
-                        ptx.st_relaxed_gpu_u64_pair(
-                            img_addr
-                            + Int64(slot) * TAG_SLOT_BYTES
-                            + Int64(mt * TAG_TILE_BYTES + tidx * 8),
-                            word,
-                            epoch,
-                        )
+                    if cutlass.const_expr(self.g.tag_tile_words <= 32 * EPI_WARPS):
+                        if tidx < self.g.tag_tile_words:
+                            word = ptx.lds_u32(hst + tidx * 4)
+                            ptx.st_relaxed_gpu_u64_pair(
+                                img_addr
+                                + Int64(slot) * self.g.tag_slot_bytes
+                                + Int64(mt * self.g.tag_tile_bytes + tidx * 8),
+                                word,
+                                epoch,
+                            )
+                    else:
+                        for part in cutlass.range_constexpr(
+                            (self.g.tag_tile_words + 32 * EPI_WARPS - 1) // (32 * EPI_WARPS)
+                        ):
+                            wi = tidx + part * 32 * EPI_WARPS
+                            if wi < self.g.tag_tile_words:
+                                word = ptx.lds_u32(hst + wi * 4)
+                                ptx.st_relaxed_gpu_u64_pair(
+                                    img_addr
+                                    + Int64(slot) * self.g.tag_slot_bytes
+                                    + Int64(mt * self.g.tag_tile_bytes + wi * 8),
+                                    word,
+                                    epoch,
+                                )
                     # the staging buffer is free for the next tile
                     ptx.bar_sync(BAR_EPI, 32 * EPI_WARPS)
                     if cutlass.const_expr(self.trace != 0):
@@ -1628,27 +1738,27 @@ class PersistentExpertsKernel:
                             if jt < TR_MAX_TILES:
                                 self._stamp(trace_addr, cta, TR_EPI0 + 3 * jt + 2)
                 else:
-                    img = img_addr + Int64(slot) * IMG_BYTES
+                    img = img_addr + Int64(slot) * self.g.img_bytes
                     kb = mt // 4
-                    if tidx < 2 * NTOK:
+                    if tidx < 2 * self.ntok:
                         # 16-byte chunk c16 = 2 (mt % 4) + half of row r, swizzled as in sB
                         r = tidx // 2
                         half = tidx - r * 2
                         c16 = 2 * (mt - kb * 4) + half
                         d = ptx.lds_v4_u32(hst + r * 32 + half * 16)
                         ptx.st_v4_u32(
-                            img + kb * B_STAGE_BYTES + r * 128 + ((c16 ^ r) * 16),
+                            img + kb * self.g.b_stage_bytes + r * 128 + ((c16 ^ self._sw(r)) * 16),
                             d[0],
                             d[1],
                             d[2],
                             d[3],
                         )
                         ptx.fence_proxy_async_global()
-                    if (tidx >= 2 * NTOK) & (tidx < 3 * NTOK):
+                    if (tidx >= 2 * self.ntok) & (tidx < 3 * self.ntok):
                         # the tile's four scale bytes of row r: compact SFB chunk mt
-                        r = tidx - 2 * NTOK
-                        w1 = ptx.lds_u32(hst + HSTAGE_SF + r * 4)
-                        ptx.st_u32(img + IMG_B_BYTES + mt * SFB_CHUNK_STRIDE + r * 16, w1)
+                        r = tidx - 2 * self.ntok
+                        w1 = ptx.lds_u32(hst + self.g.hstage_sf + r * 4)
+                        ptx.st_u32(img + self.g.img_b_bytes + mt * self.g.sfb_chunk + r * 16, w1)
                         ptx.fence_proxy_async_global()
                     # all image stores (and staging reads) precede the flag; the
                     # staging buffer is free for the next tile after this barrier
@@ -1706,7 +1816,7 @@ class PersistentExpertsKernel:
         t_neg = ptx.mul_ftz(s_gate, Float32(-LOG2E_F32))
         one = Float32(1.0)
         rcp6 = Float32(RCP6_F32)
-        for p in cutlass.range_constexpr(NTOK // 2):
+        for p in cutlass.range_constexpr(self.ntok // 2):
             n0 = 2 * p
             g0 = cute.arch.shuffle_sync_down(v[n0], 8)
             g1 = cute.arch.shuffle_sync_down(v[n0 + 1], 8)
@@ -1755,7 +1865,7 @@ class PersistentExpertsKernel:
         if lane < 8:
             ptx.sts_u8(hst + n * 32 + warp_idx * 8 + lane, byte)
         if lane == 0:
-            ptx.sts_u8(hst + HSTAGE_SF + n * 4 + warp_idx, sf)
+            ptx.sts_u8(hst + self.g.hstage_sf + n * 4 + warp_idx, sf)
 
     @cute.jit
     def _delay_spin(self, salt, cta):

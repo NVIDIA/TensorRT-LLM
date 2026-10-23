@@ -160,3 +160,74 @@ def place(selected: Sequence[int], rank: int, windows: int) -> Tuple[List[int], 
         else:
             local.append(span + expert % (EXPERTS - span))
     return local, load + loads_after(load, moved)
+
+
+# --------------------------------------------------------------------------
+# The half window (tep4): the predecessor's upper half only
+# --------------------------------------------------------------------------
+#: tep4: 4 ranks of 64-expert blocks. With the half window rank ``r`` also holds the
+#: upper half (local experts ``HALF_FROM..63``) of its ring predecessor's block, stacked
+#: as ``[own block | predecessor's upper half]`` (``HALF_SPAN`` local experts).
+HALF_RANKS = 4
+HALF_BLOCK = EXPERTS // HALF_RANKS
+HALF_FROM = HALF_BLOCK // 2
+HALF_SPAN = HALF_BLOCK + (HALF_BLOCK - HALF_FROM)
+
+
+def half_smallest_max(load: Sequence[int], movable: Sequence[int]) -> int:
+    """The smallest per-rank maximum with the half window.
+
+    ``load[b]`` counts block ``b``'s distinct selected experts and ``movable[b]``
+    those of them in its upper half, the only ones rank ``b + 1`` holds. Only
+    block ``b``'s experts cross the ring edge ``b -> b + 1``, so a maximum ``T`` is
+    feasible exactly when the two-window smallest flow ``carries(load, T)``
+    (which every flow of maximum ``T`` dominates) moves at most ``movable[b]``
+    across each edge: ``T >= ceil((arc - movable[r]) / n)`` for every arc of
+    ``n`` blocks ending at ``r``, on top of the two-window bound.
+    """
+    ranks = len(load)
+    t = smallest_max(load, 2)
+    for r in range(ranks):
+        arc = 0
+        for n in range(1, ranks + 1):
+            arc += load[(r - n + 1) % ranks]
+            t = max(t, -(-(arc - movable[r]) // n))
+    return t
+
+
+def place_half(selected: Sequence[int], rank: int) -> Tuple[List[int], List[int]]:
+    """``(local ids, stats)`` of one step's flat selection for ``rank`` with the half window.
+
+    Within a block the ``c[b]`` highest present experts move to rank ``b + 1``
+    (they lie in the upper half: ``c[b] <= movable[b]``). Local ids: an own
+    expert keeps its index ``i`` (``0..63``); a predecessor's expert this rank
+    runs is ``i + HALF_BLOCK - HALF_FROM`` (``64..95``); an expert another rank
+    runs gets an id in ``[HALF_SPAN, EXPERTS)``. ``stats`` is the per-rank loads
+    before then after placement.
+    """
+    present = sorted(set(int(v) for v in selected))
+    load = [0] * HALF_RANKS
+    movable = [0] * HALF_RANKS
+    for expert in present:
+        block, index = divmod(expert, HALF_BLOCK)
+        load[block] += 1
+        movable[block] += index >= HALF_FROM
+    t = half_smallest_max(load, movable)
+    c = carries(load, t)
+    assert all(c[b] <= movable[b] for b in range(HALF_RANKS)), (load, movable, t, c)
+    runs_on = {}
+    for block in range(HALF_RANKS):
+        in_block = sorted((e for e in present if e // HALF_BLOCK == block), reverse=True)
+        for position, expert in enumerate(in_block):
+            runs_on[expert] = (block + 1) % HALF_RANKS if position < c[block] else block
+    local = []
+    for expert in (int(v) for v in selected):
+        block, index = divmod(expert, HALF_BLOCK)
+        if runs_on[expert] != rank:
+            local.append(HALF_SPAN + expert % (EXPERTS - HALF_SPAN))
+        elif block == rank:
+            local.append(index)
+        else:
+            local.append(index + HALF_BLOCK - HALF_FROM)
+    after = [load[r] - c[r] + c[(r - 1) % HALF_RANKS] for r in range(HALF_RANKS)]
+    return local, load + after

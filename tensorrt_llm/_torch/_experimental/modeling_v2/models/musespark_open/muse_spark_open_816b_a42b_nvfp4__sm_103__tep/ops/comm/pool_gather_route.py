@@ -58,6 +58,16 @@ groups take the tag and slot from the row state as the previous call left
 it, which the quantizing warps advance only after the routing warps signalled
 that they have read it.
 
+Wide calls (``wide_prologue``, TP4): on an inbox of ``WIDE_MAX_ROWS`` rows
+(``ProjectionInbox(max_rows=WIDE_MAX_ROWS)``) a call may carry 1..32 rows, routing only
+(``PLACE_NONE``; at more than 8 rows the experts are the built-in ones, which read only
+the routing memo). Each CTA then exchanges only its own rows' logit blocks (the
+``[2, L]`` words of its rows, in the box of its first row, as above) and routes only its
+own rows, with routing warps 0 and 1 taking its first and second row: the per-row
+routing is the same statements on the same 256 logits, so every output is the one a
+call of at most 8 rows computes for that row. Compiled separately (the inbox's row
+capacity is a compile-time constant of the slot layout); the 8-row kernels are unchanged.
+
 Early expert ids (``early_expert_ids``, ``early=`` an ``ops/moe/early_expert_ids``
 buffer; a separately compiled variant, the default kernel is unchanged): the
 routing warps of CTA 0 also store every row's placed ids as tagged 64-bit
@@ -88,7 +98,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWr
 from .pool_gather_fp4quant import _AVAILABLE as _POOL_AVAILABLE
 from .pool_gather_fp4quant import _VECTOR_SPAN_WORDS, _VECTORS, BLOCK, HIDDEN, local_columns
 from .pool_gather_fp4quant import pool_gather_rmsnorm_fp4quant as _pool_op
-from .projection_inbox import MAX_ROWS, WORLDS, ProjectionInbox
+from .projection_inbox import MAX_ROWS, WIDE_MAX_ROWS, WORLDS, ProjectionInbox
 
 #: The router's experts and the top-k.
 EXPERTS = 256
@@ -139,16 +149,24 @@ PLACE_OWNER = 1
 PLACE_BALANCE = 2
 PLACE_STATIC = 3
 PLACE_BALANCE3 = 4
+#: ``half_window_experts`` (TP4): the balanced flow onto the successor's copy of each
+#: block's upper half only (``ring_windows.place_half``), whose local ids address a
+#: 96-expert ``[own block | predecessor's experts 32..63]`` stack.
+PLACE_HALF = 5
 #: The placements whose ids ``early_expert_ids`` publishes: those ``_placed_expert``
 #: computes. A placement added later is refused with ``early=`` until the
 #: publication and the ``local_ids`` store compute it through that one helper.
-EARLY_PLACES = (PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_BALANCE3)
+EARLY_PLACES = (PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_BALANCE3, PLACE_HALF)
 #: The placements served at each TP size: three ring windows only at TP8 (at TP4 the
-#: 192-expert stack does not fit beside the KV cache).
+#: 192-expert stack does not fit beside the KV cache), the half window only at TP4.
 PLACES = {
     8: (PLACE_NONE, PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_BALANCE3),
-    4: (PLACE_NONE, PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC),
+    4: (PLACE_NONE, PLACE_OWNER, PLACE_BALANCE, PLACE_STATIC, PLACE_HALF),
 }
+#: The half window's stack: a TP4 block's upper half starts at this local index, and
+#: the stack holds this many local experts.
+HALF_FROM = 32
+HALF_SPAN = 96
 
 #: The CTA: warps 0-3 run the pool gather + quantization (flashinfer's 128-thread
 #: geometry), warps 4-7 the logit exchange, the routing and the placement. Named
@@ -633,13 +651,15 @@ if _AVAILABLE:
             chosen = _sel(_eq(blk, Uint32(b)), values[b], chosen)
         return chosen
 
-    def _placed_expert(g, words, xs, peer_rank: int, x2s=None, world: int = 8):
+    def _placed_expert(g, words, xs, peer_rank: int, x2s=None, world: int = 8, half=False):
         """The placement of selected expert ``g`` on rank ``peer_rank`` (two or three ring windows).
 
         The local id of the copy this rank runs: ``g``'s index in its own block
         (own experts, ``0..L-1``), in the ring predecessor's block (``L..2L-1``) when the
         expert moves one rank on, else ``g``'s id past the ``2L``-expert window (the
-        expert runs on another rank); ``L = local_experts(world)``. ``words`` are the
+        expert runs on another rank); ``L = local_experts(world)``. With ``half``
+        (``PLACE_HALF``, TP4) a moved expert's id is in the predecessor's upper half
+        (``64..95``) and the window is ``HALF_SPAN`` experts. ``words`` are the
         census bits per 32-expert chunk (which experts any row selected; a block is
         one chunk at TP8 and the chunk pair (low, high) at TP4), ``xs`` per block how
         many of its highest selected experts move one rank on (the placement mode's
@@ -701,6 +721,15 @@ if _AVAILABLE:
             x_blk = _block_select(blk, xs, world)
         runs_on = (blk + _lt_u(above, x_blk)) & Uint32(world - 1)
         rank_u = Uint32(peer_rank)
+        if half:
+            # The half window (``PLACE_HALF``, TP4): a moved expert lies in its block's
+            # upper half (the flow moves at most the present upper-half experts), whose
+            # copy sits at local ids 64..95; an expert run elsewhere gets its id past
+            # the 96-expert window.
+            here = _sel(_eq(blk, rank_u), idx, idx + Uint32(local - HALF_FROM))
+            wrap = Uint32(EXPERTS - HALF_SPAN)
+            elsewhere = _sel(_ge_u(g, wrap), g - wrap, g) + Uint32(HALF_SPAN)
+            return _sel(_eq(runs_on, rank_u), here, elsewhere)
         here = _sel(_eq(blk, rank_u), idx, idx + Uint32(local))
         wrap = Uint32(EXPERTS - 2 * local)
         elsewhere = _sel(_ge_u(g, wrap), g - wrap, g) + Uint32(2 * local)
@@ -749,6 +778,7 @@ if _AVAILABLE:
             trigger: int = 0,
             stamps: int = 0,
             world: int = 8,
+            inbox_rows: int = MAX_ROWS,
         ):
             major, minor = torch.cuda.get_device_capability()
             super().__init__(
@@ -810,6 +840,15 @@ if _AVAILABLE:
             self.epoch_word = epoch_word
             self.trigger = trigger if publish else 0
             self.stamps = stamps
+            # The inbox's row capacity (``ProjectionInbox.max_rows``): its slot layout. A wide
+            # inbox (more than MAX_ROWS rows) routes each CTA's own rows only, without a
+            # placement or an early-id publication.
+            self.inbox_rows = inbox_rows
+            self.wide = inbox_rows > MAX_ROWS
+            if self.wide and (self.place != PLACE_NONE or publish or not route or world != 4):
+                raise ValueError(
+                    "a wide inbox serves routing only (no placement, no early ids) at TP4"
+                )
 
         def owner(self, v: int) -> int:
             return v // self.per_rank
@@ -1008,7 +1047,7 @@ if _AVAILABLE:
                             received[4 * v + 2] = l2
                             received[4 * v + 3] = l3
                             sent = (
-                                (Int64(slot) * world + self.peer_rank) * MAX_ROWS + row64
+                                (Int64(slot) * world + self.peer_rank) * self.inbox_rows + row64
                             ) * row_words_ + (word + self.offset(v))
                             for b in cutlass.range_constexpr(world):
                                 if cutlass.const_expr(b != self.peer_rank):
@@ -1022,7 +1061,7 @@ if _AVAILABLE:
                         for v in cutlass.range_constexpr(_VECTORS):
                             if cutlass.const_expr(self.owner(v) != self.peer_rank):
                                 box = (
-                                    (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                    (Int64(slot) * world + self.owner(v)) * self.inbox_rows + row64
                                 ) * row_words_ + (word + self.offset(v))
                                 p0, t0, p1, t1, p2, t2, p3, t3 = poll_words(own + box * 8)
                                 received[4 * v] = p0
@@ -1034,7 +1073,7 @@ if _AVAILABLE:
                     for v in cutlass.range_constexpr(_VECTORS):
                         if cutlass.const_expr(self.owner(v) != self.peer_rank):
                             box = (
-                                (Int64(slot) * world + self.owner(v)) * MAX_ROWS + row64
+                                (Int64(slot) * world + self.owner(v)) * self.inbox_rows + row64
                             ) * row_words_ + (word + self.offset(v))
                             clear_words(own + box * 8)
                         w0 = received[4 * v]
@@ -1168,11 +1207,23 @@ if _AVAILABLE:
                 _bar_arrive(STATE_BARRIER, QUANT_THREADS + ROUTE_THREADS)
                 tag = next_tag(last_tag)
                 slot = (last_slot ^ Uint32(1)) & Uint32(1)
-                if rt * 4 < M * local_count:
+                if cutlass.const_expr(self.wide):
+                    # The CTA's own rows' block: words 4 rt of its [rows_per_block, L] rows
+                    # of the local logits (fewer when its last row is past M).
+                    word_limit = _min_u32(
+                        Uint32(rows_per_block * local_count),
+                        Uint32((M - bidx * rows_per_block) * local_count),
+                    )
+                    logits_source = logits_local + first_row * (local_count * 4)
+                else:
+                    word_limit = M * local_count
+                    logits_source = logits_local
+                if rt * 4 < word_limit:
                     word = Int64(rt * 4)
-                    g0, g1, g2, g3 = load_words(logits_local + word * 4)
+                    g0, g1, g2, g3 = load_words(logits_source + word * 4)
                     sent = (
-                        ((Int64(slot) * world + self.peer_rank) * MAX_ROWS + first_row) * row_words_
+                        ((Int64(slot) * world + self.peer_rank) * self.inbox_rows + first_row)
+                        * row_words_
                         + pool_words_
                         + word
                     )
@@ -1187,7 +1238,8 @@ if _AVAILABLE:
                         for b in cutlass.range_constexpr(world):
                             if cutlass.const_expr(b != self.peer_rank):
                                 box = (
-                                    ((Int64(slot) * world + b) * MAX_ROWS + first_row) * row_words_
+                                    ((Int64(slot) * world + b) * self.inbox_rows + first_row)
+                                    * row_words_
                                     + pool_words_
                                     + word
                                 )
@@ -1204,7 +1256,8 @@ if _AVAILABLE:
                     for b in cutlass.range_constexpr(world):
                         if cutlass.const_expr(b != self.peer_rank):
                             box = (
-                                ((Int64(slot) * world + b) * MAX_ROWS + first_row) * row_words_
+                                ((Int64(slot) * world + b) * self.inbox_rows + first_row)
+                                * row_words_
                                 + pool_words_
                                 + word
                             )
@@ -1238,13 +1291,20 @@ if _AVAILABLE:
                 full_row = bidx * rows_per_block + rt // 64
                 if full_row < M:
                     lr = full_row * EXPERTS + (rt % 64) * 4
-                    f0, f1, f2, f3 = _load_shared_words(sLogits.iterator + lr)
+                    if cutlass.const_expr(self.wide):
+                        slr = (rt // 64) * EXPERTS + (rt % 64) * 4
+                    else:
+                        slr = lr
+                    f0, f1, f2, f3 = _load_shared_words(sLogits.iterator + slr)
                     _store_global_words(logits_full + Int64(lr) * 4, f0, f1, f2, f3)
                 eps_bits = _f32_bits(renorm_eps)
                 # Each lane's keys of the warp's two rows, sorted; then the warp's
                 # top 8 of each row (key s in lane s).
+                # Wide: one row per routing warp, the CTA's own (warps 0 and 1; warps 2 and
+                # 3 route unread shared rows and store nothing).
+                halves = (1 if self.wide else 2) if self.route else 0
                 lists = []
-                for half in cutlass.range_constexpr(2 if self.route else 0):
+                for half in cutlass.range_constexpr(halves):
                     row = rwarp + 4 * half
                     keys = []
                     for k in cutlass.range_constexpr(CHUNKS):
@@ -1255,7 +1315,7 @@ if _AVAILABLE:
                         )
                     lists.append(_sort8(keys))
                 picks, winners = _top8_by_redux(lists, lane)
-                for half in cutlass.range_constexpr(2 if self.route else 0):
+                for half in cutlass.range_constexpr(halves):
                     row = rwarp + 4 * half
                     if cutlass.const_expr(self.place != PLACE_NONE):
                         # The census, from the rounds' winners (warp-uniform): one
@@ -1268,7 +1328,7 @@ if _AVAILABLE:
                                     sCensus.iterator + (chosen >> 5),
                                     Uint32(1) << (chosen & Uint32(31)),
                                 )
-                for half in cutlass.range_constexpr(2 if self.route else 0):
+                for half in cutlass.range_constexpr(halves):
                     row = rwarp + 4 * half
                     mine = picks[half]
                     # Masked so that the unused rows' (unwritten) keys stay in bounds.
@@ -1278,14 +1338,26 @@ if _AVAILABLE:
                     quad = _add_rn(pair, _shfl_xor_b32(pair, 4))
                     total = _add_rn(quad, _shfl_xor_b32(quad, 2))
                     weight = _div_rn(score, _add_rn(eps_bits, total))
-                    keep = _lt_u(Uint32(row), Uint32(M)) & _lt_u(Uint32(lane), Uint32(TOP_K))
-                    if keep != Uint32(0):
-                        _st_shared_b32(sSelected.iterator + row * TOP_K + lane, expert_id)
-                        _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
-                        if row // rows_per_block == bidx:
-                            out = Int64(row * TOP_K + lane) * 4
+                    if cutlass.const_expr(self.wide):
+                        global_row = bidx * rows_per_block + row
+                        keep = (
+                            _lt_u(Uint32(row), Uint32(rows_per_block))
+                            & _lt_u(Uint32(global_row), Uint32(M))
+                            & _lt_u(Uint32(lane), Uint32(TOP_K))
+                        )
+                        if keep != Uint32(0):
+                            out = Int64(global_row * TOP_K + lane) * 4
                             _st_global_b32(selected + out, expert_id)
                             _st_global_b32(weights + out, weight)
+                    else:
+                        keep = _lt_u(Uint32(row), Uint32(M)) & _lt_u(Uint32(lane), Uint32(TOP_K))
+                        if keep != Uint32(0):
+                            _st_shared_b32(sSelected.iterator + row * TOP_K + lane, expert_id)
+                            _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
+                            if row // rows_per_block == bidx:
+                                out = Int64(row * TOP_K + lane) * 4
+                                _st_global_b32(selected + out, expert_id)
+                                _st_global_b32(weights + out, weight)
                 if cutlass.const_expr(self.probe):
                     if rt == 0:
                         _stamp(probe + Int64(48))
@@ -1327,6 +1399,38 @@ if _AVAILABLE:
                                 need = _max_s32(need, _div_u32(arc + Uint32(world - 1), world))
                             else:
                                 need = _max_s32(need, _div_u32(arc + Uint32(span), span + 1))
+                        t = _redux_max_s32(need)
+                        moved_r = Uint32(0)
+                        for k in cutlass.range_constexpr(world):
+                            moved_r = _max_s32(moved_r, arcs[k] - Uint32(k + 1) * t)
+                        xs = [_shfl_idx_b32(moved_r, Uint32(b)) for b in range(world)]
+                    elif cutlass.const_expr(self.place == PLACE_HALF):
+                        # The half window (ring_windows.place_half, TP4 only): the
+                        # two-window flow, with a maximum T also large enough that the
+                        # smallest flow moves at most the present upper-half experts of
+                        # each block (movable, the block's high chunk): for every arc of
+                        # k + 1 blocks ending at rank r, T >= ceil((arc - movable[r]) / (k + 1)).
+                        held = loads[0]
+                        for b in cutlass.range_constexpr(1, world):
+                            held = _sel(_eq(lane_r, Uint32(b)), loads[b], held)
+                        movable = _popc(words[1])
+                        for b in cutlass.range_constexpr(1, world):
+                            movable = _sel(_eq(lane_r, Uint32(b)), _popc(words[2 * b + 1]), movable)
+                        arc = Uint32(0)
+                        arcs = []
+                        need = Uint32(0)
+                        for k in cutlass.range_constexpr(world):
+                            span = k + 1
+                            arc = arc + _shfl_idx_b32(
+                                held, (lane_r - Uint32(k)) & Uint32(world - 1)
+                            )
+                            arcs.append(arc)
+                            if cutlass.const_expr(span == world):
+                                need = _max_s32(need, _div_u32(arc + Uint32(world - 1), world))
+                            else:
+                                need = _max_s32(need, _div_u32(arc + Uint32(span), span + 1))
+                            # arc >= load[r] >= movable[r]: no wrap.
+                            need = _max_s32(need, _div_u32(arc - movable + Uint32(span - 1), span))
                         t = _redux_max_s32(need)
                         moved_r = Uint32(0)
                         for k in cutlass.range_constexpr(world):
@@ -1393,7 +1497,15 @@ if _AVAILABLE:
                             if pubs != Uint32(0):
                                 pslot = prow * TOP_K + lane
                                 pg = _ld_shared_b32(sSelected.iterator + pslot)
-                                pplaced = _placed_expert(pg, words, xs, self.peer_rank, x2s, world)
+                                pplaced = _placed_expert(
+                                    pg,
+                                    words,
+                                    xs,
+                                    self.peer_rank,
+                                    x2s,
+                                    world,
+                                    self.place == PLACE_HALF,
+                                )
                                 pplaced = _sel(
                                     _lt_u(Uint32(prow), Uint32(M)), pplaced, Uint32(0xFFFFFFFF)
                                 )
@@ -1414,7 +1526,9 @@ if _AVAILABLE:
                     if writes != Uint32(0):
                         slot_index = own_row * TOP_K + lane
                         g = _ld_shared_b32(sSelected.iterator + slot_index)
-                        placed = _placed_expert(g, words, xs, self.peer_rank, x2s, world)
+                        placed = _placed_expert(
+                            g, words, xs, self.peer_rank, x2s, world, self.place == PLACE_HALF
+                        )
                         _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
                         w_bits = _ld_shared_b32(sWeights.iterator + slot_index)
                         _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
@@ -1455,6 +1569,7 @@ if _AVAILABLE:
         trigger: int = 0,
         stamps: int = 0,
         world: int = 8,
+        inbox_rows: int = MAX_ROWS,
     ):
         kernel = _PoolGatherRouteKernel(
             peer_rank,
@@ -1467,6 +1582,7 @@ if _AVAILABLE:
             trigger,
             stamps,
             world,
+            inbox_rows,
         )
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
@@ -1564,13 +1680,15 @@ class PoolGatherRoute(OpWrapper):
     note = """
     Certified against the built-in chain bit for bit: the full router's logits,
     `_full_routing_kernel`'s ids and weights, `ring_buddy_assign`'s local ids,
-    BF16 weights and stats (`ring_windows.place`'s for `PLACE_BALANCE3`, which
-    has no built-in counterpart), and the built-in gather + flashinfer quantization's
+    BF16 weights and stats (`ring_windows.place`'s for `PLACE_BALANCE3` and
+    `ring_windows.place_half`'s for `PLACE_HALF`, which have no built-in
+    counterpart), and the built-in gather + flashinfer quantization's
     payload, scales and gathered row; with random and constructed near-tie
     logits, a delayed rank, row-count changes with tag wrap-around and CUDA-graph
     replays. Rows 1..8 only. At TP4 the same claims hold against the built-in
     chain at TP4 (the ring-buddy placement against ``reference``'s ring flow over
-    four 64-expert blocks).
+    four 64-expert blocks). On a TP4 wide inbox (``WIDE_MAX_ROWS``): rows 1..32,
+    routing only, the same claims for the logits, the routing and the quantization.
     """
 
     def __call__(
@@ -1632,6 +1750,7 @@ class PoolGatherRoute(OpWrapper):
             bool(enable_pdl),
             bool(return_gathered),
             world=world,
+            inbox_rows=inbox.max_rows,
             **extra,
         )(
             gathered,
@@ -1712,10 +1831,13 @@ class PoolGatherRoute(OpWrapper):
         weights = (picked / (picked.sum(1, keepdim=True) + renorm_eps)).float()
         selected = ids.to(torch.int32)
         local_ids = weights_bf16 = stats = None
-        if place == PLACE_BALANCE3:
+        if place in (PLACE_BALANCE3, PLACE_HALF):
             from ...kernels.replicated_experts import windows as ring_windows
 
-            flat, placed_stats = ring_windows.place(selected.reshape(-1).tolist(), rank, 3)
+            if place == PLACE_HALF:
+                flat, placed_stats = ring_windows.place_half(selected.reshape(-1).tolist(), rank)
+            else:
+                flat, placed_stats = ring_windows.place(selected.reshape(-1).tolist(), rank, 3)
             local_ids = torch.tensor(flat, dtype=torch.int32, device=selected.device).reshape(
                 selected.shape
             )
@@ -1770,7 +1892,8 @@ class PoolGatherRoute(OpWrapper):
         stamps: Optional[torch.Tensor] = None,
     ) -> None:
         """Raw vector accesses at fixed strides: a strided or misaligned operand is read
-        as if packed; a row count outside 1..8 addresses outside the inbox. The early ids
+        as if packed; a row count outside 1..``inbox.max_rows`` addresses outside the
+        inbox, and a wide inbox routes without a placement or early ids. The early ids
         and the timeline stamps are written at raw addresses on the operands' device."""
         world = inbox.world
         columns = local_columns(world)
@@ -1778,8 +1901,12 @@ class PoolGatherRoute(OpWrapper):
         if static_from is None:
             static_from = local_count
         rows = local.shape[0] if local.dim() == 2 else -1
-        if not 1 <= rows <= MAX_ROWS or tuple(local.shape) != (rows, columns):
-            raise ValueError(f"local must be [1..{MAX_ROWS}, {columns}], got {tuple(local.shape)}")
+        if not 1 <= rows <= inbox.max_rows or tuple(local.shape) != (rows, columns):
+            raise ValueError(
+                f"local must be [1..{inbox.max_rows}, {columns}], got {tuple(local.shape)}"
+            )
+        if inbox.max_rows == WIDE_MAX_ROWS and (place != PLACE_NONE or early is not None):
+            raise ValueError("a wide inbox serves routing only: PLACE_NONE, no early ids")
         if early is not None and early.device != local.device:
             raise ValueError(f"early ids on {early.device}, operands on {local.device}")
         if stamps is not None and (

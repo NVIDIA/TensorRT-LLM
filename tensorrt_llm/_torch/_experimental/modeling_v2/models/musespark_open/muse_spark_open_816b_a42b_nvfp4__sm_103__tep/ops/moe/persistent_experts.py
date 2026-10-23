@@ -51,6 +51,12 @@ INTER = 4096
 TOP_K = 8
 #: Rows one launch serves: the MMA's N (all token columns of a decode step).
 MAX_ROWS = 8
+#: Rows the wide build serves (``wide_persistent_experts``, windows of at most 64 experts):
+#: a TP4 decode step of two requests at K = 7, on an MMA N of 16.
+WIDE_MAX_ROWS = 16
+#: What the wide build changes in the device's ``OPTIONS``: its B operand and compact scale
+#: stages are twice the 8-row build's, so four weight stages fit in shared memory.
+WIDE_OPTIONS: Dict[str, int] = {"num_stages": 4}
 #: Expert windows the kernel is compiled for.
 WINDOWS = (32, 64, 96)
 SF_VEC = 16
@@ -191,32 +197,33 @@ class _Workspace:
     once, outside graph capture, and never re-initialized.
     """
 
-    def __init__(self, device: torch.device, num_ctas: int):
-        from ._persistent_experts.kernel import (
-            FC1_MT,
-            MAX_CTAS,
-            MAX_SLOTS,
-            TRACE_WORDS,
-            WS_SLOT_BYTES,
-        )
+    def __init__(self, device: torch.device, num_ctas: int, ntok: int = MAX_ROWS):
+        from ._persistent_experts.kernel import FC1_MT, MAX_CTAS, MAX_SLOTS, TRACE_WORDS, Geometry
 
         assert num_ctas <= MAX_CTAS
         self.num_ctas = num_ctas
         self.epoch = torch.zeros(MAX_CTAS, dtype=torch.int32, device=device)
         self.flags = torch.zeros(MAX_SLOTS * FC1_MT, dtype=torch.int32, device=device)
-        self.images = torch.zeros(MAX_SLOTS * WS_SLOT_BYTES, dtype=torch.uint8, device=device)
+        self.images = torch.zeros(
+            MAX_SLOTS * Geometry(ntok).ws_slot_bytes, dtype=torch.uint8, device=device
+        )
         self.trace = torch.zeros(num_ctas, TRACE_WORDS, dtype=torch.int64, device=device)
 
 
-def _workspace(device: torch.device, num_ctas: int, handoff: Optional[int] = None) -> _Workspace:
+def _workspace(
+    device: torch.device, num_ctas: int, handoff: Optional[int] = None, ntok: int = MAX_ROWS
+) -> _Workspace:
+    """The workspace of this device, grid, hand-off protocol and build width (its own epochs)."""
     if handoff is None:
         handoff = _config(device)[1]["handoff"]
     key = (_device_index(device), num_ctas, int(handoff))
+    if ntok != MAX_ROWS:
+        key = key + (int(ntok),)
     with _LOCK:
         ws = _WORKSPACES.get(key)
         if ws is None:
             _refuse_under_capture("workspace")
-            ws = _Workspace(device, num_ctas)
+            ws = _Workspace(device, num_ctas, ntok)
             _WORKSPACES[key] = ws
     return ws
 
@@ -286,14 +293,28 @@ def _early_options(early) -> Dict[str, int]:
     )
 
 
-def _compiled(device: torch.device, num_local: int, w13, w13_sf, w2, w2_sf, early=None):
+def _compiled(
+    device: torch.device,
+    num_local: int,
+    w13,
+    w13_sf,
+    w2,
+    w2_sf,
+    early=None,
+    ntok: int = MAX_ROWS,
+):
     """(compiled launcher, grid size, options) for this device's configuration and window.
 
     With ``early`` (an ``EarlyExpertIds``), the variant that takes its ids from
     that buffer's tagged words before its dependency wait (``early_expert_ids``).
+    With ``ntok = WIDE_MAX_ROWS``, the wide build (``WIDE_OPTIONS`` applied; no early ids).
     """
     num_ctas, options = _config(device)
     extra = _early_options(early)
+    if ntok != MAX_ROWS:
+        assert early is None, "the wide build has no early-ids variant"
+        options = dict(options, **WIDE_OPTIONS)
+        extra = {"ntok": int(ntok)}
     key = (_device_index(device), num_local, num_ctas, tuple(sorted(options.items())))
     if extra:
         key = key + (tuple(sorted(extra.items())),)
@@ -377,6 +398,9 @@ def _requant_nvfp4(h: torch.Tensor) -> torch.Tensor:
 class PersistentExperts(OpWrapper):
     """NVFP4 experts of one window for <= 8 pre-routed rows, one persistent launch.
 
+    Calls of 9..16 rows on a window of at most 64 experts run the wide build (MMA N = 16,
+    its own workspace), with the same contract and the same per-row arithmetic.
+
     Arguments mirror the pre-routed ``fp4_block_scale_moe_runner`` call the
     MuseSpark layer makes: NVFP4 rows ``hidden_states`` ``[M, 2048]`` uint8 with
     linear E4M3 block scales ``hidden_states_scale`` (``M * 256``), window ids
@@ -444,6 +468,7 @@ class PersistentExperts(OpWrapper):
         device = hidden_states.device
         rows_in = hidden_states.shape[0]
         num_local = gemm1_weights.shape[0]
+        ntok = MAX_ROWS if rows_in <= MAX_ROWS else WIDE_MAX_ROWS
         fn, num_ctas, options = _compiled(
             device,
             num_local,
@@ -451,9 +476,10 @@ class PersistentExperts(OpWrapper):
             gemm1_weights_scale,
             gemm2_weights,
             gemm2_weights_scale,
+            ntok=ntok,
         )
-        ws = _workspace(device, num_ctas, options["handoff"])
-        if _EARLY:
+        ws = _workspace(device, num_ctas, options["handoff"], ntok)
+        if _EARLY and ntok == MAX_ROWS:
             from . import early_expert_ids as _early_ids
 
             early = _EARLY.get((_device_index(device), num_ctas, int(options["handoff"])))
@@ -498,15 +524,27 @@ class PersistentExperts(OpWrapper):
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         early=None,
+        wide: bool = False,
     ) -> None:
         """Compile the kernel for this window and create its workspace, now.
 
         Call it eagerly (at install time, before any graph capture): a call
         under capture that would have to do either refuses. With ``early`` (the
         workspace's ``EarlyExpertIds``) the early-ids variant
-        is compiled too.
+        is compiled too; with ``wide``, the wide build and its workspace as well.
         """
         device = gemm1_weights.device
+        if wide:
+            _, num_ctas, options = _compiled(
+                device,
+                gemm1_weights.shape[0],
+                gemm1_weights,
+                gemm1_weights_scale,
+                gemm2_weights,
+                gemm2_weights_scale,
+                ntok=WIDE_MAX_ROWS,
+            )
+            _workspace(device, num_ctas, options["handoff"], WIDE_MAX_ROWS)
         _, num_ctas, options = _compiled(
             device,
             gemm1_weights.shape[0],
@@ -600,7 +638,9 @@ class PersistentExperts(OpWrapper):
     ) -> None:
         """Inputs the kernel would read past or misread without an error."""
         m = hidden_states.shape[0]
-        assert 1 <= m <= MAX_ROWS, f"one launch serves 1..{MAX_ROWS} rows, got {m}"
+        num_local = gemm1_weights.shape[0]
+        limit = WIDE_MAX_ROWS if num_local <= 64 else MAX_ROWS
+        assert 1 <= m <= limit, f"one launch serves 1..{limit} rows on this window, got {m}"
         assert hidden_states.dtype == torch.uint8 and hidden_states.is_contiguous(), (
             "hidden_states must be contiguous packed NVFP4 bytes"
         )
@@ -612,7 +652,6 @@ class PersistentExperts(OpWrapper):
             "topk_ids must be contiguous int32; the kernel reads raw words"
         )
         assert topk_ids.numel() == m * TOP_K, f"topk_ids must be [M, {TOP_K}]"
-        num_local = gemm1_weights.shape[0]
         assert num_local in WINDOWS, f"the kernel is compiled for windows {WINDOWS}"
         for name, t, shape in (
             ("gemm1_weights", gemm1_weights, (num_local, 2 * INTER, HIDDEN // 2)),

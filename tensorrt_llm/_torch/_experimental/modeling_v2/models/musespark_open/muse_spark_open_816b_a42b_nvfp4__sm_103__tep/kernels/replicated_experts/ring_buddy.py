@@ -57,6 +57,18 @@ stack. Every other call keeps the two-window placement over the stack's
 first 64 experts, which are the two-window stack byte for byte. The two BF16
 layers keep two windows.
 
+``half_window_experts`` (``half=True`` with ``windows=1``, ``persistent``, tep4 only)
+gives every NVFP4 layer the persistent kernel serves the half window: its stack is
+``[own block | the predecessor's experts 32..63]`` (96 local experts, about +48 GiB
+per rank over the own blocks of 60 layers), and on the decode steps the prologue's
+routed kernel places (at most 8 rows) it places with the half-window flow
+(``ring_windows.place_half``, ``PLACE_HALF``) and records the 96-expert window. The
+other decode calls of those layers, up to ``HALF_MAX_ROWS`` rows (the 16..32-row steps
+of two to four requests), take the same flow from ``ring_buddy_assign(half=True)`` and
+run the whole stack too: the persistent kernel up to its row limit, TRTLLM-gen's
+pre-routed call over the 96 local experts above it. Every call of the other layers
+keeps the owner-only window over the own block.
+
 Ring sizes (``ring_size``): tep8 (8 ranks, 32-expert blocks, the description
 above) and tep4 (4 ranks on one tray, 64-expert blocks, ``ring_buddy_assign``
 with ``ranks=4``). Any other mapping keeps the built-in path on every layer.
@@ -88,10 +100,22 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ... import dispatch as _tp_agreement
-from ...ops.moe.ring_buddy_assign import BLOCK, EXPERTS, RANKS, TOP_K, block_of, ring_buddy_assign
+from ...ops.moe.ring_buddy_assign import (
+    BLOCK,
+    EXPERTS,
+    HALF_SPAN,
+    RANKS,
+    TOP_K,
+    block_of,
+    ring_buddy_assign,
+)
 
 #: Decode rows the stacked path serves; larger calls keep the built-in path.
 MAX_ROWS = 16
+
+#: Decode rows the stacked path serves on a half-window layer (``half_window_experts``):
+#: up to four requests' verify steps, the slots of one ``ring_buddy_assign`` program.
+HALF_MAX_ROWS = 32
 
 #: The static placement: local experts from this index up run on the successor at
 #: every step (4 of 32 per block, about the share the balanced placement
@@ -231,6 +255,7 @@ class _State:
         static_from: Optional[int] = None,
         windows: int = 2,
         ranks: int = RANKS,
+        half: bool = False,
     ):
         self.kind = kind
         self.stacks = stacks
@@ -251,6 +276,16 @@ class _State:
             for window in range(2, windows)
         }
         self.by_window[windows * self.block] = stacks
+        # The half window (``half_window_experts``): the owner-only placement over the
+        # stack's own block, and the prologue's half-window placement over all of it.
+        self.half = half
+        self.max_rows = HALF_MAX_ROWS if half else MAX_ROWS
+        if half:
+            self.default_window = self.block
+            self.by_window = {
+                self.block: {name: stack[: self.block] for name, stack in stacks.items()},
+                stacks["w3_w1_weight"].shape[0]: stacks,
+            }
         self.active = True
         self.balance = balance
         # With balance off: local experts static_from.. of every block run on
@@ -276,8 +311,13 @@ class _State:
         return placement
 
 
-def _replicate(moe, kind: str, mapping: Mapping, windows: int = 2) -> Dict[str, torch.Tensor]:
-    """The layer's stacks of ``windows`` ring windows; ``windows=1`` is the parameters themselves."""
+def _replicate(
+    moe, kind: str, mapping: Mapping, windows: int = 2, half: bool = False
+) -> Dict[str, torch.Tensor]:
+    """The layer's stacks of ``windows`` ring windows; ``windows=1`` is the parameters themselves.
+
+    ``half``: the half window, ``[own block | the predecessor's upper half]``.
+    """
     backend = _backend(moe)
     # The built-in loader finalizes the leaf's layout eagerly; finishing any
     # transform still pending here keeps the copies in the layout the kernels
@@ -288,11 +328,21 @@ def _replicate(moe, kind: str, mapping: Mapping, windows: int = 2) -> Dict[str, 
     for name in STACKED[kind]:
         param = getattr(backend, name)
         own = param.data
-        if windows == 1:
+        if windows == 1 and not half:
             # The owner-only window: the stacked call reads the parameter itself.
             stacks[name] = own
             continue
         block = own.shape[0]
+        if half:
+            upper = block // 2
+            stack = torch.empty((block + upper, *own.shape[1:]), dtype=own.dtype, device=own.device)
+            stack[:block].copy_(own)
+            predecessor = _predecessor_block(own[upper:], mapping)
+            stack[block:].copy_(predecessor)
+            del predecessor
+            param.data = stack[:block]
+            stacks[name] = stack
+            continue
         stack = torch.empty((windows * block, *own.shape[1:]), dtype=own.dtype, device=own.device)
         stack[:block].copy_(own)
         for back in range(1, windows):
@@ -329,6 +379,9 @@ def _refresh(moe, state: _State, mapping: Mapping) -> None:
         if param.data.data_ptr() != own.data_ptr():
             own.copy_(param.data)
             param.data = own
+        if state.half:
+            stack[block:].copy_(_predecessor_block(own[block // 2 :], mapping))
+            continue
         for back in range(1, state.windows):
             stack[back * block : (back + 1) * block].copy_(_window_block(own, mapping, back))
     state.placement = None
@@ -345,7 +398,7 @@ def _patch_routing(moe, state: _State) -> None:
             state.active
             and state.current(router_logits) is None
             and router_logits.is_cuda
-            and 0 < router_logits.shape[0] <= MAX_ROWS
+            and 0 < router_logits.shape[0] <= state.max_rows
             and selected.dtype == torch.int32
             and weights.dtype == torch.float32
             and selected.is_contiguous()
@@ -353,7 +406,13 @@ def _patch_routing(moe, state: _State) -> None:
             and not torch.compiler.is_compiling()
         ):
             local_ids, weights_bf16, stats = ring_buddy_assign(
-                selected, weights, state.rank, state.balance, state.static_from, ranks=state.ranks
+                selected,
+                weights,
+                state.rank,
+                state.balance,
+                state.static_from,
+                ranks=state.ranks,
+                half=state.half,
             )
             state.placement = (
                 router_logits,
@@ -362,6 +421,8 @@ def _patch_routing(moe, state: _State) -> None:
                 weights_bf16,
                 stats,
             )
+            if state.half:
+                state.placement += (HALF_SPAN,)
             state.last_stats = stats
         return selected, weights
 
@@ -373,7 +434,7 @@ def _patch_routing(moe, state: _State) -> None:
     routing.clear_routing_memo = types.MethodType(clear_routing_memo, routing)
 
 
-def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None):
+def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persistent_rows=8):
     """The stacked call for the native NVFP4 leaf, as its ``run_moe`` makes the built-in one.
 
     ``persistent`` (``persistent_experts``): calls of up to ``persistent_experts``'s
@@ -389,6 +450,10 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None):
 
     The call's window is the leading dim of the stacks it is given; the
     ``local_expert_offset=0`` TRTLLM-gen call runs over exactly that window.
+
+    ``persistent_rows`` (``wide_persistent_experts``: ``persistent_experts.WIDE_MAX_ROWS``):
+    calls of up to that many rows on a window of at most 64 experts go to the persistent
+    kernel's wide build.
     """
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
         fp4_block_scale_moe_runner,
@@ -417,6 +482,11 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None):
                     window_stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
                     window_stacks["w2_weight"],
                     window_stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+                    **(
+                        {"wide": True}
+                        if persistent_rows > _persistent.MAX_ROWS and window <= 64
+                        else {}
+                    ),
                 )
 
     def call(stacks, x, local_ids, weights_bf16):
@@ -427,7 +497,8 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None):
         served = (
             persistent_op is not None
             and window in persistent_windows
-            and x.fp4_tensor.shape[0] <= persistent_op.MAX_ROWS
+            and x.fp4_tensor.shape[0]
+            <= (persistent_rows if window <= 64 else persistent_op.MAX_ROWS)
         )
         if window > two_windows and not served:
             # The three-window placement runs only where the persistent kernel serves the
@@ -567,14 +638,24 @@ def _bf16_call(backend, routing, unpacked: bool = False):
 
 
 def _patch_experts(
-    moe, state: _State, persistent: bool = False, bf16_unpacked: bool = False
+    moe,
+    state: _State,
+    persistent: bool = False,
+    bf16_unpacked: bool = False,
+    persistent_rows: int = 8,
 ) -> None:
     experts = moe.experts
     backend = _backend(moe)
     builtin_forward = experts.forward
     routing = experts.routing_method
     if state.kind == "nvfp4" and persistent:
-        stacked_call = _nvfp4_call(backend, routing, persistent=True, stacks=state.by_window)
+        stacked_call = _nvfp4_call(
+            backend,
+            routing,
+            persistent=True,
+            stacks=state.by_window,
+            persistent_rows=persistent_rows,
+        )
     elif state.kind == "nvfp4":
         stacked_call = _nvfp4_call(backend, routing)
     elif bf16_unpacked:
@@ -585,7 +666,7 @@ def _patch_experts(
     default_window = state.default_window
 
     def forward(self, x, router_logits, *args, do_finalize=True, **kwargs):
-        if not state.active or do_finalize or args or not 0 < x.shape[0] <= MAX_ROWS:
+        if not state.active or do_finalize or args or not 0 < x.shape[0] <= state.max_rows:
             return builtin_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
         routing.apply(router_logits)
         placement = state.current(router_logits)
@@ -630,6 +711,12 @@ def _layer_windows(moe, kind: str, windows: int, persistent: bool) -> int:
     return 2
 
 
+def _layer_half(moe, kind: str, half: bool, persistent: bool) -> bool:
+    """Whether ``install`` gives this layer the half window: an NVFP4 layer the persistent
+    kernel serves, when the install asks for it."""
+    return half and kind == "nvfp4" and persistent and persistent_eligible(_backend(moe))
+
+
 def _is_plain_swiglu(backend) -> bool:
     """SwiGLU without per-expert bias or clamp constants (what the persistent kernel computes)."""
     from tensorrt_llm._torch.utils import ActivationType
@@ -644,7 +731,9 @@ def install(
     static_from: Optional[int] = None,
     persistent: bool = False,
     bf16_unpacked: bool = False,
+    persistent_rows: int = 8,
     windows: int = 2,
+    half: bool = False,
 ) -> List[int]:
     """Replicate and patch every eligible MoE layer of ``text_model``; returns their indices.
 
@@ -673,6 +762,10 @@ def install(
     only) stacks a third window on every NVFP4 layer the persistent kernel serves;
     the prologue's routed pool kernel then places over three windows (see the module
     docstring). The other layers keep two.
+    ``half=True`` (``half_window_experts``; needs ``windows=1``, ``persistent`` and the
+    owner-only placement, tep4 only) stacks the predecessor's upper half on every NVFP4
+    layer the persistent kernel serves (see the module docstring); the other layers
+    keep the owner-only window.
 
     A layer installed by an earlier call is refreshed in place (``_refresh``):
     its stacks follow the newly loaded parameters, its hooks are not wrapped
@@ -693,7 +786,7 @@ def install(
     """
     ranks = ring_size(mapping)
     refusal = _install_refusal(
-        text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from
+        text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from, half
     )
     refusal = _tp_agreement.agreed_refusal(mapping, refusal)
     if refusal is not None:
@@ -706,6 +799,7 @@ def install(
     failed: Optional[str] = None
     installed, refreshed = [], []
     widened = []
+    halved = []
     skipped = {}
     kinds: Dict[str, int] = {}
     added = 0
@@ -730,16 +824,21 @@ def install(
         kind = expert_format(moe)
         kinds[kind] = kinds.get(kind, 0) + 1
         layer_windows = _layer_windows(moe, kind, windows, persistent)
+        layer_half = _layer_half(moe, kind, half, persistent)
         if layer_windows == 3:
             widened.append(index)
-        stacks = _replicate(moe, kind, mapping, layer_windows)
+        if layer_half:
+            halved.append(index)
+        stacks = _replicate(moe, kind, mapping, layer_windows, layer_half)
         added += sum(t[block:].numel() * t.element_size() for t in stacks.values())
-        state = _State(kind, stacks, mapping.tp_rank, balance, static_from, layer_windows, ranks)
+        state = _State(
+            kind, stacks, mapping.tp_rank, balance, static_from, layer_windows, ranks, layer_half
+        )
         moe._replicated_experts = state
         if failed is None:
             _patch_routing(moe, state)
             try:
-                _patch_experts(moe, state, persistent, bf16_unpacked)
+                _patch_experts(moe, state, persistent, bf16_unpacked, persistent_rows)
             except Exception as error:  # noqa: BLE001 - every failure must reach the agreement
                 failed = f"layer {index}: {error!r}"
         installed.append(index)
@@ -765,7 +864,12 @@ def install(
         placement = f"static (local experts {static_from}..{block - 1} on the successor)"
     else:
         placement = "owner-only"
-    if windows == 1:
+    if windows == 1 and half:
+        what = (
+            f"owner-only {block}-expert window with the predecessor's upper half on "
+            f"{len(halved)} layers (half_window_experts)"
+        )
+    elif windows == 1:
         what = f"owner-only {block}-expert window (no replication)"
     else:
         what = "ring-buddy experts"
@@ -793,6 +897,7 @@ def _install_refusal(
     bf16_unpacked: bool,
     ranks: Optional[int] = RANKS,
     static_from: Optional[int] = None,
+    half: bool = False,
 ) -> Optional[str]:
     """``install``'s refusals known before its first all-gather, or None."""
     if windows not in (1, 2, 3):
@@ -817,11 +922,23 @@ def _install_refusal(
             "three_window_placement at tep4 would hold three 64-expert blocks per rank (about +226 GiB "
             "per rank over the own block), which does not fit next to the KV cache on a GB300"
         )
+    if half and not (windows == 1 and persistent and ranks == 4):
+        return (
+            "half_window_experts stacks the predecessor's upper half for the persistent expert kernel at "
+            "tep4: it needs windows=1 (the owner-only placement elsewhere), persistent=True "
+            f"(persistent_experts) and a tp4/ep4 mapping; got windows={windows}, "
+            f"persistent={persistent}, ring {ranks}"
+        )
     for index, layer in enumerate(text_model.layers):
         moe = layer.feed_forward
         state = getattr(moe, "_replicated_experts", None)
         if state is None:
             continue
+        if state.half != _layer_half(moe, state.kind, half, persistent):
+            return (
+                f"half_window_experts: layer {index} {'holds' if state.half else 'lacks'} the half "
+                "window and this install would change that; a refresh cannot"
+            )
         want = _layer_windows(moe, state.kind, windows, persistent)
         if state.windows != want:
             return (

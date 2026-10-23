@@ -73,7 +73,13 @@ from ...attention import MuseSparkOpenTepAttention, MuseSparkOpenTepDecodeAttent
 from ...dispatch import LAUNCH_PDL
 from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
-from ...ops.attention.swa_block import max_blocks, swa_block_attention
+from ...ops.attention.swa_block import (
+    MAX_ROWS,
+    MULTI_MAX_REQUESTS,
+    max_blocks,
+    swa_block_attention,
+    swa_block_multi_attention,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,8 +103,14 @@ class _SwaBlock:
     ``DecodeTarget`` passes it) on a sliding-window layer runs the block
     through ``ops/attention/swa_block``; every other call is the base class's.
     The per-call attributes are set by ``forward`` and cleared when it returns.
+
+    With ``_swa_multi`` (set by the ``wide_swa_block`` fast path) a decode step of
+    2..``MULTI_MAX_REQUESTS`` generation sequences of equal row count runs the block too,
+    through ``swa_block_multi_attention``: each sequence's rows, cache bytes and output are
+    the one-sequence block's.
     """
 
+    _swa_multi: bool = False
     _swa_block: Optional[SwaBlockPlan]
     _swa_raw: bool
     _swa_gate: Optional[torch.Tensor]
@@ -226,6 +238,7 @@ class _SwaBlock:
             return super()._attn_impl(q, k, v, *tail, **tail_kwargs)
         raw = self._swa_raw
         fused_width = (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim
+        requests = self._step_requests(attn_metadata)
         decline = self._paged_decode_decline(
             q.narrow(1, 0, fused_width) if raw and q.dim() == 2 else q,
             k,
@@ -240,9 +253,10 @@ class _SwaBlock:
             attention_sinks,
             relative_attention_bias,
             has_lora,
+            requests=requests,
         )
         if decline is None and window_splits(attention_window_size) < max_blocks(
-            attention_window_size, attn_metadata.num_tokens
+            attention_window_size, attn_metadata.num_tokens // requests
         ):
             decline = "fewer splits than key blocks"
         if decline is not None:
@@ -265,7 +279,9 @@ class _SwaBlock:
             f"(fused_prep={raw}, fused_gate={gate is not None}, q_fp8={decode.q_fp8})",
             key="musespark_open.swa_block.installed",
         )
-        out = self._swa_block_call(q, attn_metadata, attention_window_size, decode.q_fp8, raw, gate)
+        out = self._swa_block_call(
+            q, attn_metadata, attention_window_size, decode.q_fp8, raw, gate, requests
+        )
         self._swa_gated = gate is not None
         return out, None
 
@@ -286,7 +302,29 @@ class _SwaBlock:
             and 0 < rows <= 128
         )
 
-    def _swa_block_call(self, q, md, window: int, q_fp8: bool, raw: bool, gate):
+    def _step_requests(self, md) -> int:
+        """The sequences of this step the block takes in one call: 1, or under ``_swa_multi`` the
+        2..``MULTI_MAX_REQUESTS`` generation sequences of a step whose host ``seq_lens`` are all
+        ``rows / sequences`` (at most ``MAX_ROWS``). Host-side reads only."""
+        if not self._swa_multi:
+            return 1
+        n = md.num_seqs
+        rows = md.num_tokens
+        seq_lens = getattr(md, "seq_lens", None)
+        if (
+            not 2 <= n <= MULTI_MAX_REQUESTS
+            or md.num_generations != n
+            or rows % n
+            or rows // n > MAX_ROWS
+            or seq_lens is None
+            or seq_lens.is_cuda
+            or seq_lens.numel() < n
+            or bool((seq_lens[:n] != rows // n).any())
+        ):
+            return 1
+        return n
+
+    def _swa_block_call(self, q, md, window: int, q_fp8: bool, raw: bool, gate, requests: int = 1):
         attn = self.attn
         rows = md.num_tokens
         local_layer_idx = attn.get_local_layer_idx(md)
@@ -302,15 +340,17 @@ class _SwaBlock:
             self._total_num_blocks_fmha()._get_total_num_blocks(md),
             attn.quant_mode,
             0,
-            1,
+            requests,
             torch.bfloat16,
         )
         rope = raw and not self.skip_rope
-        return swa_block_attention(
+        multi = requests > 1
+        op = swa_block_multi_attention if multi else swa_block_attention
+        return op(
             q[:rows],
             kv_pool,
-            block_tables[0],
-            md.kv_lens_cuda_runtime[:1],
+            block_tables if multi else block_tables[0],
+            md.kv_lens_cuda_runtime[:requests],
             attn.kv_scale_orig_quant,
             self.num_heads,
             self.num_key_value_heads,
@@ -404,4 +444,32 @@ def log_installed(layers, plan: SwaBlockPlan) -> None:
     )
 
 
-__all__ = ["SwaBlockPlan", "attention_class", "log_installed"]
+def install_multi(model) -> int:
+    """``wide_swa_block``: let every sliding-window layer's ``swa_block`` take 2..4-request steps.
+
+    Called after the attention re-class. Sets ``_swa_multi`` on each sliding-window layer
+    whose attention carries ``swa_block``; returns how many.
+
+    Raises:
+        ValueError: if a sliding-window layer does not carry ``swa_block``.
+    """
+    count = 0
+    for layer in model.layers:
+        attention = layer.self_attn
+        if not attention.is_sliding:
+            continue
+        if not isinstance(attention, _SwaBlock):
+            raise ValueError(
+                "[musespark_open] wide_swa_block extends swa_block; layer "
+                f"{layer.layer_idx} carries {type(attention).__name__}"
+            )
+        attention._swa_multi = True
+        count += 1
+    logger.info(
+        f"[musespark_open] wide_swa_block: swa_block on decode steps of 2..{MULTI_MAX_REQUESTS} "
+        f"requests of up to {MAX_ROWS} rows each on {count} sliding-window layers"
+    )
+    return count
+
+
+__all__ = ["SwaBlockPlan", "attention_class", "install_multi", "log_installed"]

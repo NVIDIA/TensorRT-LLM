@@ -187,7 +187,7 @@ class AttentionRmsNormGatePdl(OpWrapper):
     dependent may launch, nothing the kernel computes.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Certified bit for bit against the built-in `rmsnorm_gate` (raw BF16 bits, heads

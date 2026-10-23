@@ -13,7 +13,9 @@ the built-in ``router_logits`` runs the TF32x3 ``_router_tensorcore_kernel`` at
 ``install`` re-classes every layer's MoE with ``RouterGemmMoE`` in front of the
 class it has (whatever the other MoE fast paths made it) and returns one
 ``RouterGemmCall`` that the model keeps. ``DecodeTarget`` arms it for the forward
-of a decode step of ``MIN_ROWS..MAX_ROWS`` rows; while it is armed, a
+of a decode step of ``min_rows..MAX_ROWS`` rows (``min_rows`` is ``MIN_ROWS``, or
+``WIDE_PROLOGUE_MIN_ROWS`` where ``wide_prologue`` serves the 16..32-row steps'
+router as its own shard, bit for bit the built-in tensor-core router's); while it is armed, a
 ``router_logits`` call of contiguous BF16 rows over the FP32 ``[256, 8192]``
 weight runs ``ops/moe/router_gemm``. Every other call -- unarmed (steps with
 context rows, which ``PrefillTarget`` runs, and decode steps of at most 8 or more
@@ -39,6 +41,18 @@ from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
 from tensorrt_llm.logger import logger
 
 from ...ops.moe import router_gemm as _op
+from ...ops.moe import router_shard as _shard
+
+#: The device capabilities the op and this path are validated on: GB300 (sm_103) and
+#: R200 (sm_107).
+VALIDATED_CAPABILITIES = frozenset({(10, 3), (10, 7)})
+#: The fewest rows the path takes by default: the op's.
+MIN_ROWS = _op.MIN_ROWS
+#: The fewest rows the path takes where ``wide_prologue`` serves 16..32-row decode steps:
+#: there each rank computes its own router columns with the built-in tensor-core router's
+#: bits (``ops/moe/router_shard.router_shard_wide``) and never calls ``router_logits``, so
+#: the op starts at five requests (33 rows at K=7).
+WIDE_PROLOGUE_MIN_ROWS = _shard.WIDE_MAX_ROWS + 1
 
 
 class RouterGemmCall:
@@ -48,7 +62,10 @@ class RouterGemmCall:
     (and why), so a served log shows what the decode steps it captured actually run.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, min_rows: int = _op.MIN_ROWS) -> None:
+        if not _op.MIN_ROWS <= min_rows <= _op.MAX_ROWS:
+            raise ValueError(f"min_rows {min_rows} outside {_op.MIN_ROWS}..{_op.MAX_ROWS}")
+        self.min_rows = min_rows
         self._armed = False
         self._reported = set()
 
@@ -67,10 +84,9 @@ class RouterGemmCall:
                 f"{hidden_states.is_contiguous()}, compiling {torch.compiler.is_compiling()})"
             )
 
-    @staticmethod
-    def takes(rows: int) -> bool:
+    def takes(self, rows: int) -> bool:
         """Whether a decode step of ``rows`` rows runs its router logits on the op."""
-        return _op.MIN_ROWS <= rows <= _op.MAX_ROWS
+        return self.min_rows <= rows <= _op.MAX_ROWS
 
     @property
     def is_armed(self) -> bool:
@@ -126,18 +142,24 @@ def _router_gemm_class(base: type) -> type:
     return type(f"{base.__name__}RouterGemm", (RouterGemmMoE, base), {})
 
 
-def install(model: torch.nn.Module) -> RouterGemmCall:
-    """Re-class every layer's MoE with ``RouterGemmMoE`` in front; returns the call to arm.
+def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmCall:
+    """Re-class every layer's MoE with ``RouterGemmMoE`` in front; returns the call to arm
+    on decode steps of ``min_rows..MAX_ROWS`` rows.
 
     Every layer is checked before any is re-classed; a layer already carrying the
     mixin is re-pointed at the returned call.
 
     Raises:
         ValueError: if a layer's feed-forward is not a ``MuseSparkOpenMoE``, or the
-            device is not sm_103.
+            device is not one of ``VALIDATED_CAPABILITIES``.
     """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        raise ValueError("[musespark_open] the router_gemm kernel is validated on sm_103 only")
+    if (
+        not torch.cuda.is_available()
+        or tuple(torch.cuda.get_device_capability()) not in VALIDATED_CAPABILITIES
+    ):
+        raise ValueError(
+            "[musespark_open] the router_gemm kernel is validated on sm_103 and sm_107 only"
+        )
     layers = list(model.layers)
     wrong = [
         layer.layer_idx for layer in layers if not isinstance(layer.feed_forward, MuseSparkOpenMoE)
@@ -146,16 +168,16 @@ def install(model: torch.nn.Module) -> RouterGemmCall:
         raise ValueError(
             f"[musespark_open] router_gemm replaces the MoE router; layers {wrong} have no MoE"
         )
-    call = RouterGemmCall()
+    call = RouterGemmCall(min_rows)
     for layer in layers:
         moe = layer.feed_forward
         if not isinstance(moe, RouterGemmMoE):
             moe.__class__ = _router_gemm_class(type(moe))
         moe._router_gemm_call = call
     logger.info(
-        f"[musespark_open] router_gemm: router logits of decode steps of {_op.MIN_ROWS}.."
-        f"{_op.MAX_ROWS} rows on the BF16x3 split-K GEMM ({_op.splits(_op.MIN_ROWS)}.."
-        f"{_op.splits(_op.MAX_ROWS)} K splits by 128-row tiles) in "
-        f"{len(layers)} MoE layers; other steps keep the built-in router"
+        f"[musespark_open] router_gemm: router logits of decode steps of {min_rows}.."
+        f"{_op.MAX_ROWS} rows on the BF16x3 split-K GEMM (one CTA per SM, K splits = SMs // "
+        f"(2 x 128-row tiles)) in {len(layers)} MoE layers; other steps keep the built-in "
+        "router"
     )
     return call

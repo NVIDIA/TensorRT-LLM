@@ -395,7 +395,7 @@ class PoolPublishRmsnormFp4Quant(OpWrapper):
     consecutive calls on one buffer (``projection_publish.buffer_sequence``).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Certified bit for bit (payload and scales) against the built-in pool consumer --

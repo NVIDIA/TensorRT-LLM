@@ -72,6 +72,16 @@ SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (8, 8192, 14336): (128, 8, 1, 6),
 }
 
+#: The tep4 drafter shapes on sm107 (212 SMs), each the fastest split-K tactic there in
+#: the same chains; every one beats cuBLAS at its shape.
+SM107_SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    (8, 8192, 2048): (64, 8, 4, 10),
+    (8, 8192, 2560): (64, 8, 4, 12),
+    (8, 2048, 8192): (128, 16, 2, 6),
+    (8, 7168, 8192): (64, 8, 2, 10),
+    (8, 8192, 14336): (64, 8, 2, 11),
+}
+
 #: The measured table of each ``(compute capability, drafter TP size)``.
 SPLITK_TACTICS_BY_SM_TP: dict[
     tuple[tuple[int, int], int], dict[tuple[int, int, int], tuple[int, int, int, int]]
@@ -79,6 +89,7 @@ SPLITK_TACTICS_BY_SM_TP: dict[
     ((10, 3), 8): SPLITK_TACTICS,
     ((10, 3), 4): SPLITK_TACTICS_TP4,
     ((10, 7), 8): SM107_SPLITK_TACTICS,
+    ((10, 7), 4): SM107_SPLITK_TACTICS_TP4,
 }
 
 #: The kernel's row limit (the dispatcher's ``_MAX_M``).

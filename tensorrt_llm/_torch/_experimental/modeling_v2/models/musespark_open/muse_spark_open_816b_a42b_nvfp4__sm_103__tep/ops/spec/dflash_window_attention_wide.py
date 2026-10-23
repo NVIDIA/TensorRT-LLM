@@ -46,6 +46,7 @@ the same way, so those two calls are bitwise equal.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -285,15 +286,48 @@ WIDE_GEOMETRY = (
 )
 
 
+#: The same sweep on R200 (212 SMs, TP4 rank shape, cold L2, confirm pass in reverse
+#: order): eight-warp programs win at almost every request count; the split count steps
+#: down as the split grid (requests x KV heads x splits) passes about one, then two
+#: waves of the larger device.
+WIDE_GEOMETRY_212_SMS = (
+    (1, 64, 11, 8, 3),
+    (10, 64, 7, 8, 3),
+    (16, 64, 6, 8, 3),
+    (20, 64, 5, 8, 3),
+    (24, 64, 7, 8, 3),
+    (28, 64, 7, 4, 3),
+    (32, 64, 6, 4, 3),
+    (40, 64, 5, 8, 3),
+    (48, 64, 4, 8, 3),
+    (64, 64, 3, 8, 3),
+    (96, 64, 2, 8, 3),
+    (128, 64, 3, 8, 3),
+)
+#: The geometry table per device SM count; a device of another count takes ``WIDE_GEOMETRY``.
+WIDE_GEOMETRY_BY_SMS = {152: WIDE_GEOMETRY, 212: WIDE_GEOMETRY_212_SMS}
+
+
+@functools.lru_cache(maxsize=None)
+def _device_sms(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
+def wide_geometry(device: torch.device) -> tuple:
+    """The geometry table for ``device``: ``WIDE_GEOMETRY_BY_SMS`` by its SM count."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return WIDE_GEOMETRY_BY_SMS.get(_device_sms(index), WIDE_GEOMETRY)
+
+
 def split_keys_for(span: int, block_n: int, splits: int) -> int:
     """Keys per split cutting ``span`` keys into at most ``splits`` splits of whole tiles."""
     return block_n * max(1, triton.cdiv(triton.cdiv(span, block_n), splits))
 
 
-def wide_launch_config(batch: int, span: int) -> dict:
-    """The split geometry for ``batch`` requests of at most ``span`` keys each (``WIDE_GEOMETRY``)."""
-    row = WIDE_GEOMETRY[0]
-    for candidate in WIDE_GEOMETRY:
+def wide_launch_config(batch: int, span: int, geometry: tuple = WIDE_GEOMETRY) -> dict:
+    """The split geometry for ``batch`` requests of at most ``span`` keys each from ``geometry``."""
+    row = geometry[0]
+    for candidate in geometry:
         if batch >= candidate[0]:
             row = candidate
     _, block_n, splits, warps, stages = row
@@ -452,13 +486,13 @@ class DflashWindowAttentionWide(OpWrapper):
     softmax_scale=None, enable_pdl=False, k_new=None, v_new=None)``: the arguments
     and the result of ``dflash_window_attention`` (see there), without its
     single-request merge entry trigger. The split geometry follows the request
-    count (``wide_launch_config``).
+    count and the device's SM count (``wide_geometry``, ``wide_launch_config``).
 
     Fusion boundary: the output projection (after) stays outside; so does the
     append when ``k_new`` is None.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = (
         "Not bitwise dflash_window_attention or flash_attn_with_kvcache: different split "
@@ -501,7 +535,9 @@ class DflashWindowAttentionWide(OpWrapper):
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        config = wide_launch_config(q.shape[0], window_size[0] + q.shape[1])
+        config = wide_launch_config(
+            q.shape[0], window_size[0] + q.shape[1], wide_geometry(q.device)
+        )
         return wide_window_attention_launch(
             q,
             k_cache,

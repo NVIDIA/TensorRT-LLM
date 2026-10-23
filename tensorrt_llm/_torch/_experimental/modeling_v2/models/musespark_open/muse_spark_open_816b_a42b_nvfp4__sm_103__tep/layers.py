@@ -236,6 +236,8 @@ class PostAttnHopCall:
     """What ``DecodeTarget`` holds under ``post_attention_hop``: the op, its workspace and the joins it arms.
 
     With ``attention_output_into_hop``, also the ``DirectPublish`` that steps of its row count arm.
+    With ``wide_post_attention_hop``, also the wide transport (``wide``) that steps of
+    ``MAX_ROWS + 1 .. WIDE_MAX_ROWS`` rows run on.
     """
 
     def __init__(
@@ -243,24 +245,49 @@ class PostAttnHopCall:
         workspace: "_hop.PostAttnHopWorkspace",
         joins: "tuple[MuseSparkOpenTepPostAttnJoin, ...]" = (),
         direct: Optional[DirectPublish] = None,
+        wide: "Optional[_hop.PostAttnHopWorkspace]" = None,
     ) -> None:
         self.op = _hop.post_attn_hop
         self.workspace = workspace
         self.joins = tuple(joins)
         self.direct = direct
+        self.wide = wide
 
-    @staticmethod
-    def takes_call(*tensors: torch.Tensor) -> bool:
-        """Whether the armed hop computes one join call (``post_attn_hop.hop_takes``)."""
-        return _hop.hop_takes(*tensors)
+    def takes_call(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        next_weight: torch.Tensor,
+    ) -> bool:
+        """Whether the armed hop computes one join call (``post_attn_hop.hop_takes``).
 
-    @staticmethod
-    def takes(rows: int) -> bool:
+        On the transport of the call's row count (``workspace_for``): the 8-row one, or
+        the wide one above it; a row count with no transport is not taken.
+        """
+        rows = partial.shape[0] if partial.ndim == 2 else 0
+        workspace = self.workspace_for(rows)
+        if workspace is None:
+            return False
+        return _hop.hop_takes(partial, residual, alpha, beta, next_weight, workspace.max_rows)
+
+    def takes(self, rows: int) -> bool:
         """Whether a decode step of ``rows`` rows runs through the armed joins.
 
         Every rank of the group sees the same rows, so every rank arms or none does.
         """
-        return 1 <= rows <= _hop.MAX_ROWS
+        if 1 <= rows <= _hop.MAX_ROWS:
+            return True
+        return self.wide is not None and rows <= self.wide.max_rows
+
+    def workspace_for(self, rows: int) -> "_hop.PostAttnHopWorkspace":
+        """The transport a ``rows``-row call runs on: the 8-row one, or the wide one above it."""
+        return self.workspace if rows <= _hop.MAX_ROWS else self.wide
+
+    def join_workspace(self, rows: int) -> "_hop.PostAttnHopWorkspace":
+        """The transport an armed join's call of ``rows`` rows (``takes_call`` took it) runs on."""
+        return self.workspace_for(rows)
 
     @contextlib.contextmanager
     def armed(self, rows: Optional[int] = None, residual: Optional[torch.Tensor] = None):
@@ -305,7 +332,7 @@ def _free_device_bytes() -> int:
 
 
 class WideHopCall:
-    """What ``DecodeTarget`` holds under ``wide_post_attention_hop``: the wide op, its workspaces
+    """What ``DecodeTarget`` holds under ``multi_request_post_attention_hop``: the wide op, its workspaces
     and the joins it arms.
 
     The joins are ``post_attention_hop``'s (``MuseSparkOpenTepPostAttnJoin``): a decode step of
@@ -326,6 +353,10 @@ class WideHopCall:
     memory. The served runtime never reaches it: an eager forward of the same batch precedes
     every capture (the general warmup of ``max_batch_size`` requests, and the eager warmup of
     each graph), and it builds the larger workspace first.
+
+    ``min_rows`` is the fewest rows a step it takes has: the row after the last one the
+    8-row hop's call takes, its wide TP4 transport (``wide_post_attention_hop``) included,
+    so a step arms one hop or the other, never both.
     """
 
     def __init__(
@@ -333,6 +364,7 @@ class WideHopCall:
         workspace: "_wide.WideHopWorkspace",
         joins: "tuple[MuseSparkOpenTepPostAttnJoin, ...]",
         wide_factory: "Optional[Callable[[], _wide.WideHopWorkspace]]" = None,
+        min_rows: int = _wide.MIN_ROWS,
     ) -> None:
         self.op = _wide.post_attn_hop_wide
         self.served = workspace
@@ -340,6 +372,7 @@ class WideHopCall:
         self.wide: "Optional[_wide.WideHopWorkspace]" = None
         self.wide_factory = wide_factory
         self.joins = tuple(joins)
+        self.min_rows = max(int(min_rows), _wide.MIN_ROWS)
         #: The joins read ``direct`` off any armed call; the wide op has no direct publication.
         self.direct = None
 
@@ -355,7 +388,7 @@ class WideHopCall:
         arms or none does. A step of more than ``MAX_ROWS`` rows first builds the larger
         workspace (collective) when it does not exist yet and no capture is running.
         """
-        if not _wide.wide_takes_rows(rows):
+        if rows < self.min_rows or not _wide.wide_takes_rows(rows):
             return False
         if _wide.capacity_for(rows) == _wide.MAX_ROWS:
             return True
@@ -367,12 +400,16 @@ class WideHopCall:
             except (ValueError, RuntimeError) as error:
                 self.wide_factory = None
                 logger.warning(
-                    f"[musespark_open] wide_post_attention_hop: no {_wide.WIDE_MAX_ROWS}-row "
+                    f"[musespark_open] multi_request_post_attention_hop: no {_wide.WIDE_MAX_ROWS}-row "
                     f"transport ({error}); decode steps above {_wide.MAX_ROWS} rows run the "
                     f"built-in o_proj all-reduce"
                 )
                 return False
         return True
+
+    def join_workspace(self, rows: int) -> "_wide.WideHopWorkspace":
+        """The workspace an armed join's call runs on: the one ``armed`` chose for the step."""
+        return self.workspace
 
     def workspace_for(self, rows: int) -> "_wide.WideHopWorkspace":
         """The workspace a step of ``rows`` rows runs on (``takes`` must have taken it)."""
@@ -464,6 +501,7 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
             and not torch.compiler.is_compiling()
             and call.takes_call(branch, residual, alpha, beta, weight)
         ):
+            workspace = call.join_workspace(branch.shape[0])
             branch, residual, alpha, beta, weight = _hop.readable(
                 branch, residual, alpha, beta, weight
             )
@@ -476,7 +514,7 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
                 eps,
                 next_norm.variance_epsilon,
                 self._preqkv_norm_fp32,
-                call.workspace,
+                workspace,
             )
         # A call the hop does not take: the built-in all-reduce, then the built-in join.
         return super()._add_after_rmsnorm_and_norm(
@@ -583,7 +621,10 @@ def post_attn_hop_refusals(layer: MuseSparkOpenDecoderLayer) -> list:
 
 
 def _build_post_attn_hop(
-    model: MuseSparkOpenModel, early_trigger: bool = False, stale_poll: bool = False
+    model: MuseSparkOpenModel,
+    early_trigger: bool = False,
+    stale_poll: bool = False,
+    wide: bool = False,
 ) -> PostAttnHopCall:
     """Take the group's one workspace (collective), then re-class every layer's ``add_attn``.
 
@@ -622,26 +663,42 @@ def _build_post_attn_hop(
         early_trigger=early_trigger,
         stale_poll=stale_poll,
     )
+    wide_workspace = None
+    if wide:
+        # wide_post_attention_hop: a second, 32-row transport (TP4) for steps of 9..32 rows.
+        wide_workspace = _hop.shared_workspace(
+            model.layers[0].mapping,
+            variants=variants,
+            early_trigger=early_trigger,
+            stale_poll=stale_poll,
+            max_rows=_hop.WIDE_MAX_ROWS,
+        )
     joins = tuple(
         MuseSparkOpenTepPostAttnJoin.adopt(layer.add_attn, layer.self_attn.o_proj.all_reduce)
         for layer in model.layers
     )
-    _hop.log_once_enabled(len(model.layers), workspace.multicast, early_trigger, stale_poll)
-    return PostAttnHopCall(workspace, joins)
+    _hop.log_once_enabled(
+        len(model.layers),
+        workspace.multicast,
+        early_trigger,
+        stale_poll,
+        wide_workspace.max_rows if wide_workspace is not None else None,
+    )
+    return PostAttnHopCall(workspace, joins, wide=wide_workspace)
 
 
 def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHopCall:
-    """``wide_post_attention_hop``: take the group's wide-hop workspace (collective) for ``call``'s joins.
+    """``multi_request_post_attention_hop``: take the group's wide-hop workspace (collective) for ``call``'s joins.
 
     The joins are ``post_attention_hop``'s, whose refusals already read every layer; the
     wide op computes the same pair on more rows, so nothing else is checked. The workspace
     comes from ``shared_wide_workspace``, so a constructor that runs again reuses it.
     """
     if not _wide.HAS_CUTE_DSL:
-        raise ValueError("[musespark_open] wide_post_attention_hop needs the CuTe DSL")
+        raise ValueError("[musespark_open] multi_request_post_attention_hop needs the CuTe DSL")
     if len(call.joins) != len(model.layers):
         raise ValueError(
-            f"[musespark_open] wide_post_attention_hop: {len(call.joins)} post-attention joins "
+            f"[musespark_open] multi_request_post_attention_hop: {len(call.joins)} post-attention joins "
             f"for {len(model.layers)} layers"
         )
     variants = sorted(
@@ -660,11 +717,14 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         variants=variants,
         early_launch=_wide.SERVED_EARLY_LAUNCH,
     )
+    # The 8-row hop's call keeps every row count it takes (its wide TP4 transport's too).
+    min_rows = (call.wide.max_rows if call.wide is not None else _hop.MAX_ROWS) + 1
     _wide.log_once_enabled(
         len(model.layers),
         workspace.multicast,
         workspace.two_shot_rows,
         workspace.early_launch,
+        min_rows,
     )
 
     mapping = model.layers[0].mapping
@@ -693,13 +753,13 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
             max_rows=_wide.WIDE_MAX_ROWS,
         )
         logger.info(
-            f"[musespark_open] wide_post_attention_hop: first decode step above "
+            f"[musespark_open] multi_request_post_attention_hop: first decode step above "
             f"{_wide.MAX_ROWS} rows; built the {_wide.WIDE_MAX_ROWS}-row two-shot transport "
             f"(+{built.workspace_bytes / 2**20:.1f} MiB of fabric memory per rank)"
         )
         return built
 
-    return WideHopCall(workspace, call.joins, wide_factory)
+    return WideHopCall(workspace, call.joins, wide_factory, min_rows=min_rows)
 
 
 def _build_direct_publish(
@@ -905,7 +965,11 @@ def adopt_model(
         # its configuration refusals leave the model untouched.
         from .kernels.dense_gemms import dispatcher as dense_gemms
 
-        dense_gemm_plan = dense_gemms.install(model, prefetch=plan.enabled("dense_gemm_prefetch"))
+        dense_gemm_plan = dense_gemms.install(
+            model,
+            prefetch=plan.enabled("dense_gemm_prefetch"),
+            wide=plan.enabled("wide_dense_gemms"),
+        )
     norm_gate_trigger = None
     early_release_on = plan.enabled("boundary_early_release")
     if early_release_on:
@@ -984,6 +1048,9 @@ def adopt_model(
         _tp_agreement.agreed_install(
             model.layers[0].mapping, lambda: prep_fold_attention.install(model)
         )
+    if plan.enabled("wide_full_attention"):
+        # After the prep append and split-KV: their mixins take steps of 2..4 sequences too.
+        full_attention.install_multi(model)
     decode_kv_splits = None
     if plan.enabled("decode_kv_splits"):
         # Re-classes nothing: DecodeTarget arms it around a forward of 72..512 rows.
@@ -996,13 +1063,17 @@ def adopt_model(
     if plan.enabled("multi_request_split_kv"):
         # After every other attention re-class but multi_request_prep_append's: its mixin
         # goes in front of them and acts only on decode steps of two or more sequences, where
-        # it swaps the decode FMHA launch (``intercepting``). Agreed like split-KV's.
+        # it swaps the decode FMHA launch (``intercepting``). Agreed like split-KV's. With
+        # wide_full_attention the fold owns steps of 2..MAX_REQUESTS sequences, so this
+        # path takes the steps above them.
         from .kernels.multi_request_split_kv import attention as multi_request_attention
+        from .ops.attention.preattn_prep_append import MAX_REQUESTS as _WIDE_MAX_REQUESTS
 
+        min_requests = _WIDE_MAX_REQUESTS + 1 if plan.enabled("wide_full_attention") else 2
         _tp_agreement.agreed_install(
             model.layers[0].mapping,
             lambda: multi_request_attention.install(
-                model, sliding=multi_request_attention.SLIDING_LAYERS
+                model, sliding=multi_request_attention.SLIDING_LAYERS, min_requests=min_requests
             ),
         )
     if plan.enabled("multi_request_prep_append"):
@@ -1012,8 +1083,16 @@ def adopt_model(
         # fold's.
         from .kernels.multi_request_prep_append import attention as multi_request_append
 
+        min_seqs = multi_request_append.MIN_SEQS
+        if plan.enabled("wide_full_attention") or plan.enabled("wide_swa_block"):
+            # Those paths fold the append of steps of two to MULTI_MAX_REQUESTS
+            # sequences in their own calls; the prep append takes the larger steps.
+            from .ops.attention.full_attention_split_kv import MULTI_MAX_REQUESTS as _full_multi_max
+            from .ops.attention.swa_block import MULTI_MAX_REQUESTS as _swa_multi_max
+
+            min_seqs = 1 + max(_full_multi_max, _swa_multi_max)
         _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: multi_request_append.install(model)
+            model.layers[0].mapping, lambda: multi_request_append.install(model, min_seqs)
         )
     if preattn_prep_on:
         logger.info(
@@ -1028,6 +1107,8 @@ def adopt_model(
         )
     if swa_block is not None:
         swa_attention_block.log_installed(model.layers, swa_block)
+        if plan.enabled("wide_swa_block"):
+            swa_attention_block.install_multi(model)
     layer_kwargs = {}
     if plan.enabled("projection_gathers"):
         # Imported only when planned: with no fast path the target imports
@@ -1048,6 +1129,13 @@ def adopt_model(
         # The router fork: its refusals (PDL off, a stream not created) are agreed over
         # the TP group.
         moe_prologue.install_router_fork(model)
+    # After the router fork (whose side stream its router shard runs on): wide_prologue hands
+    # every prologue MoE and post-FFN join its wide inbox. Its refusal is agreed over the TP
+    # group before the inboxes' collective construction.
+    if plan.enabled("wide_prologue"):
+        from .kernels.wide_prologue import prologue as wide_prologue
+
+        wide_prologue.install(model)
     router_gemm = None
     if plan.enabled("router_gemm"):
         # After moe_prologue and the router fork, which check the MoE class they re-class:
@@ -1056,8 +1144,14 @@ def adopt_model(
         # early_expert_ids) take a subclass of it. Agreed like the attention installs.
         from .kernels.router_gemm import router as _router_gemm
 
+        # Where wide_prologue serves the 16..32-row steps' router, the op starts above them.
+        min_rows = (
+            _router_gemm.WIDE_PROLOGUE_MIN_ROWS
+            if plan.enabled("wide_prologue")
+            else _router_gemm.MIN_ROWS
+        )
         router_gemm = _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: _router_gemm.install(model)
+            model.layers[0].mapping, lambda: _router_gemm.install(model, min_rows)
         )
     # The capture layers whose boundary writes the DFlash capture (capture_fold): no
     # plain capture copy follows their boundary, so boundary_early_release converts
@@ -1075,7 +1169,12 @@ def adopt_model(
     # projection_gathers re-class included) and re-classes only add_attn, which no
     # other fast path touches.
     post_attn_hop = (
-        _build_post_attn_hop(model, early_trigger=True, stale_poll=True)
+        _build_post_attn_hop(
+            model,
+            early_trigger=True,
+            stale_poll=True,
+            wide=plan.enabled("wide_post_attention_hop"),
+        )
         if plan.enabled("post_attention_hop")
         else None
     )
@@ -1165,7 +1264,7 @@ def adopt_model(
         # After dense_gemms (its o_proj dispatchers) and post_attention_hop (its joins).
         post_attn_hop.direct = _build_direct_publish(model, post_attn_hop, early_trigger=True)
     wide_hop = None
-    if plan.enabled("wide_post_attention_hop"):
+    if plan.enabled("multi_request_post_attention_hop"):
         # After post_attention_hop, whose joins it arms on 9..1024-row decode steps.
         wide_hop = _build_wide_hop(model, post_attn_hop)
     wide_projections = None

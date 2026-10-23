@@ -411,7 +411,7 @@ class MultiRequestSplitKv(OpWrapper):
     capture (``precompile``).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Metadata consumed: seq_lens (device; read by both kernels, never on the host), the batch's

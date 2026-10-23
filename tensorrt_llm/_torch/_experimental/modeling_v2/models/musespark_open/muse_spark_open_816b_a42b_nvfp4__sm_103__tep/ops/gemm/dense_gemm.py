@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The dense BF16 projections of a step of at most 8 rows (32 by split-K or cuBLAS), with the
-kernel named by the caller.
+"""The dense BF16 projections of a decode step, with the kernel named by the caller.
 
 At tep8 every decoder layer multiplies the step's rows by four BF16 weights per
 rank: the fused QKV projection ``[2304, 8192]``, the attention output projection
@@ -31,10 +30,16 @@ kernel per shape runs it on every rank:
 * ``"cublas"`` -- ``torch.mm`` into a fresh output, the call the built-in
   dispatcher's cuBLAS runner makes.
 
+The direct kernel holds every row in one CTA and serves at most ``MAX_ROWS``; the split-K
+kernel and cuBLAS also serve the 9..``WIDE_MAX_ROWS``-row steps of a tep4 rank
+(``wide_dense_gemms``, ``wide_projection_gathers``).
+
 All accumulate in FP32 and round once; they differ from each other, and the
 split-K kernel's tactics with different ``split_k`` differ among themselves, only
 in the FP32 summation order. Split-K tactics with the same ``split_k`` sum the
-same K slices in the same order.
+same K slices in the same order, whatever their tile widths, and a row's sum never
+involves another row: a split-K call of 9..32 rows gives each row the bits a split-K
+call of the same ``split_k`` gives it in a call of at most 8 rows.
 
 ``l2_prefetch`` asks the L2 to fetch a tensor without waiting for it: one
 ``cp.async.bulk.prefetch.L2`` per 32 KiB chunk, from a one-warp-per-32-chunks
@@ -221,7 +226,6 @@ class DenseGemm(OpWrapper):
         top = MAX_ROWS if parse_kernel(kernel)[0] == DIRECT else WIDE_MAX_ROWS
         assert 1 <= x.shape[0] <= top, f"1 <= M <= {top} rows for {kernel}"
         assert x.shape[1] == weight.shape[1], "weight is [N, K], not its transpose"
-        parse_kernel(kernel)
         if out is not None:
             # torch.mm would write a strided out in place; the flashinfer kernels
             # address their output as a dense row-major [M, N] matrix.

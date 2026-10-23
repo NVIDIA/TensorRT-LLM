@@ -311,7 +311,7 @@ class MultiRequestPrepAppend(OpWrapper):
     global read; it triggers its dependents only by completing.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Metadata consumed: seq_lens[0:B] (device, read by the kernel), the

@@ -338,7 +338,7 @@ class HotReplicaAssign(OpWrapper):
     loads before (``stats[:4]``, every expert on its owner) and after the placement.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     note = """
     Pure function of ``selected``, ``table`` and ``rank``; one program over at most

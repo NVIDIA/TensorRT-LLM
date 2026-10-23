@@ -43,7 +43,12 @@ then the built-in ``hidden_norm``. The gather depends on the TP width:
   ``FC_SHARD_MAX_ROWS`` rows run the built-in method.
 * TP4 (one node of four): the four ``[rows, 2048]`` slices are joined by the
   built-in NCCL all-gather (``tensorrt_llm._torch.distributed.allgather``),
-  which takes any row count, so every call is sharded.
+  which takes any row count, so every call is sharded. With ``drafter_fc_inbox``
+  calls of at most ``FC_INBOX_MAX_ROWS`` rows are gathered over the tray's
+  NVLink by the built-in projection-gather kernel on a workspace of their own
+  (``InboxGatherColumns``) instead, larger ones by the NCCL all-gather: the
+  same bytes in the same order, and no queueing behind the step's other NCCL
+  collectives on the shared communicator.
 
 The rank's GEMM runs on the fixed low-M tactic listed for its shape
 (``ops/gemm/fixed_low_m_gemm.py``) whether or not ``drafter_fixed_gemms`` is
@@ -179,6 +184,42 @@ class AllGatherColumns:
         from tensorrt_llm._torch.distributed import allgather
 
         return allgather(local, self.mapping, dim=-1)
+
+
+#: Rows a TP4 ``drafter_fc_inbox`` call gathers over the projection-gather workspace (its
+#: allocation's token capacity); larger calls take the NCCL all-gather.
+FC_INBOX_MAX_ROWS = 128
+
+
+class InboxGatherColumns:
+    """The TP4 gather of the sharded ``fc`` over the tray's NVLink (``drafter_fc_inbox``).
+
+    Calls of 1..``FC_INBOX_MAX_ROWS`` contiguous BF16 rows go through the built-in
+    projection-gather kernel on this gather's own workspace, any other call through the
+    NCCL all-gather (``AllGatherColumns``). Both join the slices by columns in rank
+    order, so the output is the same bytes. Every rank makes the same calls with the
+    same row counts, and the drafter's calls are ordered on the CUDA streams (the
+    context-K/V fork's side chain joins the main stream before the next call), as the
+    workspace requires.
+    """
+
+    def __init__(self, mapping) -> None:
+        from tensorrt_llm._torch.models.musespark_open_projection_gather import (
+            ProjectionGatherWorkspace,
+        )
+
+        self.workspace = ProjectionGatherWorkspace(mapping)
+        self.fallback = AllGatherColumns(mapping)
+
+    def gather(self, local: torch.Tensor) -> torch.Tensor:
+        if (
+            local.dim() == 2
+            and 1 <= local.shape[0] <= FC_INBOX_MAX_ROWS
+            and local.dtype == torch.bfloat16
+            and local.is_contiguous()
+        ):
+            return self.workspace.gather(local)
+        return self.fallback.gather(local)
 
 
 def sharded_project_target_hidden(
@@ -661,10 +702,13 @@ def install(
     fc_shard: bool,
     fused_accept: bool,
     fixed_gemms: bool,
+    fc_inbox: bool = False,
 ) -> None:
     """Install the drafter worker fast paths asked for on the drafter and the worker.
 
-    ``fc_shard`` (``drafter_fc_shard``) column-shards the drafter's fc, ``fused_accept``
+    ``fc_shard`` (``drafter_fc_shard``) column-shards the drafter's fc (at TP4 with
+    ``fc_inbox``, ``drafter_fc_inbox``, its decode-size calls gathered over the tray's
+    NVLink: ``InboxGatherColumns``), ``fused_accept``
     fuses the worker's acceptance, ``fixed_gemms`` (``drafter_fixed_gemms``) puts
     the drafter's GEMM call sites on fixed low-M tactics.
 
@@ -686,15 +730,28 @@ def install(
         if draft_model is None:
             raise ValueError("[musespark_open] drafter_fc_shard cannot run here: no drafter")
         was_installed = sharded_fc_installed(draft_model)
-        reason = install_sharded_fc(draft_model, mapping, enable_pdl)
+        gather = None
+        if fc_inbox and not was_installed:
+            if getattr(mapping, "tp_size", None) != 4:
+                raise ValueError(
+                    "[musespark_open] drafter_fc_inbox is the TP4 gather of the sharded fc, not TP"
+                    f"{getattr(mapping, 'tp_size', None)}"
+                )
+            gather = InboxGatherColumns(mapping)
+        extra = {"gather": gather} if gather is not None else {}
+        reason = install_sharded_fc(draft_model, mapping, enable_pdl, **extra)
         if reason is not None:
             raise ValueError(f"[musespark_open] drafter_fc_shard cannot run here: {reason}")
         if not was_installed:
-            gather = (
-                "a fabric gather"
-                if draft_model._fc_shard.world == 8
-                else "an NCCL all-gather, any row count"
-            )
+            if draft_model._fc_shard.world == 8:
+                gather = "a fabric gather"
+            elif isinstance(draft_model._fc_shard.gather, InboxGatherColumns):
+                gather = (
+                    f"the tray's projection gather up to {FC_INBOX_MAX_ROWS} rows "
+                    "(drafter_fc_inbox), an NCCL all-gather above"
+                )
+            else:
+                gather = "an NCCL all-gather, any row count"
             logger.info(
                 f"[musespark_open] drafter_fc_shard: DFlash fc column-sharded over "
                 f"TP{draft_model._fc_shard.world} with {gather}"

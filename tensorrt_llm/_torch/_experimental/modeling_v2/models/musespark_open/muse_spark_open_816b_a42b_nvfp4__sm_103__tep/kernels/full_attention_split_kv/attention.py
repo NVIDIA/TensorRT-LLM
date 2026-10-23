@@ -133,6 +133,7 @@ class SplitKvCall:
         out = kwargs["out"]
         seq_lens = kwargs["seq_lens"]
         rows = folded.rows
+        requests = folded.requests
         kv_heads = self.kv_heads
         checks = (
             (pool is None or kwargs["kv_cache"][1] is not pool, "not one K/V pool"),
@@ -141,7 +142,7 @@ class SplitKvCall:
             (kwargs["kv_cache_sf"] is not None, "a scaled KV cache"),
             (kwargs["kv_layout"] != "HND", "another KV layout"),
             (kwargs["backend"] != "trtllm-gen", "another backend"),
-            (kwargs["q_len_per_req"] != rows, "another query length"),
+            (kwargs["q_len_per_req"] != rows // requests, "another query length"),
             (
                 kwargs["max_q_len"] is not None or kwargs["cum_seq_lens_q"] is not None,
                 "a multi-token query layout",
@@ -164,12 +165,28 @@ class SplitKvCall:
                 "another cache view",
             ),
             (
-                tables.dim() != 3 or tables.shape[0] != 1 or tables.shape[1] != 2,
-                "not one sequence's K/V page table",
+                tables.dim() != 3 or tables.shape[0] != requests or tables.shape[1] != 2,
+                "not one sequence's K/V page table"
+                if requests == 1
+                else "not the step's sequences' K/V page tables",
             ),
             (
-                tables.dim() == 3 and -(-tables.shape[2] // self.splits) > _v4.cta_pages(kv_heads),
+                requests == 1
+                and tables.dim() == 3
+                and -(-tables.shape[2] // self.splits) > _v4.cta_pages(kv_heads),
                 "more pages per split than the kernel stages",
+            ),
+            (
+                requests > 1
+                and tables.dim() == 3
+                and (
+                    self.splits <= requests
+                    or -(-requests * tables.shape[2] // (self.splits - requests))
+                    > _v4.MULTI_CTA_PAGES_FACTOR * _v4.cta_pages(kv_heads)
+                    or tables.stride(0) != 2 * tables.stride(1)
+                    or tables.stride(-1) != 1
+                ),
+                "more pages per split than the multi-sequence kernel stages",
             ),
             (
                 out.dtype != torch.bfloat16
@@ -189,6 +206,7 @@ class SplitKvCall:
             EVICT_FIRST,
             self.rescale_cols,
             kv_heads,
+            requests,
         )
         if _capturing() and key not in _v4._compiled_keys:
             return "full_attention_split_kv was not compiled before this capture"
@@ -196,20 +214,40 @@ class SplitKvCall:
 
     def launch(self, kwargs: dict) -> None:
         folded = self.folded
-        part_o, part_lse = _v4.full_attention_split_kv(
-            folded.qkv_out,
-            kwargs["kv_cache"][0],
-            kwargs["block_tables"][0],
-            kwargs["seq_lens"],
-            self.kv_scale,
-            self.splits,
-            bool(kwargs["enable_pdl"]),
-            prefetch=PREFETCH,
-            evict_first=EVICT_FIRST,
-            rescale_cols=self.rescale_cols,
-        )
+        if folded.requests == 1:
+            part_o, part_lse = _v4.full_attention_split_kv(
+                folded.qkv_out,
+                kwargs["kv_cache"][0],
+                kwargs["block_tables"][0],
+                kwargs["seq_lens"],
+                self.kv_scale,
+                self.splits,
+                bool(kwargs["enable_pdl"]),
+                prefetch=PREFETCH,
+                evict_first=EVICT_FIRST,
+                rescale_cols=self.rescale_cols,
+            )
+        else:
+            part_o, part_lse = _v4.full_attention_split_kv_multi(
+                folded.qkv_out,
+                kwargs["kv_cache"][0],
+                kwargs["block_tables"],
+                kwargs["seq_lens"],
+                self.kv_scale,
+                self.splits,
+                bool(kwargs["enable_pdl"]),
+                evict_first=EVICT_FIRST,
+                rescale_cols=self.rescale_cols,
+            )
         self.launched = True
-        self.pending = (part_o, part_lse, folded.rows, kwargs["out"].data_ptr(), kwargs["seq_lens"])
+        self.pending = (
+            part_o,
+            part_lse,
+            folded.rows,
+            kwargs["out"].data_ptr(),
+            kwargs["seq_lens"],
+            folded.requests,
+        )
 
 
 @dataclass
@@ -325,7 +363,7 @@ class FullAttnSplitKvAttention:
         if pending is None:
             return super().apply_output_gate(attention_output, gate)
         self._split_kv_pending = None
-        part_o, part_lse, rows, out_ptr, seq_lens = pending
+        part_o, part_lse, rows, out_ptr, seq_lens, requests = pending
         if (
             gate is None
             or not isinstance(attention_output, torch.Tensor)
@@ -346,6 +384,7 @@ class FullAttnSplitKvAttention:
             trigger,
             seq_lens=seq_lens,
             heads=_v4.q_heads(self._split_kv_kv_heads),
+            **({"requests": requests} if requests > 1 else {}),
         )
 
 
