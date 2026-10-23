@@ -93,7 +93,7 @@ You can add the `CUDA_ARCHS="<list of architectures in CMake format>"` optional 
 
 ```bash
 # Restrict the compilation to Ada and Hopper architectures.
-make -C docker release_build CUDA_ARCHS="89-real;90-real"
+make -C docker release_build CUDA_ARCHS="89;90"
 ```
 
 After the image is built, the Docker container can be run.

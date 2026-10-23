@@ -27,7 +27,13 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (
+    get_sm_version,
+    is_sm_100f,
+    is_sm_120f,
+    maybe_pin_memory,
+    prefer_pinned,
+)
 from tensorrt_llm.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -1722,7 +1728,7 @@ class Indexer(nn.Module):
             if not 1 <= heads <= 64:
                 raise ValueError("FP4 MQA requires between 1 and 64 index heads")
             # Consumer Blackwell lacks the 8-head FP4 MQA specialization.
-            supported_heads = (16, 32, 64) if get_sm_version() in (120, 121) else (8, 16, 32, 64)
+            supported_heads = (16, 32, 64) if is_sm_120f() else (8, 16, 32, 64)
             padded_heads = next(size for size in supported_heads if size >= heads)
             if padded_heads != heads:
                 q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))

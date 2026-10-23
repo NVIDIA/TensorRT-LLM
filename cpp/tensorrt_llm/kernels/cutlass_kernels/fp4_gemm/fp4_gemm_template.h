@@ -482,7 +482,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
                 global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
 #endif
         }
-        else if (mSm == 120 || mSm == 121)
+        else if (tk::isSM120Family(mSm))
         {
             return dispatchNVFP4xNVFP4GemmCTAShapeSm120<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
@@ -563,7 +563,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
             }
         }
     }
-    else if (mSm == 120 || mSm == 121)
+    else if (tk::isSM120Family(mSm))
     {
         std::vector<tkc::CutlassTileConfigSM120> tilesSm120 = {
             tkc::CutlassTileConfigSM120::CtaShape128x128x128B,

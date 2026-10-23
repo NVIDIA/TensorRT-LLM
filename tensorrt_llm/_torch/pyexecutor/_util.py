@@ -3662,7 +3662,7 @@ def _create_kv_cache_manager(
         # Flashinfer has a SW fallback at any SM.
         if (stochastic_rounding
                 and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and (sm < 100 or sm in (120, 121))):
+                and not (100 <= sm < 120)):
             logger.info("Replay kernel Philox requires 100 <= sm < 120; "
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False

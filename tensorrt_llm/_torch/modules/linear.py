@@ -36,7 +36,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
     transform_k128_scales_to_cutedsl_mxfp8_layout,
     transform_sf_into_required_layout)
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f, is_sm_120f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -1387,7 +1387,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     module.weight_scale,
                     disable_ue8m0_cast=True,
                 )
-        elif sm_version == 120:
+        elif is_sm_120f(sm_version):
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
@@ -1529,9 +1529,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module.rebuild_tensor_metadata)
             return
         use_deep_gemm_layout = (
-            is_sm_100f()
-            and not (module.use_cute_dsl_blockscaling_mm
-                     or module.disable_deep_gemm)) or get_sm_version() == 120
+            is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                  or module.disable_deep_gemm)) or is_sm_120f()
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
@@ -2373,7 +2372,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
         block_width = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
-        return ((89 <= sm_version < 100 or sm_version in (120, 121))
+        return ((89 <= sm_version < 100 or is_sm_120f(sm_version))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
                 and block_width
@@ -2387,7 +2386,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
         if not cls.is_supported(module):
             return False
         sm_version = get_sm_version()
-        return (sm_version in (120, 121)
+        return (is_sm_120f(sm_version)
                 or "marlin" in getattr(module, "nvfp4_allowed_backends", ()))
 
     def transform_weights(self, module: Linear) -> None:

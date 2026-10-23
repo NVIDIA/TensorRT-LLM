@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...model_config import ModelConfig
@@ -136,9 +136,9 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("min", 89),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # FP8_BLOCK_SCALES: SM in {90, 120}
+        # FP8_BLOCK_SCALES: SM in {90, 120, 121}
         QuantAlgo.FP8_BLOCK_SCALES: {
-            "sm_constraint": ("in", {90, 120}),
+            "sm_constraint": ("in", {90, 120, 121}),
             "dtypes": {torch.bfloat16},
         },
         # NVFP4: SM in {100, 103, 107, 120, 121}
@@ -320,7 +320,7 @@ class CutlassFusedMoE(MoEImplBase):
         # SM120 FP8 block scales use the Triton fallback below rather than the
         # CUTLASS adaptor, and that fallback has no clamp-order parameter.
         if (p.clamp_after_silu and quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-                and sm_version == 120):
+                and is_sm_120f(sm_version)):
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "CutlassFusedMoE SM120 FP8 block scales use a Triton fallback "
@@ -1016,7 +1016,7 @@ class CutlassFusedMoE(MoEImplBase):
 
         # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
         # for large token counts due to cuTensorMapEncodeTiled limitations).
-        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
+        if self.has_deepseek_fp8_block_scales and is_sm_120f():
             from .fused_moe_triton_fp8_block_scale import \
                 run_triton_fp8_block_scale_moe
 

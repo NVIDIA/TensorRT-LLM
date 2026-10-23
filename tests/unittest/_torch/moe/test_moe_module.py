@@ -112,7 +112,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
+from tensorrt_llm._utils import get_sm_version, is_sm_120f, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -2045,7 +2045,7 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
     if backend_str == "CUTLASS":
         DSFP8BlockScalesFusedMoEMethod = (
             DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm
-            if get_sm_version() == 120
+            if is_sm_120f()
             else DeepSeekFP8BlockScalesFusedMoEMethod
         )
         method_map = {
