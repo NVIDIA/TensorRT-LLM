@@ -179,6 +179,7 @@ from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGU
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
 from .ops.attention.vision_rope_2d import vision_rope_2d
+from .ops.gemm.bf16_gemv_pdl import MAX_ROWS as _GEMV_MAX_ROWS
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
 from .ops.gemm.fp8_gemv import (
@@ -300,18 +301,26 @@ _NVFP4_ROWTILE_MIN_ROWS = 256  # capacity: fixed: a dispatch threshold, not a bu
 #: rows 275 vs 273, 8192 rows 451 vs 555, 16384 rows 656 vs 882.
 _CUTE_DSL_MOE_MIN_ROWS = 4096  # capacity: fixed: a dispatch threshold, not a buffer size
 
+#: Widest decode projection that `bf16_gemv_pdl` takes at 2..`_GEMV_MAX_ROWS` rows: the shared
+#: expert's one-column gate logit, on one CTA under `low_m_bf16_mm` (~3 us a layer at 4 rows).
+_GEMV_NARROW_N = 8  # capacity: fixed: a dispatch threshold, not a buffer size
+
 
 def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     """A graph-captured decode step's bf16 projection, always a PDL launch.
 
     One row runs `bf16_gemv_pdl` on every K it tiles (each decode projection of this
     checkpoint): its weight streams into registers before it waits on the producer, and it
-    triggers its own dependents. More rows run `low_m_bf16_mm` with its FlashInfer
-    branches' PDL on (its cuBLAS branch, above M=32 and off its table, ignores the flag).
-    Every kernel either path launches reads the activation only after
-    `griddepcontrol.wait`.
+    triggers its own dependents. So do up to `_GEMV_MAX_ROWS` rows of a projection at most
+    `_GEMV_NARROW_N` wide (the shared expert's gate logit), which `low_m_bf16_mm` would run
+    on one CTA. Other calls run `low_m_bf16_mm` with its FlashInfer branches' PDL on (its
+    cuBLAS branch, above M=32 and off its table, ignores the flag). Every kernel either
+    path launches reads the activation only after `griddepcontrol.wait`.
     """
-    if mat_a.shape[0] == 1 and mat_b.shape[0] in _GEMV_TILED_K:
+    rows = mat_a.shape[0]
+    if mat_b.shape[0] in _GEMV_TILED_K and (
+        rows == 1 or (rows <= _GEMV_MAX_ROWS and mat_b.shape[1] <= _GEMV_NARROW_N)
+    ):
         return bf16_gemv_pdl(mat_a, mat_b, True)
     return low_m_bf16_mm(mat_a, mat_b, True)
 
