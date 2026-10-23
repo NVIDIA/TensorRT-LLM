@@ -2089,14 +2089,12 @@ class TxSession(TxSessionBase):
         counts = dict.fromkeys(_PhysicalOperationState, 0)
         busy_tasks = 0
         for task in tasks:
-            if not task._physical_lock.acquire(blocking=False):
+            states = task._physical_owner.try_snapshot_operation_states()
+            if states is None:
                 busy_tasks += 1
                 continue
-            try:
-                for operation in task._physical_operations.values():
-                    counts[operation.state] += 1
-            finally:
-                task._physical_lock.release()
+            for state in states:
+                counts[state] += 1
         phases = ",".join(
             f"{'pre_submission' if state is _PhysicalOperationState.ADMITTED else state.value.lower()}={count}"
             for state, count in counts.items()
