@@ -4523,7 +4523,7 @@ class PyExecutor:
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             request.decoding_iter = request.py_decoding_iter
-            response = request.create_response(False, self.dist.rank)
+            response = request.create_response()
             if response is not None:
                 response.result.cached_tokens = request.cached_tokens
                 self._enqueue_responses([(request.py_request_id, response)])
@@ -9285,7 +9285,7 @@ class PyExecutor:
                 has_prepended_logits = self._has_prepended_logits(req)
                 logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
                                    if has_prepended_logits else None)
-                response = req.create_response(False, self.dist.rank)
+                response = req.create_response()
                 if logits_snapshot is not None and response is not None:
                     response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
@@ -9327,7 +9327,7 @@ class PyExecutor:
                 logits_snapshot = request.py_result.get_latest_logits_unexcluded(
                 )
 
-            response = request.create_response(False, self.dist.rank)
+            response = request.create_response()
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
@@ -9443,7 +9443,7 @@ class PyExecutor:
                     # Response creation may finalize and copy scalar ctx GPU totals.
                     self.perf_manager.compute_batch_gpu_times(
                         [request], gpu_times_cache=gpu_times_cache)
-                response = request.create_response(False, self.dist.rank)
+                response = request.create_response()
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
