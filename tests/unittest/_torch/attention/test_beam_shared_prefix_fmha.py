@@ -633,8 +633,8 @@ def test_sampling_grouping_pads_groups_and_demotes_surplus_sharing_groups():
     assert grouping.prefix_last_page_len.tolist() == [tpb, tpb, 1, 1]
     assert grouping.prefix_empty.tolist() == [False] * 5 + [True]
 
-    # Room for one sharing group: {0, 1} saves 2 pages, {2, 3, 4} saves 2 x 1.
-    # On a tie the earlier group is not guaranteed, so make {2, 3, 4} lose.
+    # Room for one sharing group: {0, 1} and {2, 3, 4} both save two page
+    # reads; the tie goes to the group with the lower first page.
     grouping = lib._build_grouping(
         2,
         torch.arange(rows),
@@ -666,6 +666,71 @@ def test_sampling_grouping_pads_groups_and_demotes_surplus_sharing_groups():
     assert grouping.num_sharing == 0
     assert grouping.qo_indptr.tolist() == [0, 3, 3, 3]
     assert grouping.prefix_empty.all()
+
+
+def test_sampling_tail_refresh_matches_full_regrouping():
+    """Rows crossing a page boundary only rebuild the tail tables, unless a
+    group's shared run was limited by its members' full pages."""
+    import numpy as np
+
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    tpb = 4
+    # {0, 1, 2} share pages 1-3 and diverge at their fourth page; {3, 4} share
+    # page 5 only up to row 4's current page; row 5 stands alone.
+    tables = [
+        [1, 2, 3, 10, 11, 12],
+        [1, 2, 3, 20, 21, 22],
+        [1, 2, 3, 30, 31, 32],
+        [5, 6, 40, 41, 42, 43],
+        [5, 6, 50, 51, 52, 53],
+        [7, 60, 61, 62, 63, 64],
+    ]
+    pages = np.array(tables, dtype=np.int64)
+    rows = len(tables)
+
+    def build(kv_lens, version):
+        return lib._build_grouping(
+            version,
+            np.arange(rows),
+            pages,
+            np.array(kv_lens),
+            tpb,
+            max_sharing_groups=None,
+            padded_groups=4,
+            keep_check_pages=False,
+        )
+
+    before = [15, 16, 14, 13, 6, 9]
+    grouping = build(before, 1)
+    assert grouping.num_sharing == 2 and grouping.capped_keys.tolist() == [1]
+
+    # Rows 0 and 5 cross a boundary; group {3, 4} keeps its cap.
+    after = [17, 16, 14, 13, 6, 10]
+    refreshed = lib._refresh_tail(grouping, 2, pages, np.array(after), tpb, keep_check_pages=False)
+    rebuilt = build(after, 2)
+    assert refreshed is not None
+    assert refreshed.prefix_version == 1 and refreshed.version == 2
+    for name in ("perm", "prefix_empty", "write_page", "blocks_g", "private_from"):
+        assert getattr(refreshed, name).tolist() == getattr(rebuilt, name).tolist(), name
+    for name in (
+        "qo_indptr",
+        "prefix_indptr",
+        "prefix_indices",
+        "prefix_last_page_len",
+        "tail_indptr",
+        "tail_indices",
+    ):
+        assert torch.equal(getattr(refreshed, name), getattr(rebuilt, name)), name
+
+    # Row 4's current token moves to its third page: group {3, 4} may now share
+    # its second page, so the groups have to be rebuilt.
+    assert (
+        lib._refresh_tail(
+            grouping, 3, pages, np.array([15, 16, 14, 13, 9, 9]), tpb, keep_check_pages=False
+        )
+        is None
+    )
 
 
 def _dense_attention(pool, table, kv_len, q_row, num_kv_heads, sm_scale):
