@@ -275,3 +275,32 @@ class DelayedAssert:
     def assert_all(self):
         assert all(ret[0] for ret in self.assertions), self.get_msg()
         self.clear()
+
+
+def test_exclude_cpus_from_affinity():
+    """Worker CPU affinity minus the co-located service CPUs.
+
+    Only the overlap is dropped, and never so many that fewer than the minimum
+    number of CPUs would remain.
+    """
+    assert llmapi_utils.parse_cpu_list("132-175,308-351") == (
+        set(range(132, 176))
+        | set(range(308, 352)))
+    assert llmapi_utils.parse_cpu_list(" 3, 5-6 ") == {3, 5, 6}
+    assert llmapi_utils.parse_cpu_list("") == set()
+    socket1 = list(range(88, 176)) + list(range(264, 352))
+    kept, dropped = llmapi_utils.exclude_cpus_from_affinity(
+        socket1, "132-175,308-351")
+    assert kept == list(range(88, 132)) + list(range(264, 308))
+    assert dropped == list(range(132, 176)) + list(range(308, 352))
+    socket0 = list(range(0, 88)) + list(range(176, 264))
+    assert llmapi_utils.exclude_cpus_from_affinity(
+        socket0, "132-175,308-351") == (socket0, [])
+    cpus = list(range(0, 12))
+    # dropping 8 of 12 would leave fewer than the minimum: untouched
+    assert llmapi_utils.exclude_cpus_from_affinity(cpus, "0-7") == (cpus, [])
+    assert llmapi_utils.exclude_cpus_from_affinity(cpus,
+                                                   "0-3") == (list(range(4,
+                                                                         12)),
+                                                              [0, 1, 2, 3])
+    assert llmapi_utils.exclude_cpus_from_affinity(cpus, "") == (cpus, [])

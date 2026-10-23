@@ -161,25 +161,28 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
 def _rms_norm_gated_fwd_multirow_kernel(
-    X,  # pointer to the input
-    Y,  # pointer to the output
-    W,  # pointer to the weights
-    Z,  # pointer to the gate branch
-    Rstd,  # optional pointer to the 1/std
-    FP8_SCALE,  # static scale for an optional FP8 output
-    stride_x_row,
-    stride_y_row,
-    stride_z_tok,
-    M,  # number of rows in X
-    eps,
-    N: tl.constexpr,  # row length; power of two, whole row per program
-    ROWS: tl.constexpr,  # rows per program
-    HEADS_PER_TOK: tl.constexpr,
-    GATE_SIGMOID: tl.constexpr,
-    WEIGHT_IS_DELTA: tl.constexpr,
-    SAVE_RSTD: tl.constexpr,
-    OUTPUT_FP8: tl.constexpr,
-    LAUNCH_WITH_PDL: tl.constexpr,
+        X,  # pointer to the input
+        Y,  # pointer to the output
+        W,  # pointer to the weights
+        Z,  # pointer to the gate branch
+        Rstd,  # optional pointer to the 1/std
+        FP8_SCALE,  # static scale for an optional FP8 output
+        stride_x_row,
+        stride_y_row,
+        stride_z_tok,
+        M,  # number of rows in X
+        eps,
+        N: tl.constexpr,  # row length; power of two, whole row per program
+        ROWS: tl.constexpr,  # rows per program
+        HEADS_PER_TOK: tl.constexpr,
+        GATE_SIGMOID: tl.constexpr,
+        WEIGHT_IS_DELTA: tl.constexpr,
+        SAVE_RSTD: tl.constexpr,
+        OUTPUT_FP8: tl.constexpr,
+        LAUNCH_WITH_PDL: tl.constexpr,
+        # Fast-path hints; the defaults take the general strided, masked path.
+        CONTIG: tl.constexpr = False,  # X and Y rows dense (stride == N)
+        EVEN: tl.constexpr = False,  # M % ROWS == 0: no row masking needed
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -189,19 +192,41 @@ def _rms_norm_gated_fwd_multirow_kernel(
     [M, N] z; with HEADS_PER_TOK == heads it reads a [num_tokens, heads, N]
     view whose (heads, N) block is contiguous per token, e.g. a column slice
     of a wider projection.
+
+    When CONTIG, x is loaded and y stored through flat [ROWS * N] offsets so
+    the whole program block is one contiguous span (widest possible global
+    accesses); EVEN additionally drops the bounds masks. The silu gate uses
+    the single-instruction MUFU tanh (sm_75+): silu(z) = 0.5*z*(1 + tanh(z/2)).
+    Its |error| is ~2^-11 relative, well below the bf16/fp8 output ulp; the
+    saturation and NaN behavior match z * sigmoid(z).
     """
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    row_mask = rows < M
+    r0 = tl.program_id(0) * ROWS
+    rows = r0 + tl.arange(0, ROWS)
     cols = tl.arange(0, N)
-    mask2d = row_mask[:, None]
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
-    x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
-    x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
+    if CONTIG:
+        base = tl.cast(r0, tl.int64) * N
+        flat = tl.arange(0, ROWS * N)
+        if EVEN:
+            xr = tl.load(X + base + flat)
+        else:
+            xr = tl.load(X + base + flat, mask=(r0 + flat // N) < M, other=0.0)
+        x = tl.reshape(xr, (ROWS, N)).to(tl.float32)
+    else:
+        x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
+        if EVEN:
+            x = tl.load(X + x_off).to(tl.float32)
+        else:
+            x = tl.load(X + x_off, mask=rows[:, None] < M,
+                        other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
-        tl.store(Rstd + rows, rstd, mask=row_mask)
+        if EVEN:
+            tl.store(Rstd + rows, rstd)
+        else:
+            tl.store(Rstd + rows, rstd, mask=rows < M)
     w = tl.load(W + cols).to(tl.float32)
     if WEIGHT_IS_DELTA:
         w += 1.0
@@ -210,19 +235,42 @@ def _rms_norm_gated_fwd_multirow_kernel(
     head = rows % HEADS_PER_TOK
     z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
              cols[None, :])
-    z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
-    gate = tl.sigmoid(z)
-    if not GATE_SIGMOID:
-        gate *= z
-    y *= gate
+    if EVEN:
+        z = tl.load(Z + z_off).to(tl.float32)
+    else:
+        z = tl.load(Z + z_off, mask=rows[:, None] < M, other=0.0).to(tl.float32)
+    if GATE_SIGMOID:
+        y *= tl.sigmoid(z)
+    else:
+        t = tl.inline_asm_elementwise(
+            "tanh.approx.f32 $0, $1;",
+            "=r,r",
+            [z * 0.5],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        y *= z * 0.5 * (1.0 + t)
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
         # input dtype, then static quantization reloads and multiplies by the
         # rounded reciprocal of its input scale.
         y = y.to(X.dtype.element_ty).to(tl.float32)
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
-    y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
-    tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    if CONTIG:
+        yo = tl.reshape(y, (ROWS * N, )).to(Y.dtype.element_ty)
+        if EVEN:
+            tl.store(Y + base + flat, yo)
+        else:
+            tl.store(Y + base + flat, yo, mask=(r0 + flat // N) < M)
+    else:
+        y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
+        if EVEN:
+            tl.store(Y + y_off, y.to(Y.dtype.element_ty))
+        else:
+            tl.store(Y + y_off,
+                     y.to(Y.dtype.element_ty),
+                     mask=rows[:, None] < M)
     if LAUNCH_WITH_PDL:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
@@ -283,6 +331,8 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
+    # rstd is not consumed on this path; Rstd=None skips both the scratch
+    # allocation and the (measurably expensive) extra store in the kernel.
     grid_size = triton.cdiv(M, _MULTIROW_ROWS)
     device_index = x.device.index
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
@@ -305,6 +355,8 @@ def rms_norm_gated_token_major(
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
+            CONTIG=(x.stride(0) == N and out.stride(0) == N),
+            EVEN=(M % _MULTIROW_ROWS == 0),
             num_warps=_MULTIROW_NUM_WARPS,
             launch_pdl=launch_with_pdl,
         )
@@ -396,6 +448,9 @@ def _layer_norm_fwd(
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
                 LAUNCH_WITH_PDL=launch_with_pdl,
+                CONTIG=(x.stride(0) == group_size
+                        and out.stride(0) == group_size),
+                EVEN=(M % _MULTIROW_ROWS == 0),
                 num_warps=_MULTIROW_NUM_WARPS,
                 launch_pdl=launch_with_pdl,
             )

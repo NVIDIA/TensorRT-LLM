@@ -21,7 +21,8 @@ round, ``tp_gather`` unpickles only on the destination rank, and the size /
 CPU-tensor staging uses persistent pinned buffers guarded by one lock.  These
 tests pin the contract: results identical to a plain pickle round trip, the
 NCCL call sequence identical for non-empty payloads on every rank, the staging
-touched only under the lock.
+touched only under the lock, and ``allgather_ints`` riding exactly the
+CPU-tensor transport.
 
 Multi-process, no Ray: run inside a container with >= 2 GPUs as
 
@@ -180,6 +181,39 @@ def test_tp_gather_only_destination_unpickles(td, world):
     else:
         assert out is None
         assert loads.call_count == 0
+
+
+def test_allgather_ints_matches_object_reference(td, world):
+    rank, world_size, _ = world
+
+    def vector(r):
+        # RankState-shaped: 13 ints incl. zero, negative and > 2**32 values.
+        return [r, 5 + r, 0, -3 * r, 2**40 + r] + [r * 10 + i for i in range(8)]
+
+    out = td.allgather_ints(vector(rank))
+    assert out == td.tp_allgather(vector(rank))  # object path reference
+    assert out == [vector(r) for r in range(world_size)]
+    assert all(type(x) is int for row in out for x in row)
+    assert all(type(row) is list for row in out)
+
+
+def test_allgather_ints_same_nccl_sequence_as_tensor_allgather(td, world):
+    rank, world_size, _ = world
+    values = [rank + i for i in range(13)]
+    _, seq_ints = _record_nccl(lambda: td.allgather_ints(values))
+    _, seq_tensor = _record_nccl(lambda: td.tp_allgather(torch.tensor(values, dtype=torch.int64)))
+    assert seq_ints == seq_tensor
+    assert seq_ints == [("all_gather_into_tensor", (world_size, 13), torch.int64)]
+
+
+def test_allgather_ints_rejects_width_mismatch_in_result(td, world):
+    rank, world_size, _ = world
+    # Simulate a transport returning rows of unequal width (a rank sending a
+    # different count); the helper must not hand back a ragged result.
+    ragged = [torch.zeros(13, dtype=torch.int64), torch.zeros(12, dtype=torch.int64)]
+    with mock.patch.object(td, "tp_allgather", return_value=ragged):
+        with pytest.raises(RuntimeError, match="fixed-width"):
+            td.allgather_ints([0] * 13)
 
 
 # The lock is asserted structurally: a spy on the staging accessor records
