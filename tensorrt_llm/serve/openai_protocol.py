@@ -19,7 +19,8 @@ import base64
 import math
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import (Any, Dict, List, Literal, Mapping, Optional, Sequence,
+                    Tuple, Union)
 
 import torch
 import xgrammar
@@ -379,6 +380,73 @@ class ErrorResponse(OpenAIBaseModel):
     # HTTP status by default; a machine-readable string for conditions that
     # define one (e.g. "context_length_exceeded", matching OpenAI).
     code: Union[int, str]
+
+
+def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
+                                limit: int = 20) -> Tuple[str, Optional[str]]:
+    """Describe why a request body failed validation, without quoting it.
+
+    Each error is named by its place in the body, worded the way OpenAI words
+    the same rejection: "Unknown parameter: 'store'.", "Missing required
+    parameter: 'messages'.", "Invalid value for 'messages.0.content': ...".
+    The offending value is never quoted. The client already has it, and a
+    rejected inline image would make the message megabytes long.
+
+    Args:
+        errors: ``RequestValidationError.errors()`` of the rejected request.
+        limit: How many errors to describe; the rest are only counted.
+
+    Returns:
+        The message, and the dotted location of the first error, or None when
+        that error has no location in the body (the body is not valid JSON).
+    """
+    parts: List[str] = []
+    param: Optional[str] = None
+    for index, error in enumerate(errors):
+        error_type = error.get("type", "")
+        location = ".".join(
+            str(segment) for segment in error.get("loc", ())
+            if segment != "body")
+        if error_type == "json_invalid":
+            # The location is a character offset, not a parameter.
+            reason = (error.get("ctx") or {}).get("error") or error.get(
+                "msg", "")
+            description = f"The request body is not valid JSON: {reason}."
+            location = ""
+        elif error_type == "extra_forbidden":
+            description = f"Unknown parameter: '{location}'."
+        elif error_type == "missing":
+            description = f"Missing required parameter: '{location}'."
+        elif location:
+            description = f"Invalid value for '{location}': {error.get('msg', '')}."
+        else:
+            description = f"{error.get('msg', '')}."
+        if index == 0:
+            param = location or None
+        if index < limit:
+            parts.append(description)
+    if len(errors) > limit:
+        parts.append(f"({len(errors) - limit} more errors not shown.)")
+    return " ".join(parts) or "The request body is invalid.", param
+
+
+def validation_error_body(
+        errors: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The OpenAI error envelope for a request body that failed validation.
+
+    The shape OpenAI answers with, ``{"error": {"message", "type", "param",
+    "code"}}``, so OpenAI SDKs surface the message, and clients that only
+    check for an ``error`` key still find one.
+    """
+    message, param = summarize_validation_errors(errors)
+    return {
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": param,
+            "code": None,
+        }
+    }
 
 
 class CompletionLogProbs(OpenAIBaseModel):
