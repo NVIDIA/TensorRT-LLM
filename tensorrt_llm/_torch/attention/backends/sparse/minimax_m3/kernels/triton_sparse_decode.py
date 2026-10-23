@@ -801,6 +801,26 @@ def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> i
 
 # NVFP4 instructions are supported on both datacenter Blackwell targets.
 _SM100F_CAPABILITIES = ((10, 0), (10, 3))
+
+
+# Devices already found to support the NVFP4 decode kernels, by capability.
+_NVFP4_DEVICE_CAPABILITIES: dict[torch.device, tuple[int, int]] = {}
+
+
+def _nvfp4_device_capability(device: torch.device) -> tuple[int, int]:
+    """Return the device's capability, checking NVFP4 support once per device."""
+    capability = _NVFP4_DEVICE_CAPABILITIES.get(device)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device)
+        if capability not in _SM100F_CAPABILITIES:
+            raise NotImplementedError(
+                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103; "
+                f"got SM{capability[0] * 10 + capability[1]}."
+            )
+        _NVFP4_DEVICE_CAPABILITIES[device] = capability
+    return capability
+
+
 # Shape-specific tuning was measured on GB300 only. SM100 uses the defaults.
 _NVFP4_TUNED_CAPABILITIES = ((10, 3),)
 
@@ -1069,13 +1089,9 @@ def minimax_m3_sparse_attn_decode(
     nvfp4_args = (k_block_scale, v_block_scale, k_global_scale, v_global_scale)
     kv_nvfp4 = any(arg is not None for arg in nvfp4_args)
     scale_cols = head_dim // NVFP4_SF_VEC_SIZE
+    # Checked once per device; the shape heuristics below consult it per call.
+    capability = _nvfp4_device_capability(q.device) if kv_nvfp4 else None
     if kv_nvfp4:
-        capability = torch.cuda.get_device_capability(q.device)
-        if capability not in _SM100F_CAPABILITIES:
-            raise NotImplementedError(
-                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103; "
-                f"got SM{capability[0] * 10 + capability[1]}."
-            )
         _check_nvfp4_inputs(k_paged, v_paged, nvfp4_args, head_dim=head_dim, scale_cols=scale_cols)
         # Two E2M1 elements per byte; Triton must see them unsigned so that the
         # high-nibble shift does not sign-extend.
@@ -1113,6 +1129,7 @@ def minimax_m3_sparse_attn_decode(
             gqa_group_size=gqa_group_size,
             max_topk=max_topk,
             decode_query_len=decode_query_len,
+            capability=capability,
         )
         if kv_nvfp4
         else 1
@@ -1128,6 +1145,7 @@ def minimax_m3_sparse_attn_decode(
                     gqa_group_size=gqa_group_size,
                     max_topk=max_topk,
                     decode_query_len=decode_query_len,
+                    capability=capability,
                 )
                 if kv_nvfp4
                 else None
@@ -1177,6 +1195,7 @@ def minimax_m3_sparse_attn_decode(
         gqa_group_size=gqa_group_size,
         max_topk=max_topk,
         decode_query_len=decode_query_len,
+        capability=capability,
     )
     if query_group_size == 2:
         launch_options = {"num_warps": 4, "num_stages": 1}
@@ -1188,6 +1207,7 @@ def minimax_m3_sparse_attn_decode(
                 gqa_group_size=gqa_group_size,
                 max_topk=max_topk,
                 decode_query_len=decode_query_len,
+                capability=capability,
             )
             if kv_nvfp4
             else {}
@@ -1276,6 +1296,7 @@ def minimax_m3_sparse_attn_decode(
                 gqa_group_size=gqa_group_size,
                 max_topk=max_topk,
                 decode_query_len=decode_query_len,
+                capability=capability,
             )
             if kv_nvfp4
             else {}

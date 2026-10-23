@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
@@ -772,6 +773,29 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             page_shape = [num_kv_heads, self.tokens_per_block, containers]
         return addr_key, torch_dtype, num_slots, scale, page_shape
 
+    def _cached_pool_view(self, kind: str, layer_idx: int, kv_layout: Optional[str], build):
+        """Return the pool view ``build`` makes, resolved once per layer and layout.
+
+        The pools are allocated for the manager's lifetime, so a view's address
+        and strides never change; building one costs several native accessor
+        calls plus a tensor-from-pointer conversion, and the MiniMax-M3 layers
+        ask for the same views several times per step.
+        """
+        cache = self.__dict__.get("_pool_view_cache")
+        if cache is None:
+            cache = self.__dict__["_pool_view_cache"] = {}
+        key = (kind, int(layer_idx), kv_layout)
+        view = cache.get(key)
+        if view is None:
+            # A view created under inference mode would be an inference tensor
+            # and could not be updated in place outside it (the cache scrub
+            # and the eager writers do both); build it as a plain tensor.
+            with torch.inference_mode(False):
+                view = build(layer_idx, kv_layout)
+            if view is not None:
+                cache[key] = view
+        return view
+
     def get_buffers(
         self, layer_idx: int, kv_layout: Optional[str] = None
     ) -> Optional[torch.Tensor]:
@@ -791,6 +815,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
         """
+        return self._cached_pool_view("kv", layer_idx, kv_layout, self._build_kv_buffers)
+
+    def _build_kv_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
         )
@@ -861,6 +890,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self, layer_idx: int, kv_layout: Optional[str] = None
     ) -> torch.Tensor:
         """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``."""
+        return self._cached_pool_view(
+            "scale", layer_idx, kv_layout, self._build_block_scale_buffers
+        )
+
+    def _build_block_scale_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> torch.Tensor:
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
             layer_idx, kv_layout
         )
@@ -975,9 +1011,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         The rows are written through a numpy view of a single zero-filled,
         pinned result, so the attention metadata builders ship it to the device
-        in one asynchronous copy.
+        in one asynchronous copy. Each row is copied from the request's pool-0
+        page-index buffer as an array: the buffer spans the whole
+        ``max_seq_len`` capacity, so going through the per-element Python
+        lists of :meth:`get_batch_cache_indices` costs host time on every
+        decode step in proportion to ``max_seq_len``, not to the live context.
         """
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        block_ids_per_seq = [
+            np.asarray(self.kv_cache_map[req_id].get_base_page_indices(0)) for req_id in request_ids
+        ]
         batch = len(block_ids_per_seq)
         max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
         padded_tensor = torch.zeros(
