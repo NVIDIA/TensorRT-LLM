@@ -2241,14 +2241,26 @@ class PyExecutor:
         if self._closed:
             return
         if not self._resources_released:
-            if not self._release_execution_resources(release_model_owned_graphs=True):
+            if not self._release_execution_resources(
+                    release_model_owned_graphs=True):
                 return
+        else:
+            for engine in (self.model_engine, self.draft_model_engine):
+                release_model_graphs = getattr(
+                    engine, "_release_model_owned_cuda_graphs", None)
+                if release_model_graphs is not None:
+                    release_model_graphs()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         self._closed = True
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
 
-    def _release_execution_resources(self, *, release_model_owned_graphs: bool = False) -> bool:
+    def _release_execution_resources(self,
+                                     *,
+                                     release_model_owned_graphs: bool = False
+                                     ) -> bool:
         """Stop execution and release GPU resources; retain model ownership."""
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
