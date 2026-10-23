@@ -274,6 +274,9 @@ def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_
         num_index_heads: Index heads on this rank.
         page_size: Tokens per page.
     """
+    if dtype == torch.float8_e4m3fn:
+        # The FP8 indexer scores context rows with the CuTe DSL context scorer, not the proxy.
+        return
     fmha_sm100 = require_msa_module()
     idx_q = torch.zeros(
         _PROXY_SEGMENT_LEN, num_index_heads, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda"
@@ -350,6 +353,44 @@ def _group_max_reduce(
             config.num_kv_heads, group, max_score.shape[1], max_score.shape[2]
         ).amax(dim=1)
     return max_score
+
+
+def _context_scores(
+    idx_q: torch.Tensor,
+    idx_k_paged: torch.Tensor,
+    qo_lens_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    kv_indices: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 per-block max scores of these rows, [num_index_heads, k_tiles, tokens].
+
+    Row r takes the next qo_lens[r] query tokens and the next ceil(kv_lens[r] / page_size) pages of
+    kv_indices. Blocks past row r's last block are left unwritten: the top-k selection masks them
+    with n_valid_blocks.
+    """
+    from tensorrt_llm._torch.attention.kernels.blackwell.minimax_m3_index_context_score import (
+        minimax_m3_index_context_score,
+    )
+
+    page_size = int(idx_k_paged.shape[2])
+    qo_lens, kv_lens = qo_lens_cpu.tolist(), kv_lens_cpu.tolist()
+    num_pages = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    scores = torch.empty(
+        idx_q.shape[1], max(num_pages), sum(qo_lens), dtype=torch.float32, device=idx_q.device
+    )
+    token = page = 0
+    for qo_len, kv_len, pages in zip(qo_lens, kv_lens, num_pages):
+        minimax_m3_index_context_score(
+            idx_q[token : token + qo_len],
+            idx_k_paged,
+            kv_indices[page : page + pages],
+            kv_len - qo_len,
+            scores,
+            token,
+        )
+        token += qo_len
+        page += pages
+    return scores
 
 
 class MsaIndexer:
@@ -434,21 +475,26 @@ class MsaIndexer:
                 "_validate_decode_kernel_support, so this should not happen."
             )
 
-        # The scorer took nothing, so the proxy runs every token under the
-        # whole-batch plan it was handed.
+        # The scorer took nothing, so every token is scored here: by the FP8
+        # context scorer, or by the proxy under the whole-batch plan it was handed.
         if not scored:
             gen_first = 0
-            max_score = self._proxy_scores(
-                idx_q,
-                idx_k_paged,
-                proxy_plan=proxy_plan,
-                max_score=max_score,
-                qo_lens_cpu=qo_lens_cpu,
-                kv_lens_cpu=kv_lens_cpu,
-                qo_offset_cpu=qo_offset_cpu,
-                kv_indices=kv_indices,
-                idx_sm_scale=idx_sm_scale,
-            )
+            if idx_q.dtype == torch.float8_e4m3fn:
+                max_score = _context_scores(
+                    idx_q, idx_k_paged, qo_lens_cpu, kv_lens_cpu, kv_indices
+                )
+            else:
+                max_score = self._proxy_scores(
+                    idx_q,
+                    idx_k_paged,
+                    proxy_plan=proxy_plan,
+                    max_score=max_score,
+                    qo_lens_cpu=qo_lens_cpu,
+                    kv_lens_cpu=kv_lens_cpu,
+                    qo_offset_cpu=qo_offset_cpu,
+                    kv_indices=kv_indices,
+                    idx_sm_scale=idx_sm_scale,
+                )
 
         if n_valid_blocks is None:
             n_valid_blocks = per_token_valid_blocks(
@@ -462,11 +508,20 @@ class MsaIndexer:
         gen_table = self._select(max_score, n_valid_blocks[gen_first:])
         if gen_first == 0:
             return gen_table
-        # The proxy scores the context prefix into its own buffer, under the
-        # plan prepare() built over rows [0, ctx_rows). Context pages are the
-        # prefix of the flattened page table, so kv_indices needs no slice.
-        ctx_table = self._select(
-            self._proxy_scores(
+        # The context prefix, rows [0, ctx_rows), is scored into its own buffer
+        # (the proxy under the plan prepare() built over those rows). Context
+        # pages are the prefix of the flattened page table, so kv_indices needs
+        # no slice.
+        if idx_q.dtype == torch.float8_e4m3fn:
+            ctx_scores = _context_scores(
+                idx_q[:gen_first],
+                idx_k_paged,
+                qo_lens_cpu[:ctx_rows],
+                kv_lens_cpu[:ctx_rows],
+                kv_indices,
+            )
+        else:
+            ctx_scores = self._proxy_scores(
                 idx_q[:gen_first],
                 idx_k_paged,
                 proxy_plan=proxy_plan,
@@ -476,9 +531,8 @@ class MsaIndexer:
                 qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
                 kv_indices=kv_indices,
                 idx_sm_scale=idx_sm_scale,
-            ),
-            n_valid_blocks[:gen_first],
-        )
+            )
+        ctx_table = self._select(ctx_scores, n_valid_blocks[:gen_first])
         return _combined_topk_table(ctx_table, gen_table, head_major=True)
 
     def _proxy_scores(
