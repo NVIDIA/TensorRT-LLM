@@ -113,6 +113,9 @@ class PhysicalPool:
     slot_bytes: int
     num_slots: int
     slot_stride_bytes: Optional[int] = None
+    # Byte ranges relative to base_address that are backed by memory; None when the whole
+    # extent is. A localized KV pool maps each locality domain's chunks at distinct offsets.
+    mapped_ranges: Optional[Tuple[Tuple[int, int], ...]] = None
 
     def __post_init__(self) -> None:
         if self.slot_stride_bytes is None:
@@ -121,12 +124,15 @@ class PhysicalPool:
             raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "base_address": int(self.base_address),
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
         }
+        if self.mapped_ranges is not None:
+            result["mapped_ranges"] = [list(bounds) for bounds in self.mapped_ranges]
+        return result
 
     @staticmethod
     def from_dict(data: dict) -> "PhysicalPool":
@@ -137,6 +143,11 @@ class PhysicalPool:
             slot_stride_bytes=(
                 int(data["slot_stride_bytes"])
                 if data.get("slot_stride_bytes") is not None
+                else None
+            ),
+            mapped_ranges=(
+                tuple((int(start), int(end)) for start, end in data["mapped_ranges"])
+                if data.get("mapped_ranges") is not None
                 else None
             ),
         )
