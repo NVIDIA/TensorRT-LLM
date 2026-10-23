@@ -661,7 +661,7 @@ def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
     """Provision native transfer authentication before executor workers are spawned."""
     config = llm_args.get("cache_transceiver_config")
     if config is None:
-        config = CacheTransceiverConfig()
+        return
     elif isinstance(config, dict):
         config = CacheTransceiverConfig(**config)
     else:
