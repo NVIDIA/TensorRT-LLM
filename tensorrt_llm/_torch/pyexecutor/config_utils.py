@@ -1037,6 +1037,8 @@ def load_pretrained_config(model_name_or_path: str,
         normalized_config["architectures"] = ["PplxDeciderForDecision"]
         normalized_config["num_labels"] = PPLX_DECIDER_NUM_LABELS
         model_config = transformers.Qwen3NextConfig.from_dict(normalized_config)
+        model_config.torch_dtype = _resolve_composite_torch_dtype(
+            config_dict, normalized_config)
     elif (model_type == "qwen3_5_moe" and
           (("text_config" in config_dict and "vision_config" in config_dict) or
            (architectures
