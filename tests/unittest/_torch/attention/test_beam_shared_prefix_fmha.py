@@ -484,9 +484,9 @@ def test_sampling_merge_is_as_accurate_as_one_decode_kernel():
     assert merged_err <= 1.15 * single_err, (merged_err, single_err)
 
 
-def _run_n_sampling(model_path, prompts, n, max_tokens, env):
+def _run_n_sampling(model_path, prompts, n, max_tokens, env, cuda_graph=False):
     from tensorrt_llm import LLM, SamplingParams
-    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
     previous = {key: os.environ.get(key) for key in env}
     os.environ.update(env)
@@ -499,7 +499,9 @@ def _run_n_sampling(model_path, prompts, n, max_tokens, env):
             kv_cache_config=KvCacheConfig(
                 enable_block_reuse=True, use_kv_cache_manager_v2=False, free_gpu_memory_fraction=0.3
             ),
-            cuda_graph_config=None,
+            cuda_graph_config=(
+                CudaGraphConfig(max_batch_size=len(prompts) * n) if cuda_graph else None
+            ),
             skip_tokenizer_init=True,
         )
         with llm:
@@ -519,8 +521,10 @@ def _run_n_sampling(model_path, prompts, n, max_tokens, env):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.skipif(_qwen3_small_path() is None, reason="Qwen3-0.6B checkpoint not available")
 @pytest.mark.threadleak(enabled=False)
-def test_n_sampling_shared_prefix_matches_fallback_e2e():
-    """Greedy n-sample requests give the same tokens with and without the library."""
+@pytest.mark.parametrize("cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+def test_n_sampling_shared_prefix_matches_fallback_e2e(cuda_graph):
+    """Greedy n-sample requests give the same tokens with and without the
+    library, eager and with every decode step replayed from a CUDA graph."""
     model_path = _qwen3_small_path()
     vocab = 150000
     prompts = [
@@ -533,9 +537,14 @@ def test_n_sampling_shared_prefix_matches_fallback_e2e():
         "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         "TLLM_ALLOW_N_GREEDY_DECODING": "1",
     }
-    reference = _run_n_sampling(model_path, prompts, n, max_tokens, base_env)
+    reference = _run_n_sampling(model_path, prompts, n, max_tokens, base_env, cuda_graph)
     candidate = _run_n_sampling(
-        model_path, prompts, n, max_tokens, base_env | {"TLLM_FMHA_LIBS": f"+{LIB_NAME}"}
+        model_path,
+        prompts,
+        n,
+        max_tokens,
+        base_env | {"TLLM_FMHA_LIBS": f"+{LIB_NAME}"},
+        cuda_graph,
     )
     for ref_samples, cand_samples in zip(reference, candidate):
         assert len(cand_samples) == n
