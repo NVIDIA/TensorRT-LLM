@@ -1574,10 +1574,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     "all CP ranks, so publishing it requires a group-wide "
                     "protocol. Set kv_cache_config.enable_block_reuse=False."
                 )
-            if is_draft:
+            if is_draft or any(
+                layer.owner is KVCacheLayerOwner.DRAFT for layer in self.layer_specs or ()
+            ):
                 raise ValueError(
                     "KVCacheManagerV2 does not support a draft cache "
-                    "manager with helix context parallelism."
+                    "manager or draft-owned layers with helix context parallelism."
                 )
             if mapping.enable_attention_dp:
                 raise ValueError(
