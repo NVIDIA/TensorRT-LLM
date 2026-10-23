@@ -59,9 +59,6 @@ LMBENCHMARK_SHA = "c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb"
 LMBENCHMARK_SCRIPT = ""
 _LMBENCHMARK_PACKAGE = "benchmark"
 _LMBENCHMARK_SCRIPT_IN_PACKAGE = "synthetic-multi-round-qa/multi-round-qa.py"
-_LMBENCHMARK_INSTALL_SPEC = (
-    f"{_LMBENCHMARK_PACKAGE} @ git+https://github.com/LMCache/LMBenchmark.git@{LMBENCHMARK_SHA}"
-)
 CsvMetrics: TypeAlias = dict[str, int | float]
 _SERVER_HOST = "0.0.0.0"
 _SERVER_START_MAX_ATTEMPTS = 5
@@ -711,14 +708,12 @@ def _run_lmbenchmark(
     stdout_thread.start()
     stderr_thread.start()
 
-    # Grace window above the scripted duration. LMBenchmark keeps requests
-    # in flight after `--time` expires, and at higher QPS the backlog the
-    # server still has to drain scales roughly linearly with offered load.
-    # Observed worst-case drain on H100 PCIe + Qwen3-0.6B (5 scheduler
-    # variants, 3 stages each): drain ≈ 1.7·qps + 1 s. The coefficient below
-    # gives ≥2.8× margin over the observed worst case at every tested qps
-    # while still catching genuine stalls within a few minutes.
-    grace_s = max(45, int(qps * 5))
+    # The submission window does not include draining all multi-round requests.
+    # Non-overlapping and offloaded execution can keep making progress beyond
+    # the drain time of the baseline scheduler. Allow a bounded backlog drain
+    # proportional to offered load; health and error checks remain independent
+    # of this overall deadline.
+    grace_s = max(90, int(qps * 10))
     deadline = time.time() + duration + grace_s
     last_health_ok = time.time()
     last_poll = time.time()
@@ -998,7 +993,7 @@ try:
     dist = importlib.metadata.distribution(package)
 except importlib.metadata.PackageNotFoundError:
     raise SystemExit(
-        "LMBenchmark package is not installed after fixture setup. "
+        "LMBenchmark package is not installed. Install requirements-dev.txt before running tests. "
         f"Expected {{script_in_package}}."
     )
 
@@ -1027,10 +1022,9 @@ print(
 
 @pytest.fixture(scope="module")
 def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
-    """Install and resolve the pinned LMBenchmark script used by this module."""
+    """Verify and resolve the preinstalled LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
-    llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
     LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_install(llm_venv)
     return llm_venv
 
@@ -1169,8 +1163,8 @@ class TestServePrefixAwareScheduling:
           * the CSV contains no NaN ttft values
           * the server log is free of error patterns
 
-        NOTE: This test is intended for post-merge / nightly CI due to its
-        ~10 min runtime per config.
+        This is a correctness stress test; request latency is reported but is
+        not a pass/fail threshold.
         """
         config_path = _write_config(tmp_path, sched_cfg)
         server_log_base = str(tmp_path / "server.log")

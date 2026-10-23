@@ -3387,7 +3387,7 @@ class TestTopPDecay:
             py_request_id=0,
             py_seq_slot=slot,
             is_dummy=False,
-            return_log_probs=False,
+            py_return_log_probs=False,
             # Read by the row_stride query in sampler_common; these tests are
             # single-beam, so the static admission width is 1.
             py_beam_width=1,

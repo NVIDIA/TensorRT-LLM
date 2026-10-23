@@ -25,7 +25,7 @@ to ``openai_protocol.py`` / ``openai_server.py``. Lookups are keyed two ways:
   (:func:`structured_output_format_for`).
 
 Built-in extensions live in :mod:`tensorrt_llm.serve.extensions`; importing
-that package registers them. Both lookup functions import it on first use so
+that package registers them. The hook lookup functions import it on first use so
 the registry is populated wherever it is consulted (``openai_protocol`` reaches
 it from ``to_sampling_params`` without going through ``openai_server``). The
 import is deferred to call time because the built-ins import
@@ -34,10 +34,13 @@ import is deferred to call time because the built-ins import
 
 import enum
 import importlib
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+
+RequiredToolChoiceMode = Literal["template", "grammar"]
 
 
 class OutputMode(enum.Enum):
@@ -102,6 +105,10 @@ class ServingExtension:
         from request-level fields). Called only for requests whose resolved
         ``model_type`` this extension is registered for.
         """
+
+    def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
+        """Return the required-tool policy; boolean permission selects template enforcement."""
+        return "template" if self.allows_required_tool_choice() else None
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]
@@ -189,3 +196,10 @@ def structured_output_format_for(
     _load_builtin_extensions()
     extension = _BY_REASONING_PARSER.get(reasoning_parser) if reasoning_parser else None
     return None if extension is None else extension.structured_output_format
+
+
+def required_tool_choice_mode(model_type: Optional[str]) -> Optional[RequiredToolChoiceMode]:
+    """Return required-tool handling for native chat, or None if unsupported."""
+    _load_builtin_extensions()
+    extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
+    return None if extension is None else extension.required_tool_choice_mode()

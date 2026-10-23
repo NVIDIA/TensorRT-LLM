@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 
@@ -61,10 +62,12 @@ def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
         use_kda_replay_update = True
 
         def __init__(self) -> None:
-            self.state_indices = torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+            self._state_indices_buffer = DeviceCopyBuffer(
+                torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+            )
 
         def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
-            return self.state_indices[: len(request_ids)]
+            return self._state_indices_buffer.tensor[: len(request_ids)]
 
     manager = KdaCacheManager()
     metadata = KimiK3MambaMetadata(max_batch_size=3, chunk_size=8, max_num_tokens=8)

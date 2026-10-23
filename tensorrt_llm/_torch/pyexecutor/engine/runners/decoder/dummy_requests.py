@@ -118,6 +118,10 @@ class DummyRequestFactory:
         safe over-estimate.
         """
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        if num_gen_requests and getattr(kv_cache_manager, "kda_context_only", False) is True:
+            # A disaggregated KDA context server keeps no draft-verify state,
+            # so generation shapes cannot run there.
+            return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
@@ -298,7 +302,10 @@ class DummyRequestFactory:
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
+        if (
+            getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
+            or getattr(kv_cache_manager, "kda_context_only", False) is True
+        ):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
