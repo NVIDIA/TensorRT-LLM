@@ -681,6 +681,10 @@ _FP8_GEMV_ROWS = {"in": (1, 16), "out": (2, 16), "sh_gu": (2, 16), "sh_dn": (2, 
 #: (`fp8_gemv_conv1d_verify`, certified at 2..16 rows); more rows take the Triton conv.
 _VERIFY_CONV_FUSED_MAX_ROWS = 16  # capacity: fixed: the entry's certified rows
 
+#: Rows up to which a captured single-token step runs the conv step as `fp8_gemv_conv1d`'s
+#: epilogue over the packed FP8 in_proj copy (dense FP8 mode).
+_FP8_CONV_FUSED_MAX_ROWS = 8  # capacity: fixed: a dispatch threshold
+
 
 #: Rows up to which the vocabulary projection (the draft head; under the dense FP8 mode the
 #: verify head too) runs `fp8_gemv` on the packed copy; more rows take cuBLASLt over the
@@ -5891,6 +5895,13 @@ class DecodeTarget:
         ssm_states = core._bound.ssm[i]
 
         conv_fused = fused_conv and not is_verify and num_tokens <= _GDN_CONV_FUSED_MAX_ROWS
+        fp8_conv = (
+            fused_conv
+            and not is_verify
+            and L.in_proj_g is not None
+            and _gemv_ready(x)
+            and num_tokens <= _FP8_CONV_FUSED_MAX_ROWS
+        )
         # The verify conv as the in_proj's epilogue reads the pool, taps and slots before its
         # PDL wait, like the single-token fusion: captured steps only.
         verify_fused = (
@@ -5914,7 +5925,7 @@ class DecodeTarget:
                 gen_p,
                 _PAD_SLOT_ID,
             )
-        elif conv_fused and L.in_proj_g is not None and _gemv_ready(x):
+        elif fp8_conv:
             proj = fp8_gemv_conv1d_op(
                 x,
                 L.in_proj_g,
@@ -5982,7 +5993,7 @@ class DecodeTarget:
                 mq_out,
             )
             return self._gdn_epilogue(out, z, L, num_tokens, gemm)
-        if not conv_fused:
+        if not (conv_fused or fp8_conv):
             causal_conv1d_update(
                 x=mixed_qkv,
                 conv_state=core._bound.conv[i],
