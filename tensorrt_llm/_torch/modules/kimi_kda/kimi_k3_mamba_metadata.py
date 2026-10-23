@@ -50,6 +50,12 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.kda_chunk_indices: torch.Tensor | None = None
         self.kda_varlen_is_aligned: bool | None = None
         self.kda_single_sequence_length: int | None = None
+        # Host copy of the context cu_seqlens: FLA's chunked prefill derives its chunk indices from it on the
+        # CPU instead of reading the counts back from the GPU in every KDA layer.
+        self.kda_cu_seqlens_cpu: torch.Tensor | None = None
+        # One device cu_seqlens view per forward: FLA caches its chunk metadata by tensor identity, so every
+        # KDA layer must pass the same object for the cache to hit.
+        self.kda_cu_seqlens: torch.Tensor | None = None
         # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
         # Keep the backing allocation stable so metadata preparation remains
         # safe for CUDA graph capture and replay.
@@ -89,7 +95,13 @@ class KimiK3MambaMetadata(Mamba2Metadata):
 
         if not context_lengths:
             self.kda_chunk_indices = None
+            self.kda_cu_seqlens_cpu = None
+            self.kda_cu_seqlens = None
             return
+
+        self.kda_cu_seqlens = self.query_start_loc_long[: len(context_lengths) + 1]
+
+        self.kda_cu_seqlens_cpu = torch.tensor([0] + context_lengths, dtype=torch.long).cumsum_(0)
 
         chunk_counts = [
             (length + KDA_PREFILL_CHUNK_SIZE - 1) // KDA_PREFILL_CHUNK_SIZE

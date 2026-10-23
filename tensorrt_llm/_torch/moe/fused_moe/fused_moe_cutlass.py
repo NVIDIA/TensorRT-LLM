@@ -28,7 +28,7 @@ from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
 from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
-                         MoEActivation, MoEActivationSupport)
+                         MoEActivation, MoEActivationSupport, SwigluActivation)
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
@@ -63,6 +63,11 @@ def raise_moe_lora_multichunk_unsupported(num_chunks: int) -> None:
         f"Routed-expert MoE LoRA does not support multi-chunk execution "
         f"(num_chunks={num_chunks}). Reduce the per-forward token count or "
         f"increase `moe_max_num_tokens` so the MoE runs in a single chunk.")
+
+
+# Largest batch (tokens on this rank) that runs the SM90 FP8-activation Triton
+# MoE instead of the CUTLASS / DeepGEMM grouped GEMM.
+_SM90_TRITON_FP8_MOE_MAX_TOKENS = 32
 
 
 class CutlassFusedMoE(MoEImplBase):
@@ -973,6 +978,32 @@ class CutlassFusedMoE(MoEImplBase):
             tuner_num_tokens = ctx.x.shape[0] * self.mapping.tp_size
         return tuner_num_tokens, self.routing_method.top_k
 
+    def _triton_fp8_act_swiglu(
+        self,
+        x: torch.Tensor,
+        x_sf: Optional[torch.Tensor],
+        lora_params,
+        moe_output: Optional[torch.Tensor],
+    ) -> Optional[Tuple[Optional[float], bool]]:
+        """SwiGLU clamp settings when this call can take the SM90 FP8-activation Triton path.
+
+        Returns ``(limit, clamp_after_silu)``, or None to keep the CUTLASS path:
+        FP8 block-scale weights, a plain SwiGLU with at most a scalar clamp, BF16
+        input, a decode-sized batch, and no LoRA or caller-provided output buffer.
+        """
+        if (not self.has_deepseek_fp8_block_scales
+                or self.activation_type != ActivationType.Swiglu
+                or not isinstance(self.activation, SwigluActivation)
+                or x_sf is not None or x.dtype != torch.bfloat16
+                or x.shape[0] > _SM90_TRITON_FP8_MOE_MAX_TOKENS
+                or lora_params is not None or moe_output is not None):
+            return None
+        limit = self.activation.clamp
+        if isinstance(limit, torch.Tensor):
+            return None
+        return (None if limit is None else float(limit),
+                self.activation.clamp_after_silu)
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -1016,9 +1047,17 @@ class CutlassFusedMoE(MoEImplBase):
 
         # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
         # for large token counts due to cuTensorMapEncodeTiled limitations).
-        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
-            from .fused_moe_triton_fp8_block_scale import \
-                run_triton_fp8_block_scale_moe
+        # SM90 + FP8 block scales, decode-sized batches: the Triton FP8-activation
+        # kernels launch only the expert blocks the batch routes to, where the
+        # grouped DeepGEMM kernel walks every expert on one persistent CTA per SM.
+        sm_version = get_sm_version()
+        triton_fp8_act_swiglu = (self._triton_fp8_act_swiglu(
+            x, x_sf, lora_params, moe_output) if sm_version == 90 else None)
+        if self.has_deepseek_fp8_block_scales and (
+                sm_version == 120 or triton_fp8_act_swiglu is not None):
+            from .fused_moe_triton_fp8_block_scale import (
+                run_triton_fp8_block_scale_moe,
+                run_triton_fp8_block_scale_moe_fp8_act)
 
             # forward_chunk sets token_final_scales=None when
             # apply_router_weight_on_input=True (weights already folded into x);
@@ -1032,7 +1071,11 @@ class CutlassFusedMoE(MoEImplBase):
             # (0 .. expert_size_per_partition-1), so remap and zero-scale any
             # non-local token-expert pairs to suppress their contribution.
             local_n = self.expert_size_per_partition
-            if enable_alltoall:
+            if self.ep_size == 1:
+                # Every routed expert is local: the IDs and weights need no remap.
+                local_ids = token_selected_experts
+                is_local = None
+            elif enable_alltoall:
                 # After alltoall dispatch, IDs are already local; padding = local_n
                 local_ids = token_selected_experts.clamp(0, local_n - 1)
                 is_local = token_selected_experts < local_n
@@ -1042,8 +1085,23 @@ class CutlassFusedMoE(MoEImplBase):
                     0, local_n - 1)
                 is_local = ((token_selected_experts >= slot_start)
                             & (token_selected_experts < slot_start + local_n))
-            local_scales = token_final_scales * is_local.to(
-                token_final_scales.dtype)
+            local_scales = (token_final_scales
+                            if is_local is None else token_final_scales *
+                            is_local.to(token_final_scales.dtype))
+            if triton_fp8_act_swiglu is not None:
+                swiglu_limit, swiglu_clamp_after_silu = triton_fp8_act_swiglu
+                return run_triton_fp8_block_scale_moe_fp8_act(
+                    x,
+                    local_ids,
+                    local_scales,
+                    self.w3_w1_weight,
+                    self.quant_scales.fc_weight_scales,
+                    self.w2_weight,
+                    self.quant_scales.proj_weight_scales,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                    output_dtype=output_dtype,
+                )
             result = run_triton_fp8_block_scale_moe(
                 x,
                 local_ids,

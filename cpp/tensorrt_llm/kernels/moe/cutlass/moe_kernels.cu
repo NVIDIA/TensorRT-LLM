@@ -1862,7 +1862,17 @@ __global__ void expandInputRowsFp8BlockScaleKernel(InputActivationsType const* u
     int64_t const num_elems_in_col = hidden_size / ELEM_PER_THREAD;
     auto* const permuted_output = fp8_block_scale_out.fp8_out;
 
-    for (int64_t permuted_row = blockIdx.x; permuted_row < num_valid_tokens; permuted_row += gridDim.x)
+    // Each block takes a contiguous run of permuted rows: they are sorted by expert, so one search finds the
+    // first row's expert and the rest advance linearly instead of searching per row.
+    int64_t const rows_per_block = ceilDiv(num_valid_tokens, static_cast<int64_t>(gridDim.x));
+    int64_t const row_begin = blockIdx.x * rows_per_block;
+    int64_t const row_end
+        = row_begin + rows_per_block < num_valid_tokens ? row_begin + rows_per_block : num_valid_tokens;
+    int64_t expert = row_begin < row_end
+        ? findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row_begin + 1) - 1
+        : 0;
+
+    for (int64_t permuted_row = row_begin; permuted_row < row_end; ++permuted_row)
     {
         int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
         int64_t const source_k_rank = unpermuted_row / num_tokens;
@@ -1871,8 +1881,10 @@ __global__ void expandInputRowsFp8BlockScaleKernel(InputActivationsType const* u
         auto const* source_row_ptr = reinterpret_cast<DataElem const*>(unpermuted_input + source_row * hidden_size);
         auto* dest_row_ptr = permuted_output + permuted_row * hidden_size;
 
-        int64_t const expert
-            = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, permuted_row + 1) - 1;
+        while (expert + 1 < num_experts_per_node && expert_first_token_offset[expert + 1] <= permuted_row)
+        {
+            ++expert;
+        }
         int64_t const scale_row = permuted_row + fp8BlockScaleExpertPad(expert_first_token_offset[expert], expert);
 
         for (int64_t elem_index = threadIdx.x; elem_index < num_elems_in_col; elem_index += EXPAND_THREADS_PER_BLOCK)
@@ -2873,8 +2885,11 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         }();
 
         static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
-        int32_t const max_blocks_per_sm
-            = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, ACTIVATION_THREADS_PER_BLOCK, 0);
+        // A row narrower than the block (e.g. a tensor-parallel slice of the intermediate size) would leave the
+        // remaining threads idle, so shrink the block to the row width, in whole warps.
+        int32_t const threads = static_cast<int32_t>(
+            std::min<int64_t>(ACTIVATION_THREADS_PER_BLOCK, ceilDiv(num_elems_in_col, int64_t{32}) * 32));
+        int32_t const max_blocks_per_sm = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, threads, 0);
         // X dimension for tokens in groups of num_rows_per_cta_v
         // Y dimension for columns
         // Each CTA processes num_rows_per_cta_v * threads_x tokens
@@ -2882,9 +2897,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         // Divide by rows_per_cta to get the number of token blocks needed
         int64_t const max_token_blocks = (max_tokens + num_rows_per_cta_v - 1) / num_rows_per_cta_v;
         int32_t const grid_x = std::min(sm_count * max_blocks_per_sm, static_cast<int32_t>(max_token_blocks));
-        int32_t const grid_y = static_cast<int32_t>(
-            (num_elems_in_col + ACTIVATION_THREADS_PER_BLOCK - 1) / ACTIVATION_THREADS_PER_BLOCK);
-        int32_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+        int32_t const grid_y = static_cast<int32_t>((num_elems_in_col + threads - 1) / threads);
 
         cudaLaunchConfig_t config;
         config.gridDim = dim3(grid_x, grid_y, 1);

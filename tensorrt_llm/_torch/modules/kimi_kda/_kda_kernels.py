@@ -793,6 +793,7 @@ class KDAKernelDispatch:
         cu_seqlens: Optional[torch.Tensor],
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
+        cu_seqlens_cpu: Optional[torch.Tensor] = None,
         state_pool: Optional[torch.Tensor] = None,
         state_indices: Optional[torch.Tensor] = None,
         varlen_is_aligned: Optional[bool] = None,
@@ -814,7 +815,8 @@ class KDAKernelDispatch:
         ``chunk_indices``, ``varlen_is_aligned``, and
         ``single_sequence_length`` are prepared once from Kimi K3 runtime
         metadata. They keep the optimized path from reading ``cu_seqlens``
-        back from the GPU in every KDA layer.
+        back from the GPU in every KDA layer; ``cu_seqlens_cpu`` (the host copy
+        of ``cu_seqlens``) does the same for the FLA path.
         """
         use_indexed_state = state_pool is not None
         if use_indexed_state and (initial_state is not None or state_indices is None):
@@ -897,6 +899,7 @@ class KDAKernelDispatch:
             lower_bound=lower_bound,
             state_v_first=True,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
     def decode_kda(self, **kwargs) -> torch.Tensor:
