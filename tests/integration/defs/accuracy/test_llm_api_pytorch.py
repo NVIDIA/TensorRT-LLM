@@ -6100,6 +6100,50 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         moe_expert_parallel_size=4,
                         enable_attention_dp=True)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_tep4_fp8kv_trtllm_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        """NVFP4 with TEP4 and an FP8 KV cache.
+
+        Each rank holds one KV head, so an FP8 K/V page is the size of a QSA
+        index-K page.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        kv_cache_dtype="fp8")
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_nvfp4kv_trtllm_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        """NVFP4 on four GPUs with attention DP and an NVFP4 KV cache.
+
+        Each rank holds both KV heads, so an NVFP4 K/V page is the size of a
+        QSA index-K page. QSA attention runs on the regular backend for an
+        NVFP4 KV cache.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True,
+                        kv_cache_dtype="nvfp4")
+
 
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
