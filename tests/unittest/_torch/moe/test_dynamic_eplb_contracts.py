@@ -88,7 +88,7 @@ def _extract_function(path: Path, name: str, namespace: dict):
 
 
 def test_shared_slot_provider_uses_model_owned_pool_state():
-    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena.py"
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/arena.py"
     provider_cls = _extract_class(
         source,
         "SharedSlotArenaProvider",
@@ -116,7 +116,7 @@ def test_shared_slot_provider_uses_model_owned_pool_state():
 
 
 def test_shared_slot_provider_pool_key_includes_complete_bundle():
-    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena.py"
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/arena.py"
 
     class FakePool:
         instances = []
@@ -182,7 +182,7 @@ def test_shared_slot_provider_pool_key_includes_complete_bundle():
 
 @pytest.mark.parametrize("per_layer_helper_sets", [False, True])
 def test_shared_slot_provider_pool_key_includes_helper_set_mode(per_layer_helper_sets):
-    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena.py"
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/arena.py"
 
     class FakePool:
         instances = []
@@ -514,7 +514,7 @@ def test_vendored_live_plane_abi_matches_independent_goldens(
 
 
 def test_ep_collective_adapter_uses_the_resolved_process_group():
-    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena.py"
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/arena.py"
     tree = ast.parse(source.read_text())
     selected = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_EpComm"
@@ -1211,7 +1211,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         _cuda_getCurrentRawStream=lambda _: main.cuda_stream,
     )
     torch = SimpleNamespace(cuda=cuda, _C=raw, Tensor=_Routes, int32="int32")
-    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_slot_scheduler.py"
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py"
     namespace = {"torch": torch, "threading": SimpleNamespace(get_ident=lambda: state.thread)}
     group_cls = _extract_class(source, "RebalanceSlotSchedulerGroup", None, namespace)
     lease_cls = _extract_class(source, "_LiveBankLeaseProvider", None, namespace)
@@ -1440,7 +1440,7 @@ def test_scheduler_spin_bound_follows_warmup_transitions_and_autotuning(
         runtime,
     )
     bound_cls = _extract_class(
-        _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_slot_scheduler.py",
+        _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py",
         "SchedulerSpinBound",
         None,
         {"Callable": Any, "Optional": Optional},
@@ -2068,7 +2068,7 @@ def test_on_autotune_builds_balanced_powerlaw_input(request):
 
 def test_per_layer_dynamic_shutdown_reports_in_iter_through_collective_preflight():
     manager_cls = _extract_class(
-        _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb.py",
+        _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/manager.py",
         "PerLayerDynamicMoeLoadBalancer",
         {"shutdown"},
         {},
