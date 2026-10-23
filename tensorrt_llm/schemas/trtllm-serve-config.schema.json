@@ -6459,6 +6459,16 @@
       "description": "Live objects require the Python LLM API.",
       "type": "null"
     },
+    "compact_beam_widths": {
+      "description": "Opt-in execution widths (at least 2) for compact variable-width beam search. Empty disables compaction. Only single-GPU dense Llama, Qwen2 and Qwen3 decode with TRTLLM attention is supported. CUDA graphs are captured separately for each width. Changing forward shapes can change floating-point rounding and beam rankings.",
+      "items": {
+        "minimum": 2,
+        "type": "integer"
+      },
+      "status": "prototype",
+      "title": "Compact Beam Widths",
+      "type": "array"
+    },
     "context_parallel_size": {
       "default": 1,
       "description": "The context parallel size.",
@@ -6966,6 +6976,17 @@
     "layer_wise_benchmarks_config": {
       "$ref": "#/$defs/LayerwiseBenchmarksConfig",
       "status": "prototype"
+    },
+    "lm_head_output_dtype": {
+      "default": "auto",
+      "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+      "enum": [
+        "auto",
+        "float32"
+      ],
+      "status": "prototype",
+      "title": "Lm Head Output Dtype",
+      "type": "string"
     },
     "load_format": {
       "anyOf": [

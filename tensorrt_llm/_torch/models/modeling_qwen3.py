@@ -1,5 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 from torch import nn
@@ -273,6 +276,8 @@ class Qwen3Model(DecoderModel):
 
 @register_auto_model("Qwen3ForCausalLM")
 class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
+
+    supports_compact_beam: ClassVar[bool] = True
 
     def __init__(
         self,

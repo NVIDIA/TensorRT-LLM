@@ -322,6 +322,56 @@ llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
 
+### Compact variable-width beam execution (prototype)
+
+`compact_beam_widths` is an opt-in PyTorch engine setting for variable-width beam
+search. It lists the **input beam widths** (at least 2) for which the model forward should
+execute only active rows. The default, `[]`, preserves capacity-width execution. Width-one steps also
+retain capacity-width execution, preserving the beam attention kernel family.
+The KV cache allocation and sampler layout still use `max_beam_width`; this
+option does not reduce the reserved beam capacity.
+
+```python
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    max_batch_size=2,
+    max_seq_len=1024,
+    max_num_tokens=1024,
+    max_beam_width=500,
+    compact_beam_widths=[20, 300],
+)
+params = SamplingParams(
+    use_beam_search=True,
+    best_of=500,
+    n=5,
+    max_tokens=6,
+    beam_width_array=[20, 20, 300, 300, 500, 500],
+)
+llm.generate(["The capital of France is"], params)
+```
+
+The prototype supports single-GPU dense Llama, Qwen2 and Qwen3 decoder models
+with TRTLLM attention. It requires one token per beam and the same input width
+for all real requests in a decode batch. Context/mixed batches and widths absent
+from the list use capacity-width execution. Existing beam-search admission and
+mixed-width restrictions still apply. Speculative decoding, encoder-decoder and
+multimodal models, sparse/hybrid attention, torch compile and in-graph sampling
+use capacity-width execution. Configuring this option with LoRA is rejected.
+
+With CUDA graphs enabled, each configured compact width adds a graph per
+captured batch size. Input gathering and logits padding are captured; graph
+metadata is refreshed in place before replay. This adds graph memory and warmup
+time. Eager execution is also supported. The sampler receives capacity-stride
+logits, with inactive rows filled with negative infinity.
+
+Changing the forward shape can select different attention/GEMM kernels and
+floating-point reduction orders. **Bitwise equality, identical beam rankings,
+and identical top-1 outputs are not guaranteed**, including with deterministic
+sampling. Evaluate output quality for the intended model and workload before
+enabling the option. Small beam capacities can be slower because metadata
+packing and full-vocabulary logits padding add work; benchmark the complete
+workload rather than assuming a speedup from the row-count reduction.
+
 ### Over the OpenAI-compatible API
 
 `length_penalty` and `early_stopping` now default to `null` in the HTTP schema, deferring to

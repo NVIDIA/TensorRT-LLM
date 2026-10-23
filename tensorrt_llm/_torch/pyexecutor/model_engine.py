@@ -766,6 +766,7 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora),
+            compact_beam_widths=tuple(self.llm_args.compact_beam_widths),
             **extra_fields,
         )
 
