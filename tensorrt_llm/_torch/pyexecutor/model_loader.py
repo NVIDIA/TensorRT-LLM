@@ -167,7 +167,10 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                                 else mapped_pyt_quant)
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and torch.cuda.is_available() and get_sm_version() == 107):
+            # MiniMax-M3 sparse attention decodes NVFP4 KV with its own kernels.
+            and getattr(model_config.sparse_attention_config, "algorithm",
+                        None) != "minimax_m3" and
+            torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")

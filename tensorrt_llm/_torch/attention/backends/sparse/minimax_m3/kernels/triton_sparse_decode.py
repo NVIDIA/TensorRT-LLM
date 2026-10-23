@@ -799,8 +799,8 @@ def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> i
     return 1 << (target.bit_length() - 1)
 
 
-# NVFP4 instructions are supported on both datacenter Blackwell targets.
-_SM100F_CAPABILITIES = ((10, 0), (10, 3))
+# NVFP4 instructions are supported on the datacenter Blackwell and Rubin targets.
+_SM100F_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 # Devices already found to support the NVFP4 decode kernels, by capability.
@@ -814,7 +814,7 @@ def _nvfp4_device_capability(device: torch.device) -> tuple[int, int]:
         capability = torch.cuda.get_device_capability(device)
         if capability not in _SM100F_CAPABILITIES:
             raise NotImplementedError(
-                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103; "
+                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103/SM107; "
                 f"got SM{capability[0] * 10 + capability[1]}."
             )
         _NVFP4_DEVICE_CAPABILITIES[device] = capability

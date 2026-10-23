@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
+from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -157,6 +158,19 @@ def test_validate_and_set_kv_cache_quant_downgrades_nvfp4_on_sm107(
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     validate_and_set_kv_cache_quant(model_config, "nvfp4")
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_validate_and_set_kv_cache_quant_keeps_nvfp4_for_minimax_m3_on_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MiniMax-M3 sparse attention has its own SM107 NVFP4 KV decode kernels."""
+    _mock_sm107(monkeypatch)
+    model_config = ModelConfig(
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+    )
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 def _make_mixed_precision_model_config():

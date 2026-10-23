@@ -46,8 +46,8 @@ HEAD_DIM = 128
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 skip_not_sm100 = pytest.mark.skipif(
-    get_sm_version() not in (100, 103),
-    reason="MiniMax-M3 NVFP4 and fmha_sm100 require SM100/SM103.",
+    get_sm_version() not in (100, 103, 107),
+    reason="MiniMax-M3 NVFP4 and fmha_sm100 require SM100/SM103/SM107.",
 )
 
 

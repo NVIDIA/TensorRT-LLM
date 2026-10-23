@@ -1650,8 +1650,8 @@ def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
 
     if not msa_package_available():
         pytest.skip("fmha_sm100 (MSA submodule) required")
-    if get_sm_version() not in (100, 103):
-        pytest.skip("fmha_sm100 requires SM100/SM103")
+    if get_sm_version() not in (100, 103, 107):
+        pytest.skip("fmha_sm100 requires SM100/SM103/SM107")
 
     page_size, head_dim = 128, 128
     attention, fields, q, kv_block_indexes, num_ctx_tokens = _mixed_batch_sparse_gqa_case(
@@ -2076,7 +2076,7 @@ def test_msa_attention_core_owns_the_cache_write(
 def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     from tensorrt_llm._utils import get_sm_version
 
-    if get_sm_version() not in (100, 103):
+    if get_sm_version() not in (100, 103, 107):
         pytest.skip("NVFP4 quantization requires Blackwell")
     torch.manual_seed(13)
     num_slots, pages_per_role, num_heads = 2, 4, 1
