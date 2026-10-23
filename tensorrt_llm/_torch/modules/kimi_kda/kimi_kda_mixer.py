@@ -11,7 +11,8 @@ Cache ownership
 ---------------
 The module reads and updates three short-convolution states in the combined
 ``[slots, 3D, W - 1]`` bf16 pool and one delta-rule recurrent state in the
-``[slots, H, V, K]`` fp32 pool. It owns the ``AttentionMetadata`` split,
+``[slots, H, V, K]`` FP32/BF16 pool, or a V2-owned packed 2FP4 checkpoint
+for non-speculative replay. It owns the ``AttentionMetadata`` split,
 cache-slot indexing, and speculative-verification state handling directly.
 """
 
@@ -474,7 +475,7 @@ class KimiKDALinearAttention(nn.Module):
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
-        ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32 or bf16
+        ssm_pool = layer_cache.temporal  # Dense FP32/BF16 state or a packed 2FP4 payload.
         generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
         if generation_state_indices is None:
             generation_state_indices = state_indices[num_prefills:]
@@ -508,6 +509,11 @@ class KimiKDALinearAttention(nn.Module):
                         generation_state_indices if self._use_indexed_ssm_pool else None
                     ),
                     output=output[num_ctx_tokens:num_tokens] if output is not None else None,
+                    dummy_mask=(
+                        attn_metadata.kv_cache_manager._dummy_request_mask[num_prefills:batch_size]
+                        if ssm_pool.dtype == torch.uint8
+                        else None
+                    ),
                 )
                 if output is None:
                     cores.append(decode_core)
@@ -685,7 +691,14 @@ class KimiKDALinearAttention(nn.Module):
         # the pool once the kernel has finished with it.
         staged_state = None
         kernel_pool, kernel_indices = ssm_pool, slot_indices
-        if ssm_pool.dtype != torch.float32:
+        packed_2fp4 = ssm_pool.dtype == torch.uint8
+        if packed_2fp4:
+            from .kda_2fp4 import materialize_checkpoint
+
+            staged_state = materialize_checkpoint(ssm_pool, slot_indices, has_init)
+            kernel_pool = staged_state
+            kernel_indices = mamba_metadata._arange_buffer[:num_prefills]
+        elif ssm_pool.dtype != torch.float32:
             staged_state = _stage_state_rows(ssm_pool, slot_indices_long)
             kernel_pool = staged_state
             # Staged rows are dense, so the kernel addresses them by position.
@@ -767,7 +780,13 @@ class KimiKDALinearAttention(nn.Module):
         )
 
         # The packed convolution persisted the live convolution pool in place.
-        if final_state is not None:
+        if packed_2fp4:
+            from .kda_2fp4 import store_checkpoint
+
+            store_checkpoint(
+                ssm_pool, slot_indices, final_state if final_state is not None else staged_state
+            )
+        elif final_state is not None:
             _writeback_state_rows(ssm_pool, slot_indices_long, final_state)
         else:
             assert use_indexed_state
@@ -792,8 +811,12 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
         ssm_state_indices=None,
         output: Optional[torch.Tensor] = None,
+        dummy_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Plain T=1 decode, fast path.
+
+        Packed 2FP4 pools use ``forward_decode_2fp4``. Dense pools use the
+        recurrent CUDA path described below.
 
         Calls ``trtllm::kda_decode`` directly with kernel-native layouts
         (nsys 07-24: the reference path spent ~70 us/layer on glue around
@@ -812,6 +835,10 @@ class KimiKDALinearAttention(nn.Module):
         The direct path requires stable int32 slot indices. Static or
         unsupported layouts route to ``forward_decode_fallback``.
         """
+        if ssm_pool.dtype == torch.uint8:
+            return self.forward_decode_2fp4(
+                x2d, conv_pool, ssm_pool, slot_indices, dummy_mask, layer_cache, output
+            )
         if self._dispatch.decode_kernel_path != "optimized":
             ssm_state_indices = None
         has_qkvg_projection = self._qkvg_proj_weight is not None or self.qkvg_proj is not None
@@ -947,6 +974,78 @@ class KimiKDALinearAttention(nn.Module):
         # decode_kda applies output gate/RMSNorm and returns the supplied
         # BCG buffer when out=kda_out, so both modes share the core contract.
         return o.view(B, H, hd)
+
+    def forward_decode_2fp4(
+        self,
+        x2d: torch.Tensor,
+        conv_pool: torch.Tensor,
+        ssm_pool: torch.Tensor,
+        slot_indices: torch.Tensor,
+        dummy_mask: torch.Tensor,
+        layer_cache,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fused Conv4, native checkpoint replay, and gated output norm."""
+        from .kda_2fp4 import replay
+
+        if layer_cache.history is None:
+            # Prefill-only workers reject actual generation in resource
+            # preparation, but attention-DP may still pad them with decode
+            # dummy rows to keep the other layers' collectives aligned.
+            return self._store_core(
+                torch.zeros(
+                    (x2d.shape[0], self.num_heads, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=x2d.device,
+                ),
+                output,
+            )
+        d, H, hd = self.proj_size, self.num_heads, self.head_dim
+
+        def project_qkvg() -> torch.Tensor:
+            if self._qkvg_proj_weight is not None:
+                return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
+            if self.qkvg_proj is not None:
+                return self.qkvg_proj(x2d)
+            inputs = (self.q_proj(x2d), self.k_proj(x2d), self.v_proj(x2d))
+            if self.use_full_rank_gate:
+                inputs += (self.g_proj(x2d),)
+            return torch.cat(inputs, dim=-1)
+
+        def project_gates() -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+            if self._bfa_proj_weight is not None:
+                return self._project_gate_inputs(x2d)
+            return self.b_proj(x2d), self.f_b_proj(self.f_a_proj(x2d)), None
+
+        qkvg, (beta, g, onorm_lowrank) = maybe_execute_in_parallel(
+            project_qkvg,
+            project_gates,
+            self._projection_fork_event,
+            self._projection_join_event,
+            self._projection_aux_stream if x2d.shape[0] <= _KDA_BFA_MULTISTREAM_MAX_ROWS else None,
+            disable_on_compile=True,
+        )
+        onorm_g = qkvg[:, 3 * d : 4 * d] if self.use_full_rank_gate else onorm_lowrank
+        if onorm_g is None:
+            onorm_g = self.g_b_proj(self.g_a_proj(x2d))
+        return replay(
+            qkvg[:, : 3 * d],
+            conv_pool,
+            self._packed_conv_weight,
+            g,
+            beta,
+            onorm_g.unflatten(-1, (H, hd)),
+            self.o_norm.weight.detach(),
+            ssm_pool,
+            slot_indices,
+            dummy_mask,
+            layer_cache.history,
+            self._A_log_f32,
+            self._dt_bias_f32,
+            self.gate_lower_bound,
+            self.o_norm.eps,
+            output=output,
+        )
 
     def forward_decode_fallback(
         self,

@@ -31,6 +31,7 @@ from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
+from .dummy_requests import supports_generation_warmup
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
@@ -499,7 +500,7 @@ class DecoderWarmup:
         # empty. Waiting for the first padded step can race KV saturation:
         # once the cache is full, the lazy allocation in _get_padded_batch
         # fails every step and padded batches silently run eager.
-        if getattr(kv_cache_manager, "context_swa_layer_limit", None) is None:
+        if supports_generation_warmup(kv_cache_manager):
             with self._warmup_timer.phase("preallocate_padding_dummies"):
                 self._graphs.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")

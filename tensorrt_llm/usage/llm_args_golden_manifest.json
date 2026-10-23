@@ -797,6 +797,16 @@
       "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.kda_2fp4_prefill_only"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.kda_2fp4_replay"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"

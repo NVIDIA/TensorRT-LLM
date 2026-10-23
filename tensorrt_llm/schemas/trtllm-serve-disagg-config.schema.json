@@ -4291,6 +4291,72 @@
     },
     "KvCacheConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mamba_state_config": {
+                "properties": {
+                  "kda_2fp4_replay": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "kda_2fp4_replay"
+                ]
+              }
+            },
+            "required": [
+              "mamba_state_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enable_kv_pool_rebalance": {
+                "const": false
+              },
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mamba_state_config": {
+                "properties": {
+                  "kda_2fp4_prefill_only": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "kda_2fp4_prefill_only"
+                ]
+              }
+            },
+            "required": [
+              "mamba_state_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mamba_state_config": {
+                "properties": {
+                  "kda_2fp4_replay": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "kda_2fp4_replay"
+                ]
+              }
+            }
+          }
+        }
+      ],
       "description": "Configuration for the KV cache.",
       "properties": {
         "attention_dp_events_gather_period_ms": {
@@ -5299,6 +5365,22 @@
           "status": "prototype",
           "telemetry": {},
           "title": "Enable Branch Snapshot",
+          "type": "boolean"
+        },
+        "kda_2fp4_prefill_only": {
+          "default": false,
+          "description": "Use a dedicated prefill worker: allocate packed 2FP4 checkpoints but no K/U/G replay history, and warm up only prefill paths. Actual generation requests are rejected. Requires kda_2fp4_replay=True. Leave false on unified or dedicated generation workers.",
+          "status": "prototype",
+          "telemetry": {},
+          "title": "Kda 2Fp4 Prefill Only",
+          "type": "boolean"
+        },
+        "kda_2fp4_replay": {
+          "default": false,
+          "description": "Enable native NVFP4 KDA replay for non-speculative one-token decode. Checkpoints contain primary and residual FP4 values with E4M3 block scales. Prefill uses a temporary dequantized FP32 state; decode uses native NVFP4 checkpoint projections and BF16 K/U plus FP32 cumulative-G history of length 16. Requires Kimi KDA, Blackwell, and KV cache manager V2. Disabled by default.",
+          "status": "prototype",
+          "telemetry": {},
+          "title": "Kda 2Fp4 Replay",
           "type": "boolean"
         },
         "periodic_snapshot_interval": {

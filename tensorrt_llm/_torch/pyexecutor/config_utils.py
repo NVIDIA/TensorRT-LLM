@@ -669,7 +669,10 @@ class MambaKVCacheParams:
             target_attention_mask + draft_attention_mask,
         )
 
-    def get_states_bytes_per_layer(self, mapping) -> int:
+    def get_states_bytes_per_layer(self,
+                                   mapping,
+                                   *,
+                                   kda_2fp4: bool = False) -> int:
         """Return the total bytes of Mamba state per layer, used for budgeting."""
         tp_size = mamba_effective_tp_size(mapping)
         d_inner = self.head_dim * self.num_heads
@@ -682,6 +685,10 @@ class MambaKVCacheParams:
         conv_bytes = conv_dim * (self.conv_kernel - 1) * conv_dtype.itemsize
         ssm_bytes = (nheads * self.head_dim * self.state_size *
                      ssm_dtype.itemsize)
+        if kda_2fp4:
+            from tensorrt_llm._torch.modules.kimi_kda.kda_2fp4 import \
+                STATE_BYTES_PER_HEAD
+            ssm_bytes = nheads * STATE_BYTES_PER_HEAD
         state_bytes_per_layer = conv_bytes + ssm_bytes
         return state_bytes_per_layer
 

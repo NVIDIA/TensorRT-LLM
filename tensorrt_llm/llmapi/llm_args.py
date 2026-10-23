@@ -4614,6 +4614,27 @@ _StrictNonNegativeInt = Annotated[StrictInt, PydanticField(ge=0)]
 class MambaStateConfig(StrictBaseModel):
     """Configuration for reusable Mamba recurrent-state snapshots."""
 
+    kda_2fp4_replay: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description="Enable native NVFP4 KDA replay for non-speculative "
+        "one-token decode. Checkpoints contain primary and residual FP4 "
+        "values with E4M3 block scales. Prefill uses a temporary dequantized "
+        "FP32 state; decode uses native NVFP4 checkpoint projections and "
+        "BF16 K/U plus FP32 cumulative-G history of length 16. Requires "
+        "Kimi KDA, Blackwell, and KV cache manager V2. Disabled by default.")
+
+    kda_2fp4_prefill_only: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description="Use a dedicated prefill worker: allocate packed 2FP4 "
+        "checkpoints but no K/U/G replay history, and warm up only prefill "
+        "paths. Actual generation requests are rejected. Requires "
+        "kda_2fp4_replay=True. Leave false on unified or dedicated "
+        "generation workers.")
+
     periodic_snapshot_interval: NonNegativeInt = Field(
         default=0,
         status="prototype",
@@ -4653,6 +4674,13 @@ class MambaStateConfig(StrictBaseModel):
         "an earlier snapshot. If no periodic or additional snapshot point "
         "applies to the prompt, the prompt end is snapshotted as a fallback. "
         "Requires KV cache manager V2.")
+
+    @model_validator(mode='after')
+    def validate_kda_2fp4_prefill_only(self) -> 'MambaStateConfig':
+        if self.kda_2fp4_prefill_only and not self.kda_2fp4_replay:
+            raise ValueError(
+                "kda_2fp4_prefill_only=True requires kda_2fp4_replay=True.")
+        return self
 
 
 class KVEventsConfig(StrictBaseModel):
@@ -5223,6 +5251,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @model_validator(mode='after')
     def validate_mamba_snapshot_offsets(self) -> 'KvCacheConfig':
         state_config = self.mamba_state_config
+        if state_config.kda_2fp4_replay:
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "KDA 2FP4 replay requires KV cache manager V2.")
+            if self.enable_kv_pool_rebalance:
+                raise ValueError(
+                    "KDA 2FP4 replay requires enable_kv_pool_rebalance=False.")
         has_additional_snapshots = bool(
             state_config.additional_snapshot_offsets_from_start
             or state_config.additional_snapshot_offsets_from_end)

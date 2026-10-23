@@ -204,6 +204,9 @@ def get_kv_cache_manager_cls(
       * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
     config = model_config.pretrained_config
+    if kv_cache_config.mamba_state_config.kda_2fp4_replay:
+        if not is_kimi_linear(config):
+            raise ValueError("KDA 2FP4 replay requires a Kimi KDA model.")
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     quant_config = getattr(model_config, "quant_config", None)
@@ -3463,7 +3466,8 @@ def _create_kv_cache_manager(
         # sequential verify when replay is unavailable.
         is_glm5_next = config_utils.is_glm5_next(config)
         text_config = config_utils.unwrap_glm5_next_text_config(
-            config) if is_glm5_next else config
+            config) if is_glm5_next else config_utils.unwrap_kimi_text_config(
+                config)
         if max_beam_width > 1:
             raise ValueError(
                 "glm5_next + beam search is not supported yet."
@@ -3502,6 +3506,30 @@ def _create_kv_cache_manager(
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
         kda_extra_kwargs = {}
+        state_config = kv_cache_config.mamba_state_config
+        if state_config.kda_2fp4_replay:
+            if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+                raise ValueError(
+                    "KDA 2FP4 replay requires KV cache manager V2.")
+            if spec_config is not None:
+                raise ValueError(
+                    "KDA 2FP4 replay is a one-token decode path, not an MTP path."
+                )
+            if get_sm_version() not in (100, 103):
+                raise ValueError(
+                    "Native KDA 2FP4 replay requires Blackwell SM100/SM103.")
+            if (mamba_params.state_size, mamba_params.head_dim) != (128, 128):
+                raise ValueError("KDA 2FP4 replay requires K=V=128.")
+            if mamba_params.dtype != torch.bfloat16:
+                raise ValueError("KDA 2FP4 replay requires BF16 activations.")
+            if mamba_params.conv_kernel != 4:
+                raise ValueError("KDA 2FP4 replay requires Conv4.")
+            if getattr(quant_config, "mamba_ssm_stochastic_rounding", False):
+                raise ValueError(
+                    "KDA 2FP4 replay uses round-to-nearest-even, not stochastic rounding."
+                )
+            kda_extra_kwargs[
+                "supports_generation"] = not state_config.kda_2fp4_prefill_only
         kda_replay_manager_types = (MixedMambaHybridCacheManager,
                                     MambaHybridCacheManagerV2)
         if (spec_config is not None
@@ -3540,8 +3568,8 @@ def _create_kv_cache_manager(
             num_kv_heads=1,
             head_dim=(int(text_config.kv_lora_rank) +
                       int(getattr(text_config, "qk_rope_head_dim", 0) or 0)
-                      if is_glm5_next else config.kv_lora_rank +
-                      config.qk_rope_head_dim),
+                      if is_glm5_next else text_config.kv_lora_rank +
+                      text_config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_num_tokens=max_num_tokens,

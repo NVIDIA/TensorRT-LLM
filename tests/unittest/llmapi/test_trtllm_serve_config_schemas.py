@@ -56,6 +56,81 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"max_batch_size": 8}, True),
         (generator.SERVE_SCHEMA, {"max_batch_szie": 8}, False),
         (generator.SERVE_SCHEMA, {"max_batch_size": "eight"}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"mamba_state_config": {"kda_2fp4_replay": True}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "mamba_state_config": {
+                        "kda_2fp4_replay": True,
+                        "kda_2fp4_prefill_only": True,
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "mamba_state_config": {
+                        "kda_2fp4_replay": True,
+                        "kda_2fp4_prefil_only": True,
+                    }
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "use_kv_cache_manager_v2": False,
+                    "mamba_state_config": {"kda_2fp4_replay": True},
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "enable_kv_pool_rebalance": True,
+                    "mamba_state_config": {"kda_2fp4_replay": True},
+                }
+            },
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "context_servers": {
+                    "kv_cache_config": {
+                        "mamba_state_config": {
+                            "kda_2fp4_replay": True,
+                            "kda_2fp4_prefill_only": True,
+                        }
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "generation_servers": {
+                    "kv_cache_config": {
+                        "use_kv_cache_manager_v2": False,
+                        "mamba_state_config": {"kda_2fp4_replay": True},
+                    }
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),
@@ -114,6 +189,38 @@ def test_config_validation(
 ) -> None:
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("state_config", "valid"),
+    [
+        ({}, True),
+        ({"kda_2fp4_replay": False}, True),
+        ({"kda_2fp4_replay": None}, False),
+        ({"kda_2fp4_replay": {}}, False),
+        ({"kda_2fp4_replay": {"prefill_only": True}}, False),
+        ({"kda_2fp4_prefill_only": True}, False),
+        ({"kda_2fp4_replay": False, "kda_2fp4_prefill_only": True}, False),
+    ],
+)
+def test_kda_2fp4_boolean_config_matches_runtime(
+    schemas: dict[str, dict], filename: str, state_config: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    cache_config = {"use_kv_cache_manager_v2": False, "mamba_state_config": state_config}
+    config = {"kv_cache_config": cache_config}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        parsed = KvCacheConfig(**cache_config)
+        assert parsed.mamba_state_config.kda_2fp4_replay is False
+    else:
+        with pytest.raises(ValueError):
+            KvCacheConfig(**cache_config)
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:

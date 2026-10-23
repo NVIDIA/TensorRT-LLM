@@ -97,6 +97,51 @@ def _nullable(schema: dict) -> dict:
     return {"anyOf": [schema, {"type": "null"}]}
 
 
+def _add_kda_2fp4_constraints(schema: dict) -> None:
+    """Mirror KvCacheConfig's cross-field packed-replay validation in YAML."""
+    constraint = {
+        "if": {
+            "required": ["mamba_state_config"],
+            "properties": {
+                "mamba_state_config": {
+                    "required": ["kda_2fp4_replay"],
+                    "properties": {"kda_2fp4_replay": {"const": True}},
+                }
+            },
+        },
+        "then": {
+            "properties": {
+                "use_kv_cache_manager_v2": {"not": {"const": False}},
+                "enable_kv_pool_rebalance": {"const": False},
+            }
+        },
+    }
+    constraints = schema["$defs"]["KvCacheConfig"].setdefault("allOf", [])
+    if constraint not in constraints:
+        constraints.append(constraint)
+    prefill_constraint = {
+        "if": {
+            "required": ["mamba_state_config"],
+            "properties": {
+                "mamba_state_config": {
+                    "required": ["kda_2fp4_prefill_only"],
+                    "properties": {"kda_2fp4_prefill_only": {"const": True}},
+                }
+            },
+        },
+        "then": {
+            "properties": {
+                "mamba_state_config": {
+                    "required": ["kda_2fp4_replay"],
+                    "properties": {"kda_2fp4_replay": {"const": True}},
+                }
+            }
+        },
+    }
+    if prefill_constraint not in constraints:
+        constraints.append(prefill_constraint)
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
@@ -138,6 +183,7 @@ def generate_serve_schema() -> dict:
     user_draft["resource_manager"] = {"type": "null"}
     # Update this mapping exception when the YAML loader changes legacy DecodingConfig support.
     properties["decoding_config"] = {"type": ["object", "null"]}
+    _add_kda_2fp4_constraints(schema)
     return schema
 
 
@@ -190,6 +236,7 @@ def generate_disagg_schema() -> dict:
         "maximum": (1 << DISAGG_NODE_ID_BITS) - 1,
     }
     properties.update(orchestrator)
+    _add_kda_2fp4_constraints(schema)
     return schema
 
 

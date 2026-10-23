@@ -12,6 +12,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager,
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
@@ -29,6 +30,13 @@ from .config import DecoderRunnerConfig
 NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
+
+
+def supports_generation_warmup(kv_cache_manager: BaseResourceManager | None) -> bool:
+    """Whether synthetic batches may use the cache manager's decode path."""
+    return bool(getattr(kv_cache_manager, "supports_generation", True)) and (
+        getattr(kv_cache_manager, "context_swa_layer_limit", None) is None
+    )
 
 
 class DummyRequestFactory:
@@ -136,12 +144,9 @@ class DummyRequestFactory:
 
         if num_gen_requests > self._config.max_batch_size:
             return None
-        if (
-            num_gen_requests > 0
-            and getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-        ):
+        if num_gen_requests > 0 and not supports_generation_warmup(kv_cache_manager):
             # Generic warmup also requests decode/mixed shapes. Exercise their
-            # token and batch bounds as fresh context rows on an encoder-only
+            # token and batch bounds as fresh context rows on a context-only
             # cache; actual generation requests remain invalid. Packing many
             # requests preserves N one-token rows for the max-batch shape.
             num_gen_requests = 0
@@ -298,7 +303,7 @@ class DummyRequestFactory:
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
+        if not supports_generation_warmup(kv_cache_manager):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
