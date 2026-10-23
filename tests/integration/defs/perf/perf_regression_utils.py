@@ -65,6 +65,13 @@ def get_job_info():
     raw_branch = global_vars.get("build_branch")
     branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
+    # The launcher publishes the test image; globalVars may describe a dispatcher.
+    runtime_image = os.getenv("TRTLLM_CI_RUNTIME_IMAGE", "").strip()
+    digest_match = re.fullmatch(r"[^@\s]+@(sha256:[0-9a-f]{64})", runtime_image)
+    runtime_image_digest = digest_match.group(1) if digest_match else "unknown"
+    runtime_image_identity_strength = (
+        "digest_pinned" if digest_match else "reference_only" if runtime_image else "unknown"
+    )
 
     # Initialize PR-specific fields
     trigger_mr_user = ""
@@ -113,6 +120,10 @@ def get_job_info():
         "s_job_url": job_url,
         "s_branch": branch,
         "s_commit": commit,
+        "s_runtime_image": runtime_image or "unknown",
+        "s_runtime_image_source": "TRTLLM_CI_RUNTIME_IMAGE" if runtime_image else "unknown",
+        "s_runtime_image_digest": runtime_image_digest,
+        "s_runtime_image_identity_strength": runtime_image_identity_strength,
         "b_is_post_merge": is_post_merge,
         "b_is_pr_job": is_pr_job,
         "s_trigger_mr_user": trigger_mr_user,
