@@ -36,6 +36,9 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 TriAttention allocates its resident eviction buffers when it binds the KV cache
 manager, before profiling finishes sizing the final KV pool. This storage is
 included in the measured non-KV peak; it must not be reserved a second time.
+Initialization also launches the single-request local scoring, selection, and
+compaction kernels. Zero source lengths and move counts keep this warmup from
+reading or modifying KV data; it finishes before requests are admitted.
 
 | Storage | Lifetime and bound |
 | --- | --- |

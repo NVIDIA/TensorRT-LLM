@@ -515,21 +515,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
 
             request_count = len(eviction_requests)
             union = self.eviction_mode == "union"
-            # In-place refresh: the compiled score launches captured these pointers.
-            compute_mean_phase(
-                self._logical_source_lengths_device,
-                self._phase_omega,
-                self._source_lengths_device,
-                self._prompt_lengths_device,
-                self._mean_cos,
-                self._mean_sin,
-                self._decode_lengths_device,
-                self._swa_destination_bases,
-                request_count=request_count,
-                swa_rebase_delta=self._swa_rebase_delta,
-            )
-            score_scratch = self._score_scratch if score_workspace is None else score_workspace
-            self._launch_score(request_count, score_workspace)
+            self._score_requests(request_count, score_workspace)
             if union and self._union_tp_mapping is not None:
                 # Max is order-free, so every TP rank keeps the same ordinals.
                 gathered = allgather(
@@ -542,22 +528,6 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
                     self._selection_scores_rows,
                     request_count=request_count,
                 )
-            if not union:
-                reduce_per_head_scores(
-                    score_scratch,
-                    self._decode_lengths_device,
-                    self._prompt_lengths_device,
-                    self._row_mean,
-                    self._row_inv_std,
-                    self._selection_scores_rows,
-                    self._selection_row_lengths,
-                    request_count=request_count,
-                    padded_head_columns=PADDED_HEAD_COLUMNS,
-                    score_token_capacity=self._score_token_capacity,
-                    per_layer=self.eviction_mode == "per_layer_perhead",
-                    normalize_scores=self.normalize_scores,
-                    compact_scores=True,
-                )
             self._select_kept_ordinals(request_count)
             compact(self._compaction_params, request_count)
         finally:
@@ -565,6 +535,42 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
             self._compaction_done_event.record(stream)
             if manager._stream != stream:
                 manager._stream.wait_event(self._compaction_done_event)
+
+    def _score_requests(
+        self, request_count: int, score_workspace: Optional[torch.Tensor] = None
+    ) -> None:
+        """Write local selection scores into resident outputs on the current stream."""
+        # In-place refresh: the compiled score launches captured these pointers.
+        compute_mean_phase(
+            self._logical_source_lengths_device,
+            self._phase_omega,
+            self._source_lengths_device,
+            self._prompt_lengths_device,
+            self._mean_cos,
+            self._mean_sin,
+            self._decode_lengths_device,
+            self._swa_destination_bases,
+            request_count=request_count,
+            swa_rebase_delta=self._swa_rebase_delta,
+        )
+        score_scratch = self._score_scratch if score_workspace is None else score_workspace
+        self._launch_score(request_count, score_workspace)
+        if self.eviction_mode != "union":
+            reduce_per_head_scores(
+                score_scratch,
+                self._decode_lengths_device,
+                self._prompt_lengths_device,
+                self._row_mean,
+                self._row_inv_std,
+                self._selection_scores_rows,
+                self._selection_row_lengths,
+                request_count=request_count,
+                padded_head_columns=PADDED_HEAD_COLUMNS,
+                score_token_capacity=self._score_token_capacity,
+                per_layer=self.eviction_mode == "per_layer_perhead",
+                normalize_scores=self.normalize_scores,
+                compact_scores=True,
+            )
 
     def _compute_compaction_move_offsets(
         self,
@@ -756,16 +762,29 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         self._compaction_done_event.record(torch.cuda.current_stream(device))
 
         self._build_score_runtime(score_token_capacity=self._selection_width_capacity + 128)
-        # Precompile the allocation-free selector while initialization still owns
-        # the non-KV memory budget. Scores and metadata are overwritten at eviction.
-        self._selection_scores_rows.zero_()
-        self._select_kept_ordinals(1)
+        self._warmup_eviction()
 
         logger.info(
             f"TriAttention CuTe score configured: {self._num_q_heads}q/"
             f"{self._num_kv_heads}kv heads, {num_freqs} freqs, "
             f"{int(tokens_per_block)}-token pages"
         )
+
+    def _warmup_eviction(self) -> None:
+        """Launch the TP-local fallback before profiling, without reading or moving KV.
+
+        Zero source lengths skip score page loads, and zero move offsets make
+        target/draft compaction a no-op. Selection uses synthetic full-length
+        zero scores so its normal execution path is initialized as well.
+        This must run outside graph capture, before requests are admitted.
+        """
+        self._request_metadata_device.zero_()
+        self._score_requests(1)
+        self._selection_scores_rows.zero_()
+        self._selection_row_lengths.fill_(self._selection_width_capacity)
+        self._select_kept_ordinals(1)
+        compact(self._compaction_params, 1)
+        torch.cuda.current_stream(self._score_scratch.device).synchronize()
 
     def _allocate_metadata_buffers(
         self,
