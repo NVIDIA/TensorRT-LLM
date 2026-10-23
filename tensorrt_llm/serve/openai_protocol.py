@@ -386,12 +386,59 @@ class ErrorResponse(OpenAIBaseModel):
 # the error cannot echo an arbitrarily long name back.
 _MAX_LOCATION_SEGMENT_CHARS = 64
 
+# Schema names pydantic tags a scalar union member with.
+_SCALAR_MEMBER_TAGS = frozenset(
+    {"str", "int", "float", "bool", "bytes", "none", "list", "dict"})
+
+
+def _is_union_member_tag(segment: Any) -> bool:
+    """Whether a location segment names a union member rather than a field.
+
+    Pydantic tags each member's errors with the member: a model or TypedDict
+    by its class name, any other type by its schema name ('str',
+    'list[...]', 'function-after[...]'). Request field names are lowercase.
+    """
+    return isinstance(segment,
+                      str) and ("[" in segment or segment[:1].isupper()
+                                or segment in _SCALAR_MEMBER_TAGS)
+
+
+def _matched_union_member_errors(
+        errors: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    """The errors left once each union keeps only the members its value chose.
+
+    A union reports every member's errors. A member whose literal field (a
+    message's "role", a content part's "type") rejected the value was not
+    the one the value was written for, so when other members accepted that
+    literal, the rejected members' errors are dropped.
+    """
+    members_by_union: Dict[tuple, Dict[str, List[int]]] = {}
+    for index, error in enumerate(errors):
+        loc = tuple(error.get("loc", ()))
+        for depth, segment in enumerate(loc):
+            if _is_union_member_tag(segment):
+                members = members_by_union.setdefault(loc[:depth], {})
+                members.setdefault(segment, []).append(index)
+    dropped = set()
+    for prefix, members in members_by_union.items():
+        rejected = {
+            tag
+            for tag, indices in members.items()
+            if any(errors[i].get("type") == "literal_error"
+                   and len(errors[i].get("loc", ())) == len(prefix) + 2
+                   for i in indices)
+        }
+        if rejected and len(rejected) < len(members):
+            for tag in rejected:
+                dropped.update(members[tag])
+    return [error for i, error in enumerate(errors) if i not in dropped]
+
 
 def _error_location(loc: Sequence[Any]) -> str:
     """The dotted place of a validation error within the request body."""
     segments = []
     for segment in loc:
-        if segment == "body":
+        if segment == "body" or _is_union_member_tag(segment):
             continue
         text = str(segment)
         if len(text) > _MAX_LOCATION_SEGMENT_CHARS:
@@ -420,9 +467,19 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
     """
     parts: List[str] = []
     param: Optional[str] = None
-    for index, error in enumerate(errors):
-        error_type = error.get("type", "")
+    errors = _matched_union_member_errors(errors)
+    # A field that failed in several union members is described once.
+    seen_locations = set()
+    described = []
+    for error in errors:
         location = _error_location(error.get("loc", ()))
+        if error.get("type") != "json_invalid":
+            if location in seen_locations:
+                continue
+            seen_locations.add(location)
+        described.append((error, location))
+    for index, (error, location) in enumerate(described):
+        error_type = error.get("type", "")
         if error_type == "json_invalid":
             # The location is a character offset, not a parameter.
             reason = (error.get("ctx") or {}).get("error") or error.get(
@@ -435,6 +492,8 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
             description = (f"Missing required parameter: '{location}'."
                            if location else "The request body is missing.")
         elif location:
+            # A validator's own message is passed through as written, so a
+            # validator in this module must not put a request value into it.
             description = f"Invalid value for '{location}': {error.get('msg', '')}."
         else:
             description = f"{error.get('msg', '')}."
@@ -442,8 +501,8 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
             param = location or None
         if index < limit:
             parts.append(description)
-    if len(errors) > limit:
-        parts.append(f"({len(errors) - limit} more errors not shown.)")
+    if len(described) > limit:
+        parts.append(f"({len(described) - limit} more errors not shown.)")
     return " ".join(parts) or "The request body is invalid.", param
 
 

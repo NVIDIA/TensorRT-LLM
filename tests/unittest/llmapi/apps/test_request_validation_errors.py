@@ -35,7 +35,10 @@ from fastapi.testclient import TestClient
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
-from tensorrt_llm.serve.openai_protocol import TOOL_PARAM_MAX_ENUM_VALUES
+from tensorrt_llm.serve.openai_protocol import (
+    TOOL_PARAM_MAX_ENUM_VALUES,
+    summarize_validation_errors,
+)
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
@@ -136,6 +139,72 @@ def test_body_that_is_not_json_has_no_parameter(client):
     )
     assert error["message"].startswith("The request body is not valid JSON: ")
     assert error["param"] is None
+
+
+def test_a_body_that_is_not_msgpack_has_no_parameter_and_is_not_quoted(client):
+    response = client.post(
+        "/v1/chat/completions",
+        content=b"\xc1" + PAYLOAD.encode(),
+        headers={"content-type": "application/json", "x-trtllm-msgpack": "1"},
+    )
+    error = _error(response)
+    assert error["message"].startswith("The request body is not valid JSON: msgpack: ")
+    assert error["param"] is None
+    assert PAYLOAD[:64] not in response.text
+
+
+def test_a_union_field_is_named_by_its_own_place_once(client):
+    """A message's content is a union; every member's error points at it.
+
+    Pydantic reports each member of the message and content unions, tagged
+    with the member's type. The client is told about the field it sent.
+    """
+    error = _error(
+        client.post(
+            "/v1/chat/completions",
+            json={"model": MODEL, "messages": [{"role": "user", "content": 123}]},
+        )
+    )
+    assert error["param"] == "messages.0.content"
+    assert error["message"].startswith("Invalid value for 'messages.0.content': ")
+    assert error["message"].count("Invalid value") == 1
+    assert "MessageParam" not in error["message"]
+
+
+def test_union_members_whose_literal_rejected_the_value_are_left_out():
+    errors = [
+        {"type": "literal_error", "loc": ("body", "messages", 0, "System", "role"), "msg": "x"},
+        {
+            "type": "string_type",
+            "loc": ("body", "messages", 0, "System", "content", "str"),
+            "msg": "s",
+        },
+        {
+            "type": "string_type",
+            "loc": ("body", "messages", 0, "User", "content", "str"),
+            "msg": "s",
+        },
+        {
+            "type": "list_type",
+            "loc": ("body", "messages", 0, "User", "content", "list[P]"),
+            "msg": "l",
+        },
+    ]
+    assert summarize_validation_errors(errors) == (
+        "Invalid value for 'messages.0.content': s.",
+        "messages.0.content",
+    )
+
+
+def test_a_literal_no_union_member_accepts_is_named_once():
+    errors = [
+        {"type": "literal_error", "loc": ("body", "messages", 0, "System", "role"), "msg": "a"},
+        {"type": "literal_error", "loc": ("body", "messages", 0, "User", "role"), "msg": "b"},
+    ]
+    assert summarize_validation_errors(errors) == (
+        "Invalid value for 'messages.0.role': a.",
+        "messages.0.role",
+    )
 
 
 def test_many_errors_are_counted_not_listed(client):
