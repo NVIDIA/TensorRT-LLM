@@ -153,9 +153,10 @@ def test_gdn_recurrent_matches_l2_reference(
             use_qk_l2norm_in_kernel=True,
         )
 
-    # The replay kernel rounds normalized Q/K and dot products to BF16;
-    # the bound allows that error while rejecting the different formula.
-    torch.testing.assert_close(actual.double(), expected, rtol=0.015, atol=3e-5)
+    # BF16 outputs require room for final rounding. Cached replay additionally
+    # rounds normalized Q/K to BF16 before the dot products.
+    rtol = 0.015 if kernel == "cached_replay" else 0.005
+    torch.testing.assert_close(actual.double(), expected, rtol=rtol, atol=3e-5)
     if kernel != "cached_replay":
         torch.testing.assert_close(state[indices.long()].double(), sr, rtol=3e-5, atol=2e-7)
         torch.testing.assert_close(state[[1, 3]], original[[1, 3]], rtol=0, atol=0)

@@ -187,6 +187,15 @@ def test_wait_for_addr_times_out_on_missing_file(tmp_path):
         rp.wait_for_addr(rp.addr_path(str(tmp_path), 0, 0), timeout_s=0)
 
 
+def test_wait_for_addr_stops_once_the_abort_flag_is_up(tmp_path, monkeypatch):
+    """A ctx that failed before publishing raises the flag; gen stops waiting, with its reason."""
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    work = str(tmp_path)
+    rp.raise_abort_flag(work, "ctx_0 UNHANDLED_ERROR: FileExistsError")
+    with pytest.raises(rp._PeerAbort, match="abandoned: ctx_0 UNHANDLED_ERROR: FileExistsError"):
+        rp.wait_for_addr(rp.addr_path(work, 0, 0), timeout_s=5, work_dir=work)
+
+
 def test_abort_flag_roundtrip_and_write_once(tmp_path, monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "1")
     work = str(tmp_path)
@@ -202,6 +211,39 @@ def test_abort_flag_stale_job_ignored(tmp_path, monkeypatch):
     rp.raise_abort_flag(str(tmp_path), "stale")
     monkeypatch.setenv("SLURM_JOB_ID", "new")
     assert rp.abort_flag_reason(str(tmp_path)) is None
+
+
+def test_shared_file_write_survives_a_spurious_eexist(tmp_path, monkeypatch):
+    """NFS can fail every create of one name with EEXIST; a fresh name gets through."""
+    real_open = os.open
+    poisoned = []
+
+    def open_poisoning_the_first_created_name(path, flags, *args, **kwargs):
+        if str(path).startswith(str(tmp_path)) and flags & os.O_CREAT:
+            if not poisoned or path in poisoned:
+                poisoned.append(path)
+                raise FileExistsError(17, "File exists", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_poisoning_the_first_created_name)
+    path = tmp_path / "status" / "gen_0.status"
+    rp.atomic_write_shared_file(str(path), "PASS gen_0\n")
+
+    assert len(poisoned) == 1  # mkstemp() moved on instead of retrying the poisoned name
+    assert os.path.basename(poisoned[0]).startswith(".")  # a leftover misses status/*.status
+    assert path.read_text() == "PASS gen_0\n"
+    assert path.stat().st_mode & 0o777 == 0o644
+    assert os.listdir(path.parent) == ["gen_0.status"]  # no temp file left behind
+
+
+def test_shared_file_write_removes_its_temp_file_on_failure(tmp_path, monkeypatch):
+    def failing_replace(_src, _dst):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="Input/output error"):
+        rp.atomic_write_shared_file(str(tmp_path / "gen_0.json"), "{}")
+    assert os.listdir(tmp_path) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +297,43 @@ def test_recorder_non_leader_writes_nothing(tmp_path):
     rec.record("ctx_0", 0, "TRANSFER_ERROR", "x")
     rec.finalize()
     assert not os.path.exists(os.path.join(str(tmp_path), "status"))
+
+
+def test_recorder_reports_a_write_failure_then_recovers(tmp_path, capfd):
+    """Only the leader writes, so a raise would strand the other ranks in a collective."""
+    work = tmp_path / "work"
+    work.write_text("")  # a file where the work dir belongs: every status write fails
+    rec = rp.StatusRecorder(str(work), "gen", 0, is_leader=True)
+    rec.record("ctx_0", 1024, "MISMATCH", "pair=13 layer=0")  # must not raise
+    err = capfd.readouterr().err
+    assert f"STATUS_WRITE_ERROR: NotADirectoryError: [Errno 20] Not a directory: '{work}" in err
+    # The root cause reaches the log even though no file holds it.
+    assert "verdict: FAIL gen_0: 1 case(s) failed; first: peer=ctx_0 req_len=1024 MISMATCH" in err
+
+    work.unlink()  # the filesystem recovers
+    rec.record("ctx_1", 1024, "PASS")
+    rec.finalize()
+    text, doc = _read_status(work, "gen_0")
+    assert text.startswith("FAIL gen_0: 1 case(s) failed; first: peer=ctx_0")
+    assert [case["peer"] for case in doc["cases"]] == ["ctx_0", "ctx_1"]
+
+
+def test_recorder_writes_the_status_line_before_the_json(tmp_path, monkeypatch):
+    """The gate reads only the .status line, so a failed .json write must not hold it back."""
+    real_write = rp.atomic_write_shared_file
+
+    def write_all_but_json(path, *args, **kwargs):
+        if path.endswith(".json"):
+            raise OSError(5, "Input/output error", path)
+        real_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(rp, "atomic_write_shared_file", write_all_but_json)
+    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
+    rec.record("ctx_0", 1024, "MISMATCH", "pair=13 layer=0")
+    status = (tmp_path / "status" / "gen_0.status").read_text()
+    assert status.startswith(
+        "FAIL gen_0: 1 case(s) failed; first: peer=ctx_0 req_len=1024 MISMATCH"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1121,6 +1200,131 @@ def test_gen_peer_loop_reraises_fatal_transfer(monkeypatch):
         )
 
     assert recorded == []
+
+
+class _AbortSentinel(Exception):
+    """Raised by a patched hard-abort function in place of ending the test process."""
+
+
+@pytest.mark.parametrize("scenario", ["leader", "non_leader", "leader_cannot_record"])
+def test_hard_abort_unhandled_records_the_error_then_aborts(tmp_path, monkeypatch, capfd, scenario):
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    work = str(tmp_path)
+    alarms, slept, aborted = [], [], []
+
+    def abort_process(comm):
+        aborted.append(comm)
+        raise _AbortSentinel
+
+    monkeypatch.setattr(rp.signal, "alarm", alarms.append)
+    monkeypatch.setattr(rp, "time", types.SimpleNamespace(sleep=slept.append))
+    monkeypatch.setattr(rp, "_hard_abort_process", abort_process)
+    is_leader = scenario != "non_leader"
+    runner = types.SimpleNamespace(
+        role="ctx",
+        server_idx=2,
+        rank=0 if is_leader else 3,
+        is_leader=is_leader,
+        work_dir=work,
+        comm=object(),
+        recorder=rp.StatusRecorder(work, "ctx", 2, is_leader=is_leader),
+    )
+    if scenario == "leader_cannot_record":
+        # The abort must still happen when the verdict cannot be recorded.
+        def failing_record(*_args):
+            raise RuntimeError("cannot record")
+
+        runner.recorder.record = failing_record
+
+    def publish_addr():
+        raise FileExistsError(17, "File exists", "/work/rendezvous/.ctx2_gen0.addr.k3x9q1")
+
+    with pytest.raises(FileExistsError) as raised:
+        publish_addr()
+    with pytest.raises(_AbortSentinel):
+        rp._hard_abort_unhandled(runner, raised.value)
+
+    assert aborted == [runner.comm]
+    assert alarms == [0]  # a pending watchdog alarm must not interrupt the verdict write
+    detail = "FileExistsError: [Errno 17] File exists: '/work/rendezvous/.ctx2_gen0.addr.k3x9q1'"
+    err = capfd.readouterr().err
+    assert f"] UNHANDLED_ERROR: {detail}" in err  # the gate greps this line
+    assert "in publish_addr" in err  # the traceback names the raising frame
+    if is_leader:  # peers fail fast, even when the verdict could not be recorded
+        assert rp.abort_flag_reason(work) == f"ctx_2 UNHANDLED_ERROR: {detail}"
+    if scenario == "leader":
+        text, doc = _read_status(tmp_path, "ctx_2")
+        assert text.startswith(
+            f"FAIL ctx_2: 1 case(s) failed; first: peer=- req_len=0 UNHANDLED_ERROR: {detail}"
+        )
+        assert doc["overall"] == "FAIL"
+    if scenario == "non_leader":
+        # No verdict (only the leader writes one), but peers still fail fast.
+        assert os.listdir(work) == ["precheck.abort"]
+        assert rp.abort_flag_reason(work) == f"ctx_2 r3 UNHANDLED_ERROR: {detail}"
+    # Only a non-leader waits, in case the leader failed too and is still writing its verdict.
+    assert slept == ([rp.ABORT_COORDINATION_TIMEOUT_S] if scenario == "non_leader" else [])
+
+
+@pytest.mark.parametrize("role", ["ctx", "gen"])
+@pytest.mark.parametrize(
+    ("error", "expected_handler"),
+    [
+        (FileExistsError(17, "File exists"), "_hard_abort_unhandled"),
+        (RuntimeError("leader-only zmq bind failed"), "_hard_abort_unhandled"),
+        (rp._FatalTransferError("not quiesced"), "_hard_abort_unquiesced"),
+        (rp._Timeout("deadline"), "_hard_abort_unquiesced"),
+    ],
+    ids=["unhandled_oserror", "unhandled_other", "ownership_fatal", "ownership_timeout"],
+)
+def test_main_routes_a_peer_loop_error_to_a_hard_abort(monkeypatch, role, error, expected_handler):
+    """The error may be this rank's alone; returning from main() would hang in MPI_Finalize."""
+
+    def do_nothing(*_args, **_kwargs):
+        pass
+
+    def peer_loop(*_args):
+        raise error
+
+    # Stub out MPI, CUDA, the plan, the runner and the watchdog so main() runs on the CPU.
+    ns = types.SimpleNamespace
+    comm = ns(Get_rank=lambda: 0, Get_size=lambda: 1)
+    monkeypatch.setitem(sys.modules, "mpi4py", ns(MPI=ns(COMM_WORLD=comm)))
+    monkeypatch.setitem(
+        sys.modules, "torch", ns(cuda=ns(set_device=do_nothing, device_count=lambda: 1))
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt_llm", ns(logger=ns(set_level=do_nothing)))
+    monkeypatch.setenv("UCX_PROTO_INFO", "used")  # main() setdefault()s it; monkeypatch undoes it
+    plan = dict(_kv_shape=None, _model_dir=None, n_pairs=1, request_lengths=[1], setup_timeout_s=1)
+    monkeypatch.setattr(rp, "load_plan", lambda _args: (plan, {"parallel": {"world_size": 1}}))
+    runner = ns(
+        role=role,
+        server_idx=0,
+        is_leader=True,
+        use_v2=True,
+        runtime="CPP",
+        setup=do_nothing,
+        _consensus_error=do_nothing,
+    )
+    monkeypatch.setattr(rp, "PrecheckRunner", lambda *_args: runner)
+    # _install_watchdog returns (arm, disarm, stop, current_cell).
+    monkeypatch.setattr(
+        rp, "_install_watchdog", lambda *_args: (do_nothing,) * 3 + ({"what": "-"},)
+    )
+    monkeypatch.setattr(rp, "_serve_gen_peers" if role == "ctx" else "_drive_ctx_peers", peer_loop)
+    calls = []
+    for handler_name in ("_hard_abort_unhandled", "_hard_abort_unquiesced"):
+
+        def fake_hard_abort(runner_arg, *args, handler_name=handler_name):
+            calls.append((handler_name, runner_arg, args[-1]))  # the exception comes last
+            raise _AbortSentinel
+
+        monkeypatch.setattr(rp, handler_name, fake_hard_abort)
+
+    with pytest.raises(_AbortSentinel):
+        rp.main(["--role", role, "--server-idx", "0", "--config", "x", "--work-dir", "x"])
+
+    assert calls == [(expected_handler, runner, error)]
 
 
 # --------------------------------------------------------------------------- #

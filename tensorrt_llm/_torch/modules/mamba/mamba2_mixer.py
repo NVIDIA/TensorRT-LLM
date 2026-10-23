@@ -514,27 +514,32 @@ class Mamba2Mixer(nn.Module):
             from .deterministic_ssm import deterministic_ssm
 
             batch_size = num_prefills + num_decodes
-            cu_seqlens = (mamba_metadata.cu_seqlens[:batch_size + 1]
-                          if num_prefills else
+            cu_seqlens = (mamba_metadata.cu_seqlens[:batch_size +
+                                                    1] if num_prefills else
                           mamba_metadata._arange_buffer[:batch_size + 1])
-            has_initial = torch.cat((
-                mamba_metadata.has_initial_states[:num_prefills],
-                torch.ones(num_decodes, dtype=torch.bool,
-                           device=zxbcdt.device)))
+            has_initial = torch.cat(
+                (mamba_metadata.has_initial_states[:num_prefills],
+                 torch.ones(num_decodes, dtype=torch.bool,
+                            device=zxbcdt.device)))
             xbc = zxbcdt[:num_actual_tokens,
                          self.tp_d_inner:self.tp_d_inner + self.tp_conv_dim]
-            conv_out = torch.empty_like(xbc, memory_format=torch.contiguous_format)
-            causal_conv1d_fn(
-                xbc.t(), self.conv1d.weight, self.conv1d.bias,
-                query_start_loc=cu_seqlens, cache_indices=state_indices,
-                has_initial_state=has_initial, conv_states=conv_states,
-                activation="silu", out=conv_out.t())
+            conv_out = torch.empty_like(xbc,
+                                        memory_format=torch.contiguous_format)
+            causal_conv1d_fn(xbc.t(),
+                             self.conv1d.weight,
+                             self.conv1d.bias,
+                             query_start_loc=cu_seqlens,
+                             cache_indices=state_indices,
+                             has_initial_state=has_initial,
+                             conv_states=conv_states,
+                             activation="silu",
+                             out=conv_out.t())
             deterministic_ssm(
-                conv_out,
-                zxbcdt[:num_actual_tokens, self.tp_d_inner + self.tp_conv_dim:],
-                self.A, self.D, self.dt_bias, ssm_states, cu_seqlens,
-                state_indices, has_initial, preallocated_ssm_out,
-                self.tp_ngroups, self.delta_softplus)
+                conv_out, zxbcdt[:num_actual_tokens,
+                                 self.tp_d_inner + self.tp_conv_dim:], self.A,
+                self.D, self.dt_bias, ssm_states, cu_seqlens, state_indices,
+                has_initial, preallocated_ssm_out, self.tp_ngroups,
+                self.delta_softplus)
             preallocated_ssm_out[num_actual_tokens:].zero_()
             return
 

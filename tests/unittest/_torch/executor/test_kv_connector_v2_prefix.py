@@ -42,10 +42,14 @@ class FakeKvCache:
         self.is_active = True
         self.grow_ok = grow_ok
         self.resize_calls = []
+        self.connector_reuse_calls = []
         self.closed = False
 
     def close(self) -> None:
         self.closed = True
+
+    def record_connector_reuse(self, token_begin, token_end):
+        self.connector_reuse_calls.append((token_begin, token_end))
 
     def discard_pending_stats(self) -> None:
         pass
@@ -96,7 +100,7 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
-        self.py_connector_served_position = 0
+        self.py_served_prefix_end = 0
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
         self._context_chunk_size = prompt_len
@@ -148,6 +152,8 @@ class FakeConnectorManager:
     """Records the calls the prefix path makes, in order."""
 
     def __init__(self, num_matched=0, load_async=False, add_sequence=True):
+        # Read by the manager to decide whether the prefix path runs at all.
+        self.capacity_only = False
         self.prefix_reservations_enabled = False
         self.reservations = {}
         self.reservation_requests = {}
@@ -262,11 +268,17 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.kv_cache_map = {}
     manager.enable_block_reuse = True
     manager.conversation_manager = None
+    manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._disagg_receive_ready = {}
+    manager._allocation_stream = None
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    manager._pending_preemption = {}
     manager._early_freed_index_requests = set()
     manager.impl = Mock()
     manager.index_mapper = Mock()
@@ -443,6 +455,53 @@ class TestOfferIsClamped:
         assert req.context_current_position == 64
         assert kv_cache.resize_calls == []
         assert connector.commits == [(0, 0, False)]
+
+
+class TestConnectorReuseStats:
+    """The served token span is reported to the core's stats.
+
+    The span runs from the local match to the honoured end. The core counts
+    its tokens as connector cached tokens and rebooks the blocks they fill
+    completely from missed to reused.
+    """
+
+    def test_the_served_span_is_recorded(self):
+        connector = FakeConnectorManager(num_matched=96)
+        manager = make_manager(connector)
+        kv_cache = FakeKvCache(committed=32, capacity=PROMPT_LEN)
+
+        assert serve(manager, FakeRequest(), kv_cache)
+
+        assert kv_cache.connector_reuse_calls == [(32, 128)]
+
+    def test_the_span_ends_at_the_honoured_position(self):
+        connector = FakeConnectorManager(num_matched=PROMPT_LEN)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        assert serve(manager, req, kv_cache)
+
+        assert req.context_current_position == PROMPT_LEN - 1
+        assert kv_cache.connector_reuse_calls == [(0, PROMPT_LEN - 1)]
+
+    def test_the_span_starts_at_a_mid_block_local_match(self):
+        connector = FakeConnectorManager(num_matched=47)
+        manager = make_manager(connector)
+        kv_cache = FakeKvCache(committed=17, capacity=PROMPT_LEN)
+
+        assert serve(manager, FakeRequest(), kv_cache)
+
+        assert kv_cache.connector_reuse_calls == [(17, 64)]
+
+    def test_nothing_is_rebooked_when_nothing_is_served(self):
+        connector = FakeConnectorManager(num_matched=0)
+        manager = make_manager(connector)
+        kv_cache = FakeKvCache(committed=64, capacity=PROMPT_LEN)
+
+        assert not serve(manager, FakeRequest(), kv_cache)
+
+        assert kv_cache.connector_reuse_calls == []
 
 
 class TestUnchunkedIsPureShrink:
@@ -671,6 +730,25 @@ class TestExclusions:
 
         assert connector.queries == []
 
+    def test_a_capacity_only_connector_is_driven_by_no_phase(self):
+        """It serves nothing and holds no address, so every phase is empty.
+
+        `prepare_resources` is where the phases run, once per iteration, and
+        reporting an allocation costs a page index gather per context request.
+        """
+        connector = FakeConnectorManager(num_matched=64)
+        connector.capacity_only = True
+        manager = make_manager(connector)
+        req = FakeRequest()
+        manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        manager.prepare_resources(scheduled(req))
+
+        assert connector.queries == []
+        assert connector.commits == []
+        assert connector.allocs == []
+        assert not req.py_connector_allocation_reported
+
 
 class TestAsyncLoad:
     def test_the_async_flag_reaches_the_commit(self):
@@ -826,10 +904,10 @@ class TestReEntryAfterAServe:
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
         assert manager.prepare_context(req)
         manager._run_kv_connector_hooks(scheduled(req))
-        assert req.py_connector_served_position == 64
+        assert req.py_served_prefix_end == 64
 
         req.py_connector_allocation_reported = False  # what free_resources does
-        req.py_connector_served_position = 0  # ... and this
+        req.py_served_prefix_end = 0  # ... and this
 
         assert manager.prepare_context(req)
 
@@ -884,7 +962,7 @@ class TestPrefixReservations:
     def test_reserve_before_budget_and_accept_after_final_trim(self, load_async: bool) -> None:
         manager, connector, req, cache = self.prepare(load_async=load_async)
         assert req.context_current_position == 64
-        assert req.py_connector_served_position == 0
+        assert req.py_served_prefix_end == 0
         assert cache.history_length == 0
         assert connector.accepted == []
         assert connector.allocs == []
@@ -898,7 +976,7 @@ class TestPrefixReservations:
         req.context_chunk_size = 32
         manager.report_batch_to_connector(batch)
 
-        assert req.py_connector_served_position == 64
+        assert req.py_served_prefix_end == 64
         assert req.context_chunk_size == 32
         assert len(connector.allocs) == 1
         reservation, groups = connector.accepted[0]
@@ -908,6 +986,24 @@ class TestPrefixReservations:
         manager.report_batch_to_connector(batch)
         assert len(connector.accepted) == 1
         assert len(connector.allocs) == 1
+
+    def test_an_accepted_load_is_rebooked_as_reused(self) -> None:
+        manager, connector, req, cache = self.prepare()
+        assert manager.resize_context(req, 32)
+        req.context_chunk_size = 32
+
+        manager.report_batch_to_connector(scheduled(req))
+
+        assert len(connector.accepted) == 1
+        assert cache.connector_reuse_calls == [(0, 64)]
+
+    def test_an_unaccepted_reservation_is_not_rebooked(self) -> None:
+        manager, connector, req, cache = self.prepare()
+        assert manager.resize_context(req, 32)
+
+        manager.release_unused_connector_reservations(set())
+
+        assert cache.connector_reuse_calls == []
 
     @pytest.mark.parametrize("capacity", [0, PROMPT_LEN])
     def test_rejection_rewinds_even_without_capacity_growth(self, capacity: int) -> None:
@@ -922,7 +1018,7 @@ class TestPrefixReservations:
         assert req.context_current_position == 0
         assert req.prepopulated_prompt_len == 0
         assert req.context_chunk_size == PROMPT_LEN
-        assert req.py_connector_served_position == 0
+        assert req.py_served_prefix_end == 0
         manager.release_unused_connector_reservations(set())
         assert connector.releases == [(1, 0, 64)]
 
@@ -955,7 +1051,7 @@ class TestPrefixReservations:
         )
         assert req.context_current_position == expected_end
         assert req.context_remaining_length == PROMPT_LEN - expected_end
-        assert req.py_connector_served_position == 0
+        assert req.py_served_prefix_end == 0
         reservation = connector.get_prefix_reservation(req)
         if expected_end == committed:
             assert reservation is None
@@ -979,7 +1075,7 @@ class TestPrefixReservations:
         with pytest.raises(RuntimeError, match="while request .* is loading"):
             manager.free_resources(req)
         assert not cache.closed
-        assert req.py_connector_served_position == 64
+        assert req.py_served_prefix_end == 64
         assert manager.kv_cache_map[req.request_id] is cache
 
     def test_final_batch_releases_only_rejected_requests(self) -> None:
@@ -1017,6 +1113,6 @@ def test_final_admission_rejects_an_invalid_local_allocation() -> None:
         manager.report_batch_to_connector(scheduled(req))
     assert connector.accepted == []
     assert connector.get_prefix_reservation(req) is not None
-    assert req.py_connector_served_position == 0
+    assert req.py_served_prefix_end == 0
     manager.release_unused_connector_reservations(set())
     assert connector.releases == [(1, 0, 64)]

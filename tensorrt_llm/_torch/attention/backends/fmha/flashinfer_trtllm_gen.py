@@ -395,18 +395,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        if not cls._supports_deterministic and (
-            os.getenv("FORCE_DETERMINISTIC") == "1"
-            or os.getenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
-        ):
-            # This API cannot request a fixed KV reduction. Leave selection
-            # to the deterministic FMHA library or the existing fallback.
-            logger.debug(
-                "FlashInfer TRTLLM-Gen FMHA is unavailable: deterministic attention is enabled."
-            )
-            return False
-
+    def is_environment_available(cls) -> bool:
+        """Check dependencies and architecture before constructing an attention layer."""
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -424,6 +414,24 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             logger.debug(
                 f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
             )
+            return False
+
+        return True
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not cls._supports_deterministic and (
+            os.getenv("FORCE_DETERMINISTIC") == "1"
+            or os.getenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
+        ):
+            # This API cannot request a fixed KV reduction. Leave selection
+            # to the deterministic FMHA library or the existing fallback.
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: deterministic attention is enabled."
+            )
+            return False
+
+        if not cls.is_environment_available():
             return False
 
         has_skip_softmax = isinstance(attn.sparse_params, SkipSoftmaxParams)
@@ -493,6 +501,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
         tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
@@ -529,6 +538,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # FlashInfer's TRTLLM-Gen MLA decode does not support 64 < H < 128.
+        # Let selection fall through to the legacy TRTLLM-Gen backend.
+        if 64 < num_heads < 128:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                f"for num_heads={num_heads} (64 < num_heads < 128) "
+                "as it may select unsupported kernels.",
             )
 
         if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
@@ -618,11 +637,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and attn.head_dim != 512
             and not has_q_only
             and meta.num_generations == 0
+            and not (
+                meta.use_paged_context_fmha
+                and meta.tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK
+            )
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
             # Let the FMHA selector choose the fallback implementation. H512
-            # and Q-only cached-KV requests cannot use that fallback.
+            # and Q-only cached-KV requests cannot use that fallback. Neither
+            # can paged prefill with model-specific page sizes such as M3's 128.
             # Keep mixed batches on FlashInfer: the monolithic fallback also
             # switches decoding to C++ kernels that generation-only warmup
             # does not cover, causing first-use JIT stalls (NVBug 6716104).
@@ -729,7 +753,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
                     return False, "[Context] custom mask."
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] unsupported attention mask: {fwd.attention_mask!r}."
             if has_alibi:
                 return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
@@ -768,6 +792,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
                     tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,

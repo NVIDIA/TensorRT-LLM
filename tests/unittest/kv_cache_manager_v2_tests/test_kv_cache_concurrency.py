@@ -37,6 +37,7 @@ import torch
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttentionReusePolicy,
     BufferConfig,
     CudaStream,
     GpuCacheTierConfig,
@@ -178,6 +179,56 @@ def _await_antagonist(antagonist: threading.Thread, hits: dict) -> None:
         time.sleep(0.001)
 
 
+def test_optional_selection_and_resume_with_concurrent_priority_callbacks() -> None:
+    """Candidate claims and selection share the ordinary resume lock/GIL contract."""
+    config = _make_config()
+    config.layers = [
+        *config.layers,
+        AttentionLayerConfig(
+            layer_id=1,
+            buffers=[BufferConfig(role="key", size=4096)],
+            sliding_window_size=4,
+            reuse_policy=AttentionReusePolicy.OPTIONAL,
+        ),
+    ]
+    manager = KVCacheManager(config)
+    source = None
+    try:
+        tokens = list(range(100000, 100008))
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        source = manager.create_kv_cache(None, [])
+        assert source.resume(stream)
+        assert source.resize(len(tokens))
+        source.commit(tokens, is_end=True)
+        source.suspend()
+        group = manager.get_layer_group_id(1)
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            for iteration in range(50):
+                reader = manager.create_kv_cache(None, tokens)
+                try:
+                    status = next(s for s in reader.reuse_status if s.group_id == group)
+                    assert status.complete and status.endpoint == len(tokens)
+                    selected = [group] if iteration % 2 else []
+                    assert reader.resume(stream, optional_reuse_groups=selected)
+                    reader.suspend()
+                    assert reader.resume(stream)
+                finally:
+                    reader.close()
+            assert manager.probe_reuse(None, tokens) == len(tokens)
+        finally:
+            stop.set()
+            _join(antagonist)
+    finally:
+        if source is not None:
+            source.close()
+        manager.shutdown()
+
+
 def test_capacity_and_history_length_setters_do_not_deadlock() -> None:
     """The `capacity` / `history_length` property setters reach resize(), so they must free the GIL.
 
@@ -305,6 +356,8 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
                 manager.get_and_reset_iteration_stats()
                 manager.get_and_reset_iteration_cached_tokens_by_level()
                 manager.get_and_reset_iteration_reused_blocks_by_level()
+                manager.get_and_reset_iteration_connector_reused_blocks()
+                manager.get_and_reset_iteration_connector_cached_tokens()
                 manager.get_and_reset_iteration_disk_prefetch_blocks()
                 manager.get_and_reset_iteration_peak_block_stats_by_level()
                 for stats in manager.get_storage_statistics():
@@ -336,6 +389,8 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
     [
         ("manager", "get_and_reset_iteration_cached_tokens_by_level"),
         ("manager", "get_and_reset_iteration_reused_blocks_by_level"),
+        ("manager", "get_and_reset_iteration_connector_reused_blocks"),
+        ("manager", "get_and_reset_iteration_connector_cached_tokens"),
         ("manager", "get_and_reset_iteration_disk_prefetch_blocks"),
         ("manager", "get_and_reset_iteration_peak_block_stats_by_level"),
         ("manager", "get_storage_statistics"),

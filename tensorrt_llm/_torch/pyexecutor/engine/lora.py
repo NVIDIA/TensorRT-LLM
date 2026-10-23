@@ -66,29 +66,31 @@ def make_cuda_graph_lora_manager(
 class LoraParamBuilder:
     """Own LoRA preparation state and build per-iteration model parameters.
 
-    The optional graph manager is supplied at construction; None selects eager
-    preparation only. Graph selection and parameter preparation use the same
-    manager. Speculative execution decisions remain per-call inputs.
+    ``model_config`` is set once LoRA adapters are configured. The optional
+    graph manager is replaced whenever executor resources are rebuilt; None
+    selects eager preparation only. Graph selection and parameter preparation
+    use the same manager. Speculative execution decisions remain per-call inputs.
     """
 
     def __init__(
         self,
         *,
-        spec_config: DecodingBaseConfig | None,
         attn_backend: type[AttentionMetadata],
         cuda_graph_manager: CudaGraphLoraManager | None,
+        spec_config: DecodingBaseConfig | None = None,
     ) -> None:
         self._spec_config = spec_config
         self._attn_backend = attn_backend
         self.cuda_graph_manager = cuda_graph_manager
+        self.model_config: LoraModelConfig | None = None
 
     def build(
         self,
         scheduled_requests: ScheduledRequests,
         attn_metadata: AttentionMetadata,
         *,
-        enable_spec_decode: bool,
-        runtime_draft_len: int,
+        enable_spec_decode: bool = False,
+        runtime_draft_len: int = 0,
         peft_cache_manager: PeftCacheManager | None = None,
         maybe_graph: bool = False,
         use_lora_graph: bool = False,

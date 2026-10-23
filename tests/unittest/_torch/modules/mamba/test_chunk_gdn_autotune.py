@@ -8,7 +8,10 @@ from typing import Literal
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="BF16 kernels require CUDA compute capability >= 8.0",
+)
 
 
 @pytest.mark.parametrize("state_mode", ["indexed_zero", "indexed_nonzero", "dense", "none"])
@@ -19,6 +22,7 @@ def test_chunk_gdn_cold_autotune_preserves_initial_state(
     state_mode: Literal["indexed_zero", "indexed_nonzero", "dense", "none"],
     use_gate: bool,
 ) -> None:
+    """Check cold tuning and cached execution from identical initial states."""
     from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h,
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
@@ -30,13 +34,15 @@ def test_chunk_gdn_cold_autotune_preserves_initial_state(
     monkeypatch.setattr(autotuner, "cache", {})
     monkeypatch.setattr(autotuner, "cache_results", False)
 
-    torch.manual_seed(2026)
+    # A local generator leaves the shared CPU and CUDA RNG states untouched.
+    generator = torch.Generator(device="cuda").manual_seed(2026)
     lengths = [17, 65]
     heads, key_heads, dim = 4, 2, 64
     total = sum(lengths)
 
     def randn(*shape: int) -> torch.Tensor:
-        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.05
+        """Draw BF16 inputs from this test's CUDA generator."""
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16, generator=generator) * 0.05
 
     k = randn(1, total, key_heads, dim)
     w = randn(1, total, heads, dim)
@@ -52,11 +58,12 @@ def test_chunk_gdn_cold_autotune_preserves_initial_state(
     initial = None
     if state_mode != "none":
         slots = 5 if indexed else len(lengths)
-        initial = torch.randn(slots, heads, dim, dim, device="cuda") * 0.1
+        initial = torch.randn(slots, heads, dim, dim, device="cuda", generator=generator) * 0.1
         if state_mode == "indexed_zero":
             initial[indices.long()] = 0
 
     def run() -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]:
+        """Execute from a fresh copy of the caller's initial state."""
         state = None if initial is None else initial.clone()
         result = chunk_gated_delta_rule_fwd_h(
             k=k,
@@ -98,6 +105,15 @@ def test_chunk_gdn_cold_autotune_preserves_initial_state(
 def test_chunk_gdn_autotune_memory_scales_with_active_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Check that autotune backup memory scales with the active slot count."""
+    # Reserve capacity for the 512 MiB pool and 8 MiB of working allocations.
+    required_bytes = (512 + 8) * 1024 * 1024
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes:
+        pytest.skip(
+            f"Requires {required_bytes} free CUDA bytes, but only {free_bytes} are available"
+        )
+
     from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h,
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
@@ -108,8 +124,7 @@ def test_chunk_gdn_autotune_memory_scales_with_active_slots(
     monkeypatch.setattr(autotuner, "cache_results", False)
 
     def benchmark(fn: Callable[[], object], quantiles: list[float]) -> list[float]:
-        # Exercise every candidate without including Triton's timing/flush
-        # buffers in the state-backup memory measurement.
+        """Run each candidate once without allocating benchmark flush buffers."""
         fn()
         return [1.0] * len(quantiles)
 

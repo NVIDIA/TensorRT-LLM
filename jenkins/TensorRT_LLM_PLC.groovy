@@ -22,7 +22,7 @@ def createKubernetesPodConfig()
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
-    def image = "urm.nvidia.com/docker/ubuntu:24.04"
+    def image = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
     // release mode requires a longer pod lifetime to survive the manual license review window
     def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
@@ -251,7 +251,10 @@ def sonarScan()
 {
     container("cpu") {
         def sonarScannerCliVer = "8.0.0.6341"
-        sh "wget https://maven-central.storage-download.googleapis.com/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        // Expected SHA-256 of the scanner zip; update it together with sonarScannerCliVer.
+        def sonarScannerCliSha256 = "c55773294e951dcba23ebe7084616f33721b0ce0d199401c7e07d3a6cdfafdb1"
+        sh "wget https://artifactory.pdx.nvidia.com/artifactory/maven-central-remote/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "echo '${sonarScannerCliSha256}  sonar-scanner-cli-${sonarScannerCliVer}.zip' | sha256sum -c -"
         sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"

@@ -11,12 +11,13 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
+from tensorrt_llm._bootstrap import _UNIFIED_CACHE_ENV_VARS
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -30,6 +31,38 @@ if ENABLE_MULTI_DEVICE:
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
+
+# Environment that MpiPoolSession forwards from the parent to its workers.
+_FORWARDED_ENV_PREFIXES = ("TRTLLM", "TLLM")
+_FORWARDED_ENV_NAMES = (*_UNIFIED_CACHE_ENV_VARS, "FLASHINFER_CUBIN_DIR",
+                        "MASTER_ADDR", "MASTER_PORT")
+
+
+def _is_forwarded_env(name: str) -> bool:
+    return (name.startswith(_FORWARDED_ENV_PREFIXES)
+            or name in _FORWARDED_ENV_NAMES)
+
+
+# A spawned worker starts from the environment of the MPI runtime that launches
+# it, which can be older than the parent's current one: a singleton's DVM is
+# forked once, at the process's first spawn, and keeps that environment for
+# every later spawn. ``MPIPoolExecutor(env=...)`` can only add variables, so
+# drop every inherited forwarded variable before the server applies the
+# parent's overlay; the overlay then fully defines them, including variables
+# the parent no longer has.
+_WORKER_ENV_BOOTSTRAP = f"""
+import os
+
+for _name in list(os.environ):
+    if (_name.startswith({_FORWARDED_ENV_PREFIXES!r})
+            or _name in {_FORWARDED_ENV_NAMES!r}):
+        del os.environ[_name]
+"""
+_WORKER_SERVER_MAIN = """
+from mpi4py.futures.server import main
+
+main()
+"""
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
@@ -548,28 +581,39 @@ class MpiPoolSession(MpiSession):
 
         env = {
             key: value
-            for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR",
-                "MASTER_ADDR", "MASTER_PORT")
+            for key, value in os.environ.items() if _is_forwarded_env(key)
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
         explicit_workspace_override = (_FLASHINFER_WORKSPACE_ENV
                                        in self._env_overrides)
+        workspace_root = _FLASHINFER_WORKSPACE_ROOT
+        if cache_root := env.get("TRTLLM_CACHE_DIR"):
+            workspace_root = os.path.join(os.path.expanduser(cache_root),
+                                          "flashinfer")
+            workspace_managed |= env.get(
+                _FLASHINFER_WORKSPACE_ENV) == workspace_root
         isolate_workspace = (
             (self.n_workers > 1 or workspace_managed)
             and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
                  (workspace_managed and not explicit_workspace_override)))
+        python_args = ["-c", _WORKER_ENV_BOOTSTRAP + _WORKER_SERVER_MAIN]
         if isolate_workspace:
             env.pop(_FLASHINFER_WORKSPACE_ENV, None)
+            if cache_root:
+                logger.warning_once(
+                    "TRTLLM_CACHE_DIR keeps FlashInfer isolation enabled; "
+                    "set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 for better "
+                    "cache reuse at the risk of concurrent writes.",
+                    key="flashinfer_unified_cache_isolation")
+            python_args = [
+                "-c", _WORKER_ENV_BOOTSTRAP + _FLASHINFER_WORKER_BOOTSTRAP,
+                workspace_root
+            ]
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        python_args = ([
-            "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
-        ] if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
@@ -700,6 +744,8 @@ class RemoteTask(NamedTuple):
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     sync: bool = False  # if True, the result will be sent back to the client
+    # Submitting client's sys.path, applied on every rank by task_wrapper.
+    sys_path: Tuple[str, ...] = ()
 
 
 class RemoteWorkerDeath(NamedTuple):
@@ -781,7 +827,8 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
-        self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
+        self.queue.put(
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
         return []
 
     SYNC_IDLE_INTERVAL = 8
@@ -883,7 +930,17 @@ class RemoteMpiCommSessionServer():
                     n_workers=n_workers)
 
     @staticmethod
-    def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
+    def task_wrapper(client_sys_path: Tuple[str, ...], task: Callable[..., T],
+                     /, *args, **kwargs) -> T:
+        # Adopt the client's sys.path before the task runs, so objects it later
+        # unpickles -- per-request payloads such as a caller-defined logits
+        # processor -- can resolve their classes on this rank. Appending keeps
+        # this process's own environment ahead of the client's; relative entries
+        # are dropped because they would resolve against this process's working
+        # directory rather than the client's.
+        for path in client_sys_path:
+            if os.path.isabs(path) and path not in sys.path:
+                sys.path.append(path)
         logger_debug(
             f"MpiCommSession rank{mpi_rank()} with world_size {mpi_world_size()}\n",
             "green")
@@ -908,45 +965,91 @@ class RemoteMpiCommSessionServer():
                 "green")
             mpi_barrier()
 
+    # How often the wait for a previous task's worker futures services the
+    # control socket.
+    PENDING_POLL_SECONDS = 0.1
+
+    # Reply to a shutdown request, so the stop client knows it was received.
+    SHUTDOWN_ACK = "shutdown-ack"
+
+    def _receive(self) -> Optional[RemoteTask]:
+        """Read one message from the control socket.
+
+        A shutdown request (None) is acknowledged as soon as it is read: the
+        stop client resends on a new connection whenever an attempt goes
+        unacknowledged, and the server only accepts the new connection when
+        it next reads the socket, so a reply sent later would go to a client
+        that has already closed.
+        """
+        message = self.queue.get()
+        if message is None:
+            # Best-effort: a client that has already given up does not need it.
+            self.queue.put_noblock(self.SHUTDOWN_ACK, retry=2)
+        return message
+
+    def _wait_for_pending_futures(self, pending_futures: list) -> list:
+        """Wait for a previous task's worker futures, servicing the socket.
+
+        The control socket is a PAIR socket, which talks to one peer at a time
+        and takes a new client only after a zmq call on it has processed the
+        previous client's disconnect. The wait polls the socket every
+        ``PENDING_POLL_SECONDS``, so a client that connects after the task's
+        client has exited, such as the stop client (``stop_server_main``),
+        is accepted and its messages are read while the workers are still
+        running.
+
+        Returns:
+            Messages received during the wait, in arrival order, for the caller
+            to handle after the futures are done.
+        """
+        logger_debug(
+            f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
+            "grey")
+        n_failed = 0
+        first_exc = None
+        received = []
+        not_done = set(pending_futures)
+        while not_done:
+            done, not_done = futures_wait(not_done,
+                                          timeout=self.PENDING_POLL_SECONDS)
+            for future in done:
+                try:
+                    future.result()
+                except Exception as e:
+                    n_failed += 1
+                    if first_exc is None:
+                        first_exc = e
+                    print_colored(
+                        f"RemoteMpiCommSessionServer: MPI worker future "
+                        f"failed: {type(e).__name__}: {e}\n", "red")
+            if n_failed == len(pending_futures):
+                # All workers failed, no point waiting further.
+                break
+            while self.queue.poll(0):
+                received.append(self._receive())
+        if n_failed:
+            logger.error(f"RemoteMpiCommSessionServer: {n_failed}/"
+                         f"{len(pending_futures)} MPI worker(s) failed. "
+                         f"First error: {first_exc}")
+        logger_debug(
+            "RemoteMpiCommSessionServer all pending futures completed\n",
+            "grey")
+        return received
+
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
         pending_futures = []
+        received: List[Optional[RemoteTask]] = []
         while True:
             # Wait for any pending futures from previous tasks to complete
             # This ensures all ranks are ready before accepting the next task
             if pending_futures:
-                logger_debug(
-                    f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
-                    "grey")
-                n_failed = 0
-                first_exc = None
-                # Use as_completed so that failures are logged as soon as
-                # they occur rather than blocking behind a stuck future.
-                for future in as_completed(pending_futures):
-                    try:
-                        future.result()  # Wait for completion
-                    except Exception as e:
-                        n_failed += 1
-                        if first_exc is None:
-                            first_exc = e
-                        print_colored(
-                            f"RemoteMpiCommSessionServer: MPI worker future "
-                            f"failed: {type(e).__name__}: {e}\n", "red")
-                        if n_failed == len(pending_futures):
-                            # All workers failed — no point waiting further.
-                            break
-                if n_failed:
-                    logger.error(
-                        f"RemoteMpiCommSessionServer: {n_failed}/"
-                        f"{len(pending_futures)} MPI worker(s) failed. "
-                        f"First error: {first_exc}")
+                received.extend(self._wait_for_pending_futures(pending_futures))
                 pending_futures.clear()
-                logger_debug(
-                    "RemoteMpiCommSessionServer all pending futures completed\n",
-                    "grey")
 
-            message: Optional[RemoteTask] = self.queue.get()
+            message: Optional[RemoteTask] = (received.pop(0)
+                                             if received else self._receive())
             if message is None:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
@@ -959,8 +1062,8 @@ class RemoteMpiCommSessionServer():
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
                     "green")
                 futures = self.session.submit(
-                    RemoteMpiCommSessionServer.task_wrapper, message.task,
-                    *message.args, **message.kwargs)
+                    RemoteMpiCommSessionServer.task_wrapper, message.sys_path,
+                    message.task, *message.args, **message.kwargs)
                 self.num_results = self.session.n_workers
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task

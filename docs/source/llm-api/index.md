@@ -127,7 +127,6 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 |-----------------|-------|
 | `config_and_checkpoint_loader_initialization_seconds` | Initialize the model config and checkpoint loader. |
 | `model_engine_creation_seconds` | Construct the main model engine, which includes loading model weights. |
-| `draft_model_engine_creation_seconds` | Construct the separate draft model engine in the deprecated two-model MTP setting. |
 | `guided_decoder_creation_seconds` | Construct guided-decoding resources. |
 | `sampler_creation_seconds` | Construct the sampler. |
 | `initial_kv_cache_creation_seconds` | Construct the temporary KV cache used to estimate final capacity. |
@@ -145,8 +144,6 @@ The two model-engine properties contain times for various `PyTorchModelEngine` w
 `py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
 Likewise, `final_model_engine` measures the timings for the final model engine creation as part of
 the `py_executor.final_py_executor_creation_seconds` timing.
-The deprecated two-model speculative decoding setting may produce the additional properties
-`initial_draft_model_engine` and `final_draft_model_engine`.
 
 Each model-engine property contains the warmup scopes below. Which scopes appear depends on the model
 and configuration; for example, encoder-decoder and context-parallel configurations can skip some
@@ -174,7 +171,7 @@ The `model_loader` property contains timings for loading the main LLM weights, i
 `checkpoint_finalization_seconds` for checkpoint-session synchronization and cleanup after weight population.
 If a draft model is used, additional fields `draft_checkpoint_preparation_seconds`,
 `draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds` will appear.
-A `draft_model_loader` property can also appear in the deprecated two-model MTP setting.
+A `draft_model_loader` property appears when a user-provided drafter exposes a `draft_model_engine`.
 The `py_executor.model_engine_creation_seconds` timing includes the total `model_loader` timing.
 
 | Metric | Description |
@@ -206,28 +203,58 @@ curl http://localhost:8000/server_info
 }
 ```
 
+## Unified Cache for Compiled Artifacts
 
-## Tips and Troubleshooting
+Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
+artifact caches under a single root. TensorRT-LLM supplies the following
+defaults. Except for the isolation behavior described below, an individually
+configured environment variable takes precedence.
 
-The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:
+| Environment variable | Default cache path | Default under `TRTLLM_CACHE_DIR` |
+|----------------------|--------------------|------------------------------------|
+| `TLLM_AUTOTUNER_CACHE_PATH` | Disabled | `autotuner/cache.json` |
+| `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
+| `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
+| `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
+| `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
+| `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
+| `TRTLLM_DG_CACHE_DIR` | Disabled | `trtllm_deep_gemm` |
+| `CUDA_CACHE_PATH` | `$HOME/.nv/ComputeCache` | `cuda` |
 
-### RuntimeError: only rank 0 can start multi-node session, got 1
+**Important note**: while some of the caches controlled by `TRTLLM_CACHE_DIR`
+are enabled and persisted by default (e.g., `FLASHINFER_WORKSPACE_BASE`),
+others are disabled or with a path defaulting to `/tmp` (e.g., `CUTE_DSL_CACHE_DIR`
+or `TLLM_AUTOTUNER_CACHE_PATH`). These caches are not validated for sharing
+across model instances or long-term persistence, which may lead to errors 
+and other unintended behavior. As such, we recommend using distinct 
+`TRTLLM_CACHE_DIR` caches for different models, and invalidating them anytime 
+a component in the software stack changes.
 
-  There is no need to add an `mpirun` prefix for launching single node multi-GPU inference with the LLM API.
+The directories are created by their respective consumers when needed.
+TensorRT-LLM does not add cache locking or cleanup; per-rank isolation is
+enabled only for the exceptions described below. The
+configured values are forwarded to dynamically spawned MPI workers.
 
-  For example, you can run `python llm_inference_distributed.py` to perform multi-GPU on a single node.
+Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
+`TRTLLM_CACHE_DIR`, also defaults `TRTLLM_DG_JIT_DUMP_CUBIN` to `1` so its
+NVRTC-generated cubins are persisted. An explicitly configured dump setting
+still takes precedence. See the
+[DeepGEMM environment variables](source:examples/models/core/deepseek_v3/README.md#deepgemm)
+for details.
 
-### Hang issue on Slurm Node
+Note that, when `TRTLLM_CACHE_DIR` is set, the FlashInfer workspace isolation
+mechanism described below still applies. This will prevent race conditions
+during cache read/writes, at the cost of limiting cache sharing. To disable
+workspace isolation, either set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`,
+or set `FLASHINFER_WORKSPACE_BASE` to a different path from the one assigned
+under `TRTLLM_CACHE_DIR`.
 
-  If you experience a hang or other issue on a node managed with Slurm, add prefix `mpirun -n 1 --oversubscribe --allow-run-as-root` to your launch script.
-
-  For example, try `mpirun -n 1 --oversubscribe --allow-run-as-root python llm_inference_distributed.py`.
-
-### MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.
-
-  Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
-
-  This limitation is applicable for multi-GPU inference only.
+Ray workers treat `DG_JIT_CACHE_DIR` equal to
+`<TRTLLM_CACHE_DIR>/deep_gemm` as unified-cache-managed and isolate it by rank
+and GPU, even when that value was set explicitly. Other explicit values are
+preserved. Set `TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0` to preserve and share the
+unified path.
 
 ### FlashInfer JIT workspaces for MPI workers
 
@@ -250,12 +277,34 @@ process-unique temporary workspace that is removed, artifacts included, when
 the process exits.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
-launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated
+launch modes, while setting `TRTLLM_CACHE_DIR` does not. An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated
 unchanged to every rank and is the way to share downloaded artifacts between
 ranks; populate it before the multi-rank launch, either by installing the
 `flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
 warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
 instead of being downloaded concurrently into the shared directory.
+
+## Tips and Troubleshooting
+
+The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:
+
+### RuntimeError: only rank 0 can start multi-node session, got 1
+
+  There is no need to add an `mpirun` prefix for launching single node multi-GPU inference with the LLM API.
+
+  For example, you can run `python llm_inference_distributed.py` to perform multi-GPU on a single node.
+
+### Hang issue on Slurm Node
+
+  If you experience a hang or other issue on a node managed with Slurm, add prefix `mpirun -n 1 --oversubscribe --allow-run-as-root` to your launch script.
+
+  For example, try `mpirun -n 1 --oversubscribe --allow-run-as-root python llm_inference_distributed.py`.
+
+### MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.
+
+  Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
+
+  This limitation is applicable for multi-GPU inference only.
 
 ### Cannot quit after generation
 

@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
@@ -30,12 +34,22 @@ from .sampler import SampleStateTensors
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 
+
+# Opt-in: catches attn_metadata/spec_metadata tensors rebound between capture
+# and replay. Off by default since replay() is on the per-token critical path.
+def _strict_buffer_check_enabled() -> bool:
+    """Whether TLLM_CUDA_GRAPH_STRICT_BUFFERS enables strict buffer checking."""
+    return os.getenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "0") == "1"
+
+
+_STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
+
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
-# graphs, prepare_cross_batch temporarily runs each dummy generation request
-# as a one-token context chunk to write its cross-KV cache, so enc-dec
-# dummies need one prompt token plus one generated token.
+# graphs, EncoderDecoderCudaGraphs.prepare_capture_batch temporarily runs each
+# dummy generation request as a one-token context chunk to write its cross-KV
+# cache, so enc-dec dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
@@ -47,7 +61,6 @@ def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
 class KeyType(NamedTuple):
     batch_size: int
     draft_len: int
-    is_first_draft: bool
     short_seq_len_mode: bool = False
     is_all_greedy_sample: bool = True
     # Sampling tier captured into this graph. FULL means the graph carries no
@@ -125,7 +138,6 @@ class CUDAGraphRunnerConfig:
     spec_config: Optional[DecodingBaseConfig]
     cuda_graph_mem_pool: Any
     use_mrope: bool
-    original_max_draft_len: int
     original_max_total_draft_tokens: int
     enable_attention_dp: bool
     is_encoder_decoder: bool
@@ -170,6 +182,13 @@ class CUDAGraphRunner:
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
+        # Called just before each replay, after the static input buffers are
+        # filled. For state a model computes inside its own forward and a graph
+        # therefore captures the address of: a replay runs no Python, so nothing
+        # else refreshes it. Registered by the engine on the model's behalf.
+        self._pre_replay_hooks: List[Callable[
+            [KeyType, int, Dict[str, Any], Dict[str, Any]], None]] = []
+        self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -204,6 +223,7 @@ class CUDAGraphRunner:
             max_total_tokens = self.config.max_num_tokens
         max_total_tokens = min(max_total_tokens, self.config.max_num_tokens)
 
+        self._pre_replay_position_ids = None
         self.shared_static_tensors = {
             "input_ids":
             torch.ones((max_total_tokens, ), device="cuda", dtype=torch.int32),
@@ -318,11 +338,6 @@ class CUDAGraphRunner:
                     # Use the authoritative context cursor so graph keying
                     # matches the decode-shaped input prepared for this row.
                     total_seq_len = request.context_current_position + 1
-                # First draft
-                elif request.py_is_first_draft:
-                    # get_num_tokens is O(1); len(get_tokens(0)) marshals the
-                    # whole O(seq_len) VecTokens into a Python list just for len.
-                    total_seq_len = request.get_num_tokens(0)
                 # With overlap scheduler disabled or dummy request or not assigned to a batch,
                 elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
                     total_seq_len = request.max_beam_num_tokens + num_draft_tokens
@@ -400,7 +415,6 @@ class CUDAGraphRunner:
             if not request.py_skip_cross_kv_projection)
         return KeyType(batch_size=batch_size,
                        draft_len=draft_len,
-                       is_first_draft=False,
                        short_seq_len_mode=short_seq_len_mode,
                        is_all_greedy_sample=is_all_greedy_sample,
                        sample_type=sample_type,
@@ -422,6 +436,21 @@ class CUDAGraphRunner:
     ) -> None:
         """Register how a runtime batch maps to its sampling tier."""
         self._sample_type_resolver = resolver
+
+    def register_pre_replay_hook(
+        self, hook: Callable[[KeyType, int, Dict[str, Any], Dict[str, Any]],
+                             None]
+    ) -> None:
+        """Register a callback to run immediately before every graph replay.
+
+        The hook receives ``(key, num_tokens, static_tensors, current_inputs)``. It runs
+        after the static input buffers have been filled and outside any capture region, so
+        it may issue device work on the current stream but must not allocate storage the
+        graph reads -- writes have to be in place, into the buffers capture recorded.
+        Position IDs include any speculative overlap correction, in separate storage
+        so the captured preprocessing still applies that correction exactly once.
+        """
+        self._pre_replay_hooks.append(hook)
 
     def _resolve_sample_type(
         self,
@@ -653,9 +682,6 @@ class CUDAGraphRunner:
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
-        # Preserve compatibility with direct callers that still pass the
-        # original three-field generation-only tuple.
-        key = KeyType(*key)
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -735,6 +761,9 @@ class CUDAGraphRunner:
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
+            # Snapshot before postprocessing so the check compares against
+            # the addresses the graph actually baked in.
+            self._record_strict_buffer_snapshot(key)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,
@@ -746,15 +775,24 @@ class CUDAGraphRunner:
         self.memory_pool = graph.pool()
         return graph_output
 
-    def replay(self, key: KeyType,
-               current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
-        """Replays a previously captured graph."""
-        key = KeyType(*key)
+    def replay(
+        self,
+        key: KeyType,
+        current_inputs: Dict[str, Any],
+        *,
+        position_id_offsets: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Replay a graph, applying optional per-generation-token offsets to hooks.
+
+        ``position_id_offsets`` is a one-dimensional device tensor containing the
+        position corrections applied inside the captured speculative preprocessing.
+        """
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
+        self._check_strict_buffer_stability(stored_meta)
 
         static_tensors = self.shared_static_tensors
 
@@ -837,6 +875,24 @@ class CUDAGraphRunner:
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
+        if self._pre_replay_hooks:
+            hook_tensors = static_tensors
+            if position_id_offsets is not None:
+                assert current_inputs["attn_metadata"].num_ctx_tokens == 0, (
+                    "Pre-replay position offsets require a generation-only batch"
+                )
+                # Captured preprocessing owns the in-place position update.
+                if self._pre_replay_position_ids is None:
+                    self._pre_replay_position_ids = torch.empty_like(
+                        static_tensors["position_ids"])
+                hook_positions = self._pre_replay_position_ids[..., :seqlen]
+                torch.add(static_tensors["position_ids"][..., :seqlen],
+                          position_id_offsets[:seqlen],
+                          out=hook_positions)
+                hook_tensors = dict(static_tensors, position_ids=hook_positions)
+            for hook in self._pre_replay_hooks:
+                hook(key, seqlen, hook_tensors, current_inputs)
+
         self.graphs[key].replay()
         output_ref = self.graph_outputs[key]
 
@@ -852,6 +908,75 @@ class CUDAGraphRunner:
         """
         return min(self.max_supported_batch_size, self.config.batch_size)
 
+    @staticmethod
+    def _snapshot_graph_tensor_ptrs(obj: Any) -> Dict[str, int]:
+        """Record the data_ptr() of every CUDA tensor attribute on obj.
+
+        These are the addresses the captured graph's kernels may have baked
+        in; any of them changing before a later replay means the graph would
+        read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
+        """
+        graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
+        return {
+            name: value.data_ptr()
+            for name, value in vars(obj).items()
+            if isinstance(value, torch.Tensor) and value.is_cuda
+            and name not in graph_temporary_attrs
+        }
+
+    @staticmethod
+    def _assert_graph_tensor_ptrs_stable(obj: Any,
+                                         expected_ptrs: Dict[str, int]) -> None:
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
+
+        Attributes in obj.draft_replay_swapped_attrs are deliberately rebound
+        to draft KV cache buffers for the duration of a draft replay, so their
+        live value is not the captured one. The target value saved before the
+        swap is checked in its place.
+        """
+        swapped_attrs = getattr(obj, "draft_replay_swapped_attrs", {})
+        for name, expected_ptr in expected_ptrs.items():
+            value = (swapped_attrs[name] if name in swapped_attrs else getattr(
+                obj, name, None))
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(
+                    f"CUDA graph metadata attribute `{type(obj).__name__}."
+                    f"{name}` was a tensor at capture time but is now "
+                    f"{type(value).__name__}. Graph-visible buffers must be "
+                    "updated in place, not rebound.")
+            if value.data_ptr() != expected_ptr:
+                raise RuntimeError(
+                    f"CUDA graph metadata tensor `{type(obj).__name__}."
+                    f"{name}` was reallocated between capture and replay "
+                    f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
+                    "Graph-visible buffers must be updated in place; "
+                    "rebinding invalidates addresses baked into the captured "
+                    "CUDA graph.")
+
+    def _record_strict_buffer_snapshot(self, key: KeyType) -> None:
+        """Snapshot graph-visible tensor addresses for key, if strict checking is enabled."""
+        if not _STRICT_BUFFER_CHECK:
+            return
+        stored_meta = self.graph_metadata[key]
+        stored_meta["attn_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
+            stored_meta["attn_metadata"])
+        if stored_meta["spec_metadata"] is not None:
+            stored_meta[
+                "spec_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
+                    stored_meta["spec_metadata"])
+
+    def _check_strict_buffer_stability(self, stored_meta: Dict[str,
+                                                               Any]) -> None:
+        """Assert graph-visible tensors are unchanged since capture, if strict checking is enabled."""
+        if not _STRICT_BUFFER_CHECK:
+            return
+        if "attn_metadata_ptrs" in stored_meta:
+            self._assert_graph_tensor_ptrs_stable(
+                stored_meta["attn_metadata"], stored_meta["attn_metadata_ptrs"])
+        if "spec_metadata_ptrs" in stored_meta:
+            self._assert_graph_tensor_ptrs_stable(
+                stored_meta["spec_metadata"], stored_meta["spec_metadata_ptrs"])
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
@@ -864,14 +989,14 @@ class CUDAGraphRunner:
         would mis-associate every real request with another request's output,
         because three separate consumers hard-code "the generation rows start
         at index 0":
-          * ``ModelEngine._prepare_tp_inputs`` skips the input_ids of
+          * ``DecoderInputPreparer.prepare_inputs`` skips the input_ids of
             CUDA-graph dummies and blits the overlap scheduler's tokens at
             ``input_ids_cuda[num_tokens:...]``, which only lines up with the
             per-row position_ids while every dummy sits after every real row;
           * ``TorchSampler`` reads generation logits as ``raw_logits_cuda[:
             len(generation_requests)]`` (and via request offsets that start at
             zero), against the batch with the padding already stripped;
-          * ``ModelEngine._execute_logit_post_processors`` walks the padded
+          * ``DecoderRunner._execute_logit_post_processors`` walks the padded
             batch with a row offset starting at zero.
         Offsetting all three is a change to the output association, not to
         padding, so it does not belong here.
@@ -962,8 +1087,6 @@ class CUDAGraphRunner:
                 cross_kv_cache_manager)
 
         # Get draft KV cache manager only for one-model speculative decoding.
-        # In two-model mode, each model has its own KV cache manager, so
-        # draft_kv_cache_manager should be None.
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self.spec_config, resource_manager)
 
@@ -1157,7 +1280,7 @@ class CUDAGraphRunner:
         """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
 
         The dynamic draft length mapping exists exactly when the dynamic draft
-        length feature is active (see _compute_dynamic_draft_len_mapping);
+        length feature is active (see compute_dynamic_draft_len_mapping);
         without it, this ignores draft_len and reduces to plain batch-size
         rounding.
         """
@@ -1200,6 +1323,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self._pre_replay_position_ids = None
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

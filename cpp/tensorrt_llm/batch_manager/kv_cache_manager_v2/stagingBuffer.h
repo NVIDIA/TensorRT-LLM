@@ -19,7 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
-#include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/utils/staticHostMem.h"
 
 #include <cstddef>
 #include <cuda.h>
@@ -125,11 +125,6 @@ public:
 
     [[nodiscard]] StagingBufferMemory memory() const noexcept;
 
-    [[nodiscard]] HostMem const* hostMem() const noexcept
-    {
-        return std::get_if<HostMem>(&mMemoryOwner);
-    }
-
 private:
     friend class StagingBuffer;
 
@@ -138,7 +133,7 @@ private:
     void retire(StagingBufferRange* range, CachedCudaEvent readyEvent) noexcept;
 
     size_t mSize;
-    std::variant<HostMem, CudaUniqPtr> mMemoryOwner;
+    std::variant<StaticHostMem, CudaUniqPtr> mMemoryOwner;
     // Full spatial partition; retired fragments retain their previous temporal owner event.
     std::list<StagingBufferRange> mRanges;
     std::list<StagingBufferRange>::iterator mHead;

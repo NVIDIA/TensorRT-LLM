@@ -41,29 +41,45 @@ def test_context_attention_ignores_generation_length_tail(contexts: int, generat
     values = torch.randn_like(keys)
     tables = torch.arange(contexts + generations, device="cuda", dtype=torch.int32)[:, None]
     lengths = torch.tensor(context_lengths + [9] * generations, device="cuda", dtype=torch.int32)
-    cu_q = torch.tensor(
-        [0] + context_lengths + [1] * generations, device="cuda", dtype=torch.int32
-    ).cumsum(0).int()
+    cu_q = (
+        torch.tensor([0] + context_lengths + [1] * generations, device="cuda", dtype=torch.int32)
+        .cumsum(0)
+        .int()
+    )
     output = torch.full_like(query, 123)
     expected = torch.empty_like(query[:num_context_tokens])
     common = dict(
-        query=query[:num_context_tokens], kv_cache=(keys, values),
-        block_tables=tables, batch_size=contexts, max_q_len=max(context_lengths),
-        cum_seq_lens_q=cu_q, bmm1_scale=dim**-0.5, uses_shared_paged_kv_idx=True,
+        query=query[:num_context_tokens],
+        kv_cache=(keys, values),
+        block_tables=tables,
+        batch_size=contexts,
+        max_q_len=max(context_lengths),
+        cum_seq_lens_q=cu_q,
+        bmm1_scale=dim**-0.5,
+        uses_shared_paged_kv_idx=True,
     )
     # Allocate valid backing storage for the decode tail so a buggy launch
     # deterministically overwrites the canary instead of poisoning CUDA.
     DeterministicFmha._run_attention(
-        None, FmhaPhase.CONTEXT, **common, seq_lens=lengths,
+        None,
+        FmhaPhase.CONTEXT,
+        **common,
+        seq_lens=lengths,
         out=output[:num_context_tokens],
     )
     DeterministicFmha._run_attention(
-        None, FmhaPhase.CONTEXT, **common, seq_lens=lengths[:contexts], out=expected,
+        None,
+        FmhaPhase.CONTEXT,
+        **common,
+        seq_lens=lengths[:contexts],
+        out=expected,
     )
     torch.testing.assert_close(output[:num_context_tokens], expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        output[num_context_tokens:], torch.full_like(output[num_context_tokens:], 123),
-        rtol=0, atol=0,
+        output[num_context_tokens:],
+        torch.full_like(output[num_context_tokens:], 123),
+        rtol=0,
+        atol=0,
     )
 
 
