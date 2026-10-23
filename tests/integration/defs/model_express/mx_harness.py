@@ -112,7 +112,7 @@ class MxE2ECase:
     `final_manifest_exempt_patterns` lists `fnmatch` patterns of tensor names
     whose final-tier digest may legitimately differ between roles (never a
     numeric tolerance, never at the transfer tier). Every pattern needs a code
-    comment explaining why; the qualified BF16 dense families use none.
+    comment explaining why; the current rows use none.
     """
 
     model_env: str

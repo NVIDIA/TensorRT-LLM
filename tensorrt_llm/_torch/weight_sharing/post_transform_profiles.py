@@ -48,6 +48,16 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for Qwen3 dense rows with FP8 block-scale (128x128) weights:
+# every Linear the realized quant config quantizes holds E4M3 weights [N, K],
+# FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim FP32 `input_scale`
+# and `inv_input_scale` as loaded (1.0 unless a non-fused projection's
+# checkpoint stores an input scale). All other tensors, the Q/K norm state, and
+# the target-only receiver finalization follow the Qwen3 dense contract, and no
+# one-shot transform changes them.
+QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-qwen3-dense-fp8-block128-fp32scale-target-layout-v1"
+)
 # Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
@@ -174,12 +184,32 @@ class PostTransformRuntimeConfig:
     # Realized sliding-window attention: `none`, `uniform`, `mixed`, or `None`
     # when the constructed model does not determine it.
     sliding_window: str | None
+    # SM version (`major * 10 + minor`) of the GPU that runs the load, or `None`
+    # when the caller did not supply it. Quantized transforms can realize a
+    # different tensor layout per architecture. A row that constrains
+    # `sm_versions` rejects an unknown SM, so the default fails closed.
+    sm_version: int | None = None
 
     @classmethod
     def from_model_config(
-        cls, model_config: object, *, model: nn.Module | None = None
+        cls,
+        model_config: object,
+        *,
+        model: nn.Module | None = None,
+        sm_version: int | None = None,
     ) -> "PostTransformRuntimeConfig":
-        """Capture the support-matrix dimensions from a final model config."""
+        """Capture the support-matrix dimensions from a final model config.
+
+        Args:
+            model_config: Final model config of the concrete load.
+            model: Constructed root model, used for dimensions that only the
+                built modules realize.
+            sm_version: SM version of the device that runs the load. The caller
+                supplies it so this module does not depend on CUDA.
+
+        Returns:
+            The canonical runtime dimensions of the load.
+        """
 
         pretrained_config = getattr(model_config, "pretrained_config", None)
         quant_config = getattr(model_config, "quant_config", None)
@@ -240,6 +270,7 @@ class PostTransformRuntimeConfig:
             rope_type=rope_type,
             rope_fusion=rope_fusion,
             sliding_window=sliding_window,
+            sm_version=_canonical_int(sm_version),
         )
 
 
@@ -270,6 +301,7 @@ class PostTransformRuntimeConstraints:
         ("rope_types", "rope_type"),
         ("rope_fusion", "rope_fusion"),
         ("sliding_windows", "sliding_window"),
+        ("sm_versions", "sm_version"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -294,6 +326,7 @@ class PostTransformRuntimeConstraints:
     rope_types: frozenset[str | None] | None = None
     rope_fusion: frozenset[bool | None] | None = None
     sliding_windows: frozenset[str | None] | None = None
+    sm_versions: frozenset[int | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:
