@@ -82,6 +82,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             pretrained_config=kwargs.get("pretrained_config"),
             spec_config=kwargs.get("spec_config"),
             is_disagg=kwargs.get("is_disagg", False),
+            mapping=kwargs.get("mapping"),
         )
         if args:
             args = (kv_cache_config, *args[1:])
@@ -103,6 +104,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         pretrained_config=None,
         spec_config=None,
         is_disagg: bool = False,
+        mapping: Optional[Mapping] = None,
     ):
         """Validate and install FP4 MLA layout state before V2 construction."""
         if dtype != DataType.NVFP4 or kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -145,7 +147,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             )
 
         manager._fp8_mla_global_layer_ids = get_kimi_k3_fp8_kv_layer_ids(
-            pretrained_config, nvfp4_enabled=True
+            pretrained_config, nvfp4_enabled=True, mapping=mapping
         )
         if manager._fp8_mla_global_layer_ids:
             logger.info(
@@ -1040,7 +1042,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         local_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        fp8_layer_ids = get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
+        fp8_layer_ids = get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=mapping)
         if fp8_layer_ids:
             local_global_layers = set(mapping.pp_layers(int(config.num_hidden_layers)))
             num_fp8_layers = len(fp8_layer_ids & local_global_layers)

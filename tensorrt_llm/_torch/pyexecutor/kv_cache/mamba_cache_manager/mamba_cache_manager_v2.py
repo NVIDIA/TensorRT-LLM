@@ -336,6 +336,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 pretrained_config=pretrained_config,
                 spec_config=spec_config,
                 is_disagg=kwargs.get("is_disagg", False),
+                mapping=mapping,
             )
         self.kv_cache_config = kv_cache_config
 

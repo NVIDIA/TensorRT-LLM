@@ -2068,7 +2068,7 @@ class KimiMLARuntime(nn.Module):
         # The KV cache manager stores these layers in their own FP8 pool, so
         # the attention backend runs them as FP8 KV-cache MLA.
         fp8_kv_layer_ids = get_kimi_k3_fp8_kv_layer_ids(
-            cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4
+            cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4, mapping=mapping
         )
         if layer_idx in fp8_kv_layer_ids:
             if kv_quant_algo != QuantAlgo.NVFP4:

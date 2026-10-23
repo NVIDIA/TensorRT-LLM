@@ -560,13 +560,16 @@ The FMHA package is split by role:
   With an NVFP4 KV cache, Kimi K3 keeps the last two MLA layers of the global
   `linear_attn_config.full_attn_layers` schedule in an FP8 KV cache. The model,
   the cache allocation, and the memory estimator share this policy
-  (`kimi_k3_cache_policy.py`); KDA state is unaffected.
-  `TLLM_KIMI_K3_FP8_KV_LAYERS` replaces the default with a comma-separated
-  list of zero-based global MLA layer IDs, and an empty value keeps every MLA
+  (`kimi_k3_cache_policy.py`) and pass it the same `Mapping`; KDA state is
+  unaffected. The FP4 MLA layout needs at least one NVFP4 MLA layer on every
+  pipeline stage that owns MLA layers, so the default leaves a stage whose
+  MLA layers are all in that tail with its earlier one (or its only one) in
+  NVFP4. `TLLM_KIMI_K3_FP8_KV_LAYERS` replaces the default with a
+  comma-separated list of zero-based global MLA layer IDs, rejected if it
+  selects every MLA layer of a stage, and an empty value keeps every MLA
   layer in NVFP4. The FP8 layers use their own non-evicting lifecycle with
   the FP4 MLA page size, and `fmha/cute_dsl_mla.py` serves their generation
-  phase, including in mixed batches. Each pipeline stage still needs at least
-  one NVFP4 MLA layer.
+  phase, including in mixed batches.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through

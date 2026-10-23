@@ -1912,7 +1912,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if quant_mode is not None and getattr(quant_mode, "has_fp4_kv_cache",
                                               lambda: False)():
             fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
-                config, nvfp4_enabled=True)
+                config, nvfp4_enabled=True, mapping=mapping)
         has_local_fp8_fallback = bool(
             fp8_fallback_layers and fp8_fallback_layers.intersection(
                 mapping.pp_layers(config.num_hidden_layers)))

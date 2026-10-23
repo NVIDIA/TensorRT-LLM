@@ -741,6 +741,123 @@ def test_kimi_k3_fp8_kv_layer_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
 
 
+def _pp_mapping(pp_size: int, rank: int = 0, pp_partition=None) -> Mapping:
+    return Mapping(
+        world_size=pp_size, tp_size=1, pp_size=pp_size, rank=rank, pp_partition=pp_partition
+    )
+
+
+@pytest.mark.parametrize(
+    "num_hidden_layers, full_attn_layers, mapping, expected",
+    [
+        # One stage keeps the global tail.
+        (8, [2, 4, 6, 8], None, {5, 7}),
+        # A stage whose MLA layers are exactly the tail keeps its earlier one in NVFP4.
+        (8, [2, 4, 6, 8], _pp_mapping(2), {7}),
+        # A one-MLA-layer stage keeps it in NVFP4.
+        (8, [2, 4, 6, 8], _pp_mapping(2, pp_partition=[6, 2]), {5}),
+        (8, [2, 4, 6, 8], _pp_mapping(4), set()),
+        # Stages with more MLA layers keep the full default.
+        (16, list(range(2, 17, 2)), _pp_mapping(2), {13, 15}),
+        # Too few MLA layers for the default tail.
+        (4, [2, 4], None, {3}),
+        (4, [4], None, set()),
+        # A truncated config ignores full_attn_layers past its last layer.
+        (4, [2, 4, 6, 8], None, {3}),
+    ],
+)
+def test_kimi_k3_default_fp8_kv_layers_keep_an_nvfp4_mla_layer_per_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    num_hidden_layers: int,
+    full_attn_layers: list[int],
+    mapping,
+    expected: set[int],
+) -> None:
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=num_hidden_layers,
+        linear_attn_config={"full_attn_layers": full_attn_layers},
+    )
+
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=mapping) == frozenset(
+        expected
+    )
+
+
+def test_kimi_k3_default_fp8_kv_layers_agree_across_pp_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+
+    selections = {
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=_pp_mapping(2, rank))
+        for rank in range(2)
+    }
+
+    assert selections == {frozenset({7})}
+
+
+@pytest.mark.parametrize(
+    "layer_ids, mapping, stage",
+    [
+        ("5,7", _pp_mapping(2), 1),
+        ("7", _pp_mapping(2, pp_partition=[6, 2]), 1),
+        ("1,3,5,7", None, 0),
+    ],
+)
+def test_kimi_k3_explicit_fp8_kv_layers_reject_an_all_fp8_stage(
+    monkeypatch: pytest.MonkeyPatch, layer_ids: str, mapping, stage: int
+) -> None:
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, layer_ids)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+
+    with pytest.raises(ValueError, match=f"pipeline stage {stage}"):
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=mapping)
+    # Without NVFP4 the model-wide check reports the dtype mismatch instead.
+    assert get_kimi_k3_fp8_kv_layer_ids(config, mapping=mapping) == frozenset(
+        int(layer_id) for layer_id in layer_ids.split(",")
+    )
+
+
+def test_fp4_mla_v2_cache_size_keeps_an_nvfp4_layer_on_a_tail_only_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_k3",
+            num_hidden_layers=16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            linear_attn_config={"full_attn_layers": list(range(2, 17, 2))},
+        )
+    )
+
+    # The second stage owns layers 12-15, whose MLA layers 13 and 15 are the
+    # global default tail; layer 13 stays NVFP4.
+    slope, _ = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        _pp_mapping(2, rank=1, pp_partition=[12, 4]),
+        num_layers=2,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_batch_size=3,
+        spec_config=SimpleNamespace(tokens_per_gen_step=4),
+    )
+
+    assert slope == (320 + 40 + 32) + 576
+
+
 @pytest.mark.parametrize("chunked_loop_num", [0, 2])
 def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
     monkeypatch: pytest.MonkeyPatch, chunked_loop_num: int
