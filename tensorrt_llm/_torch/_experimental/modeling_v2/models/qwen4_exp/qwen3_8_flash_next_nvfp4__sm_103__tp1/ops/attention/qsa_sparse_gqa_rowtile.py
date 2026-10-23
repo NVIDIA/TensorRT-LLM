@@ -16,6 +16,7 @@ instead, as the per-row kernel does.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import cutlass
@@ -231,6 +232,335 @@ def _row_bits(
     return bits, row_info
 
 
+# --------------------------------------------------------------------------------------
+# The plan pass (CuTe DSL). One warp per group of `rows_per_tile` rows, a lane per bitmap
+# word: the group's union word (OR of its rows' words), its resident part (tokens on pages
+# the table maps inside the pool), a warp scan of the words' token counts for their list
+# offsets, the list's slots staged in shared memory and stored by the whole warp, and each
+# row's word compressed onto the resident bits (Hacker's Delight `compress`, the masks computed
+# once a word for every row) and OR-ed into the row's packed words in shared memory
+# (`red.shared.or.b64`), stored once the list is complete. Same plan, slot list, packed words
+# and lone list as the Triton kernel below, which serves int64 request indices (and tables
+# too long for a CTA's shared memory).
+# --------------------------------------------------------------------------------------
+
+#: Groups (one a warp) a plan CTA takes.
+_PLAN_GROUPS_PER_CTA = 4
+#: Shared memory the CuTe plan may take a CTA; past it (long tables, small groups) the Triton
+#: kernel plans.
+_PLAN_SMEM_LIMIT = 200 * 1024
+
+
+def _plan_smem_bytes(rows_per_tile: int, num_words: int) -> int:
+    """A plan CTA's shared memory: per warp, its rows' packed words and a step's staged slots."""
+    return _PLAN_GROUPS_PER_CTA * (rows_per_tile * num_words * 8 + 32 * 64 * 4) + 256
+
+
+class _RowtilePlanKernel:
+    """The plan pass's slots, packed bitmaps, group plan and lone list, a warp a group."""
+
+    def __init__(self, rows_per_tile, tokens_per_block, table_width, num_words, shared_tile_cost):
+        assert 64 % tokens_per_block == 0 or tokens_per_block % 64 == 0
+        self.R = rows_per_tile
+        self.tpb = tokens_per_block
+        self.width = table_width
+        self.nw = num_words
+        self.cost = shared_tile_cost
+        self.warps = _PLAN_GROUPS_PER_CTA
+        # Pages a 64-token word spans, and the tokens of the word on each.
+        self.ppw = max(1, 64 // tokens_per_block)
+        self.seg = min(64, tokens_per_block)
+
+    @cute.jit
+    def __call__(
+        self,
+        req_t: cute.Tensor,
+        info_ptr: cute.Pointer,
+        bits_ptr: cute.Pointer,
+        table_ptr: cute.Pointer,
+        slots_ptr: cute.Pointer,
+        packed_ptr: cute.Pointer,
+        plan_ptr: cute.Pointer,
+        lone_rows_ptr: cute.Pointer,
+        lone_count_ptr: cute.Pointer,
+        rows: cutlass.Int32,
+        num_groups: cutlass.Int32,
+        num_requests: cutlass.Int32,
+        num_cache_pages: cutlass.Int32,
+        table_stride: cutlass.Int32,
+        slots_stride: cutlass.Int32,
+        bits_stride: cutlass.Int32,
+        stream,
+    ):
+        ctas = (num_groups + self.warps - 1) // self.warps
+        # `req_t` arrives as a tensor: the TVM-FFI entry takes its stream from a GPU tensor.
+        self.kernel(
+            req_t,
+            info_ptr,
+            bits_ptr,
+            table_ptr,
+            slots_ptr,
+            packed_ptr,
+            plan_ptr,
+            lone_rows_ptr,
+            lone_count_ptr,
+            rows,
+            num_groups,
+            num_requests,
+            num_cache_pages,
+            table_stride,
+            slots_stride,
+            bits_stride,
+        ).launch(
+            grid=[ctas, 1, 1],
+            block=[32 * self.warps, 1, 1],
+            smem=_plan_smem_bytes(self.R, self.nw),
+            stream=stream,
+        )
+
+    @cute.jit
+    def compress_masks(self, m):
+        """The six move masks of `compress` for mask `m` (as `_compress_bits`)."""
+        one = cutlass.Uint64(1)
+        mk = (~m) << one
+        mvs = []
+        for i in cutlass.range_constexpr(6):
+            mp = mk ^ (mk << one)
+            mp = mp ^ (mp << cutlass.Uint64(2))
+            mp = mp ^ (mp << cutlass.Uint64(4))
+            mp = mp ^ (mp << cutlass.Uint64(8))
+            mp = mp ^ (mp << cutlass.Uint64(16))
+            mp = mp ^ (mp << cutlass.Uint64(32))
+            mv = mp & m
+            m = (m ^ mv) | (mv >> cutlass.Uint64(1 << i))
+            mk = mk & (~mp)
+            mvs.append(mv)
+        return mvs
+
+    @cute.kernel
+    def kernel(
+        self,
+        mReq: cute.Tensor,
+        info_ptr: cute.Pointer,
+        bits_ptr: cute.Pointer,
+        table_ptr: cute.Pointer,
+        slots_ptr: cute.Pointer,
+        packed_ptr: cute.Pointer,
+        plan_ptr: cute.Pointer,
+        lone_rows_ptr: cute.Pointer,
+        lone_count_ptr: cute.Pointer,
+        rows: cutlass.Int32,
+        num_groups: cutlass.Int32,
+        num_requests: cutlass.Int32,
+        num_cache_pages: cutlass.Int32,
+        table_stride: cutlass.Int32,
+        slots_stride: cutlass.Int32,
+        bits_stride: cutlass.Int32,
+    ):
+        R = self.R
+        NW = self.nw
+        I32 = cutlass.Int32
+        U64 = cutlass.Uint64
+        big = cute.make_layout((1 << 30,))
+        tidx, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(tidx // 32)
+        lane = tidx % 32
+        group = bid * self.warps + warp
+        mInfo = cute.make_tensor(info_ptr, big)
+        mBits = cute.make_tensor(bits_ptr, big)
+        mTable = cute.make_tensor(table_ptr, big)
+        mSlots = cute.make_tensor(slots_ptr, big)
+        mPacked = cute.make_tensor(packed_ptr, big)
+        mPlan = cute.make_tensor(plan_ptr, big)
+        mLone = cute.make_tensor(lone_rows_ptr, big)
+        mLoneCount = cute.make_tensor(lone_count_ptr, cute.make_layout((1,)))
+
+        smem = cutlass.utils.SmemAllocator()
+        buf = smem.allocate_tensor(
+            U64, cute.make_layout((self.warps * R * NW,), stride=(1,)), byte_alignment=16
+        )
+        buf_base = I32(buf.iterator.toint())
+        # A step's slots (at most 32 words x 64 tokens), staged for coalesced stores.
+        sstage = smem.allocate_tensor(
+            I32, cute.make_layout((self.warps * 32 * 64,), stride=(1,)), byte_alignment=16
+        )
+        sbase = warp * (32 * 64)
+        wbase = warp * (R * NW)
+        for i in cutlass.range(lane, R * NW, 32, unroll=1):
+            buf[wbase + i] = U64(0)
+        cute.arch.sync_warp()
+
+        if group < num_groups:
+            row = group * R + lane
+            live = lane < R and row < rows
+            req = I32(-1)
+            hi_tok = I32(-1)
+            own = I32(0)
+            if live:
+                req = I32(mReq[row])
+                hi_tok = mInfo[row * 2]
+                own = (mInfo[row * 2 + 1] + 63) // 64
+            lowest = req if live else num_requests
+            highest = req
+            for o in cutlass.range_constexpr(5):
+                lowest = cutlass.min(lowest, cute.arch.shuffle_sync_bfly(lowest, offset=1 << o))
+                highest = cutlass.max(highest, cute.arch.shuffle_sync_bfly(highest, offset=1 << o))
+                hi_tok = cutlass.max(hi_tok, cute.arch.shuffle_sync_bfly(hi_tok, offset=1 << o))
+                own = own + cute.arch.shuffle_sync_bfly(own, offset=1 << o)
+            one_request = lowest == highest and lowest >= 0 and lowest < num_requests
+            words_needed = I32(0)
+            if one_request:
+                words_needed = (hi_tok + 64) // 64
+            req_c = cutlass.max(cutlass.min(lowest, num_requests - 1), I32(0))
+            listed = I32(0)
+            for base in cutlass.range(0, words_needed, 32, unroll=1):
+                w = base + lane
+                inr = w < words_needed
+                rw = []
+                union = U64(0)
+                for r in cutlass.range_constexpr(R):
+                    x = U64(0)
+                    if inr and group * R + r < rows:
+                        x = U64(mBits[(group * R + r) * bits_stride + w])
+                    rw.append(x)
+                    union = union | x
+                # Resident tokens: the word's pages mapped inside the pool.
+                resident = U64(0)
+                pages = []
+                for pp in cutlass.range_constexpr(self.ppw):
+                    lp = (w * 64 + pp * self.seg) // self.tpb
+                    pid = I32(-1)
+                    if inr and lp < self.width:
+                        pid = mTable[req_c * table_stride + lp]
+                    pages.append(pid)
+                    seg_bits = (
+                        U64(0xFFFFFFFFFFFFFFFF)
+                        if self.seg == 64
+                        else U64(((1 << self.seg) - 1) << (pp * self.seg))
+                    )
+                    if pid >= 0 and pid < num_cache_pages:
+                        resident = resident | seg_bits
+                resident = resident & union
+                count = I32(cute.arch.popc(resident))
+                incl = count
+                for o in cutlass.range_constexpr(5):
+                    up = cute.arch.shuffle_sync_up(incl, offset=1 << o)
+                    if lane >= (1 << o):
+                        incl = incl + up
+                total = cute.arch.shuffle_sync(incl, 31)
+                first = listed + incl - count
+                # The list: resident tokens in logical order, as physical cache slots, staged in
+                # shared memory and stored by the whole warp.
+                pos = incl - count
+                for b in cutlass.range_constexpr(64):
+                    if (resident >> U64(b)) & U64(1) != U64(0):
+                        if cutlass.const_expr(self.tpb <= 64):
+                            tok = b % self.tpb
+                        else:
+                            tok = (w * 64) % self.tpb + b
+                        sstage[sbase + pos] = pages[b // self.seg] * self.tpb + tok
+                        pos = pos + 1
+                cute.arch.sync_warp()
+                slot_row = group * slots_stride + listed
+                for k in cutlass.range(lane, total, 32, unroll=1):
+                    mSlots[slot_row + k] = sstage[sbase + k]
+                cute.arch.sync_warp()
+                # Each row's word compressed onto the resident bits, at the list offset.
+                mvs = self.compress_masks(resident)
+                d0 = first // 64
+                sh = U64(first % 64)
+                spills = (first % 64) + count > 64
+                if count > 0:
+                    for r in cutlass.range_constexpr(R):
+                        x = rw[r] & resident
+                        for i in cutlass.range_constexpr(6):
+                            moved = x & mvs[i]
+                            x = (x ^ moved) | (moved >> U64(1 << i))
+                        addr = buf_base + (wbase + r * NW + d0) * 8
+                        _red_or_shared(addr, cutlass.Int64(x << sh))
+                        if spills:
+                            _red_or_shared(
+                                addr + 8,
+                                cutlass.Int64((x >> U64(1)) >> (U64(63) - sh)),
+                            )
+                listed = listed + total
+            cute.arch.sync_warp()
+            tiles = (listed + 63) // 64
+            shared = one_request and tiles * self.cost <= own * 4
+            if lane == 0:
+                mPlan[group * 2] = tiles if shared else I32(-1)
+                mPlan[group * 2 + 1] = listed
+            for r in cutlass.range_constexpr(R):
+                rr = group * R + r
+                if rr < rows:
+                    for k in cutlass.range(lane, tiles, 32, unroll=1):
+                        mPacked[rr * bits_stride + k] = buf[wbase + r * NW + k]
+            if not shared:
+                n_live = I32(1) if live else I32(0)
+                for o in cutlass.range_constexpr(5):
+                    n_live = n_live + cute.arch.shuffle_sync_bfly(n_live, offset=1 << o)
+                start = I32(0)
+                if lane == 0:
+                    start = cute.arch.atomic_add(mLoneCount.iterator, n_live)
+                start = cute.arch.shuffle_sync(start, 0)
+                if live:
+                    mLone[start + lane] = row
+
+
+_ROW_PLAN: dict = {}
+
+
+def _cute_plan_supported(request_indices, tokens_per_block, rows_per_tile, num_words) -> bool:
+    """Whether `_RowtilePlanKernel` plans this launch: int32 request indices, pages that tile a
+    64-token word (or whole words), and a CTA's packed words within `_PLAN_SMEM_LIMIT`."""
+    return (
+        request_indices.dtype == torch.int32
+        and (64 % tokens_per_block == 0 or tokens_per_block % 64 == 0)
+        and _plan_smem_bytes(rows_per_tile, num_words) <= _PLAN_SMEM_LIMIT
+    )
+
+
+def _rowtile_plan_cute(
+    request_indices, row_info, bits, block_table, slots, packed_bits, group_plan, lone_rows,
+    lone_count, rows, num_groups, *, rows_per_tile, tokens_per_block, num_cache_pages,
+):  # fmt: skip
+    """The plan pass on `_RowtilePlanKernel` (int32 request indices). Writes each row's packed
+    words below its group's tile count only."""
+    table_width = block_table.shape[1]
+    num_words = bits.shape[1]
+    key = (rows_per_tile, tokens_per_block, table_width, num_words)
+    fn = _ROW_PLAN.get(key)
+    ptrs = (row_info, bits, block_table, slots, packed_bits, group_plan, lone_rows, lone_count)
+    args = (request_indices, *(t.data_ptr() for t in ptrs))
+    if fn is None:
+        gm = cute.AddressSpace.gmem
+        dtypes = (cutlass.Int32, cutlass.Uint64, cutlass.Int32, cutlass.Int32, cutlass.Uint64,
+                  cutlass.Int32, cutlass.Int32, cutlass.Int32)  # fmt: skip
+        aligns = (8, 16, 4, 4, 16, 4, 4, 4)
+        fn = cute.compile(
+            _RowtilePlanKernel(
+                rows_per_tile, tokens_per_block, table_width, num_words, _SHARED_TILE_COST
+            ),
+            from_dlpack(request_indices, assumed_align=4).mark_layout_dynamic(leading_dim=0),
+            *(make_ptr(dt, p, gm, assumed_align=al) for dt, p, al in zip(dtypes, args[1:], aligns)),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+        _ROW_PLAN[key] = fn
+    fn(
+        *args, rows, num_groups, block_table.shape[0], num_cache_pages, block_table.stride(0),
+        slots.stride(0), bits.stride(0),
+    )  # fmt: skip
+
+
 @triton.jit
 def _or_combine(a, b):
     return a | b
@@ -259,7 +589,7 @@ def _compress_bits(x, m):
 
 
 @triton.jit
-def _rowtile_plan_kernel(
+def _rowtile_plan_kernel_triton(
     request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
     lone_rows, lone_count, rows,
     bits_stride_row, block_table_stride_request, block_table_stride_page, slots_stride_group,
@@ -343,6 +673,44 @@ def _rowtile_plan_kernel(
     if not shared:
         base = tl.atomic_add(lone_count, tl.sum(live.to(tl.int32), axis=0))
         tl.store(lone_rows + base + offsets, members.to(tl.int32), mask=live)
+
+
+def _rowtile_plan(
+    grid, request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
+    lone_rows, lone_count, rows, *, rows_per_tile, tokens_per_block, num_cache_pages,
+):  # fmt: skip
+    """The plan pass over `grid = (groups,)`: `_RowtilePlanKernel` for int32 request indices
+    (packed words written below each group's tile count), else the Triton kernel (packed words
+    OR-ed into a zeroed `packed_bits`)."""
+    (num_groups,) = grid
+    if _cute_plan_supported(request_indices, tokens_per_block, rows_per_tile, bits.shape[1]):
+        _rowtile_plan_cute(
+            request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
+            lone_rows, lone_count, rows, num_groups, rows_per_tile=rows_per_tile,
+            tokens_per_block=tokens_per_block, num_cache_pages=num_cache_pages,
+        )  # fmt: skip
+        return
+    table_width = block_table.shape[1]
+    _rowtile_plan_kernel_triton[(num_groups,)](
+        request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
+        lone_rows, lone_count, rows,
+        bits.stride(0), block_table.stride(0), block_table.stride(1), slots.stride(0),
+        ROWS_PER_TILE=rows_per_tile, NUM_REQUESTS=block_table.shape[0],
+        ROWS_POW2=triton.next_power_of_2(rows_per_tile), BLOCK_N=BLOCK_N,
+        SHARED_TILE_COST=_SHARED_TILE_COST, NUM_CACHE_PAGES=num_cache_pages,
+        PAGE_TABLE_WIDTH=table_width, TOKENS_PER_BLOCK=tokens_per_block,
+        PLAN_WORDS=_PLAN_WORDS, num_warps=_PLAN_WARPS,
+    )  # fmt: skip
+
+
+class _PlanLauncher:
+    """`_rowtile_plan_kernel[(groups,)](...)`: grid-indexed like the entry's other launches."""
+
+    def __getitem__(self, grid):
+        return functools.partial(_rowtile_plan, tuple(grid))
+
+
+_rowtile_plan_kernel = _PlanLauncher()
 
 
 @triton.jit
@@ -572,7 +940,10 @@ def qsa_rowtile_sparse_gqa(
     out_strides = (output.stride(0), output.stride(1), output.stride(2))
     num_groups = triton.cdiv(rows, rows_per_tile)
     slots = torch.empty((num_groups, num_words * 64), dtype=torch.int32, device=q.device)
-    packed_bits = torch.zeros((rows, num_words), dtype=torch.int64, device=q.device)
+    # The CuTe plan writes every packed word the row-tile pass reads; the Triton one ORs.
+    on_cute = _cute_plan_supported(request_indices, tokens_per_block, rows_per_tile, num_words)
+    alloc = torch.empty if on_cute else torch.zeros
+    packed_bits = alloc((rows, num_words), dtype=torch.int64, device=q.device)
     group_plan = torch.empty((num_groups, 2), dtype=torch.int32, device=q.device)
     lone_rows = torch.empty((rows,), dtype=torch.int32, device=q.device)
     # [0]: the lone list's length; [1]: the row-tile pass's work-ticket counter.
@@ -580,12 +951,8 @@ def qsa_rowtile_sparse_gqa(
     lone_count = counters[:1]
     _rowtile_plan_kernel[(num_groups,)](
         request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
-        lone_rows, lone_count, rows,
-        bits.stride(0), block_table.stride(0), block_table.stride(1), slots.stride(0),
-        ROWS_PER_TILE=rows_per_tile, NUM_REQUESTS=block_table.shape[0], ROWS_POW2=rows_pow2,
-        BLOCK_N=BLOCK_N, SHARED_TILE_COST=_SHARED_TILE_COST, NUM_CACHE_PAGES=k_cache.shape[0],
-        PAGE_TABLE_WIDTH=table_width, TOKENS_PER_BLOCK=tokens_per_block,
-        PLAN_WORDS=_PLAN_WORDS, num_warps=_PLAN_WARPS,
+        lone_rows, lone_count, rows, rows_per_tile=rows_per_tile,
+        tokens_per_block=tokens_per_block, num_cache_pages=k_cache.shape[0],
     )  # fmt: skip
     use_pdl = get_env_enable_pdl()
     _rowtile_lone_kernel[(min(rows, _LONE_PROGRAMS), num_kv_heads)](
