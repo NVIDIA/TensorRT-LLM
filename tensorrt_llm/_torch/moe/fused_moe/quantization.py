@@ -4381,13 +4381,67 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                     f"MoE rebalance live weight plane {plane.name!r} changed storage after binding"
                 )
 
+    def _bind_live_weight_planes(self, module: torch.nn.Module, arena) -> None:
+        """Alias MegaMoE's seven live parameters onto its rebalance arena."""
+        expected_bundle = self.live_weight_plane_spec(module)
+        if expected_bundle != arena.bundle:
+            raise RuntimeError(
+                "MoE rebalance arena does not match the quant-method plane spec"
+            )
+        expected_names = tuple(plane.name for plane in expected_bundle.planes)
+        if tuple(arena.plane_names) != expected_names:
+            raise RuntimeError(
+                "MoE rebalance arena plane order is not canonical")
+        rebound = False
+        for name, arena_view, alias in zip(arena.plane_names,
+                                           arena.local_plane_views,
+                                           arena.tekit_alias_views):
+            old = getattr(module, name, None)
+            if old is None:
+                raise RuntimeError(
+                    f"MoE rebalance live weight plane {name!r} was not registered"
+                )
+            if (tuple(alias.shape) != tuple(old.shape)
+                    or tuple(alias.stride()) != tuple(old.stride())
+                    or alias.dtype != old.dtype):
+                raise RuntimeError(
+                    f"MoE rebalance arena alias for {name!r} has an incompatible layout"
+                )
+            if (not alias.is_cuda
+                    or int(alias.data_ptr()) != int(arena_view.data_ptr())):
+                raise RuntimeError(
+                    f"MoE rebalance arena alias for {name!r} is not its allocator view"
+                )
+            if old.is_meta:
+                setattr(
+                    module,
+                    name,
+                    torch.nn.Parameter(alias, requires_grad=old.requires_grad),
+                )
+                rebound = True
+            else:
+                try:
+                    old.data = alias
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"MoE rebalance failed to bind live plane {name!r}: {error}"
+                    ) from error
+        if rebound:
+            self.setup_quant_scales(module)
+        norm_const = getattr(module, "fc1_norm_const", None)
+        if (norm_const is not None
+                and arena.home_experts < norm_const.data.shape[0]):
+            norm_const.data[int(arena.home_experts):].fill_(1.0)
+        self.assert_live_weight_aliases(module, arena)
+
     # -----------------------------------------------------------------
     # create_weights: register MegaMoE-format parameters in addition to
     # the grandparent's standard NVFP4 parameters.
     # -----------------------------------------------------------------
     def create_weights(self, module: torch.nn.Module):
-        # Resolve the same descriptor used by build-time arena allocation before
-        # the parent materializes any source or derived Parameters.
+        # Resolve the seven-plane descriptor before the parent materializes any
+        # source or derived Parameters; a per-layer dynamic EPLB arena is
+        # allocated from it first.
         bundle = self.live_weight_plane_spec(module)
         # Fail fast: the derived-only EPLB migration path registers no bias
         # staging.
@@ -4395,6 +4449,19 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             raise NotImplementedError(
                 "NVFP4MegaMoECuteDslMethod does not support expert bias "
                 "together with dynamic-EPLB shared weight loading.")
+        layer_load_balancer = getattr(module, "layer_load_balancer", None)
+        arena = None
+        if (layer_load_balancer is not None
+                and layer_load_balancer.produces_replica_plan):
+            # Collective over EP: every rank allocates its H + S live-weight
+            # arena here.
+            arena = layer_load_balancer.allocate_arena(
+                bundle=bundle,
+                ep_process_group=module.ep_process_group,
+                mapping=module.mapping,
+                device=int(module.mapping.local_rank),
+                layer_idx=module.layer_idx,
+            )
 
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         self.block_scales_vec_size = torch.iinfo(
@@ -4492,6 +4559,24 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # Alpha Parameters may have been resized or rebound after the parent
         # built its view; refresh it against the final seven-plane identities.
         self.setup_quant_scales(module)
+        if arena is not None:
+            self._bind_live_weight_planes(module, arena)
+
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
+        super().cache_derived_state(module)
+        layer_load_balancer = getattr(module, "layer_load_balancer", None)
+        if (layer_load_balancer is None
+                or not layer_load_balancer.produces_replica_plan):
+            return
+        # Loading and transformation must leave the seven planes on the arena;
+        # the layer handle then builds its HALO-Q/TMA producer against them.
+        arena = layer_load_balancer.live_weight_arena
+        if arena is None:
+            raise RuntimeError(
+                "per-layer dynamic EPLB layer has no live-weight arena")
+        arena.assert_identity()
+        self.assert_live_weight_aliases(module, arena)
+        layer_load_balancer.bind_backend(module)
 
     def _materialize_source_params(self, module: torch.nn.Module):
         """Rematerialize this module's streamed source params (full shape)

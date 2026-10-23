@@ -1596,12 +1596,17 @@ class FusedCommMoEScheduler(MoEScheduler):
             # prepare its workspace.
             moe_input = x_chunk_real
             x_sf = None
-        else:
+        elif replica_plan is None:
             # Delegate to ``backend.quantize_input`` so each fused-comm backend
             # owns its own empty-tensor layout. Both MegaMoEDeepGemm and
             # MegaMoECuteDsl short-circuit ``x.shape[0] == 0`` inside their
             # quantize_input contracts.
             moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
+        else:
+            # Leave the plan's SMs to its concurrent HALO-Q/TMA kernel.
+            moe_input, x_sf = moe.backend.quantize_input(
+                x_chunk_real, reserved_sms=replica_plan.reserved_sms
+            )
 
         # CuteDSL needs the scheduler's rank-identical chunk maximum to select
         # one adaptive bucket on every EP rank; using a local token count could

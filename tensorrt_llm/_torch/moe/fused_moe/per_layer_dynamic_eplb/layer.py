@@ -144,10 +144,15 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         """Attach resources built after final weight storage is available."""
         if arena is None or scheduler_group is None:
             raise ValueError("arena and scheduler_group are both required")
-        if self._arena is not None:
+        if self._scheduler_group is not None:
             if arena is self._arena and scheduler_group is self._scheduler_group:
                 return
             raise RuntimeError(f"per-layer dynamic EPLB layer {self.layer_idx} is already bound")
+        if self._arena is not None and arena is not self._arena:
+            raise RuntimeError(
+                f"per-layer dynamic EPLB layer {self.layer_idx} cannot bind an arena "
+                "it did not allocate"
+            )
 
         arena_home = getattr(arena, "home_experts", self.resident_experts_per_rank)
         arena_helpers = getattr(arena, "helper_slots", self.helper_slots_per_rank)
@@ -179,14 +184,21 @@ class PerLayerDynamicMoeLayerLoadBalancer:
     ) -> Any:
         """Allocate this layer's H + S live-weight arena from model-owned resources.
 
-        Collective across the EP group: every rank calls it from the same point
-        of the backend's ``create_weights``, after the symmetric-buffer
-        rendezvous and before the kernel-plane Parameters are registered.
-        ``bundle`` is the quant method's live-weight plane spec.
+        Collective across the EP group: the quant method calls it from its
+        ``create_weights`` on every rank, before it registers the kernel-plane
+        Parameters. ``bundle`` is the quant method's live-weight plane spec.
+        A later call returns the same arena.
         """
+        if self._arena is not None:
+            if bundle != self._arena.bundle:
+                raise RuntimeError(
+                    f"per-layer dynamic EPLB layer {self.layer_idx} already allocated "
+                    "its arena for a different live-weight plane spec"
+                )
+            return self._arena
         from .arena import allocate_rebalance_arena
 
-        return allocate_rebalance_arena(
+        self._arena = allocate_rebalance_arena(
             home_experts=self.resident_experts_per_rank,
             helper_slots=self.helper_slots_per_rank,
             bundle=bundle,
@@ -196,13 +208,21 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             device=int(device),
             layer_idx=layer_idx,
         )
+        return self._arena
+
+    @property
+    def live_weight_arena(self) -> Optional[Any]:
+        """The H + S arena that the live kernel planes alias, or ``None``."""
+        return self._arena
 
     def bind_backend(self, backend: Any) -> None:
         """Build and own the producer after the backend's live aliases exist."""
-        arena = backend.live_weight_arena
+        arena = self._arena
         if arena is None:
-            raise RuntimeError("per-layer dynamic EPLB backend has no live arena")
-        if self._arena is not None or self._scheduler_group is not None:
+            raise RuntimeError(
+                f"per-layer dynamic EPLB layer {self.layer_idx} has no live-weight arena"
+            )
+        if self._scheduler_group is not None:
             bound_backend = (
                 self._bound_backend_ref() if self._bound_backend_ref is not None else None
             )
@@ -210,15 +230,6 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                 raise RuntimeError(
                     f"per-layer dynamic EPLB layer {self.layer_idx} is already "
                     "bound to a different backend"
-                )
-            if self._arena is not arena:
-                raise RuntimeError(
-                    f"per-layer dynamic EPLB layer {self.layer_idx} backend "
-                    "changed its rebalance arena after binding"
-                )
-            if self._scheduler_group is None:
-                raise RuntimeError(
-                    f"per-layer dynamic EPLB layer {self.layer_idx} has an incomplete runtime binding"
                 )
             return
 

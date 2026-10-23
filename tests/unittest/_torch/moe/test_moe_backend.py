@@ -2147,30 +2147,140 @@ def test_megamoe_live_plane_spec_rejects_expand_before_allocation():
 
 
 @pytest.mark.cpu_only
-def test_megamoe_rejects_expand_before_provider_allocation(monkeypatch):
-    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
-    torch.nn.Module.__init__(moe)
-    moe._weights_created = False
-    moe.expert_size_per_partition = 4
-    moe._rebalance_slots_active = 1
-    moe._rebalance_home_experts = None
-    moe.layer_idx = 0
-    moe.hidden_size = 160
-    moe.intermediate_size_per_partition = 80
-    # The base class derives this from the expand ratio; pin an inconsistent value.
-    monkeypatch.setattr(MegaMoECuteDsl, "expand_intermediate_size_per_partition", 176)
-    moe.quant_method = NVFP4MegaMoECuteDslMethod()
-    moe.ep_size = 2
-    allocate_provider = MagicMock()
-    moe._alloc_symm_provider = allocate_provider
+def test_megamoe_rejects_expand_before_arena_allocation():
     allocate_arena = MagicMock()
-    moe.layer_load_balancer = SimpleNamespace(allocate_arena=allocate_arena)
+    module = SimpleNamespace(
+        hidden_size=160,
+        intermediate_size_per_partition=80,
+        expand_intermediate_size_per_partition=176,
+        layer_load_balancer=SimpleNamespace(
+            produces_replica_plan=True, allocate_arena=allocate_arena
+        ),
+    )
 
     with pytest.raises(ValueError, match="expand_intermediate == 2"):
-        moe.create_weights()
+        NVFP4MegaMoECuteDslMethod().create_weights(module)
 
-    allocate_provider.assert_not_called()
     allocate_arena.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("produces_replica_plan", [True, False, None])
+def test_megamoe_quant_method_allocates_and_binds_the_arena_through_the_layer_handle(
+    monkeypatch, produces_replica_plan
+):
+    method = NVFP4MegaMoECuteDslMethod()
+    bundle = method._live_weight_bundle_layout(160, 80, 160)
+    resident, helpers = 2, 1 if produces_replica_plan else 0
+    arena = object()
+    events = []
+
+    def create_parent_weights(self, module, *args):
+        events.append("parent")
+        for name in NVFP4MegaMoECuteDslMethod._STREAMED_SOURCE_PARAMS:
+            module.register_parameter(
+                name, torch.nn.Parameter(torch.empty(1, dtype=torch.uint8), requires_grad=False)
+            )
+        for name in ("fc31_alpha", "fc2_alpha"):
+            shape, _, dtype_name, _, _ = method._live_weight_plane(bundle, name).storage_metadata(
+                resident
+            )
+            module.register_parameter(
+                name,
+                torch.nn.Parameter(
+                    torch.ones(shape, dtype=getattr(torch, dtype_name)), requires_grad=False
+                ),
+            )
+
+    def allocate_arena(**kwargs):
+        events.append(("allocate", kwargs))
+        return arena
+
+    monkeypatch.setattr(NVFP4FusedMoEMethod, "create_weights", create_parent_weights)
+    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "setup_quant_scales", lambda self, module: None)
+    monkeypatch.setattr(
+        NVFP4MegaMoECuteDslMethod,
+        "_bind_live_weight_planes",
+        lambda self, module, bound: events.append(("bind", bound)),
+    )
+    module = torch.nn.Module()
+    module.hidden_size = 160
+    module.intermediate_size_per_partition = 80
+    module.expand_intermediate_size_per_partition = 160
+    module.bias = False
+    module.expert_size_per_partition = resident
+    module.compute_slot_count = resident + helpers
+    module.rebuild_tensor_metadata = {}
+    module.ep_process_group = "ep_group"
+    module.mapping = SimpleNamespace(local_rank=3)
+    module.layer_idx = 5
+    module.layer_load_balancer = (
+        None
+        if produces_replica_plan is None
+        else SimpleNamespace(
+            produces_replica_plan=produces_replica_plan, allocate_arena=allocate_arena
+        )
+    )
+
+    method.create_weights(module)
+
+    assert module.mega_fc1_weight.shape[0] == resident + helpers
+    if not produces_replica_plan:
+        assert events == ["parent"]
+        return
+    # Every rank allocates the arena before any Parameter exists and binds the
+    # seven planes once all of them are registered.
+    assert events == [
+        (
+            "allocate",
+            dict(
+                bundle=bundle,
+                ep_process_group="ep_group",
+                mapping=module.mapping,
+                device=3,
+                layer_idx=5,
+            ),
+        ),
+        "parent",
+        ("bind", arena),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_megamoe_quant_method_builds_the_producer_after_checking_the_planes(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        NVFP4FusedMoEMethod, "cache_derived_state", lambda self, module: events.append("parent")
+    )
+    monkeypatch.setattr(
+        NVFP4MegaMoECuteDslMethod,
+        "assert_live_weight_aliases",
+        lambda self, module, arena: events.append(("aliases", arena)),
+    )
+    arena = SimpleNamespace(assert_identity=lambda: events.append("identity"))
+    handle = SimpleNamespace(
+        produces_replica_plan=True,
+        live_weight_arena=arena,
+        bind_backend=lambda module: events.append(("bind_backend", module)),
+    )
+    module = SimpleNamespace(layer_load_balancer=handle)
+    method = NVFP4MegaMoECuteDslMethod()
+
+    method.cache_derived_state(module)
+
+    assert events == ["parent", "identity", ("aliases", arena), ("bind_backend", module)]
+
+    # Standard EPLB and EPLB-off layers only refresh the parent state.
+    events.clear()
+    method.cache_derived_state(SimpleNamespace(layer_load_balancer=None))
+    method.cache_derived_state(
+        SimpleNamespace(layer_load_balancer=SimpleNamespace(produces_replica_plan=False))
+    )
+    assert events == ["parent", "parent"]
+
+    handle.live_weight_arena = None
+    with pytest.raises(RuntimeError, match="no live-weight arena"):
+        method.cache_derived_state(module)
 
 
 @pytest.mark.cpu_only
@@ -2198,7 +2308,7 @@ def test_megamoe_live_plane_identity_guard_detects_parameter_replacement():
         local_plane_views=(arena_view,),
         tekit_alias_views=(alias,),
     )
-    module = SimpleNamespace(_rebalance_arena=arena, weight=Tensor(17))
+    module = SimpleNamespace(weight=Tensor(17))
     method = NVFP4MegaMoECuteDslMethod()
     method.live_weight_plane_spec = MagicMock(return_value=bundle)
 
@@ -2209,22 +2319,25 @@ def test_megamoe_live_plane_identity_guard_detects_parameter_replacement():
         method.assert_live_weight_aliases(module, arena)
 
 
+def _per_layer_dynamic_handle(helper_slots_per_rank):
+    return SimpleNamespace(produces_replica_plan=True, helper_slots_per_rank=helper_slots_per_rank)
+
+
 @pytest.mark.cpu_only
-def test_megamoe_compute_slots_do_not_widen_resident_expert_axis():
+def test_megamoe_compute_slots_come_from_the_layer_handle():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe.expert_size_per_partition = 8
-    moe._rebalance_home_experts = 8
-    moe._rebalance_slots_active = 3
+    moe.layer_load_balancer = None
+    assert moe.compute_slot_count == 8
 
+    # Standard EPLB produces no replica plan and adds no helper slot.
+    moe.layer_load_balancer = SimpleNamespace(produces_replica_plan=False)
+    assert moe.compute_slot_count == 8
+
+    moe.layer_load_balancer = _per_layer_dynamic_handle(3)
     assert moe.compute_slot_count == 11
     assert moe.expert_size_per_partition == 8
-
-    # A resident axis that already counts the helper slots
-    # (expert_size_per_partition == H + S) must raise instead of adding S again.
-    moe.expert_size_per_partition = 11
-    with pytest.raises(RuntimeError, match="resident expert geometry changed"):
-        _ = moe.compute_slot_count
 
 
 @pytest.mark.cpu_only
@@ -2232,9 +2345,7 @@ def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe.expert_size_per_partition = 8
-    moe._rebalance_home_experts = 8
-    moe._rebalance_slots_active = 3
-    moe._quantize_reserved_sms = 8
+    moe.layer_load_balancer = _per_layer_dynamic_handle(3)
     wait_for_routes = MagicMock()
     ready_flags = torch.empty(8, dtype=torch.int64)
     plan = MoEReplicaPlan(
@@ -2242,14 +2353,14 @@ def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
         compute_slots_per_rank=11,
         ready_flags=ready_flags,
         ready_generation=7,
-        reserved_sms=8,
+        reserved_sms=4,
         _wait_for_routes=wait_for_routes,
     )
 
     compute_slots, helper_slots, actual_flags, generation, reserved_sms = (
         moe._replica_plan_launch_args(plan)
     )
-    assert (compute_slots, helper_slots, generation, reserved_sms) == (11, 3, 7, 8)
+    assert (compute_slots, helper_slots, generation, reserved_sms) == (11, 3, 7, 4)
     assert actual_flags is ready_flags
     moe._wait_rebalance_routes(plan)
     wait_for_routes.assert_called_once_with()
@@ -2345,13 +2456,51 @@ def test_megamoe_run_moe_hands_routes_to_staging_unconverted():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("has_sm_budget", [True, False])
+def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, request, has_sm_budget):
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
+
+    calls = []
+
+    def outputs(x):
+        rows = x.shape[0]
+        return (
+            torch.zeros(rows, x.shape[1] // 2, dtype=torch.uint8),
+            torch.zeros(rows * x.shape[1] // 16, dtype=torch.uint8),
+        )
+
+    def fp4_quantize(x, scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        calls.append(("default", sf_vec_size, sf_use_ue8m0, is_sf_swizzled))
+        return outputs(x)
+
+    def sm_budget(x, scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled, *, reserved_sms):
+        calls.append(("sm_budget", sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms))
+        return outputs(x)
+
+    if has_sm_budget:
+        fp4_quantize.sm_budget = sm_budget
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fp4_quantize, raising=False)
+    mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear()
+    request.addfinalizer(mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear)
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.fc31_input_scale = torch.ones(1)
+    x = torch.zeros(3, 64, dtype=torch.bfloat16)
+
+    moe.quantize_input(x)
+    moe.quantize_input(x, reserved_sms=4)
+
+    default = ("default", 16, False, False)
+    budget = ("sm_budget", 16, False, False, 4) if has_sm_budget else default
+    assert calls == [default, budget]
+
+
+@pytest.mark.cpu_only
 def test_megamoe_replica_plan_rejects_unallocated_geometry():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe.expert_size_per_partition = 8
-    moe._rebalance_home_experts = 8
-    moe._rebalance_slots_active = 3
-    moe._quantize_reserved_sms = 8
+    moe.layer_load_balancer = _per_layer_dynamic_handle(3)
     plan = MoEReplicaPlan(
         resident_experts_per_rank=8,
         compute_slots_per_rank=12,
@@ -2372,24 +2521,14 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     quant_method = SimpleNamespace(
         transform_weights=MagicMock(),
         cache_derived_state=MagicMock(),
-        assert_live_weight_aliases=MagicMock(),
     )
     moe.quant_method = quant_method
-    moe._rebalance_slots_active = 1
-    arena = MagicMock()
-    # ``unittest.mock`` blocks dynamically-created ``assert_*`` attributes.
-    arena.assert_identity = MagicMock()
-    moe._rebalance_arena = arena
-    moe.layer_load_balancer = SimpleNamespace(bind_backend=MagicMock())
 
     moe.post_load_weights()
     moe.transform_weights()
 
     quant_method.transform_weights.assert_called_once_with(moe)
     quant_method.cache_derived_state.assert_called_once_with(moe)
-    moe._rebalance_arena.assert_identity.assert_called_once_with()
-    quant_method.assert_live_weight_aliases.assert_called_once_with(moe, moe._rebalance_arena)
-    moe.layer_load_balancer.bind_backend.assert_called_once_with(moe)
     assert moe._weights_transformed is True
 
 
@@ -2442,6 +2581,7 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
         PerLayerDynamicMoeLoadBalancer,
         planner,
     )
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
     config = SimpleNamespace(
         num_slots=24,
@@ -2458,21 +2598,39 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
         top_k=2,
         slot_count_per_rank=6,
     )
-    arena = MagicMock(home_experts=4, helper_slots=2)
+    bundle = NVFP4MegaMoECuteDslMethod._live_weight_bundle_layout(160, 80, 160)
+    arena = MagicMock(home_experts=4, helper_slots=2, bundle=bundle)
     arena.assert_identity = MagicMock()
+    allocate = MagicMock(return_value=arena)
+    monkeypatch.setattr(arena_module, "allocate_rebalance_arena", allocate)
+    monkeypatch.setattr(manager, "get_ep_comm", lambda process_group: "ep_comm")
+    monkeypatch.setattr(manager, "create_arena_provider", lambda: "provider")
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
-    moe.quant_method = SimpleNamespace(
-        cache_derived_state=MagicMock(),
-        assert_live_weight_aliases=MagicMock(),
-    )
-    moe._rebalance_slots_active = 2
-    moe._rebalance_arena = arena
     moe._ep_pg = object()
     moe._maxt_buckets = [64, 128]
     moe.mapping = SimpleNamespace(local_rank=0)
     moe.layer_idx = 5
     moe.layer_load_balancer = layer
+    moe.initial_global_assignments = list(range(16))
+    # The quant method's create_weights allocates through the handle; a second
+    # call with the same plane spec returns the same arena.
+    for _ in range(2):
+        assert (
+            layer.allocate_arena(
+                bundle=bundle,
+                ep_process_group=moe.ep_process_group,
+                mapping=moe.mapping,
+                device=0,
+                layer_idx=5,
+            )
+            is arena
+        )
+    allocate.assert_called_once()
+    moe.quant_method = NVFP4MegaMoECuteDslMethod()
+    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "setup_quant_scales", lambda self, module: None)
+    assert_aliases = MagicMock()
+    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "assert_live_weight_aliases", assert_aliases)
     builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
     monkeypatch.setattr(
         planner,
@@ -2483,9 +2641,9 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     moe.cache_derived_state()
     moe.cache_derived_state()
 
-    assert moe.quant_method.cache_derived_state.call_count == 2
     assert arena.assert_identity.call_count == 2
-    assert moe.quant_method.assert_live_weight_aliases.call_count == 2
+    assert assert_aliases.call_count == 2
+    assert layer.live_weight_arena is arena
     builder.assert_called_once_with(
         arena=arena,
         manager=manager,

@@ -68,6 +68,7 @@ non-1 scales compute correctly.
 
 from __future__ import annotations
 
+import functools
 import os
 import socket
 import weakref
@@ -139,8 +140,6 @@ _RUNTIME_PROBE_CACHE: Dict[int, Union[bool, str]] = {}
 
 _MEGAMOE_PRIME_LADDER = os.environ.get("MEGAMOE_PRIME_LADDER", "1") == "1"
 _MEGAMOE_PRIMED_LADDERS: set = set()
-
-# Distinguish an absent arm attribute from an explicit False when restoring it.
 
 
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
@@ -285,6 +284,17 @@ def _as_nvfp4(t: torch.Tensor) -> torch.Tensor:
 
 def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.float8_e4m3fn else t.view(torch.float8_e4m3fn)
+
+
+@functools.cache
+def _fp4_quantize_has_sm_budget() -> bool:
+    if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
+        return True
+    logger.warning(
+        "fp4_quantize.sm_budget is unavailable; per-layer dynamic EPLB "
+        "quantization will use the selected backend without SM control"
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -434,16 +444,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ``CombineFormat.parse`` in the kernel package's token_comm.py.
     _SUPPORTED_COMBINE_FORMATS = frozenset({"bf16", "32e4m3xe8m0", "16e2m1xbf16"})
 
-    # Disabled defaults also cover construction paths before weight allocation.
-    _rebalance_slots_active: int = 0
-    _quantize_reserved_sms: int = 0
-    # Resident count H is recorded at weight creation and never widened.
-    _rebalance_home_experts: Optional[int] = None
-    # Active per-layer dynamic variant of ``model_config.moe_load_balancer``.
-    _per_layer_dynamic_eplb_config = None
-    # Allocate the arena once; the copy endpoint retains its plane identities.
-    _rebalance_arena = None
-
     # ------------------------------------------------------------------
     # Capability gating
     # ------------------------------------------------------------------
@@ -556,23 +556,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Init
     # ------------------------------------------------------------------
-    @staticmethod
-    def _reject_rebalance_dwdp_overlap(mapping, helper_slots: int, layer_idx=None) -> None:
-        """Reject simultaneous helper-slot rebalance and DWDP before allocation.
-
-        DWDP makes every rank own all experts and rewrites the slot axis after
-        weight creation, invalidating the H + S arena geometry.
-        """
-        if int(helper_slots) <= 0:
-            return
-        if not bool(getattr(mapping, "dwdp_enabled", False)):
-            return
-        raise ValueError(
-            f"MoE rebalance S={helper_slots} at layer {layer_idx} cannot run with "
-            f"DWDP size {getattr(mapping, 'dwdp_size', '?')}: DWDP rewrites the "
-            "H + S weight axis. Disable rebalance or use dwdp_size=1."
-        )
-
     def __init__(
         self,
         *,
@@ -643,61 +626,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # MERGE lockstep sweep). Must be set identically on ALL ranks (it
         # gates collective tuning behavior).
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
-
-        # Per-layer dynamic EPLB uses the standard load-balancer configuration.
-        # P is the global physical slot count; the fused kernel sees
-        # M = P / EP slots per rank and S = M - H helper rows.
-        load_balancer = getattr(model_config, "moe_load_balancer", None)
-        self._per_layer_dynamic_eplb_config = (
-            load_balancer if getattr(load_balancer, "mode", None) == "per_layer_dynamic" else None
-        )
-        self._rebalance_slots_active = 0
-        if self._per_layer_dynamic_eplb_config is not None:
-            ep_size = int(self.ep_size)
-            global_slots = int(self._per_layer_dynamic_eplb_config.num_slots)
-            if ep_size <= 0 or num_experts <= 0 or num_experts % ep_size != 0:
-                raise ValueError(
-                    "per-layer dynamic EPLB requires a positive expert count divisible "
-                    f"by EP; got E={num_experts}, EP={ep_size}."
-                )
-            if global_slots % ep_size != 0:
-                raise ValueError(
-                    "per-layer dynamic EPLB requires num_slots divisible by EP; "
-                    f"got P={global_slots}, EP={ep_size}."
-                )
-            resident_experts = num_experts // ep_size
-            compute_slots = global_slots // ep_size
-            self._rebalance_slots_active = compute_slots - resident_experts
-            if self._rebalance_slots_active <= 0:
-                raise ValueError(
-                    "per-layer dynamic EPLB requires physical capacity larger than "
-                    f"resident capacity; got P={global_slots}, E={num_experts}."
-                )
-
-        self._quantize_reserved_sms = 0
-        self._rebalance_reserved_sms = 0
-        if self._rebalance_slots_active > 0:
-            self._rebalance_reserved_sms = int(self._per_layer_dynamic_eplb_config.auxiliary_sms)
-            if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
-                self._quantize_reserved_sms = self._rebalance_reserved_sms
-            else:
-                logger.warning_once(
-                    "fp4_quantize.sm_budget is unavailable; per-layer dynamic EPLB "
-                    "quantization will use the selected backend without SM control",
-                    key="dynamic_eplb_quantize_without_sm_budget",
-                )
-        # Reject DWDP before it can rewrite the same slot axis.
-        self._reject_rebalance_dwdp_overlap(
-            getattr(self, "mapping", None),
-            self._rebalance_slots_active,
-            layer_idx,
-        )
-        if self._rebalance_slots_active > 0:
-            logger.debug(
-                f"[MegaMoECuteDsl] prefill rebalance active "
-                f"(S={self._rebalance_slots_active}); kernel weight planes "
-                f"use M = H + S while expert_size_per_partition stays H."
-            )
 
         # Buffer sizing. MoE layers execute serially per forward; one pool
         # sized to the worst-case per-rank tokens covers every layer. The
@@ -787,26 +715,19 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Return the kernel-only slot axis ``M = H + S``.
 
         ``expert_size_per_partition`` remains the resident/checkpoint axis H.
-        Only the seven live kernel planes, symmetric workspace, and launch
-        geometry use this wider axis.
+        The per-layer dynamic EPLB layer handle supplies the S helper slots;
+        without one, M is H. Only the seven live kernel planes, symmetric
+        workspace, and launch geometry use this wider axis.
         """
         resident_experts = int(self.expert_size_per_partition)
-        recorded_home = self._rebalance_home_experts
-        if recorded_home is not None and resident_experts != recorded_home:
-            raise RuntimeError(
-                "MegaMoECuteDsl resident expert geometry changed after weight "
-                f"creation: expected H={recorded_home}, got H={resident_experts}."
-            )
-        return resident_experts + int(self._rebalance_slots_active)
+        layer_load_balancer = self.layer_load_balancer
+        if layer_load_balancer is None or not layer_load_balancer.produces_replica_plan:
+            return resident_experts
+        return resident_experts + int(layer_load_balancer.helper_slots_per_rank)
 
     # ------------------------------------------------------------------
-    # Facts the per-layer dynamic EPLB layer handle binds against
+    # Backend facts the per-layer dynamic EPLB layer handle reads
     # ------------------------------------------------------------------
-    @property
-    def live_weight_arena(self):
-        """The H + S arena that the live kernel planes alias, or ``None``."""
-        return self._rebalance_arena
-
     @property
     def ep_process_group(self):
         """The EP ProcessGroup resolved at construction, or ``None`` on one rank."""
@@ -1069,15 +990,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Build-time weight + symmetric-buffer allocation.
 
         Order:
-          0. Record the resident/checkpoint axis H. The backend keeps
-             ``expert_size_per_partition == H``; ``compute_slot_count`` exposes
-             ``M = H + S`` only to kernel-plane allocation and launch geometry.
           1. Allocate symmetric-memory provider for multi-rank EP
              (collective rendezvous; MUST run at build time -- not from
              ``run_moe`` -- because forward time may be inside CUDA
              graph capture or non-lockstep PP/layer-skip).
-          2. Resolve the quantization method and its seven-plane ABI.
-          3. Delegate parameter registration to the same quant method.
+          2. Resolve quantization method.
+          3. Delegate parameter registration to the quant method.
           4. Flip ``_weights_created``.
 
         The symm provider is shared across MoE layers with the same
@@ -1089,62 +1007,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         if self._weights_created:
             return
-        # ConfigurableMoE has synchronized resident geometry H before this call.
-        # Keep that public/checkpoint axis unchanged. The explicit
-        # ``compute_slot_count`` property is the only H + S axis.
-        resident_experts = int(self.expert_size_per_partition)
-        helper_slots = int(self._rebalance_slots_active)
-        if self._rebalance_home_experts is None:
-            self._rebalance_home_experts = resident_experts
-        elif resident_experts != self._rebalance_home_experts:
-            raise RuntimeError(
-                "MegaMoECuteDsl: expert_size_per_partition changed between "
-                f"create_weights() calls -- expected resident H="
-                f"{self._rebalance_home_experts}, found H={resident_experts}."
-            )
-        if helper_slots > 0:
-            log_fn = logger.info if self.layer_idx in (0, None) else logger.debug
-            log_fn(
-                f"[MegaMoECuteDsl] layer={self.layer_idx} MoE rebalance uses "
-                f"resident H={resident_experts} and helper S={helper_slots}; "
-                f"only the seven live kernel planes use "
-                f"M={self.compute_slot_count} rows."
-            )
-        # The quant method is the sole authority for the seven live planes.
-        if self.quant_method is None:
-            self.quant_method = self._get_quant_method()
-        live_weight_plane_spec = self.quant_method.live_weight_plane_spec(self)
-
         # Step 1: build-time symmetric memory allocation (multi-rank only).
         # Single-rank degenerate uses local CUDA tensors and skips here.
         if self.ep_size > 1:
             self._alloc_symm_provider()
-        # Allocate the H + S arena before the quant method creates the seven
-        # kernel-plane Parameters. Source/checkpoint Parameters remain H rows.
-        if self._rebalance_slots_active > 0 and self._rebalance_arena is None:
-            # The layer handle allocates the hierarchical multicast arena (one
-            # multicast group per HALO level, rather than one per source and
-            # destination pair) from model-owned resources.
-            layer_balancer = getattr(self, "layer_load_balancer", None)
-            allocate_arena = getattr(layer_balancer, "allocate_arena", None)
-            if not callable(allocate_arena):
-                raise RuntimeError(
-                    "per-layer dynamic EPLB requires a layer load balancer that "
-                    "allocates the live-weight arena"
-                )
-            self._rebalance_arena = allocate_arena(
-                bundle=live_weight_plane_spec,
-                ep_process_group=self._ep_pg,
-                mapping=self.mapping,
-                device=int(self.mapping.local_rank),
-                layer_idx=self.layer_idx,
-            )
-        # Step 2-3: the same quant method registers every live Parameter.
+        # Step 2-3: quant method registers all NVFP4 + MegaMoE-format params.
+        self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
-        if self._rebalance_arena is not None:
-            from ..per_layer_dynamic_eplb.planner import bind_live_weight_planes
-
-            bind_live_weight_planes(self.quant_method, self, self._rebalance_arena)
         # Step 4.
         self._weights_created = True
 
@@ -1303,17 +1172,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if self.quant_method is None:
             self.create_weights()
         super().cache_derived_state()
-        # ConfigurableMoE delegates this hook on both ordinary and staged
-        # loading paths. The layer manager builds and owns the producer only
-        # after the final seven plane aliases exist.
-        if self._rebalance_slots_active > 0:
-            arena = self._rebalance_arena
-            arena.assert_identity()
-            self.quant_method.assert_live_weight_aliases(self, arena)
-            bind_backend = getattr(self.layer_load_balancer, "bind_backend", None)
-            if not callable(bind_backend):
-                raise RuntimeError("per-layer dynamic EPLB layer manager cannot bind its runtime")
-            bind_backend(self)
 
     def pre_reload_weights(self) -> None:
         raise NotImplementedError(
@@ -1327,7 +1185,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         kernel sees the latest dynamic-EPLB migration outcome (once
         that path lands; currently the slots are static).
         """
-        _view = MegaMoECuteDslWeightView(
+        return MegaMoECuteDslWeightView(
             fc1_weight=self.mega_fc1_weight,
             fc1_weight_sf=self.mega_fc1_weight_sf,
             fc2_weight=self.mega_fc2_weight,
@@ -1336,7 +1194,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             fc2_alpha=self.fc2_alpha,
             fc1_norm_const=self.fc1_norm_const,
         )
-        return _view
 
     # ------------------------------------------------------------------
     # MoE-contract methods
@@ -1346,6 +1203,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         x: Union[torch.Tensor, "Fp4QuantizedTensor"],
         *,
         post_quant_comm: bool = False,
+        reserved_sms: int = 0,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """BF16 -> NVFP4 packed activation + plain K-major FP8 SF.
@@ -1362,6 +1220,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         method loads it into ``self.fc31_act_scale`` (``[1, hidden]``), and
         ``fc31_input_scale`` was calibrated on the scaled activation. The
         kernel itself only ever sees the quantized input.
+
+        ``reserved_sms`` is the number of SMs left to the concurrent
+        HALO-Q/TMA kernel of a replica plan; zero uses the default
+        quantization overload.
 
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
@@ -1390,16 +1252,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # admits bf16 activations only, so ``fc31_act_scale``, created at
             # ``module.dtype``, is bf16 as well.
             x_bf16 = x_bf16 * fc31_act_scale
-        # Match the concurrent scheduler/copy reservation. The default overload
-        # remains unchanged when load balancing is disabled.
-        if self._quantize_reserved_sms:
+        # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
+        # default overload remains unchanged without a plan.
+        if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
                 x_bf16,
                 self.fc31_input_scale,
                 16,
                 False,
                 False,
-                reserved_sms=self._quantize_reserved_sms,
+                reserved_sms=reserved_sms,
             )
         else:
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
@@ -1445,13 +1307,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 "MegaMoECuteDsl received an invalid replica plan: "
                 f"S={helper_slots}, generation={generation}, "
                 f"reserved_sms={reserved_sms}."
-            )
-        quantize_reserved_sms = int(getattr(self, "_quantize_reserved_sms", 0))
-        if quantize_reserved_sms not in (0, reserved_sms):
-            raise RuntimeError(
-                "MegaMoECuteDsl replica-plan SM reservation differs from the "
-                f"quantization reservation: plan={reserved_sms}, "
-                f"quantize={quantize_reserved_sms}."
             )
         return (
             compute_slots,
@@ -1736,7 +1591,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         num_tokens: int,
         top_k: int,
         stage_activation: bool,
-        stage_routes: bool = True,
         replica_plan=None,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
@@ -1764,7 +1618,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         max_T = bufs.topk_idx_local.shape[0]
         last_T = self._last_staged_T.get(max_T)
-        if stage_routes and last_T is not None and last_T > num_tokens:
+        if last_T is not None and last_T > num_tokens:
             bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
         if num_tokens > 0:
             if stage_activation:
@@ -1773,11 +1627,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
         if num_tokens < max_T:
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
-        if stage_routes:
-            if num_tokens > 0:
-                self._wait_rebalance_routes(replica_plan)
-                bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
-            self._last_staged_T[max_T] = num_tokens
+        if num_tokens > 0:
+            self._wait_rebalance_routes(replica_plan)
+            bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
+        self._last_staged_T[max_T] = num_tokens
 
     def _launch_megamoe_kernel(
         self,
@@ -1878,8 +1731,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 helper_ready_generation,
                 _reserved_sms,
             ) = plan_args
-        # Record the actual helper-slot ABI for verification.
-        self._last_S_to_kernel = _S_active
         # Quantization, independent staging, output clears, and host setup
         # are already enqueued. The router inside this op first reads routes.
         self._wait_rebalance_routes(replica_plan)
@@ -2017,7 +1868,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         weight_view,
         primed,
     ):
-        """Prime each max-token bucket; the caller manages the rebalance arm state."""
+        """Prime each max-token bucket."""
         for max_T in self._maxt_buckets:
             if max_T == live_T:
                 continue
@@ -2151,7 +2002,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
         )
-        borrowed_routes = None
         if not use_direct_routing_inputs:
             self._stage_inputs(
                 bufs=bufs,
@@ -2162,19 +2012,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 num_tokens=num_tokens,
                 top_k=top_k,
                 stage_activation=not use_direct_inputs,
-                stage_routes=borrowed_routes is None,
                 replica_plan=replica_plan,
             )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,
             activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
-            topk_idx=(
-                borrowed_routes
-                if borrowed_routes is not None
-                else topk_idx
-                if use_direct_routing_inputs
-                else bufs.topk_idx_local
-            ),
+            topk_idx=topk_idx if use_direct_routing_inputs else bufs.topk_idx_local,
             topk_weights=(
                 topk_weights if use_direct_routing_inputs else bufs.topk_weights[:, :top_k]
             ),

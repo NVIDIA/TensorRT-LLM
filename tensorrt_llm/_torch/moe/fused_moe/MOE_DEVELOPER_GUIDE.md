@@ -221,6 +221,7 @@ Still on old path (standalone, with embedded communication):
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
+| `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
 
 ### Backends (`fused_moe/`)
@@ -876,9 +877,10 @@ set wrong has a test that catches it:
   copy stream, one CTA per auxiliary SM. Each CTA raises a device route epoch
   once its routes are written. The main stream may enqueue shared-expert work
   and input quantization before its first routed-expert use, where a stream
-  memory wait on that epoch orders it after the routes. A single CPU submitter
-  owns both streams; the path does not require a CUDA green context or a
-  steady-state host wait.
+  memory wait on that epoch orders it after the routes. Each layer binds one
+  main stream, the executor's execution stream, on which warmup and serving
+  submit from their own threads; the path does not require a CUDA green
+  context or a steady-state host wait.
 - HALO-Q waits for every EP rank inside the kernel and traps once a peer is
   later than its spin bound. Each launch passes the bound, which
   `SchedulerSpinBound` takes from the MoE communication timeout guard: the
@@ -897,20 +899,32 @@ set wrong has a test that catches it:
   rollback must release the scheduler, TMA bindings, shared-slot mappings,
   and fabric allocations collectively. Forward execution must not retain
   activation tensors after their consumer has been enqueued.
-- Per-layer dynamic EPLB reuses the EPLB seams. `maybe_create_moe_load_balancer`
-  builds `PerLayerDynamicMoeLoadBalancer`, which shares the
-  `BaseMoeLoadBalancer` lifecycle with `MoeLoadBalancer` (context entry,
-  `set_iter_info`, `start_iter`/`end_iter`, collective `shutdown`); warmup
-  reaches it only through `set_iter_info`. `add_layer` returns a
-  `PerLayerDynamicMoeLayerLoadBalancer` with `produces_replica_plan = True`:
-  `_load_balancer_route` plans, the backend reads `MoERunContext.replica_plan`,
-  and the scheduler finishes the plan after each chunk's `run_moe`. Model code
-  passes independent main-stream work such as shared experts through
+- Per-layer dynamic EPLB lives in `per_layer_dynamic_eplb/` (`manager`,
+  `layer`, `arena`, `planner`) and reuses the EPLB seams.
+  `maybe_create_moe_load_balancer` builds `PerLayerDynamicMoeLoadBalancer`,
+  which shares the `BaseMoeLoadBalancer` lifecycle with `MoeLoadBalancer`, and
+  `add_layer` returns a `PerLayerDynamicMoeLayerLoadBalancer` with
+  `produces_replica_plan = True`. In every chunk `_load_balancer_route` plans,
+  the backend reads `MoERunContext.replica_plan`, and the post-`run_moe` hook
+  releases the plan. The planner consumes logical routes, so the expert
+  statistics and the layer-wise calibrator record (or replay) them before the
+  route; standard EPLB records the slots after it. When the forward raises,
+  `MoeLoadBalancerIterContext` calls `abort_iter`, which releases the pending
+  plans. Plans run during warmup too, so there is no warmup switch; only the
+  HALO-Q spin bound changes, as described above. Model code passes independent
+  main-stream work such as shared experts through
   `MoE.load_balancer_overlap(fn)`; the route runs it once, after submitting the
-  copy stream. The backend allocates its live-weight arena through the layer
-  handle's `allocate_arena` and exposes `live_weight_arena`,
-  `ep_process_group`, and `max_tokens_per_rank_capacity` to `bind_backend`
-  instead of private attributes.
+  copy stream.
+- The quant method owns the seven live kernel planes. Its `create_weights`
+  allocates them from its plane spec through the layer handle's
+  `allocate_arena` and binds them; its `cache_derived_state` checks them and
+  calls the handle's `bind_backend`, which builds the HALO-Q/TMA producer. The
+  backend only declares `supports_per_layer_dynamic_eplb`, uses
+  `compute_slot_count` (H + S, with S from the layer handle) for the planes,
+  symmetric workspace, and launch geometry while `expert_size_per_partition`
+  stays H, and consumes the replica plan, including the SMs its input
+  quantization leaves to the copy kernel. `bind_backend` reads the backend's
+  `ep_process_group` and `max_tokens_per_rank_capacity`.
 - DeepSeek-V4 selects the fused shared FC12 kernel when the routed backend
   declares per-layer dynamic support, the final projection quantization and
   hardware (SM100 family) support that kernel, and the model runs eagerly

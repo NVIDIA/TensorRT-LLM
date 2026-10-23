@@ -1736,7 +1736,7 @@ def test_route_wait_occurs_after_independent_staging():
         {"torch": SimpleNamespace(uint8="uint8")},
     )
 
-    def run(stage_routes):
+    def run():
         trace = []
         owner = impl()
         owner._last_staged_T = {8: 8}
@@ -1756,20 +1756,64 @@ def test_route_wait_occurs_after_independent_staging():
             num_tokens=4,
             top_k=6,
             stage_activation=True,
-            stage_routes=stage_routes,
         )
         return trace, owner
 
-    trace, owner = run(True)
+    trace, owner = run()
     assert trace.index("copy:activation") < trace.index("wait")
     assert trace.index("copy:topk_weights") < trace.index("wait")
     assert trace.index("wait") < trace.index("copy:topk_idx_local")
     assert owner._last_staged_T[8] == 4
 
-    trace, owner = run(False)
-    assert "wait" not in trace
-    assert not any("topk_idx_local" in item for item in trace)
-    assert owner._last_staged_T[8] == 8
+
+@pytest.mark.parametrize("has_sm_budget", [True, False])
+def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
+    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+    calls = []
+
+    class Activation:
+        def __init__(self, rows, cols):
+            self.shape = (rows, cols)
+
+        def to(self, dtype):
+            return self
+
+        def contiguous(self):
+            return self
+
+        def view(self, *shape):
+            return shape
+
+    def fp4_quantize(*args):
+        calls.append(("default", *args[1:]))
+        return "x_fp4", Activation(3, 4)
+
+    def sm_budget(*args, reserved_sms):
+        calls.append(("sm_budget", *args[1:], reserved_sms))
+        return "x_fp4", Activation(3, 4)
+
+    if has_sm_budget:
+        fp4_quantize.sm_budget = sm_budget
+    namespace = {
+        "torch": SimpleNamespace(
+            bfloat16="bf16", ops=SimpleNamespace(trtllm=SimpleNamespace(fp4_quantize=fp4_quantize))
+        ),
+        "logger": SimpleNamespace(warning=lambda message: None),
+        "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
+        "megamoe_activation_sf_bytes_per_row": lambda hidden: hidden // 16,
+        "ceil_div": lambda a, b: -(-a // b),
+    }
+    _extract_function(source, "_fp4_quantize_has_sm_budget", namespace)
+    impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
+    owner = impl()
+    owner.fc31_input_scale = "scale"
+
+    owner.quantize_input(Activation(3, 64))
+    owner.quantize_input(Activation(3, 64), reserved_sms=4)
+
+    default = ("default", "scale", 16, False, False)
+    budget = ("sm_budget", "scale", 16, False, False, 4) if has_sm_budget else default
+    assert calls == [default, budget]
 
 
 def test_megamoe_launch_buffers_are_built_once_per_bucket_and_mode():
@@ -2303,7 +2347,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     _extract_function(source, "_leading_rows", namespace)
     scheduler_cls = _extract_class(source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace)
 
-    plan = object()
+    plan = SimpleNamespace(reserved_sms=4)
     layer = None if mode == "off" else SimpleNamespace(produces_replica_plan=mode != "standard")
 
     def route(routes, use_dp):
@@ -2359,13 +2403,15 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     assert out == "out"
     tail = [("quantize", {}), ("bucket", 6)]
     if mode == "per_layer_dynamic":
-        # The planner consumes the logical routes the calibrator records or replays.
+        # The planner consumes the logical routes the calibrator records or
+        # replays, and quantization leaves the plan's SMs to its copy kernel.
         expected = [
             ("update_statistic", "logical"),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
-            *tail,
+            ("quantize", {"reserved_sms": 4}),
+            ("bucket", 6),
             ("run_moe", "physical", plan),
         ]
     elif mode == "standard":

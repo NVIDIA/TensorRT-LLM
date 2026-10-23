@@ -46,7 +46,8 @@ class _Arena:
     home_experts = 4
     helper_slots = 2
 
-    def __init__(self):
+    def __init__(self, bundle="bundle"):
+        self.bundle = bundle
         self.flags = torch.empty(4, dtype=torch.uint64)
         self.generation = 0
         self.provider = SimpleNamespace(pool=None)
@@ -62,8 +63,7 @@ class _Arena:
 
 
 class _Backend:
-    def __init__(self, arena):
-        self.live_weight_arena = arena
+    def __init__(self):
         self.tactic_autotune = False
         self.mapping = SimpleNamespace(local_rank=0)
         self.ep_process_group = object()
@@ -112,6 +112,22 @@ def _manager():
         ep_rank=0,
         ep_size=4,
         config=_Config(),
+    )
+
+
+def _allocate_arena(layer, monkeypatch, arena):
+    """Allocate ``arena`` through the layer handle, as the quant method does."""
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
+
+    monkeypatch.setattr(layer.manager, "get_ep_comm", lambda process_group: object())
+    monkeypatch.setattr(layer.manager, "create_arena_provider", lambda: object())
+    monkeypatch.setattr(arena_module, "allocate_rebalance_arena", MagicMock(return_value=arena))
+    return layer.allocate_arena(
+        bundle=arena.bundle,
+        ep_process_group=object(),
+        mapping=object(),
+        device=0,
+        layer_idx=layer.layer_idx,
     )
 
 
@@ -247,7 +263,8 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     arena = _Arena()
-    backend = _Backend(arena)
+    assert _allocate_arena(layer, monkeypatch, arena) is arena
+    backend = _Backend()
     group = _Group()
     builder = MagicMock(return_value=group)
     monkeypatch.setattr(
@@ -276,30 +293,34 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
     assert layer._scheduler_group is group
 
 
-def test_bind_backend_rejects_different_backend_or_arena_before_construction(
+def test_bind_backend_requires_the_layer_arena_and_rejects_another_backend(
     monkeypatch,
 ):
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
 
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
-    arena = _Arena()
-    backend = _Backend(arena)
+    backend = _Backend()
     builder = MagicMock(return_value=_Group())
     monkeypatch.setattr(
         planner,
         "build_rebalance_slot_scheduler_group",
         builder,
     )
+    with pytest.raises(RuntimeError, match="no live-weight arena"):
+        layer.bind_backend(backend)
+
+    arena = _Arena()
+    _allocate_arena(layer, monkeypatch, arena)
+    # The runtime binds only the arena this handle allocated.
+    with pytest.raises(RuntimeError, match="did not allocate"):
+        layer.bind_runtime(arena=_Arena(), scheduler_group=_Group())
     layer.bind_backend(backend)
 
     with pytest.raises(RuntimeError, match="different backend"):
-        layer.bind_backend(_Backend(arena))
-    backend.live_weight_arena = _Arena()
-    with pytest.raises(RuntimeError, match="changed its rebalance arena"):
-        layer.bind_backend(backend)
-
+        layer.bind_backend(_Backend())
     builder.assert_called_once()
+    assert layer.live_weight_arena is arena
 
 
 def test_iteration_context_reuses_common_lifecycle():
@@ -380,7 +401,8 @@ def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     order = []
-    process_group, comm, provider, arena = object(), object(), object(), object()
+    process_group, comm, provider, bundle, mapping = (object() for _ in range(5))
+    arena = SimpleNamespace(bundle=bundle)
 
     def get_ep_comm(group):
         assert group is process_group
@@ -395,17 +417,12 @@ def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
     monkeypatch.setattr(manager, "create_arena_provider", create_arena_provider)
     allocate = MagicMock(return_value=arena)
     monkeypatch.setattr(arena_module, "allocate_rebalance_arena", allocate)
-    bundle, mapping = object(), object()
+    kwargs = dict(ep_process_group=process_group, mapping=mapping, device=1, layer_idx=7)
 
-    allocated = layer.allocate_arena(
-        bundle=bundle,
-        ep_process_group=process_group,
-        mapping=mapping,
-        device=1,
-        layer_idx=7,
-    )
+    allocated = layer.allocate_arena(bundle=bundle, **kwargs)
 
     assert allocated is arena
+    assert layer.live_weight_arena is arena
     assert order == ["ep_comm", "provider"]
     allocate.assert_called_once_with(
         home_experts=4,
@@ -417,6 +434,13 @@ def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
         device=1,
         layer_idx=7,
     )
+
+    # Allocation happens once per layer; only the same plane spec gets the arena back.
+    assert layer.allocate_arena(bundle=bundle, **kwargs) is arena
+    with pytest.raises(RuntimeError, match="different live-weight plane spec"):
+        layer.allocate_arena(bundle=object(), **kwargs)
+    allocate.assert_called_once()
+    assert order == ["ep_comm", "provider"]
 
 
 @pytest.mark.parametrize(
