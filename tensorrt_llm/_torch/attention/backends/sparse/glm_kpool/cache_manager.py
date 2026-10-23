@@ -30,6 +30,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateState,
     KDAReplayState,
+    _is_disagg_context_server,
+    bind_kda_replay_pool,
     get_kda_replay_num_spec,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -55,6 +57,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     Registering it through _extra_buffers_per_layer shares allocation, reuse,
     release and disaggregated transfer with the base manager.
     """
+
+    kda_context_only = False
 
     @override
     def __init__(
@@ -95,16 +99,20 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if use_replay_state_update:
             raise ValueError("GLM KDA does not support Mamba2 replay")
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
+        self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
         self._kda_replay: KDAReplayState | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState:
+    def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState | None:
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
+        self.kda_context_only = self.kda_context_only and num_spec is not None
+        if self.kda_context_only:
+            return None
         if num_spec is not None:
             self._kda_replay = KDAReplayState(
                 num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
@@ -116,6 +124,28 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
+
+    @override
+    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
+        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
+        if self._kda_replay is not None:
+            buffers.extend(
+                self._kda_replay.pool_buffer_configs(self._state_layout, global_layer_id)
+            )
+        return buffers
+
+    @override
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        roles = super().get_disagg_ignored_roles()
+        if self._kda_replay is not None:
+            roles |= self._kda_replay.disagg_ignored_roles(self._state_layout)
+        return roles
+
+    @override
+    def _setup_model_state(self) -> None:
+        if self._kda_replay is not None:
+            bind_kda_replay_pool(self._kda_replay, self)
+        super()._setup_model_state()
 
     @override
     def _build_cache_config(self, config):
@@ -208,12 +238,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def _extra_scratch_bytes_per_slot(self) -> int:
-        if self._kda_replay is None:
+        if self._kda_replay is None or not self._kda_replay._stochastic_rounding:
             return 0
-        return sum(
-            self._kda_replay.bytes_per_slot(self._state_layout, layer_id)
-            for layer_id in self.mamba_pp_layers
-        )
+        return torch.int64.itemsize
 
     @classmethod
     @override
@@ -231,6 +258,16 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
             )
             self._kda_replay.reset_slots(slots, fresh_slots)
+
+    @override
+    def update_mamba_states(
+        self, attn_metadata, num_accepted_tokens, state_indices=None, accepted_leaf_positions=None
+    ) -> None:
+        if self.kda_context_only:
+            return
+        super().update_mamba_states(
+            attn_metadata, num_accepted_tokens, state_indices, accepted_leaf_positions
+        )
 
     @override
     def update_resources(

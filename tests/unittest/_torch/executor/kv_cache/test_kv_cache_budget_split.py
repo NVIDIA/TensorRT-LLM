@@ -461,6 +461,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_batch_size = max_batch_size
         creator._max_num_tokens = 128
         creator._speculative_config = None
+        creator._is_disagg = False
         # The second of two pipeline ranks: it holds global layers 2 and 3.
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [2, 3]

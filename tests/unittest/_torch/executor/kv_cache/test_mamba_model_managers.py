@@ -325,9 +325,17 @@ def test_k3_initializes_only_the_selected_state(
 
     manager._state_layout = object()
     manager.all_ssm_states, manager.all_conv_states = [], []
+    pool_bind = Mock()
+    monkeypatch.setitem(
+        manager_cls._setup_model_state.__globals__, "bind_kda_replay_pool", pool_bind
+    )
     bind = Mock()
     monkeypatch.setattr(state, "bind", bind)
     manager._setup_model_state()
+    if num_spec is not None:
+        pool_bind.assert_called_once_with(state, manager)
+    else:
+        pool_bind.assert_not_called()
     bind.assert_called_once_with(
         manager._state_layout, manager.all_ssm_states, manager.all_conv_states
     )
@@ -735,7 +743,7 @@ def test_kda_scratch_cost_matches_allocated_slot_buffers():
 @pytest.mark.parametrize("pool_share", [0.25, 0.75])
 @pytest.mark.parametrize("quota_source", ["max_tokens", "max_gpu_total_bytes", "both"])
 @pytest.mark.parametrize("granularity", [1, 4096])
-def test_kda_pool_allocation_reserves_actual_replay_capacity(
+def test_kda_pool_allocation_includes_replay_in_native_quota(
     monkeypatch, manager_cls, replay, pool_share, quota_source, granularity
 ):
     from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as module
@@ -751,7 +759,7 @@ def test_kda_pool_allocation_reserves_actual_replay_capacity(
     manager.mapping = layout.mapping
     manager._num_reserved_dummy_slots = 1
     manager.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-    persistent_bytes_per_slot = 2 * (128 + 288)
+    persistent_bytes_per_slot = manager._mamba_state_bytes_per_slot()
     total_quota = 1 << 20
     if quota_source in ("max_tokens", "both"):
         monkeypatch.setattr(
@@ -797,25 +805,9 @@ def test_kda_pool_allocation_reserves_actual_replay_capacity(
     )
     # The native pool can have many more slots than the live batch needs.
     assert pool.slots > layout.max_batch_size
-    if replay:
-        state = manager._kda_replay
-        views = _state_views(slots=pool.slots)
-        state.bind(
-            layout.with_slot_capacity(pool.slots), views.all_ssm_states, views.all_conv_states
-        )
-        scratch_bytes = sum(
-            buffer.untyped_storage().nbytes()
-            for buffer in (*state._layer_replay_buffers(), state.prev_num_accepted_tokens)
-        )
-        if byte_limit:
-            assert pool.resize_calls > 0
-            assert pool.quota + scratch_bytes <= byte_limit
-        else:
-            assert pool.resize_calls == 0
-        assert manager._get_external_cache_bytes(pool) == scratch_bytes
-    else:
-        assert pool.resize_calls == 0
-        assert pool.quota == (total_quota + granularity - 1) // granularity * granularity
+    assert pool.resize_calls == 0
+    assert pool.quota == (total_quota + granularity - 1) // granularity * granularity
+    assert manager._get_external_cache_bytes(pool) == 0
     # Host fallback retries must retain the original total GPU budget.
     assert config.cache_tiers[0].quota == total_quota
     assert config.cache_tiers[1].quota == 12345
@@ -901,6 +893,7 @@ def test_kda_affine_estimator_includes_replay_scratch(
     params = SimpleNamespace(
         n_groups=2,
         state_size=4,
+        head_dim=4,
         conv_kernel=4,
         num_heads=2,
         mamba_ssm_cache_dtype=torch.float16,
@@ -947,7 +940,8 @@ def test_kda_affine_estimator_includes_replay_scratch(
     dummy_slots = common._get_num_cuda_graph_padding_dummy_slots(
         layout.spec_config, layout.max_batch_size
     )
-    state_bytes = 2 * 416 + scratch_per_slot
+    # KVCM pads the shared accepted-draft count from 4 to 16 bytes.
+    state_bytes = 2 * 416 + scratch_per_slot + (12 if replay else 0)
     interval = kv_config.mamba_state_config.periodic_snapshot_interval
     slope = (state_bytes + interval - 1) // interval if reuse and interval > 0 else 0
     assert cost == (slope, (layout.max_batch_size + dummy_slots) * state_bytes)

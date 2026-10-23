@@ -85,8 +85,8 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         for body, empty_result in ((changed_files, "return []"), (one_file_diff, 'return ""')):
             with self.subTest(empty_result=empty_result):
                 self.assertIn(f"if ({infra_dry_run_check} ||", body)
-                self.assertLess(body.index(infra_dry_run_check), body.index("def githubPrApiUrl"))
-                self.assertLess(body.index(empty_result), body.index("def githubPrApiUrl"))
+                self.assertLess(body.index(infra_dry_run_check), body.index("getMRChangedFile("))
+                self.assertLess(body.index(empty_result), body.index("getMRChangedFile("))
 
     def test_docs_skip_results_only_after_a_successful_build(self) -> None:
         result_handler = _function_body(
