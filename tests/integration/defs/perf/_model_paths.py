@@ -89,6 +89,8 @@ MODEL_PATH_DICT = {
     "deepseek_v41_flash_nvfp4_dspark": "DeepSeek-V4.1-Flash-NVFP4",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
+    "glm_5.3_fp8": "GLM-5.3",
+    "glm_5.3_flash_fp8": "GLM-5.3-Flash",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
     "glm_5.2_fp4": "GLM-5.2-NVFP4",
     "glm_5.3_flash_fp8": "GLM-5.3-Flash",
