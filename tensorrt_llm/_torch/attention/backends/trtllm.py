@@ -42,7 +42,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
+from .fmha.beam_shared_prefix import LIB_NAME as BEAM_SHARED_PREFIX_LIB
+from .fmha.beam_shared_prefix import plan_step as beam_shared_prefix_plan_step
 from .fmha.manager import FmhaManager
+from .fmha.registry import is_fmha_lib_enabled
 from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -1144,6 +1147,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
+
+        # Per-step host planning of the opt-in shared-prefix generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        if is_fmha_lib_enabled(BEAM_SHARED_PREFIX_LIB):
+            beam_shared_prefix_plan_step(self)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
