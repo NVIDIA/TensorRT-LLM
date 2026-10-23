@@ -378,28 +378,35 @@ class TestMoeConfigPerLayerDynamicEplb:
         assert config.load_balancer.planner == "halo_r"
         assert config.backend == "MEGAMOE_CUTEDSL"
 
+    # The planner rejection tests build the config directly: MoeConfig
+    # re-raises a load-balancer error with only the input dictionary in its
+    # message, which would hide the reason these tests check.
     @pytest.mark.parametrize("mode", [None, "per_layer_resident"])
     def test_halo_r_requires_shared_banks(self, mode: str | None) -> None:
         values = self._per_layer_dynamic()
         values["planner"] = "halo_r"
         if mode is not None:
             values["helper_slot_mode"] = mode
-        with pytest.raises(ValidationError, match="shared_banks"):
-            MoeConfig(load_balancer=values)
+        with pytest.raises(ValidationError,
+                           match="requires `helper_slot_mode: shared_banks`"):
+            MoePerLayerDynamicLoadBalancerConfig(**values)
 
     def test_halo_r_requires_two_auxiliary_sms(self) -> None:
         values = self._per_layer_dynamic()
         values.update(planner="halo_r",
                       helper_slot_mode="shared_banks",
                       auxiliary_sms=1)
-        with pytest.raises(ValidationError, match="auxiliary_sms"):
-            MoeConfig(load_balancer=values)
+        with pytest.raises(ValidationError,
+                           match="requires `auxiliary_sms` >= 2; got 1"):
+            MoePerLayerDynamicLoadBalancerConfig(**values)
 
     def test_rejects_unknown_planner(self) -> None:
         values = self._per_layer_dynamic()
         values["planner"] = "halo_m"
-        with pytest.raises(ValidationError, match="planner"):
-            MoeConfig(load_balancer=values)
+        with pytest.raises(ValidationError,
+                           match=r"planner\n\s+Input should be 'halo_q' or "
+                           r"'halo_r'"):
+            MoePerLayerDynamicLoadBalancerConfig(**values)
 
     def test_standard_mode_rejects_planner(self) -> None:
         with pytest.raises(ValidationError):
