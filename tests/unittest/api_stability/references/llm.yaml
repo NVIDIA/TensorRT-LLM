@@ -401,6 +401,10 @@ methods:
     return_annotation: None
   generate:
     parameters:
+      kv_hints:
+        annotation: Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], List[Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], NoneType]], NoneType]
+        default: null
+        status: prototype
       disaggregated_params:
         annotation: Union[tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], NoneType]
         default: null
@@ -423,6 +427,10 @@ methods:
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
+      kv_hints:
+        annotation: Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], NoneType]
+        default: null
+        status: prototype
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
