@@ -139,6 +139,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
+            "mixed_nvfp4_fp8": QuantAlgo.FP8,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False
 

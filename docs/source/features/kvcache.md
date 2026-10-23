@@ -122,6 +122,52 @@ and pipelined KV transfer remain unsupported with V2 beam search.
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
+### Mixed-Precision KV Cache (Prototype)
+
+The V2 manager can store the full KV history of every full-attention layer in
+NVFP4 while keeping the first `mixed_precision_first_n` and the most recent
+`mixed_precision_last_n` tokens of each sequence in the regular KV dtype.
+Select it through `dtype`:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  dtype: mixed_nvfp4_bfloat16   # or mixed_nvfp4_fp8, mixed_nvfp4_float16
+  mixed_precision_first_n: 256
+  mixed_precision_last_n: 256
+  pool_ratio: [0.75, 0.25]      # optional, see below
+```
+
+The first part of the dtype names the history storage (NVFP4 values with one
+FP8 scale per 16 elements); the second part is the dtype attention computes
+in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
+select the unquantized model dtype. Retention follows the
+cache page granularity, and at least one of `mixed_precision_first_n` and
+`mixed_precision_last_n` must be positive.
+
+Each mixed-precision layer owns two pools: its original pool holds the NVFP4
+history, and a second layer group, appended after the model's own layer
+groups, holds the retained tokens. When `pool_ratio` is set it must therefore
+carry one more entry than the model has layer groups, with the retained-token
+group last; leave it unset to size all groups automatically. Sliding-window
+layers and layers whose KV is shared with another layer stay native.
+
+Before a mixed-precision layer runs, the attention metadata gathers the two
+pools into a staging copy in the attention dtype and writes the new tokens
+back afterwards, so attention kernels are unchanged. The staging copy is
+allocated once per rank from the attention buffer pool and sized as
+`max_num_sequences x ceil(max_seq_len / page) x largest local layer page`,
+with KV heads already sharded across tensor-parallel ranks; its size is
+logged at startup and the KV budget profiling run accounts for it. Each
+forward converts up to the longest sequence in the batch for every
+mixed-precision layer (the full span inside CUDA graphs), which is the
+feature's per-step cost.
+
+The prototype requires the TRTLLM or FlashInfer attention backend with
+`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
+beam search, sparse attention, cold-page compression or context parallelism.
+
 ### SWA Endpoint Retention
 
 To prefer cached sliding-window attention (SWA) blocks near a prompt's endpoint

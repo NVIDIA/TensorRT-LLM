@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
-                    List, Literal, Optional, Set, Tuple, Type, TypeAlias,
-                    TypeVar, Union, get_args, get_origin)
+                    List, Literal, NamedTuple, Optional, Set, Tuple, Type,
+                    TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -4824,6 +4824,23 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
+# Mixed-precision KV dtype: "mixed_<history dtype>_<retained dtype>". The
+# first/last retained tokens and the attention inputs use the second dtype;
+# the full history is stored in the first. Requires KV cache manager V2.
+_MIXED_PRECISION_KV_DTYPE = re.compile(
+    r"^mixed_(?P<low>nvfp4)_(?P<high>fp8|float16|bfloat16)$")
+_MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
+                                   for high in ("fp8", "float16", "bfloat16"))
+
+
+class MixedPrecisionKV(NamedTuple):
+    """Layout of a mixed-precision KV cache, parsed from KvCacheConfig."""
+    low: str
+    high: str
+    first_n: int
+    last_n: int
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4941,12 +4958,31 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
+        "keeps the first and last N tokens of every sequence in <dtype> "
+        "('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "
+        "mixed_precision_last_n; requires KV cache manager V2. "
         "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4"))
+                                             "nvfp4",
+                                             *_MIXED_PRECISION_KV_DTYPES))
+
+    mixed_precision_first_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: number of leading tokens per sequence kept at the "
+        "retained dtype. Retention follows the cache page granularity.")
+
+    mixed_precision_last_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: number of most recent tokens per sequence kept at "
+        "the retained dtype. Retention follows the cache page granularity.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5165,10 +5201,23 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
+        if _MIXED_PRECISION_KV_DTYPE.match(v):
+            return v
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", or valid torch.dtype string')
+            '"nvfp4", "mixed_nvfp4_<fp8|float16|bfloat16>", or valid '
+            'torch.dtype string')
+
+    @property
+    def mixed_precision_kv(self) -> Optional[MixedPrecisionKV]:
+        """Layout of a mixed-precision KV cache, else None."""
+        match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
+        if match is None:
+            return None
+        return MixedPrecisionKV(match["low"], match["high"],
+                                self.mixed_precision_first_n,
+                                self.mixed_precision_last_n)
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5326,6 +5375,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
+
+    @model_validator(mode='after')
+    def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
+        """A mixed-precision cache must retain at least one token per sequence."""
+        if (self.mixed_precision_kv is not None and self.mixed_precision_first_n
+                == self.mixed_precision_last_n == 0):
+            raise ValueError(
+                "Mixed-precision KV requires mixed_precision_first_n or "
+                "mixed_precision_last_n to be greater than zero.")
+        return self
 
     @field_validator('pool_ratio')
     @classmethod
@@ -7072,6 +7131,38 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
+        """Reject runtime features the mixed-precision KV cache does not support."""
+        if self.kv_cache_config.mixed_precision_kv is None:
+            return self
+        if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
+            raise ValueError(
+                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+            )
+        # get_attention_backend matches the name case-insensitively.
+        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+            raise ValueError(
+                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
+                f"backends; got attn_backend={self.attn_backend!r}.")
+        if self.sparse_attention_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with sparse attention."
+            )
+        # The connector layout maps every cache layer to one model layer; the
+        # retained-token layers break that mapping.
+        if self.kv_connector_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with a KV connector."
+            )
+        if (self.speculative_config is not None
+                or self.kv_cache_compression_config is not None
+                or self.max_beam_width != 1):
+            raise ValueError(
+                "Mixed-precision KV currently requires single-beam execution "
+                "without speculative decoding or cold-page compression.")
+        return self
+
+    @model_validator(mode="after")
     def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
         if (self.disable_mm_encoder
                 and self.multimodal_config.encoder_cache_max_bytes != 0):
@@ -7802,10 +7893,15 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla',
+                                            'mixed_nvfp4_fp8'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif self.kv_cache_config.dtype in ('mixed_nvfp4_float16',
+                                            'mixed_nvfp4_bfloat16'):
+            # Retained tokens stay in the model dtype: no KV quantization.
+            self.quant_config.kv_cache_quant_algo = None
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
