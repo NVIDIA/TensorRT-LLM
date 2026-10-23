@@ -678,7 +678,7 @@ protected:
             self.kv_lora_rank, self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim,
             self.predicted_tokens_per_seq, self.mla_layer_num, self.rope_append, self.sage_attn_num_elts_per_blk_q,
             self.sage_attn_num_elts_per_blk_k, self.sage_attn_num_elts_per_blk_v, self.sage_attn_qk_int8,
-            self.sage_attn_smooth_k, self.skip_correction_threshold);
+            self.sage_attn_smooth_k, self.skip_correction_threshold, self.locality_domain_id);
     }
 
     int device = 0;
@@ -719,6 +719,8 @@ protected:
     bool sage_attn_qk_int8 = false;
     bool sage_attn_smooth_k = false;
     double skip_correction_threshold = 0.0;
+    // Each locality domain runs on its own stream, so it gets its own op and scratch state.
+    std::int64_t locality_domain_id = -1;
 
     // Op state, derived from the device and the key members; not part of the key. Set by
     // the `TrtllmAttention` constructor. MLA overrides the head geometry for its latent KV

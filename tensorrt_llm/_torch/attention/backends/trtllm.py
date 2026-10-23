@@ -18,7 +18,8 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
                     List, Optional, Tuple)
 
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .sparse.dsa.metadata import TokenMajorGenView
 
+from itertools import accumulate
+
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
@@ -44,6 +47,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantMode
 
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
+from ...locality_domain.runtime import LocalityDomainRuntime
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
@@ -64,6 +68,12 @@ from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+
+# Set to 0 to run the locality domains one at a time instead of concurrently.
+# Each domain still uses its own stream, workspace and metadata, so only the
+# overlap is lost -- useful for telling a partitioning bug apart from a race.
+_LOCALITY_DOMAIN_TWO_STREAM = os.environ.get(
+    "TRTLLM_LOCALITY_DOMAIN_TWO_STREAM_ATTN", "1") == "1"
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -304,6 +314,34 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         return min(self.max_seq_len, self.max_num_tokens)
 
+    # Locality domain two-kernel attention fields (backend-specific, not in interface.py)
+    locality_domain_enabled: bool = False
+    locality_domain_runtime: Optional[LocalityDomainRuntime] = None
+    locality_domain_num_ctx_tokens: Optional[List[int]] = None
+    locality_domain_num_gen_tokens: Optional[List[int]] = None
+    # Cumulative boundary arrays of length N+1 (N = num_locality_domains).
+    # locality_domain_ctx_req_splits[i]..[i+1] is the range of context requests
+    # belonging to locality domain i.
+    locality_domain_ctx_req_splits: Optional[List[int]] = None
+    locality_domain_gen_req_splits: Optional[List[int]] = None
+    locality_domain_ctx_token_splits: Optional[List[int]] = None
+    locality_domain_gen_token_splits: Optional[List[int]] = None
+    locality_domain_kv_cache_block_offsets: Optional[List[torch.Tensor]] = None
+    draft_locality_domain_kv_cache_block_offsets: Optional[List[
+        torch.Tensor]] = None
+    # Per-locality-domain MLA generation state computed by mla_rope_generation.
+    locality_domain_mla_gen_state: Optional[List[Optional[dict]]] = None
+    # Pre-allocated per-locality-domain workspaces.
+    locality_domain_workspaces: Optional[List[torch.Tensor]] = None
+    locality_domain_cuda_graph_workspaces: Optional[List[torch.Tensor]] = None
+    # Per-domain trtllm-gen tree mask buffers; entry 0 is None (domain 0 keeps
+    # spec_decoding_bl_tree_mask).
+    locality_domain_spec_decoding_bl_tree_masks: Optional[List[Optional[
+        torch.Tensor]]] = None
+    # Layout whose domain slices last passed _validate_locality_domain_coverage;
+    # the check reruns only when the layout changes.
+    locality_domain_validated_layout: Optional[tuple] = None
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -452,6 +490,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
                 dtype=torch.int8,
             )
+
+        self._ensure_locality_domain_workspaces()
 
         if self.kv_cache_manager is not None:
             num_attention_op_pools = getattr(self.kv_cache_manager,
@@ -666,6 +706,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.on_update_kv_lens(self)
 
+    def _ensure_locality_domain_workspaces(self) -> None:
+        if not self.locality_domain_enabled:
+            return
+
+        num_locality_domains = (self.kv_cache_manager.num_locality_domains
+                                if self.kv_cache_manager is not None else 2)
+        if (not self.is_cuda_graph and
+            (self.locality_domain_workspaces is None
+             or len(self.locality_domain_workspaces) != num_locality_domains)):
+            self.locality_domain_workspaces = [
+                torch.empty(0, device='cuda', dtype=torch.int8)
+                for _ in range(num_locality_domains)
+            ]
+        if (self.locality_domain_cuda_graph_workspaces is None
+                or len(self.locality_domain_cuda_graph_workspaces)
+                != num_locality_domains):
+            self.locality_domain_cuda_graph_workspaces = [
+                torch.empty(0, device='cuda', dtype=torch.int8)
+                for _ in range(num_locality_domains)
+            ]
+
     def update_for_spec_dec(self) -> None:
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
@@ -680,6 +741,92 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
         self._cute_dsl_mla_split_plan_key = None
+
+        if (not self.locality_domain_enabled or self.kv_cache_manager is None
+                or self.request_ids is None):
+            return
+
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        sequence_lengths = self.seq_lens[:self.num_seqs].tolist()
+
+        per_locality_domain_ctx_reqs = [0] * num_locality_domains
+        per_locality_domain_ctx_tokens = [0] * num_locality_domains
+        per_locality_domain_gen_reqs = [0] * num_locality_domains
+        per_locality_domain_gen_tokens = [0] * num_locality_domains
+
+        def locality_domain_from_splits(splits: Optional[List[int]],
+                                        local_req_idx: int) -> Optional[int]:
+            if splits is None:
+                return None
+            for locality_domain_idx in range(len(splits) - 1):
+                if splits[locality_domain_idx] <= local_req_idx < splits[
+                        locality_domain_idx + 1]:
+                    return locality_domain_idx
+            return None
+
+        old_ctx_req_splits = self.locality_domain_ctx_req_splits
+        old_gen_req_splits = self.locality_domain_gen_req_splits
+        for req_idx, request_id in enumerate(self.request_ids[:self.num_seqs]):
+            if req_idx < self.num_contexts:
+                locality_domain_id = locality_domain_from_splits(
+                    old_ctx_req_splits, req_idx)
+                if locality_domain_id is None:
+                    locality_domain_id = self.kv_cache_manager.get_locality_domain(
+                        request_id)
+                per_locality_domain_ctx_reqs[locality_domain_id] += 1
+                per_locality_domain_ctx_tokens[
+                    locality_domain_id] += sequence_lengths[req_idx]
+            else:
+                gen_req_idx = req_idx - self.num_contexts
+                locality_domain_id = locality_domain_from_splits(
+                    old_gen_req_splits, gen_req_idx)
+                if locality_domain_id is None:
+                    locality_domain_id = self.kv_cache_manager.get_locality_domain(
+                        request_id)
+                per_locality_domain_gen_reqs[locality_domain_id] += 1
+                per_locality_domain_gen_tokens[
+                    locality_domain_id] += sequence_lengths[req_idx]
+        self.locality_domain_ctx_req_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_reqs))
+        self.locality_domain_gen_req_splits = [0] + list(
+            accumulate(per_locality_domain_gen_reqs))
+        self.locality_domain_ctx_token_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_tokens))
+        self.locality_domain_gen_token_splits = [0] + list(
+            accumulate(per_locality_domain_gen_tokens))
+        self.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
+        self.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
+
+        if self.host_request_types is not None:
+            self.host_request_types[:self.num_contexts].fill_(0)
+            self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
+        if self.kv_cache_block_offsets is not None:
+            self.locality_domain_kv_cache_block_offsets = (
+                self.build_locality_domain_block_offsets(
+                    self.kv_cache_block_offsets,
+                    '_locality_domain_block_offsets_buf'))
+
+        if self.draft_kv_cache_block_offsets is not None:
+            self.draft_locality_domain_kv_cache_block_offsets = (
+                self.build_locality_domain_block_offsets(
+                    self.draft_kv_cache_block_offsets,
+                    '_draft_locality_domain_block_offsets_buf'))
+
+        if not hasattr(self, '_locality_domain_host_total_kv_lens_buf'):
+            self._locality_domain_host_total_kv_lens_buf = [
+                torch.zeros(2, dtype=torch.int, device='cpu')
+                for _ in range(num_locality_domains)
+            ]
+
+        if self.is_cuda_graph:
+            for locality_domain_idx in range(num_locality_domains):
+                buf = self._locality_domain_host_total_kv_lens_buf[
+                    locality_domain_idx]
+                buf[0] = self.max_seq_len * per_locality_domain_ctx_reqs[
+                    locality_domain_idx]
+                buf[1] = self.max_seq_len * per_locality_domain_gen_reqs[
+                    locality_domain_idx]
 
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
@@ -790,6 +937,51 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
             cp_size=self.mapping.cp_size,
             cp_rank=self.mapping.cp_rank)
+
+    def build_locality_domain_block_offsets(
+        self,
+        source_block_offsets: Optional[torch.Tensor],
+        buffer_attr: str,
+    ) -> Optional[List[torch.Tensor]]:
+        if (not self.locality_domain_enabled or source_block_offsets is None
+                or self.kv_cache_manager is None):
+            return None
+
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        buffers = getattr(self, buffer_attr, None)
+        if buffers is None:
+            buffers = [
+                torch.zeros_like(source_block_offsets)
+                for _ in range(num_locality_domains)
+            ]
+            setattr(self, buffer_attr, buffers)
+
+        packed_block_offsets = []
+        num_ctx = self.num_contexts
+        for locality_domain_idx in range(num_locality_domains):
+            ctx_start = self.locality_domain_ctx_req_splits[locality_domain_idx]
+            ctx_end = self.locality_domain_ctx_req_splits[locality_domain_idx +
+                                                          1]
+            gen_start = num_ctx + self.locality_domain_gen_req_splits[
+                locality_domain_idx]
+            gen_end = num_ctx + self.locality_domain_gen_req_splits[
+                locality_domain_idx + 1]
+            num_ctx_reqs = ctx_end - ctx_start
+            num_gen_reqs = gen_end - gen_start
+            num_seqs = num_ctx_reqs + num_gen_reqs
+            block_offsets = buffers[locality_domain_idx]
+            block_offsets.zero_()
+            if num_seqs > 0:
+                if num_ctx_reqs > 0:
+                    block_offsets[:, :num_ctx_reqs].copy_(
+                        source_block_offsets[:, ctx_start:ctx_end],
+                        non_blocking=True)
+                if num_gen_reqs > 0:
+                    block_offsets[:, num_ctx_reqs:num_seqs].copy_(
+                        source_block_offsets[:, gen_start:gen_end],
+                        non_blocking=True)
+            packed_block_offsets.append(block_offsets)
+        return packed_block_offsets
 
     def _bind_runtime_views(
         self,
@@ -1092,6 +1284,64 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.num_seqs,
                     max_blocks=max_blocks)
 
+            # Build per-locality-domain block offsets for fork-join attention.
+            if self.locality_domain_enabled:
+                self._ensure_locality_domain_workspaces()
+                num_locality_domains = self.kv_cache_manager.num_locality_domains
+
+                if not hasattr(self, '_locality_domain_host_total_kv_lens_buf'):
+                    self._locality_domain_host_total_kv_lens_buf = [
+                        torch.zeros(2, dtype=torch.int, device='cpu')
+                        for _ in range(num_locality_domains)
+                    ]
+
+                self.locality_domain_kv_cache_block_offsets = (
+                    self.build_locality_domain_block_offsets(
+                        self.kv_cache_block_offsets,
+                        '_locality_domain_block_offsets_buf'))
+
+                if (self.draft_kv_cache_manager is not None and getattr(
+                        self.draft_kv_cache_manager, 'fork_join_attn', False)):
+                    self.draft_locality_domain_kv_cache_block_offsets = (
+                        self.build_locality_domain_block_offsets(
+                            self.draft_kv_cache_block_offsets,
+                            '_draft_locality_domain_block_offsets_buf'))
+
+                num_ctx = self.num_contexts
+                for locality_domain_idx in range(num_locality_domains):
+                    ctx_start = self.locality_domain_ctx_req_splits[
+                        locality_domain_idx]
+                    ctx_end = self.locality_domain_ctx_req_splits[
+                        locality_domain_idx + 1]
+                    gen_start = num_ctx + self.locality_domain_gen_req_splits[
+                        locality_domain_idx]
+                    gen_end = num_ctx + self.locality_domain_gen_req_splits[
+                        locality_domain_idx + 1]
+                    num_ctx_reqs = ctx_end - ctx_start
+                    num_gen_reqs = gen_end - gen_start
+
+                    if self.is_cuda_graph:
+                        # CUDA graph capture bakes host-side launch scalars into
+                        # thop.attention. Use conservative per-domain bounds so a graph
+                        # captured for one decode length can replay for later, longer
+                        # decode steps with the same request split.
+                        ctx_total_kv_length = self.max_seq_len * num_ctx_reqs
+                        gen_total_kv_length = self.max_seq_len * num_gen_reqs
+                    else:
+                        ctx_total_kv_length = (
+                            kv_lens[ctx_start:ctx_end].sum().item()
+                            if num_ctx_reqs > 0 else 0)
+                        gen_total_kv_length = (
+                            kv_lens[gen_start:gen_end].sum().item()
+                            if num_gen_reqs > 0 else 0)
+                    buf = self._locality_domain_host_total_kv_lens_buf[
+                        locality_domain_idx]
+                    buf[0] = ctx_total_kv_length
+                    buf[1] = gen_total_kv_length
+
+                self.locality_domain_mla_gen_state = [None
+                                                      ] * num_locality_domains
+
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
         # kv_lens_runtime, which becomes host_past_key_value_lengths and
@@ -1107,6 +1357,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens_runtime = kv_lens[:self.num_seqs]
             prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
             prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
+        # Under locality-domain CUDA graphs, host-side launch scalars are captured per
+        # sub-call, so use conservative bounds while keeping the device sequence
+        # tensors and prompt lengths actual.
+        if self.is_cuda_graph and self.locality_domain_enabled:
+            kv_lens_runtime = torch.full_like(kv_lens[:self.num_seqs],
+                                              self.max_seq_len)
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
             kv_lens=kv_lens_runtime,
@@ -1495,6 +1751,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
             )
 
+    def _ensure_locality_domain_spec_bl_tree_masks(self) -> None:
+        if not self.locality_domain_enabled or self.kv_cache_manager is None:
+            return
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        if num_locality_domains <= 1 or self.spec_decoding_bl_tree_mask is None:
+            return
+        masks = self.locality_domain_spec_decoding_bl_tree_masks
+        if (masks is None or len(masks) != num_locality_domains
+                or any(mask.shape != self.spec_decoding_bl_tree_mask.shape
+                       for mask in masks[1:])):
+            self.locality_domain_spec_decoding_bl_tree_masks = [None] + [
+                torch.zeros_like(self.spec_decoding_bl_tree_mask)
+                for _ in range(num_locality_domains - 1)
+            ]
+
     def update_blackwell_first_sparse_mask_offset(self) -> None:
         """Fill gen slots [0:ng) with (kv_lens_cuda - seq_lens); in-place for CUDA graph."""
         nc = self.num_contexts
@@ -1591,10 +1862,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
                 self.spec_decoding_param_prepare_for_blackwell()
+                self._ensure_locality_domain_spec_bl_tree_masks()
             else:
                 self.spec_decoding_bl_tree_mask_offset = None
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
+                self.locality_domain_spec_decoding_bl_tree_masks = None
 
             # Case 1: dynamic tree — copy per-request params from spec_tree_manager.
             if self.is_spec_dec_dynamic_tree:
@@ -1664,6 +1937,635 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def is_sm_version_trtllm_gen_kernel(self, sm):
         return is_sm_100f(sm)
+
+
+def _get_generation_only_token_splits(
+    metadata: TrtllmAttentionMetadata,
+    total_gen_tokens: Optional[int],
+) -> Tuple[List[int], List[int]]:
+    gen_token_splits = metadata.locality_domain_gen_token_splits
+    per_locality_domain_gen_tokens = metadata.locality_domain_num_gen_tokens
+
+    if (total_gen_tokens is None or gen_token_splits is None
+            or per_locality_domain_gen_tokens is None
+            or metadata.num_generations == 0):
+        return gen_token_splits, per_locality_domain_gen_tokens
+
+    expected_total_gen_tokens = gen_token_splits[-1]
+    if total_gen_tokens == expected_total_gen_tokens:
+        return gen_token_splits, per_locality_domain_gen_tokens
+
+    # MTP draft forwards can shrink the live q/fused_q tensor without
+    # rebuilding the cached locality domain token splits. Request ordering is still
+    # locality domain-contiguous, so rebuild generation token boundaries from the
+    # current token count for this forward.
+    if total_gen_tokens % metadata.num_generations != 0:
+        raise RuntimeError(
+            "locality domain generation-only attention received a token count that "
+            "cannot be partitioned evenly across generation requests: "
+            f"{total_gen_tokens=} {metadata.num_generations=}")
+
+    tokens_per_generation_request = total_gen_tokens // metadata.num_generations
+    current_gen_token_splits = [0]
+    current_per_locality_domain_gen_tokens = []
+    for locality_domain_idx in range(
+            len(metadata.locality_domain_gen_req_splits) - 1):
+        num_gen_reqs = (
+            metadata.locality_domain_gen_req_splits[locality_domain_idx + 1] -
+            metadata.locality_domain_gen_req_splits[locality_domain_idx])
+        locality_domain_gen_tokens = num_gen_reqs * tokens_per_generation_request
+        current_per_locality_domain_gen_tokens.append(
+            locality_domain_gen_tokens)
+        current_gen_token_splits.append(current_gen_token_splits[-1] +
+                                        locality_domain_gen_tokens)
+
+    return current_gen_token_splits, current_per_locality_domain_gen_tokens
+
+
+def _build_locality_domain_slices(metadata: TrtllmAttentionMetadata,
+                                  locality_domain_id: int,
+                                  attention_input_type: AttentionInputType,
+                                  total_gen_tokens: Optional[int] = None,
+                                  dense_ctx_kv: bool = False):
+    """Build per-locality domain request/token slices and metadata tensors.
+
+    Returns a dict with per-locality domain counts, slices, and metadata tensors,
+    or None if this locality domain has no tokens for the given phase.
+
+    When ``dense_ctx_kv`` is True (MLA cached-KV / chunked-prefill context),
+    ctx k/v rows are laid out by per-request KV length (cached+new or
+    chunk-sized), not by per-request Q length. The returned
+    ``ctx_kv_token_start/end`` give the per-locality domain k/v slice for that layout;
+    callers continue to use ``ctx_token_start/end`` for q/q_pe. When False,
+    the KV range equals the Q range (current behavior).
+    """
+    num_ctx = metadata.num_contexts
+    ctx_req_splits = metadata.locality_domain_ctx_req_splits
+    gen_req_splits = metadata.locality_domain_gen_req_splits
+    ctx_token_splits = metadata.locality_domain_ctx_token_splits
+    gen_token_splits = metadata.locality_domain_gen_token_splits
+    total_ctx_tokens = sum(metadata.locality_domain_num_ctx_tokens)
+    if attention_input_type == AttentionInputType.generation_only:
+        gen_token_splits, _ = _get_generation_only_token_splits(
+            metadata, total_gen_tokens)
+
+    # Request slices via cumulative boundary arrays
+    ctx_req_start = ctx_req_splits[locality_domain_id]
+    ctx_req_end = ctx_req_splits[locality_domain_id + 1]
+    gen_req_start = num_ctx + gen_req_splits[locality_domain_id]
+    gen_req_end = num_ctx + gen_req_splits[locality_domain_id + 1]
+
+    # Token slices depend on attention_input_type
+    if attention_input_type == AttentionInputType.generation_only:
+        ctx_token_start, ctx_token_end = 0, 0
+        gen_token_start = gen_token_splits[locality_domain_id]
+        gen_token_end = gen_token_splits[locality_domain_id + 1]
+    elif attention_input_type == AttentionInputType.context_only:
+        # context_only: q/k/v tensors have ONLY context tokens.
+        # Gen token slices must be zero so _locality_domain_cat_slices returns a
+        # view (preserving strides) instead of torch.cat (which makes
+        # a contiguous copy).  A contiguous V copy breaks the TMA
+        # descriptor stride assumption in the FMHA kernel.
+        ctx_token_start = ctx_token_splits[locality_domain_id]
+        ctx_token_end = ctx_token_splits[locality_domain_id + 1]
+        gen_token_start, gen_token_end = 0, 0
+    else:
+        # mixed: combined [ctx_tokens | gen_tokens] layout
+        ctx_token_start = ctx_token_splits[locality_domain_id]
+        ctx_token_end = ctx_token_splits[locality_domain_id + 1]
+        gen_token_start = total_ctx_tokens + gen_token_splits[locality_domain_id]
+        gen_token_end = total_ctx_tokens + gen_token_splits[locality_domain_id +
+                                                            1]
+
+    # For generation_only (MLA), exclude context requests from per-request
+    # metadata.  The mla_rope_generation C++ kernel expects token tensors
+    # and per-request metadata to be consistent — token buffers have only
+    # gen tokens, so the metadata must also cover only gen requests.
+    if attention_input_type == AttentionInputType.generation_only:
+        ctx_req_start = ctx_req_end  # zero-width context range
+
+    num_ctx_reqs = ctx_req_end - ctx_req_start
+    num_gen_reqs = gen_req_end - gen_req_start
+    num_ctx_tokens = ctx_token_end - ctx_token_start
+    num_gen_tokens = gen_token_end - gen_token_start
+    num_tokens = num_ctx_tokens + num_gen_tokens
+
+    # Dense-KV ctx slicing: rows of k/v are laid out by per-req kv_len
+    # (cached+new or chunk-sized), contiguous per request. The per-locality domain
+    # boundary is the running sum of ``kv_lens_runtime`` over preceding
+    # locality domains' ctx requests. Derived dynamically so chunked prefill (which
+    # rewrites ``kv_lens_runtime`` per loop iter) works without extra
+    # metadata. When not dense, fall through to the Q range.
+    if dense_ctx_kv and attention_input_type == AttentionInputType.context_only:
+        assert metadata.kv_lens_runtime is not None, (
+            "dense_ctx_kv requires kv_lens_runtime to be prepared")
+        all_ctx_kv_lens = metadata.kv_lens_runtime[:num_ctx]
+        ctx_kv_token_start = int(
+            all_ctx_kv_lens[:ctx_req_splits[locality_domain_id]].sum().item())
+        ctx_kv_token_end = int(
+            all_ctx_kv_lens[:ctx_req_splits[locality_domain_id +
+                                            1]].sum().item())
+    else:
+        ctx_kv_token_start = ctx_token_start
+        ctx_kv_token_end = ctx_token_end
+
+    if num_tokens == 0:
+        return None
+    if attention_input_type == AttentionInputType.context_only and num_ctx_tokens == 0:
+        return None
+    if attention_input_type == AttentionInputType.generation_only and num_gen_tokens == 0:
+        return None
+
+    # Per-request metadata: repack ctx + gen contiguously
+    num_seqs = num_ctx_reqs + num_gen_reqs
+    if num_seqs == 0:
+        return None
+    if attention_input_type == AttentionInputType.generation_only:
+        # Gen-only: context range is empty (ctx_req_start==ctx_req_end),
+        # use views directly.
+        # Eliminates torch.cat allocations — CUDA-graph-safe.
+        sequence_lengths = metadata.kv_lens_cuda_runtime[
+            gen_req_start:gen_req_end]
+        kv_lengths = metadata.kv_lens_runtime[gen_req_start:gen_req_end]
+        prompt_lengths_cuda = metadata.prompt_lens_cuda_runtime[
+            gen_req_start:gen_req_end]
+        prompt_lengths_cpu = metadata.prompt_lens_cpu_runtime[
+            gen_req_start:gen_req_end]
+        host_context_lengths = prompt_lengths_cpu
+        if metadata.is_cuda_graph:
+            # attentionOp.cpp captures max(host_context_lengths) as a launch
+            # scalar. Use the same graph launch bounds as host KV lengths for
+            # gen-only locality domain graphs so a graph captured on a short prompt can
+            # replay on later, longer prompts.
+            host_context_lengths = kv_lengths
+        request_types = metadata.host_request_types_runtime[
+            gen_req_start:gen_req_end]
+        host_total_kv_lengths = metadata._locality_domain_host_total_kv_lens_buf[
+            locality_domain_id]
+    else:
+        sequence_lengths = torch.cat([
+            metadata.kv_lens_cuda_runtime[ctx_req_start:ctx_req_end],
+            metadata.kv_lens_cuda_runtime[gen_req_start:gen_req_end]
+        ])
+        kv_lengths = torch.cat([
+            metadata.kv_lens_runtime[ctx_req_start:ctx_req_end],
+            metadata.kv_lens_runtime[gen_req_start:gen_req_end]
+        ])
+        prompt_lengths_cuda = torch.cat([
+            metadata.prompt_lens_cuda_runtime[ctx_req_start:ctx_req_end],
+            metadata.prompt_lens_cuda_runtime[gen_req_start:gen_req_end]
+        ])
+        prompt_lengths_cpu = torch.cat([
+            metadata.prompt_lens_cpu_runtime[ctx_req_start:ctx_req_end],
+            metadata.prompt_lens_cpu_runtime[gen_req_start:gen_req_end]
+        ])
+        host_context_lengths = prompt_lengths_cpu
+        request_types = torch.cat([
+            metadata.host_request_types_runtime[ctx_req_start:ctx_req_end],
+            metadata.host_request_types_runtime[gen_req_start:gen_req_end]
+        ])
+        if dense_ctx_kv:
+            # Dense-KV callers (MLA cached-KV / chunked-prefill context) rebind
+            # ``metadata.kv_lens_runtime`` per call to reflect the actual row
+            # count of the passed k/v, so the stale
+            # ``_locality_domain_host_total_kv_lens_buf`` captured at prepare() no longer
+            # matches the kernel inputs. Recompute from the live runtime tensor.
+            host_total_kv_lengths = torch.tensor([
+                int(metadata.kv_lens_runtime[ctx_req_start:ctx_req_end].sum().
+                    item()),
+                int(metadata.kv_lens_runtime[gen_req_start:gen_req_end].sum().
+                    item())
+            ],
+                                                 dtype=torch.int,
+                                                 device='cpu')
+        else:
+            host_total_kv_lengths = metadata._locality_domain_host_total_kv_lens_buf[
+                locality_domain_id]
+
+    # The KV cache manager is shared across locality domains; per-locality domain addressing
+    # is encoded in the block offsets (KVCacheManagerV2 uses a single
+    # canonical pool pointer, with the locality domain-specific virtual-memory
+    # offset baked into the global page indices).
+    kv_cache_manager = metadata.kv_cache_manager
+
+    # The per-locality domain block offsets tensor is laid out as
+    # [ctx_block_offsets | gen_block_offsets].  For generation_only, the
+    # C++ kernel uses num_ctx_reqs=0 and expects gen entries at position 0.
+    # Re-index the block offsets so gen entries start at position 0.
+    block_offsets = metadata.locality_domain_kv_cache_block_offsets[
+        locality_domain_id]
+    if attention_input_type == AttentionInputType.generation_only and num_gen_reqs > 0:
+        # Compute the ctx count in the block offsets layout (from
+        # prepare_batch, which packs ctx requests before gen requests).
+        num_ctx_in_block_offsets = (ctx_req_splits[locality_domain_id + 1] -
+                                    ctx_req_splits[locality_domain_id])
+        if num_ctx_in_block_offsets > 0:
+            gen_block_offsets = torch.zeros_like(block_offsets)
+            gen_block_offsets[:, :num_gen_reqs].copy_(
+                block_offsets[:, num_ctx_in_block_offsets:
+                              num_ctx_in_block_offsets + num_gen_reqs])
+            block_offsets = gen_block_offsets
+
+    return {
+        'ctx_req_start': ctx_req_start,
+        'ctx_req_end': ctx_req_end,
+        'gen_req_start': gen_req_start,
+        'gen_req_end': gen_req_end,
+        'ctx_token_start': ctx_token_start,
+        'ctx_token_end': ctx_token_end,
+        'ctx_kv_token_start': ctx_kv_token_start,
+        'ctx_kv_token_end': ctx_kv_token_end,
+        'gen_token_start': gen_token_start,
+        'gen_token_end': gen_token_end,
+        'num_ctx_reqs': num_ctx_reqs,
+        'num_gen_reqs': num_gen_reqs,
+        'num_ctx_tokens': num_ctx_tokens,
+        'num_gen_tokens': num_gen_tokens,
+        'num_tokens': num_tokens,
+        'num_seqs': num_seqs,
+        'sequence_lengths': sequence_lengths,
+        'kv_lengths': kv_lengths,
+        'prompt_lengths_cuda': prompt_lengths_cuda,
+        'prompt_lengths_cpu': prompt_lengths_cpu,
+        'host_context_lengths': host_context_lengths,
+        'request_types': request_types,
+        'host_total_kv_lengths': host_total_kv_lengths,
+        'block_offsets': block_offsets,
+        'pool_pointers': kv_cache_manager.kv_cache_pool_pointers,
+        'pool_mapping': metadata.host_kv_cache_pool_mapping,
+        'kv_cache_manager': kv_cache_manager,
+    }
+
+
+def _check_locality_domain_side_inputs(metadata, forward_args) -> None:
+    """Reject per-request inputs the partition path does not slice.
+
+    Everything listed here is indexed by batch row or by token inside the
+    kernels, so handing a domain the full-batch tensor would read another
+    domain's rows. Raising beats a silent full-batch fallback that hides the
+    missing locality.
+    """
+    unsupported = []
+    # The scoped view clears block_ids_per_seq, which is the FlashMLA block table.
+    if getattr(metadata, "enable_flash_mla", False):
+        unsupported.append("FlashMLA")
+    if metadata.beam_width != 1:
+        unsupported.append(f"beam_width={metadata.beam_width}")
+    if metadata.is_cross or forward_args.cross_kv is not None:
+        unsupported.append("cross attention")
+    if metadata.enable_helix:
+        unsupported.append("helix parallelism")
+    if forward_args.attention_mask_data is not None:
+        unsupported.append("custom attention mask data")
+    sparse = forward_args.sparse_runtime_params
+    if sparse is not None and sparse.sparse_attn_indices is not None:
+        unsupported.append("sparse attention indices")
+    if (forward_args.mrope_rotary_cos_sin is not None
+            and forward_args.attention_input_type != AttentionInputType.mixed):
+        unsupported.append("MRoPE outside the mixed attention input type")
+    if unsupported:
+        raise NotImplementedError(
+            "Locality domain fork-join attention does not support "
+            f"{', '.join(unsupported)}; disable enable_locality_domains for "
+            "this configuration.")
+
+
+def _locality_domain_attention_enabled(attn, metadata, forward_args) -> bool:
+    """Whether this call should be split across locality domains."""
+    # The flag is the explicit opt-out: draft sub-forwards without their own
+    # per-domain layout clear it while the manager still reports two domains.
+    if not metadata.locality_domain_enabled:
+        return False
+    # output_sf is deliberately not checked here: an NVFP4 output quantization
+    # request that reaches this path is asserted on rather than silently run
+    # unpartitioned.
+    if forward_args.output is None:
+        return False
+    # MLA chunked-prefill context gathers k/v by per-request KV length, and a
+    # domain can hold a mix of chunk lengths including zero, which FMHA rejects.
+    # Leave it on the single-kernel path; generation in the same step still splits.
+    if (attn.is_mla_enable and forward_args.attention_input_type
+            == AttentionInputType.context_only
+            and forward_args.latent_cache is None
+            and metadata.runtime_features is not None
+            and metadata.runtime_features.chunked_prefill):
+        return False
+    kv_cache_manager = metadata.kv_cache_manager
+    if kv_cache_manager is None:
+        return False
+    if getattr(kv_cache_manager, "num_locality_domains", 1) <= 1:
+        return False
+    if metadata.locality_domain_gen_req_splits is None:
+        return False
+    _check_locality_domain_side_inputs(metadata, forward_args)
+    return True
+
+
+def _resize_locality_domain_workspaces_from_domain0(metadata) -> None:
+    """Propagate a workspace growth on domain 0 to the other domains.
+
+    The attention kernel resizes the workspace it is handed, so with one
+    workspace per domain only domain 0's grows.
+    """
+    workspaces = metadata.locality_domain_workspaces
+    if metadata.is_cuda_graph or workspaces is None:
+        return
+    target_numel = workspaces[0].numel()
+    if target_numel == 0:
+        return
+    runtime = metadata.locality_domain_runtime
+    for locality_domain_id, workspace in enumerate(workspaces[1:], start=1):
+        if workspace.numel() >= target_numel:
+            continue
+        with runtime.partition_context(locality_domain_id):
+            workspace.resize_(target_numel)
+
+
+_LOCALITY_DOMAIN_GEN_INDEXED_SPEC_FIELDS = (
+    "spec_decoding_generation_lengths",
+    "spec_decoding_packed_mask",
+    "spec_decoding_bl_tree_mask_offset",
+    "spec_bl_tree_first_sparse_mask_offset_kv",
+)
+
+
+def _locality_domain_mrope_overrides(forward_args, ld_slice, num_contexts,
+                                     num_q_rows):
+    """Slice the MRoPE inputs the way the kernels index them.
+
+    The context kernel reads cos/sin by batch-flat token row and the generation
+    kernels read position deltas by local generation batch index.
+    """
+    overrides = {}
+    cos_sin = forward_args.mrope_rotary_cos_sin
+    if cos_sin is not None:
+        ctx_start, ctx_end = ld_slice["ctx_token_start"], ld_slice[
+            "ctx_token_end"]
+        if ctx_end > ctx_start:
+            if num_q_rows <= 0 or cos_sin.numel() % num_q_rows != 0:
+                raise RuntimeError(
+                    f"mrope_rotary_cos_sin holds {cos_sin.numel()} values for "
+                    f"{num_q_rows} tokens; cannot slice it per locality domain")
+            per_token = cos_sin.numel() // num_q_rows
+            overrides["mrope_rotary_cos_sin"] = cos_sin.reshape(
+                -1)[ctx_start * per_token:ctx_end * per_token].view(1, -1)
+        else:
+            overrides["mrope_rotary_cos_sin"] = None
+    deltas = forward_args.mrope_position_deltas
+    if deltas is not None:
+        gen_start = ld_slice["gen_req_start"] - num_contexts
+        gen_end = ld_slice["gen_req_end"] - num_contexts
+        overrides["mrope_position_deltas"] = (deltas[gen_start:gen_end]
+                                              if gen_end > gen_start else None)
+    return overrides
+
+
+def _spans_tile(intervals, start, end) -> bool:
+    if any(a < 0 or b < a for a, b in intervals):
+        return False
+    spans = sorted((a, b) for a, b in intervals if b > a)
+    if not spans:
+        return start == end
+    if spans[0][0] != start or spans[-1][1] != end:
+        return False
+    return all(spans[i][1] == spans[i + 1][0] for i in range(len(spans) - 1))
+
+
+def _validate_locality_domain_coverage(metadata, prepared, attention_input_type,
+                                       num_q_rows, num_kv_rows,
+                                       dense_ctx_kv) -> None:
+    """Check on the host that the domain slices tile the live batch exactly.
+
+    Splits are built at prepare(); a draft rewrite that changes the layout
+    without a new prepare() would otherwise launch kernels over a subset of
+    the rows and leave the rest of the output unwritten. Python ints only, so
+    this never synchronizes.
+    """
+    slices = [prep["ld_slice"] for prep in prepared]
+
+    def spans(start_key, end_key):
+        return [(s[start_key], s[end_key]) for s in slices]
+
+    num_ctx = metadata.num_contexts
+    num_gen = metadata.num_generations
+    problems = []
+    batch_rows = metadata.kv_lens_runtime.shape[0]
+    if batch_rows != num_ctx + num_gen:
+        problems.append(f"runtime metadata has {batch_rows} rows for "
+                        f"{num_ctx} context + {num_gen} generation requests")
+    for s in slices:
+        if (s["num_ctx_tokens"] != s["ctx_token_end"] - s["ctx_token_start"]
+                or s["num_gen_tokens"]
+                != s["gen_token_end"] - s["gen_token_start"]):
+            problems.append(f"inconsistent token counts in slice {s}")
+    ctx_tokens = spans("ctx_token_start", "ctx_token_end")
+    gen_tokens = spans("gen_token_start", "gen_token_end")
+    ctx_reqs = spans("ctx_req_start", "ctx_req_end")
+    gen_reqs = spans("gen_req_start", "gen_req_end")
+    if attention_input_type == AttentionInputType.generation_only:
+        expected = [("generation tokens", gen_tokens, 0, num_q_rows),
+                    ("generation requests", gen_reqs, num_ctx,
+                     num_ctx + num_gen), ("context tokens", ctx_tokens, 0, 0)]
+    elif attention_input_type == AttentionInputType.context_only:
+        expected = [("context tokens", ctx_tokens, 0, num_q_rows),
+                    ("context requests", ctx_reqs, 0, num_ctx),
+                    ("generation tokens", gen_tokens, 0, 0)]
+        ctx_kv = spans("ctx_kv_token_start", "ctx_kv_token_end")
+        if dense_ctx_kv:
+            if num_kv_rows is not None:
+                expected.append(("context kv rows", ctx_kv, 0, num_kv_rows))
+        elif ctx_kv != ctx_tokens:
+            problems.append(f"context kv rows {ctx_kv} differ from context "
+                            f"tokens {ctx_tokens}")
+    else:
+        total_ctx_tokens = sum(metadata.locality_domain_num_ctx_tokens)
+        expected = [
+            ("context tokens", ctx_tokens, 0, total_ctx_tokens),
+            ("generation tokens", gen_tokens, total_ctx_tokens, num_q_rows),
+            ("context requests", ctx_reqs, 0, num_ctx),
+            ("generation requests", gen_reqs, num_ctx, num_ctx + num_gen)
+        ]
+    for label, intervals, start, end in expected:
+        if not _spans_tile(intervals, start, end):
+            problems.append(f"{label} {intervals} do not tile [{start}, {end})")
+    if problems:
+        raise RuntimeError(
+            "Locality domain attention slices do not cover the batch "
+            f"({attention_input_type.name}): " + "; ".join(problems))
+
+
+def _scatter_locality_domain_rows(dst, src, ld_slice, num_ctx_tokens,
+                                  num_gen_tokens) -> None:
+    if num_ctx_tokens > 0:
+        dst[ld_slice["ctx_token_start"]:ld_slice["ctx_token_end"]] = (
+            src[:num_ctx_tokens])
+    if num_gen_tokens > 0:
+        dst[ld_slice["gen_token_start"]:ld_slice["gen_token_end"]] = (
+            src[num_ctx_tokens:])
+
+
+@contextmanager
+def _locality_domain_metadata(metadata, ld_slice, locality_domain_id):
+    """Point the shared metadata at one locality domain's rows for the duration.
+
+    The FMHA backends read their per-request tensors off ``metadata`` rather than
+    taking them as arguments, so a per-domain call is expressed by swapping those
+    fields for the domain's slices and restoring them afterwards.
+    """
+    overrides = {
+        "kv_lens_cuda_runtime": ld_slice["sequence_lengths"],
+        "kv_lens_runtime": ld_slice["kv_lengths"],
+        "prompt_lens_cuda_runtime": ld_slice["prompt_lengths_cuda"],
+        "prompt_lens_cpu_runtime": ld_slice["prompt_lengths_cpu"],
+        "host_request_types_runtime": ld_slice["request_types"],
+        "host_total_kv_lens": ld_slice["host_total_kv_lengths"],
+        "kv_cache_block_offsets": ld_slice["block_offsets"],
+        # pool pointers/mapping are read-only and identical for every domain.
+        # The counts go on the private fields: the property setters call
+        # on_update(), which would recompute them from the full-batch seq_lens.
+        "_num_contexts": ld_slice["num_ctx_reqs"],
+        "_num_generations": ld_slice["num_gen_reqs"],
+        "_num_ctx_tokens": ld_slice["num_ctx_tokens"],
+        "_num_tokens": ld_slice["num_tokens"],
+        # Indexed by sequence over the whole batch, so it cannot describe a
+        # single domain's rows.
+        "block_ids_per_seq": None,
+    }
+    if metadata.use_spec_decoding:
+        # The generation kernels index these by the local generation batch
+        # index, so each domain gets its own rows.
+        gen_start = ld_slice["gen_req_start"] - metadata.num_contexts
+        gen_end = ld_slice["gen_req_end"] - metadata.num_contexts
+        for name in _LOCALITY_DOMAIN_GEN_INDEXED_SPEC_FIELDS:
+            tensor = getattr(metadata, name, None)
+            if tensor is not None:
+                overrides[name] = tensor[gen_start:gen_end]
+        if metadata.spec_decoding_position_offsets is not None:
+            # Dynamic trees write the offsets compactly, row width
+            # max_total_draft_tokens + 1, into a buffer whose allocation width
+            # may be larger; slice the compact view so later domains start at
+            # the right row.
+            offsets = metadata.spec_decoding_position_offsets_cpp
+            if offsets is None or offsets.dim() != 2:
+                offsets = metadata.spec_decoding_position_offsets_for_cpp
+            offsets = offsets[gen_start:gen_end]
+            overrides["spec_decoding_position_offsets"] = offsets
+            overrides["spec_decoding_position_offsets_cpp"] = offsets
+        # prepareCustomMask writes the trtllm-gen tree mask from offset 0 on
+        # every call, so concurrent domains cannot share one mask buffer.
+        masks = metadata.locality_domain_spec_decoding_bl_tree_masks
+        if (masks is not None and locality_domain_id < len(masks)
+                and masks[locality_domain_id] is not None):
+            overrides["spec_decoding_bl_tree_mask"] = masks[locality_domain_id]
+    # Each domain needs its own scratch: the streams run concurrently, so a
+    # shared workspace would be a data race. ``effective_workspace`` picks
+    # between these two by ``is_cuda_graph``, so override both.
+    for name, per_domain in (("workspace", metadata.locality_domain_workspaces),
+                             ("cuda_graph_workspace",
+                              metadata.locality_domain_cuda_graph_workspaces)):
+        if per_domain is not None and locality_domain_id < len(per_domain):
+            overrides[name] = per_domain[locality_domain_id]
+    saved = {k: getattr(metadata, k) for k in overrides}
+    try:
+        for name, value in overrides.items():
+            setattr(metadata, name, value)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(metadata, name, value)
+
+
+def _locality_domain_cat_slices(t, ctx_token_start, ctx_token_end,
+                                gen_token_start, gen_token_end, num_ctx_tokens,
+                                num_gen_tokens):
+    """Cat context and generation token slices for a locality domain."""
+    if t is None:
+        return None
+    if num_ctx_tokens > 0 and num_gen_tokens > 0:
+        return torch.cat([
+            t[ctx_token_start:ctx_token_end], t[gen_token_start:gen_token_end]
+        ],
+                         dim=0)
+    return t[ctx_token_start:ctx_token_end] if num_gen_tokens == 0 else t[
+        gen_token_start:gen_token_end]
+
+
+def _slice_cu_seqlens(cu_seqlens: torch.Tensor, start: int,
+                      end: int) -> torch.Tensor:
+    sliced = cu_seqlens[start:end + 1] - cu_seqlens[start]
+    return sliced.contiguous()
+
+
+def _slice_locality_domain_cu_seqlens(cu_seqlens, ld_slice,
+                                      attention_input_type,
+                                      num_contexts) -> torch.Tensor:
+    """Per-domain view of a full-batch cumulative length tensor.
+
+    The full tensor is indexed by request in batch order. Generation-only
+    calls carry generation requests only, so their indices drop the context
+    offset; mixed calls splice the domain's context and generation ranges.
+    """
+    if attention_input_type == AttentionInputType.generation_only:
+        return _slice_cu_seqlens(cu_seqlens,
+                                 ld_slice["gen_req_start"] - num_contexts,
+                                 ld_slice["gen_req_end"] - num_contexts)
+    if attention_input_type == AttentionInputType.context_only:
+        return _slice_cu_seqlens(cu_seqlens, ld_slice["ctx_req_start"],
+                                 ld_slice["ctx_req_end"])
+    ctx = _slice_cu_seqlens(cu_seqlens, ld_slice["ctx_req_start"],
+                            ld_slice["ctx_req_end"])
+    gen = _slice_cu_seqlens(cu_seqlens, ld_slice["gen_req_start"],
+                            ld_slice["gen_req_end"])
+    return torch.cat((ctx, gen[1:] + ctx[-1]))
+
+
+def _prepare_locality_domain_mla_gen_state_from_full(
+    metadata: TrtllmAttentionMetadata,
+    cu_q_seqlens: torch.Tensor,
+    cu_kv_seqlens: torch.Tensor,
+    fmha_scheduler_counter: torch.Tensor,
+    mla_bmm1_scale: Optional[torch.Tensor],
+    mla_bmm2_scale: Optional[torch.Tensor],
+    total_gen_tokens: int,
+) -> None:
+    num_locality_domains = metadata.kv_cache_manager.num_locality_domains
+    metadata.locality_domain_mla_gen_state = [None] * num_locality_domains
+    counters = (
+        fmha_scheduler_counter.new_zeros((num_locality_domains, ) +
+                                         tuple(fmha_scheduler_counter.shape))
+        if fmha_scheduler_counter is not None else None)
+    for locality_domain_id in range(num_locality_domains):
+        locality_domain_slice = _build_locality_domain_slices(
+            metadata,
+            locality_domain_id,
+            AttentionInputType.generation_only,
+            total_gen_tokens=total_gen_tokens,
+        )
+        if locality_domain_slice is None:
+            continue
+
+        gen_req_start = locality_domain_slice[
+            'gen_req_start'] - metadata.num_contexts
+        gen_req_end = locality_domain_slice[
+            'gen_req_end'] - metadata.num_contexts
+        counter = counters[locality_domain_id] if counters is not None else None
+        # The rope kernel already wrote these and FMHA only reads them, and
+        # cumulative lengths start at 0, so a slice from row 0 can be a view.
+        if gen_req_start == 0:
+            cu_q_seqlens_locality_domain = cu_q_seqlens[:gen_req_end + 1]
+            cu_kv_seqlens_locality_domain = cu_kv_seqlens[:gen_req_end + 1]
+        else:
+            cu_q_seqlens_locality_domain = _slice_cu_seqlens(
+                cu_q_seqlens, gen_req_start, gen_req_end)
+            cu_kv_seqlens_locality_domain = _slice_cu_seqlens(
+                cu_kv_seqlens, gen_req_start, gen_req_end)
+        metadata.locality_domain_mla_gen_state[locality_domain_id] = {
+            'cu_q_seqlens': cu_q_seqlens_locality_domain,
+            'cu_kv_seqlens': cu_kv_seqlens_locality_domain,
+            'fmha_scheduler_counter': counter,
+            'mla_bmm1_scale': mla_bmm1_scale,
+            'mla_bmm2_scale': mla_bmm2_scale,
+        }
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
@@ -2521,6 +3423,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
+            # prepareCustomMask ORs into whichever mask a domain is handed.
+            domain_masks = metadata.locality_domain_spec_decoding_bl_tree_masks
+            for mask in domain_masks or ():
+                if mask is not None:
+                    mask.zero_()
 
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
@@ -2577,29 +3484,32 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # library selection and dispatch: support checks read the
         # same runtime metadata as the selected FMHA implementation.
         with metadata.presented_token_major(token_major_view):
-            fmha = self._fmha_manager.select(self, q, k, v, metadata,
-                                             forward_args)
+            for q_part, k_part, v_part, part_args in self._attention_partitions(
+                    q, k, v, metadata, forward_args):
+                fmha = self._fmha_manager.select(self, q_part, k_part, v_part,
+                                                 metadata, part_args)
 
-            if fmha is None:
-                if (getattr(forward_args, "qk_fp8_per_tensor", False)
-                        or getattr(forward_args, "v_fp8_per_tensor", False)):
+                if fmha is None:
+                    if (getattr(part_args, "qk_fp8_per_tensor", False)
+                            or getattr(part_args, "v_fp8_per_tensor", False)):
+                        raise RuntimeError(
+                            "The per-tensor FP8 attention recipe needs the PrimTS "
+                            "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
+                            "enabled or does not support this request.")
                     raise RuntimeError(
-                        "The per-tensor FP8 attention recipe needs the PrimTS "
-                        "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
-                        "enabled or does not support this request.")
-                raise RuntimeError(
-                    "No TRT-LLM attention FMHA library supports this request.")
-            if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
-                # Conservatively disable reclamation for metadata used by graphs
-                # or backends that can retain staged workspace state.
-                metadata.workspace_reclaimable = False
-            try:
-                fmha.forward(q, k, v, metadata, forward_args)
-            except RuntimeError as exc:
-                log_attention_failure_context(
-                    type(self).__name__, self.layer_idx, metadata,
-                    forward_args.attention_window_size, exc)
-                raise
+                        "No TRT-LLM attention FMHA library supports this request."
+                    )
+                if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+                    # Conservatively disable reclamation for metadata used by graphs
+                    # or backends that can retain staged workspace state.
+                    metadata.workspace_reclaimable = False
+                try:
+                    fmha.forward(q_part, k_part, v_part, metadata, part_args)
+                except RuntimeError as exc:
+                    log_attention_failure_context(
+                        type(self).__name__, self.layer_idx, metadata,
+                        part_args.attention_window_size, exc)
+                    raise
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat
@@ -2612,6 +3522,197 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return forward_args.output
         else:
             return forward_args.output, forward_args.output_sf
+
+    def _attention_partitions(self, q, k, v, metadata, forward_args):
+        """Yield the (q, k, v, forward_args) partitions this call must dispatch.
+
+        Without locality domains this yields the batch once, unchanged. With them
+        it yields once per domain -- inputs sliced to that domain's rows, its own
+        workspace and MLA state in place, and its stream current -- so the caller
+        keeps a single dispatch site for both paths.
+
+        Generation rows are split by position (the runner's balanced half/half
+        split), not by the domain that owns their KV pages, so a row can run on
+        the other domain's stream; the result is still correct. Context rows
+        follow their owning domain when the runner could sort them.
+        """
+        if not _locality_domain_attention_enabled(self, metadata, forward_args):
+            yield q, k, v, forward_args
+            return
+
+        assert forward_args.output_sf is None, (
+            "NVFP4 output quantization is not supported with locality domain "
+            "fork-join attention.")
+
+        num_locality_domains = metadata.kv_cache_manager.num_locality_domains
+        # MLA context with pre-gathered k/v lays those rows out by per-request
+        # KV length, not by Q length, so the k/v slice differs from q's.
+        is_gen_only = (forward_args.attention_input_type ==
+                       AttentionInputType.generation_only)
+        dense_ctx_kv = (self.is_mla_enable and forward_args.attention_input_type
+                        == AttentionInputType.context_only
+                        and forward_args.latent_cache is None)
+        if metadata.locality_domain_runtime is None:
+            metadata.locality_domain_runtime = LocalityDomainRuntime(
+                num_partitions=num_locality_domains)
+        runtime = metadata.locality_domain_runtime
+        output = forward_args.output
+
+        # Prep every domain first, on the default stream: no host-side tensor
+        # building happens inside the fork/join region.
+        prepared = []
+        for locality_domain_id in range(num_locality_domains):
+            ld_slice = _build_locality_domain_slices(
+                metadata,
+                locality_domain_id,
+                forward_args.attention_input_type,
+                total_gen_tokens=(q.shape[0] if is_gen_only else None),
+                dense_ctx_kv=dense_ctx_kv)
+            if ld_slice is None:
+                continue
+            num_ctx_tokens = ld_slice["num_ctx_tokens"]
+            num_gen_tokens = ld_slice["num_gen_tokens"]
+            if num_ctx_tokens + num_gen_tokens == 0:
+                continue
+            num_ctx_kv_tokens = (ld_slice["ctx_kv_token_end"] -
+                                 ld_slice["ctx_kv_token_start"])
+            cat = functools.partial(_locality_domain_cat_slices,
+                                    ctx_token_start=ld_slice["ctx_token_start"],
+                                    ctx_token_end=ld_slice["ctx_token_end"],
+                                    gen_token_start=ld_slice["gen_token_start"],
+                                    gen_token_end=ld_slice["gen_token_end"],
+                                    num_ctx_tokens=num_ctx_tokens,
+                                    num_gen_tokens=num_gen_tokens)
+            cat_kv = functools.partial(
+                _locality_domain_cat_slices,
+                ctx_token_start=ld_slice["ctx_kv_token_start"],
+                ctx_token_end=ld_slice["ctx_kv_token_end"],
+                gen_token_start=ld_slice["gen_token_start"],
+                gen_token_end=ld_slice["gen_token_end"],
+                num_ctx_tokens=num_ctx_kv_tokens,
+                num_gen_tokens=num_gen_tokens)
+            if num_ctx_tokens > 0 and num_gen_tokens > 0:
+                ld_output = output.new_empty((num_ctx_tokens +
+                                              num_gen_tokens, ) +
+                                             output.shape[1:])
+                scatter_back = True
+            else:
+                ld_output = cat(output)
+                scatter_back = False
+            ld_overrides = dict(output=ld_output,
+                                locality_domain_id=locality_domain_id)
+            # Written per token row by the kernel, so it needs the same
+            # view-or-copy treatment as the output.
+            softmax_stats = forward_args.softmax_stats_tensor
+            ld_softmax_stats = None
+            if softmax_stats is not None:
+                if scatter_back:
+                    ld_softmax_stats = softmax_stats.new_empty(
+                        (num_ctx_tokens + num_gen_tokens, ) +
+                        softmax_stats.shape[1:])
+                else:
+                    ld_softmax_stats = cat(softmax_stats)
+                ld_overrides["softmax_stats_tensor"] = ld_softmax_stats
+            ld_overrides.update(
+                _locality_domain_mrope_overrides(forward_args, ld_slice,
+                                                 metadata.num_contexts,
+                                                 q.shape[0]))
+            for name in ("latent_cache", "q_pe"):
+                tensor = getattr(forward_args, name)
+                if tensor is not None:
+                    ld_overrides[name] = cat(tensor)
+            mla_state = metadata.locality_domain_mla_gen_state
+            mla_state = (mla_state[locality_domain_id] if
+                         (mla_state is not None
+                          and locality_domain_id < len(mla_state)) else None)
+            if mla_state is not None and is_gen_only:
+                ld_overrides.update(mla_state)
+                if forward_args.quant_q_buffer is not None:
+                    ld_overrides["quant_q_buffer"] = (
+                        forward_args.quant_q_buffer[ld_slice["gen_token_start"]:
+                                                    ld_slice["gen_token_end"]])
+            else:
+                # Slice the incoming offsets rather than rebuilding them from
+                # prompt lengths: for generation rows the prompt length is the
+                # history, not the number of packed Q rows.
+                for name in ("cu_q_seqlens", "cu_kv_seqlens"):
+                    cu = getattr(forward_args, name)
+                    if cu is not None:
+                        ld_overrides[name] = _slice_locality_domain_cu_seqlens(
+                            cu, ld_slice, forward_args.attention_input_type,
+                            metadata.num_contexts)
+                if forward_args.fmha_scheduler_counter is not None:
+                    ld_overrides["fmha_scheduler_counter"] = torch.zeros_like(
+                        forward_args.fmha_scheduler_counter)
+                if forward_args.quant_q_buffer is not None:
+                    ld_overrides["quant_q_buffer"] = cat(
+                        forward_args.quant_q_buffer)
+            prepared.append(
+                dict(locality_domain_id=locality_domain_id,
+                     ld_slice=ld_slice,
+                     ld_args=replace(forward_args, **ld_overrides),
+                     q=cat(q),
+                     k=cat_kv(k),
+                     v=cat_kv(v),
+                     ld_output=ld_output,
+                     ld_softmax_stats=ld_softmax_stats,
+                     scatter_back=scatter_back,
+                     num_ctx_tokens=num_ctx_tokens,
+                     num_gen_tokens=num_gen_tokens))
+
+        num_kv_rows = k.shape[0] if k is not None else None
+        layout = (forward_args.attention_input_type, q.shape[0], num_kv_rows,
+                  dense_ctx_kv, metadata.num_contexts, metadata.num_generations,
+                  metadata.kv_lens_runtime.shape[0],
+                  tuple(metadata.locality_domain_num_ctx_tokens),
+                  tuple(metadata.locality_domain_ctx_req_splits),
+                  tuple(metadata.locality_domain_gen_req_splits),
+                  tuple(metadata.locality_domain_ctx_token_splits),
+                  tuple(metadata.locality_domain_gen_token_splits))
+        if metadata.locality_domain_validated_layout != layout:
+            _validate_locality_domain_coverage(
+                metadata, prepared, forward_args.attention_input_type,
+                q.shape[0], num_kv_rows, dense_ctx_kv)
+            metadata.locality_domain_validated_layout = layout
+
+        two_stream = _LOCALITY_DOMAIN_TWO_STREAM
+        if two_stream:
+            runtime.fork()
+        try:
+            for prep in prepared:
+                locality_domain_id = prep["locality_domain_id"]
+                ld_slice = prep["ld_slice"]
+                # Serialized mode forks and joins around each domain in turn, so
+                # the domains never overlap.
+                if not two_stream:
+                    runtime.fork()
+                try:
+                    with _locality_domain_metadata(metadata, ld_slice,
+                                                   locality_domain_id):
+                        with runtime.partition_context(locality_domain_id):
+                            yield (prep["q"], prep["k"], prep["v"],
+                                   prep["ld_args"])
+                            if prep["scatter_back"]:
+                                _scatter_locality_domain_rows(
+                                    output, prep["ld_output"], ld_slice,
+                                    prep["num_ctx_tokens"],
+                                    prep["num_gen_tokens"])
+                                if prep["ld_softmax_stats"] is not None:
+                                    _scatter_locality_domain_rows(
+                                        forward_args.softmax_stats_tensor,
+                                        prep["ld_softmax_stats"], ld_slice,
+                                        prep["num_ctx_tokens"],
+                                        prep["num_gen_tokens"])
+                            if locality_domain_id == 0:
+                                _resize_locality_domain_workspaces_from_domain0(
+                                    metadata)
+                finally:
+                    if not two_stream:
+                        runtime.join()
+        finally:
+            if two_stream:
+                runtime.join()
+            prepared.clear()
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -3081,6 +4182,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             quant_scale_qkv,
             q_rope_applied,
         )
+
+        # RoPE generation stays a single full-batch op; only the metadata the
+        # per-domain FMHA calls consume is split.
+        if (metadata.locality_domain_enabled
+                and metadata.kv_cache_manager is not None and getattr(
+                    metadata.kv_cache_manager, "num_locality_domains", 1) > 1):
+            if (metadata.locality_domain_gen_req_splits is None
+                    or metadata.locality_domain_gen_token_splits is None
+                    or metadata.locality_domain_num_gen_tokens is None
+                    or metadata.locality_domain_num_ctx_tokens is None):
+                raise RuntimeError(
+                    "locality domain MLA generation needs the per-domain "
+                    "splits that prepare() builds; they are missing")
+            _prepare_locality_domain_mla_gen_state_from_full(
+                metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                latent_cache.shape[0],
+            )
 
     def _fp4_mla_rope_generation(
         self,

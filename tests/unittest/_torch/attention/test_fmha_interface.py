@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
 
@@ -119,6 +119,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn.kv_scale_quant_orig = None
     attn.get_local_layer_idx.return_value = 0
     attn._ensure_rope_table_size = Mock()
+    attn._attention_partitions = MethodType(TrtllmAttention._attention_partitions, attn)
     fmha = Mock()
     attn._fmha_manager = Mock()
     attn._fmha_manager.select.return_value = fmha
@@ -132,6 +133,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     metadata.spec_decoding_bl_tree_mask = None
     metadata.max_context_q_len_override = None
     metadata.kv_cache_manager = None
+    metadata.locality_domain_enabled = False
     lengths = torch.ones(1, dtype=torch.int32)
     metadata.kv_lens_cuda_runtime = lengths
     metadata.kv_lens_runtime = lengths

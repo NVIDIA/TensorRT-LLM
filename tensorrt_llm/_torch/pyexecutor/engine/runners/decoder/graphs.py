@@ -59,6 +59,7 @@ from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputPreparer
+from .locality_domain import locality_domain_forkjoin_enabled
 from .metadata import DecoderMetadata
 from .warmup import WarmupAgreement
 
@@ -454,6 +455,9 @@ class DecoderCudaGraphs:
             # fresh final-context row would skip its cache-slot reset.
             and not self._model_uses_ple_recurrent_state
             and self.mapping.cp_size == 1
+            # Promoted rows are re-sorted by domain with the generation rows,
+            # while sampling still walks the semantic batch in its own order.
+            and not locality_domain_forkjoin_enabled(kv_cache_manager)
         ):
             return scheduled_requests, frozenset()
         return _make_single_token_context_graph_batch(

@@ -1023,6 +1023,8 @@ class AttentionForwardArgs:
     cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
         dtype=torch.uint32)
+    # Locality domain this call runs against; -1 means the whole batch.
+    locality_domain_id: int = -1
     mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
