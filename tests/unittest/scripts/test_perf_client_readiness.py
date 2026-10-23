@@ -88,10 +88,28 @@ def test_transient_http_failure_still_retries(client: ModuleType, endpoint, stat
     assert len(requests) == 2
 
 
+def test_retryable_failure_reason_reaches_the_timeout_message(
+    client: ModuleType, endpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url, _, requests = endpoint
+    # Every request gets the stub's default 503 until the 1 s budget runs out.
+    monkeypatch.setenv("AGENTX_READY_TIMEOUT", "1")
+    with pytest.raises(RuntimeError, match="Last response: HTTP 503: not ready"):
+        client.verify_endpoint(url, "model")
+    assert requests
+
+
+def test_error_body_naming_choices_is_not_a_completion(client: ModuleType, endpoint) -> None:
+    url, responses, requests = endpoint
+    responses.extend([(500, '{"error":{"param":"choices"}}'), (200, '{"choices":[{}]}')])
+    client.verify_endpoint(url, "model")
+    assert len(requests) == 2
+
+
 def test_heartbeat_request_remains_best_effort(client: ModuleType, endpoint) -> None:
     url, responses, requests = endpoint
     responses.append((400, "invalid request"))
-    assert client.post_one_token(url, "model", timeout=1) is None
+    assert client.post_one_token(url, "model", timeout=1) == "HTTP 400: invalid request"
     assert len(requests) == 1
 
 
