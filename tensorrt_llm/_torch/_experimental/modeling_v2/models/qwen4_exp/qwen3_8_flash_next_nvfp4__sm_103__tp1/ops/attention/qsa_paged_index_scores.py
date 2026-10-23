@@ -71,6 +71,12 @@ _FREE_PAGING = tuple(
 )
 
 
+#: The same plane under an NVFP4 KV pool: the QSA position page joins each physical
+#: page after the index buffers (`page_pad` elements), so the trunk's view is
+#: `[pages, 32, 1, 128]` at page stride 12 x 4096 + 192 = 49344.
+_TRUNK_POOL_NVFP4 = dict(pool_buffers=12, page_pad=192)
+
+
 class QsaPagedIndexScores(OpWrapper):
     """Score every causally visible compressed block of each query row.
 
@@ -92,9 +98,9 @@ class QsaPagedIndexScores(OpWrapper):
 
     `context_rows` is a layout declaration ("consecutive rows mostly share a
     request"), not a phase one: with more than 256 rows and an index-head count
-    that divides 16 into more than one row (1, 2, 4, 8) it selects a
-    query-tiled kernel sharing one key gather across rows; otherwise the
-    row-wise kernel runs. Each cell names the kernel it was measured on. The
+    that divides 128 into more than one row (1, 2, 4, ..., 64) it selects a
+    query-tiled kernel sharing one key gather across `128 // heads` rows;
+    otherwise the row-wise kernel runs. Each cell names the kernel it was measured on. The
     two agree to one fp32 ulp, not bitwise.
 
     Fusion boundary: the table walk, the gather, the dots, relu, head sum,
@@ -106,6 +112,34 @@ class QsaPagedIndexScores(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
+        # ---- the NVFP4-pool plane: page stride 49344, a kernel of its own ----
+        Cell(
+            why="NVFP4 trunk plane, page stride 49344: decode MTP 4 requests x 2 rows",
+            spec=_spec(
+                layout="decode",
+                gen_positions=(7000, 5000, 4200, 2100),
+                rows_per_request=2,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+                **_TRUNK_POOL_NVFP4,
+            ),
+        ),
+        Cell(
+            why="NVFP4 trunk plane, page stride 49344: prefill 300 rows from 0",
+            spec=_spec(
+                layout="capture",
+                lengths=(300,),
+                slots=8,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=True,
+                branch="query_tile",
+                **_TRUNK_POOL_NVFP4,
+            ),
+        ),
         # ---- the target's call shapes: [*, 260] table, 2080 columns -------
         Cell(
             why="decode: 1 row deep in history, [32, 260] table, visible-only",
@@ -155,6 +189,45 @@ class QsaPagedIndexScores(OpWrapper):
                 slots=32,
                 pages=_WIDTH,
                 only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+            ),
+        ),
+        Cell(
+            why="decode MTP7: 1 request x 8 rows across a page edge, visible-only",
+            spec=_spec(
+                layout="decode",
+                gen_positions=(6012,),
+                rows_per_request=8,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+            ),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, visible-only",
+            spec=_spec(
+                layout="decode",
+                gen_positions=tuple(100 + (499 * g) % 8000 for g in range(32)),
+                rows_per_request=8,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=True,
+                context_rows=False,
+                branch="row_wise",
+            ),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, -inf padded",
+            spec=_spec(
+                layout="decode",
+                gen_positions=tuple(100 + (499 * g) % 8000 for g in range(32)),
+                rows_per_request=8,
+                slots=32,
+                pages=_WIDTH,
+                only_visible_blocks=False,
                 context_rows=False,
                 branch="row_wise",
             ),
@@ -316,27 +389,27 @@ class QsaPagedIndexScores(OpWrapper):
         ),
         Cell(why="1024 rows, context_rows=False: row-wise", spec=_small(1024, 6)),
         Cell(
-            why="300 rows x 1 head: 16 rows per query tile",
+            why="300 rows x 1 head: 128 rows per query tile",
             spec=_small(300, 5, heads=1, context_rows=True, branch="query_tile"),
         ),
         Cell(
-            why="300 rows x 2 heads: 8 rows per query tile",
+            why="300 rows x 2 heads: 64 rows per query tile",
             spec=_small(300, 5, heads=2, context_rows=True, branch="query_tile"),
         ),
         Cell(
-            why="300 rows x 8 heads: 2 rows per query tile",
+            why="300 rows x 8 heads: 16 rows per query tile",
             spec=_small(300, 5, heads=8, context_rows=True, branch="query_tile"),
         ),
         Cell(
-            why="300 rows x 16 heads: one row per tile, row-wise",
-            spec=_small(300, 5, heads=16, context_rows=True),
+            why="300 rows x 16 heads: 8 rows per query tile",
+            spec=_small(300, 5, heads=16, context_rows=True, branch="query_tile"),
         ),
         Cell(
-            why="300 rows x 3 heads: does not divide 16, row-wise",
+            why="300 rows x 3 heads: does not divide 128, row-wise",
             spec=_small(300, 5, heads=3, context_rows=True),
         ),
         Cell(
-            why="300 rows x 5 heads: does not divide 16, row-wise",
+            why="300 rows x 5 heads: does not divide 128, row-wise",
             spec=_small(300, 5, heads=5, context_rows=True),
         ),
         Cell(
@@ -401,6 +474,13 @@ class QsaPagedIndexScores(OpWrapper):
     again after `q`, the cache and the table were overwritten in place; both
     matched the reference.
 
+    `prefetch` (with `use_pdl` and `only_visible_blocks`, at generation-sized
+    batches) reads the pages and compressed keys before the PDL wait and q after
+    it. Sound only behind the decode step's own prologue
+    (`qwen4_exp_attn_decode_prologue`), which writes no compressed key but the last
+    visible block's, at a row whose position ends a group; that key is read again
+    after the wait.
+
     Not certified: more than 8192 rows, tables wider than 260 pages, more than
     32 table rows, and any head geometry other than 4 x 128 at the 2080-column
     width. Hard limits: not probed; the largest certified extent is 8192 x
@@ -418,6 +498,8 @@ class QsaPagedIndexScores(OpWrapper):
         compress_ratio: int,
         only_visible_blocks: bool,
         context_rows: bool,
+        use_pdl: bool = False,
+        prefetch: bool = False,
     ) -> torch.Tensor:
         return _triton_qsa_paged_index_scores(
             q=q,
@@ -429,6 +511,8 @@ class QsaPagedIndexScores(OpWrapper):
             compress_ratio=compress_ratio,
             only_visible_blocks=only_visible_blocks,
             context_rows=context_rows,
+            use_pdl=use_pdl,
+            prefetch=prefetch,
         )
 
     def reference(
@@ -442,6 +526,8 @@ class QsaPagedIndexScores(OpWrapper):
         compress_ratio: int,
         only_visible_blocks: bool,
         context_rows: bool,
+        use_pdl: bool = False,
+        prefetch: bool = False,
     ) -> torch.Tensor:
         """fp32 scores, `-inf` past each row's bound -- or NaN there, meaning
         "unspecified", when `only_visible_blocks` is True. `context_rows` is

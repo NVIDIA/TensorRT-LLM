@@ -52,6 +52,14 @@ class GeluTanh(OpWrapper):
         )
         + (
             Cell(
+                why="block MLP activand at the tower call ceiling, 32768 patch rows x 4304 bf16",
+                spec=dict(
+                    shape=(32768, INTERMEDIATE_SIZE), dtype=torch.bfloat16, lo=-16.0, hi=16.0
+                ),
+            ),
+        )
+        + (
+            Cell(
                 why="activand built through fc1 at the checkpoint's measured scale",
                 spec=dict(shape=(512, INTERMEDIATE_SIZE), dtype=torch.bfloat16, dist="fc1"),
             ),

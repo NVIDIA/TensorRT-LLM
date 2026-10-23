@@ -97,10 +97,21 @@ def _build(spec, seed: int):
 
     rows = len(positions)
     qkv = torch.randn(
-        rows, spec["heads_q"] + 2 * hkv, head_dim, generator=gen, dtype=torch.float32
+        rows,
+        spec["heads_q"] + 2 * hkv + spec.get("row_pad_heads", 0),
+        head_dim,
+        generator=gen,
+        dtype=torch.float32,
     ).to(device=DEV, dtype=spec["row_dtype"])
     k = qkv[:, spec["heads_q"] : spec["heads_q"] + hkv]
-    v = qkv[:, spec["heads_q"] + hkv :]
+    v = qkv[:, spec["heads_q"] + hkv : spec["heads_q"] + 2 * hkv]
+    if spec["values"] == "every_bf16":
+        patterns = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
+        patterns = patterns.view(torch.bfloat16).reshape(rows, hkv, head_dim).to(DEV)
+        k.copy_(patterns)
+        v.copy_(patterns.flip(0))
+    else:
+        assert spec["values"] == "randn"
     if spec["k_layout"] == "head_major":
         k = k.transpose(1, 2).contiguous().transpose(1, 2)
         v = v.transpose(1, 2).contiguous().transpose(1, 2)
@@ -162,9 +173,15 @@ def test_fp8_pool_saturates_an_out_of_range_row() -> None:
     assert float(stored[0, 0].float()) == 448.0
 
 
-def test_cuda_graph_replay_follows_updated_positions() -> None:
+#: The cell of 32 MTP7 verify blocks (256 rows): the segments, pool and table it runs over.
+_MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 requests"))
+_MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
+
+
+@pytest.mark.parametrize("batch", ({}, _MTP7_BATCH), ids=("decode", "mtp7-32x8"))
+def test_cuda_graph_replay_follows_updated_positions(batch) -> None:
     """Captured once, replayed against new positions written into the same buffer."""
-    args, pool = _decode_args(seed=9)
+    args, pool = _decode_args(seed=9, **batch)
     positions = args["logical_positions"]
     saved = positions.clone()
     positions.zero_()

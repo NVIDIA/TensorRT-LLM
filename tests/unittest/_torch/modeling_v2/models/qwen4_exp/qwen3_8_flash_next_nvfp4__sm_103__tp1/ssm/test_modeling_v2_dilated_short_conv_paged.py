@@ -333,9 +333,11 @@ def test_repeat_calls_are_bitwise_stable() -> None:
         assert torch.equal(first[0], again[0]) and torch.equal(first[1], again[1])
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    """Captured once, replayed after the batch tensors' values change in place."""
-    args = _small((4, 4, 4, 4), (0, 1, 2, 3), seed=25, pool_slots=6)
+@pytest.mark.parametrize("batch, p", ((4, 4), (32, 8)))
+def test_cuda_graph_capture_and_replay(batch, p) -> None:
+    """Captured once, replayed after the batch tensors' values change in place: four
+    requests of 4 tokens, and the MTP-7 verify's 32 of 8."""
+    args = _small((p,) * batch, tuple(range(batch)), seed=25, pool_slots=batch + 2)
     x, weight, _, pool, qsl, cidx, his = args[:7]
     live = pool.clone()
     stream = torch.cuda.Stream()
@@ -351,9 +353,10 @@ def test_cuda_graph_capture_and_replay() -> None:
         captured = op(x, weight, None, live, qsl, cidx, his, DILATION, True, PAD_SLOT_ID)
 
     g = torch.Generator(device="cuda").manual_seed(26)
-    qsl.copy_(torch.tensor([0, 1, 2, 3, 16], dtype=torch.int32, device="cuda"))
-    cidx.copy_(torch.tensor([4, 3, 2, 1], dtype=torch.int32, device="cuda"))
-    his.copy_(torch.tensor([True, False, True, False], dtype=torch.bool, device="cuda"))
+    # Every row but the last shrinks to one token; the slot map reverses and shifts by one.
+    qsl.copy_(torch.tensor([*range(batch), batch * p], dtype=torch.int32, device="cuda"))
+    cidx.copy_(torch.tensor(list(range(batch, 0, -1)), dtype=torch.int32, device="cuda"))
+    his.copy_(torch.tensor([i % 2 == 0 for i in range(batch)], dtype=torch.bool, device="cuda"))
     x.copy_(torch.randn(x.shape, generator=g, device="cuda").to(x.dtype))
     live.copy_(pool)
     graph.replay()

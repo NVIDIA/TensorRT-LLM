@@ -24,9 +24,10 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
-#: Largest conv-pool slot count the cache manager was seen to allocate for this
-#: checkpoint (10 .. 461 over twelve runtime-value dumps). The verify path hands
-#: the whole pool over unsliced.
+#: A conv-pool slot count of a full-size engine run. The kernel addresses a slot by its
+#: index alone, so a pool of another size (a bf16 recurrent pool holds more slots in the
+#: same memory, and the conv pool shares its slot space) takes the same path. The verify
+#: path hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
 #: The engine's `max_num_sequences`: the snapshot buffer's row count.
 ENGINE_SNAPSHOT_ROWS = 32
@@ -71,9 +72,10 @@ class CausalConv1dTritonUpdate(OpWrapper):
 
     # spec keys: dim, width (4), state_len (pool columns, 3), seqlen (2), batch,
     # pool_slots, slots ("random" | tuple | None), dtype, bias, activation
-    # ("silu"), pad_slot_id, x_form ("token_major" | "contiguous" | "2d"),
-    # snapshots (rows of the snapshot buffer, or 0 for none), accepted,
-    # launch_dependent_kernels.
+    # ("silu"), pad_slot_id, x_form ("token_major" | "in_proj" (token_major
+    # over the q|k|v columns of a [n * p, 16480] projection) | "contiguous" | "2d"),
+    # snapshots (rows of the snapshot buffer, or 0 for none), snapshot_steps
+    # (the buffer's step depth, default seqlen), accepted, launch_dependent_kernels.
     CELLS: tuple[Cell, ...] = (
         tuple(
             Cell(
@@ -87,7 +89,48 @@ class CausalConv1dTritonUpdate(OpWrapper):
                     snapshots=ENGINE_SNAPSHOT_ROWS,
                 ),
             )
-            for batch, seqlen in ((1, 2), (8, 3), (32, 2), (17, 4))
+            for batch, seqlen in (
+                (1, 2),
+                (8, 3),
+                (32, 2),
+                (17, 4),
+                # max_draft_len 4..7: seqlen 5..8, up to 256 rows.
+                (32, 5),
+                (8, 6),
+                (17, 7),
+                (1, 8),
+                (17, 8),
+                (32, 8),
+            )
+        )
+        + (
+            Cell(
+                why="seqlen 5 into an 8-step snapshot buffer: steps 5..7 untouched",
+                spec=dict(
+                    dim=CKPT_DIM,
+                    batch=8,
+                    seqlen=5,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_pinned(8),
+                    snapshots=ENGINE_SNAPSHOT_ROWS,
+                    snapshot_steps=8,
+                ),
+            ),
+        )
+        + tuple(
+            Cell(
+                why=f"verify, x over the [n*p, 16480] in_proj, batch {batch}, {seqlen} tok/row",
+                spec=dict(
+                    dim=CKPT_DIM,
+                    batch=batch,
+                    seqlen=seqlen,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_pinned(batch),
+                    snapshots=ENGINE_SNAPSHOT_ROWS,
+                    x_form="in_proj",
+                ),
+            )
+            for batch, seqlen in ((1, 2), (32, 3))
         )
         + tuple(
             Cell(
@@ -215,14 +258,15 @@ class CausalConv1dTritonUpdate(OpWrapper):
     Metadata consumed: none.
 
     Call site: the GDN speculative verify step -- `x` the `[n, 10240, p]`
-    transposed view of `[n, p, 10240]` (p = runtime_draft_len + 1), the layer's
+    transposed view of `[n, p, 10240]` (p = runtime_draft_len + 1, 2..8 here), the layer's
     whole conv pool `[slots, 10240, 3]`, W 4, no bias, `"silu"`, the verify rows'
     slots, `pad_slot_id` -1, snapshots into `[max_num_sequences, p, 10240, 3]`
     with `intermediate_state_indices = arange(n)`, `num_accepted_tokens` None.
     The op advances the pool by all `p` tokens whatever is accepted later; the
     snapshots are what a rollback has to read. Certified at 128 and 461 pool
     slots (bitwise identical for the same slot content), snapshot buffers of
-    `batch` and of 32 rows.
+    `batch` and of 32 rows, seqlen 2..8 (a buffer deeper than seqlen keeps its
+    later steps untouched).
 
     Raise loudly, so not guarded: width 1 (triton CompilationError); a missing
     `intermediate_state_indices` with snapshots and slot indices given.

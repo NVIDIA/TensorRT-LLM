@@ -20,6 +20,9 @@ import re
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
+    fused_sigmoid_mul_inplace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
     qsa_paged_sparse_gqa as op,
 )
@@ -55,6 +58,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 DEV = "cuda"
 ENGINE_MAX_SEQ_LEN = 8192
+FP8 = torch.float8_e4m3fn
+#: The e4m3fn NaN bit pattern (and, with the sign bit, 0xFF).
+E4M3_NAN = 0x7F
 
 _KERNELS = {
     "_qsa_paged_sparse_gqa_kernel": "prefill",
@@ -176,8 +182,9 @@ def _build(spec, seed):
         k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
 
     q_dtype = spec["q_dtype"]
-    if spec["q_layout"] == "qkv_slice":
-        qkv = torch.randn(rows, q_heads + 2 * kv, d, generator=gen, device=DEV).to(q_dtype)
+    if spec["q_layout"] in ("qkv_slice", "fused_row"):
+        row_heads = q_heads + 2 * kv if spec["q_layout"] == "qkv_slice" else 55
+        qkv = torch.randn(rows, row_heads, d, generator=gen, device=DEV).to(q_dtype)
         q = qkv[:, :q_heads]
     else:
         q = torch.randn(rows, q_heads, d, generator=gen, device=DEV).to(q_dtype)
@@ -192,6 +199,15 @@ def _build(spec, seed):
         request_indices[2] = slots + 67  # a request the table does not have
         block_table[:, 0] = -1  # every request's first page unmapped
 
+    gate = None
+    if spec.get("gate") == "fused_row":
+        # The gate columns of the target's fused projection row (55 heads of
+        # D): heads 28..51, after q, k and v.
+        fused = torch.randn(rows, 55 * d, generator=gen, device=DEV).to(q_dtype)
+        gate = fused[:, 28 * d : (28 + q_heads) * d]
+    elif spec.get("gate") == "heads":
+        gate = torch.randn(rows, q_heads, d, generator=gen, device=DEV).to(q_dtype)
+
     args = dict(
         q=q,
         k_cache=k_cache,
@@ -204,6 +220,8 @@ def _build(spec, seed):
     )
     if spec["prefill_pair"]:
         args.update(query_positions=positions, compress_ratio=spec["compress_ratio"])
+    if gate is not None:
+        args.update(output_gate=gate)
     return args, generation
 
 
@@ -366,6 +384,37 @@ def test_calls_are_bitwise_deterministic() -> None:
     assert torch.equal(op(**args), op(**args))
 
 
+@pytest.mark.parametrize("rows", [1, 4, 128])
+def test_output_gate_in_the_merge_is_the_standalone_gate(rows) -> None:
+    """The gate carried by the merge equals the ungated call followed by the
+    standalone gate kernel, bit for bit, and the gate moves the output."""
+    spec = _with(segments=((4000, 1),) * rows, slots=rows + 32, q_layout="fused_row")
+    spec["gate"] = "fused_row"
+    args, _ = _build(spec, seed=8900 + rows)
+    gate = args.pop("output_gate")
+    assert op.fuses_output_gate(args["q"], args["k_cache"], args["selected_tokens"], gate)
+    ungated = op(**args)
+    gated = op(**args, output_gate=gate)
+    standalone = fused_sigmoid_mul_inplace(ungated.reshape(rows, -1).clone(), gate)
+    assert torch.equal(gated.reshape(rows, -1), standalone)
+    assert (gated.float() - ungated.float()).abs().max().item() > 0.1
+
+
+def test_output_gate_needs_a_merge() -> None:
+    """One split (300 rows) and the prefill kernel have no merge to carry the
+    gate: `fuses_output_gate` says so and the call refuses it."""
+    for spec in (
+        _with(segments=((600, 1),) * 300, slots=384),
+        _with(segments=((2032, 272),), prefill_pair=True),
+    ):
+        spec["gate"] = "heads"
+        args, _ = _build(spec, seed=9200)
+        gate = args["output_gate"]
+        assert not op.fuses_output_gate(args["q"], args["k_cache"], args["selected_tokens"], gate)
+        with pytest.raises(ValueError, match="output-gate fusion requires a compatible split-K"):
+            op(**args)
+
+
 def test_zero_rows_return_an_empty_output() -> None:
     args, _ = _build(_with(segments=((900, 1),) * 4), seed=8400)
     for name in ("q", "selected_tokens", "request_indices"):
@@ -488,3 +537,84 @@ def test_selection_width_is_checked_on_the_prefill_kernel_only() -> None:
     args, _ = _build(_with(segments=((200, 100),), prefill_pair=True), seed=9400)
     args["selected_tokens"] = args["selected_tokens"][:, :64].contiguous()
     _compare(op(**args), op.reference(**args))
+
+
+# --------------------------------------------------------------------------
+# an fp8 pool is read at face value
+# --------------------------------------------------------------------------
+
+
+def _every_finite_e4m3_code():
+    """The 256 e4m3fn codes as bytes, the two NaN codes replaced by +0."""
+    codes = torch.arange(256, dtype=torch.int32, device=DEV).to(torch.uint8)
+    return torch.where((codes & 0x7F) == E4M3_NAN, torch.zeros_like(codes), codes)
+
+
+def _two_token_rows(kernel, seed):
+    """Rows at position 1 of a request each, on an fp8 pool: every row's
+    selection is tokens 0 and 1, both on the request's first page."""
+    rows = 300 if kernel == "prefill" else 12
+    spec = _with(
+        segments=((1, 1),) * rows,
+        slots=rows + 8,
+        prefill_pair=kernel == "prefill",
+        cache_dtype=FP8,
+    )
+    args, _ = _build(spec, seed)
+    pages = args["block_table"][args["request_indices"].long(), 0].long()
+    return args, pages
+
+
+@pytest.mark.parametrize("kernel", ["prefill", "splitk"])
+def test_fp8_values_are_read_at_face_value(kernel, launches) -> None:
+    """Token 0's V row holds every finite code, token 1's is zero, and q is
+    zero, so each output row is exactly half of token 0's row: no scale, and
+    the widening to bf16 is exact for every code, subnormals included."""
+    args, pages = _two_token_rows(kernel, seed=12000)
+    codes = _every_finite_e4m3_code()
+    values = args["v_cache"].view(torch.uint8)
+    values[pages, :, 0, :] = codes
+    values[pages, :, 1, :] = 0
+    args["q"].zero_()
+    out = op(**args)
+    assert launches[0][0] == kernel
+    expected = codes.view(FP8).to(torch.bfloat16) / 2
+    assert torch.equal(out, expected.expand_as(out))
+    _compare(out, op.reference(**args))
+
+
+@pytest.mark.parametrize("kernel", ["prefill", "splitk"])
+def test_fp8_keys_are_read_at_face_value(kernel, launches) -> None:
+    """Token 0's K row holds every finite code, token 1's is zero, and each
+    (row, head) queries one element of token 0's row with a one-hot power of
+    two sized so the logit lands near +-8. Every product is exact, and each
+    output row is token 0's softmax weight for one code. A reference that
+    flushed K's 14 subnormal codes to zero moves their weights to 0.5 and is
+    rejected, so the gate sees a misread of a single code."""
+    args, pages = _two_token_rows(kernel, seed=12100)
+    codes = _every_finite_e4m3_code()
+    keys, values = args["k_cache"].view(torch.uint8), args["v_cache"].view(torch.uint8)
+    keys[pages, :, 0, :] = codes
+    keys[pages, :, 1, :] = 0
+    values[pages, :, 0, :] = torch.tensor(1.0, device=DEV).to(FP8).view(torch.uint8)
+    values[pages, :, 1, :] = 0
+    q = args["q"]
+    rows, heads, dim = q.shape
+    assert rows * heads >= dim, "every code must be read by some (row, head)"
+    magnitude = codes.view(FP8).float().abs()
+    # |q . k| * softmax_scale = 128 / 16 = 8 up to the power-of-two rounding.
+    scale = torch.where(magnitude > 0, torch.exp2(torch.round(torch.log2(128.0 / magnitude))), 1.0)
+    column = (torch.arange(rows * heads, device=DEV) % dim).reshape(rows, heads, 1)
+    q.zero_()
+    q.scatter_(2, column, scale[column].to(q.dtype))
+    out = op(**args)
+    assert launches[0][0] == kernel
+    _compare(out, op.reference(**args))
+
+    subnormal = ((codes & 0x78) == 0) & ((codes & 0x07) != 0)
+    assert int(subnormal.sum()) == 14
+    flushed = args["k_cache"].clone()
+    flushed.view(torch.uint8)[pages, :, 0, :] = torch.where(subnormal, codes & 0x80, codes)
+    wrong = op.reference(**{**args, "k_cache": flushed})
+    with pytest.raises(AssertionError):
+        _compare(out, wrong)

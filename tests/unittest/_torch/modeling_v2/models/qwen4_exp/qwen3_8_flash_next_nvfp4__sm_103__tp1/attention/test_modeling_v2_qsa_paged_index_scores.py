@@ -3,8 +3,8 @@
 """GPU test for the qsa_paged_index_scores catalog entry.
 
 The paged state is real: a `[pages, tokens_per_block, 1, dim]` index cache
-sized from the pages the table maps, and an int32 block table whose rows are
-request *slots* -- more of them than the batch has requests, assigned by a
+(a view of a wider page under the NVFP4 cells) sized from the pages the table maps, and an
+int32 block table whose rows are request *slots* -- more of them than the batch has requests, assigned by a
 seeded permutation -- with shuffled physical pages and `-1` past each
 sequence on the serving layouts, which is what the engine's table carries.
 
@@ -51,7 +51,7 @@ DEV = torch.device("cuda")
 #: The callable's own threshold: at or below it every call is row-wise.
 DECODE_ROW_LIMIT = 256
 #: Index heads must divide this into more than one row for the query tile.
-DOT_TILE_WIDTH = 16
+DOT_TILE_WIDTH = 128
 CAPTURE_PAGES = 260
 
 
@@ -186,9 +186,20 @@ def _build(spec, seed):
     for slot, count in zip(slot_of.tolist(), mapped):
         block_table[slot, :count] = page_ids[cursor : cursor + count]
         cursor += count
-    index_cache = torch.randn(
-        pool_pages, spec["tokens_per_block"], 1, head_dim, generator=gen, device=DEV
-    ).to(dtype)
+    tpb = spec["tokens_per_block"]
+    keys = torch.randn(pool_pages, tpb, 1, head_dim, generator=gen, device=DEV).to(dtype)
+    if "page_pad" in spec:
+        # The NVFP4 pool's page: the other index buffers, this layer's, then the position
+        # page, so the plane is a view at page stride buffers * tpb * dim + page_pad.
+        buffers, buffer = spec["pool_buffers"], tpb * head_dim
+        page = torch.zeros(pool_pages, buffers * buffer + spec["page_pad"], dtype=dtype, device=DEV)
+        index_cache = page[:, (buffers - 1) * buffer : buffers * buffer].view(
+            pool_pages, tpb, 1, head_dim
+        )
+        index_cache.copy_(keys)
+        assert index_cache.stride() == (page.stride(0), head_dim, head_dim, 1)
+    else:
+        index_cache = keys
 
     if spec["q_layout"] == "scratch_slice":
         # [T, index heads | 1 k | 1 v, D], q is the first `heads` slots.
@@ -347,6 +358,78 @@ def test_both_modes_agree_on_the_visible_columns() -> None:
     unspecified = op(**{**args, "only_visible_blocks": True})
     visible = _visible(args)
     assert torch.equal(padded[visible], unspecified[visible])
+
+
+def test_pdl_launch_is_bitwise_the_plain_one_and_reads_after_the_wait() -> None:
+    """`use_pdl` changes the launch, not the result; under graph replay a producer rewrites
+    q right before the op, and a read of it before the wait would see the previous
+    replay's."""
+    args = _build(_case(4, 4, only_visible_blocks=True), seed=313)
+    visible = _visible(args)
+    plain = op(**args)
+    assert torch.equal(op(**{**args, "use_pdl": True})[visible], plain[visible])
+    src = args["q"].clone()
+
+    def step():
+        args["q"].copy_(src * 1.0)
+        return op(**{**args, "use_pdl": True})
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    for trial in range(3):
+        src.copy_(_build(_case(4, 4, only_visible_blocks=True), seed=314 + trial)["q"])
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out[visible], op(**args)[visible]), f"replay {trial}"
+
+
+def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:
+    """`prefetch` reads pages and keys before the PDL wait. Under graph replay a producer
+    rewrites q and, at rows whose position ends a group, the last visible block's anchor
+    key -- what the decode prologue writes -- right before the op; both must be seen.
+    The other keys are static, as they are in the decode step."""
+    args = _build(_case(4, 4, only_visible_blocks=True), seed=411)
+    cr, tpb = args["compress_ratio"], args["tokens_per_block"]
+    pos = args["query_positions"].clone()
+    assert bool((pos >= cr).all())
+    ends = torch.tensor([True, False, True, True], device=DEV)
+    args["query_positions"] = torch.where(ends, pos - (pos + 1) % cr, pos).to(pos.dtype)
+    pos = args["query_positions"].long()
+    assert bool(((pos + 1) % cr == 0).eq(ends).all())
+    pages = args["block_table"][args["request_indices"].long(), pos // tpb].long()
+    anchors = (pages[ends], (pos % tpb)[ends])
+    visible = _visible(args)
+    plain = op(**args)
+    assert torch.equal(op(**{**args, "use_pdl": True, "prefetch": True})[visible], plain[visible])
+    src_q = args["q"].clone()
+    src_k = args["index_cache"][anchors].clone()
+
+    def step():
+        args["q"].copy_(src_q * 1.0)
+        args["index_cache"][anchors] = src_k * 1.0
+        return op(**{**args, "use_pdl": True, "prefetch": True})
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    for trial in range(3):
+        fresh = _build(_case(4, 4, only_visible_blocks=True), seed=412 + trial)
+        src_q.copy_(fresh["q"])
+        src_k.copy_(torch.randn(src_k.shape, device=DEV).to(src_k.dtype))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out[visible], op(**args)[visible]), f"replay {trial}"
 
 
 def test_capture_shape_survives_cuda_graph_capture_and_replay() -> None:

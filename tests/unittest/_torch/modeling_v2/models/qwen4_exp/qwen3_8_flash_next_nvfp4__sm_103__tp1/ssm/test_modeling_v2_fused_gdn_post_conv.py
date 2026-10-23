@@ -78,6 +78,8 @@ L2_NORM_EPS = 1e-6
 #: The stock mixer's `z` half of `in_proj_qkvz`, and its `[b|a]` projection width.
 Z_WIDTH = NUM_V_HEADS * HEAD_V_DIM
 BA_WIDTH = 2 * NUM_V_HEADS
+#: The target's one GDN input-projection output: [q|k|v | z | a | b].
+IN_PROJ_WIDTH = QKV_DIM + Z_WIDTH + 2 * NUM_V_HEADS  # 16480
 
 
 def _build(spec, seed):
@@ -96,6 +98,18 @@ def _build(spec, seed):
         ba = randn(n, BA_WIDTH)
         b, a = ba[:, :NUM_V_HEADS], ba[:, NUM_V_HEADS:]
         assert not decode.is_contiguous() and not a.is_contiguous()
+    elif layout == "in_proj":
+        # `_gdn_block`: one [T, 16480] GEMM output; q|k|v, a and b are its column
+        # views, the decode half the row split of q|k|v, the prefill half the
+        # transposing extraction of the rest.
+        proj = randn(n, IN_PROJ_WIDTH)
+        mixed = proj[:, :QKV_DIM]
+        prefill = mixed[:n_p].t().contiguous()
+        decode = mixed[n_p:] if n_d else None
+        a = proj[:, QKV_DIM + Z_WIDTH : QKV_DIM + Z_WIDTH + NUM_V_HEADS]
+        b = proj[:, QKV_DIM + Z_WIDTH + NUM_V_HEADS :]
+        assert a.stride(0) == b.stride(0) == IN_PROJ_WIDTH
+        assert decode is None or decode.stride() == (IN_PROJ_WIDTH, 1)
     elif layout == "target_mixed":
         # `_gdn_block`: mixed_qkv = x @ w_qkv is [T, 10240]; the decode half is
         # its row split, the prefill half the transposing extraction of the rest.

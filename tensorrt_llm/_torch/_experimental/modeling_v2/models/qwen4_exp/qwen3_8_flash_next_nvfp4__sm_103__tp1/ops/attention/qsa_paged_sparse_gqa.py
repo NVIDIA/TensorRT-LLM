@@ -13,6 +13,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 # Approved exception: QSA's sparse path never reaches the thop attention op's
 # sparse argument group, so there is no torch.ops surface for this computation.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    can_fuse_qsa_splitk_output_gate as _can_fuse_qsa_splitk_output_gate,
+)
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_sparse_gqa as _triton_qsa_paged_sparse_gqa,
 )
 
@@ -27,7 +30,8 @@ _CHECKPOINT = dict(
     q_dtype=torch.bfloat16,
     # K and V are the two role planes of one [pages, 2, kv, tpb, D] pool.
     cache_layout="pool_planes",
-    # q is the first 24 heads of the packed [T, 24 + 2 + 2, 256] QKV buffer.
+    # q is the first 24 heads of the packed [T, 24 + 2 + 2, 256] QKV buffer;
+    # "fused_row" is the target's fused input projection row, 55 heads of 256.
     q_layout="qkv_slice",
     request_dtype=torch.int32,
     # The engine's table: 260 pages per slot, -1 past each sequence.
@@ -36,6 +40,7 @@ _CHECKPOINT = dict(
 
 _SPLIT_K = ("splitk", "merge")
 _PREFILL = ("prefill",)
+_FP8 = dict(cache_dtype=torch.float8_e4m3fn)
 
 
 def _spec(**overrides) -> dict:
@@ -53,8 +58,9 @@ def _decode(segments, launches=_SPLIT_K, **overrides) -> dict:
     return _spec(**{**base, **overrides})
 
 
-def _mixed(requests, context_lens) -> dict:
-    return _spec(mixed=(requests, context_lens), slots=32, prefill_pair=True, launches=_PREFILL)
+def _mixed(requests, context_lens, **overrides) -> dict:
+    base = dict(mixed=(requests, context_lens), slots=32, prefill_pair=True, launches=_PREFILL)
+    return _spec(**{**base, **overrides})
 
 
 class QsaPagedSparseGqa(OpWrapper):
@@ -89,9 +95,20 @@ class QsaPagedSparseGqa(OpWrapper):
     silently truncated (measured: a planted index moving the right answer by
     0.77 moved the op's by nothing). The split-K kernel ignores the pair.
 
-    Fusion boundary: the block-table gather, scale, online softmax, P.V and
-    the split-K merge are inside. Deciding what to attend to, appending K/V to
-    the pool, and q's projection, norm, RoPE and output gate are not.
+    **The output gate rides the merge when `output_gate` is passed.** Each
+    merged head row is rounded to `q.dtype`, multiplied in fp32 by
+    `sigmoid(output_gate)` and rounded again: the arithmetic of the ungated
+    call followed by `fused_sigmoid_mul_inplace`. `output_gate` is `[rows,
+    Hq * D]` or `[rows, Hq, D]` in `q.dtype`, unit stride in its last dim, any
+    row stride (the gate columns of the fused projection row). Only a split-K
+    launch with more than one split has a merge to carry it; `fuses_output_gate`
+    says whether a call does, and the op raises `ValueError` if handed a gate
+    it cannot carry.
+
+    Fusion boundary: the block-table gather, scale, online softmax, P.V, the
+    split-K merge and, when passed, the output gate are inside. Deciding what
+    to attend to, appending K/V to the pool, and q's projection, norm and RoPE
+    are not.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -107,6 +124,22 @@ class QsaPagedSparseGqa(OpWrapper):
             spec=_decode(((4000, 1), (4037, 1), (4074, 1), (4111, 1))),
         ),
         Cell(
+            why="decode: 1 row, gate off the fused row, in the merge, PDL",
+            spec=_decode(((4000, 1),), q_layout="fused_row", gate="fused_row"),
+        ),
+        Cell(
+            why="decode: 4 requests x 1 row, gate fused into the merge",
+            spec=_decode(tuple((4000 + 37 * i, 1) for i in range(4)), gate="fused_row"),
+        ),
+        Cell(
+            why="decode: 128 rows, 8-way split-K, gate fused into the merge",
+            spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160, gate="fused_row"),
+        ),
+        Cell(
+            why="decode: 4 rows, a compact [rows, Hq, D] gate in the merge",
+            spec=_decode(((900, 1),) * 4, gate="heads"),
+        ),
+        Cell(
             why="decode MTP: 4 requests x 2 rows, split-K + merge",
             spec=_decode(tuple((4000 + 37 * i, 2) for i in range(4))),
         ),
@@ -117,6 +150,18 @@ class QsaPagedSparseGqa(OpWrapper):
         Cell(
             why="decode MTP: all 32 slots x 2 rows, positions 100..8099",
             spec=_decode(tuple((100 + (499 * g) % 8000, 2) for g in range(32))),
+        ),
+        Cell(
+            why="decode MTP7: 1 request x 8 rows, 32-way split-K",
+            spec=_decode(((4000, 8),)),
+        ),
+        Cell(
+            why="decode MTP7: 8 requests x 8 rows, 8-way split-K",
+            spec=_decode(tuple((4000 + 37 * i, 8) for i in range(8))),
+        ),
+        Cell(
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
         ),
         Cell(
             why="300 rows, no prefill pair: split-K, one split, no merge",
@@ -185,8 +230,38 @@ class QsaPagedSparseGqa(OpWrapper):
             why="fp8-e4m3 pool under a bf16 q, read unscaled",
             spec=_decode(((900, 1),) * 4, cache_dtype=torch.float8_e4m3fn),
         ),
+        # The target's three call shapes over an fp8 pool (kv_cache_dtype=fp8, unit scale).
+        Cell(
+            why="fp8 decode MTP: 4 requests x 2 rows, split-K + merge",
+            spec=_decode(tuple((4000 + 37 * i, 2) for i in range(4)), **_FP8),
+        ),
+        Cell(
+            why="fp8 context 128 rows from 2032: pair passed, still split-K",
+            spec=_decode(((2032, 128),), prefill_pair=True, **_FP8),
+        ),
+        Cell(
+            why="fp8 context 272 rows from 2032: causal-prefix prefill kernel",
+            spec=_decode(((2032, 272),), launches=_PREFILL, prefill_pair=True, **_FP8),
+        ),
+        Cell(why="fp8 mixed 257 rows: 1 chunk + 31 MTP decodes", spec=_mixed(32, (195,), **_FP8)),
+        Cell(
+            why="fp8 decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
+            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32)), **_FP8),
+        ),
         Cell(
             why="int64 request indices", spec=_decode(((1000, 2),) * 4, request_dtype=torch.int64)
+        ),
+        Cell(
+            why="q as the head slice of the fused projection row (55 x 256), decode",
+            spec=_decode(((900, 1),) * 4, q_layout="fused_row"),
+        ),
+        Cell(
+            why="q off the fused projection row (55 x 256), 128 decode rows",
+            spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160),
+        ),
+        Cell(
+            why="q off the fused projection row (55 x 256), 8191-row prefill",
+            spec=_decode(((0, 8191),), launches=_PREFILL, prefill_pair=True, q_layout="fused_row"),
         ),
         Cell(
             why="standalone contiguous K and V buffers, contiguous q",
@@ -217,7 +292,8 @@ class QsaPagedSparseGqa(OpWrapper):
       - The prefill pair is a property of the launch: passed because some
         rows are context, it puts the generation rows on the prefill kernel
         too, and the bound applies to them (asserted with a planted index).
-      - There is no KV scale argument: an fp8 pool is read at face value.
+      - There is no KV scale argument: an fp8 pool is read at face value (each code
+        widens exactly to bf16 under a bf16 q), so it must hold K/V written at unit scale.
       - `D` must be a power of two (192 is refused); `Hq % Hkv == 0`.
 
     The op validates its own inputs loudly (11 `ValueError`s pinned by the
@@ -228,6 +304,10 @@ class QsaPagedSparseGqa(OpWrapper):
     PDL: `TRTLLM_ENABLE_PDL` (default on) enables programmatic dependent
     launch for multi-split launches of 4 rows or fewer; both launch modes are
     inside the cells. Calls are bitwise deterministic.
+
+    The decode site carries up to 8 rows per request (max_draft_len 7): the
+    cells run 1, 8 and 32 requests of 8 rows, which is 16, 128 and 512
+    `rows * Hkv` programs, so the 32-way, 8-way and 4-way split-K launches.
 
     Not certified: capture in a CUDA graph (the split-K path allocates its
     partials inside the call); head geometries other than 24/2 x 256;
@@ -249,6 +329,7 @@ class QsaPagedSparseGqa(OpWrapper):
         softmax_scale: float,
         query_positions: Optional[torch.Tensor] = None,
         compress_ratio: Optional[int] = None,
+        output_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return _triton_qsa_paged_sparse_gqa(
             q=q,
@@ -261,7 +342,18 @@ class QsaPagedSparseGqa(OpWrapper):
             softmax_scale=softmax_scale,
             query_positions=query_positions,
             compress_ratio=compress_ratio,
+            output_gate=output_gate,
         )
+
+    @staticmethod
+    def fuses_output_gate(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        selected_tokens: torch.Tensor,
+        output_gate: torch.Tensor,
+    ) -> bool:
+        """Whether a call with these operands and no prefill pair carries `output_gate`."""
+        return _can_fuse_qsa_splitk_output_gate(q, k_cache, selected_tokens, output_gate)
 
     def reference(
         self,
@@ -276,8 +368,10 @@ class QsaPagedSparseGqa(OpWrapper):
         softmax_scale: float,
         query_positions: Optional[torch.Tensor] = None,
         compress_ratio: Optional[int] = None,
+        output_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """fp32 sparse GQA over every resident selected token, rounded once.
+        """fp32 sparse GQA over every resident selected token, rounded once;
+        with `output_gate`, then gated in fp32 and rounded again.
 
         `query_positions` and `compress_ratio` are ignored: on a prefix-packed
         selection the prefill kernel's bound reads exactly the valid entries.
@@ -317,7 +411,10 @@ class QsaPagedSparseGqa(OpWrapper):
             weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
             pooled = torch.einsum("bhgk,bkhd->bhgd", weights, values)
             out[start:stop] = pooled.reshape(stop - start, num_q_heads, head_dim)
-        return out.to(q.dtype)
+        if output_gate is None:
+            return out.to(q.dtype)
+        gate = output_gate.reshape(rows, num_q_heads, head_dim).float()
+        return (out.to(q.dtype).float() * torch.sigmoid(gate)).to(q.dtype)
 
 
 qsa_paged_sparse_gqa = QsaPagedSparseGqa()

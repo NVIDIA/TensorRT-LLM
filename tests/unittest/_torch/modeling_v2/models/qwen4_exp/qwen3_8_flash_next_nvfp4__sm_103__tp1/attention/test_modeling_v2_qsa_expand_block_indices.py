@@ -63,6 +63,12 @@ def _rows(batch) -> tuple[list[int], list[int]]:
         positions = [4096 + 13 * i for i in range(batch[1])]
     elif kind == "serving":
         return _serving_rows(batch[1], batch[2])
+    elif kind == "verify":
+        starts, per_request = batch[1], batch[2]
+        positions = [s + i for s in starts for i in range(per_request)]
+        lengths = [s + per_request for s in starts for _ in range(per_request)]
+        assert max(lengths) <= ENGINE_MAX_SEQ_LEN
+        return positions, lengths
     else:
         positions = list(batch[1])
     return positions, [p + 1 for p in positions]
@@ -204,9 +210,11 @@ def test_unpacked_prefix_is_silently_dropped() -> None:
     assert out.cpu().tolist() == [[-1] * 11]
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    """Capturable, and a replay recomputes from whatever the buffers now hold."""
-    positions = torch.tensor([4096 + 7 * i for i in range(4)], device=DEV)
+@pytest.mark.parametrize("rows", (4, 256))
+def test_cuda_graph_capture_and_replay(rows) -> None:
+    """Capturable, and a replay recomputes from whatever the buffers now hold: 4 rows, and the
+    256 rows a verify step of 32 requests carries at max_draft_len 7."""
+    positions = torch.tensor([4096 + 7 * i for i in range(rows)], device=DEV)
     lengths = (positions + 1).to(torch.int32)
     blocks = _packed_selection(positions, CR, TOPK, seed=31)
 

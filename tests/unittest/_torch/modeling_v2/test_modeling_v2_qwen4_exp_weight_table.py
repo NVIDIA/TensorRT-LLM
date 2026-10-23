@@ -65,7 +65,7 @@ _VISION = dict(
 )
 
 
-def _core(mtp: bool):
+def _core(mtp: bool, backend: str = "TRTLLM"):
     """The configuration surface the table reads."""
     return SimpleNamespace(
         model_config=SimpleNamespace(
@@ -75,6 +75,7 @@ def _core(mtp: bool):
         ),
         vision_config=SimpleNamespace(**_VISION),
         mtp_enabled=mtp,
+        trunk_moe_backend=backend,
     )
 
 
@@ -97,9 +98,16 @@ def test_mtp_rows_appear_only_when_mtp_is_live():
     on = W.MODEL_WEIGHTS.manifest(_core(True))
     added = set(on) - set(off)
     assert set(off) <= set(on)
-    assert added and all(k.startswith(f"l{_TEXT['num_hidden_layers']}_mtp_") for k in added)
-    # The draft layer's own QSA indexer is never loaded; see weights.py.
-    assert not any("indexer" in str(src) for k in added for src, _, _ in on[k])
+    m = f"l{_TEXT['num_hidden_layers']}_mtp_"
+    assert added and all(k.startswith(m) for k in added)
+    # The draft layer runs QSA over its own indexer, read from the module's keys.
+    indexer = {f"{m}idx_w", f"{m}idx_qn", f"{m}idx_kn"}
+    assert indexer <= added
+    assert all(
+        str(src).startswith("mtp.layers.0.self_attn.indexer.")
+        for k in indexer
+        for src, _, _ in on[k]
+    )
 
 
 def _reference_declaration(mtp: bool) -> dict:
@@ -139,32 +147,34 @@ def _reference_declaration(mtp: bool) -> dict:
         P(f"{prefix}_up", stream, rank)
         P(f"{prefix}_inject", t.hc_count, stream)
 
-    def gated_attention(prefix):
-        P(f"{prefix}q_w", 2 * q_width, hidden)
-        P(f"{prefix}k_w", kv_width, hidden)
-        P(f"{prefix}v_w", kv_width, hidden)
+    def gated_attention(prefix, fused_in=False):
+        if fused_in:
+            # [q | k | v | gate | index q, k | one index head of zero pad]
+            rows = 2 * q_width + 2 * kv_width + index_width + t.indexer_head_dim
+            P(f"{prefix}attn_in_w", rows, hidden)
+        else:
+            P(f"{prefix}q_w", 2 * q_width, hidden)
+            P(f"{prefix}k_w", kv_width, hidden)
+            P(f"{prefix}v_w", kv_width, hidden)
         P(f"{prefix}o_w", hidden, q_width)
         P(f"{prefix}q_norm", t.head_dim)
         P(f"{prefix}k_norm", t.head_dim)
 
     def shared_expert(prefix):
-        P(f"{prefix}sh_gu", 2 * shared, hidden)
+        # gate|up, then the per-token gate's row and zero rows (`weights._cat_rows`).
+        P(f"{prefix}sh_gu", 2 * shared + 8, hidden)
         P(f"{prefix}sh_dn", hidden, shared)
-        P(f"{prefix}sh_gate", 1, hidden)
 
     for i in range(nl):
         hyper_connection(f"l{i}_ahc")
         hyper_connection(f"l{i}_mhc")
         if t.layer_types[i] == "full_attention":
-            gated_attention(f"l{i}_")
-            P(f"l{i}_idx_w", index_width, hidden)
+            gated_attention(f"l{i}_", fused_in=True)
             P(f"l{i}_idx_qn", t.indexer_head_dim)
             P(f"l{i}_idx_kn", t.indexer_head_dim)
         else:
-            P(f"l{i}_in_qkv_w", conv_dim, hidden)
-            P(f"l{i}_in_z_w", value_dim, hidden)
-            P(f"l{i}_in_a_w", t.linear_num_value_heads, hidden)
-            P(f"l{i}_in_b_w", t.linear_num_value_heads, hidden)
+            # [in_proj_qkv | in_proj_z | in_proj_a | in_proj_b], one row block each.
+            P(f"l{i}_in_proj_w", conv_dim + value_dim + 2 * t.linear_num_value_heads, hidden)
             P(f"l{i}_A_log", t.linear_num_value_heads)
             P(f"l{i}_dt_bias", t.linear_num_value_heads)
             P(f"l{i}_conv_w", conv_dim, 1, t.linear_conv_kernel_dim)
@@ -175,6 +185,11 @@ def _reference_declaration(mtp: bool) -> dict:
         P(f"l{i}_fc1_s", experts, 2 * inter, hidden // 16, dtype=u8)
         P(f"l{i}_fc2_w", experts, hidden, inter // 2, dtype=u8)
         P(f"l{i}_fc2_s", experts, hidden, inter // 16, dtype=u8)
+        # The trtllm-gen backend's second, CuteDSL-layout copy of the experts.
+        P(f"l{i}_fc1_w_cd", experts, 2 * inter, hidden // 2, dtype=u8)
+        P(f"l{i}_fc1_s_cd", experts, 2 * inter, hidden // 16, dtype=u8)
+        P(f"l{i}_fc2_w_cd", experts, hidden, inter // 2, dtype=u8)
+        P(f"l{i}_fc2_s_cd", experts, hidden, inter // 16, dtype=u8)
         for name in ("e_isc1", "e_isc1_up", "e_ws2_1", "e_ws2_1_up", "e_isc2", "e_ws2_2"):
             P(f"l{i}_{name}", experts, dtype=f32)
         shared_expert(f"l{i}_")
@@ -223,6 +238,9 @@ def _reference_declaration(mtp: bool) -> dict:
         hyper_connection(f"{m}ahc")
         hyper_connection(f"{m}mhc")
         gated_attention(m)
+        P(f"{m}idx_w", index_width, hidden)
+        P(f"{m}idx_qn", t.indexer_head_dim)
+        P(f"{m}idx_kn", t.indexer_head_dim)
         P(f"{m}router", experts, hidden)
         P(f"{m}fc1_w", experts, 2 * inter, hidden, dtype=f8)
         P(f"{m}fc1_s", experts, (2 * inter) // 128, hidden // 128, dtype=f32)
@@ -248,3 +266,107 @@ def test_the_table_declares_what_the_init_block_did(mtp):
     )
     wrong = {k: (got[k], want[k]) for k in got if got[k] != want[k]}
     assert not wrong, list(wrong.items())[:8]
+
+
+def test_gdn_input_projections_fill_adjacent_row_blocks():
+    """The concatenated GDN input projection: each checkpoint tensor lands in its own
+    row block, in the column order the forward splits the GEMM output by, and the
+    blocks tile the declared rows exactly."""
+    t = SimpleNamespace(**_TEXT)
+    core = _core(False)
+    manifest = W.MODEL_WEIGHTS.manifest(core)
+    key_dim = t.linear_num_key_heads * t.linear_key_head_dim
+    value_dim = t.linear_num_value_heads * t.linear_value_head_dim
+    widths = (
+        2 * key_dim + value_dim,
+        value_dim,
+        t.linear_num_value_heads,
+        t.linear_num_value_heads,
+    )
+    gdn = [i for i, kind in enumerate(t.layer_types) if kind == "linear_attention"]
+    assert len(gdn) == 36
+    for i in gdn:
+        rows = manifest[f"l{i}_in_proj_w"]
+        names = [ckpt.rsplit(".", 2)[-2] for ckpt, _, _ in rows]
+        assert names == ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"], names
+        assert all(ckpt.startswith(f"{W._LM}.layers.{i}.linear_attn.") for ckpt, _, _ in rows)
+        assert all(transform is None for _, _, transform in rows)
+        spans = [(index[0].start, index[0].stop) for _, index, _ in rows]
+        starts = [0, widths[0], widths[0] + widths[1], widths[0] + widths[1] + widths[2]]
+        assert spans == [(s, s + w) for s, w in zip(starts, widths)], spans
+        assert spans[-1][1] == sum(widths) == 16480
+
+
+def test_attention_input_projection_relayout():
+    """`_attn_in_w` puts q, k, v, the output gate and the index projection side by side
+    so that one GEMM's columns are exactly what the four separate projections gave:
+    q and gate de-interleaved from q_proj's per-head `[q | gate]` rows, then a zero pad
+    of one index head. Checked at the checkpoint's head geometry, a narrow hidden."""
+    t = SimpleNamespace(**_TEXT)
+    heads, d, kvh, hidden = t.num_attention_heads, t.head_dim, t.num_key_value_heads, 64
+    idx_rows = (t.indexer_n_heads + t.indexer_kv_heads) * t.indexer_head_dim
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(2 * heads * d, hidden, generator=g, dtype=torch.float64)
+    k = torch.randn(kvh * d, hidden, generator=g, dtype=torch.float64)
+    v = torch.randn(kvh * d, hidden, generator=g, dtype=torch.float64)
+    idx = torch.randn(idx_rows, hidden, generator=g, dtype=torch.float64)
+    core = SimpleNamespace(heads_q=heads, head_dim=d, index_head_dim=t.indexer_head_dim)
+    fused = W._attn_in_w((q, k, v, idx), core)
+    rows = 2 * heads * d + 2 * kvh * d + idx_rows + t.indexer_head_dim
+    assert fused.shape == (rows, hidden) and fused.is_contiguous()
+
+    x = torch.randn(3, hidden, generator=g, dtype=torch.float64)
+    y = x @ fused.t()
+    qg = (x @ q.t()).reshape(3, heads, 2 * d)
+    want = torch.cat(
+        [
+            qg[..., :d].reshape(3, -1),
+            x @ k.t(),
+            x @ v.t(),
+            qg[..., d:].reshape(3, -1),
+            x @ idx.t(),
+            torch.zeros(3, t.indexer_head_dim, dtype=torch.float64),
+        ],
+        1,
+    )
+    torch.testing.assert_close(y, want, rtol=0, atol=1e-12)
+    # The row is a whole number of head_dim heads: the main norm+rope addresses it so.
+    assert rows % d == 0
+
+
+def test_cutedsl_fc1_pairs_up_and_gate_rows_in_64_row_groups():
+    """Destination rows `[128k, 128k + 64)` hold up rows `[64k, 64k + 64)` and the next 64
+    hold the matching gate rows, which sit `I` rows later in the `[up ; gate]` stack."""
+    inter = _TEXT["moe_intermediate_size"]
+    core = SimpleNamespace(trunk_moe_backend="CUTEDSL")
+    perm = W._fc1_perm(2 * inter, "cpu", core)
+    assert sorted(perm.tolist()) == list(range(2 * inter))
+    for k in range(inter // 64):
+        assert perm[128 * k : 128 * k + 64].tolist() == list(range(64 * k, 64 * k + 64))
+        assert perm[128 * k + 64 : 128 * k + 128].tolist() == list(
+            range(inter + 64 * k, inter + 64 * k + 64)
+        )
+
+
+def test_cutedsl_fc2_keeps_the_checkpoint_row_order_and_trtllm_gen_shuffles_it():
+    """trtllm-gen's 32-row block shuffle moves source row `4u + v` to destination row
+    `8v + u`; CuteDSL reads `down_proj` as the checkpoint stores it."""
+    rows = torch.arange(64).unsqueeze(1).expand(64, 8).contiguous()
+    kept = W._expert_fc2_w(rows, SimpleNamespace(trunk_moe_backend="CUTEDSL"))
+    assert torch.equal(kept, rows)
+    shuffled = W._expert_fc2_w(rows, SimpleNamespace(trunk_moe_backend="TRTLLM"))
+    for u in range(8):
+        for v in range(4):
+            assert int(shuffled[8 * v + u, 0]) == 4 * u + v
+            assert int(shuffled[32 + 8 * v + u, 0]) == 32 + 4 * u + v
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
+def test_cute_dsl_expert_copy_rows_only_under_trtllm_gen(backend):
+    """Under trtllm-gen every layer also carries its experts in the CuteDSL layout
+    (`fc*_cd`), which prefill-sized launches run on; under CuteDSL the one copy is that
+    layout and no `_cd` row is declared."""
+    manifest = W.MODEL_WEIGHTS.manifest(_core(False, backend))
+    rows = [k for k in manifest if k.endswith(("_fc1_w_cd", "_fc1_s_cd", "_fc2_w_cd", "_fc2_s_cd"))]
+    layers = _TEXT["num_hidden_layers"]
+    assert len(rows) == (4 * layers if backend == "TRTLLM" else 0), len(rows)

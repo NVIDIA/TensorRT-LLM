@@ -66,7 +66,9 @@ class FusedGdnPostConv(OpWrapper):
     # (decode a row slice of a [T, 10240] projection, as the target's split
     # makes it) | "production" (the stock mixer's views: decode a row slice of
     # a column slice of [T, 10240 + 6144], a/b column halves of [T, 96]) |
-    # "prefill_view" (prefill a `.t()` of a wider buffer, stride (1, 16384));
+    # "prefill_view" (prefill a `.t()` of a wider buffer, stride (1, 16384)) |
+    # "in_proj" (the target's one [T, 16480] input projection: decode the
+    # q|k|v column view of its decode rows, a/b its column views);
     # beta_dtype, gate_dtype (A_log/dt_bias), dt_bias_fill.
     CELLS: tuple[Cell, ...] = (
         tuple(
@@ -84,6 +86,13 @@ class FusedGdnPostConv(OpWrapper):
             Cell(
                 why="target mixed call: decode a row slice of the projection",
                 spec=dict(num_prefill=200, num_decode=32, layout="target_mixed"),
+            ),
+            *(
+                Cell(
+                    why=f"target in_proj views, {p} prefill + {d} decode tokens",
+                    spec=dict(num_prefill=p, num_decode=d, layout="in_proj"),
+                )
+                for p, d in ((200, 32), (2048, 0), (0, 128))
             ),
             Cell(
                 why="stock mixer views: strided decode, a/b column halves",
@@ -124,8 +133,9 @@ class FusedGdnPostConv(OpWrapper):
     `(mq_p_t, mq_d, a, b, ...)` and the MTP-verify context half
     `(mq_p_t, None, a_p, b_p, ...)`, all with `l2_norm_eps=1e-6`,
     `softplus_threshold=20.0` and the fp32 `beta_dtype` default; `prefill` is
-    `extract_transpose_prefill_slice`'s contiguous output, `a`/`b` the
-    `[T, 48]` projections. The stock mixer's verify call passes
+    `extract_transpose_prefill_slice`'s contiguous output; `decode` and `a`/`b`
+    column views (row stride 16480) of the layer's one `[T, 16480]`
+    input-projection output. The stock mixer's verify call passes
     `beta_dtype=b.dtype`.
 
     Preconditions: `prefill.shape[0]` and `decode.shape[1]` >= qkv_dim (extra

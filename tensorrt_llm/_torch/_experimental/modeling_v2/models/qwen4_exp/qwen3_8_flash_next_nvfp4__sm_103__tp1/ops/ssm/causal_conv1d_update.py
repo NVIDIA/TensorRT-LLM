@@ -1,15 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Single-step causal depthwise conv1d against a slot-indexed conv-state pool."""
+"""Single-step causal depthwise conv1d against a slot-indexed conv-state pool.
+
+The decode step's shape (one token a row, SiLU, no bias, a width-4 conv over a
+3-column bf16 pool, slot indices) from `_CUTE_MIN_ROWS` rows runs a CuTe DSL
+kernel (Tier 6, written for this target) that is bitwise the TRT-LLM kernel it
+replaces there; every other call is `torch.ops.trtllm.causal_conv1d_update`.
+"""
 
 from __future__ import annotations
 
 from typing import Optional
 
+import cutlass
+import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
@@ -17,6 +29,283 @@ CKPT_DIM = 10240
 #: checkpoint (10 .. 461 over twelve runtime-value dumps, batch never above 32).
 #: The decode step hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
+
+
+# --------------------------------------------------------------------------------------
+# The decode shape in CuTe DSL. TRT-LLM's seqlen-1 kernel runs a thread per (row,
+# channel) with 2-byte accesses -- at 128 rows 1.3 M threads, four waves of one load
+# latency each (7.5 us a layer on GB300). Here a thread owns 8 channels of one row: the
+# weights (64 B), its state (8 channels x 3 columns, 48 contiguous bytes) and x (16 B)
+# by 16-byte loads, then the TRT-LLM kernel's arithmetic instruction for instruction
+# (`__fmaf_rn` over the taps from 0, `v * __frcp_rn(1 + __expf(-v))`, round to bf16),
+# x written in place and the state shifted by the new token.
+# --------------------------------------------------------------------------------------
+
+#: Rows from which the decode shape runs the CuTe kernel (GB300, graph replay, 8
+#: rotating layers, us: 128 rows 7.46 -> 5.41, 121 rows 7.40 -> 5.13; at 33 rows
+#: and below the TRT-LLM kernel's one wave is faster: 3.10 vs 3.39).
+_CUTE_MIN_ROWS = 64
+_CH = 8
+_THREADS = 128
+
+
+def _iv(x, loc, ip):
+    return x.ir_value(loc=loc, ip=ip)
+
+
+def _asm(ret, args, text, constraints, loc, ip, side_effects=False):
+    return llvm.inline_asm(
+        ret,
+        [_iv(a, loc, ip) for a in args],
+        text,
+        constraints,
+        has_side_effects=side_effects,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def _asm4(args, text, constraints, loc, ip, side_effects=False):
+    ty = T.i32()
+    res = _asm(
+        llvm.StructType.get_literal([ty] * 4), args, text, constraints, loc, ip, side_effects
+    )
+    return [cutlass.Int32(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _ldg_v4(addr, *, loc=None, ip=None):
+    """16 bytes; volatile so that no load moves across the pool's in-place update."""
+    return _asm4(
+        [cutlass.Int64(addr)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _ldg_nc_v4(addr, *, loc=None, ip=None):
+    """16 bytes of a read-only operand (the weights), non-coherent path."""
+    return _asm4(
+        [cutlass.Int64(addr)],
+        "ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _stg_v4(addr, a, b, c, d, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int64(addr)] + [cutlass.Int32(v) for v in (a, b, c, d)],
+        "{ st.global.v4.b32 [$1], {$2, $3, $4, $5}; mov.u32 $0, 0; }",
+        "=r,l,r,r,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _bf16_lo(w, *, loc=None, ip=None):
+    """The low bf16 of a word as fp32 (exact)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int32(w)],
+            "{ .reg .b32 t; shl.b32 t, $1, 16; mov.b32 $0, t; }",
+            "=f,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16_hi(w, *, loc=None, ip=None):
+    """The high bf16 of a word as fp32 (exact)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int32(w)],
+            "{ .reg .b32 t; and.b32 t, $1, 0xFFFF0000; mov.b32 $0, t; }",
+            "=f,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16x2(lo, hi, *, loc=None, ip=None):
+    """`cvt.rn.bf16x2.f32`: `lo` in the low half (exact for values already in bf16)."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Float32(hi), cutlass.Float32(lo)],
+            "cvt.rn.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _conv_silu(w0, w1, w2, w3, s0, s1, s2, x, *, loc=None, ip=None):
+    """`__fmaf_rn(w[i], s[i], v)` over the four taps from 0, then `v * __frcp_rn(1 +
+    __expf(-v))` (`__expf` is `ex2.approx.ftz` of the `mul.ftz` by log2e)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(v) for v in (w0, w1, w2, w3, s0, s1, s2, x)],
+            "{ .reg .f32 v, t, e; fma.rn.f32 v, $1, $5, 0f00000000; fma.rn.f32 v, $2, $6, v; "
+            "fma.rn.f32 v, $3, $7, v; fma.rn.f32 v, $4, $8, v; neg.f32 t, v; "
+            "mul.ftz.f32 t, t, 0f3FB8AA3B; ex2.approx.ftz.f32 e, t; add.f32 e, e, 0f3F800000; "
+            "rcp.rn.f32 e, e; mul.rn.f32 $0, v, e; }",
+            "=f,f,f,f,f,f,f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+class _DecodeConvKernel:
+    """One token a row: `x[row, c] = silu(conv)` in place and the row's slot shifted."""
+
+    def __init__(self, dim: int, x_stride: int):
+        assert dim % (_CH * _THREADS) == 0
+        self.dim, self.sx = dim, x_stride
+
+    @cute.jit
+    def __call__(
+        self,
+        x_t: cute.Tensor,
+        w_ptr: cute.Pointer,
+        st_ptr: cute.Pointer,
+        slot_ptr: cute.Pointer,
+        rows: cutlass.Int32,
+        slot_stride: cutlass.Int32,
+        pad_slot_id: cutlass.Int32,
+        stream,
+    ):
+        slots = cute.make_tensor(slot_ptr, cute.make_layout((rows,), stride=(1,)))
+        # `x` arrives as a tensor: the TVM-FFI entry takes its stream from a GPU tensor.
+        self.kernel(
+            x_t.iterator.toint(), w_ptr.toint(), st_ptr.toint(), slots, slot_stride, pad_slot_id
+        ).launch(
+            grid=[rows, self.dim // (_CH * _THREADS), 1], block=[_THREADS, 1, 1], stream=stream
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x_base: cutlass.Int64,
+        w_base: cutlass.Int64,
+        st_base: cutlass.Int64,
+        mSlot: cute.Tensor,
+        slot_stride: cutlass.Int32,
+        pad_slot_id: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row, cb, _ = cute.arch.block_idx()
+        c0 = (cb * _THREADS + tidx) * _CH
+        # The weights: 8 channels x 4 taps, 32 contiguous bf16.
+        wv = []
+        for q in cutlass.range_constexpr(4):
+            wv += _ldg_nc_v4(w_base + cutlass.Int64(c0 * 4 + q * 8) * 2)
+        slot = mSlot[row]
+        if slot != pad_slot_id:
+            sb = st_base + (cutlass.Int64(slot) * slot_stride + c0 * 3) * 2
+            sv = []
+            for q in cutlass.range_constexpr(3):
+                sv += _ldg_v4(sb + q * 16)
+            xa = x_base + (cutlass.Int64(row) * self.sx + c0) * 2
+            xv = _ldg_v4(xa)
+
+            def elem(words, e):
+                return _bf16_lo(words[e // 2]) if e % 2 == 0 else _bf16_hi(words[e // 2])
+
+            outs, shifted = [], []
+            for ch in cutlass.range_constexpr(_CH):
+                w = [elem(wv, ch * 4 + k) for k in range(4)]
+                st = [elem(sv, ch * 3 + k) for k in range(3)]
+                xc = elem(xv, ch)
+                outs.append(_conv_silu(*w, *st, xc))
+                shifted += [st[1], st[2], xc]
+            _stg_v4(xa, *[_bf16x2(outs[2 * i], outs[2 * i + 1]) for i in range(4)])
+            for q in cutlass.range_constexpr(3):
+                _stg_v4(
+                    sb + q * 16,
+                    *[
+                        _bf16x2(shifted[8 * q + 2 * i], shifted[8 * q + 2 * i + 1])
+                        for i in range(4)
+                    ],
+                )
+
+
+_DECODE_CONV: dict = {}
+
+
+def _decode_conv_ok(x, conv_state, weight, bias, silu_activation, cache_seqlens, indices) -> bool:
+    """The decode shape this kernel certifies; anything else runs the TRT-LLM op."""
+    return (
+        x.dim() == 2
+        and x.shape[0] >= _CUTE_MIN_ROWS
+        and bias is None
+        and silu_activation
+        and cache_seqlens is None
+        and indices is not None
+        and indices.dtype == torch.int32
+        and indices.is_contiguous()
+        and indices.shape == (x.shape[0],)
+        and x.dtype == conv_state.dtype == weight.dtype == torch.bfloat16
+        and weight.shape == (x.shape[1], 4)
+        and weight.is_contiguous()
+        and conv_state.dim() == 3
+        and conv_state.shape[1:] == (x.shape[1], 3)
+        and conv_state.stride()[1:] == (3, 1)
+        and x.shape[1] % (_CH * _THREADS) == 0
+        and x.stride(1) == 1
+        and (x.stride(0) * 2) % 16 == 0
+        and (conv_state.stride(0) * 2) % 16 == 0
+        and x.data_ptr() % 16 == 0
+        and conv_state.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
+
+
+def _decode_conv(x, conv_state, weight, indices, pad_slot_id) -> None:
+    dim = x.shape[1]
+    key = (dim, x.stride(0))
+    args = (x, weight.data_ptr(), conv_state.data_ptr(), indices.data_ptr())
+    fn = _DECODE_CONV.get(key)
+    if fn is None:
+        gm = cute.AddressSpace.gmem
+        cargs = (
+            from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            make_ptr(cutlass.BFloat16, args[1], gm, assumed_align=16),
+            make_ptr(cutlass.BFloat16, args[2], gm, assumed_align=16),
+            make_ptr(cutlass.Int32, args[3], gm, assumed_align=4),
+        )
+        fn = cute.compile(
+            _DecodeConvKernel(dim, x.stride(0)),
+            *cargs,
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(-1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+        _DECODE_CONV[key] = fn
+    fn(*args, x.shape[0], conv_state.stride(0), pad_slot_id)
 
 
 def _pinned(batch: int) -> tuple[int, ...]:
@@ -51,7 +340,8 @@ class CausalConv1dUpdate(OpWrapper):
 
     # spec keys: dim, width (4), state_len (3), seqlen (1), batch, pool_slots,
     # slots ("random" | tuple | None), dtype, bias, silu, cache_seqlens,
-    # pad_slot_id, x_form ("3d" | "2d" | "2d_row_slice" | "token_major"),
+    # pad_slot_id, x_form ("3d" | "2d" | "2d_row_slice" | "2d_in_proj" |
+    # "token_major"),
     # strided_state.
     CELLS: tuple[Cell, ...] = (
         tuple(
@@ -78,6 +368,23 @@ class CausalConv1dUpdate(OpWrapper):
                     x_form="2d_row_slice",
                 ),
             ),
+        )
+        + tuple(
+            Cell(
+                why=f"x the q|k|v column view of the [rows, 16480] in_proj, batch {batch}",
+                spec=dict(
+                    dim=CKPT_DIM,
+                    batch=batch,
+                    pool_slots=pool,
+                    slots=slots,
+                    x_form="2d_in_proj",
+                ),
+            )
+            for batch, pool, slots in (
+                (1, ENGINE_SLOTS, _pinned(1)),
+                (32, ENGINE_SLOTS, _pinned(32)),
+                (128, 256, "random"),
+            )
         )
         + tuple(
             Cell(
@@ -179,11 +486,19 @@ class CausalConv1dUpdate(OpWrapper):
     note = """
     Metadata consumed: none.
 
-    Call site: the GDN decode step -- 2-D `[num_decodes, 10240]` x (the decode
-    rows of the projection), the layer's whole conv pool `[slots, 10240, 3]`,
-    W 4, no bias, SiLU on, `cache_seqlens` None, int32 slots, `pad_slot_id` -1.
-    That exact shape (silu, no ring, `state_len == W - 1`) runs a dedicated
-    seqlen-1 kernel; every other cell runs the general one. Certified at 128
+    Call site: the GDN decode step -- 2-D `[num_decodes, 10240]` x, the q|k|v
+    column view (row stride 16480) of the decode rows of the layer's one
+    `[T, 16480]` input-projection output (the op writes those columns only);
+    the layer's whole conv pool `[slots, 10240, 3]`, W 4, no bias, SiLU on,
+    `cache_seqlens` None, int32 slots, `pad_slot_id` -1.
+    That exact shape (silu, no ring, `state_len == W - 1`) runs TRT-LLM's
+    dedicated seqlen-1 kernel; every other cell runs its general one. From
+    `_CUTE_MIN_ROWS` (64) rows, with bf16 operands, a contiguous weight, a
+    pool whose slot is `[dim, 3]` contiguous and 16-byte aligned rows, it runs
+    `_DecodeConvKernel` (CuTe DSL) instead: 8 channels a thread by 16-byte
+    loads, the TRT-LLM kernel's instructions, bitwise its result (x and pool,
+    pad rows untouched); 128 rows 7.46 -> 5.41 us a layer (GB300, graph
+    replay over 8 rotating layers). Certified at 128
     and 461 pool slots; at 461 the result is bitwise identical to 128 for the
     same slot content.
 
@@ -216,6 +531,11 @@ class CausalConv1dUpdate(OpWrapper):
         conv_state_indices: Optional[torch.Tensor],
         pad_slot_id: int,
     ) -> torch.Tensor:
+        if _decode_conv_ok(
+            x, conv_state, weight, bias, silu_activation, cache_seqlens, conv_state_indices
+        ):
+            _decode_conv(x, conv_state, weight, conv_state_indices, pad_slot_id)
+            return x
         torch.ops.trtllm.causal_conv1d_update(
             x.unsqueeze(-1) if x.dim() == 2 else x,
             conv_state,
