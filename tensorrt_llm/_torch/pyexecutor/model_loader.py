@@ -20,6 +20,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
@@ -51,6 +52,7 @@ from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
+from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
@@ -133,16 +135,22 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
         kv_cache_config.enable_block_reuse = False
 
 
+def effective_mamba_ssm_cache_dtype(config: ModelConfig,
+                                    mamba_ssm_cache_dtype: str) -> torch.dtype:
+    """The recurrent-state cache dtype the engine runs with."""
+    if mamba_ssm_cache_dtype == "auto":
+        return resolve_auto_ssm_cache_dtype(config.pretrained_config,
+                                            config.torch_dtype)
+    return str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+
 def validate_and_set_mamba_ssm_cache_dtype(
         config: ModelConfig,
         mamba_ssm_cache_dtype: str,
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
-    if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
-            config.pretrained_config, config.torch_dtype)
-    else:
-        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
+        config, mamba_ssm_cache_dtype)
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)
@@ -294,6 +302,31 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             "Encoder-decoder tensor parallelism currently supports "
             f"attn_backend='TRTLLM' only, but got "
             f"attn_backend='{model_config.attn_backend}'.")
+
+
+def validate_lm_head_output_dtype(model: torch.nn.Module,
+                                  requested_dtype: str) -> None:
+    """Reject an explicit output dtype that the constructed LM heads ignore."""
+    if requested_dtype == "auto":
+        return
+
+    expected_dtype = str_dtype_to_torch(requested_dtype)
+    found_lm_head = False
+    for name, module in model.named_modules():
+        # Embedding inherits LMHead but does not project hidden states to logits.
+        if not isinstance(module, LMHead) or isinstance(module, Embedding):
+            continue
+        found_lm_head = True
+        if module.output_dtype != expected_dtype:
+            raise ValueError(
+                f"lm_head_output_dtype={requested_dtype!r} is not supported "
+                f"by {type(model).__name__}: {name or '<root>'}.output_dtype "
+                f"is {module.output_dtype}, expected {expected_dtype}.")
+
+    if not found_lm_head:
+        raise ValueError(
+            f"lm_head_output_dtype={requested_dtype!r} is not supported by "
+            f"{type(model).__name__}: no LMHead was constructed.")
 
 
 def initialize_dummy_weights(
@@ -711,6 +744,18 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
+        PostTransformProfile(
+            profile_id="phi3-for-causal-lm-bf16-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_phi3", "Phi3ForCausalLM"),
+            architecture="Phi3ForCausalLM",
+            model_type="phi3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
     ))
 
     @classmethod
@@ -973,6 +1018,9 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+
+            validate_lm_head_output_dtype(model,
+                                          self.llm_args.lm_head_output_dtype)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -1946,6 +1994,9 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            lm_head_output_dtype=(torch.float32
+                                  if self.llm_args.lm_head_output_dtype
+                                  == "float32" else None),
             locality_domain_policy=LocalityDomainPolicy(
                 enabled=self.llm_args.enable_locality_domains),
         )

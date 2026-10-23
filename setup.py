@@ -719,7 +719,10 @@ setup(
             'trtllm-render=tensorrt_llm.serve.render.__main__:main'
         ],
     },
-    scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
+    scripts=[
+        'tensorrt_llm/llmapi/trtllm-llmapi-launch',
+        'tensorrt_llm/llmapi/_llmapi_process_guard.py',
+    ],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
         "openengine": [],

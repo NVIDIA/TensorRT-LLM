@@ -18,9 +18,10 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import get_sm_version, global_mpi_rank
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -654,14 +655,16 @@ def _create_py_executor(
     # about dwdp_size/dwdp_rank, so inject them here (before anything reads
     # mapping.dwdp_enabled / moe_ep_rank).
     #
-    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # dwdp_rank MUST be derived from the global DWDP rank (the global MPI
+    # rank, or TRTLLM_DWDP_RANK when context workers are launched
+    # independently -- see modules.dwdp.rendezvous), not mapping.rank:
     # in disaggregated serving each context worker is its own TP=1 instance
     # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
     # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
     # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
         dwdp_size = llm_args.dwdp_config.dwdp_size
-        dwdp_rank = global_mpi_rank() % dwdp_size
+        dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
             "dwdp_rank": dwdp_rank
@@ -722,8 +725,8 @@ def _create_py_executor(
 
     # Initialize DWDP Manager.
     #
-    # DWDP needs every global MPI rank to be a complete, unsharded model replica
-    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # DWDP needs every global DWDP rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is
     # only meaningful under that bijection. Disaggregated context workers satisfy
     # this with TP=1, aggregated serving with full attention DP; everything that
     # shards a replica across ranks is rejected. Pipeline and context parallelism
