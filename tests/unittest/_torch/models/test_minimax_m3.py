@@ -111,6 +111,8 @@ class _M3CompositionExperts(nn.Module):
     def __init__(self, scheduler_kind: MoESchedulerKind) -> None:
         super().__init__()
         self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+        # M3 opts in, so a fused-comm layer hands back the global output.
+        self.returns_global_routed_output = scheduler_kind == MoESchedulerKind.FUSED_COMM
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, **kwargs: object
@@ -205,6 +207,7 @@ def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)
             self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+            self.returns_global_routed_output = scheduler_kind == MoESchedulerKind.FUSED_COMM
             self.routed_output_is_global = _moe_routed_output_is_global(self)
 
     monkeypatch.setattr(

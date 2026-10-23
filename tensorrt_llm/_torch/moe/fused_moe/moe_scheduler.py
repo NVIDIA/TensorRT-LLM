@@ -998,9 +998,32 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
-        if len(outputs) == 1:
-            return outputs[0]
-        return torch.cat(outputs, dim=0)
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+        return self._as_rank_partial_if_reduced_externally(output)
+
+    def _as_rank_partial_if_reduced_externally(self, output: torch.Tensor) -> torch.Tensor:
+        """Match the external-comm output contract under attention TP (TEP).
+
+        With attention TP and ``reduce_results=False``, an external-comm
+        backend returns a rank partial that the caller all-reduces across the
+        TP group, usually together with the shared-expert partial. The fused
+        kernel instead returns the globally combined routed output on every
+        rank, so that same all-reduce would sum it ``tp_size`` times. Keep it
+        on TP rank 0 and return zeros elsewhere; the caller's all-reduce then
+        restores it exactly. Callers built with
+        ``accepts_global_routed_output=True`` compose the global output
+        themselves and receive it unchanged.
+        """
+        moe = self.moe
+        if (
+            moe.parallel_size <= 1
+            or moe.use_dp
+            or moe.reduce_results
+            or moe.accepts_global_routed_output
+            or moe.mapping.tp_rank == 0
+        ):
+            return output
+        return torch.zeros_like(output)
 
     def _strip_adp_padding(
         self,
@@ -1018,15 +1041,24 @@ class FusedCommMoEScheduler(MoEScheduler):
         provided, e.g. dummy / single-rank forwards).
         """
         moe = self.moe
-        had_meta = all_rank_num_tokens is not None
+        # A single count is local (non-DP) metadata, not one entry per EP rank:
+        # indexing it with moe_ep_rank > 0 would raise.
+        had_meta = all_rank_num_tokens is not None and len(all_rank_num_tokens) > 1
         if had_meta:
             # Force plain Python int: downstream torch.Tensor.split and range()
             # reject torch 0-d tensor / numpy scalar elements, and the public
             # ``Optional[List[int]]`` type hint is not runtime-enforced.
             real_all_rank_num_tokens = [int(v) for v in all_rank_num_tokens]
+            if len(real_all_rank_num_tokens) != moe.mapping.moe_ep_size:
+                raise ValueError(
+                    "Fused-comm MoE token metadata must contain one count per EP rank; "
+                    f"got {len(real_all_rank_num_tokens)} counts for EP size "
+                    f"{moe.mapping.moe_ep_size}."
+                )
             ep_rank = moe.mapping.moe_ep_rank
         else:
-            real_all_rank_num_tokens = [int(x.shape[0])]
+            real_local = int(all_rank_num_tokens[0]) if all_rank_num_tokens else int(x.shape[0])
+            real_all_rank_num_tokens = [real_local]
             ep_rank = 0
         real_local = real_all_rank_num_tokens[ep_rank]
         assert real_local <= x.shape[0], (

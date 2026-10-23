@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -64,6 +64,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
@@ -106,7 +107,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     impl_class_for,
     resolve_moe_impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import (
+    ExternalCommMoEScheduler,
+    FusedCommMoEScheduler,
+)
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -132,6 +136,50 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fused_comm_scheduler_accepts_singleton_non_dp_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6])
+    )
+
+    assert x_real.shape == x.shape
+    assert router_logits_real.shape == router_logits.shape
+    assert all_rank_num_tokens == [6]
+    assert ep_rank == 0
+    assert not had_meta
+
+
+def test_fused_comm_scheduler_indexes_full_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5, 4, 3])
+    )
+
+    assert x_real.shape[0] == 3
+    assert router_logits_real.shape[0] == 3
+    assert all_rank_num_tokens == [6, 5, 4, 3]
+    assert ep_rank == 3
+    assert had_meta
+
+
+def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    with pytest.raises(ValueError, match="got 2 counts for EP size 4"):
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
 
 
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
@@ -1533,34 +1581,232 @@ def test_megamoe_cutedsl_rejects_non_minimax_swiglu_bias_package(
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
-@pytest.mark.cpu_only
-def test_megamoe_cutedsl_tep_requires_minimax_m3_activation() -> None:
-    deployment = _make_megamoe_cutedsl_test_deployment(ep_size=4, parallel_size=4)
-    minimax_verdict = MegaMoECuteDsl.can_implement(
-        _make_megamoe_cutedsl_minimax_problem(
-            bias=False,
-            activation=ActivationType.SwigluBias,
-        ),
-        deployment,
-    )
-    plain_swiglu_verdict = MegaMoECuteDsl.can_implement(
-        MoEProblem(
-            quant=QuantAlgo.NVFP4.value,
-            dtype_act=torch.bfloat16,
-            hidden_size=512,
-            intermediate_size=512,
-            num_experts=8,
-            top_k=2,
-            swiglu_gptoss_style=False,
-            bias=False,
-            activation=ActivationType.Swiglu.name,
-        ),
-        deployment,
+def _make_megamoe_cutedsl_tep_problem(
+    activation: ActivationType, constants: set[str]
+) -> MoEProblem:
+    return MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=512,
+        intermediate_size=512,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=activation is ActivationType.SwigluBias,
+        bias=False,
+        activation=activation.name,
+        activation_constants=frozenset(constants),
     )
 
-    assert minimax_verdict.eligible, minimax_verdict.detail
-    assert not plain_swiglu_verdict.eligible
-    assert plain_swiglu_verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+_MEGAMOE_CUTEDSL_TEP_ACTIVATIONS = [
+    pytest.param(ActivationType.SwigluBias, {"alpha", "beta", "clamp"}, id="minimax"),
+    pytest.param(ActivationType.SiTu, {"alpha", "beta"}, id="kimi"),
+    pytest.param(ActivationType.Swiglu, set(), id="plain-swiglu"),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("parallel_size", [2, 8])
+@pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
+def test_megamoe_cutedsl_accepts_tep_for_every_model(
+    parallel_size: int, activation: ActivationType, constants: set[str]
+) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(activation, constants),
+        _make_megamoe_cutedsl_test_deployment(ep_size=parallel_size, parallel_size=parallel_size),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
+def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
+    activation: ActivationType, constants: set[str]
+) -> None:
+    deployment = dataclasses.replace(
+        _make_megamoe_cutedsl_test_deployment(ep_size=2, parallel_size=4), tp_size=2
+    )
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(activation, constants), deployment
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
+def test_strict_megamoe_cutedsl_request_reports_rejection_detail() -> None:
+    """A strict MEGAMOE_CUTEDSL request names why the backend was rejected."""
+    model_config = ModelConfig()
+    model_config.moe_backend = "MEGAMOE_CUTEDSL"
+    deployment = dataclasses.replace(
+        _make_megamoe_cutedsl_test_deployment(ep_size=2, parallel_size=4), tp_size=2
+    )
+
+    with pytest.raises(ValueError, match="EP-only"):
+        resolve_moe_impl(
+            model_config,
+            problem=_make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
+            deployment=deployment,
+            allow_degradation=False,
+        )
+
+
+def _fused_comm_scheduler(
+    *,
+    rank: int,
+    tp_size: int = 4,
+    enable_attention_dp: bool = False,
+    reduce_results: bool = False,
+    accepts_global_routed_output: bool = False,
+) -> FusedCommMoEScheduler:
+    mapping = Mapping(
+        world_size=tp_size,
+        rank=rank,
+        tp_size=tp_size,
+        moe_tp_size=1,
+        moe_ep_size=tp_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+    moe = Mock(
+        spec_set=[
+            "parallel_size",
+            "use_dp",
+            "reduce_results",
+            "accepts_global_routed_output",
+            "mapping",
+        ]
+    )
+    moe.parallel_size = tp_size
+    moe.use_dp = enable_attention_dp
+    moe.reduce_results = reduce_results
+    moe.accepts_global_routed_output = accepts_global_routed_output
+    moe.mapping = mapping
+    return FusedCommMoEScheduler(moe)
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_tep_output_is_a_rank_partial_for_external_all_reduce() -> None:
+    """The caller's TP all-reduce of the per-rank outputs restores the global
+    routed output exactly once, as it does for external-comm backends."""
+    tp_size = 4
+    global_output = torch.randn(5, 16, dtype=torch.bfloat16)
+    partials = [
+        _fused_comm_scheduler(rank=rank, tp_size=tp_size)._as_rank_partial_if_reduced_externally(
+            global_output.clone()
+        )
+        for rank in range(tp_size)
+    ]
+
+    assert torch.equal(partials[0], global_output)
+    for partial in partials[1:]:
+        assert partial.shape == global_output.shape
+        assert partial.dtype == global_output.dtype
+        assert not partial.any()
+    assert torch.equal(torch.stack(partials).sum(dim=0), global_output)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"reduce_results": True}, id="layer-reduces"),
+        pytest.param({"accepts_global_routed_output": True}, id="caller-takes-global"),
+        pytest.param({"enable_attention_dp": True}, id="attention-dp"),
+        pytest.param({"tp_size": 1}, id="single-rank"),
+    ],
+)
+def test_fused_comm_output_stays_global_when_nobody_reduces_it_again(overrides: dict) -> None:
+    tp_size = overrides.get("tp_size", 4)
+    global_output = torch.randn(5, 16, dtype=torch.bfloat16)
+    for rank in range(tp_size):
+        scheduler = _fused_comm_scheduler(rank=rank, **overrides)
+        assert scheduler._as_rank_partial_if_reduced_externally(global_output) is global_output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("accepts_global_routed_output", [False, True])
+def test_fused_comm_forward_returns_what_the_caller_reduces(
+    monkeypatch: pytest.MonkeyPatch, accepts_global_routed_output: bool
+) -> None:
+    """``forward`` itself must hand back a rank partial under TEP, not only the
+    helper; multi-chunk outputs are concatenated before the conversion."""
+    tp_size = 4
+    x = torch.randn(5, 16, dtype=torch.bfloat16)
+    router_logits = torch.randn(5, 8)
+    global_output = torch.randn(5, 16, dtype=torch.bfloat16)
+    outputs = []
+    for rank in range(tp_size):
+        scheduler = _fused_comm_scheduler(
+            rank=rank,
+            tp_size=tp_size,
+            accepts_global_routed_output=accepts_global_routed_output,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_strip_adp_padding",
+            lambda x, rl, ids, counts: (x, rl, ids, [x.shape[0]], 0, False),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_compute_chunk_layout",
+            lambda x, rl, counts, ep_rank: (
+                2,
+                list(x.split([3, 2])),
+                list(rl.split([3, 2])),
+                [[3, 2]],
+            ),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_chunks",
+            lambda *args, **kwargs: list(global_output.clone().split([3, 2])),
+        )
+        outputs.append(
+            scheduler.forward(
+                x,
+                router_logits,
+                do_finalize=True,
+                output_dtype=torch.bfloat16,
+                all_rank_num_tokens=None,
+                use_dp_padding=None,
+                input_ids=None,
+            )
+        )
+
+    assert torch.equal(outputs[0], global_output)
+    for output in outputs[1:]:
+        if accepts_global_routed_output:
+            assert torch.equal(output, global_output)
+        else:
+            assert not output.any()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "scheduler_kind, accepts_global_routed_output, expected",
+    [
+        (MoESchedulerKind.FUSED_COMM, True, True),
+        (MoESchedulerKind.FUSED_COMM, False, False),
+        (MoESchedulerKind.EXTERNAL_COMM, True, False),
+        (MoESchedulerKind.EXTERNAL_COMM, False, False),
+    ],
+)
+def test_configurable_moe_reports_global_routed_output_only_when_opted_in(
+    scheduler_kind: MoESchedulerKind, accepts_global_routed_output: bool, expected: bool
+) -> None:
+    """Callers decide whether to skip their routed all-reduce from this
+    property, so it must agree with what ``FusedCommMoEScheduler`` returns."""
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    # The class-level default is what ``FusedCommMoEScheduler`` reads when a
+    # caller does not pass the flag.
+    assert moe.accepts_global_routed_output is False
+    moe.accepts_global_routed_output = accepts_global_routed_output
+    moe.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+
+    assert moe.returns_global_routed_output is expected
+    assert MoE.returns_global_routed_output.fget(moe) is False
 
 
 @pytest.mark.cpu_only
