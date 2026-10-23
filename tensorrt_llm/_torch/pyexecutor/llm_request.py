@@ -10,13 +10,12 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
-                                            export_multimodal_data,
-                                            export_multimodal_params,
                                             get_multimodal_item_metadata)
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -311,7 +310,9 @@ class PyResult:
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
         first_gen_log_probs: TokenLogprobs | None = None
-        multimodal: dict[str, Any] | None = None
+        mm_embeddings: list[dict[str, Any] | None] = None
+        mrope_position_ids: dict[str, Any] | None = None
+        mrope_position_deltas: dict[str, Any] | None = None
         additional_context_outputs_list: list[tuple[str, torch.Tensor]] = field(
             default_factory=list)
         additional_generation_outputs_list: list[tuple[str,
@@ -354,7 +355,9 @@ class PyResult:
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._first_gen_log_probs: Optional[TokenLogprobs] = None
-        self._multimodal: dict[str, Any] | None = None
+        self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
         self._additional_context_outputs = {
             name: []
             for name in additional_outputs
@@ -391,8 +394,13 @@ class PyResult:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
         if diff.first_gen_log_probs is not None:
             self._first_gen_log_probs = diff.first_gen_log_probs
-        if diff.multimodal is not None:
-            self._multimodal = diff.multimodal
+        if diff.mm_embeddings is not None:
+            self._mm_embeddings = diff.mm_embeddings
+        if diff.mrope_position_ids is not None:
+            self._mrope_position_ids = diff.mrope_position_ids
+            self._mrope_position_deltas = diff.mrope_position_deltas
+        if diff.encoder_output is not None:
+            self._encoder_output = diff.encoder_output
         if len(diff.additional_context_outputs_list) > 0:
             for name, additional_context_outputs in diff.additional_context_outputs_list:
                 self._additional_context_outputs[name].append(
@@ -424,30 +432,50 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
-    def set_multimodal_result(self, params: MultimodalParams) -> None:
-        """Publish the common encoded-item handoff for one request."""
-        self._multimodal = export_multimodal_params(params)
-        self.diff.multimodal = self._multimodal
+    def append_mm_embeddings(
+        self,
+        mm_embeddings: torch.Tensor,
+        mm_embedding_lengths: List[int],
+        mm_embedding_metadata: list[dict[str, list[int]]]
+        | None = None) -> None:
+        """Split concatenated embeddings by per-item lengths and create handles.
 
-    def set_multimodal_decode_inputs(
-            self,
-            params: MultimodalParams,
-            *,
-            request_layout: dict[str, Any] | None = None) -> None:
-        """Export only model-required decode state, owned by this prefill worker."""
-        self._multimodal = {
-            "schema_version":
-            1,
-            "items": [],
-            "decode_inputs":
-            export_multimodal_data(params.multimodal_data, clone_tensors=True),
-        }
-        if request_layout is not None:
-            self._multimodal["request_layout"] = {
-                key: value
-                for key, value in request_layout.items() if key != "model_data"
-            }
-        self.diff.multimodal = self._multimodal
+        Args:
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape
+                [total_tokens, hidden_dim].
+            mm_embedding_lengths: Per-item encoder-output embedding lengths.
+            mm_embedding_metadata: Optional per-item layout data for prefill.
+        """
+        if mm_embedding_metadata is not None and len(
+                mm_embedding_metadata) != len(mm_embedding_lengths):
+            raise ValueError(
+                "Embedding metadata must have one entry per multimodal item")
+        split_embeddings = torch.split(mm_embeddings,
+                                       mm_embedding_lengths,
+                                       dim=0)
+
+        self._mm_embeddings = [
+            SharedTensorContainer.from_tensor(emb).dump_to_dict()
+            for emb in split_embeddings
+        ]
+        if mm_embedding_metadata is not None:
+            for handle, metadata in zip(self._mm_embeddings,
+                                        mm_embedding_metadata,
+                                        strict=True):
+                handle["metadata"] = metadata
+        self.diff.mm_embeddings = self._mm_embeddings
+
+    def set_mrope_position(
+        self,
+        mrope_position_ids: torch.Tensor,
+        mrope_position_deltas: torch.Tensor,
+    ):
+        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict()
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict()
+        self.diff.mrope_position_ids = self._mrope_position_ids
+        self.diff.mrope_position_deltas = self._mrope_position_deltas
 
     def set_encoder_output(self, encoder_output: torch.Tensor):
         self._encoder_output = encoder_output
@@ -542,8 +570,21 @@ class PyResult:
         return self._first_gen_log_probs
 
     @property
-    def multimodal(self) -> dict[str, Any] | None:
-        return self._multimodal
+    def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
+        """Returns a list of SharedTensorContainer handles, one per multimodal item."""
+        return self._mm_embeddings
+
+    @property
+    def mrope_position_ids_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_ids
+
+    @property
+    def mrope_position_deltas_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_deltas
 
     @property
     def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
@@ -578,8 +619,10 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'first_gen_log_probs', 'multimodal', 'additional_context_outputs',
-         'additional_generation_outputs', 'encoder_output'))
+         'first_gen_log_probs', 'mm_embedding_handles',
+         'additional_context_outputs', 'additional_generation_outputs',
+         'encoder_output', 'mrope_position_ids_handle',
+         'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],

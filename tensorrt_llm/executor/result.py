@@ -665,8 +665,9 @@ class GenerationResultBase:
                 existing_disagg_params = self.disaggregated_params
                 remote_tail_start = getattr(response_result,
                                             "remote_tail_start", None)
-                # Publish only model-selected decode state below; completed
-                # prefill does not forward the encoder's item handles.
+                # Use `replace` to preserve things like `mrope_position_ids_handle` and
+                # `mrope_position_deltas_handle`. However, explicitly set
+                # `multimodal_embedding_handles=None` since they should no longer be needed.
                 self._disaggregated_params = dataclasses.replace(
                     existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
@@ -679,7 +680,7 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
-                    multimodal=None,
+                    multimodal_embedding_handles=None,
                 )
 
             finish_reasons = response_result.finish_reasons
@@ -723,17 +724,27 @@ class GenerationResultBase:
                     response_result.context_logits) is not None:
                 self._context_logits = context_logits
 
-            if (multimodal := getattr(response_result, "multimodal",
-                                      None)) is not None:
-                if self._disaggregated_params is None:
-                    self._disaggregated_params = DisaggregatedParams(
-                        multimodal=multimodal)
+            if (mm_embedding_handles :=
+                    getattr(response_result, "mm_embedding_handles",
+                            None)) is not None:
+                if self._disaggregated_params is not None:
+                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
+                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
                 else:
-                    self._disaggregated_params = dataclasses.replace(
-                        self._disaggregated_params,
-                        multimodal=multimodal,
-                        multimodal_positions=None,
-                        multimodal_lengths=None)
+                    self._disaggregated_params = DisaggregatedParams(
+                        multimodal_embedding_handles=mm_embedding_handles,
+                        multimodal_hashes=self._multimodal_hashes)
+
+            # Handle mrope handles for both:
+            # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
+            # 2. Prefill-only EPD requests (mm_embedding_handle is None because embeddings
+            #    were already computed in encode phase, but mrope still needs forwarding)
+            if (getattr(response_result, "mrope_position_ids_handle", None)
+                    is not None and self.disaggregated_params is not None):
+                self._disaggregated_params.mrope_position_ids_handle = (
+                    response_result.mrope_position_ids_handle)
+                self._disaggregated_params.mrope_position_deltas_handle = (
+                    response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -1106,12 +1117,12 @@ class GenerationResult(GenerationResultBase):
         mm_input = getattr(
             getattr(generation_request, "multimodal_params", None),
             "multimodal_input", None)
+        self._multimodal_hashes = getattr(mm_input, "multimodal_hashes", None)
         mm_positions = getattr(mm_input, "multimodal_positions", None)
         mm_lengths = getattr(mm_input, "multimodal_lengths", None)
         if (self._disaggregated_params is not None
                 and self._disaggregated_params.request_type == "context_only"
-                and mm_positions is not None
-                and self._disaggregated_params.multimodal is None):
+                and mm_positions is not None):
             # Seed before postprocessing workers receive the request metadata.
             self._disaggregated_params = dataclasses.replace(
                 self._disaggregated_params,

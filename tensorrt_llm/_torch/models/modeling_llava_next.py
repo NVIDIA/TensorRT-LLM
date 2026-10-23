@@ -19,8 +19,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
-                                            MultimodalParams,
-                                            _multimodal_embedding_shape)
+                                            MultimodalParams)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -121,7 +120,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     ) -> Tuple[List[int], List[int], List[int]]:
         """
         Shared logic (called by expand_prompt_token_ids_for_mm and
-        _finalize_multimodal_prompt):
+        build_disagg_prefill_multimodal_inputs):
         replace each image placeholder token in prompt_token_ids
         with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
 
@@ -287,10 +286,10 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
-    def _finalize_multimodal_prompt(
+    def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: Union[TextPrompt, TokensPrompt],
-        params: MultimodalParams,
+        mm_handles: List[Dict[str, Any]],
         *,
         mm_hashes: list[list[int]] | None = None,
     ) -> tuple[list[int], MultimodalParams]:
@@ -301,14 +300,13 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         Args:
             inputs: Inputs containing an already tokenized text prompt or a text prompt string.
-            embeddings: List of multimodal embedding handles.
+            mm_handles: List of multimodal embedding handles.
             mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
             Expanded token IDs and common multimodal params containing
             prompt layout, item metadata, and embedding handles.
         """
-        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if text_prompt:
@@ -318,20 +316,18 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             raise ValueError(
                 "Text prompt or token IDs are required but neither is provided")
 
-        if not isinstance(embeddings, list):
-            raise ValueError("embeddings must be a list")
+        if not isinstance(mm_handles, list):
+            raise ValueError("mm_handles must be a list")
 
         expected_hidden_size = self.config.text_config.hidden_size
-        for i, embedding in enumerate(embeddings):
-            hidden_size = _multimodal_embedding_shape(embedding)[1]
+        for i, mm_handle in enumerate(mm_handles):
+            hidden_size = mm_handle['tensor_size'][1]
             if hidden_size != expected_hidden_size:
                 raise RuntimeError(
                     f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
                 )
 
-        num_mm_tokens_per_image = [
-            _multimodal_embedding_shape(h)[0] for h in embeddings
-        ]
+        num_mm_tokens_per_image = [h["tensor_size"][0] for h in mm_handles]
         expanded_ids, mm_token_length, mm_token_offsets = (
             self._expand_image_placeholders_in_token_ids(
                 prompt_token_ids, num_mm_tokens_per_image))
@@ -351,12 +347,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 f"than or equal to final_length ({final_length})")
 
         return expanded_ids, MultimodalParams.from_embeddings(
-            embeddings,
+            mm_handles,
             MultimodalItemMetadata(
-                [("image", i) for i in range(len(embeddings))],
+                [("image", i) for i in range(len(mm_handles))],
                 output_embedding_lengths=[
-                    _multimodal_embedding_shape(handle)[0]
-                    for handle in embeddings
+                    handle["tensor_size"][0] for handle in mm_handles
                 ],
             ),
             multimodal_hashes=mm_hashes,

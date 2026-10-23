@@ -27,7 +27,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Final, Generic, Optional, TypeAlias, TypeVar, cast
+from typing import Any, Dict, Final, Generic, List, Optional, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -36,7 +36,6 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
-from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 from ...utils import torch_multi_arange
@@ -292,33 +291,67 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
 
 @dataclass(kw_only=True)
 class MultimodalResult:
-    """Request-ordered encoded views and their scheduled request correspondence."""
-
-    mm_encoder_outputs: list[MultimodalParams]
-    mm_embedding_request_indices: list[int]
+    mm_embeddings: List[torch.Tensor]
+    # needed to torch.split the mm_embeddings into item-wise chunks
+    mm_embedding_lengths: List[List[int]]
+    # needed when requests mix text-only and multimodal ones
+    mm_embedding_request_indices: List[int]
+    # number of context requests in the batch
     num_context_requests: int
+    # Can be used to include e.g. `mrope_position_ids`, etc.
+    extra_data: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
-        if len(self.mm_encoder_outputs) != len(self.mm_embedding_request_indices):
-            raise ValueError("Encoder outputs and request indices must align")
-        for result, index in zip(
-            self.mm_encoder_outputs, self.mm_embedding_request_indices, strict=True
+        num_embeddings = len(self.mm_embeddings)
+        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
+        if metadata is not None and len(metadata) != num_embeddings:
+            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
+        num_lengths = len(self.mm_embedding_lengths)
+        if num_lengths != num_embeddings:
+            raise ValueError(
+                "mm_embedding_lengths batch size does not match mm_embeddings: "
+                f"{num_lengths} != {num_embeddings}"
+            )
+        num_request_indices = len(self.mm_embedding_request_indices)
+        if num_request_indices != num_embeddings:
+            raise ValueError(
+                "mm_embedding_request_indices batch size does not match "
+                f"mm_embeddings: {num_request_indices} != {num_embeddings}"
+            )
+        for result_index, (mm_embedding, mm_embedding_lengths) in enumerate(
+            zip(self.mm_embeddings, self.mm_embedding_lengths, strict=True)
         ):
-            if not 0 <= index < self.num_context_requests:
-                raise ValueError("Invalid multimodal encoder request index")
-            expected = sum(result.get_item_layout()[1])
-            data = cast(dict[str, Any], result.multimodal_data)
-            if data["multimodal_embedding"].shape[0] != expected:
-                raise ValueError("Multimodal encoder output rows do not match item metadata")
+            actual_rows = len(mm_embedding)
+            expected_rows = sum(mm_embedding_lengths)
+            if actual_rows != expected_rows:
+                raise ValueError(
+                    f"mm_embedding shape mismatch for result {result_index}: "
+                    f"{actual_rows} != {expected_rows}"
+                )
+        for request_index in self.mm_embedding_request_indices:
+            if request_index < 0 or request_index >= self.num_context_requests:
+                raise ValueError(
+                    "mm_embedding_request_indices contains an invalid request "
+                    f"index: {request_index} not in [0, {self.num_context_requests})"
+                )
 
     @classmethod
     def from_model_outputs(
-        cls, model_outputs: dict[str, Any], num_context_requests: int
+        cls, model_outputs: Dict[str, Any], num_context_requests: int
     ) -> "MultimodalResult":
+        result_keys = {
+            "mm_embeddings",
+            "mm_embedding_lengths",
+            "mm_embedding_request_indices",
+        }
         return cls(
-            mm_encoder_outputs=model_outputs["mm_encoder_outputs"],
+            mm_embeddings=model_outputs["mm_embeddings"],
+            mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
             mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
             num_context_requests=num_context_requests,
+            extra_data={
+                key: value for key, value in model_outputs.items() if key not in result_keys
+            },
         )
 
 
@@ -368,15 +401,42 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleState)
         requests = state.requests
+        mm_embeddings = state.data.mm_embeddings
+        extra_data = state.data.extra_data or {}
+        mrope_position_ids = extra_data.get("mrope_position_ids", None)
+        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
         for request in requests:
             request.state = LlmRequestState.GENERATION_COMPLETE
+            # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
+
         if not self.return_mm_results:
             return
-        for index, result in zip(
-            state.data.mm_embedding_request_indices, state.data.mm_encoder_outputs, strict=True
+
+        request_indices = state.data.mm_embedding_request_indices
+        for result_index, (request_index, mm_embedding) in enumerate(
+            zip(request_indices, mm_embeddings, strict=True)
         ):
-            requests[index].py_result.set_multimodal_result(result)
+            request = requests[request_index]
+            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
+
+            embedding_metadata = extra_data.get("mm_embedding_metadata")
+            if embedding_metadata is None:
+                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            else:
+                request.py_result.append_mm_embeddings(
+                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
+                )
+
+            # Store mrope data if available
+            if mrope_position_ids is not None and mrope_position_deltas is not None:
+                mrope_index = (
+                    request_index if len(mrope_position_ids) == len(requests) else result_index
+                )
+                request.py_result.set_mrope_position(
+                    mrope_position_ids[mrope_index],
+                    mrope_position_deltas[mrope_index],
+                )
 
     @override
     def is_generation_model(self) -> bool:

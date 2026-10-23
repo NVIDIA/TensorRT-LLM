@@ -31,8 +31,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            import_multimodal_params)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -959,7 +958,8 @@ class BaseLLM:
         # on the `supports_token_id_mm_expansion` class flag.
 
         is_mm_disagg = (disaggregated_params is not None
-                        and disaggregated_params.has_multimodal_embeddings)
+                        and disaggregated_params.multimodal_embedding_handles
+                        is not None)
         is_gen_only = (disaggregated_params is not None and
                        disaggregated_params.request_type == "generation_only")
 
@@ -973,29 +973,41 @@ class BaseLLM:
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
                 )
+            mm_handles = disaggregated_params.multimodal_embedding_handles
+            # TODO(TRTLLM-12869): Pass encoder-side MM layout through
+            # DisaggregatedParams so prefill does not rebuild prompt tokens,
+            # positions, lengths, runs, special offsets, and cumsum here.
+            prompt_token_ids, multimodal_params = (
+                self.input_processor.build_disagg_prefill_multimodal_inputs(
+                    inputs,
+                    mm_handles,
+                    mm_hashes=disaggregated_params.multimodal_hashes))
+            if not isinstance(multimodal_params, MultimodalParams):
+                raise TypeError(
+                    "build_disagg_prefill_multimodal_inputs must return "
+                    "(prompt_token_ids, MultimodalParams)")
+            prompt = inputs.get("prompt", None)
             if is_gen_only:
                 raise ValueError(
-                    "Generation-only requests cannot contain encoder item outputs"
+                    "Generation-only mode should not need multimodal parameters"
                 )
-            handoff = disaggregated_params.multimodal
-            multimodal_params = import_multimodal_params(handoff)
-            layout = handoff.get("request_layout")
-            if layout is not None:
-                prompt_token_ids = list(layout["prompt_token_ids"])
             else:
-                hashes = [item.get("hash") for item in handoff["items"]]
-                prompt_token_ids, multimodal_params = self.input_processor.finalize_multimodal_prompt(
-                    inputs,
-                    multimodal_params,
-                    mm_hashes=hashes if all(value is not None
-                                            for value in hashes) else None,
-                )
-            prompt = inputs.get("prompt")
-            maybe_compute_mm_embed_cumsum(
-                prompt_token_ids,
-                {"multimodal_data": multimodal_params.multimodal_data},
-                cast(BaseMultimodalInputProcessor, self.input_processor),
-            )
+                # BaseWorker resolves embedding handles to local tensor views.
+                multimodal_data = multimodal_params.multimodal_data
+                if disaggregated_params.mrope_position_ids_handle is not None:
+                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    assert disaggregated_params.mrope_position_deltas_handle is not None
+                    mrope_config = {}
+                    mrope_config[
+                        "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                    mrope_config[
+                        "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                    multimodal_data["mrope_config"] = mrope_config
+                # Backfill multimodal_embed_mask_cumsum so downstream chunked-prefill
+                # logic can slice the pre-computed embeddings correctly.
+                maybe_compute_mm_embed_cumsum(
+                    prompt_token_ids, {"multimodal_data": multimodal_data},
+                    cast(BaseMultimodalInputProcessor, self.input_processor))
         # This condition is to ensure that this branch is not hit for models that expand
         # placeholder token IDs with MM data.
         elif ("prompt_token_ids" in inputs
@@ -1003,9 +1015,19 @@ class BaseLLM:
               and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
             multimodal_data = {}
-            if disaggregated_params is not None and disaggregated_params.multimodal is not None:
-                multimodal_data = disaggregated_params.multimodal.get(
-                    "decode_inputs", {})
+            # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
+            if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
+                # PyTorchModelEngine assumes both are present when using mrope.
+                if disaggregated_params.mrope_position_deltas_handle is None:
+                    raise RuntimeError(
+                        "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
+                        "be provided, or both `None`.")
+                mrope_config = {}
+                mrope_config[
+                    "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                mrope_config[
+                    "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                multimodal_data["mrope_config"] = mrope_config
             if multimodal_data:
                 multimodal_params = MultimodalParams(
                     multimodal_data=multimodal_data)
@@ -1059,7 +1081,23 @@ class BaseLLM:
                 else:
                     # Convert to shared tensor handle to reduce IPC overhead
                     multimodal_params.to_handle("multimodal_data")
-
+                    if (disaggregated_params is not None) and (
+                            "mrope_config"
+                            in multimodal_params.multimodal_data):
+                        # Propagate mRoPE handles during context-only P -> D so decode-only
+                        # can rebuild mrope_config without raw multimodal inputs.
+                        mrope_config = multimodal_params.multimodal_data[
+                            "mrope_config"]
+                        mrope_position_ids = mrope_config.get(
+                            "mrope_position_ids")
+                        mrope_position_deltas = mrope_config.get(
+                            "mrope_position_deltas")
+                        if (mrope_position_ids is not None
+                                and mrope_position_deltas is not None):
+                            disaggregated_params.mrope_position_ids_handle = (
+                                mrope_position_ids)
+                            disaggregated_params.mrope_position_deltas_handle = (
+                                mrope_position_deltas)
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"

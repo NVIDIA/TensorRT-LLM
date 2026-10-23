@@ -42,7 +42,6 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalParams,
 )
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     EncodeCudaGraphConfig,
@@ -79,12 +78,6 @@ def _make_runner(
     kwargs = dict(mapping=SimpleNamespace(), dist=SimpleNamespace(), moe_load_balancer=None)
     if issubclass(runner_type, PoolingRunner):
         kwargs["model_caller"] = model_caller or Mock(return_value={"logits": torch.empty(0)})
-    if issubclass(runner_type, MultimodalEncoderRunner):
-
-        class Processor:
-            finalize_multimodal_prompt = BaseMultimodalInputProcessor.finalize_multimodal_prompt
-
-        kwargs["input_processor"] = Processor()
     with patch.object(InputBuffers, "allocate", return_value=buffers):
         return runner_type(model, config, **kwargs)
 
@@ -461,8 +454,9 @@ def test_mm_encoder_runner_forward_step_returns_empty_result_without_multimodal_
     result = runner._forward_step({}, SimpleNamespace(context_requests=[]))
 
     assert result == {
-        "mm_encoder_outputs": [],
+        "mm_embeddings": [],
         "mm_embedding_request_indices": [],
+        "mm_embedding_lengths": [],
         "logits": None,
     }
 
@@ -478,78 +472,109 @@ def test_mm_encoder_runner_forward_step_rejects_payload_request_count_mismatch()
         )
 
 
-def test_mm_encoder_runner_forward_step_skips_metadata_only_requests() -> None:
-    metadata = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[2])
-    params = [
-        MultimodalParams(multimodal_data={"mrope_config": {}}),
-        MultimodalParams(
-            multimodal_data={
-                "image": {"pixel_values": torch.ones(2, 2)},
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
-            }
+def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_requests() -> None:
+    requests = [
+        SimpleNamespace(py_multimodal_data={"mrope_config": {}}),
+        SimpleNamespace(py_multimodal_data={"image": object()}),
+        SimpleNamespace(
+            py_multimodal_data={
+                "image": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
+            },
+            multimodal_lengths=[2],
         ),
     ]
-    requests = [
-        SimpleNamespace(py_multimodal_data=param.multimodal_data, multimodal_hashes=None)
-        for param in params
-    ]
-    output = params[1].with_encoder_output(torch.arange(4).reshape(2, 2))
-    model = SimpleNamespace(encode_multimodal_inputs=Mock(return_value=[output]))
-    result = _make_runner(MultimodalEncoderRunner, model)._forward_step(
-        {"multimodal_params": params}, SimpleNamespace(context_requests=requests)
-    )
-    model.encode_multimodal_inputs.assert_called_once_with([params[1]])
-    assert result["mm_embedding_request_indices"] == [1]
-    actual = result["mm_encoder_outputs"][0]
-    assert actual.item_metadata is metadata
-    torch.testing.assert_close(
-        actual.multimodal_data["multimodal_embedding"], torch.arange(4).reshape(2, 2)
-    )
-
-
-def test_mm_encoder_runner_preserves_per_request_rows_and_model_metadata() -> None:
-    embeddings = torch.arange(6).reshape(3, 2)
-    auxiliary = torch.arange(10).reshape(5, 2)
-    params = [
-        MultimodalParams(
-            multimodal_data={
-                "image": {"pixel_values": torch.ones(length, 2)},
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                    [("image", 0)], output_embedding_lengths=[length]
-                ),
-            }
+    params = [MultimodalParams(multimodal_data=request.py_multimodal_data) for request in requests]
+    model = SimpleNamespace(
+        encode_multimodal_inputs=Mock(
+            return_value=[params[2].with_encoder_output(torch.arange(4).reshape(2, 2))]
         )
-        for length in (1, 2)
-    ]
-    outputs = [
-        param.with_encoder_output(
-            tensor,
-            metadata={
-                "mrope_config": {"mrope_position_deltas": index},
-                "multimodal_features": [{"auxiliary": auxiliary}],
+    )
+    runner = _make_runner(MultimodalEncoderRunner, model)
+
+    result = runner._forward_step(
+        {"multimodal_params": params},
+        SimpleNamespace(context_requests=requests),
+    )
+
+    model.encode_multimodal_inputs.assert_called_once_with([params[2]])
+    assert result["logits"] is None
+    assert result["mm_embedding_request_indices"] == [2]
+    assert result["mm_embedding_lengths"] == [[2]]
+    torch.testing.assert_close(result["mm_embeddings"][0], torch.arange(4).reshape(2, 2))
+
+
+def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> None:
+    first_param = MultimodalParams(
+        multimodal_data={
+            "image": object(),
+            "mrope_config": {
+                "mrope_position_ids": "first-ids",
+                "mrope_position_deltas": "first-deltas",
             },
-        )
-        for index, (param, tensor) in enumerate(zip(params, embeddings.split([1, 2]), strict=True))
-    ]
-    model = SimpleNamespace(encode_multimodal_inputs=Mock(return_value=outputs))
-    requests = [
-        SimpleNamespace(py_multimodal_data=param.multimodal_data, multimodal_hashes=None)
-        for param in params
-    ]
-    result = _make_runner(MultimodalEncoderRunner, model)._forward_step(
-        {"multimodal_params": params}, SimpleNamespace(context_requests=requests)
+        }
     )
+    second_param = MultimodalParams(
+        multimodal_data={
+            "image": object(),
+            "mrope_config": {
+                "mrope_position_ids": "second-ids",
+                "mrope_position_deltas": "second-deltas",
+            },
+        }
+    )
+    requests = [
+        SimpleNamespace(
+            py_multimodal_data={
+                "image": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
+            },
+            multimodal_lengths=[1],
+        ),
+        SimpleNamespace(
+            py_multimodal_data={
+                "image": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
+            },
+            multimodal_lengths=[2],
+        ),
+    ]
+    embeddings = torch.arange(6).reshape(3, 2)
+    first_param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = requests[
+        0
+    ].py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    second_param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = requests[
+        1
+    ].py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    model = SimpleNamespace(
+        encode_multimodal_inputs=Mock(
+            return_value=[
+                first_param.with_encoder_output(embeddings[:1]),
+                second_param.with_encoder_output(embeddings[1:]),
+            ]
+        )
+    )
+    runner = _make_runner(MultimodalEncoderRunner, model)
+
+    result = runner._forward_step(
+        {"multimodal_params": [first_param, second_param]},
+        SimpleNamespace(context_requests=requests),
+    )
+
+    model.encode_multimodal_inputs.assert_called_once_with([first_param, second_param])
+    assert result["logits"] is None
     assert result["mm_embedding_request_indices"] == [0, 1]
-    for index, (actual, expected) in enumerate(
-        zip(result["mm_encoder_outputs"], embeddings.split([1, 2]), strict=True)
-    ):
-        tensor = actual.multimodal_data["multimodal_embedding"]
-        torch.testing.assert_close(tensor, expected)
-        assert tensor.untyped_storage() is not embeddings.untyped_storage()
-        assert actual.multimodal_data["mrope_config"]["mrope_position_deltas"] == index
-        feature = actual.multimodal_data["multimodal_features"][0]["auxiliary"]
-        torch.testing.assert_close(feature, auxiliary)
-        assert feature.untyped_storage() is not auxiliary.untyped_storage()
+    assert result["mm_embedding_lengths"] == [[1], [2]]
+    torch.testing.assert_close(result["mm_embeddings"][0], embeddings[:1])
+    torch.testing.assert_close(result["mm_embeddings"][1], embeddings[1:])
+    assert result["mrope_position_ids"] == ["first-ids", "second-ids"]
+    assert result["mrope_position_deltas"] == ["first-deltas", "second-deltas"]
 
 
 @pytest.mark.parametrize("effective_length", [None, 0, 3])
@@ -784,7 +809,6 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
         ),
     ]
     for request in requests:
-        request.multimodal_hashes = None
         request.py_result = PyResult(prompt_len=1, max_new_tokens=1)
         request.set_finished_reason = Mock()
     params = [
@@ -817,17 +841,15 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
     state = sampler.sample_async(scheduled_requests, result, [])
     sampler.update_requests(state)
 
-    assert requests[1].py_result.multimodal is None
-    image_items = json.loads(json.dumps(requests[0].py_result.multimodal))["items"]
-    image_handles = [item["embeddings"]["multimodal_embedding"] for item in image_items]
+    assert requests[1].py_result.mm_embedding_handles is None
+    image_handles = json.loads(json.dumps(requests[0].py_result.mm_embedding_handles))
     assert len(image_handles) == 1
     assert "metadata" not in image_handles[0]
     torch.testing.assert_close(
         SharedTensorContainer.from_dict(image_handles[0]).get_local_view(), embeddings[:1]
     )
-    video_items = json.loads(json.dumps(requests[2].py_result.multimodal))["items"]
-    video_handles = [item["embeddings"]["multimodal_embedding"] for item in video_items]
-    assert [item["model_metadata"]["retained_token_counts"] for item in video_items] == [
+    video_handles = json.loads(json.dumps(requests[2].py_result.mm_embedding_handles))
+    assert [handle["metadata"]["retained_token_counts"] for handle in video_handles] == [
         [2, 1],
         [2, 0],
     ]

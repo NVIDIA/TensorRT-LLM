@@ -37,12 +37,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import (
-    MultimodalItemMetadata,
-    MultimodalItemPartition,
-    MultimodalParams,
-    _multimodal_embedding_shape,
-)
+from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -85,7 +80,7 @@ from .modeling_utils import (
 
 def _expand_prompt_token_ids_for_mm_handoff(
     input_ids: torch.Tensor,
-    embeddings: List[Dict[str, Any]],
+    mm_handles: List[Dict[str, Any]],
     *,
     image_token_id: int,
     video_token_id: int,
@@ -109,16 +104,14 @@ def _expand_prompt_token_ids_for_mm_handoff(
         for pos, token in enumerate(input_ids.tolist())
         if token in (image_token_id, video_token_id)
     ]
-    if len(placeholder_positions) != len(embeddings):
+    if len(placeholder_positions) != len(mm_handles):
         raise ValueError(
-            "Number of multimodal placeholders must match number of embeddings: "
+            "Number of multimodal placeholders must match number of mm_handles: "
             f"placeholders={len(placeholder_positions)}, "
-            f"embeddings={len(embeddings)}"
+            f"mm_handles={len(mm_handles)}"
         )
 
-    total_mm_embed_tokens = sum(
-        _multimodal_embedding_shape(embedding)[0] for embedding in embeddings
-    )
+    total_mm_embed_tokens = sum(mm_handle["tensor_size"][0] for mm_handle in mm_handles)
     final_length = len(input_ids) - len(placeholder_positions) + total_mm_embed_tokens
     expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
 
@@ -141,7 +134,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
             write_pos += 1
             continue
 
-        mm_token_num = _multimodal_embedding_shape(embeddings[mm_handle_idx])[0]
+        mm_token_num = mm_handles[mm_handle_idx]["tensor_size"][0]
         has_leading_special = (
             read_pos > 0 and int(input_ids[read_pos - 1].item()) == vision_start_token_id
         )
@@ -170,7 +163,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
         raise RuntimeError(f"Write position mismatch: {write_pos} != {final_length}")
 
     params = MultimodalParams.from_embeddings(
-        embeddings,
+        mm_handles,
         MultimodalItemMetadata(item_refs, output_embedding_lengths=multimodal_embedding_lengths),
         multimodal_hashes=mm_hashes,
         multimodal_lengths=mm_token_lengths,
@@ -489,10 +482,10 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # np), the raw side is left at 0-255 and the ViT sees garbage.
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
-    def _finalize_multimodal_prompt(
+    def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,
-        params: MultimodalParams,
+        mm_handles: List[Dict[str, Any]],
         *,
         mm_hashes: list[list[int]] | None = None,
     ) -> tuple[list[int], MultimodalParams]:
@@ -501,42 +494,36 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
-            embeddings: List of multimodal embedding handles.
+            mm_handles: List of multimodal embedding handles.
             mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
             Expanded token IDs and common multimodal params containing
             prompt layout, item metadata, and embedding handles.
         """
-        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
-        prompt_token_ids = inputs.get("prompt_token_ids")
-        if prompt_token_ids is None and not text_prompt:
-            raise ValueError("Prompt token IDs or text are required")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
 
-        if not isinstance(embeddings, list):
-            raise TypeError("embeddings must be a list")
+        if not isinstance(mm_handles, list):
+            raise TypeError("mm_handles must be a list")
 
         num_deepstack_levels = len(self.config.vision_config.deepstack_visual_indexes)
         # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
         # feature maps from deepstack layers.
         expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
-        for i, embedding in enumerate(embeddings):
-            hidden_size = _multimodal_embedding_shape(embedding)[1]
+        for i, mm_handle in enumerate(mm_handles):
+            hidden_size = mm_handle["tensor_size"][1]
             if hidden_size != expected_size:
                 raise RuntimeError(
                     f"Expected multimodal embedding {i} to have hidden size {expected_size}, got {hidden_size}."
                 )
 
-        input_ids = (
-            torch.tensor(prompt_token_ids)
-            if prompt_token_ids is not None
-            else self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
-        )
+        input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
 
         return _expand_prompt_token_ids_for_mm_handoff(
             input_ids,
-            embeddings,
+            mm_handles,
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,

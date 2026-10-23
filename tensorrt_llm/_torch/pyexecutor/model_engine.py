@@ -55,7 +55,7 @@ from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
-from .engine.runners import MultimodalEncoderRunner, resolve_runner_type
+from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache)
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
@@ -698,9 +698,6 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
-            **({
-                "input_processor": self.input_processor
-            } if issubclass(runner_cls, MultimodalEncoderRunner) else {}),
         )
 
     def _decoder_runner_config(

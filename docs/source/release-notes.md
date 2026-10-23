@@ -18,7 +18,7 @@ All published functionality in the Release Notes has been fully tested and verif
   `MultimodalItemMetadata`, replacing `get_mm_encoder_item_metadata()` and
   `MultimodalEncoderItemMetadata`. The removed `DisaggPrefillMultimodalInputs`
   result is replaced by `(prompt_token_ids, MultimodalParams)` from
-  `finalize_multimodal_prompt()`, which also accepts the keyword-only
+  `build_disagg_prefill_multimodal_inputs()`, which also accepts the keyword-only
   `mm_hashes` argument. Custom processors must migrate these hooks; processors
   defining the removed metadata hook now fail at wrapper creation.
   Also removed: `MultimodalParams(mm_item_order=...)`, the
@@ -29,17 +29,14 @@ All published functionality in the Release Notes has been fully tested and verif
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
 
-- <span style="color: red">**[BREAKING CHANGE] Structured multimodal encoder results and E/P handoff.**</span>
-  Outer encoder hooks now return ordered `MultimodalParams` views instead of a
-  concatenated tensor. Physical tower functions keep returning tensors.
-  `DisaggregatedParams.multimodal` carries versioned encoded items, an optional
-  finalized request layout, and model-required decode state; it replaces flat
-  E/P embedding/hash/mrope fields. E/P extensions use
-  `finalize_multimodal_prompt()` in place of
-  `build_disagg_prefill_multimodal_inputs()`. External E/P orchestrators,
-  including Dynamo, must deploy their matching adapter revision. Existing HTTP
-  P/D span fields remain supported. See the
-  [multimodal developer guide](developer-guide/multimodal.md#encoderprefill-handoff).
+- <span style="color: red">**[BREAKING CHANGE] Structured multimodal encoder hooks.**</span>
+  Model implementations of `encode_multimodal_inputs()` now return one encoded
+  `MultimodalParams` view per input; `forward_multimodal_encoder_items()` returns
+  one per selected item. Each view carries embeddings and common item metadata.
+  Physical tower functions still return tensors. Use
+  `split_multimodal_encoder_outputs()` or `encode_multimodal_by_groups()` to
+  migrate custom model hooks. Existing `DisaggregatedParams` fields and E/P/D
+  wire formats remain supported; Dynamo does not need an update for batching.
 
 ### Fixed Issues
 

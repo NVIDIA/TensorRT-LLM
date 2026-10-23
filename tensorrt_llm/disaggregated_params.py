@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from tensorrt_llm.bindings import executor as tllme
 
 
@@ -46,10 +48,10 @@ class DisaggregatedParams:
          usage accounting on the generation server.
         remote_tail_start (int): Prompt-token boundary transferred by a remote-tail
          context worker. The generation worker replays the suffix starting here.
-        multimodal (Dict[str, Any]): Versioned multimodal handoff. ``items``
-         contains encoded item handles, actual output lengths and model metadata.
-         Optional ``request_layout`` contains finalized prompt tokens and layout;
-         optional ``decode_inputs`` contains model-required generation state.
+        multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
+        multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
+        multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
+        multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
     """
 
     request_type: Optional[str] = None
@@ -67,24 +69,18 @@ class DisaggregatedParams:
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[Dict[str, Any]] = None
     remote_tail_start: Optional[int] = None
-    # Existing HTTP P/D span fields. Canonical E/P data uses request_layout.
     multimodal_positions: Optional[List[int]] = None
     multimodal_lengths: Optional[List[int]] = None
 
-    # Encoded item data and optional finalized request layout. Live Params,
-    # raw media, local cache references and CUDA events are never serialized.
-    multimodal: Optional[Dict[str, Any]] = None
-
-    @property
-    def has_multimodal_embeddings(self) -> bool:
-        """Whether the handoff contains encoder outputs to import for prefill."""
-        return self.multimodal is not None and bool(self.multimodal["items"])
-
-    def get_multimodal_embedding_handles(self) -> list[dict[str, Any]]:
-        """Read primary item handles in their declared order."""
-        if self.multimodal is None:
-            return []
-        return [item["embeddings"]["multimodal_embedding"] for item in self.multimodal["items"]]
+    # E-P Disaggregated Params
+    multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
+        None  # multimodal embedding handles should be a list of cudaIPC handles for each mm_embedding
+    )
+    multimodal_hashes: Optional[List[List[int]]] = (
+        None  # user provided mm hashes should be a list of 8 integers
+    )
+    mrope_position_ids_handle: Optional[Dict[str, Any]] = None
+    mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         # Prefer disagg_request_id over ctx_request_id
@@ -129,11 +125,6 @@ class DisaggregatedParams:
                 raise ValueError("multimodal_positions must be non-negative")
             if any(length <= 0 for length in self.multimodal_lengths):
                 raise ValueError("multimodal_lengths must be positive")
-        if self.multimodal is not None:
-            if self.multimodal.get("schema_version") != 1:
-                raise ValueError("Unsupported multimodal handoff schema_version; expected 1")
-            if not isinstance(self.multimodal.get("items"), list):
-                raise ValueError("Multimodal handoff items must be a list")
         if self.request_type is not None:
             self.request_type = self.request_type.lower()
             if self.request_type not in [
@@ -145,3 +136,22 @@ class DisaggregatedParams:
                     f"Unknown request type: {self.request_type}. Must be context_only, generation_only or "
                     "context_and_generation"
                 )
+        if self.multimodal_embedding_handles is not None:
+            if self.multimodal_hashes is not None:
+                # if mm hashes are provided, kvcache reuse can be enabled
+                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
+                    "multimodal_embedding_handles and multimodal_hashes must have the same length"
+                )
+                for mm_hash in self.multimodal_hashes:
+                    assert isinstance(mm_hash, list), "mm_hash must be a list"
+                    assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
+                    assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
+            else:
+                # if user did not provide mm embedding handles, kvcache reuse will be disabled
+                assert len(self.multimodal_embedding_handles) > 0, (
+                    "multimodal_embedding_handles must be provided"
+                )
+                vals = np.random.randint(
+                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
+                ).tolist()
+                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)

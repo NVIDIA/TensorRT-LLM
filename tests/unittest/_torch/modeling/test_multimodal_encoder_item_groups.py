@@ -954,46 +954,6 @@ def test_encoded_results_borrow_rows_without_retaining_request_inputs_or_state()
     assert retained.untyped_storage() is not auxiliary.untyped_storage()
 
 
-def test_finalized_handoff_roundtrip_preserves_item_layout_and_named_tensor_handles() -> None:
-    import dataclasses
-    import json
-
-    from tensorrt_llm.disaggregated_params import DisaggregatedParams
-    from tensorrt_llm.inputs.multimodal import export_multimodal_params, import_multimodal_params
-
-    source = _make_request(["image", "video"])
-    source.multimodal_input = MultimodalInput.from_components([[1] * 8, [2] * 8], [1, 6], [2, 4])
-    result = _GroupedEncoderModel().encode_multimodal_inputs([source])[0]
-    # The E boundary associates the pure encoder view with the original request.
-    result.multimodal_input = source.multimodal_input
-    result.multimodal_data["multimodal_features"] = [
-        {"auxiliary": torch.arange(6).reshape(3, 2)},
-        {},
-    ]
-    result.multimodal_data["request_layout"] = {
-        "prompt_token_ids": [0] * 10,
-        "multimodal_positions": [1, 6],
-        "multimodal_lengths": [2, 4],
-    }
-    envelope = DisaggregatedParams(multimodal=export_multimodal_params(result))
-    envelope = DisaggregatedParams(**json.loads(json.dumps(dataclasses.asdict(envelope))))
-    imported = import_multimodal_params(envelope.multimodal)
-
-    assert imported.get_item_layout() == result.get_item_layout()
-    assert imported.multimodal_input == source.multimodal_input
-    assert imported.multimodal_data["request_layout"] == result.multimodal_data["request_layout"]
-    assert len(envelope.get_multimodal_embedding_handles()) == 2
-    imported.to_tensor("multimodal_data")
-    torch.testing.assert_close(
-        imported.multimodal_data["multimodal_features"][0]["auxiliary"],
-        result.multimodal_data["multimodal_features"][0]["auxiliary"],
-    )
-    torch.testing.assert_close(
-        torch.cat(imported.multimodal_data["multimodal_embedding"]),
-        result.multimodal_data["multimodal_embedding"],
-    )
-
-
 @pytest.mark.parametrize("token_limit", [2, 4])
 def test_gemma_batches_compatible_audio_and_vision_requests_and_restores_order(
     token_limit: int,

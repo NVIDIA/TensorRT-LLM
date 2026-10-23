@@ -48,9 +48,9 @@ def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
         [11, _VISION_START_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_END_TOKEN_ID, 12]
     )
 
-    prompt_token_ids, params = processor._finalize_multimodal_prompt(
+    prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
         {"prompt": "video prompt"},
-        MultimodalParams(multimodal_data={"multimodal_embedding": [{"tensor_size": (3, 16)}]}),
+        [{"tensor_size": (3, 16)}],
         mm_hashes=[[1] * 8],
     )
 
@@ -125,7 +125,7 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
 
 def test_qwen3vl_disagg_prompt_layout_requires_handle_per_placeholder():
     """Each prompt placeholder must have a matching MM handle."""
-    with pytest.raises(ValueError, match="placeholders=1, embeddings=0"):
+    with pytest.raises(ValueError, match="placeholders=1, mm_handles=0"):
         _expand_prompt_token_ids_for_mm_handoff(
             torch.tensor([1, 2, 3]),
             [],
@@ -157,10 +157,8 @@ def test_disagg_image_processors_return_common_params(model):
     handles = [{"tensor_size": (2, 16)}, {"tensor_size": (3, 16)}]
     hashes = [[1] * 8, [2] * 8]
 
-    tokens, params = processor._finalize_multimodal_prompt(
-        {"prompt": "video prompt"},
-        MultimodalParams(multimodal_data={"multimodal_embedding": handles}),
-        mm_hashes=hashes,
+    tokens, params = processor.build_disagg_prefill_multimodal_inputs(
+        {"prompt": "video prompt"}, handles, mm_hashes=hashes
     )
 
     assert tokens == [11, _IMAGE_TOKEN_ID, _IMAGE_TOKEN_ID, 12, *([_IMAGE_TOKEN_ID] * 3), 13]
@@ -192,47 +190,31 @@ def test_disagg_preprocess_keeps_processor_params_and_mrope(monkeypatch, deepsta
     llm._hf_model_config = SimpleNamespace(is_encoder_decoder=False)
     handles = [{"tensor_size": (3, 16 * (1 + deepstack_levels))}]
     mrope_ids, mrope_deltas = {"position_ids": "handle"}, {"position_deltas": "handle"}
-    expected_ids, prepared = processor._finalize_multimodal_prompt(
-        {"prompt": "video prompt"},
-        MultimodalParams(multimodal_data={"multimodal_embedding": handles}),
-        mm_hashes=[[1] * 8],
-    )
-    prepared.multimodal_data["mrope_config"] = {
-        "mrope_position_ids": mrope_ids,
-        "mrope_position_deltas": mrope_deltas,
-    }
-    prepared.multimodal_data["video"] = {"video_grid_thw": torch.tensor([[1, 2, 2]])}
-    processor.finalize_multimodal_prompt({"prompt_token_ids": expected_ids}, prepared)
-    assert "video" not in prepared.multimodal_data
-    layout = prepared.multimodal_data["request_layout"]
     disagg = DisaggregatedParams(
         request_type="context_and_generation",
-        multimodal={
-            "schema_version": 1,
-            "items": [
-                {
-                    "item_ref": ["video", 0],
-                    "output_embedding_length": 3,
-                    "hash": [1] * 8,
-                    "embeddings": {"multimodal_embedding": handles[0]},
-                }
-            ],
-            "request_layout": layout,
-        },
+        multimodal_embedding_handles=handles,
+        multimodal_hashes=[[1] * 8],
+        mrope_position_ids_handle=mrope_ids,
+        mrope_position_deltas_handle=mrope_deltas,
     )
+    build = processor.build_disagg_prefill_multimodal_inputs
+    built = []
 
-    def unexpected_finalization(*args: object, **kwargs: object) -> None:
-        raise AssertionError("A completed encoder layout must bypass prompt finalization")
+    def capture(*args, **kwargs):
+        result = build(*args, **kwargs)
+        built.append(result[1])
+        return result
 
-    monkeypatch.setattr(processor, "finalize_multimodal_prompt", unexpected_finalization)
+    monkeypatch.setattr(processor, "build_disagg_prefill_multimodal_inputs", capture)
     tokens, prompt, params, encoder_tokens = llm._preprocess(
         {"prompt": "video prompt"}, SamplingParams(), disagg
     )
-    assert tokens == expected_ids
+
+    assert params is built[0]
     assert prompt == "video prompt"
     assert encoder_tokens is None
     assert params.get_item_layout() == ((("video", 0),), (3,))
-    assert params.multimodal_data["multimodal_embedding"][0] is handles[0]
+    assert params.multimodal_data["multimodal_embedding"] is handles
     assert params.multimodal_data["mrope_config"]["mrope_position_ids"] is mrope_ids
     assert params.multimodal_data["mrope_config"]["mrope_position_deltas"] is mrope_deltas
     cumsum = params.multimodal_data["multimodal_embed_mask_cumsum"]
@@ -247,19 +229,20 @@ def test_disagg_preprocess_keeps_processor_params_and_mrope(monkeypatch, deepsta
 def test_disagg_decode_rebuilds_only_mrope_params():
     llm = object.__new__(BaseLLM)
     llm._hf_model_config = SimpleNamespace(is_encoder_decoder=False)
-    mrope_deltas = {"position_deltas": "handle"}
+    mrope_ids, mrope_deltas = {"position_ids": "handle"}, {"position_deltas": "handle"}
     disagg = DisaggregatedParams(
         request_type="generation_only",
-        multimodal={
-            "schema_version": 1,
-            "items": [],
-            "decode_inputs": {"mrope_config": {"mrope_position_deltas": mrope_deltas}},
-        },
+        mrope_position_ids_handle=mrope_ids,
+        mrope_position_deltas_handle=mrope_deltas,
     )
+
     _, _, params, _ = llm._preprocess({"prompt_token_ids": [10, 11]}, SamplingParams(), disagg)
+
     assert params.item_metadata is None
     assert params.multimodal_input is None
-    assert params.multimodal_data == {"mrope_config": {"mrope_position_deltas": mrope_deltas}}
+    assert params.multimodal_data == {
+        "mrope_config": {"mrope_position_ids": mrope_ids, "mrope_position_deltas": mrope_deltas}
+    }
 
 
 @pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
@@ -305,51 +288,4 @@ def test_qwen3vl_video_token_count_sums_single_video_grid_rows():
             video_grid_thw=torch.tensor([[1, 8, 10], [1, 8, 10]]),
         )
         == 40
-    )
-
-
-@pytest.mark.cpu_only
-def test_image_item_finalization_uses_encoder_geometry_for_mrope() -> None:
-    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-    from tensorrt_llm.inputs.multimodal import (
-        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemMetadata,
-    )
-
-    processor = object.__new__(Qwen3VLInputProcessorBase)
-    processor._config = SimpleNamespace(
-        image_token_id=_IMAGE_TOKEN_ID,
-        video_token_id=_VIDEO_TOKEN_ID,
-        vision_start_token_id=_VISION_START_TOKEN_ID,
-        vision_config=SimpleNamespace(spatial_merge_size=2, deepstack_visual_indexes=[]),
-        text_config=SimpleNamespace(hidden_size=16),
-    )
-    grid = torch.tensor([[1, 2, 12]])
-    params = MultimodalParams(
-        multimodal_data={
-            "multimodal_embedding": torch.zeros(6, 16),
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("image", 0)], output_embedding_lengths=[6]
-            ),
-            "multimodal_embedding_metadata": [
-                {
-                    "image": {
-                        "image_grid_thw": SharedTensorContainer.from_tensor(grid).dump_to_dict()
-                    }
-                }
-            ],
-        }
-    )
-    tokens, result = processor.finalize_multimodal_prompt(
-        {"prompt_token_ids": [_VISION_START_TOKEN_ID, _IMAGE_TOKEN_ID, _VISION_END_TOKEN_ID, 7]},
-        params,
-        mm_hashes=[[1] * 8],
-    )
-    ids = torch.tensor([tokens])
-    expected = processor.get_mrope_config(ids, grid, None, torch.ones_like(ids))
-    for key, value in expected.items():
-        torch.testing.assert_close(result.multimodal_data["mrope_config"][key], value)
-    assert (
-        result.multimodal_data["request_layout"]["model_data"]["mrope_config"]
-        is result.multimodal_data["mrope_config"]
     )
