@@ -90,6 +90,11 @@ _instance_ids = itertools.count()  # names each backend and binding in thread na
 _Results = Sequence[RowResult] | None  # None: not concluded yet, or no new evidence
 
 
+def _warn_once(message: str, key: tuple[object, ...]) -> None:
+    """One warning per ``key`` for the process; the logger's own API is untyped."""
+    logger.warning_once(message, key=key)  # type: ignore[no-untyped-call]
+
+
 class _Observation(NamedTuple):
     """What one look at a batch's driver call found."""
 
@@ -246,9 +251,9 @@ class RegionBinding:
             try:
                 self.driver.unregister(handle)
             except Exception as error:
-                logger.warning_once(
+                _warn_once(
                     f"blob backend: revoking region:{index} failed, will retry: {error!r}",
-                    key=(self._name, "unregister", index),
+                    (self._name, "unregister", index),
                 )
                 continue
             with self._lock:
@@ -321,9 +326,9 @@ class RegionBinding:
             try:
                 driver.unregister_regions(handle)
             except Exception as error:
-                logger.warning_once(
+                _warn_once(
                     f"blob backend: revoking the regions together failed, will retry: {error!r}",
-                    key=(self._name, "unregister_regions"),
+                    (self._name, "unregister_regions"),
                 )
                 continue
             with self._lock:
@@ -756,9 +761,9 @@ class BlobBackend:
         try:
             self._driver.cancel(op)
         except Exception as error:  # noqa: BLE001 - advisory: a failed cancel changes nothing
-            logger.warning_once(
+            _warn_once(
                 f"blob backend: cancelling a store operation raised {error!r}",
-                key=(self._name, "cancel", type(error)),
+                (self._name, "cancel", type(error)),
             )
 
     def _drop_queued(self, attempt: BlobAttempt) -> None:
@@ -817,6 +822,12 @@ class BlobBackend:
         return self._fetch_queue.popleft() if self._fetch_queue else None
 
     def _run(self, batch: _Batch) -> None:
+        with self._lock:
+            violation = self._protocol_violation
+        if violation is not None:  # taken before the break was recorded: never dispatched
+            reason = f"the store driver broke its protocol: {violation}"
+            self._finish(batch, _refused(batch, reason))
+            return
         try:
             row_ios = self._row_ios(batch)
         except Exception as error:  # the driver was never called: nothing escaped
@@ -857,7 +868,9 @@ class BlobBackend:
         return self._driver.get(row_ios, attempt._hint)
 
     def _row_ios(self, batch: _Batch) -> list[RowIO]:
-        group_rows = batch.attempt._groups[batch.group]
+        groups = batch.attempt._groups
+        assert groups is not None  # cleared only once the attempt quiesced, after every batch
+        group_rows = groups[batch.group]
         slot_bytes, stem = group_rows.region.slot_bytes, self._key_stem
         names = group_rows.object_keys[batch.start : batch.stop]
         hexed, width = names.tobytes().hex(), 2 * names.shape[1]  # one pass for the batch
@@ -875,9 +888,9 @@ class BlobBackend:
             unprovable = not ended and self._driver.access_unprovable(batch.op)
             count, done = len(results), concluded(results)
         except Exception as error:  # no new evidence this time
-            logger.warning_once(
+            _warn_once(
                 f"blob backend: observing a store operation raised {error!r}",
-                key=(self._name, "observe", type(error)),
+                (self._name, "observe", type(error)),
             )
             return _NO_NEW_EVIDENCE
         if count != len(batch):  # outside the driver protocol: no later answer proves an access end
@@ -926,16 +939,17 @@ class BlobBackend:
             batch.unprovable = True
             attempt._has_unprovable_batch = True
             self._unprovable_batches += 1
-            logger.warning_once(
+            _warn_once(
                 f"blob backend: a store call of {attempt.label} can never prove its access "
                 "ended; its slots stay held",
-                key=(self._name, "unprovable"),
+                (self._name, "unprovable"),
             )
         if batch.settled:
             self._watched.discard(batch)
         others_changed = False
         if observed.breaks_protocol and self._protocol_violation is None:
-            others_changed = self._stop_after_protocol_violation(observed.whole_call_fault)
+            violation = observed.whole_call_fault or "an unnamed protocol violation"
+            others_changed = self._stop_after_protocol_violation(violation)
         return self._conclude_or_quiesce(attempt) or others_changed
 
     def _stop_after_protocol_violation(self, violation: str) -> bool:
@@ -944,7 +958,7 @@ class BlobBackend:
         carries the violation as its fault unless it already had one. Batches already in the
         driver run on and still record their rows. True when an attempt concluded or quiesced."""
         self._protocol_violation = violation
-        logger.warning(
+        logger.warning(  # type: ignore[no-untyped-call]
             f"blob backend: the store driver broke its protocol ({violation}); every later "
             "submission is refused and queued batches are dropped"
         )
@@ -983,9 +997,9 @@ class BlobBackend:
                         self._shutdown_recheck.notify_all()
                     return
             except Exception as error:  # the thread must live on, or the labels never clear
-                logger.warning_once(
+                _warn_once(
                     f"blob backend: a progress round raised {error!r}",
-                    key=(self._name, "progress", type(error)),
+                    (self._name, "progress", type(error)),
                 )
             delay = self._wait_for_next_round(delay)
 
@@ -1009,10 +1023,10 @@ class BlobBackend:
                 if now - started > STUCK_CALL_WARNING_S
             ]
         for batch in stuck:
-            logger.warning_once(
+            _warn_once(
                 f"blob backend: a store call of {batch.attempt.label} has run for over "
                 f"{STUCK_CALL_WARNING_S:g} s; its slots stay held until it returns",
-                key=(self._name, "stuck", batch.attempt.label, batch.group, batch.start),
+                (self._name, "stuck", batch.attempt.label, batch.group, batch.start),
             )
 
     def _wait_for_next_round(self, delay: float) -> float:
@@ -1029,8 +1043,9 @@ class BlobBackend:
 
     def _try_teardown(self) -> bool:
         """True once the driver is drained and the registrations revoked; a step that is not done
-        yet is retried next round. The driver is never closed here: closing a store client may
-        block for long, and process exit frees it."""
+        yet is retried next round. The driver is never closed here: whoever opened it closes it,
+        after this revocation, since a close may hold the GIL or send RPCs and is the opener's to
+        schedule."""
         with self._lock:
             if self._workers_alive or any(not attempt._quiesced for attempt in self._attempts):
                 return False
@@ -1077,17 +1092,17 @@ class BlobBackend:
             return
         self._reported_labels = labels
         if labels:
-            logger.warning(f"blob backend: shutting down, still accessible: {sorted(labels)}")
+            message = f"blob backend: shutting down, still accessible: {sorted(labels)}"
+            logger.warning(message)  # type: ignore[no-untyped-call]
         else:
-            logger.info("blob backend: shut down; nothing is accessible any more")
+            message = "blob backend: shut down; nothing is accessible any more"
+            logger.info(message)  # type: ignore[no-untyped-call]
 
     def _call_wake(self) -> None:
         try:
             self._wake()
         except Exception as error:  # a raising wake must not kill a backend thread
-            logger.warning_once(
-                f"blob backend: wake raised {error!r}", key=(self._name, "wake", type(error))
-            )
+            _warn_once(f"blob backend: wake raised {error!r}", (self._name, "wake", type(error)))
 
 
 def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:

@@ -11,7 +11,12 @@ thread, and can hold a method on an event or make it raise. Every wait has an up
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import inspect
+import os
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -94,6 +99,43 @@ def wait_until(predicate: Callable[[], bool], what: str, timeout: float = WAIT_S
         if time.monotonic() > deadline:
             raise AssertionError(f"timed out waiting for {what}")
         time.sleep(0.001)
+
+
+CHILD_ENV = "TRTLLM_BLOB_TEST_CHILD"
+CHILD_TIMEOUT_S = 120.0
+
+
+def in_a_child_process(test: Callable[..., None]) -> Callable[..., None]:
+    """For a test that leaves a backend thread alive for good, as an access the driver can never
+    prove ended does: under pytest the test runs itself again, by node id, in a child process
+    and passes when that run passed; the child, told apart by ``TRTLLM_BLOB_TEST_CHILD``, runs
+    the body and takes the thread with it when it exits. Fixtures resolve as usual and reach the
+    body in the child."""
+
+    @functools.wraps(test)
+    def wrapper(*args: object, **kwargs: object) -> None:
+        if os.environ.get(CHILD_ENV):
+            test(*args, **kwargs)
+            return
+        # The exact id, parameters included, comes from pytest; the file path from the function.
+        current = os.environ.get("PYTEST_CURRENT_TEST", "")
+        name = current.rsplit("::", 1)[-1].split(" ")[0] if current else test.__name__
+        node_id = f"{inspect.getfile(test)}::{name}"
+        command = [sys.executable, "-m", "pytest", node_id, "-q", "-p", "no:threadleak"]
+        completed = subprocess.run(
+            command,
+            cwd=os.getcwd(),
+            env={**os.environ, CHILD_ENV: "1"},
+            capture_output=True,
+            text=True,
+            timeout=CHILD_TIMEOUT_S,
+            check=False,
+        )
+        assert completed.returncode == 0, (
+            f"the child run of {test.__name__} failed:\n{completed.stdout}\n{completed.stderr}"
+        )
+
+    return wrapper
 
 
 class _Sealable:

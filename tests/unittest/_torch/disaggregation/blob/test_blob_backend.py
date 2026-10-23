@@ -33,6 +33,7 @@ from cpu_fixtures import (
     Rows,
     TogetherDriverSpy,
     commit_object,
+    in_a_child_process,
     masks,
     object_key,
     store_key,
@@ -1487,3 +1488,37 @@ def test_the_first_fault_drops_the_attempts_queued_batches() -> None:
     assert reader.backend.stats()["batches_in_queues"] == 0
     assert store_calls(reader) == ["get"]  # B and C never reached the driver
     reader.close()
+
+
+# A protocol break seen by the progress thread.
+
+
+@in_a_child_process
+def test_a_protocol_break_seen_by_the_progress_thread_concludes_the_queue_at_once(
+    store: MemoryStore,
+) -> None:
+    """No worker is free, the only one being inside the driver; the queued work still concludes."""
+    published(store, {"A": b"aaaaaaaa", "A2": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    driver = ShortPollDriver(store, controlled=True)
+    reader = Endpoint(driver, ["A", "A2", "B", "C", "D"], rows_per_batch=2)
+    watched = reader.backend.fetch(reader.view("A", "A2"), None)  # one batch, handle back
+    reader.op("A")
+    gate = reader.driver.hold("get")
+    blocked = reader.backend.fetch(reader.view("B"), None)  # the only worker, held in the call
+    reader.driver.wait_for(lambda: len(reader.driver.calls_to("get")) == 2, "the held get")
+    queued = reader.backend.fetch(reader.view("C", "D"), None)
+    assert reader.backend.stats()["batches_in_queues"] == 1
+    driver.short = True  # the progress thread's next poll of A comes back one result short
+    outcome = reader.wait_outcome(queued)
+    reader.wait_quiesced(queued)  # concluded while the worker is still held
+    assert not gate.is_set() and reader.backend.stats()["batches_in_queues"] == 0
+    assert masks(outcome) == [[False, False]] and "broke its protocol" in outcome.fault
+    assert "gave 1 results for 2 rows" in reader.wait_outcome(watched).fault
+    gate.set()
+    op_b = reader.op("B")  # dispatched before the break: it runs to its own end
+    driver.complete(op_b)
+    driver.end_access(op_b)
+    assert masks(reader.wait_outcome(blocked)) == [[True]]
+    reader.wait_quiesced(blocked)
+    labels = reader.backend.shutdown(0)
+    assert watched.label in labels and queued.label not in labels and blocked.label not in labels
