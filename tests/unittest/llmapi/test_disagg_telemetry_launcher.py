@@ -474,34 +474,13 @@ def test_rank_info_key_is_carried_by_transceiver_config():
     assert "_rank_info_auth_key" not in config.model_dump()
 
 
-def test_rank_info_key_is_shared_with_mpi_ranks_and_spawned_client(monkeypatch):
-    config = SimpleNamespace(internal_request_auth_key=None)
-    comm = mock.Mock()
-    comm.Get_rank.return_value = 0
-    comm.bcast.side_effect = lambda key, root: key
-    key = serve._resolve_rank_info_auth_key(config, False, comm)
-    assert len(key) == 32
-    assert serve._resolve_rank_info_auth_key(config, False, comm) != key
-
-    comm.Get_rank.return_value = 1
-    comm.bcast.side_effect = None
-    comm.bcast.return_value = key
-    assert serve._resolve_rank_info_auth_key(config, False, comm) == key
-    comm.bcast.assert_called_with(None, root=0)
-
-    env_name = serve.DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY
-    monkeypatch.setenv(env_name, key.hex())
-    comm.reset_mock()
-    assert serve._resolve_rank_info_auth_key(config, True, comm) == key
-    comm.bcast.assert_not_called()
-    assert env_name not in os.environ
-
-
 @pytest.mark.parametrize("protocol", ["openengine", "smg"])
-def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol):
+@pytest.mark.parametrize("key", [None, "deployment-key"])
+def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key):
     config = tmp_path / "worker.yaml"
     config.write_text(
-        "internal_request_auth_key: deployment-key\ncache_transceiver_config:\n  backend: NIXL\n"
+        (f"internal_request_auth_key: {key}\n" if key is not None else "")
+        + "cache_transceiver_config:\n  backend: NIXL\n"
     )
     launch = mock.Mock()
     module = SimpleNamespace(launch_server=launch, launch_smg_server=launch)
@@ -518,7 +497,10 @@ def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol):
     launch.assert_called_once()
     llm_args = launch.call_args.args[2]
     transceiver = llm_args["cache_transceiver_config"]
-    assert transceiver.backend == "NIXL"
-    assert transceiver._rank_info_auth_key == b"deployment-key"
-    assert "_rank_info_auth_key" not in transceiver.model_dump()
+    if key is None:
+        assert transceiver == {"backend": "NIXL"}
+    else:
+        assert transceiver.backend == "NIXL"
+        assert transceiver._rank_info_auth_key == key.encode()
+        assert "_rank_info_auth_key" not in transceiver.model_dump()
     assert "internal_request_auth_key" not in llm_args

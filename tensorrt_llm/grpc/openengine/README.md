@@ -33,38 +33,6 @@ Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-
 
 ### Disaggregated serving
 
-For a local context/generation pair, use the managed launcher from the repository
-root; it generates a fresh shared RankInfo authentication key automatically:
-
-```bash
-python examples/disaggregated/openengine/launch.py <model> \
-  --context-config ctx.yaml --generation-config gen.yaml \
-  --context-gpus 0 --generation-gpus 1
-```
-
-Both input files contain normal worker options, for example:
-
-```yaml
-cache_transceiver_config:
-  backend: NIXL
-  transceiver_runtime: PYTHON
-```
-
-Do not supply an authentication key. The launcher writes private temporary
-copies of these configs with the same generated key, starts two OpenEngine
-servers at `127.0.0.1:8001` and `127.0.0.1:8002`, and removes the copies after
-stopping both workers. It leaves the input configs unchanged. Use disjoint
-CUDA device IDs (or UUIDs) and set each config's parallelism to match its GPU
-allocation. This launcher supports local MPI workers; it does not launch an
-HTTP proxy or an OpenEngine router. An OpenEngine client/router must send the
-context request to the first server and its returned session to the second.
-Ctrl-C, SIGTERM, or either server exiting stops the pair. Readiness is exposed
-through each server's OpenEngine Control service.
-
-Independently issued server commands and multi-node deployments still need a
-trusted deployment coordinator to distribute a common key; this local launcher
-does not provide cross-host key discovery.
-
 A context worker returns its handoff as a `PrefillReady` event carrying a
 `KvSessionRef`; a generation worker resumes it by echoing that `KvSessionRef`
 back in `GenerateRequest.kv.session`. A request carrying a session is always

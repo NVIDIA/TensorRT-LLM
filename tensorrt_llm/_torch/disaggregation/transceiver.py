@@ -48,7 +48,7 @@ from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
     TransferWorkerConfig,
-    _require_rank_info_auth_key,
+    _validate_rank_info_auth_key,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -161,7 +161,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        _require_rank_info_auth_key(cache_transceiver_config._rank_info_auth_key)
+        _validate_rank_info_auth_key(cache_transceiver_config._rank_info_auth_key)
         enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
             mapping, kv_cache_manager, cache_transceiver_config
         )
