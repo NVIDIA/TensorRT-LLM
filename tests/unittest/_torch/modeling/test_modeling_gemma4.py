@@ -2774,7 +2774,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         starts = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
         ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device="cuda")
         output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
-        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
         attn_metadata = fake_metadata_type()
         attn_metadata.num_contexts = 1
         attn_metadata.padded_num_tokens = None
@@ -2858,7 +2858,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         token_type_ids = torch.tensor([0, 1, 1, 0], dtype=torch.long, device="cuda")
         dense_mask = torch.ones(4, 4, dtype=torch.bool, device="cuda")
         output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
-        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
         attn_metadata = fake_metadata_type()
         attn_metadata.num_contexts = 1
         attn_metadata.padded_num_tokens = None
@@ -2921,7 +2921,7 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         token_type_ids = torch.tensor([1, 1, 1, 1], device="cuda")
         output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
-        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
         metadata = fake_metadata_type()
         metadata.num_contexts = 1
         metadata.padded_num_tokens = None
@@ -2965,7 +2965,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
         model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
         output = torch.zeros(1, config.hidden_size, dtype=config.torch_dtype, device="cuda")
-        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
 
         for sm_version in (100, 103):
             with self.subTest(sm_version=sm_version):
