@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_protocol import TOOL_PARAM_MAX_ENUM_VALUES
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
@@ -103,6 +104,25 @@ def test_an_oversized_parameter_name_is_cut_short(client):
     shown = "x" * 64 + "..."
     assert error["message"] == f"Unknown parameter: '{shown}'."
     assert error["param"] == shown
+    assert len(response.content) < 1024
+
+
+def test_a_rejected_tool_is_named_by_its_place_not_its_name(client):
+    name = "t" * 200_000
+    enum = [f"v{i}" for i in range(TOOL_PARAM_MAX_ENUM_VALUES + 1)]
+    tool = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "parameters": {"type": "object", "properties": {"p": {"type": "string", "enum": enum}}},
+        },
+    }
+    response = client.post("/v1/chat/completions", json=_chat_body(tools=[tool]))
+    error = _error(response)
+    assert error["param"] == "tools.0.function"
+    assert error["message"].startswith("Invalid value for 'tools.0.function': ")
+    assert "enum values" in error["message"]
+    assert name[:64] not in response.text
     assert len(response.content) < 1024
 
 

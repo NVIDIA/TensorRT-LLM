@@ -1114,8 +1114,10 @@ class FunctionDefinition(OpenAIBaseModel):
         if self.parameters is not None:
             num_enum_values = _count_schema_enum_values(self.parameters)
             if num_enum_values > TOOL_PARAM_MAX_ENUM_VALUES:
+                # The name is left out: it is client text of any length, and
+                # the error's location already identifies the tool.
                 raise ValueError(
-                    f"tool function {self.name!r} declares {num_enum_values} "
+                    f"tool function declares {num_enum_values} "
                     f"enum values across its parameters schema; the maximum "
                     f"is {TOOL_PARAM_MAX_ENUM_VALUES}.")
         return self
