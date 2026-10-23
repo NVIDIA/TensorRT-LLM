@@ -547,7 +547,7 @@ def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransf
 
 
 def _make_loader(monkeypatch, *, events, spec_config=None):
-    llm_args = SimpleNamespace(load_format=LoadFormat.AUTO)
+    llm_args = SimpleNamespace(load_format=LoadFormat.AUTO, lm_head_output_dtype="auto")
     loader = ModelLoader(
         llm_args=llm_args,
         mapping=MagicMock(name="mapping"),
