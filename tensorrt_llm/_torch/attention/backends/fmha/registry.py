@@ -54,7 +54,8 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+beam_shared_prefix).
         # It must precede flashinfer_trtllm_gen, which takes every generation
-        # batch it supports, and it declines batches without a shared prefix.
+        # batch it supports. It declines eager batches without a shared prefix
+        # but serves every n-sample batch a CUDA graph is captured for.
         "beam_shared_prefix": BeamSharedPrefixFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,

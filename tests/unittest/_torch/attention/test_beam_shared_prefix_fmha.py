@@ -847,7 +847,11 @@ def test_sampling_cuda_graph_replay_matches_eager_across_steps(
     k_static = torch.zeros(rows, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v_static = torch.zeros_like(k_static)
     out_static = torch.zeros_like(q_static)
+    # Device KV lengths at a fixed address, refreshed per step like the
+    # metadata's kv_lens_cuda_runtime that the graph reads.
+    kv_lens_static = torch.zeros(rows, dtype=torch.int32, device=device)
     graph = None
+    previous_version = None
     state = None
     wrappers = None
     for step, (tables, kv_lens) in enumerate(steps):
@@ -866,6 +870,10 @@ def test_sampling_cuda_graph_replay_matches_eager_across_steps(
         assert state.plan is not None and state.graph is not None
         grouping = state.plan.grouping
         assert (grouping.num_sharing, grouping.num_placeholder_rows) == expected_groups[step]
+        if step == 1:
+            # Same pages as step 0: nothing is uploaded or re-planned.
+            assert grouping.version == previous_version
+        previous_version = grouping.version
         assert grouping.num_groups == state.graph.num_groups == 4
         if wrappers is None:
             wrappers = lib._graph_wrappers(state, key, meta)
@@ -881,7 +889,18 @@ def test_sampling_cuda_graph_replay_matches_eager_across_steps(
             # Padding rows repeat one request: identical inputs, one KV slot.
             q[r], k[r], v[r] = q[dummy_rows[0]], k[dummy_rows[0]], v[dummy_rows[0]]
 
+        kv_lens_static.copy_(torch.tensor(kv_lens, dtype=torch.int32))
+
         def run(target_pool, out, q_in, k_in, v_in):
+            # Between page boundaries prepare() uploads nothing: the graph
+            # derives the write slots and last-page lengths on the device.
+            lib.step_slots(
+                kv_lens_static,
+                buffers.perm,
+                buffers.write_slot,
+                buffers.tail_last_page_len,
+                tpb,
+            )
             lib.sampling_attention(
                 target_pool,
                 q_in,

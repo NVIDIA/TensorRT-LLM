@@ -59,12 +59,13 @@ the prefix call is planned for a fixed number of groups (up to
 ``TLLM_BEAM_SHARED_PREFIX_MAX_GROUPS`` sharing groups plus one placeholder
 group for the rows without a shared prefix, padded with empty groups), the
 tail call for one entry per row, and the per-step indices (KV write page and
-slot, group order, placeholder mask) live in one device buffer. ``prepare``
-refreshes all of them before every replay with one host-to-device copy, and
-re-plans the FlashInfer work lists only when the grouping or a page count
-changes. The captured kernels read nothing else that changes between steps,
-so any batch of the captured size is served: surplus sharing groups and rows
-without a shared prefix are attended through the tail call alone.
+slot, group order, placeholder mask, tail last-page lengths) live in fixed
+device buffers. ``prepare`` refreshes them before every replay with a few
+asynchronous host-to-device copies, and re-plans the FlashInfer work lists
+only when the groups or a page count change. The captured kernels read
+nothing else that changes between steps, so any batch of the captured size is
+served: surplus sharing groups and rows without a shared prefix are attended
+through the tail call alone.
 
 Opt in with ``TLLM_FMHA_LIBS=+beam_shared_prefix``.
 ``TLLM_BEAM_SHARED_PREFIX_MAX_TAIL`` (default 8) bounds how many generated
@@ -101,6 +102,8 @@ from .phased import FmhaParams, PhasedFmha
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
+
+    from .beam_shared_prefix_kernels import merge_scatter, step_slots, write_kv_gather_q
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -955,11 +958,21 @@ class _SamplingPlan:
 
     step: int
     grouping: _Grouping
-    tail_last_page_len_np: np.ndarray
-    """[rows] int32, grouped order."""
-    write_slot_np: np.ndarray
-    """[rows] int64, batch order: slot of the current token inside its page."""
+    kv_lens: np.ndarray
+    """[rows] int64 (>= 1), batch order."""
+    tokens_per_block: int
     check_kv_lens: Optional[torch.Tensor] = None
+
+    @property
+    def tail_last_page_len_np(self) -> np.ndarray:
+        """[rows] int32, grouped order: filled length of each row's last page."""
+        last = (self.kv_lens[self.grouping.perm] - 1) % self.tokens_per_block + 1
+        return last.astype(np.int32)
+
+    @property
+    def write_slot_np(self) -> np.ndarray:
+        """[rows] int64, batch order: slot of the current token inside its page."""
+        return (self.kv_lens - 1) % self.tokens_per_block
 
     @property
     def tail_last_page_len(self) -> torch.Tensor:
@@ -1149,20 +1162,22 @@ def _graph_float_workspace_bytes(
 class _GraphBuffers:
     """Fixed-address step inputs of one captured batch size.
 
-    Page-locked staging buffers feed device buffers that the captured graph
-    reads, with one asynchronous copy each per step; ``prepare`` issues them,
-    so they precede the replay on the stream. ``rows_device`` (int64, the
-    index dtype of the gather/scatter kernels) holds the write page, write slot
-    and group order (``rows`` each); ``pages_device`` (int32, FlashInfer's
-    index dtype) holds the tail last-page lengths, then the prefix and tail page
-    indices of a regrouping step, which the wrappers' plans copy into their own
-    buffers.
+    A page-locked staging buffer feeds the device buffer that the captured
+    graph reads with one asynchronous copy per step; ``prepare`` issues it, so
+    it precedes the replay on the stream. The buffer is int64: the write page,
+    write slot and group order (``rows`` each, the index dtype of the
+    gather/scatter kernels), followed by an int32 view (FlashInfer's index
+    dtype) holding the tail last-page lengths and the prefix and tail page
+    indices of a regrouping step, which the wrappers' plans copy into their
+    own buffers.
     """
 
     rows: int
     num_groups: int
     prefix_capacity: int
     tail_capacity: int
+    staging: torch.Tensor
+    device: torch.Tensor
     rows_staging: torch.Tensor
     rows_device: torch.Tensor
     pages_staging: torch.Tensor
@@ -1184,16 +1199,20 @@ class _GraphBuffers:
         prefix_capacity = (num_groups - 1) * max_pages + num_groups
         tail_capacity = rows * max_pages
         pinned = prefer_pinned()
-        pages_size = rows + prefix_capacity + tail_capacity
+        size = 3 * rows + (rows + prefix_capacity + tail_capacity + 1) // 2
+        staging = torch.zeros((size,), dtype=torch.int64, pin_memory=pinned)
+        device_buffer = torch.zeros((size,), dtype=torch.int64, device=device)
         return cls(
             rows=rows,
             num_groups=num_groups,
             prefix_capacity=prefix_capacity,
             tail_capacity=tail_capacity,
-            rows_staging=torch.zeros((3 * rows,), dtype=torch.int64, pin_memory=pinned),
-            rows_device=torch.zeros((3 * rows,), dtype=torch.int64, device=device),
-            pages_staging=torch.zeros((pages_size,), dtype=torch.int32, pin_memory=pinned),
-            pages_device=torch.zeros((pages_size,), dtype=torch.int32, device=device),
+            staging=staging,
+            device=device_buffer,
+            rows_staging=staging[: 3 * rows],
+            rows_device=device_buffer[: 3 * rows],
+            pages_staging=staging[3 * rows :].view(torch.int32),
+            pages_device=device_buffer[3 * rows :].view(torch.int32),
             empty_staging=torch.zeros((rows,), dtype=torch.bool, pin_memory=pinned),
             empty=torch.zeros((rows,), dtype=torch.bool, device=device),
             copied=torch.cuda.Event(),
@@ -1254,8 +1273,8 @@ class _GraphBuffers:
             row_staging[2 * rows :] = grouping.perm
             self.empty_staging.numpy()[:] = grouping.prefix_empty
             self.empty.copy_(self.empty_staging, non_blocking=True)
-        self.rows_device.copy_(self.rows_staging, non_blocking=True)
-        self.pages_device[:count].copy_(self.pages_staging[:count], non_blocking=True)
+        used = 3 * rows + (count + 1) // 2
+        self.device[:used].copy_(self.staging[:used], non_blocking=True)
         self.copied.record()
         self.pending = True
         self.uploaded_version = grouping.version
@@ -1285,6 +1304,9 @@ class _SamplingState:
     step_counter: int = 0
     grouping_counter: int = 0
     captured: bool = False
+    slots_step: int = -1
+    """Step whose slot indices ``step_slots`` last wrote (CUDA graph batches)."""
+    slots_captured: bool = False
     logged: bool = False
     ran: bool = False
 
@@ -1430,15 +1452,16 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
     state.plan = _SamplingPlan(
         step=state.step_counter,
         grouping=grouping,
-        tail_last_page_len_np=(
-            kv_lens[grouping.perm] - (grouping.blocks_g - 1) * tokens_per_block
-        ).astype(np.int32),
-        write_slot_np=(kv_lens - 1) % tokens_per_block,
+        kv_lens=kv_lens,
+        tokens_per_block=tokens_per_block,
         check_kv_lens=torch.from_numpy(kv_lens) if check else None,
     )
     state.device = None
     if graph is not None:
-        graph.upload(state.plan)
+        # Between page boundaries only the write slots and last-page lengths
+        # move; the graph derives them from the device KV lengths (step_slots).
+        if grouping.version != graph.uploaded_version:
+            graph.upload(state.plan)
         for key in state.prefix_wrappers:
             _plan_graph_wrappers(state, key, metadata)
     if not state.logged:
@@ -1684,11 +1707,11 @@ def sampling_attention(
             state is a placeholder and must not contribute.
     """
     rows, num_heads, head_dim = q.shape
-    # 1. Persist the current token's K/V in the row's own block.
-    pool.permute(0, 3, 1, 2, 4)[write_page, write_slot] = torch.stack((k, v), dim=1)
+    # 1. Persist the current token's K/V in the row's own block and gather the
+    # queries into group order (one kernel).
+    q_grouped = write_kv_gather_q(pool, q, k, v, write_page, write_slot, perm)
 
     # 2. Shared prefix: the queries of each group against its common pages.
-    q_grouped = q if perm is None else q.index_select(0, perm)
     partial_dtype = _partial_out_dtype(q.dtype)
     prefix_out = torch.empty((rows, num_heads, head_dim), dtype=partial_dtype, device=q.device)
     prefix_lse = torch.empty((rows, num_heads), dtype=torch.float32, device=q.device)
@@ -1699,16 +1722,9 @@ def sampling_attention(
     tail_lse = torch.empty_like(prefix_lse)
     tail_wrapper.run(q_grouped, pool, out=tail_out, lse=tail_lse, return_lse=True)
 
-    # 4. Merge in place into the prefix result; placeholder rows take the tail
-    # alone (their prefix output is zeroed too, as 0 * NaN would survive the merge).
-    if prefix_empty is not None:
-        prefix_lse.masked_fill_(prefix_empty.view(-1, 1), float("-inf"))
-        prefix_out.masked_fill_(prefix_empty.view(-1, 1, 1), 0.0)
-    flashinfer.merge_state_in_place(prefix_out, prefix_lse, tail_out, tail_lse)
-    if perm is None:
-        out.copy_(prefix_out)
-    else:
-        out[perm] = prefix_out.to(out.dtype)
+    # 4. Merge the two states and write the result back in batch order (one
+    # kernel); placeholder rows take the tail state alone.
+    merge_scatter(prefix_out, prefix_lse, tail_out, tail_lse, out, perm, prefix_empty)
 
 
 def merge_states(
@@ -2063,10 +2079,23 @@ class BeamSharedPrefixFmha(PhasedFmha):
         graph = state.graph
         if graph is not None:
             prefix_wrapper, tail_wrapper = _graph_wrappers(state, key, metadata)
+            capturing = torch.cuda.is_current_stream_capturing()
+            # Once per step, and recorded by the capture itself: an eager
+            # warmup forward of the same step does not put it in the graph.
+            if state.slots_step != plan.step or (capturing and not state.slots_captured):
+                step_slots(
+                    metadata.kv_lens_cuda_runtime[:rows],
+                    graph.perm,
+                    graph.write_slot,
+                    graph.tail_last_page_len,
+                    int(metadata.tokens_per_block),
+                )
+                state.slots_step = plan.step
+                state.slots_captured = capturing
             write_page, write_slot = graph.write_page, graph.write_slot
             perm: Optional[torch.Tensor] = graph.perm
             prefix_empty: Optional[torch.Tensor] = graph.empty
-            if torch.cuda.is_current_stream_capturing():
+            if capturing:
                 state.captured = True
         else:
             indices = _sampling_device(state, qkv.device)
