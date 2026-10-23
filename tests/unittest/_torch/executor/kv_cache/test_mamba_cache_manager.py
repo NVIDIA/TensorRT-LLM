@@ -3905,6 +3905,7 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
     layer."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.kv_cache_type = CacheTypeCpp.SELF
