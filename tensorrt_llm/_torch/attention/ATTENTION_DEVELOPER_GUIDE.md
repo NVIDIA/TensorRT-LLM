@@ -543,7 +543,9 @@ The FMHA package is split by role:
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
-  batch state, cache storage, and kernels live in `fp4_mla/`. Chunked
+  batch state, cache storage, and kernels live in `fp4_mla/`. The absorption
+  weights follow `kv_b_proj`: BF16, or FP8 with 128x128 block scales as in
+  Kimi K3 checkpoints. Chunked
   prefill (`MLA.forward_context_with_chunked_prefill_fp4`) appends the chunk
   to the FP4 cache, gathers each cached prefix partition back from it, and
   attends every partition through `Fp4MlaFmha.forward_context_partition`;

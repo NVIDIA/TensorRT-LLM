@@ -752,16 +752,18 @@ class MLA(nn.Module):
             and self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
         ):
+            # The absorption weights follow kv_b_proj: BF16, or FP8 with
+            # 128x128 block scales. Generation has a BMM for each that writes
+            # into the same fused Q slice, and the context path expands KV
+            # through kv_b_proj itself, so both dtypes are accepted here.
             if (
-                mla_weight_dtype != torch.bfloat16
-                or self.mapping.cp_size != 1
+                self.mapping.cp_size != 1
                 or self.apply_rotary_emb
                 or self.kv_cache_dtype == "fp8_ds_mla"
             ):
                 raise ValueError(
-                    "FP4 MLA requires BF16 absorption weights and fused RoPE "
-                    "on the TRTLLM backend without context parallelism or "
-                    "fp8_ds_mla cache packing."
+                    "FP4 MLA requires fused RoPE on the TRTLLM backend without "
+                    "context parallelism or fp8_ds_mla cache packing."
                 )
             if not self.mqa.rope_params.duplicate_data:
                 raise ValueError("FP4 MLA requires RopeParams.duplicate_data=True.")
