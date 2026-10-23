@@ -175,9 +175,10 @@
       "allowed_values": [
         "auto",
         "native",
-        "rank_striped_read_ahead"
+        "rank_striped_read_ahead",
+        "model_streamer"
       ],
-      "capture_policy": "literal",
+      "capture_policy": "enum[CheckpointIOPolicy]",
       "kind": "categorical",
       "path": "checkpoint_io_policy"
     },

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for GMS-specific branches in ``ModelLoader``."""
+"""Unit tests for loading through ``GmsWeightSource`` in ``ModelLoader``."""
 
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -16,6 +16,8 @@ from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.pyexecutor.weight_sources import gms as gms_mod
+from tensorrt_llm._torch.pyexecutor.weight_sources import model_hooks, post_transform
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -25,13 +27,14 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformProfileRegistry,
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
+    SourceIdentity,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 pytestmark = pytest.mark.cpu_only
 
 
-_SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
+_SOURCE_IDENTITY = SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
     artifact_identity=ArtifactIdentity(
         format_version=ARTIFACT_IDENTITY_FORMAT_VERSION,
@@ -104,8 +107,10 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         max_num_tokens=128,
         max_seq_len=128,
     )
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
+    monkeypatch.setattr(
+        model_hooks,
+        "call_load_weights",
+        MagicMock(side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)),
     )
     loader._load_and_validate_config = MagicMock(
         return_value=SimpleNamespace(
@@ -129,7 +134,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         return _SOURCE_IDENTITY.artifact_identity
 
     monkeypatch.setattr(
-        model_loader_mod.ArtifactIdentity,
+        ArtifactIdentity,
         "from_checkpoint",
         classmethod(_build_artifact_identity),
     )
@@ -142,7 +147,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         )
 
     monkeypatch.setattr(
-        model_loader_mod.SourceIdentity,
+        SourceIdentity,
         "from_model_config",
         classmethod(_build_source_identity),
     )
@@ -183,8 +188,8 @@ class _PostTransformMxLoader:
     def __init__(self) -> None:
         self.load_weights = MagicMock(side_effect=self._load_weights)
         self.is_weights_preloaded = MagicMock(return_value=True)
-        self.post_load_apply = MagicMock()
-        self.post_load_publish = MagicMock()
+        self.get_initialized_weight_mapper = MagicMock(return_value=MagicMock())
+        self.publish_as_source = MagicMock()
 
     @staticmethod
     def _load_weights(
@@ -216,7 +221,7 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
                 architecture="TinyForCausalLM",
                 model_type="tiny",
                 speculative_mode=None,
-                protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
+                protocol_version=(post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
                 transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
                 runtime_constraints=PostTransformRuntimeConstraints(),
@@ -231,13 +236,13 @@ def test_gms_artifact_identity_failure_remains_fatal(monkeypatch):
         "Checkpoint manifests do not support nested symlinked directories: /ckpt/shards"
     )
     monkeypatch.setattr(
-        model_loader_mod.ArtifactIdentity,
+        ArtifactIdentity,
         "from_checkpoint",
         MagicMock(side_effect=artifact_error),
     )
     source_identity_factory = MagicMock()
     monkeypatch.setattr(
-        model_loader_mod.SourceIdentity,
+        SourceIdentity,
         "from_model_config",
         source_identity_factory,
     )
@@ -299,30 +304,27 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert loader._gms_backend is backend
+    assert loader._weight_source.backend is backend
     assert events == expected_events
     if is_rw:
         # RW: load weights, run them through the mapper, then commit
         # everything that landed in the GMS pool for RO consumers.
-        # ``model=model`` is passed for symmetry with the LoadFormat.AUTO
-        # path (see model_loader.py); HF ignores it, MX uses it for direct
-        # P2P writes when MX+GMS composition eventually lands.
-        # ``source_identity`` is included so format-specific loaders can
-        # publish the same compatibility fingerprint the RO path validates.
+        # The writer loads through the same weight session as
+        # LoadFormat.AUTO; HF uses ``model=`` only for context-only lazy
+        # loading. Only MX also receives the SourceIdentity.
         checkpoint_loader.load_weights.assert_called_once_with(
             "/ckpt",
             mapping=loader.mapping,
             model=model,
-            source_identity=loader._source_identity,
         )
-        loader._call_load_weights.assert_called_once()
+        model_hooks.call_load_weights.assert_called_once()
         backend.move_untracked_params.assert_called_once_with(model)
         backend.finalize_write.assert_called_once_with(model)
     else:
         # RO: setup_aliases() must run before the GMS materialize step so
         # module aliases are wired up before zero-copy mapping.
         checkpoint_loader.load_weights.assert_not_called()
-        loader._call_load_weights.assert_not_called()
+        model_hooks.call_load_weights.assert_not_called()
         backend.materialize_module.assert_called_once_with(model)
 
 
@@ -341,14 +343,11 @@ def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
 
         return _append
 
-    checkpoint_loader.post_load_apply.side_effect = record("post_load_apply")
-    checkpoint_loader.post_load_publish.side_effect = record("post_load_publish")
-
     # The STRICT pre-materialize identity gate runs between alias setup and
     # materialization; record it to pin the ordering without exercising the
     # comparison logic, which is covered in test_source_identity.py.
     monkeypatch.setattr(
-        model_loader_mod,
+        gms_mod,
         "check_weight_sharing_compatibility",
         lambda *_args, **_kwargs: events.append("check_source_identity"),
     )
@@ -356,12 +355,10 @@ def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
     loader.load("/ckpt", checkpoint_loader)
 
     assert events == [
-        "post_load_apply",
         "setup_aliases",
         "check_source_identity",
         "materialize",
         "cache_derived_state",
-        "post_load_publish",
     ]
     assert "post_load_weights" not in events
     checkpoint_loader.load_weights.assert_not_called()
@@ -390,12 +387,6 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
-    checkpoint_loader.post_load_apply.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_apply"
-    )
-    checkpoint_loader.post_load_publish.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_publish"
-    )
 
     loader.load("/ckpt", checkpoint_loader)
 
@@ -404,10 +395,8 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
         "_apply",
         "to",
         "load_weights",
-        "post_load_apply",
         "post_load_weights",
         "move_untracked_params",
-        "post_load_publish",
         "pool_exit",
         "finalize_write",
     ]
@@ -423,8 +412,6 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
         "_apply",
         "to",
         "load_weights",
-        "post_load_apply",
-        "post_load_publish",
         "post_load_weights",
         "move_untracked_params",
     ):
@@ -451,10 +438,11 @@ def test_gms_rw_loader_preload_skips_mapping_pipeline(monkeypatch):
     checkpoint_loader.checkpoint_format = "MX"
     checkpoint_loader.load_weights.return_value = {}
     checkpoint_loader.is_weights_preloaded.return_value = True
+    checkpoint_loader.is_post_transform_weights_preloaded.return_value = False
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    loader._call_load_weights.assert_not_called()
+    model_hooks.call_load_weights.assert_not_called()
     backend.move_untracked_params.assert_called_once_with(model)
     backend.finalize_write.assert_called_once_with(model)
 
@@ -464,8 +452,8 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     backend = _build_gms_backend(is_rw=True, events=events)
@@ -476,11 +464,8 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     _install_gms_backend(monkeypatch, backend)
 
     checkpoint_loader = _PostTransformMxLoader()
-    checkpoint_loader.post_load_apply.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_apply"
-    )
-    checkpoint_loader.post_load_publish.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_publish"
+    checkpoint_loader.publish_as_source.side_effect = lambda *_a, **_kw: events.append(
+        "publish_as_source"
     )
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
@@ -490,11 +475,10 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
         "_apply",
         "to",
         "setup_aliases",
-        "post_load_apply",
         "setup_aliases",
         "cache_derived_state",
         "move_untracked_params",
-        "post_load_publish",
+        "publish_as_source",
         "pool_exit",
         "finalize_write",
     ]
@@ -503,19 +487,20 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
     assert callable(kwargs["prepare_post_transform_receiver"])
-    assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
-    loader._call_load_weights.assert_not_called()
-    checkpoint_loader.post_load_publish.assert_called_once_with(
+    source_identity = loader._weight_source.source_identity
+    assert source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert kwargs["source_identity"] is source_identity
+    model_hooks.call_load_weights.assert_not_called()
+    checkpoint_loader.publish_as_source.assert_called_once_with(
         model,
         checkpoint_dir="/ckpt",
-        weights_preloaded=True,
-        source_identity=loader._source_identity,
+        source_identity=source_identity,
     )
     backend.finalize_write.assert_called_once_with(model)
 
 
 def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
-    """RW + empty ``weights`` + ``is_weights_preloaded()=False`` is a bug.
+    """RW + empty ``weights`` from a loader that cannot preload is a bug.
 
     Without weights and without a loader-driven preload, the model is
     not populated. Committing it to GMS would expose an uninitialized
@@ -529,7 +514,6 @@ def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     checkpoint_loader.load_weights.return_value = {}
-    checkpoint_loader.is_weights_preloaded.return_value = False
 
     with pytest.raises(RuntimeError, match="Refusing to commit an unpopulated model"):
         loader.load("/ckpt", checkpoint_loader)
@@ -537,14 +521,14 @@ def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
     # Pool was opened, but nothing must be committed.
     backend.finalize_write.assert_not_called()
     backend.cleanup.assert_called_once()
-    assert loader._gms_backend is None
+    assert loader._weight_source.backend is None
 
 
 def test_gms_rw_exception_during_weight_mapping_cleans_up(monkeypatch):
     """A writer error after pool population must release the GMS session."""
     events = []
     loader = _make_loader(monkeypatch, events=events)
-    loader._call_load_weights.side_effect = RuntimeError("mapping failed")
+    model_hooks.call_load_weights.side_effect = RuntimeError("mapping failed")
     backend = _build_gms_backend(is_rw=True, events=events)
     _install_gms_backend(monkeypatch, backend)
 
@@ -557,7 +541,7 @@ def test_gms_rw_exception_during_weight_mapping_cleans_up(monkeypatch):
 
     backend.cleanup.assert_called_once()
     backend.finalize_write.assert_not_called()
-    assert loader._gms_backend is None
+    assert loader._weight_source.backend is None
 
 
 def test_gms_ro_with_spec_config_materializes_full_model_tree(monkeypatch):
