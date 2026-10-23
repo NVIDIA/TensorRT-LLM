@@ -834,6 +834,7 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
     assert "kda_replay_num_spec" not in allocate.call_args.kwargs
     manager = object.__new__(Glm5NextCacheManager)
     manager._requested_num_spec = None
+    manager._requested_draft_records = False
     manager._kda_replay = None
     manager._mamba_ssm_stochastic_rounding = False
     manager.spec_config = spec_config

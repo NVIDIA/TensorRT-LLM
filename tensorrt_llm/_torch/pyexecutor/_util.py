@@ -3490,6 +3490,11 @@ def _create_kv_cache_manager(
         # it), so the params pass through unscaled.
         kda_extra_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
                                                      "kimi_linear")
+        backbone = getattr(getattr(model_engine, "model", None), "model", None)
+        if (spec_config is not None
+                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                and getattr(backbone, "kda_draft_records", False)):
+            kda_extra_kwargs["kda_draft_records"] = True
         if is_glm5_next:
             from ..attention.backends.sparse.glm_kpool import \
                 glm_kpool_cache_row_dim

@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -1169,7 +1171,7 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
-        self._dummy_request_mask = None
+        self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
@@ -1226,9 +1228,7 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
         self._dummy_request_mask_host.zero_()
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(torch.tensor(is_dummy, dtype=torch.bool))
-        mask_staging = torch.empty_like(self._dummy_request_mask_host, pin_memory=prefer_pinned())
-        mask_staging.copy_(self._dummy_request_mask_host)
-        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
+        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -1892,8 +1892,9 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
             self.layer_offsets[self.mamba_pp_layers[0]]
         ][0]
 
-        self.cuda_state_indices = torch.zeros(
-            [self.max_batch_size], dtype=torch.int32, device="cuda"
+        self._state_indices_buffer = DeviceCopyBuffer(
+            torch.zeros([self.max_batch_size], dtype=torch.int32, device="cuda"),
+            pin_memory=prefer_pinned(),
         )
         self._host_state_indices = torch.zeros(
             [self.max_batch_size], dtype=torch.int32, pin_memory=prefer_pinned()
@@ -2007,7 +2008,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
-        self._dummy_request_mask = None
+        self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
@@ -2280,9 +2281,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
                 )
             self._host_state_indices[:n] = values
 
-        idx_staging = torch.empty_like(self._host_state_indices, pin_memory=prefer_pinned())
-        idx_staging.copy_(self._host_state_indices)
-        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
+        self._state_indices_buffer.update(self._host_state_indices, force=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
 
@@ -2346,7 +2345,10 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         if not self._allocate_pool_replay_buffers(spec_config, cache_size, device):
             return
 
-        self._dummy_request_mask = torch.zeros(self.max_batch_size, dtype=torch.bool, device=device)
+        self._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(self.max_batch_size, dtype=torch.bool, device=device),
+            pin_memory=prefer_pinned(),
+        )
         self._dummy_request_mask_host = torch.zeros(
             self.max_batch_size,
             dtype=torch.bool,

@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+import numpy as np
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
@@ -32,6 +34,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, GpuCacheTierConfig, KVCacheDesc
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -87,10 +91,12 @@ class KDAReplayLayerCache(MambaLayerCache):
     kda_g_cache: torch.Tensor | None = None
     kda_v_cache: torch.Tensor | None = None
     kda_beta_cache: torch.Tensor | None = None
+    # [slots, 3, num_spec, heads, head_dim]: fp32 vn, beta * k, and decay.
+    kda_state_tok: torch.Tensor | None = None
 
     @property
     def has_kda_replay_caches(self) -> bool:
-        return self.kda_k_cache is not None
+        return self.kda_conv_q is not None
 
     def commit_conv_window(self, slot_indices: torch.Tensor, conv_pool: torch.Tensor) -> None:
         """Seed the replay convolution windows from the live pool."""
@@ -142,6 +148,7 @@ def allocate_kda_replay_fields(
     conv_kernel_size: int,
     num_heads: int,
     device: torch.device,
+    draft_records: bool = False,
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
     """Allocate the complete KDA fused-verify replay payload."""
     if conv_dim % 3 != 0:
@@ -164,34 +171,52 @@ def allocate_kda_replay_fields(
         "kda_conv_q": allocate_conv_cache(),
         "kda_conv_k": allocate_conv_cache(),
         "kda_conv_v": allocate_conv_cache(),
-        "kda_k_cache": torch.zeros(
+    }
+    if draft_records:
+        fields["kda_state_tok"] = torch.zeros(
             num_local_layers,
             cache_size,
+            3,
             num_speculative_tokens,
-            section_dim,
-            dtype=torch.bfloat16,
-            device=device,
-        ),
-        "kda_g_cache": torch.zeros(
-            num_local_layers,
-            cache_size,
-            num_speculative_tokens,
-            section_dim,
+            num_heads,
+            section_dim // num_heads,
             dtype=torch.float32,
             device=device,
-        ),
-        "kda_v_cache": torch.zeros(
-            num_local_layers,
-            cache_size,
-            num_speculative_tokens,
-            section_dim,
-            dtype=torch.bfloat16,
-            device=device,
-        ),
-        "kda_beta_cache": _allocate_kda_beta_cache(
-            (num_local_layers, cache_size, num_speculative_tokens, num_heads), device
-        ),
-    }
+        )
+        return fields, [
+            value for name, value in fields.items() if name != "prev_num_accepted_tokens"
+        ]
+    fields.update(
+        {
+            "kda_k_cache": torch.zeros(
+                num_local_layers,
+                cache_size,
+                num_speculative_tokens,
+                section_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            "kda_g_cache": torch.zeros(
+                num_local_layers,
+                cache_size,
+                num_speculative_tokens,
+                section_dim,
+                dtype=torch.float32,
+                device=device,
+            ),
+            "kda_v_cache": torch.zeros(
+                num_local_layers,
+                cache_size,
+                num_speculative_tokens,
+                section_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            "kda_beta_cache": _allocate_kda_beta_cache(
+                (num_local_layers, cache_size, num_speculative_tokens, num_heads), device
+            ),
+        }
+    )
     scratch = [
         fields["kda_conv_q"],
         fields["kda_conv_k"],
@@ -315,8 +340,10 @@ class KDAReplayState:
         num_speculative_tokens: int,
         *,
         stochastic_rounding: bool = False,
+        draft_records: bool = False,
     ) -> None:
         self._stochastic_rounding = stochastic_rounding
+        self.draft_records = draft_records
         self.num_speculative_tokens = num_speculative_tokens
         self.suspended_requests: set[int] = set()
         self.acceptance_pending: set[int] = set()
@@ -332,6 +359,7 @@ class KDAReplayState:
         self.kda_g_cache: torch.Tensor | None = None
         self.kda_v_cache: torch.Tensor | None = None
         self.kda_beta_cache: torch.Tensor | None = None
+        self.kda_state_tok: torch.Tensor | None = None
         self.intermediate_indices: torch.Tensor | None = None
         self.rand_seed: torch.Tensor | None = None
         self._seed_request_counter = 0
@@ -359,6 +387,11 @@ class KDAReplayState:
 
     def _layer_bytes_per_slot(self, section_dim: int, committed_window: int, num_heads: int) -> int:
         extended_window = committed_window + self.num_speculative_tokens
+        if self.draft_records:
+            return (
+                3 * section_dim * extended_window * torch.bfloat16.itemsize
+                + 3 * self.num_speculative_tokens * section_dim * torch.float32.itemsize
+            )
         bf16_elements = (
             3 * section_dim * extended_window
             + self.num_speculative_tokens * 2 * section_dim
@@ -409,7 +442,7 @@ class KDAReplayState:
             getattr(quant_config, "mamba_ssm_stochastic_rounding", False)
             and params.mamba_ssm_cache_dtype == torch.float16,
         )
-        state = cls(num_spec)
+        state = cls(num_spec, draft_records=kwargs.get("kda_draft_records", False))
         layer_bytes = state._layer_bytes_per_slot(
             params.n_groups * params.state_size // tp_size,
             params.conv_kernel - 1,
@@ -449,6 +482,7 @@ class KDAReplayState:
             conv_kernel_size=context.conv_state_shape[1] + 1,
             num_heads=context.ssm_state_shape[0],
             device=device,
+            draft_records=self.draft_records,
         )
         for name, value in fields.items():
             setattr(self, name, value)
@@ -477,6 +511,9 @@ class KDAReplayState:
             "kda_beta_cache": (
                 None if self.kda_beta_cache is None else self.kda_beta_cache[layer_offset]
             ),
+            "kda_state_tok": None
+            if self.kda_state_tok is None
+            else self.kda_state_tok[layer_offset],
         }
 
     def make_layer_cache(
@@ -580,9 +617,8 @@ class KDAReplayState:
             self.kda_v_cache,
             self.kda_beta_cache,
         ):
-            if replay_buffer is None:
-                raise RuntimeError("KDA replay history buffers are not bound")
-            replay_buffer.index_fill_(1, state_indices, 0)
+            if replay_buffer is not None:
+                replay_buffer.index_fill_(1, state_indices, 0)
         self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
 
     def record_acceptance(
@@ -620,7 +656,7 @@ class KDAReplayState:
             (1,), slot, dtype=torch.int32, device=self.prev_num_accepted_tokens.device
         )
         num_accepted = self.prev_num_accepted_tokens.index_select(0, slots)
-        state_tok = getattr(self, "kda_state_tok", None)
+        state_tok = self.kda_state_tok
         for layer, (ssm_states, conv_states) in enumerate(zip(self._ssm_states, self._conv_states)):
             commit_kda_pending_drafts(
                 ssm_states,
@@ -628,10 +664,10 @@ class KDAReplayState:
                 self.kda_conv_q[layer],
                 self.kda_conv_k[layer],
                 self.kda_conv_v[layer],
-                self.kda_k_cache[layer],
-                self.kda_g_cache[layer],
-                self.kda_v_cache[layer],
-                self.kda_beta_cache[layer],
+                None if self.kda_k_cache is None else self.kda_k_cache[layer],
+                None if self.kda_g_cache is None else self.kda_g_cache[layer],
+                None if self.kda_v_cache is None else self.kda_v_cache[layer],
+                None if self.kda_beta_cache is None else self.kda_beta_cache[layer],
                 slots,
                 num_accepted,
                 state_tok=state_tok[layer] if state_tok is not None else None,
@@ -647,8 +683,9 @@ class KDAReplayState:
             self.kda_g_cache,
             self.kda_v_cache,
             self.kda_beta_cache,
+            self.kda_state_tok,
         )
-        if any(buffer is None for buffer in buffers):
+        if any(buffer is None for buffer in buffers[:3]):
             raise RuntimeError("KDA replay buffers are not bound")
         return tuple(buffer for buffer in buffers if buffer is not None)
 
@@ -666,6 +703,7 @@ class KDAReplayState:
         self.kda_g_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
+        self.kda_state_tok = None
         self.intermediate_indices = None
         self.rand_seed = None
 
@@ -713,6 +751,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self,
         *args,
         kda_replay_num_spec: int | None = None,
+        kda_draft_records: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -720,6 +759,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             raise ValueError("KDA replay and Mamba2 replay are mutually exclusive")
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_num_spec = kda_replay_num_spec
+        self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
@@ -731,7 +771,9 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
         if num_spec is not None:
             self._kda_replay = KDAReplayState(
-                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+                num_spec,
+                stochastic_rounding=self._mamba_ssm_stochastic_rounding,
+                draft_records=self._requested_draft_records,
             )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay
@@ -740,6 +782,67 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
+
+    @property
+    def keeps_kda_draft_records(self) -> bool:
+        return self._kda_replay is not None and self._kda_replay.kda_state_tok is not None
+
+    def _kda_draft_record_bytes_per_slot(self) -> int:
+        replay = self._kda_replay
+        if replay is None or not replay.draft_records or not self.local_num_mamba_layers:
+            return 0
+        return (
+            self.local_num_mamba_layers
+            * 3
+            * replay.num_speculative_tokens
+            * self.ssm_state_shape[0]
+            * self.ssm_state_shape[-1]
+            * torch.float32.itemsize
+        )
+
+    @override
+    def _mamba_state_bytes_per_slot(self) -> int:
+        return super()._mamba_state_bytes_per_slot() + self._kda_draft_record_bytes_per_slot()
+
+    def _ssm_pool_at_live_floor(self, kv_cache_config) -> bool:
+        """Keep draft records only for live and reserved slots, without prefix reuse."""
+        return (
+            self._kda_draft_record_bytes_per_slot() > 0
+            and not kv_cache_config.enable_block_reuse
+            and self._attention_cache_bytes_per_token() > 0
+        )
+
+    def _live_floor_draft_record_slots(self, max_util_for_resume: float) -> int:
+        """Match the native pool's float32 utilization and resident-slot floor."""
+        if self.kv_cache_config.pool_ratio is not None or not self._ssm_pool_at_live_floor(
+            self.kv_cache_config
+        ):
+            return 0
+        slots = self._max_resident_sequences() + self._num_reserved_dummy_slots
+        return math.ceil(slots / float(np.float32(max_util_for_resume)))
+
+    def _quota_filling_request_capacity(self, gpu_quota: int) -> int:
+        """Give attention the remaining quota while recurrent slots stay at their floor."""
+        bytes_per_token = self._max_resident_sequences() * self._attention_cache_bytes_per_token()
+        return min(ceil_div(gpu_quota, bytes_per_token), 1 << 30)
+
+    @override
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        quota = super()._get_quota_from_max_tokens(max_tokens)
+        state_slots = (
+            self._max_resident_sequences()
+            + self._num_reserved_dummy_slots
+            + self._num_ssm_snapshots_for_capacity(max_tokens, self.kv_cache_config)
+        )
+        floor_slots = self._live_floor_draft_record_slots(self.kv_cache_config.max_util_for_resume)
+        return quota + max(0, floor_slots - state_slots) * self._mamba_state_bytes_per_slot()
+
+    @override
+    def _minimum_live_gpu_quota(self) -> int:
+        floor_slots = self._live_floor_draft_record_slots(self.kv_cache_config.max_util_for_resume)
+        floor_quota = floor_slots * self._mamba_state_bytes_per_slot()
+        attention_page = self._attention_cache_bytes_per_token() * self.tokens_per_block
+        return max(super()._minimum_live_gpu_quota(), floor_quota + attention_page)
 
     @override
     def _build_cache_config(self, config):
@@ -753,7 +856,39 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 "and a rebalance can grow that pool past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False."
             )
-        return super()._build_cache_config(config)
+        record_bytes = self._kda_draft_record_bytes_per_slot()
+        if record_bytes and (
+            config.initial_pool_ratio is not None
+            or not self._ssm_pool_at_live_floor(self.kv_cache_config)
+        ):
+            raise ValueError(
+                "KDA draft records (kda_draft_records) need the SSM pool at "
+                "its live floor: kv_cache_config.enable_block_reuse off, "
+                "kv_cache_config.pool_ratio unset, and attention layers on this rank."
+            )
+        config = super()._build_cache_config(config)
+        if not record_bytes:
+            return config
+        record_slots = self._live_floor_draft_record_slots(config.max_util_for_resume)
+        record_quota = record_slots * record_bytes
+        pool_quota = config.cache_tiers[0].quota - record_quota
+        capacity = max(
+            self._get_typical_request_capacity(self.kv_cache_config),
+            self._quota_filling_request_capacity(pool_quota),
+        )
+        requests = self._typical_request_descs(capacity, self.kv_cache_config)
+        dummy_requests = [
+            KVCacheDesc(capacity=0, history_length=0) for _ in range(self._num_reserved_dummy_slots)
+        ]
+        logger.info(
+            f"KDA draft records for {record_slots} slots reserve {record_quota} GPU bytes; "
+            f"native pools receive {pool_quota} bytes"
+        )
+        return replace(
+            config,
+            cache_tiers=[GpuCacheTierConfig(quota=pool_quota), *config.cache_tiers[1:]],
+            typical_step=BatchDesc(requests * self._max_resident_sequences() + dummy_requests),
+        )
 
     @override
     def suspend_request(self, request) -> None:

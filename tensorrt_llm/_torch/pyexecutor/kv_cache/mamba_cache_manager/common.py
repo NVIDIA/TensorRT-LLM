@@ -258,6 +258,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     _supports_additional_snapshot_offsets = False
 
+    @property
+    def cuda_state_indices(self) -> torch.Tensor:
+        return self._state_indices_buffer.tensor
+
+    @property
+    def _dummy_request_mask(self) -> Optional[torch.Tensor]:
+        if self._dummy_request_mask_buffer is None:
+            return None
+        return self._dummy_request_mask_buffer.tensor
+
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         """Set reusable Mamba snapshot boundaries before scheduling."""
         if not self.enable_block_reuse:

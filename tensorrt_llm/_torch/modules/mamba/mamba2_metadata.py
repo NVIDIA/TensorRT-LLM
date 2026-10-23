@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
@@ -374,6 +375,8 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        self._state_indices_buffer = DeviceCopyBuffer(
+            self.state_indices, pin_memory=prefer_pinned())
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
@@ -483,11 +486,12 @@ class Mamba2Metadata:
                         "are used; got a different address than the first "
                         "call.")
                 self.state_indices = indices
+                self._state_indices_buffer = kv_cache_manager._state_indices_buffer
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_buffer.update(
+                    self.state_indices_cpu[:batch_size])
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -498,8 +502,8 @@ class Mamba2Metadata:
                 self.state_indices_cpu[:batch_size].copy_(
                     torch.as_tensor(indices,
                                     dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_buffer.update(
+                    self.state_indices_cpu[:batch_size])
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

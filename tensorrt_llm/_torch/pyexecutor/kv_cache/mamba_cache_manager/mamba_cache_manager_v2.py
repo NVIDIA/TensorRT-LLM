@@ -33,6 +33,8 @@ from typing import (
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
+
 if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
@@ -638,15 +640,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_is_dummy = {}
 
         state_index_capacity = self.max_batch_size + self._num_reserved_dummy_slots
-        self.cuda_state_indices = torch.zeros(
-            [state_index_capacity], dtype=torch.int32, device="cuda"
+        self._state_indices_buffer = DeviceCopyBuffer(
+            torch.zeros([state_index_capacity], dtype=torch.int32, device="cuda"),
+            pin_memory=prefer_pinned(),
         )
         self._host_state_indices = torch.zeros(
             [state_index_capacity], dtype=torch.int32, pin_memory=prefer_pinned()
         )
 
-        self._dummy_request_mask = torch.zeros(
-            state_index_capacity, dtype=torch.bool, device="cuda"
+        self._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(state_index_capacity, dtype=torch.bool, device="cuda"),
+            pin_memory=prefer_pinned(),
         )
         self._dummy_request_mask_host = torch.zeros(
             state_index_capacity, dtype=torch.bool, pin_memory=prefer_pinned()
@@ -938,9 +942,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     )
                 self._host_state_indices[i] = base_index
 
-        idx_staging = torch.empty_like(self._host_state_indices, pin_memory=prefer_pinned())
-        idx_staging.copy_(self._host_state_indices)
-        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
+        self._state_indices_buffer.update(self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
@@ -971,9 +973,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._dummy_request_mask_host.zero_()
         if count:
             self._dummy_request_mask_host[:count].copy_(torch.tensor(is_dummy, dtype=torch.bool))
-        mask_staging = torch.empty_like(self._dummy_request_mask_host, pin_memory=prefer_pinned())
-        mask_staging.copy_(self._dummy_request_mask_host)
-        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
+        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
 
     @override
     def get_state_indices(
@@ -1342,7 +1342,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._recurrent_buffers.clear()
         self.all_ssm_states = []
         self.all_conv_states = []
-        self._dummy_request_mask = None
+        self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self._generation_state_indices = None
         self._branch_snapshot_points.clear()

@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
@@ -72,7 +73,6 @@ def test_model_managers_inherit_the_common_lifecycle(manager_cls):
     assert manager_cls.__bases__ == (MambaHybridCacheManagerV2,)
     for method in (
         "try_commit_blocks",
-        "_get_quota_from_max_tokens",
         "_setup_state_pool",
     ):
         assert getattr(manager_cls, method) is getattr(MambaHybridCacheManagerV2, method)
@@ -250,6 +250,7 @@ def test_model_initialization_validates_selected_replay(manager_cls):
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
     manager._requested_replay = True
     manager._requested_num_spec = 2
+    manager._requested_draft_records = False
     manager._kda_replay = None
     _prepare_model_layout(manager)
     manager._state_layout = replace(
@@ -275,6 +276,7 @@ def test_k3_initializes_only_the_selected_state(
 ):
     manager = object.__new__(manager_cls)
     manager._requested_num_spec = requested_num_spec
+    manager._requested_draft_records = False
     manager._kda_replay = None
     manager.spec_config = (
         SimpleNamespace(decoding_type=decoding_type, tokens_per_gen_step=3)
@@ -305,7 +307,10 @@ def test_k3_initializes_only_the_selected_state(
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
-        replay_factory.assert_called_once_with(num_spec, stochastic_rounding=False)
+        replay_kwargs = {"stochastic_rounding": False}
+        if manager_cls is KimiK3HybridCacheManager:
+            replay_kwargs["draft_records"] = False
+        replay_factory.assert_called_once_with(num_spec, **replay_kwargs)
         assert manager._speculative_state is manager._kda_replay
         state = manager._kda_replay
     else:
@@ -379,7 +384,7 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding(monkeypatch):
     manager._setup_model_state()
     seeds = manager.get_mamba_ssm_rand_seed()
     before = seeds.clone()
-    manager.cuda_state_indices = torch.tensor([1], dtype=torch.int32)
+    manager._state_indices_buffer = DeviceCopyBuffer(torch.tensor([1], dtype=torch.int32))
     manager._host_state_indices = manager.cuda_state_indices.clone()
     manager._reset_context_mamba_slots(num_contexts=1)
     assert manager.get_mamba_ssm_rand_seed() is seeds
@@ -431,7 +436,7 @@ def test_base_manager_requires_model_for_speculative_decoding():
     manager._speculative_state = None
     manager.local_num_mamba_layers = 1
     manager._generation_state_indices = torch.empty(0, dtype=torch.int32)
-    manager._dummy_request_mask = torch.empty(0, dtype=torch.bool)
+    manager._dummy_request_mask_buffer = DeviceCopyBuffer(torch.empty(0, dtype=torch.bool))
     with pytest.raises(NotImplementedError, match="model manager"):
         manager.update_mamba_states(
             SimpleNamespace(num_seqs=0, num_contexts=0),
@@ -486,10 +491,10 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     assert manager.intermediate_ssm_states == ([ssm] if mode == "intermediate" else None)
     assert manager.intermediate_conv_states == ([conv] if mode != "plain" else None)
     manager.local_num_mamba_layers = 1
-    manager.cuda_state_indices = torch.tensor([4, 2, 3], dtype=torch.int32)
+    manager._state_indices_buffer = DeviceCopyBuffer(torch.tensor([4, 2, 3], dtype=torch.int32))
     manager._host_state_indices = manager.cuda_state_indices.clone()
     manager._generation_state_indices = torch.arange(2, dtype=torch.int32)
-    manager._dummy_request_mask = torch.tensor([False, False, True])
+    manager._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, False, True]))
     manager._reset_context_mamba_slots(num_contexts=1)
     reset.assert_called_once()
     slots, host_slots = reset.call_args.args
