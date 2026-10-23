@@ -115,6 +115,9 @@ skip_blackwell = pytest.mark.skipif(
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
+skip_pre_rubin = pytest.mark.skipif(
+    getSMVersion() < 107,
+    reason="This test is not supported in pre-Rubin architecture")
 skip_rubin = pytest.mark.skipif(
     100 <= getSMVersion() < 110 and getSMVersion() not in (100, 103),
     reason="This test is not supported on non-Blackwell 100f architectures")

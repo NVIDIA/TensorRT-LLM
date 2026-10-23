@@ -16,6 +16,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -283,6 +284,8 @@ class DecoderWarmup:
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
+        warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
             return self._warmup_scheduled(resource_manager, kv_cache_manager)

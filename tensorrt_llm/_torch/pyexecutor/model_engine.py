@@ -18,7 +18,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -36,6 +36,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
@@ -100,6 +101,26 @@ class ModelEngine(ABC):
         perform warmup actions: instantiating CUDA graphs, torch.compile, etc.
         """
         return
+
+
+# Refit only needs the compile wrapper removed before weights are loaded: the
+# wrapper inserts "_orig_mod" into every parameter path, and load_weights()
+# matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
+# allow_partial_loading=True the whole compiled subtree then silently loads
+# nothing and keeps its pre-refit weights.
+#
+# Bisected on a TP8 Qwen3.5 397B refit against a real-weight reference; only the
+# unwrap changes the outcome, so the refit lifecycle is unwrap -> load ->
+# re-wrap and nothing else. The measurements, for anyone tempted to add the
+# other steps back:
+#   unwrap + compiler.reset() + recompile + recapture   clean 6.5 s
+#   unwrap + reset + recompile, no recapture            clean 5.7 s
+#   unwrap + recompile                                  clean 5.6 s
+#   unwrap + re-wrap only                    (shipped)  clean 5.1 s
+#   no unwrap                                           GARBAGE
+# Clearing and recapturing the piecewise graphs is the part that was dropped:
+# refit moves no tensor, so the captures stay valid and PWCG stays hot across a
+# refit (976 graphs measured still live) instead of going cold.
 
 
 def _filter_piecewise_capture_num_tokens(
@@ -483,6 +504,32 @@ class PyTorchModelEngine(ModelEngine):
             self._nccl_window_tensor_scope_hooks = []
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
+                if mpi_disabled() and self.mapping.world_size > 1:
+                    # Resolve the device-mesh dims the compiled forward reads
+                    # (mapping.tp_group & friends) while still eager: the
+                    # DeviceMesh resolver is compiler-disabled and must never
+                    # run under tracing; once memoized these reads trace as
+                    # constants.
+                    _ = self.mapping.tp_group
+                    _ = self.mapping.pp_group
+                    _ = self.mapping.cp_group
+                    if self.mapping.moe_ep_size > 1:
+                        _ = self.mapping.moe_tp_group
+                        _ = self.mapping.moe_ep_group
+                # torch.compile traces AllReduce.forward, whose lazy MNNVL
+                # workspace rescale cannot allocate inside the traced region -
+                # grow the workspaces to the engine maximum up front.
+                num_mnnvl_allreduces = 0
+                for module in self.model.modules():
+                    if isinstance(module, MNNVLAllReduce):
+                        module.prescale_workspace(self.max_num_tokens,
+                                                  self.model.config.hidden_size)
+                        num_mnnvl_allreduces += 1
+                if num_mnnvl_allreduces:
+                    logger.info(f"Pre-scaled the MNNVL allreduce workspace for "
+                                f"{num_mnnvl_allreduces} modules to cover "
+                                f"max_num_tokens={self.max_num_tokens} before "
+                                "torch.compile.")
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
@@ -498,10 +545,6 @@ class PyTorchModelEngine(ModelEngine):
                     capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
                     mapping=self.mapping)
-                apply_llm_torch_compile = getattr(self.model,
-                                                  "apply_llm_torch_compile",
-                                                  None)
-
                 if compile_only_piecewise_graphs and not isinstance(
                         self.model, DecoderModelForCausalLM):
                     raise ValueError(
@@ -509,32 +552,8 @@ class PyTorchModelEngine(ModelEngine):
                         "compile_only_piecewise_graphs=True is "
                         "only supported for DecoderModelForCausalLM models.")
 
-                if isinstance(self.model, DecoderModelForCausalLM):
-                    eager_model = self.model.model
-                    compiled_model = torch.compile(
-                        eager_model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
-                    self._torch_compile_prefill_only = (
-                        self._torch_compile_piecewise_cuda_graph
-                        and (compile_only_piecewise_graphs
-                             or not self.model.use_fx_for_pcg_fallback))
-                    if self._torch_compile_prefill_only:
-                        self.model.model = PrefillCompiledModel(
-                            eager_model, compiled_model)
-                    else:
-                        self.model.model = compiled_model
-                elif callable(apply_llm_torch_compile):
-                    # TODO: Move this contract to MultimodalModelMixin once
-                    # multimodal models consistently expose their LLM compile
-                    # scope through the mixin.
-                    apply_llm_torch_compile(backend=self._torch_compile_backend,
-                                            fullgraph=torch_compile_fullgraph)
-                else:
-                    self.model = torch.compile(
-                        self.model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
+                self._apply_torch_compile(self._torch_compile_backend,
+                                          torch_compile_fullgraph)
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
@@ -1293,6 +1312,131 @@ class PyTorchModelEngine(ModelEngine):
             self._torch_compile_backend.clear_piecewise_cuda_graphs(
                 release_nccl_window_owners=release_nccl_window_owners)
 
+    def _eager_decoder_scope(self) -> torch.nn.Module:
+        """Return the eager decoder scope under any compile or prefill wrapper."""
+        scope = self.model.model
+        if isinstance(scope, PrefillCompiledModel):
+            scope = scope.eager_model
+        return getattr(scope, "_orig_mod", scope)
+
+    def _apply_torch_compile(self, backend: Backend, fullgraph: bool) -> None:
+        """Compile the eager model scope."""
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
+                                          None)
+        if isinstance(self.model, DecoderModelForCausalLM):
+            eager_model = self._eager_decoder_scope()
+            compiled_model = torch.compile(eager_model,
+                                           backend=backend,
+                                           fullgraph=fullgraph)
+            self._torch_compile_prefill_only = (
+                self._torch_compile_piecewise_cuda_graph
+                and (self._compile_only_piecewise_graphs
+                     or not self.model.use_fx_for_pcg_fallback))
+            self.model.model = (PrefillCompiledModel(
+                eager_model, compiled_model) if self._torch_compile_prefill_only
+                                else compiled_model)
+        elif callable(apply_llm_torch_compile):
+            # Avoid nesting a new wrapper around the previous compile.
+            llm = getattr(self.model, "llm", None)
+            compiled_model = getattr(llm, "model", None)
+            if hasattr(compiled_model, "_orig_mod"):
+                llm.model = compiled_model._orig_mod
+            # TODO: Move this contract to MultimodalModelMixin once
+            # multimodal models consistently expose their LLM compile scope.
+            apply_llm_torch_compile(backend=backend, fullgraph=fullgraph)
+        else:
+            eager_model = getattr(self.model, "_orig_mod", self.model)
+            self.model = torch.compile(eager_model,
+                                       backend=backend,
+                                       fullgraph=fullgraph)
+
+    def _remove_torch_compile(self) -> None:
+        """Restore the eager model scope."""
+        if isinstance(self.model, DecoderModelForCausalLM):
+            self.model.model = self._eager_decoder_scope()
+            return
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
+                                          None)
+        if callable(apply_llm_torch_compile):
+            llm = getattr(self.model, "llm", None)
+            compiled_model = getattr(llm, "model", None)
+            if hasattr(compiled_model, "_orig_mod"):
+                llm.model = compiled_model._orig_mod
+            return
+        self.model = getattr(self.model, "_orig_mod", self.model)
+
+    def unwrap_compiled_model_for_refit(self) -> None:
+        """Release compiled state before refit.
+
+        Gated on torch.compile, NOT on piecewise CUDA graphs. PWCG is only one
+        thing a compiled engine carries across a refit; the compiled wrapper
+        itself has to be unwrapped either way. Gating this on
+        ``_torch_compile_piecewise_cuda_graph`` left ``TorchCompileConfig()``
+        (compile on, PWCG off -- the default shape of that config) with no refit
+        lifecycle at all, and a TP8 Qwen3.5 397B refit in that configuration
+        emits degenerate repetition while the same engine with PWCG enabled is
+        clean. Nothing goes stale: the wrapper inserts ``_orig_mod`` into every
+        parameter path, ``load_weights`` matches checkpoint tensors by dotted
+        path, and ``allow_partial_loading=True`` then skips the whole compiled
+        subtree in silence, so it simply keeps its pre-refit weights.
+
+        The piecewise captures are deliberately NOT cleared. Refit moves no
+        tensor (0 of 1405 parameters, buffers and tensor attributes change
+        address), so the captures stay valid; clearing them only forces PWCG
+        cold and replay-less until something recaptures.
+        """
+        if not self._torch_compile_enabled:
+            return
+        # Barrier before refit overwrites weights, so prior GPU work cannot still
+        # be reading them. In the original code this sat *after* the PWCG-gated
+        # early return, so a compile-without-PWCG engine skipped it entirely.
+        torch.cuda.synchronize()
+        self._remove_torch_compile()
+
+    @with_warmup_flag
+    def restore_compiled_model_after_refit(
+            self, resource_manager: ResourceManager) -> None:
+        """Re-install the torch.compile wrapper after refit.
+
+        Gated on torch.compile, not on PWCG -- see
+        :meth:`unwrap_compiled_model_for_refit` for why.
+
+        This ONLY re-wraps: the cached compiled artifact is reused, so there is
+        no ``torch.compiler.reset()`` and no piecewise recapture. Both were
+        measured unnecessary on a TP8 Qwen3.5 397B refit -- 976 piecewise graphs
+        were still live afterwards, so the captures survive intact and PWCG
+        stays hot.
+
+        No ``gc.collect()`` either. The previous wrapper is released by
+        reference count when it is replaced, and a full collection in a
+        process holding the executor, the request bookkeeping and the
+        trainer-side Ray state costs seconds; this hook sits inside the
+        refit bubble, so that was pure generation-idle time.
+
+        Deliberately NOT decorated with ``warmup_with_kv_cache_cleanup``: that
+        decorator ends with ``check_invalid_values_in_kv_cache(fill_with_zero=
+        True)``, which zero-fills every attention KV pool whether or not it
+        found a NaN. It belongs after a capture warm-up that ran forwards on
+        placeholder inputs; this hook never runs a forward, and under an
+        in-flight weight update (``drain=False``) the zero-fill would wipe the
+        KV of every request kept across the refit. The wrapper also ran when
+        torch.compile is disabled, because the early return below happens
+        inside the wrapped method.
+
+        ``resource_manager`` is unused here; it stays in the signature because
+        callers (including NeMo-RL) already pass it.
+        """
+        if not self._torch_compile_enabled:
+            return
+        self._apply_torch_compile(self._torch_compile_backend,
+                                  self.torch_compile_config.enable_fullgraph)
+
+    # Back-compat aliases. Callers probe these names with getattr() and fall
+    # back to doing nothing, so removing them would silently skip the unwrap
+    # and let refit load into a wrapped model again.
+    release_piecewise_cuda_graphs_for_refit = unwrap_compiled_model_for_refit
+    recapture_piecewise_cuda_graphs_after_refit = restore_compiled_model_after_refit
+
     def get_max_num_sequences(self) -> int:
         """
         Return the maximum number of sequences that the model supports. PyExecutor needs this to compute max_num_active_requests
@@ -1351,6 +1495,18 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
+            return False
+
+        # The userbuffers bootstrap exchanges CUDA memory handles over raw
+        # MPI_COMM_WORLD collectives (userbuffers-host.cpp). Under non-MPI
+        # orchestrators (Ray sets TLLM_DISABLE_MPI) every worker holds a
+        # 1-rank MPI world, so importer ranks would receive uninitialized
+        # bytes instead of peer handles and crash in
+        # cuMemImportFromShareableHandle with 'operation not supported'.
+        if mpi_disabled():
+            logger.info(
+                "Disabling userbuffers: its bootstrap requires MPI, which is "
+                "disabled under this orchestrator.")
             return False
 
         # Disable UB for unsupported platforms
