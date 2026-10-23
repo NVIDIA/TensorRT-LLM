@@ -215,6 +215,16 @@ class MultimodalEncoderMixin:
         runner.capture_all(device)
         self._blocks_graph_runner = runner
 
+    def clear_blocks_cuda_graph(self,
+                                *,
+                                release_nccl_window_owners: bool = True
+                                ) -> None:
+        """Release block graphs at the engine's coordinated teardown boundary."""
+        if self._blocks_graph_runner is not None:
+            self._blocks_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
+            self._blocks_graph_runner = None
+
     def get_encoder_attention_metadata_capacity(
             self, max_num_tokens: int) -> dict[str, int]:
         """Map the token budget to model-internal attention sequences.

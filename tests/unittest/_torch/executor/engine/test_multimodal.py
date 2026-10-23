@@ -61,7 +61,10 @@ def test_disabled_encoder_does_not_initialize_processor():
     processor.get_mm_max_tokens_per_item.assert_not_called()
 
 
-def test_encoder_graph_capture_follows_metadata_setup_and_runs_once() -> None:
+@pytest.mark.parametrize("release_nccl_window_owners", [False, True])
+def test_encoder_graph_capture_follows_metadata_setup_and_runs_once(
+    release_nccl_window_owners: bool,
+) -> None:
     events = []
 
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
@@ -109,6 +112,21 @@ def test_encoder_graph_capture_follows_metadata_setup_and_runs_once() -> None:
     ]
     assert model.first._blocks_graph_runner is model.first.runner
     assert model.second._blocks_graph_runner is model.second.runner
+    model.disabled.runner.capture_all.assert_not_called()
+
+    for encoder in (model.first, model.second, model.disabled):
+        encoder.clear_blocks_cuda_graph(release_nccl_window_owners=release_nccl_window_owners)
+        encoder.clear_blocks_cuda_graph(release_nccl_window_owners=release_nccl_window_owners)
+        assert encoder._blocks_graph_runner is None
+    for encoder in (model.first, model.second):
+        encoder.runner.clear.assert_called_once_with(
+            release_nccl_window_owners=release_nccl_window_owners
+        )
+    model.disabled.runner.clear.assert_not_called()
+
+    setup_mm_encoder_cuda_graphs(model)
+    assert model.first.runner.capture_all.call_count == 2
+    assert model.second.runner.capture_all.call_count == 2
     model.disabled.runner.capture_all.assert_not_called()
 
 
