@@ -78,9 +78,7 @@ def attn_res_fwd_chunked_reference(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Chunked torch reference for packed Attention Residual forward.
 
-    Mirrors ``exisiting_optimization_work/Attention_residual/tests/util/attn_res_ref.py``
-    so callers can produce byte-identical reference outputs without loading
-    the optimization tree.
+    Callers can produce reference outputs from this implementation.
 
     Args mirror :meth:`KimiK3AttnResidualOp.attn_res_fwd`:
 
