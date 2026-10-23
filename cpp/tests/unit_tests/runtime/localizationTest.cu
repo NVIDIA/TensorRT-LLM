@@ -441,6 +441,51 @@ TEST_F(LocalizationTest, CreateLocalizedStreamLocalityDomain1)
     EXPECT_EQ(mHandle->createLocalizedStream(1), stream);
 }
 
+TEST_F(LocalizationTest, LocalizedStreamSmCountMatchesItsPartition)
+{
+    if (!mSupportsLocalityDomain)
+    {
+        GTEST_SKIP() << "LOCALITY_DOMAIN not supported, skipping test";
+    }
+
+    for (int localityDomainId = 0; localityDomainId < 2; ++localityDomainId)
+    {
+        CUstream stream = mHandle->createLocalizedStream(localityDomainId);
+        auto const [partitionSmCount, deviceSmCount] = mHandle->getLocalityDomainComputeSmCounts(localityDomainId);
+        ASSERT_GT(partitionSmCount, 0u);
+        EXPECT_LT(partitionSmCount, deviceSmCount);
+        EXPECT_EQ(getLocalizedStreamSmCount(stream), partitionSmCount);
+    }
+}
+
+TEST_F(LocalizationTest, OrdinaryStreamHasNoLocalizedSmCount)
+{
+    EXPECT_EQ(getLocalizedStreamSmCount(nullptr), 0u);
+
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    EXPECT_EQ(getLocalizedStreamSmCount(reinterpret_cast<CUstream>(stream)), 0u);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST_F(LocalizationTest, LocalizedStreamSmCountIsReadableDuringGraphCapture)
+{
+    if (!mSupportsLocalityDomain)
+    {
+        GTEST_SKIP() << "LOCALITY_DOMAIN not supported, skipping test";
+    }
+
+    CUstream stream = mHandle->createLocalizedStream(0);
+    auto const expected = mHandle->getLocalityDomainComputeSmCounts(0).first;
+    auto const cudaStream = reinterpret_cast<cudaStream_t>(stream);
+    ASSERT_EQ(cudaStreamBeginCapture(cudaStream, cudaStreamCaptureModeThreadLocal), cudaSuccess);
+    unsigned int const captured = getLocalizedStreamSmCount(stream);
+    cudaGraph_t graph{};
+    ASSERT_EQ(cudaStreamEndCapture(cudaStream, &graph), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    EXPECT_EQ(captured, expected);
+}
+
 // Bandwidth checks allocate tens of GiB and are disabled in normal unit-test runs.
 // Run them explicitly with --gtest_also_run_disabled_tests when benchmarking locality-domain locality.
 
