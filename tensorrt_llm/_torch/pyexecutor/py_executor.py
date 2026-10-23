@@ -9237,16 +9237,19 @@ class PyExecutor:
         Returns:
             Newly activated requests that were not retired by cancellation.
         """
-        if (getattr(self.kv_cache_transceiver, "_fp4_mla_bridge_enabled",
-                    False) is not True or not self.canceled_req_ids
+        if (self.kv_cache_transceiver is None or not self.canceled_req_ids
                 or getattr(self, "kv_connector_manager", None) is not None):
             return new_requests
 
+        supports_idle_cancel = self.kv_cache_transceiver.supports_idle_request_cancellation
+        cancel_queued = supports_idle_cancel() is True
         cancelled_ids = set(self.canceled_req_ids)
-        self.waiting_queue.remove_by_ids(cancelled_ids)
+        if cancel_queued:
+            self.waiting_queue.remove_by_ids(cancelled_ids)
         new_ids = {req.py_request_id for req in new_requests}
         retired_ids = set()
         failed_ids = set()
+        handled_cancel_ids = set()
         for request in self.active_requests:
             cancel_id = (request.parent_request_id
                          if request.is_child else request.py_request_id)
@@ -9263,12 +9266,14 @@ class PyExecutor:
                     LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
                     LlmRequestState.DISAGG_TRANS_ERROR,
                 ))
-            if not (context_waiting or generation_waiting):
+            if (not (context_waiting or generation_waiting)
+                    or supports_idle_cancel(request) is not True):
                 continue
             # Even an unsubmitted CTX request may be in the transceiver's
             # peer-info wait set. Cancel there before a late ready can revive it.
             if not self.disagg.request_cancellation(request):
                 continue
+            handled_cancel_ids.add(cancel_id)
             if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
                 # Keep the failure outcome. The pending cancel must no longer
                 # block the coordinator's rank-synchronized error cleanup.
@@ -9285,6 +9290,8 @@ class PyExecutor:
             self._pending_response_terminations.append(request)
             retired_ids.add(request.py_request_id)
 
+        if not cancel_queued:
+            self.waiting_queue.remove_by_ids(handled_cancel_ids)
         self.active_requests[:] = [
             req for req in self.active_requests
             if req.py_request_id not in retired_ids
@@ -9296,7 +9303,8 @@ class PyExecutor:
         }
         self.canceled_req_ids[:] = [
             request_id for request_id in self.canceled_req_ids
-            if request_id in active_cancel_ids
+            if request_id in active_cancel_ids or (
+                not cancel_queued and request_id not in handled_cancel_ids)
         ]
         return [
             req for req in new_requests if req.py_request_id not in retired_ids
@@ -9359,6 +9367,15 @@ class PyExecutor:
 
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
+                if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
+                        and request.is_generation_only_request
+                        and self.kv_cache_transceiver is not None
+                        and getattr(self, "kv_connector_manager", None) is None
+                        and self.kv_cache_transceiver.
+                        supports_idle_request_cancellation(request) is True):
+                    # Drop the pending cancel so synchronized error cleanup
+                    # can report the committed failure without rewriting it.
+                    continue
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
                 request.py_kv_transfer_timed_out = False

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Worker cancellation must progress without a model batch in the ownership bridge.
+"""Progress session-free CTX and ownership-bridge cancellation without a model batch.
 
 The worker, request queue, executor cancellation/response methods, coordinator,
 and receive-session ownership are real. Network endpoints, GPU readiness and
@@ -14,10 +14,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
 from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
+from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
+from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
@@ -177,29 +180,32 @@ def _assert_released_once(executor: PyExecutor, request: LlmRequest) -> None:
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
 
-def test_queued_cancellation_removes_only_the_target_before_activation(
-    executor: PyExecutor,
+@pytest.mark.parametrize("bridge_enabled", [False, True])
+def test_queued_cancellation_remains_gated_before_activation(
+    executor: PyExecutor, bridge_enabled: bool
 ) -> None:
-    """A queued abort removes only its target without allocating resources."""
+    """Only qualified runtimes remove queued aborts before a model batch."""
     request = _request(1)
+    executor.kv_cache_transceiver._fp4_mla_bridge_enabled = bridge_enabled
     executor.waiting_queue.add_requests([RequestQueueItem(1), RequestQueueItem(2)])
     _abort(executor, request)
 
     assert executor._cancel_waiting_disagg_requests([]) == []
 
-    assert [item.id for item in executor.waiting_queue] == [2]
-    assert executor.canceled_req_ids == []
+    assert [item.id for item in executor.waiting_queue] == ([2] if bridge_enabled else [1, 2])
+    assert executor.canceled_req_ids == ([] if bridge_enabled else [1])
     assert executor.active_requests == []
     assert executor._pending_transfer_responses == []
     executor.resource_manager.free_resources.assert_not_called()
 
 
-@pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize("context, bridge_enabled", [(False, True), (True, True), (True, False)])
 def test_worker_abort_settles_waiting_request_without_model_batch(
-    executor: PyExecutor, context: bool
+    executor: PyExecutor, context: bool, bridge_enabled: bool
 ) -> None:
     """Duplicate aborts settle idle work once and preserve a healthy sibling."""
     cancelled, healthy = _request(1, context=context), _request(2, context=context)
+    executor.kv_cache_transceiver._fp4_mla_bridge_enabled = bridge_enabled
     executor.active_requests = [cancelled, healthy]
     executor.waiting_queue.add_request(RequestQueueItem(1))
     if context:
@@ -222,13 +228,17 @@ def test_worker_abort_settles_waiting_request_without_model_batch(
     executor.resource_manager.free_resources.assert_called_once_with(cancelled)
 
 
-def test_worker_abort_settles_context_waiting_from_previous_pass(executor: PyExecutor) -> None:
+@pytest.mark.parametrize("bridge_enabled", [False, True])
+def test_worker_abort_settles_context_waiting_from_previous_pass(
+    executor: PyExecutor, bridge_enabled: bool
+) -> None:
     """Cancel an earlier peer wait once without reviving it on late readiness."""
     cancelled, healthy = _request(1, context=True), _request(2, context=True)
     for request in (cancelled, healthy):
         request.state = LlmRequestState.CONTEXT_INIT
     executor.active_requests = [cancelled, healthy]
     transceiver = executor.kv_cache_transceiver
+    transceiver._fp4_mla_bridge_enabled = bridge_enabled
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = False
     peer_ready = Mock(return_value=False)
@@ -289,12 +299,49 @@ def test_existing_transfer_error_is_not_rewritten_as_cancellation(executor: PyEx
     executor.resource_manager.free_resources.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "runtime", ["bridge", "python", "cpp", "context_bridge", "context_python", "connector"]
+)
+def test_post_batch_error_preservation_stays_in_the_qualified_path(
+    executor: PyExecutor, runtime: str
+) -> None:
+    """Keep legacy cancellation when idle transfer-error cleanup is unsupported."""
+    transceiver = executor.kv_cache_transceiver
+    transceiver._fp4_mla_bridge_enabled = runtime in ("bridge", "context_bridge", "connector")
+    if runtime == "cpp":
+        transceiver = object.__new__(BindKvCacheTransceiver)
+    executor.kv_cache_transceiver = transceiver
+    executor.disagg._transceiver = transceiver
+    if runtime == "connector":
+        executor.kv_connector_manager = Mock(capacity_only=True)
+        executor.kv_connector_manager.defer_load_termination.return_value = False
+    request = _request(1, context=runtime.startswith("context"))
+    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+    executor.active_requests = [request]
+    _abort(executor, request)
+
+    executor._handle_canceled_requests()
+
+    if runtime == "bridge":
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert not request.is_finished
+        assert executor.disagg._requests_in_error_state() == [request]
+    else:
+        assert request.is_finished_due_to_cancellation
+    assert executor.canceled_req_ids == []
+    assert executor.active_requests == [request]
+    assert executor._pending_transfer_responses == []
+    executor.resource_manager.free_resources.assert_not_called()
+
+
 @pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize("bridge_enabled", [False, True])
 def test_existing_compute_request_keeps_post_batch_cancellation(
-    executor: PyExecutor, context: bool
+    executor: PyExecutor, context: bool, bridge_enabled: bool
 ) -> None:
     """Model-active work retains the existing post-sampler cancel boundary."""
     request = _request(1, context=context)
+    executor.kv_cache_transceiver._fp4_mla_bridge_enabled = bridge_enabled
     request.state = (
         LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
     )
@@ -310,10 +357,29 @@ def test_existing_compute_request_keeps_post_batch_cancellation(
     executor.resource_manager.free_resources.assert_not_called()
 
 
-def test_disabled_bridge_preserves_existing_cancellation_path(executor: PyExecutor) -> None:
-    """The new idle cancellation path does not activate outside the bridge."""
-    request = _request(1)
-    executor.kv_cache_transceiver._fp4_mla_bridge_enabled = False
+@pytest.mark.parametrize(
+    "case",
+    ["generation", "published_generation", "context_send", "context_receive", "context_first"],
+)
+def test_disabled_bridge_preserves_unqualified_cancellation_paths(
+    executor: PyExecutor, case: str
+) -> None:
+    """Session-free CTX support does not enable other unqualified paths."""
+    request = _request(1, context=case.startswith("context"))
+    transceiver = executor.kv_cache_transceiver
+    transceiver._fp4_mla_bridge_enabled = False
+    session = Mock()
+    if case == "published_generation":
+        _published_receive(executor, request)
+    elif case == "context_send":
+        transceiver._send_sessions[1] = session
+    elif case == "context_receive":
+        transceiver._recv_sessions[1] = session
+    elif case == "context_first":
+        request.py_disaggregated_params.schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+    if request.is_context_only_request:
+        transceiver._wait_reqs[1] = request
+    transceiver.cancel_request = Mock(wraps=transceiver.cancel_request)
     executor.active_requests = [request]
     _abort(executor, request)
 
@@ -323,6 +389,44 @@ def test_disabled_bridge_preserves_existing_cancellation_path(executor: PyExecut
     assert executor.canceled_req_ids == [1]
     assert not request.is_finished
     assert executor._pending_transfer_responses == []
+    transceiver.cancel_request.assert_not_called()
+    if request.is_context_only_request:
+        assert transceiver._wait_reqs == {1: request}
+    executor.resource_manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("runtime", ["cpp", "python"])
+def test_idle_cancellation_preserves_unhandled_queued_abort(
+    executor: PyExecutor, runtime: str
+) -> None:
+    """Keep queued cancellation pending even when an eligible CTX wait retires."""
+    transceiver = executor.kv_cache_transceiver
+    transceiver._fp4_mla_bridge_enabled = False
+    if runtime == "cpp":
+        transceiver = object.__new__(BindKvCacheTransceiver)
+        transceiver.cancel_request = Mock()
+    executor.kv_cache_transceiver = transceiver
+    executor.disagg._transceiver = transceiver
+    request = _request(1, context=True)
+    executor.active_requests = [request]
+    executor.waiting_queue.add_request(RequestQueueItem(2))
+    _abort(executor, request)
+    _abort(executor, _request(2))
+
+    remaining = executor._cancel_waiting_disagg_requests([request])
+
+    assert [item.id for item in executor.waiting_queue] == [2]
+    if runtime == "cpp":
+        assert remaining == executor.active_requests == [request]
+        assert executor.canceled_req_ids == [1, 2]
+        assert not request.is_finished
+        transceiver.cancel_request.assert_not_called()
+        assert executor._pending_transfer_responses == []
+        executor.resource_manager.free_resources.assert_not_called()
+    else:
+        assert remaining == executor.active_requests == []
+        assert executor.canceled_req_ids == [2]
+        _assert_released_once(executor, request)
 
 
 def test_connector_owned_request_stays_on_existing_cancellation_path(executor: PyExecutor) -> None:
@@ -342,24 +446,34 @@ def test_connector_owned_request_stays_on_existing_cancellation_path(executor: P
 
 
 def test_cancel_does_not_rewrite_an_already_finished_request(executor: PyExecutor) -> None:
-    """A late abort preserves the request's already committed finish reason."""
-    request = _request(1)
+    """Finished CTX work stays on its existing response and cleanup path."""
+    request = _request(1, context=True)
     request.finish_by_reason(FinishReason.LENGTH)
     executor.active_requests = [request]
     _abort(executor, request)
 
-    executor._cancel_waiting_disagg_requests([])
+    assert executor._cancel_waiting_disagg_requests([request]) == [request]
 
+    assert executor.active_requests == [request]
     assert request.is_finished_due_to_length
     assert not request.is_finished_due_to_cancellation
+    assert executor._pending_transfer_responses == []
+    assert executor._pending_response_terminations == []
+    executor.resource_manager.free_resources.assert_not_called()
 
 
-def _published_receive(executor: PyExecutor, request: LlmRequest) -> tuple[RxSession, Mock]:
+def _published_receive(
+    executor: PyExecutor,
+    request: LlmRequest,
+    *,
+    watchdog: RetirementWatchdog | None = None,
+) -> tuple[RxSession, Mock]:
     """Publish real receive claims against controlled network and AUX storage.
 
     Args:
         executor: Executor holding the receive session and request.
         request: Request whose destination is exposed to one writer.
+        watchdog: Optional real deadline and logical-outcome arbiter.
 
     Returns:
         The receive session and its controlled AUX allocation boundary.
@@ -376,7 +490,14 @@ def _published_receive(executor: PyExecutor, request: LlmRequest) -> tuple[RxSes
         clear_session=Mock(),
         send_cancel_to_senders=Mock(side_effect=lambda _rid, endpoints: set(endpoints)),
     )
-    session = RxSession(request.py_request_id, request.py_disaggregated_params, receiver, aux)
+    session = RxSession(
+        request.py_request_id,
+        request.py_disaggregated_params,
+        receiver,
+        aux,
+        timeout_s=1.0 if watchdog is not None else None,
+        retirement_watchdog=watchdog,
+    )
 
     def publish(task: KVRecvTask) -> None:
         """Seal one writer and record publication of the receive task."""
@@ -405,6 +526,90 @@ def _published_receive(executor: PyExecutor, request: LlmRequest) -> tuple[RxSes
     request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     request.py_kv_transfer_start_time = 12.0
     return session, aux
+
+
+@pytest.mark.parametrize("failure_first", [False, True], ids=["cancel-first", "failure-first"])
+@pytest.mark.parametrize("poll_first", [False, True], ids=["cancel-retires", "poll-retires"])
+@pytest.mark.parametrize("boundary", ["early", "post_batch"])
+def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
+    executor: PyExecutor, failure_first: bool, poll_first: bool, boundary: str
+) -> None:
+    """Preserve the committed result through either cancellation and retirement path."""
+    request = _request(1)
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    executor.perf_manager = Mock()
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    executor.force_terminate_ctx_for_partial_reuse = False
+    watchdog = RetirementWatchdog(Mock(), clock=lambda: 0.0)
+    session, aux = _published_receive(executor, request, watchdog=watchdog)
+    handle = TaskHandle(session, session._kv_tasks[0], token_end=8)
+    transceiver = executor.kv_cache_transceiver
+    transceiver._ever_had_recv_session = True
+    transceiver._mapping = SimpleNamespace(enable_attention_dp=True, pp_size=1)
+    transceiver._dist = executor.dist
+
+    def cancel() -> None:
+        """Run the selected real executor cancellation boundary."""
+        if boundary == "early":
+            executor._cancel_waiting_disagg_requests([])
+        else:
+            executor._handle_canceled_requests()
+
+    if failure_first:
+        session.process_kv_agent_result(0, 0, True, AgentResult.FAILED)
+    _abort(executor, request)
+    cancel()
+    assert not session.resources_drained()
+    assert executor.canceled_req_ids == [1]
+    executor.resource_manager.free_resources.assert_not_called()
+    aux.free_slot.assert_not_called()
+    if not failure_first:
+        session.process_kv_agent_result(0, 0, True, AgentResult.FAILED)
+
+    expected_status = SessionStatus.ERROR if failure_first else SessionStatus.CANCELLED
+    expected_outcome = Failed if failure_first else Cancelled
+    assert session.status is expected_status
+    assert isinstance(handle.poll(), expected_outcome)
+    cancel()
+    assert executor.active_requests == [request]
+    assert not request.is_finished
+    assert executor.responses == {}
+    aux.free_slot.assert_not_called()
+    executor.resource_manager.free_resources.assert_not_called()
+
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    assert session.resources_drained()
+    if poll_first:
+        executor.disagg.reap_gen_receives(0)
+    cancel()
+    assert executor.canceled_req_ids == []
+    assert session.status is expected_status
+    assert isinstance(handle.poll(), expected_outcome)
+    if failure_first:
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert not request.is_finished_due_to_cancellation
+        executor.disagg.reap_gen_receives(0)
+    elif boundary == "post_batch":
+        executor._handle_responses()
+    executor._flush_pending_transfer_responses()
+
+    assert executor.active_requests == []
+    (response,) = executor.responses[request.py_request_id]
+    assert (response.error_msg is not None) is failure_first
+    assert request.is_finished_due_to_cancellation is not failure_first
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    aux.free_slot.assert_called_once_with(0)
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+    cancel()
+    executor.disagg.reap_gen_receives(0)
+    executor._flush_pending_transfer_responses()
+    assert len(executor.responses[request.py_request_id]) == 1
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    aux.free_slot.assert_called_once_with(0)
+    watchdog.require_retired()
+    watchdog.stop()
 
 
 @pytest.mark.parametrize("last_resource", ["kv", "aux"])
@@ -455,9 +660,9 @@ class _ReachedScheduler(Exception):
     """Stop the real preparation path before model/capacity scheduling."""
 
 
-@pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize("context, bridge_enabled", [(False, True), (True, True), (True, False)])
 def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
-    executor: PyExecutor, context: bool
+    executor: PyExecutor, context: bool, bridge_enabled: bool
 ) -> None:
     """The real preparation path applies abort before admitting more work."""
     cancelled, healthy = _request(1, context=context), _request(2)
@@ -466,6 +671,7 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
     executor.active_requests = [cancelled, healthy]
     _abort(executor, cancelled)
     transceiver = executor.kv_cache_transceiver
+    transceiver._fp4_mla_bridge_enabled = bridge_enabled
     transceiver.prepare_context_requests = Mock()
     transceiver.request_and_receive_async = Mock()
     ready = Mock()
