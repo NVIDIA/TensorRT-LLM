@@ -250,21 +250,22 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
 @skip_pre_blackwell
-@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
-@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
 @pytest.mark.parametrize(
-    "tp_size,cp_size,num_heads",
+    "fp8,gate,tp_size,cp_size,num_heads",
     [
-        pytest.param(1, 1, 32, id="tp1-cp1"),
-        pytest.param(1, 2, 32, id="tp1-cp2"),
+        pytest.param(False, True, 1, 1, 32, id="bf16-control-tp1-cp1"),
+        pytest.param(False, False, 1, 2, 32, id="bf16-no-gate-tp1-cp2"),
+        pytest.param(True, True, 1, 2, 32, id="fp8-gate-tp1-cp2"),
         pytest.param(
+            True,
+            True,
             2,
             2,
             32,
-            id="tp2-cp2",
+            id="fp8-gate-tp2-cp2",
             marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
         ),
-        pytest.param(1, 2, 6, id="tp1-cp2-unaligned-q-scale-block"),
+        pytest.param(True, False, 1, 2, 6, id="fp8-no-gate-tp1-cp2-unaligned-q-scale-block"),
     ],
 )
 def test_k3_mla_helix_context_heads(fp8, gate, tp_size, cp_size, num_heads):

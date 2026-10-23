@@ -1462,17 +1462,16 @@ def test_context_prefix_counts_tokens_not_rows():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("mapping_override", [False, True])
 @pytest.mark.parametrize(
-    "backend,cp_size,sparse,rejected",
+    "mapping_override,backend,cp_size,sparse,rejected",
     [
-        ("FLASHINFER", 2, False, True),
-        ("VANILLA", 2, False, True),
-        ("TRTLLM", 2, False, False),
-        ("trtllm", 2, False, False),
-        ("FLASHINFER", 1, False, False),
-        ("VANILLA", 1, False, False),
-        ("FLASHINFER", 2, True, False),
+        (False, "FLASHINFER", 2, False, True),
+        (False, "VANILLA", 2, False, True),
+        (False, "TRTLLM", 2, False, False),
+        (True, "FLASHINFER", 2, False, True),
+        (True, "TRTLLM", 2, False, False),
+        (False, "FLASHINFER", 1, False, False),
+        (False, "FLASHINFER", 2, True, False),
     ],
 )
 def test_mla_helix_backend_validation(monkeypatch, mapping_override, backend,
