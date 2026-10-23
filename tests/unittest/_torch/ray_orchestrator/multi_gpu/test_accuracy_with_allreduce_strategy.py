@@ -14,17 +14,38 @@
 # limitations under the License.
 import asyncio
 import os
+from contextlib import contextmanager
 from functools import partial
-from typing import List
+from typing import Iterator, List
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+
+
+@contextmanager
+def _hf_reference_precision() -> Iterator[None]:
+    """Use FP32 attention intermediates and IEEE FP32 matrix multiplication."""
+    matmul_precision = torch.get_float32_matmul_precision()
+    cuda_precision = torch.backends.cuda.matmul.fp32_precision
+    mkldnn_precision = torch.backends.mkldnn.matmul.fp32_precision
+    math_reduction = torch.backends.cuda.fp16_bf16_reduction_math_sdp_allowed()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(False)
+        with sdpa_kernel(SDPBackend.MATH):
+            yield
+    finally:
+        torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(math_reduction)
+        torch.set_float32_matmul_precision(matmul_precision)
+        torch.backends.cuda.matmul.fp32_precision = cuda_precision
+        torch.backends.mkldnn.matmul.fp32_precision = mkldnn_precision
 
 
 async def generate_batch_async(
@@ -103,11 +124,13 @@ def compare_logprobs(logprobs_list, ref_new_token_logprobs_list):
 @pytest.mark.gpu4
 @pytest.mark.parametrize("model_dir", ["Qwen3/Qwen3-8B"])
 @pytest.mark.parametrize("allreduce_strategy", ["NCCL", "AUTO"])
-def test_accuracy_with_allreduce_strategy(model_dir, allreduce_strategy):
+def test_accuracy_with_allreduce_strategy(
+    model_dir: str, allreduce_strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test accuracy with different allreduce strategies.
 
-    This test validates that both NCCL and AUTO allreduce strategies produce
-    correct logprobs compared to HuggingFace reference implementation.
+    This test validates BF16 NCCL and AUTO logprobs against a BF16
+    HuggingFace reference.
 
     Expected behavior:
         - allreduce_strategy="NCCL": Accuracy assertion PASSES
@@ -126,10 +149,19 @@ def test_accuracy_with_allreduce_strategy(model_dir, allreduce_strategy):
     llm_logprobs = []
     llm_responses = []
 
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
+    # Fix attention dispatch for the cross-backend comparison while retaining
+    # the selected all-reduce strategy in each fresh Ray worker.
+    monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        free_gpu_memory_fraction=0.6,
+        use_kv_cache_manager_v2=True,
+    )
     llm = LLM(
         model=model_dir,
         backend="pytorch",
+        dtype="bfloat16",
+        model_kwargs={"dtype": "bfloat16"},
         orchestrator_type="ray",
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         kv_cache_config=kv_cache_config,
@@ -203,7 +235,9 @@ def test_accuracy_with_allreduce_strategy(model_dir, allreduce_strategy):
             tasks.append(task)
         return await asyncio.gather(*tasks)
 
-    ref_logprobs_chunks = asyncio.run(process_all_chunks(dp_hf_models))
+    # Configure process-wide reference precision before starting the workers.
+    with _hf_reference_precision():
+        ref_logprobs_chunks = asyncio.run(process_all_chunks(dp_hf_models))
 
     # Move all tensors to cuda:0 and flatten the list
     # Each GPU returns a list of logprobs tensors
