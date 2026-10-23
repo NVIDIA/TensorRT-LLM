@@ -662,6 +662,22 @@ class GenerationExecutor(ABC):
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
 
+        # A TP1 worker in its own process without MPI (a spawned Python
+        # process), for containers that forbid MPI_Comm_spawn.
+        if (os.environ.get("TLLM_WORKER_USE_MP_PROCESS", "0") == "1" and not return_logits
+                and model_world_size == 1):
+            ctx = multiprocessing.get_context("spawn")
+            mpi_session = ProcessPoolExecutorSession(n_workers=1, mp_context=ctx)
+            executor = GenerationExecutor._create_ipc_executor(
+                worker_kwargs,
+                model_world_size=model_world_size,
+                mpi_session=mpi_session,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                use_worker=False)
+            executor._owns_mpi_session = True
+            return executor
+
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
         # WAR: Developers can enable this manually, this will be easier for TP1
