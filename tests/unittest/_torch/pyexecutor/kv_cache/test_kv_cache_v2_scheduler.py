@@ -2275,6 +2275,24 @@ class TestContextPreemption:
         assert ids(out.recompute_paused_requests) == [99]
         assert ids(out.context_requests) == []
 
+    def test_preemption_victim_must_share_the_locality_domain(self):
+        """Pages are per domain: a victim elsewhere frees nothing for the request."""
+        mgr = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        same = make_gen_request(1)
+        same.py_locality_domain_id = 0
+        # Newest, so it would be taken first without the domain filter.
+        other = make_gen_request(2)
+        other.py_locality_domain_id = 1
+        recompute_paused = []
+
+        assert sched._try_preempt_for_pages(
+            [same, other], set(), set(), recompute_paused, set(), locality_domain_id=0
+        )
+
+        assert recompute_paused == [same]
+        mgr.preempt_request.assert_called_once_with(same)
+
     def test_a_failed_preemption_still_lets_the_pass_continue(self):
         """With nothing to give up there is no capacity to reserve."""
         mgr = make_kv_cache_manager(

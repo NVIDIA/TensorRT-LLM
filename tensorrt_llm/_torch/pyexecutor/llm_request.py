@@ -718,6 +718,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
+            locality_domain_id: Optional[int] = None,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -807,6 +808,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Python-side locality domain ownership. ``None`` is used for non-localized
+        # execution; localized requests must pass a concrete value at creation.
+        self.py_locality_domain_id = locality_domain_id
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 
@@ -1250,6 +1254,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                        is not None else None),
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
+            locality_domain_id=self.py_locality_domain_id,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
@@ -1568,7 +1573,8 @@ def executor_request_to_llm_request(
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
-        position_ids: Optional[List] = None) -> LlmRequest:
+        position_ids: Optional[List] = None,
+        locality_domain_id: Optional[int] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
@@ -1726,6 +1732,7 @@ def executor_request_to_llm_request(
                                        "py_logprobs_simple_format", False),
         return_routed_experts=getattr(executor_request,
                                       "py_return_routed_experts", False),
+        locality_domain_id=locality_domain_id,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
