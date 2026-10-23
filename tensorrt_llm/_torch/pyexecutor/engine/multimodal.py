@@ -23,11 +23,11 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
-from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
     EncoderDpError,
     encoder_dp_error_guard,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
@@ -530,10 +530,18 @@ class MultimodalItemScheduler:
             try:
                 outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
             except (MultimodalEncoderContractError, EncoderDpError) as error:
-                pending_error = MultimodalEncoderRequestError(
-                    str(error), request_ids=producer_request_ids
-                )
-                pending_error.__cause__ = error
+                cause = error
+                while isinstance(cause, EncoderDpError) and cause.__cause__ is not None:
+                    cause = cause.__cause__
+                if isinstance(cause, MultimodalEncoderRequestError):
+                    pending_error = cause
+                elif isinstance(cause, (MultimodalEncoderContractError, EncoderDpError)):
+                    pending_error = MultimodalEncoderRequestError(
+                        str(cause), request_ids=producer_request_ids
+                    )
+                    pending_error.__cause__ = error
+                else:
+                    raise cause
             if pending_error is None and len(outputs) != len(output_targets):
                 pending_error = MultimodalEncoderRequestError(
                     "MM item encoder must return one output per item",

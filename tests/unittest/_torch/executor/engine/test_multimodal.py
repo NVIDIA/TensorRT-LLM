@@ -359,6 +359,9 @@ def test_item_encoder_scopes_peer_failure_to_local_producers() -> None:
         ("output_count", MultimodalEncoderRequestError, False),
         ("contract", MultimodalEncoderRequestError, False),
         ("system", torch.cuda.OutOfMemoryError, True),
+        ("wrapped_contract", MultimodalEncoderRequestError, False),
+        ("wrapped_system", torch.cuda.OutOfMemoryError, True),
+        ("wrapped_request", MultimodalEncoderRequestError, False),
     ],
 )
 def test_item_encoder_closes_window_scope_before_request_errors(
@@ -370,10 +373,17 @@ def test_item_encoder_closes_window_scope_before_request_errors(
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(self, _):
-            if forward_failure == "contract":
-                raise MultimodalEncoderContractError("bad encoder output rows")
-            if forward_failure == "system":
-                raise torch.cuda.OutOfMemoryError("encoder OOM")
+            with (
+                encoder_dp_error_guard(bool)
+                if forward_failure.startswith("wrapped_")
+                else nullcontext()
+            ):
+                if forward_failure.endswith("contract"):
+                    raise MultimodalEncoderContractError("bad encoder output rows")
+                if forward_failure.endswith("system"):
+                    raise torch.cuda.OutOfMemoryError("encoder OOM")
+                if forward_failure == "wrapped_request":
+                    raise MultimodalEncoderRequestError("bad request", request_ids={17})
             return []
 
     class _RecordingScope:
@@ -397,12 +407,14 @@ def test_item_encoder_closes_window_scope_before_request_errors(
         "tensorrt_llm._torch.pyexecutor.engine.multimodal.discard_nccl_window_tensor_outputs",
         _RecordingScope,
     ):
-        with pytest.raises(expected_error):
+        with pytest.raises(expected_error) as error:
             mm_item_scheduler.forward_items([request], {request.request_id: [0]})
 
     # Request-level failures leave the scope normally so its window leases are
     # released; anything else still fails the scope and quarantines them.
     assert _RecordingScope.exits == [scope_failed]
+    if forward_failure == "wrapped_request":
+        assert error.value.request_ids == {17}
 
 
 @pytest.mark.parametrize("invalid_output", ["rows", "width", "dtype", "rank", "type"])
