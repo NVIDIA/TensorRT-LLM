@@ -174,6 +174,7 @@ from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
 from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
 from .ops.attention.qsa_topk_expand_decode import supports as _topk_expand_supports
 from .ops.attention.qsa_topk_select import qsa_topk_select
+from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGUE_SCORE_ROWS
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
 from .ops.attention.vision_rope_2d import vision_rope_2d
@@ -5378,12 +5379,12 @@ class DecodeTarget:
         advanced, so a request that grows past the threshold finds its prefix
         already compressed; above it the dense core is replaced outright and the
         main K/V append becomes this layer's own call, because the op that would
-        have done it is not the one running. Above the threshold over a bf16 pool,
-        on a step with one row per request, everything up to the index scores is one
-        launch, `qwen4_exp_attn_decode_prologue`. A verify step stays on the composed
-        prologue: at a group's last token that launch reads the group's earlier keys
-        from the index plane, and in a verify group the rows before it are written by
-        the same launch."""
+        have done it is not the one running. Above the threshold over a bf16 or NVFP4 pool,
+        everything up to the index scores is one launch, `qwen4_exp_attn_decode_prologue`
+        (over an NVFP4 pool it quantizes the K/V append). On a verify step the rollback
+        stages the index slots first, and at a group's last token the launch takes the
+        raw keys of the group's earlier rows in the same step from their projection
+        rows, as the index plane holds them only after the launch."""
         core = self.core
         (
             req_idx,
@@ -5400,9 +5401,19 @@ class DecodeTarget:
         ) = qsa
         num_tokens = x.shape[0]
 
-        proj = _dense_mm(x, L.attn_in, L.attn_in8, gemm, "in", L.attn_in_g)
         main = torch.cuda.current_stream()
         side = core._side_stream
+        index_cache = core._bound.index_cache[i]
+        kv = core._bound.kv[i]
+        # A bf16 or an NVFP4 pool (an fp8 one stays on the composed prologue).
+        fused_prologue = sparse and (kv.k_scale is not None or kv.k.dtype == x.dtype)
+        if fused_prologue and stage:
+            # The rollback's copy of the slots the prologue launch overwrites, taken on
+            # the side stream under the input projection.
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
+        proj = _dense_mm(x, L.attn_in, L.attn_in8, gemm, "in", L.attn_in_g)
         qkv_view, gate, index_view = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -5418,13 +5429,20 @@ class DecodeTarget:
             1,
         )[0]
         index_section = (_QSA_MROPE_SECTION or (0, 0, 0)) if _QSA_INDEX_USE_MROPE else (0, 0, 0)
-        index_cache = core._bound.index_cache[i]
-        kv = core._bound.kv[i]
-        fused_prologue = sparse and not stage and kv.k_scale is None and kv.k.dtype == proj.dtype
+        # Up to SCORE_ROWS decode rows the index scores ride the prologue launch too.
+        scores = None
+        if fused_prologue and not stage and num_tokens <= _PROLOGUE_SCORE_ROWS:
+            scores = torch.empty(
+                (num_tokens, block_table.shape[1] * tokens_per_block // core.compress_ratio),
+                dtype=torch.float32,
+                device=proj.device,
+            )
         if fused_prologue:
+            if stage:
+                main.wait_stream(side)
             # The norm + rope of both planes, the K/V append the dense op would have
-            # owned, and the index branch's raw-key and coordinate store and group
-            # compression in one launch on this stream.
+            # owned (quantizing over an NVFP4 pool), and the index branch's raw-key and
+            # coordinate store and group compression in one launch on this stream.
             qwen4_exp_attn_decode_prologue(
                 proj,
                 q_index,
@@ -5457,6 +5475,11 @@ class DecodeTarget:
                 index_mrope_section1=index_section[1],
                 index_mrope_section2=index_section[2],
                 compress_mrope_section=_QSA_MROPE_SECTION,
+                k_scale_cache=kv.k_scale,
+                v_scale_cache=kv.v_scale,
+                kv_scale_orig_quant=None if kv.k_scale is None else core.kv_scale_orig_quant,
+                rows_per_request=step["predicted_tokens_per_seq"],
+                index_scores=scores,
             )
         else:
             self._attention_prologue(
@@ -5473,24 +5496,26 @@ class DecodeTarget:
                 # Append the fused-norm+rope'd K/V; the selection reads the current
                 # token from the pool. Over an fp8 or NVFP4 pool as in the prefill target.
                 _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            scores = qsa_paged_index_scores(
-                q=q_index,
-                index_cache=index_cache,
-                block_table=block_table,
-                query_positions=logical,
-                request_indices=req_idx,
-                tokens_per_block=tokens_per_block,
-                compress_ratio=core.compress_ratio,
-                only_visible_blocks=True,
-                context_rows=False,
-                # Its predecessor is the prologue launch and its consumer the top-k,
-                # which waits before reading the scores. With one row per request the
-                # prologue writes no compressed key but the one the entry re-reads
-                # after its wait, so at decode-sized batches the pages and keys are
-                # read before it.
-                use_pdl=fused_prologue,
-                prefetch=fused_prologue and num_tokens <= _SPARSE_DECODE_MAX_ROWS,
-            )
+            if scores is None:
+                scores = qsa_paged_index_scores(
+                    q=q_index,
+                    index_cache=index_cache,
+                    block_table=block_table,
+                    query_positions=logical,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    only_visible_blocks=True,
+                    context_rows=False,
+                    # Its predecessor is the prologue launch and its consumer the top-k,
+                    # which waits before reading the scores. With one row per request the
+                    # prologue writes no compressed key but the one the entry re-reads
+                    # after its wait, so at decode-sized batches the pages and keys are
+                    # read before it; a verify step's later rows also see the key its
+                    # group-end row compresses, so they read every key after the wait.
+                    use_pdl=fused_prologue,
+                    prefetch=fused_prologue and not stage and num_tokens <= _SPARSE_DECODE_MAX_ROWS,
+                )
             if _topk_expand_supports(scores):
                 # The canonical block top-k and its expansion to tokens in one launch
                 # (QSA's row starts are zero).
