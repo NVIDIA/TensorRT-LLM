@@ -1017,6 +1017,7 @@ def _fp4_mla_generation_q1_kv_tile_update(
     hp_index,
     kv_len,
     block_base_pos,
+    hp_pos_offset,
     page_pos,
     physical_page,
     dim_blocks,
@@ -1055,7 +1056,7 @@ def _fp4_mla_generation_q1_kv_tile_update(
 
     abs_positions = block_base_pos + token_offsets
     valid_tokens = abs_positions < kv_len
-    hp_slots = abs_positions % HP_POOL_SIZE
+    hp_slots = (abs_positions + hp_pos_offset) % HP_POOL_SIZE
 
     hp_even_ptrs = (
         hp_pool_ptr
@@ -1181,6 +1182,7 @@ def _fp4_mla_generation_q1_kv_tail8_update(
     hp_index,
     kv_len,
     block_base_pos,
+    hp_pos_offset,
     page_pos,
     physical_page,
     dim_block_base,
@@ -1226,8 +1228,8 @@ def _fp4_mla_generation_q1_kv_tail8_update(
     token1_valid = token1 < tail_count
     abs_position0 = block_base_pos + token0
     abs_position1 = block_base_pos + token1
-    hp_slot0 = abs_position0 % HP_POOL_SIZE
-    hp_slot1 = abs_position1 % HP_POOL_SIZE
+    hp_slot0 = (abs_position0 + hp_pos_offset) % HP_POOL_SIZE
+    hp_slot1 = (abs_position1 + hp_pos_offset) % HP_POOL_SIZE
     dim_even = dim_block * FP4_BLOCK + byte_offset * 2
     hp_base = hp_index * pool_s0 + local_layer * pool_s1
     pair0_ptr = (hp_pool_ptr + hp_base + hp_slot0 * HEAD_D + dim_even).to(
@@ -1480,6 +1482,27 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 other=-1,
             )
             first_new_pos = tl.minimum(first_new_pos, tl.where(local_slot >= 0, local_slot, kv_len))
+    # HP ring slots are addressed by global position (the context writer and
+    # the ring transfer use it). Helix cache positions are rank-local; the
+    # difference only cancels when HP_POOL_SIZE divides the page size.
+    hp_pos_offset = first_new_pos - first_new_pos
+    if USE_HELIX_LOCAL_SLOTS:
+        for token_idx in tl.static_range(0, MAX_GEN_TILES * HP_BLOCK):
+            local_slot = tl.load(
+                helix_local_slots_ptr + seq_idx * gen_len + token_idx,
+                mask=token_idx < gen_len,
+                other=-1,
+            )
+            global_pos = tl.load(
+                helix_position_offsets_ptr + seq_idx * gen_len + token_idx,
+                mask=token_idx < gen_len,
+                other=0,
+            )
+            hp_pos_offset = tl.where(
+                local_slot == first_new_pos, global_pos - local_slot, hp_pos_offset
+            )
+    elif USE_HELIX:
+        hp_pos_offset = rope_first_new_pos - first_new_pos
     if FUSE_ROPE_CACHE_STORE:
         work_idx = tl.program_id(1)
         dim_block = work_idx
@@ -1809,7 +1832,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 + latent_token.to(tl.int64) * (NUM_DIM_BLOCKS * FP4_BLOCK)
                 + prestage_dim.to(tl.int64)
             )
-            prestage_slot = first_new_pos % HP_POOL_SIZE
+            prestage_slot = (first_new_pos + hp_pos_offset) % HP_POOL_SIZE
             tl.store(
                 hp_pool_ptr
                 + hp_index * pool_s0
@@ -1839,6 +1862,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         hp_index,
                         kv_len,
                         block_base_pos,
+                        hp_pos_offset,
                         page_pos,
                         physical_page,
                         dim_block_base,
@@ -1886,6 +1910,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         hp_index,
                         kv_len,
                         block_base_pos,
+                        hp_pos_offset,
                         page_pos,
                         physical_page,
                         pair_dim_blocks,
@@ -2046,7 +2071,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 residual_stored_scale,
             )
 
-            hp_slot = position % HP_POOL_SIZE
+            hp_slot = (position + hp_pos_offset) % HP_POOL_SIZE
             hp_store_base = (
                 hp_pool_ptr + hp_index * pool_s0 + local_layer * pool_s1 + hp_slot * HEAD_D
             )
@@ -2088,7 +2113,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
 
         abs_positions = block_base_pos + token_offsets
         valid_tokens = abs_positions < kv_len
-        hp_slots = abs_positions % HP_POOL_SIZE
+        hp_slots = (abs_positions + hp_pos_offset) % HP_POOL_SIZE
         if USE_HELIX_LOCAL_SLOTS:
             from_latent = abs_positions < 0
             new_token_offsets = abs_positions - abs_positions
