@@ -367,7 +367,7 @@ def test_pool_scores_broadcast_table_single_context_request():
 
 
 @pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+    get_sm_version() not in (90, 100, 103), reason="DeepGEMM MQA logits require SM90 or SM100/103"
 )
 @pytest.mark.parametrize("single_request", [True, False], ids=["one_table", "two_tables"])
 def test_fp8_pool_scores_track_bf16_selection(single_request):
@@ -425,7 +425,7 @@ def test_fp8_pool_scores_track_bf16_selection(single_request):
 
 
 @pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+    get_sm_version() not in (90, 100, 103), reason="DeepGEMM MQA logits require SM90 or SM100/103"
 )
 @pytest.mark.parametrize("lens", [[16384], [16000, 12000, 8000]], ids=["one-table", "three-tables"])
 def test_fp8_pool_score_peak_memory_fits_the_planned_cost(lens):
@@ -475,7 +475,7 @@ def test_fp8_pool_score_peak_memory_fits_the_planned_cost(lens):
 
 
 @pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+    get_sm_version() not in (90, 100, 103), reason="DeepGEMM MQA logits require SM90 or SM100/103"
 )
 def test_fp8_pool_scores_of_a_table_range_match_the_packed_call():
     """Scoring one request against its own table equals its rows of a multi-table call."""

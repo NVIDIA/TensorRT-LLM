@@ -284,9 +284,11 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: construction). A float lets the kernel take it as an argument, without a
         #: per-call device multiply.
         self._native_bmm1_scale: float | None = None
-        #: Packed context rows score pools in FP8 with DeepGEMM MQA logits on SM100-family
-        #: GPUs; TRTLLM_GLM_INDEXER_BF16=1 keeps the BF16 Triton scorer for them.
-        self._indexer_fp8 = is_sm_100f() and os.environ.get("TRTLLM_GLM_INDEXER_BF16", "0") != "1"
+        #: Packed context rows score pools in FP8 with DeepGEMM MQA logits on SM90 and
+        #: SM100-family GPUs; TRTLLM_GLM_INDEXER_BF16=1 keeps the BF16 Triton scorer for them.
+        self._indexer_fp8 = (get_sm_version() == 90 or is_sm_100f()) and os.environ.get(
+            "TRTLLM_GLM_INDEXER_BF16", "0"
+        ) != "1"
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -527,7 +529,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         callers that know a host bound on the visible lengths pass max_kv_len so
         only reachable pools are scored; columns past it are left unwritten and
         the top-k must scan only each row's complete pools. Packed context rows
-        with such a bound use the FP8 scorer on SM100-family GPUs, whose result
+        with such a bound use the FP8 scorer on SM90 and SM100-family GPUs, whose result
         may be a strided view. table_range, from :meth:`plan_context_scores`,
         names the context tables those rows' request_ids fall in.
         """
