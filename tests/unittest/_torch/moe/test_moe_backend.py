@@ -2759,6 +2759,41 @@ def test_cutedsl_quantize_input_rejects_prequantized_awq_input(backend_cls: type
         backend.quantize_input(x, post_quant_comm=False)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_w4a16_nvfp4_quantize_input_applies_pre_quant_scale(has_pre_quant_scale: bool) -> None:
+    """The CUTLASS W4A16_NVFP4 leaf applies the pre-quant scale too.
+
+    This leaf keeps activations in high precision -- ``run_moe`` dequantizes the
+    NVFP4 weights and runs the unquantized kernel -- so unlike the ``nvfp4``
+    leaf it does no FP4 activation quantization. A pre-quant scale is not part
+    of that quantization, though: ``NVFP4FusedMoEMethod.load_quant_scales``
+    fills ``fc31_act_scale`` from the checkpoint's ``*.pre_quant_scale`` keys
+    without consulting ``quant_algo``, and the dequantized ``W / s`` fed into
+    the BF16 MoE expect the scaled activation. The dense counterpart,
+    ``W4A16NVFP4LinearMethod``, applies ``pre_quant_scale`` the same way.
+    """
+    hidden_size = 64
+    moe = TrtllmCutlassW4a16Nvfp4Impl.__new__(TrtllmCutlassW4a16Nvfp4Impl)
+    torch.nn.Module.__init__(moe)
+    # ``create_weights`` registers the slot as None, and only a checkpoint
+    # that carries ``*.pre_quant_scale`` fills it.
+    moe.register_parameter("fc31_act_scale", None)
+    pre_quant_scale = None
+    if has_pre_quant_scale:
+        pre_quant_scale = torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0)
+        moe.register_parameter(
+            "fc31_act_scale", torch.nn.Parameter(pre_quant_scale, requires_grad=False)
+        )
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    out, out_sf = moe.quantize_input(x)
+
+    assert out_sf is None
+    expected = x * pre_quant_scale if has_pre_quant_scale else x
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
 # ---------------------------------------------------------------------------
 # NVFP4_AWQ on the per-expert STREAMING loader.
 #
