@@ -3995,11 +3995,31 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
+        for request in requests:
+            self._align_fp4_mla_snapshot_points(request)
         if (not self.enable_block_reuse or not self.kv_cache_config.
                 mamba_state_config.enable_branch_snapshot):
             return
         for request in requests:
             self._apply_branch_snapshot_point(request)
+
+    def _align_fp4_mla_snapshot_points(self, request: LlmRequest) -> None:
+        """Move recurrent-state snapshots onto full cache blocks.
+
+        The FP4 MLA cache quantizes the latent cache in 16-token tiles and
+        disables partial-block reuse, so a reused prefix always ends on a
+        cache block. A snapshot inside a block would restore the recurrent
+        state of a later token than the reused prefix ends at; one below the
+        first block can never be reused. Snapshot points also end the
+        context chunks, which keeps every non-final chunk tile-aligned.
+        """
+        if self._attention_cache_layout_policy is None:
+            return
+        block = self.tokens_per_block
+        request.expect_snapshot_points = sorted({
+            point // block * block
+            for point in request.expect_snapshot_points if point >= block
+        })
 
     def _apply_branch_snapshot_point(
         self,
@@ -4020,6 +4040,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if point is not None and point > current_position:
             points.add(point)
         request.expect_snapshot_points = sorted(points)
+        self._align_fp4_mla_snapshot_points(request)
 
     def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
         """Log recurrent-cache movement; this is KDA state for Kimi K3."""
@@ -5251,7 +5272,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             has_pending_snapshot = any(
                 point > request.context_current_position
                 for point in request.expect_snapshot_points)
-            should_resize = (not should_block_reuse or
+            # The FP4 MLA HP ring is positioned by the history length, so it
+            # needs each completed chunk's watermark even while a later
+            # recurrent-state snapshot is still pending.
+            should_resize = (self._attention_cache_layout_policy is not None
+                             or not should_block_reuse or
                              (not is_all_reusable and not has_pending_snapshot))
             should_commit = (is_all_reusable or is_snapshot_boundary
                              or request.context_remaining_length == 0)
