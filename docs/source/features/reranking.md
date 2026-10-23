@@ -132,7 +132,8 @@ preprocessing and scoring implementation currently supports the
 
 Qwen3-Reranker checkpoints are published as causal language models that score
 the tokens `yes` and `no`. TensorRT-LLM selects `Qwen3ForTextReranking` for
-these checkpoints and derives a one-row scoring head at load time:
+these checkpoints, reads the token IDs from `1_LogitScore/config.json` when
+present, and derives a one-row scoring head at load time:
 
 ```text
 W_score = W_yes - W_no

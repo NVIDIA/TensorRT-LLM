@@ -31,8 +31,8 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import (TYPE_CHECKING, Any, Dict, Iterator, Literal, NamedTuple,
-                    NoReturn, Optional, Sequence, Set)
+from typing import (TYPE_CHECKING, Any, Dict, Iterator, Literal, NoReturn,
+                    Optional, Sequence, Set)
 
 import click
 import torch
@@ -695,9 +695,8 @@ _EMBEDDING_ARCH_MAP = {
 # Qwen3-Reranker checkpoints declare their causal-LM architecture because they
 # are trained to answer yes or no. The rerank command supplies the serving
 # intent needed to select the scalar text-reranking wrapper.
-_RERANK_ARCH_MAP = {
-    "Qwen3ForCausalLM": "Qwen3ForTextReranking",
-}
+_RERANK_ARCHITECTURE = "Qwen3ForTextReranking"
+_RERANK_ARCH_MAP = {"Qwen3ForCausalLM": _RERANK_ARCHITECTURE}
 
 
 def _resolve_embedding_architecture_override(
@@ -782,10 +781,21 @@ def _resolve_rerank_architecture_override(
         return None
 
     if not architectures:
+        raise click.BadParameter(
+            f"Model {model!r} does not declare an architecture; rerank "
+            f"requires {_RERANK_ARCHITECTURE}.",
+            param_hint="model")
+
+    source = architectures[0]
+    if source == _RERANK_ARCHITECTURE:
         return None
-    target = _RERANK_ARCH_MAP.get(architectures[0])
+
+    target = _RERANK_ARCH_MAP.get(source)
     if target is None:
-        return None
+        raise click.BadParameter(
+            f"Unsupported rerank architecture {source!r}; expected "
+            f"Qwen3ForCausalLM or {_RERANK_ARCHITECTURE}.",
+            param_hint="model")
 
     if os.path.isdir(model):
         score_config = os.path.join(model, "1_LogitScore", "config.json")
@@ -795,8 +805,7 @@ def _resolve_rerank_architecture_override(
                 "1_LogitScore/config.json; proceeding with the standard "
                 "Qwen3-Reranker yes/no token IDs.")
 
-    logger.info(f"Rerank routing: overriding architecture "
-                f"{architectures[0]} -> {target}")
+    logger.info(f"Rerank routing: overriding architecture {source} -> {target}")
     return {"architectures": [target]}
 
 
@@ -859,18 +868,23 @@ def launch_rerank_server(
     llm_args.pop("build_config", None)
     llm_args.pop("encode_only", None)
 
-    override = _resolve_rerank_architecture_override(
-        model, llm_args.get("trust_remote_code", False),
-        llm_args.get("revision"))
-    if override is not None:
-        model_kwargs = dict(llm_args.get("model_kwargs") or {})
-        if "architectures" in model_kwargs:
-            logger.info(
-                "Rerank routing: keeping user-supplied model_kwargs "
-                f"architectures={model_kwargs['architectures']} (auto-remap "
-                f"to {override['architectures']} suppressed).")
-        else:
+    model_kwargs = dict(llm_args.get("model_kwargs") or {})
+    configured_architectures = model_kwargs.get("architectures")
+    if configured_architectures is not None:
+        if configured_architectures != [_RERANK_ARCHITECTURE]:
+            raise click.BadParameter(
+                "Unsupported rerank architecture override "
+                f"{configured_architectures!r}; expected "
+                f"[{_RERANK_ARCHITECTURE!r}].",
+                param_hint="config")
+    else:
+        override = _resolve_rerank_architecture_override(
+            model, llm_args.get("trust_remote_code", False),
+            llm_args.get("revision"))
+        if override is not None:
             model_kwargs["architectures"] = override["architectures"]
+
+    if model_kwargs:
         llm_args["model_kwargs"] = model_kwargs
 
     llm = PyTorchLLM(encode_only=True, **llm_args)

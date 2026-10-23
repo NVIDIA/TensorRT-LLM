@@ -123,11 +123,11 @@ class RemoteOpenAIServer:
                     raise RuntimeError("Server exited unexpectedly.") from err
 
                 time.sleep(0.5)
-                if time.time() - start > timeout:
-                    # Terminate the server to avoid the process keeping running in background after timeout
-                    self.terminate()
-                    raise RuntimeError(
-                        "Server failed to start in time.") from err
+
+            if time.time() - start > timeout:
+                # Terminate the server to avoid the process keeping running in background after timeout
+                self.terminate()
+                raise RuntimeError("Server failed to start in time.")
 
     @property
     def url_root(self) -> str:

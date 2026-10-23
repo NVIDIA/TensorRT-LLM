@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import json
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -385,9 +387,11 @@ class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     def __init__(self, model_config: ModelConfig[Qwen3Config]) -> None:
         nn.Module.__init__(self)
         self.model_config = model_config
-        self.model = Qwen3Model(model_config)
 
         config = model_config.pretrained_config
+        self._yes_token_id, self._no_token_id = self._load_score_token_ids(
+            config)
+        self.model = Qwen3Model(model_config)
         self.score = Linear(config.hidden_size,
                             1,
                             bias=False,
@@ -396,7 +400,45 @@ class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         self.epilogue = [self.score]
 
     @classmethod
-    def _derive_score_weight(cls, weights: dict) -> tuple[str, torch.Tensor]:
+    def _load_score_token_ids(cls, config: Qwen3Config) -> tuple[int, int]:
+        checkpoint_dir = getattr(config, "_name_or_path", None)
+        if not checkpoint_dir:
+            return cls._YES_TOKEN_ID, cls._NO_TOKEN_ID
+
+        score_config_path = (Path(checkpoint_dir) / "1_LogitScore" /
+                             "config.json")
+        try:
+            with score_config_path.open(encoding="utf-8") as config_file:
+                score_config = json.load(config_file)
+        except FileNotFoundError:
+            return cls._YES_TOKEN_ID, cls._NO_TOKEN_ID
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Could not read Qwen3 reranker score config at "
+                             f"{score_config_path}: {error}") from error
+
+        try:
+            yes_token_id = score_config["true_token_id"]
+            no_token_id = score_config["false_token_id"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"Qwen3 reranker score config at {score_config_path} must "
+                "define true_token_id and false_token_id.") from error
+
+        for field_name, token_id in (("true_token_id", yes_token_id),
+                                     ("false_token_id", no_token_id)):
+            if (not isinstance(token_id, int) or isinstance(token_id, bool)
+                    or token_id < 0):
+                raise ValueError(
+                    f"{field_name} in {score_config_path} must be a "
+                    f"non-negative integer; got {token_id!r}.")
+
+        return yes_token_id, no_token_id
+
+    @staticmethod
+    def _derive_score_weight(
+            weights: dict,
+            yes_token_id: int = _YES_TOKEN_ID,
+            no_token_id: int = _NO_TOKEN_ID) -> tuple[str, torch.Tensor]:
         """Build the scalar head from the checkpoint's yes/no token rows."""
         source_names = (
             "lm_head.weight",
@@ -405,15 +447,16 @@ class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         for source_name in source_names:
             if source_name in weights:
                 source = weights[source_name]
-                yes = source[cls._YES_TOKEN_ID:cls._YES_TOKEN_ID + 1]
-                no = source[cls._NO_TOKEN_ID:cls._NO_TOKEN_ID + 1]
+                yes = source[yes_token_id:yes_token_id + 1]
+                no = source[no_token_id:no_token_id + 1]
                 return source_name, yes - no
         raise ValueError(
             "Qwen3 reranker checkpoint must contain lm_head.weight or "
             "model.embed_tokens.weight for a tied language-model head.")
 
     def load_weights(self, weights: dict, **kwargs) -> None:
-        source_name, score_weight = self._derive_score_weight(weights)
+        source_name, score_weight = self._derive_score_weight(
+            weights, self._yes_token_id, self._no_token_id)
         weights["score.weight"] = score_weight
         # An untied LM head is not otherwise consumed by this model. Releasing
         # it here keeps peak host memory bounded for the 8B checkpoint.

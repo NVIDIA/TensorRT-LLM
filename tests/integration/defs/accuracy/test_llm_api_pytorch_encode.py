@@ -350,12 +350,16 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
         from tensorrt_llm.serve.reranker import format_qwen3_rerank_prompt
 
         torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
-        with (Path(model_path) / "1_LogitScore" / "config.json").open(
-            encoding="utf-8"
-        ) as config_file:
-            logit_score_config = json.load(config_file)
-        yes_token_id = logit_score_config["true_token_id"]
-        no_token_id = logit_score_config["false_token_id"]
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        score_config_path = Path(model_path) / "1_LogitScore" / "config.json"
+        if score_config_path.is_file():
+            with score_config_path.open(encoding="utf-8") as config_file:
+                logit_score_config = json.load(config_file)
+            yes_token_id = logit_score_config["true_token_id"]
+            no_token_id = logit_score_config["false_token_id"]
+        else:
+            yes_token_id = tokenizer.convert_tokens_to_ids("yes")
+            no_token_id = tokenizer.convert_tokens_to_ids("no")
         prompts = [format_qwen3_rerank_prompt(query, document) for query, document in RERANK_PAIRS]
 
         with LLM(
@@ -366,7 +370,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
         ) as llm:
             outputs = llm.encode(prompts)
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
         hf_model = (
             AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype).cuda().eval()
         )

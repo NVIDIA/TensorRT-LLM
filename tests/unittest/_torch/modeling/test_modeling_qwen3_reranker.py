@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 import torch
+from transformers import Qwen3Config
 
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForTextReranking
 from tensorrt_llm.serve.reranker import rerank_probability
@@ -76,6 +79,52 @@ def test_derived_head_supports_lazy_slices():
 
     assert len(lazy.requests) == 2
     assert score_weight.shape == (1, lazy.tensor.shape[1])
+
+
+def test_score_token_ids_are_loaded_from_checkpoint_config(tmp_path):
+    score_config_dir = tmp_path / "1_LogitScore"
+    score_config_dir.mkdir()
+    (score_config_dir / "config.json").write_text(
+        json.dumps({"true_token_id": 3, "false_token_id": 1}),
+        encoding="utf-8",
+    )
+    config = Qwen3Config()
+    config._name_or_path = str(tmp_path)
+
+    yes_token_id, no_token_id = Qwen3ForTextReranking._load_score_token_ids(config)
+    vocab_weight = torch.randn(5, 8)
+    _, score_weight = Qwen3ForTextReranking._derive_score_weight(
+        {"lm_head.weight": vocab_weight}, yes_token_id, no_token_id
+    )
+
+    assert (yes_token_id, no_token_id) == (3, 1)
+    torch.testing.assert_close(
+        score_weight,
+        vocab_weight[3:4] - vocab_weight[1:2],
+    )
+
+
+def test_score_token_ids_fall_back_when_checkpoint_config_is_absent(tmp_path):
+    config = Qwen3Config()
+    config._name_or_path = str(tmp_path)
+
+    token_ids = Qwen3ForTextReranking._load_score_token_ids(config)
+
+    assert token_ids == (_YES_TOKEN_ID, _NO_TOKEN_ID)
+
+
+def test_score_token_ids_reject_incomplete_checkpoint_config(tmp_path):
+    score_config_dir = tmp_path / "1_LogitScore"
+    score_config_dir.mkdir()
+    (score_config_dir / "config.json").write_text(
+        json.dumps({"true_token_id": 3}),
+        encoding="utf-8",
+    )
+    config = Qwen3Config()
+    config._name_or_path = str(tmp_path)
+
+    with pytest.raises(ValueError, match="true_token_id and false_token_id"):
+        Qwen3ForTextReranking._load_score_token_ids(config)
 
 
 def test_derived_head_rejects_checkpoint_without_lm_head_or_embeddings():

@@ -80,13 +80,22 @@ def test_v2_wire_shape(server):
 
 
 def test_custom_instruction(server):
+    default_response = _post(server, "v1/rerank")
+    instruction = (
+        "Judge whether the document discusses a national capital, its location, "
+        "or its role as the seat of government."
+    )
     response = _post(
         server,
         "v1/rerank",
-        instruction="Judge whether the document is about a country's capital",
+        instruction=instruction,
     )
+    assert default_response.status_code == 200
     assert response.status_code == 200
-    assert len(response.json()["results"]) == len(DOCUMENTS)
+    default_body = default_response.json()
+    body = response.json()
+    assert len(body["results"]) == len(DOCUMENTS)
+    assert body["usage"]["prompt_tokens"] != default_body["usage"]["prompt_tokens"]
 
 
 def test_max_tokens_per_doc_reduces_prompt_tokens(server):

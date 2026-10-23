@@ -36,13 +36,22 @@ def test_qwen3_causal_lm_is_remapped_to_reranker(tmp_path):
     assert override == {"architectures": ["Qwen3ForTextReranking"]}
 
 
-def test_unknown_architecture_is_left_alone(tmp_path):
+def test_reranker_architecture_is_accepted_without_override(tmp_path):
     from tensorrt_llm.commands.serve import _resolve_rerank_architecture_override
 
-    model = _write_config(tmp_path, "BertForSequenceClassification")
+    model = _write_config(tmp_path, "Qwen3ForTextReranking")
     override = _resolve_rerank_architecture_override(model, trust_remote_code=False)
 
     assert override is None
+
+
+def test_unknown_architecture_is_rejected(tmp_path):
+    from tensorrt_llm.commands.serve import _resolve_rerank_architecture_override
+
+    model = _write_config(tmp_path, "BertForSequenceClassification")
+
+    with pytest.raises(click.BadParameter, match="Unsupported rerank architecture"):
+        _resolve_rerank_architecture_override(model, trust_remote_code=False)
 
 
 def test_config_load_failure_is_best_effort(monkeypatch):
@@ -60,7 +69,7 @@ def test_config_load_failure_is_best_effort(monkeypatch):
     assert override is None
 
 
-def test_user_supplied_architecture_override_wins(monkeypatch):
+def test_supported_user_architecture_override_wins(monkeypatch):
     from tensorrt_llm.commands import serve
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
@@ -70,7 +79,7 @@ def test_user_supplied_architecture_override_wins(monkeypatch):
     monkeypatch.setattr(
         serve,
         "_resolve_rerank_architecture_override",
-        lambda *args, **kwargs: {"architectures": ["Qwen3ForTextReranking"]},
+        lambda *args, **kwargs: pytest.fail("explicit architecture should bypass auto-routing"),
     )
 
     def fake_llm(**kwargs):
@@ -91,15 +100,37 @@ def test_user_supplied_architecture_override_wins(monkeypatch):
 
     llm_args = {
         "model": "reranker",
-        "model_kwargs": {"architectures": ["CustomReranker"]},
+        "model_kwargs": {"architectures": ["Qwen3ForTextReranking"]},
     }
     serve.launch_rerank_server("localhost", 8000, llm_args, 0.005, 2048)
 
     assert captured["llm_kwargs"]["encode_only"] is True
-    assert captured["llm_kwargs"]["model_kwargs"]["architectures"] == ["CustomReranker"]
+    assert captured["llm_kwargs"]["model_kwargs"]["architectures"] == ["Qwen3ForTextReranking"]
     assert captured["server_kwargs"]["server_role"] is ServerRole.RERANK
     assert captured["address"] == ("localhost", 8000)
     assert captured["run"] is run_value
+
+
+def test_user_supplied_unknown_architecture_is_rejected(monkeypatch):
+    from tensorrt_llm.commands import serve
+
+    monkeypatch.setattr(
+        serve,
+        "_resolve_rerank_architecture_override",
+        lambda *args, **kwargs: pytest.fail("invalid explicit architecture should fail first"),
+    )
+    monkeypatch.setattr(
+        serve,
+        "PyTorchLLM",
+        lambda **kwargs: pytest.fail("unsupported architecture must fail before model loading"),
+    )
+    llm_args = {
+        "model": "reranker",
+        "model_kwargs": {"architectures": ["CustomReranker"]},
+    }
+
+    with pytest.raises(click.BadParameter, match="Unsupported rerank architecture override"):
+        serve.launch_rerank_server("localhost", 8000, llm_args, 0.005, 2048)
 
 
 @pytest.mark.parametrize(
