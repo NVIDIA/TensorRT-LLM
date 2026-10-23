@@ -633,7 +633,7 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
 
     engine._cleanup_done = False
     engine.model_loader = None
-    engine._release_cuda_graphs = lambda: events.append("release_graphs")
+    engine._release_cuda_graphs = lambda **_: events.append("release_graphs")
     engine.moe_load_balancer = Manager()
     engine._runner = object()
     engine._model_caller = object()
@@ -675,7 +675,7 @@ def test_model_engine_prepare_failure_participates_in_unsafe_preflight():
     engine = engine_cls()
     engine._cleanup_done = False
     engine.model_loader = None
-    engine._release_cuda_graphs = lambda: (_ for _ in ()).throw(
+    engine._release_cuda_graphs = lambda **_: (_ for _ in ()).throw(
         RuntimeError("graph cleanup failed")
     )
     engine.moe_load_balancer = Manager()
@@ -841,7 +841,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
                 raise RuntimeError("sampler stop failed")
 
     class Engine:
-        def _release_cuda_graphs(self):
+        def _release_cuda_graphs(self, **_):
             events.append("release_graphs")
 
     class DwdpManager:
@@ -857,7 +857,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/py_executor.py",
         "PyExecutor",
-        {"shutdown", "_finish_shutdown"},
+        {"shutdown", "_shutdown", "_finish_shutdown"},
         {
             "AsyncWorkerMixin": AsyncWorkerMixin,
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
@@ -1149,7 +1149,7 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
     )
     args = worker_args()
     assert run(
-        lambda: worker_main(engine="engine", worker_queues=None, log_level="info", llm_args=args),
+        lambda: worker_main(worker_queues=None, log_level="info", llm_args=args),
         "mpi_comm",
     ) == expected + ["mpi_comm"]
     assert args.env_overrides == configured
@@ -1172,9 +1172,7 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
         bases=("GenerationExecutor",),
     )
     args = worker_args()
-    assert run(lambda: worker_cls(engine="engine", llm_args=args), "executor_init") == expected + [
-        "executor_init"
-    ]
+    assert run(lambda: worker_cls(llm_args=args), "executor_init") == expected + ["executor_init"]
     assert args.env_overrides == configured
 
     # Ray worker: the first CUDA query follows launch-queue setup.
