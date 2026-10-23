@@ -1034,6 +1034,7 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._utils import mpi_rank, mpi_world_size
     from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -1121,15 +1122,18 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
     try:
         tp_metadata = fresh_metadata(tp_mapping)
         reference_metadata = fresh_metadata(Mapping())
-        # Both ranks execute both calls, including any shared startup/tuning
-        # collectives. The reference has replicated heads and no TP reduction.
-        actual = model(hidden, tp_metadata.csa2_positions, tp_metadata)
-        expected = reference(hidden, reference_metadata.csa2_positions, reference_metadata)
-        torch.cuda.synchronize()
-        assert reductions == [torch.Size([3, 128])]
-        # Each TP shard rounds its O-B accumulation to BF16 before summation;
-        # the reference rounds once after a full-width accumulation.
-        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+        # The eager TP=2 O-B all-reduce may return an NCCL window tensor, whose
+        # lease must end at a scope rather than at its tensor destructor.
+        with nccl_window_tensor_scope(hidden):
+            # Both ranks execute both calls, including any shared startup/tuning
+            # collectives. The reference has replicated heads and no TP reduction.
+            actual = model(hidden, tp_metadata.csa2_positions, tp_metadata)
+            expected = reference(hidden, reference_metadata.csa2_positions, reference_metadata)
+            torch.cuda.synchronize()
+            assert reductions == [torch.Size([3, 128])]
+            # Each TP shard rounds its O-B accumulation to BF16 before summation;
+            # the reference rounds once after a full-width accumulation.
+            torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
     finally:
         for manager, request in resources:
             manager.free_resources(request)

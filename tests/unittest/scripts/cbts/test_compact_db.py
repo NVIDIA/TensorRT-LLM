@@ -19,8 +19,10 @@ import unittest
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
+from cbts.command.coverage.collection import pystart_report
 from cbts.command.coverage.collection.pystart_report import merge_to_sqlite
 from cbts.coverage.collection.compact_db import (
     merge_databases,
@@ -30,6 +32,34 @@ from cbts.coverage.collection.compact_db import (
 from cbts.coverage.selection.touch_db import TouchDB
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_report_counts_tainted_complete_tests_as_unsafe(tmp_path: Path) -> None:
+    """Taint, failed outcome, and missing workers each make a report row unsafe."""
+    leaf = tmp_path / "leaf.sqlite"
+    tests = ("test_safe", "test_tainted", "test_failed", "test_incomplete")
+    write_leaf_database(
+        leaf,
+        stage="stage",
+        process_uid="stage/coordinator",
+        touches={test: {("tensorrt_llm/x.py", "run")} for test in tests},
+        outcomes={test: "failed" if test == "test_failed" else "passed" for test in tests},
+        expected_workers={test: 1 if test == "test_incomplete" else 0 for test in tests},
+        taints=[("stage/unidentified_worker", "test_tainted", "attribution", "unconfirmed")],
+    )
+    output = tmp_path / "merged.sqlite"
+    result = CliRunner().invoke(
+        pystart_report.main, ["--glob", str(leaf), "--out-sqlite", str(output)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "4 (test, stage) rows, 3 not safe to skip" in result.output
+    assert "or tainted" in result.output
+    with sqlite3.connect(output) as connection:
+        row = connection.execute(
+            "SELECT outcome, saved_procs, expected_workers, tainted FROM test_case_meta "
+            "WHERE test = 'stage/test_tainted'"
+        ).fetchone()
+    assert row == ("passed", 1, 0, 1)
 
 
 def _rows(path: Path, query: str) -> list[tuple]:

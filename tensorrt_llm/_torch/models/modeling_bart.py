@@ -44,6 +44,7 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
+from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from .modeling_utils import PostInitCaller, register_auto_model
 
 # ---------------------------------------------------------------------------
@@ -179,6 +180,7 @@ class BartCrossAttention(CrossAttention):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class BartEncoderLayer(nn.Module):
     """BART/mBART encoder layer with configurable pre- or post-norm."""
 
@@ -260,6 +262,7 @@ class BartEncoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class BartDecoderLayer(nn.Module):
     """BART/mBART decoder layer with configurable pre- or post-norm."""
 
@@ -372,6 +375,7 @@ class BartDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class BartEncoder(nn.Module):
     """BART/mBART encoder: positional embedding + encoder layers."""
 
@@ -429,6 +433,7 @@ class BartEncoder(nn.Module):
         return hidden_states
 
 
+@nccl_window_tensor_scoped_module
 class BartDecoder(nn.Module):
     """BART/mBART decoder: positional embedding + decoder layers."""
 

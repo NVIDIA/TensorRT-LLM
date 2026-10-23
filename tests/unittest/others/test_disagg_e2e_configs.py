@@ -56,6 +56,11 @@ def test_e2e_recipe_avoids_legacy_transceiver_options(path: Path) -> None:
         assert config.get("backend") not in {"UCX", "MPI", "MOONCAKE"}, (path, config)
         # Omitted runtime means auto; an explicit null still selects C++ today.
         assert config.get("transceiver_runtime", "auto") not in {"CPP", None}, (path, config)
+        if config.get("transceiver_runtime") == "PYTHON":
+            assert worker.get("kv_cache_config", {}).get("use_kv_cache_manager_v2") is not False, (
+                path,
+                worker,
+            )
         # The Python transceiver ignores max_tokens_in_buffer, but with PP > 1 the
         # generation executor still uses it as the KV transfer admission window.
         if worker.get("pipeline_parallel_size", 1) <= 1:
