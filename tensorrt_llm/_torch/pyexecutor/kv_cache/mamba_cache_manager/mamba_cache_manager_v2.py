@@ -403,7 +403,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         attention_slope_override = None
         attention_intercept = 0
         attention_page_bytes_override = 0
-        config = model_config.pretrained_config
+        # Estimator callers may pass a bare config stand-in; only an FP4 MLA
+        # model (which always carries a pretrained_config) takes this branch.
+        config = getattr(model_config, "pretrained_config", None)
         quant_config = getattr(model_config, "quant_config", None)
         if (
             getattr(config, "kv_lora_rank", None) is not None
