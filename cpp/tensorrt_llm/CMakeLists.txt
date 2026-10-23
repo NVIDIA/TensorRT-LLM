@@ -340,7 +340,13 @@ if(NOT WIN32)
 endif()
 
 if(BUILD_PYT)
+  # modeling_v2 family libraries (cpp/tensorrt_llm/modeling_v2) are separate
+  # modules loaded on demand; th_common reports the contract fingerprint they
+  # are checked against, so it is defined before thop.
+  include(modelingV2)
+  trtllm_mv2_define_contract_fingerprint()
   add_subdirectory(thop)
+  add_subdirectory(modeling_v2)
 endif()
 
 add_subdirectory(nanobind)

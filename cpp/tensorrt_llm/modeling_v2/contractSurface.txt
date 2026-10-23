@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The stock headers modeling_v2 native code may include, as written in #include
+# (resolved against cpp/include and cpp/). This list is the contract between
+# stock and the family libraries:
+#
+#   * cpp/cmake/modules/modelingV2.cmake hashes these headers into the contract
+#     fingerprint that th_common and every family library report, and the
+#     loader refuses a family library whose fingerprint differs;
+#   * tests/unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
+#     rejects any other stock include under cpp/tensorrt_llm/modeling_v2.
+#
+# Adding a header widens what stock changes can affect modeling_v2 targets;
+# it is reviewed by the stock owners of that header.
+tensorrt_llm/common/*.h
+tensorrt_llm/common/*.cuh
+tensorrt_llm/kernels/kvCacheUtils.h
+tensorrt_llm/kernels/quantization.cuh
+tensorrt_llm/kernels/quantization.h
+tensorrt_llm/runtime/mcastDeviceMemory.h
+tensorrt_llm/thop/thUtils.h
