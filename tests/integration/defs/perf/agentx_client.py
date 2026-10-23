@@ -69,6 +69,11 @@ DEFAULT_AIPERF_REF = (
     "@754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 )
 
+# aiperf's idle-connection keep-alive, in seconds. Must stay below the server's
+# own keep-alive timeout: trtllm-serve's is 5 s (TIMEOUT_KEEP_ALIVE in
+# tensorrt_llm/serve/openai_server.py).
+AIPERF_HTTP_KEEPALIVE_TIMEOUT_S = 4
+
 # aiperf's CLI/serialization/UI dependencies. The TRT-LLM container already
 # carries its ML stack (numpy/pandas/torch/huggingface-hub/aiohttp); installing
 # only this set has been verified to add packages without reinstalling the
@@ -614,6 +619,12 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     # Custom tokenizers (e.g. deepseek_v4) are loaded in aiperf's worker
     # processes, which do not inherit a CLI trust flag.
     os.environ["HF_HUB_TRUST_REMOTE_CODE"] = "1"
+    # trtllm-serve closes a connection that has been idle for its keep-alive
+    # timeout (5 s). aiperf keeps idle pooled connections for 300 s, so it can
+    # write a request into a connection the server is closing at that moment,
+    # which fails as ClientOSError "Connection reset by peer". Dropping idle
+    # connections on the client side first avoids that.
+    os.environ.setdefault("AIPERF_HTTP_KEEPALIVE_TIMEOUT", str(AIPERF_HTTP_KEEPALIVE_TIMEOUT_S))
 
     ensure_aiperf(url, args.model)
     verify_endpoint(url, args.model)

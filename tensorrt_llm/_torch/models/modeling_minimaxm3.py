@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -72,6 +73,7 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
@@ -1298,6 +1300,11 @@ class MiniMaxM3Attention(Attention):
             # A fallback-first policy cannot serve P128 cached prefill safely.
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():
+            return
+        if get_sm_version() == 107:
+            # SM107 admits the library only for the KV manager's extra page sizes
+            # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
+            # there, as before SM107 was admitted.
             return
         # Q/K norm and partial RoPE run in the model before backend dispatch.
         native_attn = TrtllmAttention(
@@ -3096,6 +3103,8 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     ``multi_modal_projector.*`` and ``patch_merge_mlp.*`` checkpoint
     blobs under that namespace.
     """
+
+    lora_owner = DecoderLoraOwner(module_path="model")
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in
