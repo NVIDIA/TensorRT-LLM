@@ -175,21 +175,19 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
-def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
-    """Decide which modeling_v2 target, if any, this deployment builds.
+def _route(
+    config: "ModelConfig", llm_args: "TorchLlmArgs", mode: ModelingV2Mode
+) -> Tuple[Optional[type], Optional[str]]:
+    """``(target class, None)``, or ``(None, why)`` for the built-in implementation.
 
-    Returns the target class, or None for the built-in implementation:
-    when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, or when that ``route`` raises ``NoTarget``.
-    In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    ``why`` is None when the checkpoint names no architecture, which is not a
+    fallback worth reporting. Under ``require`` a missing target raises instead.
+    A target's native code loads when ``route`` imports the target (see
+    ``_native``), so its ``NoTarget`` lands here like any other.
     """
-    mode = ModelingV2Mode.of(llm_args)
-    if mode is ModelingV2Mode.OFF:
-        return None
-
     pretrained_config = config.pretrained_config
     if not getattr(pretrained_config, "architectures", None):
-        return None
+        return None, None
     arch = pretrained_config.architectures[0]
 
     try:
@@ -197,11 +195,94 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if route is None:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability())
+        return route(config, llm_args, _device_compute_capability()), None
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
-        logger.info(
-            f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
-        )
+        return None, f"no target fits {arch!r} ({why})"
+
+
+def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
+    """Decide which modeling_v2 target, if any, this deployment builds.
+
+    Returns the target class, or None for the built-in implementation:
+    when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
+    for the architecture, or when that ``route`` raises ``NoTarget``.
+    In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+
+    This decides for the calling rank only; the model loader uses
+    :func:`modeling_v2_resolve_on_all_ranks`.
+    """
+    mode = ModelingV2Mode.of(llm_args)
+    if mode is ModelingV2Mode.OFF:
         return None
+    target, fallback = _route(config, llm_args, mode)
+    if fallback is not None:
+        logger.info(f"modeling_v2: {fallback}; using the built-in implementation")
+    return target
+
+
+def _qualified(target: Optional[type]) -> Optional[str]:
+    return None if target is None else f"{target.__module__}.{target.__qualname__}"
+
+
+def modeling_v2_resolve_on_all_ranks(
+    config: "ModelConfig", llm_args: "TorchLlmArgs"
+) -> Optional[type]:
+    """:func:`modeling_v2_resolve`, agreed by every rank of the engine.
+
+    Each rank routes on its own facts -- its device, and whether this
+    installation built the target's native code -- so one rank can land on the
+    built-in model while its peers build the target, and the first collective
+    then hangs instead of failing. Every rank therefore reports its outcome, and
+    all of them raise unless the outcomes agree. A rank's error is reported
+    after the exchange, not before, so its peers are never left waiting in it.
+
+    ``off`` returns before any exchange: nothing in this package runs then.
+    """
+    mode = ModelingV2Mode.of(llm_args)
+    if mode is ModelingV2Mode.OFF:
+        return None
+
+    target = fallback = error = None
+    try:
+        target, fallback = _route(config, llm_args, mode)
+    except Exception as caught:  # noqa: BLE001 -- re-raised below, after every rank has reported
+        error = caught
+    outcome = (
+        _qualified(target),
+        fallback,
+        None if error is None else f"{type(error).__name__}: {error}",
+    )
+
+    mapping = config.mapping
+    outcomes = [outcome]
+    if mapping.world_size > 1:
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+
+        outcomes = Distributed.get(mapping).allgather(outcome)
+
+    if error is not None:
+        raise error
+    failed = {rank: o[2] for rank, o in enumerate(outcomes) if o[2] is not None}
+    if failed:
+        detail = "; ".join(f"rank {rank}: {why}" for rank, why in sorted(failed.items()))
+        raise RuntimeError(f"modeling_v2: other ranks failed to resolve a target ({detail})")
+    if len({o[0] for o in outcomes}) > 1:
+        detail = "; ".join(
+            f"rank {rank}: {o[0] or 'built-in (' + str(o[1]) + ')'}"
+            for rank, o in enumerate(outcomes)
+        )
+        raise RuntimeError(
+            f"modeling_v2: ranks disagree on the implementation to build ({detail}); "
+            "every rank has to run the same code"
+        )
+
+    if mapping.rank == 0:
+        if target is not None:
+            logger.warning(
+                f"modeling_v2: building {_qualified(target)} on all {len(outcomes)} rank(s)"
+            )
+        elif fallback is not None:
+            logger.warning(f"modeling_v2: {fallback}; using the built-in implementation")
+    return target

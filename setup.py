@@ -179,6 +179,8 @@ else:
     package_data = [
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
+        'libs/libtrtllm_mv2_*.so',
+        'libs/modeling_v2_manifest.json',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',

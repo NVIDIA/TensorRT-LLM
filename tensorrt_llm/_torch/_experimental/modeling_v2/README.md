@@ -111,13 +111,28 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
+_native.py          loads a target's native code (see "Native code" below)
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
+                      fake_ops.py       fakes of the target's native ops, if it has any
 catalog/<category>/ entries more than one target calls
 ```
+
+### Native code
+
+A target's C++/CUDA lives beside the stock tree, not in it:
+`cpp/tensorrt_llm/modeling_v2/<familyCamel>/<targetCamel>/`, built into one
+library per family, `libtrtllm_mv2_<family>.so`. Nothing of it is linked into
+`libtensorrt_llm.so` or `libth_common.so`, and nothing loads it until routing
+imports one of the family's targets, whose `__init__.py` starts with
+`native_ops = load_target_ops(__name__)`. A target this build or this device
+cannot run is a `NoTarget`, so `auto` keeps the built-in model; a broken
+installation is a `NativeLoadError`, never a fallback.
+`cpp/tensorrt_llm/modeling_v2/README.md` is the guide, and
+`models/fixture/` is the smallest complete example.
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain

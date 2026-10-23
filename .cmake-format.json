@@ -25,6 +25,27 @@
           "NAMESPACE": "+",
           "ARCHS": "+"
         }
+      },
+      "trtllm_mv2_family": {
+        "pargs": 1
+      },
+      "trtllm_mv2_shared": {
+        "pargs": 1,
+        "kwargs": {
+          "ARCHS": "+",
+          "SOURCES": "+",
+          "DEPS": "+",
+          "REQUIRES": "+"
+        }
+      },
+      "trtllm_mv2_target": {
+        "pargs": 2,
+        "kwargs": {
+          "ARCHS": "+",
+          "SOURCES": "+",
+          "DEPS": "+",
+          "REQUIRES": "+"
+        }
       }
     },
     "_help_vartags": [

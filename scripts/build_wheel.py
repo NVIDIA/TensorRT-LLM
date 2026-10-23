@@ -792,6 +792,38 @@ def has_sm90_or_newer(cuda_architectures: str) -> bool:
     return False
 
 
+def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
+                             install_file) -> None:
+    """Install the modeling_v2 family libraries and their manifest.
+
+    The manifest is what the loader reads
+    (tensorrt_llm/_torch/_experimental/modeling_v2/_native.py). This is also
+    the packaging completeness check: the manifest lists, per family, the
+    library its built targets need, and a listed library that is missing fails
+    the build here rather than turning into a modeling_v2 fallback at run time.
+    """
+    manifest_path = mv2_build_dir / "modeling_v2_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"{manifest_path} is missing; the cmake configure step writes it "
+            "(cpp/tensorrt_llm/modeling_v2/CMakeLists.txt)")
+    manifest = json.loads(manifest_path.read_text())
+    install_file(manifest_path, lib_dir / manifest_path.name)
+    missing = []
+    for family, entry in sorted(manifest.get("families", {}).items()):
+        library = entry.get("library")
+        if library is None:
+            continue
+        if not (mv2_build_dir / library).is_file():
+            missing.append(f"{family}: {library}")
+            continue
+        install_file(mv2_build_dir / library, lib_dir / library)
+    if missing:
+        raise RuntimeError(
+            "modeling_v2 packaging check: the manifest lists libraries the build "
+            f"did not produce: {', '.join(missing)}")
+
+
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
     """Stage NCCL-EP namespace packages from the intermediate wheel."""
     package_root = staging_dir / "3rdparty" / "nccl_extensions"
@@ -1018,7 +1050,7 @@ def main(*,
 
     targets = [
         "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
-        "pg_utils", "flash_mla"
+        "pg_utils", "flash_mla", "modeling_v2_libs"
     ]
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
     if build_nccl_extensions_enabled:
@@ -1341,6 +1373,8 @@ def main(*,
                      lib_dir / "libtensorrt_llm.so")
         install_file(build_dir / "tensorrt_llm/thop/libth_common.so",
                      lib_dir / "libth_common.so")
+        install_modeling_v2_libs(build_dir / "tensorrt_llm/modeling_v2",
+                                 lib_dir, install_file)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
