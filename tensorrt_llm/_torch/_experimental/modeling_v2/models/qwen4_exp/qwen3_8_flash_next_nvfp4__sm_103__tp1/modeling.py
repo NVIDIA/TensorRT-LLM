@@ -187,6 +187,9 @@ from .ops.gemm.fp8_gemv import (
 )
 from .ops.gemm.fp8_per_tensor_mm import amax_partials, fp8_per_tensor_mm, fp8_per_tensor_weight
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
+from .ops.gemm.nvfp4_gemv import nvfp4_gemv_op
+from .ops.gemm.nvfp4_gemv import pack_from_bf16 as nvfp4_pack_from_bf16
+from .ops.gemm.nvfp4_gemv import precompile as nvfp4_gemv_precompile
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
 from .ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (
@@ -608,6 +611,22 @@ def _mtp_draft_vocab() -> int:
     vocab = int(os.environ.get(_MTP_DRAFT_VOCAB_ENV, "0"))
     assert vocab >= 0, f"{_MTP_DRAFT_VOCAB_ENV}={vocab}: expected a non-negative row count"
     return vocab
+
+
+#: Set to 1 to give the FP8 draft head an NVFP4 copy of its lm_head (e2m1 values, one e4m3
+#: scale per 16 hidden elements of a vocabulary row, an fp32 global scale; built at load, 357
+#: MB in place of the 636 MB packed FP8 copy unless the dense FP8 mode's verify head needs that)
+#: and run its decode rows -- up to `_FP8_GEMV_HEAD_ROWS` -- on `nvfp4_gemv` (GB300 micro,
+#: 248320 x 2560: 54-57 us at 1-8 rows and 66-67 at 9-16, against fp8_gemv's 87-90 and 96-98);
+#: more rows keep the per-row FP8 copy through cuBLASLt. The verify head is untouched: outputs
+#: are unchanged and the acceptance length is the cost to watch. 0 (default): `fp8_gemv`.
+_MTP_HEAD_NVFP4_ENV = "TRTLLM_MODELING_V2_MTP_HEAD_NVFP4"
+
+
+def _mtp_head_nvfp4_enabled() -> bool:
+    mode = os.environ.get(_MTP_HEAD_NVFP4_ENV, "0")
+    assert mode in ("0", "1"), f"{_MTP_HEAD_NVFP4_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
 
 
 #: Set to 1 to run the GDN input / output and attention input / output projections in FP8
@@ -1694,6 +1713,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # The draft head's own packed copy when it reads a vocabulary slice
         # (`_MTP_DRAFT_VOCAB_ENV`); else the draft head shares `_lm_head_g`.
         self._mtp_head_g = None
+        # The draft head's NVFP4 copy (`_MTP_HEAD_NVFP4_ENV`), read by `nvfp4_gemv` at decode
+        # rows in place of the packed FP8 copy.
+        self._mtp_head_nv = None
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
@@ -7085,7 +7107,7 @@ class MTPLayer:
             final, _ = qwen4_exp_gated_residual(normed, M.fhc_down, M.fhc_up, None, core.hc_count)
         if core._mtp_head_fp8 is not None:
             packed = core._mtp_head_g if core._mtp_head_g is not None else core._lm_head_g
-            lm_head = _Fp8DraftHead(*core._mtp_head_fp8, packed)
+            lm_head = _Fp8DraftHead(*core._mtp_head_fp8, packed, core._mtp_head_nv)
         return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
 
     def forward(
@@ -7358,21 +7380,23 @@ class _WidenedHead:
 
 class _Fp8DraftHead:
     """The draft head's projection over an FP8 copy of `lm_head`: up to `fp8_gemv`'s rows on
-    the packed block-scaled copy (bf16 activations, one launch at HBM rate), more rows as
-    per-token e4m3 activations (`quantize_e4m3_activation`) times the per-row e4m3 weight,
-    scaled in cuBLASLt's epilogue; bf16 out (`_WidenedHead` widens it as it does the bf16
-    head's)."""
+    the packed block-scaled copy (bf16 activations, one launch at HBM rate) -- or, given the
+    NVFP4 copy `nv` (`_MTP_HEAD_NVFP4_ENV`), `nvfp4_gemv` over it --, more rows as per-token
+    e4m3 activations (`quantize_e4m3_activation`) times the per-row e4m3 weight, scaled in
+    cuBLASLt's epilogue; bf16 out (`_WidenedHead` widens it as it does the bf16 head's)."""
 
-    def __init__(self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, packed=None) -> None:
+    def __init__(
+        self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, packed=None, nv=None
+    ) -> None:
         self.weight_fp8, self.weight_scale, self.packed = weight_fp8, weight_scale, packed
+        self.nv = nv
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (
-            self.packed is not None
-            and hidden_states.shape[0] <= _FP8_GEMV_HEAD_ROWS
-            and _gemv_ready(hidden_states)
-        ):
-            return fp8_gemv_op(hidden_states, self.packed)
+        if hidden_states.shape[0] <= _FP8_GEMV_HEAD_ROWS and _gemv_ready(hidden_states):
+            if self.nv is not None:
+                return nvfp4_gemv_op(hidden_states, self.nv)
+            if self.packed is not None:
+                return fp8_gemv_op(hidden_states, self.packed)
         x8, xs = torch.ops.tensorrt_llm.quantize_e4m3_activation(hidden_states)
         return torch._scaled_mm(
             x8,
@@ -7880,15 +7904,32 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         )
         if draft_fp8:
             self.model._mtp_head_fp8 = rowwise
+        # The draft head's decode rows read an NVFP4 copy instead of the packed FP8 one.
+        draft_nv = draft_fp8 and _mtp_head_nvfp4_enabled()
         # One packed block-scaled copy serves the draft head's decode rows and, under the dense
         # FP8 mode, the target's own head's.
-        if draft_fp8 or _dense_fp8_enabled():
+        if (draft_fp8 and not draft_nv) or _dense_fp8_enabled():
             self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
         if _dense_fp8_enabled():
             self.logits_processor.fp8_head = (rowwise, self.model._lm_head_g)
+        if draft_nv:
+            self._build_draft_head_nvfp4(self.lm_head.weight.data)
         vocab = _mtp_draft_vocab()
         if draft_fp8 and vocab > 0:
             self._slice_draft_vocab(rowwise, vocab)
+
+    def _build_draft_head_nvfp4(self, weight: torch.Tensor) -> None:
+        """The draft head's NVFP4 copy of `weight` (`_MTP_HEAD_NVFP4_ENV`), with both of
+        `nvfp4_gemv`'s row-octet kernels compiled now rather than at a first serving call."""
+        nv = nvfp4_pack_from_bf16(weight)
+        nvfp4_gemv_precompile(nv)
+        self.model._mtp_head_nv = nv
+        print(
+            f"draft head NVFP4 ({_MTP_HEAD_NVFP4_ENV}=1): lm_head {tuple(weight.shape)} -> "
+            f"{nv.data.numel() / 2**20:.1f} MiB (e2m1 + 16-element e4m3 scales, global scale "
+            f"{nv.global_scale:.3e}), decode rows <= {_FP8_GEMV_HEAD_ROWS} on nvfp4_gemv",
+            flush=True,
+        )
 
     def _slice_draft_vocab(self, rowwise: tuple, vocab: int) -> None:
         """The draft head over token ids `[0, vocab)` and the vocabulary's tail from the
@@ -7906,7 +7947,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         rows = torch.cat([torch.arange(vocab), torch.arange(tail, full)]).to(weight.device)
         codes, scale = rowwise
         self.model._mtp_head_fp8 = (codes[rows], scale[:, rows].contiguous())
-        self.model._mtp_head_g = pack_from_bf16(weight[rows])
+        if self.model._mtp_head_nv is not None:
+            self._build_draft_head_nvfp4(weight[rows])
+        else:
+            self.model._mtp_head_g = pack_from_bf16(weight[rows])
         d2t = torch.zeros(rows.numel(), dtype=torch.long, device=weight.device)
         d2t[vocab:] = tail - vocab
         self.draft_model.model = types.SimpleNamespace(d2t=d2t)
