@@ -10,7 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -35,12 +35,18 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
     KVCacheManagerV2,
+    Role,
     _get_static_cache_size_layer_components,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
@@ -49,6 +55,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1248,8 +1255,70 @@ def test_creator_uses_v2_affine_cache_cost():
     assert cost == CacheCost(slope=20, intercept=21)
 
 
+def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
+    windowed = KVCacheStorageLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+        head_dim=16,
+        buffer_roles=(Role.KEY, Role.VALUE),
+        sliding_window_size=128,
+        num_sink_tokens=65,
+    )
+    layers = [
+        windowed,
+        replace(windowed, global_layer_id=1, reuse_policy=AttentionReusePolicy.PRIVATE),
+        replace(windowed, global_layer_id=2, num_sink_tokens=None),
+        replace(windowed, global_layer_id=3, sliding_window_size=None, num_sink_tokens=None),
+    ]
+    config = KvCacheConfig(enable_block_reuse=False, enable_swa_scratch_reuse=True)
+    kwargs = dict(
+        tokens_per_block=64,
+        max_seq_len=4096,
+        kv_cache_config=config,
+        layer_specs=layers,
+    )
+    slope, fixed = KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=256, **kwargs
+    )
+    # Each layer costs 64 bytes/token. Different sinks or policies cannot share scratch.
+    # The SWA layers retain 5, 5, and 3 pages, including two pages for 65 sink tokens.
+    assert slope == 64
+    assert fixed == 256 * 192 + 2 * (320 + 320 + 192) * 64
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = tuple(layers)
+    manager._has_cp_helix = False
+    manager.max_attention_window_vec = [128, 128, 128, None]
+    manager.tokens_per_block = 64
+    manager.max_batch_size = 2
+    manager.max_num_tokens = 256
+    manager._generation_kv_capacity_headroom = 1
+    manager.enable_swa_scratch_reuse = True
+    quota = manager._get_quota_from_max_tokens(512)
+    assert quota == slope * 512 + fixed
+    assert manager._get_max_tokens_from_quota(quota) == 512
+    assert KVCacheManagerV2._get_per_request_layer_tokens(None, Mapping(), **kwargs) == (
+        [(64, 320, 320), (64, 320, 320), (64, 192, 192), (64, 4160, 0)],
+        4160,
+    )
+
+    # Draft lifecycles need 7 and 21 usable slots: separate resume rounding
+    # gives 8 + 23 slots; rounding their average together would give only 30.
+    draft = replace(windowed, owner=KVCacheLayerOwner.DRAFT, num_sink_tokens=0)
+    kwargs.update(
+        layer_specs=[draft, replace(draft, global_layer_id=1, num_sink_tokens=448)],
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_util_for_resume=0.95),
+    )
+    assert KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=64, is_draft=True, **kwargs
+    ) == (0, (8 + 23) * 64 * 64)
+
+
 def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = None
     manager._has_cp_helix = False
     manager.num_local_layers = 3
     manager.pp_layers = [4, 5, 6]
@@ -1812,6 +1881,58 @@ def _mixed_schedule_pretrained(layer_types: list[str], **overrides: object) -> S
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize("publish_model_geometry", [False, True])
+def test_create_kv_cache_manager_preserves_storage_layer_specs(
+    publish_model_geometry: bool,
+) -> None:
+    captured = {}
+
+    class RecordingManager(KVCacheManagerV2):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    target = KVCacheStorageLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    storage_specs = (
+        target,
+        replace(target, global_layer_id=1, owner=KVCacheLayerOwner.DRAFT, dtype=DataType.BF16),
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=_mixed_schedule_pretrained([_FULL]),
+        quant_config=None,
+        kv_cache_layer_specs=(
+            (KVCacheLayerSpec(head_dim=128, num_kv_heads=8, num_q_heads=8),)
+            if publish_model_geometry
+            else None
+        ),
+    )
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=4096,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=1024,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        layer_specs=storage_specs,
+    )
+
+    assert captured["layer_specs"] is storage_specs
 
 
 def _eagle3_one_model_spec_config(num_draft_hidden_layers: int | None = None) -> SimpleNamespace:

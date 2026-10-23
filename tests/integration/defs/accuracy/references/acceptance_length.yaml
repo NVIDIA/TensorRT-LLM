@@ -123,6 +123,12 @@ ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3:
 TestGLM53FlashFP8::test_mtp:
   ref_al: 3.384
   min_al: 3.215
+# Measured on B200, 1P1D TP1 with target and draft KV in one manager.
+# min_al is 95% of the measured value.
+TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv:
+  ref_al: 4.062
+  min_al: 3.859
+
 # Read by the acceptance-length cases of TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1
 # (test_qwen4_exp.py). Keyed by target and variant for the same reason as the
 # ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above, and one key per variant:
