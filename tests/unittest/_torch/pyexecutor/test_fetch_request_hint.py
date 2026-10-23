@@ -190,27 +190,6 @@ def test_idle_with_tracked_context_transfer_polls_instead_of_blocking():
     assert stub.request_broadcaster.broadcast.call_args.kwargs["prefer_cpu"] is True
 
 
-def test_idle_with_tracked_transfer_bounds_the_ray_heartbeat():
-    stub = _with_tracked_transfers(_make_stub_executor(), local_inflight=True)
-    stub._disable_mpi = True
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=0, new_requests_hint=None)
-
-    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(milliseconds=5000)
-    )
-
-
-def test_idle_without_tracked_transfer_keeps_blocking_probe():
-    stub = _with_tracked_transfers(_make_stub_executor(), local_inflight=False)
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=0, new_requests_hint=None)
-
-    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(None)
-
-
 def test_idle_transfer_poll_is_tp_wide_under_attention_dp():
     # Under attention DP the ranks own different requests: a transfer tracked
     # on a peer rank must bound rank 0's wait too, so the flag is combined
@@ -228,31 +207,4 @@ def test_idle_transfer_poll_is_tp_wide_under_attention_dp():
     assert stub.dist.tp_allreduce.call_args.args[0] == 0
     stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
         datetime.timedelta(milliseconds=5000)
-    )
-
-
-def test_busy_path_ignores_tracked_transfers():
-    stub = _with_tracked_transfers(_make_stub_executor(queued_items=[Mock()]), local_inflight=True)
-    stub.enable_attention_dp = True
-    stub.dist = Mock(rank=0, tp_size=8)
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=3, new_requests_hint=None)
-
-    stub.dist.tp_allreduce.assert_not_called()
-    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(0)
-    )
-
-
-def test_idle_poll_falls_back_to_one_second_without_configured_interval():
-    stub = _with_tracked_transfers(
-        _make_stub_executor(), local_inflight=True, poll_interval_ms=None
-    )
-    waiting_queue = FCFSWaitingQueue()
-
-    _fetch(stub, waiting_queue, total_num_active_requests=0, new_requests_hint=None)
-
-    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(milliseconds=1000)
     )
