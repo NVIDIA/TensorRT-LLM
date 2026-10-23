@@ -36,8 +36,10 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
     TransferWorkerConfig,
     TxSession,
+    _LogicalOutcomes,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import LlmRequestState
 
 
@@ -171,6 +173,7 @@ def _make_tx_session(
     deadline_monotonic_s: Optional[float] = None,
 ) -> TxSession:
     session = object.__new__(TxSession)
+    session._logical_outcomes = _LogicalOutcomes()
     session._timeout_s = timeout_s
     session._overall_timeout_s = None
     session._deadline_monotonic_s = deadline_monotonic_s
@@ -415,7 +418,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._recv_reqs = {}
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set()))
     transceiver._close_failed_sessions = Mock()
 
     status = transceiver.check_gen_transfer_status(at_least_request_num=0)
@@ -426,6 +429,8 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+    # to_process, cancelled, failed, completed, locally_verified
+    transceiver._gen_consensus_outcome.assert_called_once_with([], [], [], [], [])
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
@@ -843,13 +848,42 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     KvCacheTransceiverV2(
         mapping=mapping,
         dist=Mock(),
-        kv_cache_manager=SimpleNamespace(max_batch_size=4),
+        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4),
         cache_transceiver_config=cache_config,
     )
 
     worker_config = worker_constructor.call_args.args[0]
     assert isinstance(worker_config, TransferWorkerConfig)
     return worker_config
+
+
+@pytest.mark.parametrize("ownership_enabled", [False, True])
+def test_transceiver_activates_fail_stop_only_for_ownership_bridge(
+    monkeypatch: pytest.MonkeyPatch, ownership_enabled: bool
+) -> None:
+    """Only an opt-in bridge with a qualified executor world enables fail-stop."""
+    from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+
+    monkeypatch.setattr(
+        transceiver_module,
+        "_validate_fp4_mla_bridge_profile",
+        lambda *_args: ownership_enabled,
+    )
+    communicator = Mock()
+    qualify_world = Mock(return_value=communicator)
+    monkeypatch.setattr(transceiver_module, "_retirement_executor_comm", qualify_world)
+    config = _construct_worker_config(monkeypatch, _make_cache_config())
+    assert config.enforce_physical_ownership is ownership_enabled
+    callback = config.quiescence_fatal_callback
+    if ownership_enabled:
+        assert callback.__func__ is KvCacheTransceiverV2._fail_unproven_transfer
+        assert isinstance(callback.__self__, KvCacheTransceiverV2)
+        assert callback.__self__._kv_cache_manager is config.kv_cache_manager
+        assert callback.__self__._retirement_mpi_comm is communicator
+        qualify_world.assert_called_once_with(callback.__self__._mapping)
+    else:
+        assert callback is None
+        qualify_world.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -921,7 +955,7 @@ def test_transceiver_rejects_unset_transfer_timeout() -> None:
         KvCacheTransceiverV2(
             mapping=Mock(),
             dist=Mock(),
-            kv_cache_manager=Mock(),
+            kv_cache_manager=Mock(spec=KVCacheManagerV2),
             cache_transceiver_config=cache_config,
         )
 
@@ -959,6 +993,7 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         timeout_s=0.25,
         prompt_len=128,
         overall_timeout_s=60.0,
+        retirement_watchdog=None,
     )
 
 

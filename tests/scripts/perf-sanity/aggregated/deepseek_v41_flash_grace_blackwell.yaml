@@ -1,0 +1,125 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4.1-Flash perf sanity on one 4xGB300 tray, 8k1k only (the same
+# ISL/OSL the DeepSeek-V4-Pro perf-sanity lanes use). Three shapes: TEP4 at low
+# concurrency, DEP4 (attention DP) at high concurrency, TEP4 + embedded DSpark.
+#
+# Deliberately NOT pinned, because DeepseekV41ForCausalLM derives them and a
+# value fixed here would silently diverge from production the next time the
+# derivation changes (see disagg_config_ctxtp4_gentp4_deepseek_v41.yaml):
+#   sparse_attention_config   auto-derived from architectures[0].
+#   kv_cache_config.dtype     the CSA2 TRTLLM backend stages BF16 KV and rejects
+#                             anything but auto/bfloat16.
+#   tokens_per_block          model default (128 == sliding_window).
+#   moe_config.backend        V4.1's experts are MXFP4; the model selects its
+#                             own MoE path.
+# Pinned on purpose:
+#   cuda_graph_config.batch_sizes  padding against the default list produces more
+#                             graph batch sizes than the fullgraph compile helper
+#                             tolerates (FailOnRecompileLimitHit), which crashes
+#                             the server; an explicit short list avoids that.
+#   custom_tokenizer          production serving uses the V4.1 chat renderer.
+# Speculative decoding: V4.1 rejects MTP; only its embedded DSpark stages are
+# supported, so the spec case below uses DSpark with the target checkpoint as
+# `speculative_model`. Accepted tokens are forced so `d_al` is a constant and
+# the throughput numbers measure the runtime rather than the draft quality.
+metadata:
+  model_name: deepseek_v41_flash
+  supported_gpus:
+  - GB300
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # 8k1k - TEP4 (TP4/EP4, attention DP off), low concurrency
+  - name: "v41_flash_tep4_8k1k"
+    model_name: "deepseek_v41_flash"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 8192
+    max_seq_len: 9344
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    custom_tokenizer: "deepseek_v41"
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con8_iter10_8k1k"
+        concurrency: 8
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+
+  # 8k1k - DEP4 (TP4/EP4 with attention DP), high concurrency
+  - name: "v41_flash_dep4_8k1k"
+    model_name: "deepseek_v41_flash"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 32
+    max_num_tokens: 8192
+    max_seq_len: 9344
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    custom_tokenizer: "deepseek_v41"
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8, 16, 32]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con128_iter5_8k1k"
+        concurrency: 128
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+
+  # 8k1k - TEP4 with embedded DSpark speculative decoding, low concurrency
+  - name: "v41_flash_tep4_dspark_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
+    model_name: "deepseek_v41_flash"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 8192
+    max_seq_len: 9344
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    custom_tokenizer: "deepseek_v41"
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'DSpark'
+      max_draft_len: 5
+      speculative_model: DeepSeek-V4.1-Flash
+    client_configs:
+      - name: "con8_iter10_8k1k"
+        concurrency: 8
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"

@@ -10,7 +10,7 @@ class ExecutionScope:
     Every scaffolding request gets a root scope (``branch_path == ()``).
     Each ``ParallelProcess`` fork appends a zero-based branch index,
     producing a child scope.  The resulting ``scope_id`` is globally
-    unique and can be used as a key for resource ownership (SSE
+    unique and can be used as a key for resource ownership (MCP
     connections, sandboxes, etc.).
 
     Examples::

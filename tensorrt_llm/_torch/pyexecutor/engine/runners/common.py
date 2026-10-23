@@ -5,18 +5,24 @@
 
 import bisect
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
-from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from .interface import ScheduledInputs
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 
 
 def get_all_rank_num_tokens(
@@ -28,16 +34,18 @@ def get_all_rank_num_tokens(
 ) -> list[int] | None:
     if enable_attention_dp:
         assert dist is not None, "attention DP requires a distributed communicator"
-        num_tokens = attn_metadata.num_tokens
+        counts = attn_metadata.get_adp_token_counts()
         if mapping.has_cp_helix():
             # With CP, attention uses reduce-scatter to divide tokens
             # among CP ranks. Report the post-RS token count.
             # Use tp_cp_allgather so MoE (which sees the repurposed
             # mapping where tp_size = original tp * cp) can index
             # with its tp_rank.
-            num_tokens = math.ceil(num_tokens / mapping.cp_size)
-            return dist.tp_cp_allgather_int64([num_tokens])[:, 0].tolist()
-        return dist.tp_allgather_int64([num_tokens])[:, 0].tolist()
+            counts = [math.ceil(count / mapping.cp_size) for count in counts]
+            gathered = dist.tp_cp_allgather_int64(counts)
+        else:
+            gathered = dist.tp_allgather_int64(counts)
+        return attn_metadata.set_adp_token_counts(gathered.T.tolist())
     return None
 
 
@@ -51,34 +59,6 @@ def get_all_rank_ctx_requests(
         assert dist is not None, "attention DP requires a distributed communicator"
         return dist.tp_allgather_int64([num_ctx_requests])[:, 0].tolist()
     return None
-
-
-def set_spec_metadata_all_rank_num_tokens(
-    spec_metadata: SpecMetadata,
-    spec_all_rank_num_tokens: list[int],
-    all_rank_num_seqs: list[int],
-    all_rank_num_gens: list[int] | None = None,
-) -> None:
-    # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
-    # draft loop iterations i>0 (per-sequence counts, since each
-    # sequence contributes one token per iteration).
-    spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-    spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-    # DSpark can draft only after the target processes the current bonus token,
-    # because it consumes captured target-layer hidden states for that token.
-    # Prefill computes hidden states for prompt tokens; the first generated token
-    # is sampled from the last prompt logits and has not itself passed through the
-    # target layers. Thus context requests seed the rolling window but do not run
-    # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
-    # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
-    # chunk loop identical across EP ranks.
-    if all_rank_num_gens is not None:
-        spec_metadata.all_rank_num_gens = all_rank_num_gens
-    if (
-        spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-    ):
-        spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
 
 
 def get_padding_params(
@@ -145,6 +125,69 @@ def get_padding_params(
     return total_num_tokens, False, attn_all_rank_num_tokens
 
 
+def pad_input_tokens(
+    attn_metadata: AttentionMetadata,
+    num_tokens: int,
+    num_ctx_requests: int,
+    attn_all_rank_num_tokens: list[int] | None,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    dist: Distributed | None,
+    enable_attention_dp: bool,
+    prefill_cuda_graph_backend: PrefillCudaGraphBackend,
+    prefill_cuda_graph_num_tokens: list[int],
+) -> int:
+    """Pad the batch to the token count its prefill graph or attention-DP peers need.
+
+    Zeroes the padded rows of ``input_ids`` and ``position_ids``, whose last
+    dimension is the token one, and returns the token count the model runs on.
+    """
+    padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = get_padding_params(
+        num_tokens,
+        num_ctx_requests,
+        attn_all_rank_num_tokens,
+        dist=dist,
+        enable_attention_dp=enable_attention_dp,
+        prefill_cuda_graph_backend=prefill_cuda_graph_backend,
+        prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
+    )
+    set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
+    attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
+    if enable_attention_dp:
+        attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+    if attn_metadata.padded_num_tokens is None:
+        return num_tokens
+    input_ids[num_tokens:padded_num_tokens].fill_(0)
+    position_ids[..., num_tokens:padded_num_tokens].fill_(0)
+    return padded_num_tokens
+
+
+def token_model_inputs(
+    attn_metadata: AttentionMetadata,
+    resource_manager: Any,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    num_tokens: int,
+    multimodal_params: list[Any],
+) -> dict[str, Any]:
+    """Return the model inputs over the first ``num_tokens`` rows of the token buffers.
+
+    A one-dimensional ``position_ids`` gains a batch dimension; the [3, 1, N]
+    MRoPE layout is kept as is, padded or not, to keep torch.compile guards stable.
+    """
+    positions = position_ids[..., :num_tokens]
+    return {
+        "attn_metadata": attn_metadata,
+        "input_ids": input_ids[:num_tokens],
+        "position_ids": positions.unsqueeze(0) if positions.dim() == 1 else positions,
+        "inputs_embeds": None,
+        "multimodal_params": multimodal_params,
+        "resource_manager": resource_manager,
+    }
+
+
 def prepare_multimodal_indices(
     input_ids: list[int],
     *,
@@ -207,3 +250,37 @@ def ship_multimodal_indices(
         text_token_indices_cpu = torch.cat([text_token_indices_cpu, extra_text])
     text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
     inputs["text_token_indices"] = text_token_indices_cpu.to("cuda", non_blocking=True)
+
+
+def make_scheduled_inputs(
+    batch: ScheduledRequests,
+    new_tensors_device: "SampleStateTensors | None",
+    cache_indirection_buffer: torch.Tensor | None,
+    *,
+    enable_spec_decode: bool,
+    runtime_draft_len: int,
+) -> ScheduledInputs:
+    """Build a scheduled record that gathers context logits when any request returns them."""
+    return ScheduledInputs(
+        batch=batch,
+        new_tensors_device=new_tensors_device,
+        cache_indirection_buffer=cache_indirection_buffer,
+        gather_context_logits=any(
+            request.py_return_context_logits for request in batch.context_requests
+        ),
+        enable_spec_decode=enable_spec_decode,
+        runtime_draft_len=runtime_draft_len,
+    )
+
+
+def resolve_mrope_position_deltas_cache(model: torch.nn.Module | None) -> torch.Tensor | None:
+    """The MRoPE delta cache held by ``model`` or by its draft model.
+
+    ``None`` for every model that does not keep one, which is also how
+    ``should_enable_overlap_headroom`` learns that the seat pool may be widened:
+    the cache is sized from ``max_num_tokens`` rather than from the seat pool.
+    """
+    cache = getattr(model, "mrope_position_deltas_cache", None)
+    if cache is None:
+        cache = getattr(getattr(model, "draft_model", None), "mrope_position_deltas_cache", None)
+    return cache

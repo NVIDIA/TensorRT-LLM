@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import itertools
+import os
+import sys
 from collections.abc import Sequence
 from functools import cached_property
 from importlib.util import find_spec
@@ -20,46 +22,45 @@ from typing import TYPE_CHECKING, NamedTuple
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
+        NDEBUG,
         AttentionLayerConfig,
         BeamIndex,
         CudaStream,
         DataRole,
         KVCacheManagerConfig,
         LayerId,
+        MemAddress,
+        PageIndexMode,
         SsmLayerConfig,
         TokenIdExt,
         _KVCache,
-    )
-    from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress, PageIndexMode
-    from kv_cache_manager_v2._utils import (
-        HalfOpenRange,
-        div_up,
-        exact_div,
-        get_uniform_attribute,
-        intersect,
-        temporary_sys_path,
-        typed_range,
-        value_or,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
+        NDEBUG,
         AttentionLayerConfig,
         BeamIndex,
         CudaStream,
         DataRole,
         KVCacheManagerConfig,
         LayerId,
+        MemAddress,
+        PageIndexMode,
         SsmLayerConfig,
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
-        BAD_PAGE_INDEX,
-        NDEBUG,
-        MemAddress,
-        PageIndexMode,
-    )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import (  # noqa: E402
         HalfOpenRange,
         div_up,
         exact_div,
@@ -69,10 +70,11 @@ else:
         typed_range,
         value_or,
     )
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
 
-import os
-
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+with temporary_sys_path(_TEST_DIR):
     from kernels import check_values, fill_values
 
 

@@ -30,7 +30,13 @@ import torch
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import is_sm_100f
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERejectReason
+from ..impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERejectReason,
+    check_quant_matches_identity,
+)
 from ..impl_environment import MoEDep, MoEEnvFlag
 from ..interface import _reject
 
@@ -45,9 +51,10 @@ def check_trtllm_gen_capabilities(
     format and then defers here.
     """
     # The cubin drop is sm_100f (family-compatible) plus arch-specific
-    # sm_100a/sm_103a, so the whole SM100 family is servable; the C++
+    # sm_100a/sm_103a/sm_107a, so the whole SM100 family is servable; the C++
     # selector (KernelRunner.cpp isSMCompatible) picks sm_100f on family
-    # members without their own arch build.
+    # members without their own arch build. A leaf whose dtype pair has no
+    # sm_100f build (W4A8 NVFP4 FP8) narrows this in its own can_implement.
     if not is_sm_100f(d.env.sm):
         return _reject(
             MoERejectReason.SM_UNSUPPORTED,
@@ -273,27 +280,6 @@ def nvfp4_needs_padded_method(activation_type: ActivationType, has_alpha_constan
         ActivationType.Relu2,
         ActivationType.Silu,
     )
-
-
-def identity_quant_of(cls: type) -> str:
-    """The single format ``cls`` publishes, spelled as the identities spell it.
-
-    Read off ``cls.descriptor`` rather than restated as a set, so the format a
-    leaf admits and the format it publishes are the same string.
-    """
-    return cls.descriptor.identity.quant
-
-
-def check_quant_matches_identity(cls: type, p: MoEProblem) -> MoEEligibility | None:
-    """Reject any format other than the one in this leaf's own identity."""
-    expected = identity_quant_of(cls)
-    actual = p.identity_quant
-    if actual != expected:
-        return _reject(
-            MoERejectReason.QUANT_UNSUPPORTED,
-            f"{cls.__name__} implements quant={expected}, got {actual}",
-        )
-    return None
 
 
 def check_trtllm_gen_leaf(

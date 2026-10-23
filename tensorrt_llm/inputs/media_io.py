@@ -97,7 +97,7 @@ async def _get_aiohttp_session() -> aiohttp.ClientSession:
     return _global_aiohttp_session
 
 
-# Maximum allowed response size for remote fetches (200 MB).
+# Maximum allowed response size and encoded video input size (200 MiB).
 _MAX_RESPONSE_BYTES = 200 * 1024 * 1024
 
 # Chunk size used while enforcing the response size cap.
@@ -108,12 +108,40 @@ _MAX_REDIRECTS = 5
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
+# Opt-in switch relaxing the requirement that media URLs resolve to global
+# (public) IP addresses. Set TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1 to allow
+# http(s) media URLs that resolve to private, loopback, or link-local
+# addresses — needed for airgapped / intranet deployments where media is
+# served from hosts that have no public address. Default OFF: with the
+# switch unset, non-global addresses are rejected as SSRF protection.
+# Enabling it lets clients steer server-side fetches at internal services
+# (including cloud metadata endpoints), so only set it when every client
+# of the server is trusted or egress is filtered at the network level.
+# Multicast addresses are rejected either way. Read per call so tests and
+# long-lived processes observe changes without re-import.
+_ALLOW_PRIVATE_URLS_ENV = "TRTLLM_MEDIA_ALLOW_PRIVATE_URLS"
+
+
+def _allow_private_urls() -> bool:
+    if os.environ.get(_ALLOW_PRIVATE_URLS_ENV, "0") != "1":
+        return False
+    logger.warning_once(
+        f"{_ALLOW_PRIVATE_URLS_ENV}=1: media URLs resolving to private/loopback "
+        "addresses are allowed; server-side SSRF protection for media fetches "
+        "is relaxed.",
+        key="media_allow_private_urls",
+    )
+    return True
+
 
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
     Raises ``RuntimeError`` for URLs that target non-global addresses or that
-    use a scheme other than http / https.
+    use a scheme other than http / https. Setting
+    ``TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1`` skips the non-global-address
+    rejection (scheme, hostname, and multicast checks still apply); see
+    ``_ALLOW_PRIVATE_URLS_ENV`` above for the security tradeoff.
 
     Note: validation is performed at DNS-resolution time. A DNS-rebinding
     attack (TTL=0, resolves to a public IP during validation then a private IP
@@ -135,10 +163,17 @@ def _validate_url(url: str) -> None:
     except socket.gaierror as exc:
         raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
 
+    allow_private = _allow_private_urls()
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
+        if ip.is_multicast:
+            raise RuntimeError(f"URL resolves to a multicast address ({ip})")
+        if not ip.is_global and not allow_private:
+            raise RuntimeError(
+                f"URL resolves to a non-public address ({ip}); set "
+                f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
+                f"in trusted network environments"
+            )
 
 
 def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
@@ -247,6 +282,81 @@ def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
     return convert_image_mode(image, "RGB")
+
+
+def _jpeg_frame_header(data: bytes) -> Optional[Tuple[int, int, int, int]]:
+    """Return ``(precision, height, width, components)`` of a common JPEG frame.
+
+    Only accepts the APPn, COM, DQT, DHT, and DRI segments that may precede a
+    baseline, extended, or progressive Huffman frame header. Any other layout
+    returns ``None`` so that Pillow keeps handling it.
+    """
+    if data[:2] != b"\xff\xd8":
+        return None
+    pos = 2
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker == 0xFF:  # Fill byte before a marker.
+            pos += 1
+            continue
+        length = int.from_bytes(data[pos + 2 : pos + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):  # SOF0/SOF1/SOF2 (baseline, extended, progressive).
+            if length < 8 or pos + 10 > len(data):
+                return None
+            return (
+                data[pos + 4],
+                int.from_bytes(data[pos + 5 : pos + 7], "big"),
+                int.from_bytes(data[pos + 7 : pos + 9], "big"),
+                data[pos + 9],
+            )
+        # APP0-APP15, DHT, DQT, DRI, COM.
+        if length < 2 or not (0xE0 <= marker <= 0xEF or marker in (0xC4, 0xDB, 0xDD, 0xFE)):
+            return None
+        pos += 2 + length
+    return None
+
+
+def _decode_jpeg_image(data: bytes) -> Optional[torch.Tensor]:
+    """Decode an 8-bit RGB or grayscale JPEG to a uint8 RGB ``(3, H, W)`` tensor.
+
+    torchvision decodes straight into a tensor, and `_jpeg_frame_header`
+    stands in for a Pillow header parse, which would hold the GIL. Like the
+    Pillow path, EXIF orientation is not applied.
+
+    Returns ``None`` for every other input, including images larger than
+    ``Image.MAX_IMAGE_PIXELS``, so the caller keeps the Pillow path and its
+    decompression-bomb check.
+    """
+    header = _jpeg_frame_header(data)
+    if header is None:
+        return None
+    precision, height, width, components = header
+    max_pixels = Image.MAX_IMAGE_PIXELS
+    if (
+        precision != 8
+        or components not in (1, 3)
+        or height == 0
+        or width == 0
+        or (max_pixels is not None and height * width > max_pixels)
+    ):
+        return None
+
+    from torchvision.io import ImageReadMode, decode_image
+
+    try:
+        decoded = decode_image(
+            torch.frombuffer(bytearray(data), dtype=torch.uint8),
+            mode=ImageReadMode.UNCHANGED,
+            apply_exif_orientation=False,
+        )
+    except RuntimeError:
+        # Let Pillow decode the input or raise its usual error.
+        return None
+    if decoded.shape[0] != components:
+        return None
+    return decoded.expand(3, -1, -1) if components == 1 else decoded
 
 
 def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
@@ -750,7 +860,24 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
-def _safe_read_local_file(location: str) -> bytes:
+def _check_media_size(size: int, max_bytes: int) -> None:
+    if size > max_bytes:
+        raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")
+
+
+def _decode_base64_with_limit(data: str) -> bytes:
+    """Decode base64 media under the shared encoded-input size limit."""
+    max_encoded_chars = 4 * ((_MAX_RESPONSE_BYTES + 2) // 3)
+    if len(data) > max_encoded_chars:
+        raise ValueError(
+            f"Base64 media input exceeds maximum allowed size of {_MAX_RESPONSE_BYTES} decoded bytes."
+        )
+    decoded = base64.b64decode(data)
+    _check_media_size(len(decoded), _MAX_RESPONSE_BYTES)
+    return decoded
+
+
+def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
     """Read a local file, refusing anything that has no end.
 
     Takes a bare path or a ``file://`` URI.
@@ -761,10 +888,9 @@ def _safe_read_local_file(location: str) -> bytes:
     turns a caller into a denial of service. A regular file is finite, which is
     the property required here.
 
-    Size is deliberately not capped: naming a large file of one's own is the
-    normal case for a local caller, and no threshold separates that from an
-    abusive one. This bounds the shape of what may be read, then, not its size
-    or its reach — any regular file the process can read is still readable.
+    When ``max_bytes`` is set, check the file size before reading and bound
+    the read to one byte beyond the limit in case the file grows. Other
+    callers retain the uncapped default.
     """
     path = Path(_normalize_file_uri(location))
     try:
@@ -777,10 +903,19 @@ def _safe_read_local_file(location: str) -> bytes:
             f"path is not a regular file: {location!r}. Character devices, "
             "FIFOs and directories cannot be read as media."
         )
+    if max_bytes is not None:
+        _check_media_size(stat.st_size, max_bytes)
     try:
-        return path.read_bytes()
+        with path.open("rb") as source:
+            # Allocate for the observed size; use the remaining budget only if the file grows.
+            data = source.read(-1 if max_bytes is None else stat.st_size + 1)
+            if max_bytes is not None and len(data) > stat.st_size:
+                data += source.read(max_bytes + 1 - len(data))
     except OSError as exc:
         raise ValueError(f"file could not be read: {exc}") from exc
+    if max_bytes is not None:
+        _check_media_size(len(data), max_bytes)
+    return data
 
 
 _MediaT = TypeVar("_MediaT")
@@ -800,6 +935,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
+
+    # Required MIME type prefix for `data:` URIs handled by this modality
+    # (e.g. `"image/"`). A data URI whose declared media type falls outside
+    # this prefix is rejected rather than decoded. URIs that omit the media
+    # type are accepted for backward compatibility. `None` disables the check.
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = None
 
     @classmethod
     def set_executor(cls, executor: Executor) -> None:
@@ -874,6 +1015,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             encoding = parts[1] if len(parts) > 1 else ""
             if encoding != "base64":
                 raise NotImplementedError("Only base64 data URLs are supported for now.")
+            prefix = self._data_uri_mime_prefix
+            if prefix and media_type and not media_type.lower().startswith(prefix):
+                raise ValueError(
+                    f"data URI declares media type {media_type!r}, which does not "
+                    f"match the expected {prefix}* type for this content part"
+                )
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
             return await self._run_in_executor(self.load_file, url)
@@ -892,6 +1039,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
+
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
@@ -908,13 +1057,32 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
             return np.asarray(image)
         return image
 
+    def _postprocess_decoded(self, image: torch.Tensor) -> Union[torch.Tensor, np.ndarray]:
+        """Match `_postprocess` for a uint8 RGB ``(3, H, W)`` tensor.
+
+        Keeps torch calls to a minimum: each one releases and re-acquires the
+        GIL, which is slow while other threads are running Python code.
+        """
+        if self._format == "np":
+            # torchvision decodes into an HWC buffer, so RGB needs no copy here.
+            return np.ascontiguousarray(image.numpy().transpose(1, 2, 0))
+        return (
+            image.to(dtype=torch.get_default_dtype(), memory_format=torch.contiguous_format)
+            .div_(255)
+            .to(device=self._device)
+        )
+
     def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
+        if self._format in ("np", "pt"):
+            decoded = _decode_jpeg_image(data)
+            if decoded is not None:
+                return self._postprocess_decoded(decoded)
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
     def load_base64(
         self, media_type: str, data: str
     ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
+        return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
@@ -922,6 +1090,8 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
 
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
+
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
 
     def __init__(self, **kwargs) -> None:
         # AudioMediaIO has no configurable parameters. An explicit __init__
@@ -949,7 +1119,9 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
-    """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
+    """Video I/O with a 200 MiB encoded-input limit and coupled sampling kwargs."""
+
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
 
     def __init__(
         self,
@@ -990,6 +1162,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return merged
 
     def load_bytes(self, data: bytes) -> VideoData:
+        _check_media_size(len(data), _MAX_RESPONSE_BYTES)
         # In-memory fast path when cv2 has a stream-buffered backend; spill
         # to a tempfile otherwise so cv2 can open it by path. The tempfile
         # is unlinked on context exit; the inode survives until cv2 closes
@@ -1022,10 +1195,10 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        return self.load_bytes(_safe_read_local_file(url, max_bytes=_MAX_RESPONSE_BYTES))
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(

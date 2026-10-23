@@ -738,6 +738,7 @@ __global__ void markContextTopKKernel(int32_t const* __restrict__ localTopKIndic
     }
 }
 
+template <bool kMlaLayout>
 __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ dataPool,
     __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* __restrict__ selectedFlags,
     int32_t const* __restrict__ selectedOffsets, int32_t const* __restrict__ selectedGlobalIndices,
@@ -747,6 +748,9 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
     float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
+    // Keep GLM row strides and scaling-group bounds constant through dequantization.
+    int32_t const effectiveHeadDim = kMlaLayout ? kMlaHeadDim : headDim;
+    int32_t const effectiveResidualDim = kMlaLayout ? kMlaResidualDim : residualDim;
     int64_t packedToken = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
     int64_t const tokenStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
     for (; packedToken < totalKvTokens; packedToken += tokenStride)
@@ -776,13 +780,13 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
         {
             if (dequantScale == 1.F)
             {
-                dequantizeRow<true>(
-                    dataPool, scalePool, output, globalIdx, outputIdx, headDim, residualDim, dequantScale, lane);
+                dequantizeRow<true>(dataPool, scalePool, output, globalIdx, outputIdx, effectiveHeadDim,
+                    effectiveResidualDim, dequantScale, lane);
             }
             else
             {
-                dequantizeRow<false>(
-                    dataPool, scalePool, output, globalIdx, outputIdx, headDim, residualDim, dequantScale, lane);
+                dequantizeRow<false>(dataPool, scalePool, output, globalIdx, outputIdx, effectiveHeadDim,
+                    effectiveResidualDim, dequantScale, lane);
             }
         }
     }
@@ -969,7 +973,7 @@ void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_
         scanWorkspace, tokenScanWorkspaceSize, selectedFlags, selectedOffsets, maxKvTokens, stream));
 
     int32_t const gatherBlocks = getPersistentBlockCount(maxKvTokens);
-    nvFp4MlaContextKvCacheGatherKernel<<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+    nvFp4MlaContextKvCacheGatherKernel<false><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
         selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, maxKvTokens, outputCapacity,
         headDim, residualDim, numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
@@ -1037,9 +1041,18 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
         scanWorkspace, scanWorkspaceSize, selectedFlags, selectedOffsets, totalKvTokens, stream));
 
     int32_t const gatherBlocks = getPersistentBlockCount(totalKvTokens);
-    nvFp4MlaContextKvCacheGatherKernel<<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
-        selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, totalKvTokens,
-        outputCapacity, headDim, residualDim, numPoolTokens);
+    if (headDim == kMlaHeadDim && residualDim == kMlaResidualDim)
+    {
+        nvFp4MlaContextKvCacheGatherKernel<true><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+            selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, totalKvTokens,
+            outputCapacity, headDim, residualDim, numPoolTokens);
+    }
+    else
+    {
+        nvFp4MlaContextKvCacheGatherKernel<false><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+            selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, totalKvTokens,
+            outputCapacity, headDim, residualDim, numPoolTokens);
+    }
     TLLM_CUDA_CHECK(cudaGetLastError());
 
     int64_t const numPairs = static_cast<int64_t>(numQueryRows) * topK;

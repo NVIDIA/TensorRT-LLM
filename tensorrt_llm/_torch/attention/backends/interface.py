@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
+    from ..kernels.sage_quant import SageQuantized
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -165,6 +166,14 @@ class AttentionMetadata:
     # The number of tokens in each rank.
     all_rank_num_tokens: Optional[List[int]] = None
 
+    def get_adp_token_counts(self) -> List[int]:
+        """Local execution-stage counts carried by the input count exchange."""
+        return [self.num_tokens]
+
+    def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
+        """Save stage counts and return the input-stage counts for padding."""
+        return counts[0]
+
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
     # as DDS and fails to compile.
@@ -185,8 +194,9 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    # The number of heads per kv head.
-    num_heads_per_kv: Optional[int] = 1
+    # Upper bound on query heads per KV head over the target model's layers
+    # (unsharded); sizes the spec-dec tree mask.
+    max_num_heads_per_kv: Optional[int] = 1
 
     multi_item_part_lens: Optional[list[list[int]]] = None
     """Additional token layout information for multi-item scoring.
@@ -468,6 +478,7 @@ class AttentionMetadata:
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
+        helix_owned_new_tokens: Optional[List[int]] = None,
     ) -> None:
         """
         Hook to be called when using helix parallelism.
@@ -958,11 +969,27 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
+    sage_attn_smooth_k: bool = False
+    # Subtract the per-channel V mean before quantizing V. Applied by FMHA libraries that add
+    # the mean back to the output; the others quantize V unsmoothed.
+    sage_attn_smooth_v: bool = False
+    # SageAttention inputs that the attention core quantized for the FMHA libraries
+    # taking quantized inputs; the attention op quantizes inside its kernels.
+    sage_quantized: Optional["SageQuantized"] = None
+    # Per-tensor FP8 recipe of the PrimTS FMHA library. Quantize Q/K and/or V to
+    # E4M3 with one scale each, folded into the softmax and output scales.
+    qk_fp8_per_tensor: bool = False
+    v_fp8_per_tensor: bool = False
 
+    # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
+    # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
+    # algorithm, resolved on the host by the caller. When set, backends use it
+    # instead of reading ``timestep``, which CUDA Graph capture cannot do.
+    sparse_attn_phase: Optional[int] = None
 
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
@@ -978,6 +1005,15 @@ class AttentionForwardArgs:
             return int(AttentionMaskType.padding)
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
+
+    @property
+    def sage_attn_qk_dtype(self) -> Optional[torch.dtype]:
+        """Quantized Q/K dtype of the SageAttention recipe, or ``None`` without one."""
+        if (self.sage_attn_num_elts_per_blk_q <= 0
+                and self.sage_attn_num_elts_per_blk_k <= 0
+                and self.sage_attn_num_elts_per_blk_v <= 0):
+            return None
+        return torch.int8 if self.sage_attn_qk_int8 else torch.float8_e4m3fn
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
@@ -1080,6 +1116,11 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def support_fp4_kv_cache(cls) -> bool:
+        """Whether the backend can execute attention with an FP4 KV cache."""
+        return False
+
+    @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
 
@@ -1109,6 +1150,24 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        """Capacity-sized workspace not bounded by summed attended KV length.
+
+        The estimator reserves the full capacity alongside the profiled peak,
+        covering arenas first allocated after the peak prefill step.
+        """
+        return 0
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

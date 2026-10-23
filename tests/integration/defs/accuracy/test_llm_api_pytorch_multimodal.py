@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
+    get_sm_version,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
@@ -177,12 +178,15 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
 
     def test_nvfp4_no_mtp(self):
         # Same checkpoint without MTP drafting.
+        # SM121 (GB10) needs FlashInfer set explicitly; other GPUs use the model default.
+        extra_kwargs = {"attn_backend": "FLASHINFER"} if get_sm_version() == 121 else {}
         with LLM(
             self.MODEL_PATH,
             max_batch_size=16,
             kv_cache_config=self.kv_cache_config,
             enable_chunked_prefill=True,
             guided_decoding_backend="xgrammar",
+            **extra_kwargs,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert_guided_decoding_regex(llm)
@@ -639,7 +643,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
         ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, max_num_tokens):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, use_kv_cache_manager_v2=True)
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,

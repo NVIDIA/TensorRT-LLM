@@ -302,6 +302,14 @@ srun --mpi=pmix \
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$TRITON_CACHE_DIR\"
 
+        # DeepGEMM JIT writes compiled artifacts through a temporary file +
+        # rename. Sharing one cache across ranks lets two compilers race that
+        # rename (seen with KIMI_K3_FP8_WEIGHT_READ=1). Keep it node-local and
+        # per-rank, like the Triton cache above.
+        export DG_JIT_CACHE_DIR=/tmp/deep-gemm-job${SLURM_JOB_ID:-0}-rank\${SLURM_PROCID:-0}
+        mkdir -p \"\$DG_JIT_CACHE_DIR\"
+        echo \"[k3] DG_JIT_CACHE_DIR=\$DG_JIT_CACHE_DIR\"
+
         # Node-local flashinfer cache: the default (\$HOME) is shared NFS and
         # races across ranks during cubin download (stale file handles).
         # These caches are cold on every run (~minutes of JIT per rank).
@@ -339,8 +347,8 @@ srun --mpi=pmix \
         # either has the setting it was submitted with or fails visibly - a
         # silently-unset precision flag would look like a clean A/B while
         # actually re-running the same configuration twice.
-        export KIMI_K3_FP8_WEIGHT_READ=\"${KIMI_K3_FP8_WEIGHT_READ:-0}\"
-        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ=\$KIMI_K3_FP8_WEIGHT_READ\"
+        export KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=\"${KIMI_K3_FP8_WEIGHT_READ_MOE_MLP:-0}\"
+        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=\$KIMI_K3_FP8_WEIGHT_READ_MOE_MLP\"
 
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;

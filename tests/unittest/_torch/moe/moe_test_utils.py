@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFusedMoE, CutlassFusedMoE, MarlinFusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, CuteDslFusedMoE, CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -38,6 +38,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     find_trtllm_gen_leaf,
     trtllm_gen_leaf,
@@ -71,6 +72,7 @@ class MoeBackendType(str, Enum):
     CUTLASS = "CUTLASS"
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
+    CUTEDSL_FC12 = "CUTEDSL_FC12"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     # Keep the two MegaMoE variants explicit.
@@ -85,28 +87,34 @@ def get_backend_class(
 ) -> type[MoE]:
     """Get the MoE backend class for a given backend type.
 
-    Raises when TRTLLM-Gen publishes no leaf for the format. Callers enumerating
+    Raises when the family publishes no leaf for the format. Callers enumerating
     combinations to decide what is worth running want ``find_backend_classes``.
     """
     backend_class = find_backend_class(backend_type, quant_algo)
     if backend_class is None:
-        # Reuse the raising lookup for its message, which lists what *is*
-        # registered rather than only naming what is missing.
-        return trtllm_gen_leaf(quant_algo)
+        # Reuse the family's raising lookup for its message, which lists what
+        # *is* registered rather than only naming what is missing.
+        raising_lookup = {
+            MoeBackendType.TRTLLM: trtllm_gen_leaf,
+            MoeBackendType.MARLIN: marlin_leaf,
+        }[backend_type]
+        return raising_lookup(quant_algo)
     return backend_class
 
 
 def find_backend_class(
     backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
 ) -> type[MoE] | None:
-    """The MoE backend class, or ``None`` if TRTLLM-Gen has no leaf for the format.
+    """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``TRTLLM`` is not one class but a set of leaves keyed by (provider, quant), so
-    it needs ``quant_algo``. It prefers the native leaf for that format and
-    falls back to the FlashInfer sibling, which is what "the TRTLLM backend"
-    has to mean for the unquantized format: bf16 has no native leaf, only
+    ``TRTLLM`` and ``MARLIN`` are not one class each but sets of leaves keyed by
+    quant (and, for TRTLLM-Gen, provider), so both need ``quant_algo``.
+    TRTLLM-Gen prefers the native leaf for that format and falls back to the
+    FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
+    unquantized format: bf16 has no native leaf, only
     ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
     exists and wins, so only bf16 tests are exercising a FlashInfer class.
+    Marlin has a single provider, so its lookup is keyed by quant alone.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
@@ -115,16 +123,18 @@ def find_backend_class(
     """
     if backend_type is MoeBackendType.TRTLLM:
         return find_trtllm_gen_leaf(quant_algo)
+    if backend_type is MoeBackendType.MARLIN:
+        return find_marlin_leaf(quant_algo)
 
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
+        MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
         MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
-        MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -400,7 +410,7 @@ def should_skip_trtllm(
     # - MiniMax2 (sigmoid activation, bias-added selection, scaled sum-normalize)
     # - Llama4 (requires top_k=1)
     # - Renormalize / RenormalizeNaive / Default (softmax-based)
-    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu
+    # See: cpp/tensorrt_llm/kernels/moe/trtllmGen/runner.cu
     if routing_method_cls is not None:
         from tensorrt_llm._torch.moe.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
@@ -689,17 +699,18 @@ def should_skip_cutedsl(
     moe_tp_size: int = 1,
 ) -> Optional[str]:
     """
-    Check CuteDSL backend specific constraints.
+    Check constraints shared by the CuteDSL backends (CUTEDSL, CUTEDSL_FC12).
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.CUTEDSL:
+    if backend_type not in (MoeBackendType.CUTEDSL, MoeBackendType.CUTEDSL_FC12):
         return None
 
     if model_config is None:
         return None
 
+    backend_name = backend_type.value  # "CUTEDSL" or "CUTEDSL_FC12"
     intermediate_size = model_config.intermediate_size
 
     # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
@@ -718,7 +729,7 @@ def should_skip_cutedsl(
     # fused kernel keeping BF16 intermediate precision.
     if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
         return (
-            f"[Design Limitation] CuteDslFusedMoE NVFP4 with large "
+            f"[Design Limitation] {backend_name} NVFP4 with large "
             f"intermediate_size has accuracy issues due to FP4 intermediate "
             f"storage between FC1+SwiGLU and FC2 kernels "
             f"(intermediate_size={intermediate_size} >= 14336, "
@@ -744,7 +755,7 @@ def should_skip_cutedsl(
             and routing_method_cls == Llama4RenormalizeMoeRoutingMethod
         ):
             return (
-                "[Design Limitation] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
+                f"[Design Limitation] {backend_name} NVFP4 with Llama4Renormalize "
                 "routing: FP4 intermediate errors amplified by non-normalized "
                 "sigmoid routing weights (mismatch up to 34.6%)."
             )
@@ -755,7 +766,7 @@ def should_skip_cutedsl(
         per_shard = intermediate_size // moe_tp_size
         if per_shard % 128 != 0:
             return (
-                f"CuteDslFusedMoE NVFP4: per-shard intermediate_size="
+                f"{backend_name} NVFP4: per-shard intermediate_size="
                 f"{per_shard} (= {intermediate_size} / {moe_tp_size}) is not "
                 f"128-aligned. fp4_utils asserts M % 128 == 0."
             )

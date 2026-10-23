@@ -64,22 +64,32 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
-import tensorrt_llm._mnnvl_utils as mnnvl
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+    FORCE_CFT_ENV,
+    NVLinkOneSided,
+)
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
+    MnnvlMoe,
+    NVLinkTwoSided,
+)
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
     NVLinkTwoSidedFlashinfer,
 )
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import is_nccl_ep_installed
+from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
+    is_nccl_ep_installed,
+    nccl_ep_supports_version,
+)
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -254,15 +264,15 @@ def _read_nvlink_topk_target_ranks(
     return raw.view(torch.int32).view(max_num_tokens, top_k).cpu()
 
 
-def _read_nvlink_topk_send_indices(
+def _read_nvlink_topk_target_indices(
     comm: NVLinkOneSided,
     max_num_tokens: int,
     top_k: int,
 ) -> torch.Tensor:
-    """Read topk_send_indices[max_num_tokens, top_k] from NVLinkOneSided workspace."""
+    """Read topk_target_indices[max_num_tokens, top_k] from NVLinkOneSided workspace."""
     from tensorrt_llm.bindings import internal as _tllm_internal
 
-    offset_index = int(_tllm_internal.thop.MOE_A2A_TOPK_SEND_INDICES_OFFSET_INDEX)
+    offset_index = int(_tllm_internal.thop.MOE_A2A_TOPK_TARGET_INDICES_OFFSET_INDEX)
     offset = comm.moe_a2a_metainfo[offset_index].item()
     raw = comm.workspace[
         comm.ep_rank,
@@ -300,12 +310,12 @@ def _run_nvlink_rank_mask_dispatch(
         runtime_max_tokens_per_rank,
         comm.top_k,
     )
-    topk_send_indices = _read_nvlink_topk_send_indices(
+    topk_target_indices = _read_nvlink_topk_target_indices(
         comm,
         runtime_max_tokens_per_rank,
         comm.top_k,
     )
-    return recv_tensors, int(combine_payload_offset), topk_target_ranks, topk_send_indices
+    return recv_tensors, int(combine_payload_offset), topk_target_ranks, topk_target_indices
 
 
 def _run_nvlink_rank_mask_combine(
@@ -344,7 +354,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch/combine with an optional active rank mask."""
-    recv_tensors, combine_payload_offset, topk_target_ranks, topk_send_indices = (
+    recv_tensors, combine_payload_offset, topk_target_ranks, topk_target_indices = (
         _run_nvlink_rank_mask_dispatch(
             comm,
             token_selected_experts,
@@ -363,14 +373,14 @@ def _run_nvlink_rank_mask_dispatch_combine(
         enable_rank_mask,
         active_rank_mask,
     )
-    return combined.cpu(), topk_target_ranks, topk_send_indices
+    return combined.cpu(), topk_target_ranks, topk_target_indices
 
 
 def _expected_nvlink_rank_mask_combine_output(
     comm: NVLinkOneSided,
     payload: torch.Tensor,
     topk_target_ranks: torch.Tensor,
-    topk_send_indices: torch.Tensor,
+    topk_target_indices: torch.Tensor,
     local_num_tokens: int,
     runtime_max_tokens_per_rank: int,
 ) -> torch.Tensor:
@@ -383,7 +393,7 @@ def _expected_nvlink_rank_mask_combine_output(
         dtype=torch.float32,
         device=payload.device,
     )
-    payload_offset_index = int(_tllm_internal.thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
+    payload_offset_index = int(_tllm_internal.thop.MOE_A2A_DISPATCH_PAYLOAD_OFFSET_INDEX)
     payload_offset = comm.moe_a2a_metainfo[payload_offset_index].item()
     bytes_per_rank = (
         comm.ep_size * runtime_max_tokens_per_rank * hidden_size * payload.element_size()
@@ -392,7 +402,7 @@ def _expected_nvlink_rank_mask_combine_output(
     for token_idx in range(local_num_tokens):
         for k in range(comm.top_k):
             target_rank = int(topk_target_ranks[token_idx, k].item())
-            dst_idx = int(topk_send_indices[token_idx, k].item())
+            dst_idx = int(topk_target_indices[token_idx, k].item())
             if dst_idx < 0:
                 continue
             raw = comm.workspace[target_rank, payload_offset : payload_offset + bytes_per_rank]
@@ -542,7 +552,8 @@ def create_comm_object(
     # NOT a constructor parameter -- do not pass it.
     qc = (
         _make_mock_quant_config(config.quant_mode)
-        if config.quant_mode != "none" and comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL)
+        if config.quant_mode != "none"
+        and comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL, COMM_NCCL_EP)
         else None
     )
 
@@ -576,7 +587,7 @@ def create_comm_object(
         # Reset class-level singleton to avoid assertion failures when
         # test params change across MPI process reuse.
         NVLinkOneSided._WORKSPACE = None
-        os.environ["TRTLLM_MOE_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
+        os.environ["TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
 
         return NVLinkOneSided(
             mapping=mapping,
@@ -619,6 +630,8 @@ def create_comm_object(
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=max_num_tokens,
             top_k=config.top_k,
+            quant_config=qc,
+            use_low_precision_combine=config.use_low_precision_combine,
         )
 
     else:
@@ -631,6 +644,18 @@ _WORKER_COMM = None
 
 def _comm_reuse_key(config: CommTestConfig) -> Tuple:
     """Return the constructor-affecting key used for worker-side comm reuse."""
+    if config.comm_type == COMM_NCCL_EP:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.hidden_size,
+            config.top_k,
+            config.quant_mode,
+            max(config.all_num_tokens),
+            config.use_low_precision_combine,
+        )
+
     if config.comm_type == COMM_ALLGATHER_RS:
         return (config.comm_type, config.ep_size)
 
@@ -815,7 +840,12 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
 
     if comm_type == COMM_NCCL_EP:
-        if config.quant_mode != "none":
+        if config.quant_mode == "nvfp4" and config.hidden_size % 256 != 0:
+            return "NcclEP nvfp4 requires hidden_size divisible by 256"
+        if config.quant_mode in ("fp8", "nvfp4"):
+            if not nccl_ep_supports_version("0.2"):
+                return f"NcclEP {config.quant_mode} requires libnccl_ep >= 0.2"
+        elif config.quant_mode != "none":
             return f"NcclEP does not support quant_mode={config.quant_mode}"
         if config.top_k > NCCL_EP_MAX_TOP_K:
             return f"NcclEP MAX_TOP_K={NCCL_EP_MAX_TOP_K}, got top_k={config.top_k}"
@@ -1049,6 +1079,9 @@ def _run_worker_dispatch(
         **worker_inputs.dispatch_kwargs,
     )
 
+    if config.comm_type == COMM_NCCL_EP:
+        assert recv_scales.dtype == worker_inputs.scales.dtype
+
     return DispatchOutputs(
         recv_hs=recv_hs,
         recv_sf=recv_sf,
@@ -1110,7 +1143,7 @@ def _prepare_moe_output_for_combine_reference(
     if config.comm_type == COMM_NVLINK_ONE_SIDED:
         return moe_output.to(torch.float8_e4m3fn).to(torch.bfloat16)
 
-    if config.comm_type == COMM_NVLINK_TWO_SIDED:
+    if config.comm_type in (COMM_NVLINK_TWO_SIDED, COMM_NCCL_EP):
         return _simulate_nvfp4_round_trip(moe_output)
 
     return None
@@ -1142,67 +1175,74 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         comm = _get_worker_comm(mapping, config)
 
         worker_inputs = _prepare_worker_inputs(rank, config)
-        dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
+        # Keep dispatch buffers alive through combine and the CPU result copies.
+        with nccl_window_tensor_scope(worker_inputs.hs):
+            dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
 
-        # ----- decode routing + dequant + MoE + combine -----
-        # Decode source info from raw dispatch output (before dequant) so we
-        # know which original (src_rank, token_idx) each dispatched row maps to.
-        # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
-        # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
-        recv_source_info = decode_source_info(
-            dispatch_outputs.recv_hs,
-            dispatch_outputs.recv_hs.dtype,
-            dispatch_outputs.recv_hs.shape[1],
-        )
+            # ----- decode routing + dequant + MoE + combine -----
+            # Decode source info from raw dispatch output (before dequant) so we
+            # know which original (src_rank, token_idx) each dispatched row maps to.
+            # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
+            # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
+            recv_source_info = decode_source_info(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_hs.dtype,
+                dispatch_outputs.recv_hs.shape[1],
+            )
 
-        recv_hs_bf16 = _to_bf16(
-            dispatch_outputs.recv_hs,
-            dispatch_outputs.recv_sf,
-            worker_inputs.global_scale,
-            config.quant_mode,
-        )
+            recv_hs_bf16 = _to_bf16(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_sf,
+                worker_inputs.global_scale,
+                config.quant_mode,
+            )
 
-        # Use ceil/floor partitioning so the slot range is correct for both
-        # uniform and non-divisible EP (num_experts % ep_size != 0).
-        _, local_slot_start, local_slot_end = _compute_ep_partition(
-            config.num_experts, config.ep_size, rank
-        )
-        # Run a minimal local-expert compute step before combine(). This keeps
-        # the test aligned with the real MoE pipeline, where combine() consumes
-        # per-rank expert outputs rather than raw dispatch payloads.
-        moe_output = simple_moe(
-            recv_hs_bf16,
-            dispatch_outputs.recv_slots,
-            dispatch_outputs.recv_scales,
-            local_slot_start,
-            local_slot_end,
-        )
+            # Use ceil/floor partitioning so the slot range is correct for both
+            # uniform and non-divisible EP (num_experts % ep_size != 0).
+            _, local_slot_start, local_slot_end = _compute_ep_partition(
+                config.num_experts, config.ep_size, rank
+            )
+            # Run a minimal local-expert compute step before combine(). This keeps
+            # the test aligned with the real MoE pipeline, where combine() consumes
+            # per-rank expert outputs rather than raw dispatch payloads.
+            moe_output = simple_moe(
+                recv_hs_bf16,
+                dispatch_outputs.recv_slots,
+                dispatch_outputs.recv_scales,
+                local_slot_start,
+                local_slot_end,
+            )
 
-        combined = comm.combine(
-            moe_output,
-            all_rank_max_num_tokens=max(config.all_num_tokens),
-        )
+            combined = comm.combine(
+                moe_output,
+                all_rank_max_num_tokens=max(config.all_num_tokens),
+            )
 
-        # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
-        # needs raw dispatched hidden_states, not accumulated moe_output).
-        saved_recv_hs_bf16 = recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
-        moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
+            # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
+            # needs raw dispatched hidden_states, not accumulated moe_output).
+            saved_recv_hs_bf16 = (
+                recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
+            )
+            moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
 
-        return _build_worker_result(
-            rank,
-            worker_inputs,
-            dispatch_outputs,
-            combined,
-            moe_output,
-            recv_source_info,
-            config,
-            recv_hs_bf16=saved_recv_hs_bf16,
-            moe_output_for_ref=moe_output_for_ref,
-        )
+            return _build_worker_result(
+                rank,
+                worker_inputs,
+                dispatch_outputs,
+                combined,
+                moe_output,
+                recv_source_info,
+                config,
+                recv_hs_bf16=saved_recv_hs_bf16,
+                moe_output_for_ref=moe_output_for_ref,
+            )
     except Exception:
-        _destroy_cached_worker_comm()
         traceback.print_exc()
         raise
+    finally:
+        # A CFT workspace holds a process-global binding only destroy() frees,
+        # and the cache does not survive to the next pool task.
+        _destroy_cached_worker_comm()
 
 
 def _nccl_ep_replay_slots(
@@ -1211,20 +1251,14 @@ def _nccl_ep_replay_slots(
     num_tokens: int,
     experts_per_rank: int,
 ) -> torch.Tensor:
-    """Route every local token to one EP rank, using distinct local experts."""
+    """Route every local token to one EP rank using distinct local experts."""
     local_experts = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
     local_experts %= experts_per_rank
     return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
 
 
-def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
-    """Capture LL dispatch, change routing, and verify the replay sees the change.
-
-    ``NcclEP.dispatch`` converts the stable input routing tensor to the dtype
-    expected by nccl-ep inside the graph. The captured handle therefore must
-    consume the updated device buffer on each replay, rather than reusing the
-    routes present while the graph was captured.
-    """
+def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: torch.dtype) -> dict:
+    """Capture LL dispatch, change routing, and verify replay sees the change."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
@@ -1241,7 +1275,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
         all_rank_num_tokens = config.all_num_tokens
 
         # A rank-tagged payload makes a routing change visible without relying
-        # on private nccl-ep state: local routing receives rank + 1, while the
+        # on private NCCL-EP state: local routing receives rank + 1, while the
         # second replay must receive the peer rank tag.
         hidden_states = torch.full(
             (num_tokens, config.hidden_size),
@@ -1249,7 +1283,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
             dtype=torch.bfloat16,
             device="cuda",
         )
-        weights = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+        weights = torch.ones(num_tokens, 1, dtype=routing_dtype, device="cuda")
         local_routes = _nccl_ep_replay_slots(
             target_rank=rank,
             num_tokens=num_tokens,
@@ -1262,44 +1296,52 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
             experts_per_rank=experts_per_rank,
         )
 
-        # Initialize the context and handle eagerly. Capture is intentionally
-        # rejected before this point, so this mirrors production graph setup.
-        comm.dispatch(
-            hidden_states,
-            None,
-            local_routes,
-            weights,
-            all_rank_num_tokens,
-        )
-        torch.cuda.synchronize()
-
-        static_routes = local_routes.clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            recv_hs, _, recv_slots, _ = comm.dispatch(
+        with nccl_window_tensor_scope(hidden_states):
+            # Initialize the context and handle eagerly. Capture is intentionally
+            # rejected before this point, matching production graph setup.
+            comm.dispatch(
                 hidden_states,
                 None,
-                static_routes,
+                local_routes,
                 weights,
                 all_rank_num_tokens,
             )
-        torch.cuda.synchronize()
-
-        def replay_and_check(expected_sender: int) -> dict:
-            graph.replay()
             torch.cuda.synchronize()
-            valid = recv_slots[:, 0] >= 0
-            received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
-            return {
-                "valid_count": int(valid.sum().item()),
-                "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
-            }
 
-        static_routes.copy_(local_routes)
-        local_result = replay_and_check(rank)
-        static_routes.copy_(peer_routes)
-        peer_result = replay_and_check(peer_rank)
-        return {"rank": rank, "local": local_result, "peer": peer_result}
+            static_routes = local_routes.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                recv_hs, _, recv_slots, recv_scales = comm.dispatch(
+                    hidden_states,
+                    None,
+                    static_routes,
+                    weights,
+                    all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+
+            assert recv_scales.dtype == routing_dtype
+
+            def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
+                graph.replay()
+                torch.cuda.synchronize()
+                valid = recv_slots[:, 0] >= 0
+                received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
+                return {
+                    "valid_count": int(valid.sum().item()),
+                    "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
+                    "weights_match": bool(
+                        torch.all(recv_scales[valid, 0] == expected_weight).item()
+                    ),
+                }
+
+            static_routes.copy_(local_routes)
+            weights.fill_(0.5)
+            local_result = replay_and_check(rank, 0.5)
+            static_routes.copy_(peer_routes)
+            weights.fill_(0.25)
+            peer_result = replay_and_check(peer_rank, 0.25)
+            return {"rank": rank, "local": local_result, "peer": peer_result}
     except Exception:
         traceback.print_exc()
         raise
@@ -1481,7 +1523,7 @@ def _worker_rank_mask_one_rank_masked(
         token_selected_experts = live_expert_ids[live_expert_indices]
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
 
-        combined, topk_target_ranks, topk_send_indices = _run_nvlink_rank_mask_dispatch_combine(
+        combined, topk_target_ranks, topk_target_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
@@ -1498,7 +1540,7 @@ def _worker_rank_mask_one_rank_masked(
             comm,
             payload,
             topk_target_ranks,
-            topk_send_indices,
+            topk_target_indices,
             local_num_tokens,
             local_num_tokens,
         )
@@ -1805,7 +1847,7 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
     N, H = x.shape
     assert H % group_size == 0
 
-    # E2M1 lookup tables (same as torch_quant.py)
+    # E2M1 lookup tables.
     e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
     e2m1_pos_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
 
@@ -1923,13 +1965,17 @@ def _build_combine_reference(
             if target_mask.any():
                 ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
-    elif config.use_low_precision_combine and config.comm_type == COMM_NVLINK_TWO_SIDED:
-        # Path 1b: NVLinkTwoSided NVFP4 simulation + float32 accumulation.
+    elif config.use_low_precision_combine and config.comm_type in (
+        COMM_NVLINK_TWO_SIDED,
+        COMM_NCCL_EP,
+    ):
+        # Path 1b: NVLinkTwoSided and NCCL-EP both follow the DeepEP-LL
+        # NVFP4 pack/dequantize contract, then accumulate in float32.
         # fusedMoeCommKernels.cu quantize_nvfp4_sharedmem uses two-level
         # scaling: per-row global fp32 scale + per-group-of-16 fp8 scale,
         # with E2M1 quantization. After NVLink transfer,
         # dequantize_nvfp4_sharedmem reverses the process. The top_k
-        # reduction is then done in bf16 by torch.sum in _mnnvl_utils.py. The
+        # reduction is then done in bf16 by torch.sum in nvlink_two_sided.py. The
         # NVFP4 round-trip is precomputed on the worker GPU.
         for proc_result in all_results:
             nvfp4_out = proc_result["moe_output_for_ref"]
@@ -2041,6 +2087,7 @@ def verify_combine_results(
 
 POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
     "fp8": [
+        COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
         COMM_NVLINK_TWO_SIDED_FLASHINFER,
@@ -2048,6 +2095,7 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
         COMM_ALLGATHER_RS,
     ],
     "nvfp4": [
+        COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
         COMM_NVLINK_TWO_SIDED_FLASHINFER,
@@ -2080,6 +2128,9 @@ def _supports_low_precision_combine(config: CommTestConfig) -> bool:
         if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES_EXTENSION:
             return False
         return config.quant_mode in ("fp8", "nvfp4", "w4afp8")
+
+    if config.comm_type == COMM_NCCL_EP:
+        return config.quant_mode == "nvfp4" and config.hidden_size % 512 == 0
 
     return False
 
@@ -2156,6 +2207,22 @@ def _make_boundary_test_params():
         for comm_type in ALL_COMM_TYPES:
             aligned_top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
             boundary_cases = []
+            if comm_type == COMM_NVLINK_ONE_SIDED:
+                # DSpark routes to three experts; include an idle ADP peer.
+                boundary_cases.append(
+                    (
+                        2,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=3,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[17, 0],
+                        ),
+                        f"{comm_type}_topk3",
+                    )
+                )
             if comm_type != COMM_NVLINK_TWO_SIDED_FLASHINFER:
                 boundary_cases.append(
                     (
@@ -2430,7 +2497,7 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
-def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
+def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.dtype) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
     config = CommTestConfig(
@@ -2446,7 +2513,7 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
         pytest.skip(skip_reason)
 
     futures = [
-        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config)
+        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config, routing_dtype)
         for _ in range(config.ep_size)
     ]
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
@@ -2460,6 +2527,9 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
             )
             assert replay["sender_matches"], (
                 f"rank {rank}: {replay_name} replay did not observe the expected routing buffer"
+            )
+            assert replay["weights_match"], (
+                f"rank {rank}: {replay_name} replay did not observe the updated routing weights"
             )
 
 
@@ -2674,7 +2744,11 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         moe_ep_size=config.ep_size,
         world_size=config.ep_size,
     )
-    communication = create_comm_object(config.comm_type, mapping, config)
+    with pytest.MonkeyPatch.context() as patch:
+        # Pin worker-side policy: CFT binds the workspace for the life of the
+        # process, so checkpointing is refused while it is on.
+        patch.setenv(FORCE_CFT_ENV, "0")
+        communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
     finally:
@@ -2707,7 +2781,11 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         moe_ep_size=world_size,
         world_size=world_size,
     )
-    communication = create_comm_object(config.comm_type, mapping, config)
+    with pytest.MonkeyPatch.context() as patch:
+        # Pin worker-side policy: CFT binds the workspace for the life of the
+        # process, so checkpointing is refused while it is on.
+        patch.setenv(FORCE_CFT_ENV, "0")
+        communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()
 
@@ -2726,6 +2804,8 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
     executor.dist = SimpleNamespace(rank=rank, world_size=world_size)
     executor.model_engine = SimpleNamespace(model=_Model())
     executor.draft_model_engine = None
+    executor._is_kv_manager_v2 = False
+    executor.enable_kv_cache_reuse = False
 
     class _ControlRequestQueue:
         def enqueue_control_request(self, *, drain, control_id):
@@ -2954,6 +3034,49 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
         "mpi_pool_executor,group",
+        [
+            pytest.param(
+                2,
+                CommTestGroup(
+                    configs=[
+                        CommTestConfig(
+                            comm_type=COMM_NCCL_EP,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=2,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[16, 16],
+                        )
+                    ]
+                ),
+                id="NcclEP_capability_e2e",
+            ),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_nccl_ep_capability_e2e(self, mpi_pool_executor, group: CommTestGroup):
+        """Exercise the public NCCL-EP v0.2 capability path end-to-end."""
+        if not nccl_ep_supports_version("0.2"):
+            pytest.skip("NCCL-EP capability API requires libnccl_ep >= 0.2")
+
+        from nccl.ep import ExpertIdKind, LayoutInfo
+
+        layout_info = LayoutInfo(recv_topk_idx_kind=ExpertIdKind.GLOBAL)
+        assert int(layout_info._lowpp.recv_topk_idx_kind) == int(ExpertIdKind.GLOBAL)
+        _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+    @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
+        self, mpi_pool_executor, routing_dtype: torch.dtype
+    ) -> None:
+        """Verify LL CUDA graph replay reads routing written after capture."""
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,group",
         _make_boundary_test_params(),
         indirect=["mpi_pool_executor"],
     )
@@ -2980,18 +3103,6 @@ class TestMoEComm:
     def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, group: CommTestGroup):
         """Verify NVLinkOneSided with non-divisible EP (num_experts % ep_size != 0)."""
         _run_full_test_group(mpi_pool_executor, group)
-
-    @pytest.mark.threadleak(enabled=False)
-    @pytest.mark.skip(
-        reason=(
-            "Temporarily waived pending NCCL-EP CUDA-graph replay fix: "
-            "https://nvbugspro.nvidia.com/bug/6523820"
-        )
-    )
-    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
-        """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)

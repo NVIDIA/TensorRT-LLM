@@ -63,18 +63,21 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
+DEEPSEEK_V41_MODELS = {
+    "deepseek_v41_flash_nvfp4",
+    "deepseek_v41_flash_nvfp4_dspark",
+}
 QWEN38_MTP_MODELS = {
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
     "qwen3.8_flash_next_fp4_mtp",
 }
 KIMI_K3_SERVER_ENV = {
-    "KIMI_K3_FP8_WEIGHT_READ": "1",
-    "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
     "kimi_k3",
@@ -108,8 +111,12 @@ OPENAI_CHAT_BACKEND_MODELS = {
     "nemotron_3_nano_omni_nvfp4_image",
 }
 
-# Spec-dec models real dataset in serve perf tests.
+# Spec-dec models and their non-speculative controls use real text in serve tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
+    **{
+        model: "cnn_dailymail"
+        for model in DEEPSEEK_V41_MODELS
+    },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
@@ -127,11 +134,6 @@ SPEC_DEC_MODELS = {
     "gpt_oss_120b_eagle3_throughput",
     "qwen3.6_35b_a3b_fp4_mtp",
     *SPEC_DEC_REAL_DATASET_MODELS,
-}
-
-# Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
-AUTODEPLOY_MODEL_CONFIGS = {
-    "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
 }
 
 
@@ -235,9 +237,6 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
-    # AutoDeploy builds its KVCacheManager from the same shared C++ class (see
-    # tensorrt_llm/_torch/auto_deploy/shim/interface.py), so its post-resize
-    # capacity also logs this line (max() below picks that final value).
     PerfMetricType.KV_CACHE_SIZE:
     KV_CACHE_SIZE_LOG_QUERY,
     PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
@@ -460,10 +459,6 @@ class PerfTestConfig:
         pp_size: int = 1,
         num_gpus: int = 1,
         moe_backend: str | None = None,
-        # _autodeploy backend specific parameters
-        ad_compile_backend: str = "torch-cudagraph",
-        extra_runtime: str = "trtllm",
-        skip_loading_weights: bool = False,
     ):
         # The model name.
         self.model_name = model_name
@@ -471,7 +466,7 @@ class PerfTestConfig:
         self.runtime = runtime
         # API Type: only executor is allowed
         self.api = api
-        # Backend type: pytorch or _autodeploy
+        # Backend type: pytorch
         self.backend = backend
         # Streaming responses
         self.streaming = streaming
@@ -514,25 +509,16 @@ class PerfTestConfig:
         # Number of GPUs.
         self.num_gpus = num_gpus
         self.moe_backend = moe_backend
-        # _autodeploy backend specific parameters
-        self.ad_compile_backend = ad_compile_backend
-        self.extra_runtime = extra_runtime
-        self.skip_loading_weights = skip_loading_weights
 
     def to_string(self,
                   custom_server_name: str = None,
                   custom_client_name: str = None,
                   custom_bs: int = None,
                   custom_input_len: int = None,
-                  custom_output_len: int = None,
-                  device_subtype: str = None) -> str:
+                  custom_output_len: int = None) -> str:
 
         # First, add the model name.
         entries = [self.model_name]
-
-        # Add device subtype if provided (for autodeploy tests)
-        if device_subtype:
-            entries.append(f"subtype:{device_subtype}")
 
         if self.runtime == "serve":
             entries.append("serve")
@@ -544,8 +530,6 @@ class PerfTestConfig:
             entries.append("bench")
             if self.backend == 'pytorch':
                 entries.append("pytorch")
-            elif self.backend == '_autodeploy':
-                entries.append("_autodeploy")
             if self.streaming == "streaming":
                 entries.append("streaming")
 
@@ -654,18 +638,12 @@ class PerfTestConfig:
 
         self.model_name = labels.pop(0)
 
-        # Check if device subtype is present (for autodeploy tests)
-        self.device_subtype = None
-        if len(labels) > 0 and labels[0].startswith("subtype:"):
-            self.device_subtype = labels.pop(0).replace("subtype:", "")
-
         assert labels[0] in ["serve", "bench"], \
             f"Unsupported runtime '{labels[0]}'; only 'serve' and 'bench' are supported."
         self.runtime = labels.pop(0)
 
         self.api = labels.pop(0) if labels[0] == "exe" else ""
-        self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
-                                                      ] else "pytorch"
+        self.backend = labels.pop(0) if labels[0] == "pytorch" else "pytorch"
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
         self.data_type = labels.pop(0)
         if labels[0].startswith("gwp"):
@@ -774,7 +752,7 @@ class PerfTestConfig:
         VALID_RUNTIMES = ["serve", "bench"]
         assert self.runtime in VALID_RUNTIMES, \
             f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
-        assert self.backend in ["pytorch", "_autodeploy"], \
+        assert self.backend == "pytorch", \
             f"Unsupported backend '{self.backend}'."
         if self.runtime == "serve":
             assert self.backend == "pytorch", \
@@ -993,9 +971,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
 
-        build_script = "trtllm-bench" if self._config.runtime == "bench" else None
-
-        self._build_script = build_script
         self._benchmark_script = benchmark_script
         self._working_dir = working_dir
         self._output_dir = output_dir
@@ -1056,8 +1031,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.model_name in HF_MODEL_PATH.keys():
             tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
         else:
-            tokenizer_dir = os.path.join(llm_models_root(), "llama-models-v2",
-                                         "TinyLlama-1.1B-Chat-v1.0")
+            tokenizer_dir = os.path.join(llm_models_root(), "Qwen3",
+                                         "Qwen3-0.6B")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
 
@@ -1117,7 +1092,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 0
             ostdev = 0
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
-            if self._build_script == 'trtllm-bench':
+            if self._config.runtime == "bench":
                 data_cmd += [
                     "trtllm-bench",
                     f"--model={tokenizer_dir}",
@@ -1135,7 +1110,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 ]
             else:
                 raise RuntimeError(
-                    f"Unsupported build script {self._build_script} for "
+                    f"Unsupported runtime {self._config.runtime} for "
                     "dataset preparation.")
 
         return data_cmd
@@ -1197,37 +1172,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
-        elif self._config.backend == "_autodeploy":
-            autodeploy_config_path = os.path.join(engine_dir,
-                                                  "extra_llm_api_options.yaml")
-            if not os.path.exists(autodeploy_config_path):
-                os.makedirs(os.path.dirname(autodeploy_config_path),
-                            exist_ok=True)
-
-            # Default autodeploy config
-            autodeploy_config = {
-                'transforms': {
-                    'compile_model': {
-                        'backend': self._config.ad_compile_backend
-                    },
-                },
-                'runtime': self._config.extra_runtime,
-                'skip_loading_weights': self._config.skip_loading_weights
-            }
-
-            # If model has a curated config, use it instead
-            if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
-                config_file = os.path.join(
-                    self._llm_root,
-                    AUTODEPLOY_MODEL_CONFIGS[self._config.model_name])
-                if os.path.exists(config_file):
-                    with open(config_file, 'r') as f:
-                        autodeploy_config = yaml.safe_load(f)
-
-            print_info(f"_autodeploy model config: {autodeploy_config}")
-            with open(autodeploy_config_path, 'w') as f:
-                yaml.dump(autodeploy_config, f, default_flow_style=False)
-            benchmark_cmd += [f"--config={autodeploy_config_path}"]
         # for sampler options
         sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
         if not os.path.exists(sampler_options_path):
@@ -1295,10 +1239,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         from transformers import AutoTokenizer
 
         model_dir = self.get_trtllm_bench_model()
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_dir,
-            trust_remote_code=self._config.model_name
-            in TRUST_REMOTE_CODE_MODELS)
+        model_config = self._get_model_yaml_config()
+        custom_tokenizer = model_config.get('custom_tokenizer')
+        trust_remote_code = self._config.model_name in TRUST_REMOTE_CODE_MODELS
+        if custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizer = load_custom_tokenizer(
+                custom_tokenizer,
+                model_dir,
+                trust_remote_code=trust_remote_code)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code)
         dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
                                             "cnn_dailymail"),
                                "3.0.0",
@@ -1331,6 +1283,23 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         prompt_ids = prompt_ids[:input_len]
                 prompt_text = tokenizer.decode(prompt_ids,
                                                skip_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        tokenize=False,
+                        enable_thinking=False,
+                        add_generation_prompt=True,
+                    )
+                    prompt_ids = tokenizer.encode(prompt_text,
+                                                  add_special_tokens=False)
+                    max_seq_len = model_config['max_seq_len']
+                    if len(prompt_ids) + output_len > max_seq_len:
+                        raise ValueError(
+                            "Rendered V4.1 prompt and output cap exceed max_seq_len"
+                        )
 
                 sample = {
                     "input": {
@@ -1380,6 +1349,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        custom_tokenizer = self._get_model_yaml_config().get('custom_tokenizer')
+        if custom_tokenizer:
+            client_cmd += ["--custom-tokenizer", custom_tokenizer]
+        if self._config.model_name in DEEPSEEK_V41_MODELS:
+            client_cmd += [
+                "--save-result",
+                "--save-detailed",
+                "--result-dir",
+                engine_dir,
+                "--result-filename",
+                f"result_{input_len}_{output_len}.json",
+            ]
         # --ignore-eos must be off for spec-decoding models: forcing generation
         # past EOS produces unstable acceptance rates.
         if self._config.model_name not in SPEC_DEC_MODELS:
@@ -1479,12 +1460,30 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             if self._config.model_name in KIMI_K3_MODELS:
                 server_env.update(KIMI_K3_SERVER_ENV)
+            if self._config.model_name in DEEPSEEK_V41_MODELS:
+                # Compare real acceptance with the same bounded-replay policy.
+                server_env = {
+                    name: value
+                    for name, value in server_env.items()
+                    if not name.startswith("TRTLLM_V41_")
+                }
+                server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
+                               None)
+                server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
             if self._config.model_name in QWEN38_MTP_MODELS:
                 server_timeout = 5400
             elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
+            elif self._config.model_name in DEEPSEEK_V41_MODELS:
+                server_timeout = 3600
+            elif self._config.model_name == "deepseek_v4_pro_base_fp8":
+                # Allow time for model loading and executor warmup.
+                server_timeout = 1800
+            elif self._config.model_name == "minimax_m3_fp4":
+                # Cold MSA JIT compilation can exceed the default 10 minutes.
+                server_timeout = 1800
             else:
                 server_timeout = 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
@@ -1493,7 +1492,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                            server_env=server_env,
                                            server_timeout=server_timeout)
 
-        # PyTorch and AutoDeploy load model checkpoints directly.
+        # PyTorch loads model checkpoints directly.
         build_cmd = []
         if self._config.runtime != "bench":
             pytest.skip("only support trtllm-bench and serve runtime")
@@ -1527,11 +1526,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         mpi_cmd.extend(["-x", var])
                 mpi_cmd.append("trtllm-llmapi-launch")
 
-        if self._build_script == "trtllm-bench":
-            return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
-                                           mpi_cmd)
-        else:
-            pytest.skip("only support trtllm-bench and serve runtime")
+        return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
+                                       mpi_cmd)
 
     def get_perf_result(self, outputs: Dict[int, str]) -> float:
         """
@@ -1567,7 +1563,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     metric_values.append(float(value))
 
         if len(metric_values) == 0:
-            if self._build_script == "trtllm-bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
+            if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
                 print_info("skip building process for multi-gpu test"
                            )  #https://nvbugspro.nvidia.com/bug/5210111
                 metric_values = [0.0]
@@ -1601,7 +1597,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     f"Combining up enc builder_perf {enc_metrics} and dec builder_perf {dec_metrics} to {metric_values}."
                 )
             # For other models, builder metric should equal # gpus.
-            elif self._build_script != "trtllm-build" and self._build_script != "trtllm-bench":
+            elif self._config.runtime != "bench":
                 assert len(
                     metric_values
                 ) == num_gpus, f"num of metrics: {len(metric_values)} should match num_gpus: {num_gpus}"
@@ -1639,6 +1635,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         outputs = {}
         result_states = {}
         errors = []
+        copy_error = None
 
         if self._config.runtime == 'bench':
             print_info(f"Running command for generating dataset")
@@ -1705,7 +1702,24 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if isinstance(commands, PerfServeScriptTestCmds):
                 print_info("Stopping serve server")
                 commands.stop_server()
-            shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
+            engine_dir = self._get_engine_dir()
+            if (self._config.model_name in DEEPSEEK_V41_MODELS
+                    and os.path.isdir(engine_dir)):
+                # Preserve raw results, prompts and config before workspace cleanup.
+                result_dir = os.path.join(output_dir, "detailed_results",
+                                          os.path.basename(engine_dir))
+                try:
+                    shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+                except OSError as error:
+                    copy_error = error
+                    print_warning(
+                        f"Failed to preserve detailed results in {result_dir}: {error}"
+                    )
+            if copy_error is None:
+                shutil.rmtree(engine_dir, ignore_errors=True)
+
+        if copy_error is not None:
+            errors.append(copy_error)
 
         def add_myelin_time_pass_to(input_env):
             time_pass_flag = r" -time_pass=on"
@@ -1718,7 +1732,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         llm_venv._new_env["__LUNOWUD"] = old_llm_venv
 
         # Check if any commands failed.
-        if not all([result_states[idx] == "valid" for idx in result_states]):
+        if errors or not all(
+            [result_states[idx] == "valid" for idx in result_states]):
             # If there is only one error, throw it directly.
             if len(errors) == 1:
                 raise errors[0]
@@ -1759,7 +1774,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 f"Skip building process for {self._config.model_name} as serve handles model loading"
             )
         elif self._config.runtime == "bench":
-            if self._config.backend in ["pytorch", "_autodeploy"]:
+            if self._config.backend == "pytorch":
                 print_info(
                     f"Skip building process for {self._config.model_name} as it is {self._config.backend} backend"
                 )
@@ -1833,15 +1848,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Construct the metric name for given metric_type, bs, input_len, and output_len.
         """
 
-        # Get device subtype for autodeploy tests
-        device_subtype = None
-        if (hasattr(self, '_gpu_clock_lock') and self._gpu_clock_lock
-                and self._config.backend == "_autodeploy"):
-            device_subtype = self._gpu_clock_lock.get_device_subtype()
-
         if metric_type in BUILDER_METRICS:
             # We build one engine for all benchmark runs, so add all bs and seq lens to the metric name.
-            metric_label = self._config.to_string(device_subtype=device_subtype)
+            metric_label = self._config.to_string()
         elif self._config.runtime == "aggr_server":
             metric_label = self._config.to_string(
                 custom_server_name=server_name,
@@ -1856,7 +1865,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 custom_bs=bs,
                 custom_input_len=input_len,
                 custom_output_len=output_len,
-                device_subtype=device_subtype,
             )
         metric_name = f"test_perf_metric_{metric_type.lower()}"
         return self._test_domain_name + "::" + metric_name + "[" + metric_label + "]"

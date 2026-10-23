@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="v1.4.0"
+NIXL_VERSION="v1.5.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
@@ -19,7 +19,7 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 pip3 install meson ninja pybind11 setuptools
 
@@ -52,4 +52,21 @@ cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
+# Consumers import `nixl`, but the build above installs the backend as
+# `nixl_cu13`. Install the dispatching shim with --no-deps: the backend it would
+# otherwise pull from PyPI bundles a second UCX, which segfaults alongside the
+# one torch already links.
+pip3 install --no-deps "nixl==${NIXL_VERSION#v}"
+
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+# ninja installs the bindings outside site-packages, so the shim needs PYTHONPATH. This takes
+# precedence over the PyPI backend that requirements-dev.txt installs into the test
+# environments, so keep that pin in step with NIXL_VERSION above -- otherwise the wheel is
+# installed and silently never used.
+# Prepend only once: ${ENV} is sourced again by every nested shell.
+cat >> "${ENV}" <<'EOF'
+case ":${PYTHONPATH:-}:" in
+  *":/opt/nvidia/nvda_nixl/lib/python3/dist-packages:"*) ;;
+  *) export PYTHONPATH="/opt/nvidia/nvda_nixl/lib/python3/dist-packages${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
+EOF

@@ -1558,7 +1558,7 @@ class Qwen2_5_VLVisionAttention(Attention):
         # for the LM, `forward_impl` would otherwise dispatch vision
         # through `attn_custom_op_inplace`, which looks
         # `attention_metadata` up in the global `extra_attrs` --
-        # that slot is populated by `model_engine.model_forward` with
+        # that slot is populated by `DecoderRunner.model_forward` with
         # the LM decoder's metadata, so vision FMHA receives the LM's
         # S/num_contexts with vision's head_dim and dispatch fails
         # (`FMHA kernels are not found ... D: <vision_head_dim>`).
@@ -1580,7 +1580,7 @@ class Qwen2_5_VLVisionAttention(Attention):
         cos, sin = position_embeddings
 
         # FlashInfer fused RoPE assumes head_size is a multiple of 64 (see
-        # auto_deploy custom op rope docs / flashinfer tests). Qwen2.5-VL vision
+        # custom op RoPE docs / FlashInfer tests). Qwen2.5-VL vision
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
@@ -1613,14 +1613,14 @@ class Qwen2_5_VLVisionAttention(Attention):
         k = k.view(seq_len, -1, self.head_dim)
         v = v.view(seq_len, -1, self.head_dim)
         if _flash_attn_apply_rotary is None:
-            q = RotaryEmbedding.apply_rotary_pos_emb(q.unsqueeze(0),
-                                                     cos,
-                                                     sin,
-                                                     unsqueeze_dim=1).squeeze(0)
-            k = RotaryEmbedding.apply_rotary_pos_emb(k.unsqueeze(0),
-                                                     cos,
-                                                     sin,
-                                                     unsqueeze_dim=1).squeeze(0)
+            # Rotate in place, like the FlashInfer and flash_attn paths, so
+            # `forward` can pass the fused QKV projection buffer directly.
+            q.copy_(
+                RotaryEmbedding.apply_rotary_pos_emb(
+                    q.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+            k.copy_(
+                RotaryEmbedding.apply_rotary_pos_emb(
+                    k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path
@@ -1661,7 +1661,20 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = self.split_qkv(q, k, v)
 
         q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
-        q, k, v = self.convert_qkv(q, k, v)
+        reuse_qkv = False
+        if self.support_fused_qkv:
+            # Only reuse the projection when RoPE preserves every original
+            # view's storage, offset, shape, stride, and dtype.
+            projected_qkv = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                      dim=-1)
+            reuse_qkv = all(
+                rotated.dtype == projected.dtype
+                and rotated.is_set_to(projected)
+                for rotated, projected in zip((q, k, v), projected_qkv))
+        if reuse_qkv:
+            q, k, v = qkv, None, None
+        else:
+            q, k, v = self.convert_qkv(q, k, v)
 
         output = self.forward_impl(
             q=q,
@@ -2060,7 +2073,17 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
 
-        hidden_states = self.patch_embed(pixel_values)
+        # `patch_embed.proj` is a Conv3d with kernel_size == stride == one
+        # patch, and each row of `pixel_values` is one flattened patch, so the
+        # convolution is exactly a linear projection with the same weight and
+        # bias. Run it as a GEMM, which is much faster than the Conv3d kernel.
+        patch_weight = self.patch_embed.proj.weight
+        hidden_states = F.linear(
+            pixel_values.reshape(-1, patch_weight[0].numel()).to(
+                patch_weight.dtype),
+            patch_weight.flatten(1),
+            self.patch_embed.proj.bias,
+        )
 
         seq_len, _ = hidden_states.size()
         grid_rows = grid_thw.tolist()
@@ -2189,7 +2212,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `model_engine.model_forward` binds via
+        # `extra_attrs` that `DecoderRunner.model_forward` binds via
         # `with_model_extra_attrs(self.model.extra_attrs)` -- the
         # outer wrapper's dict. Without sharing, `llm_model_config`
         # carries a deep-copied dict, so LM `attn_custom_op_inplace`

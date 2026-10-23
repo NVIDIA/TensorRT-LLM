@@ -31,7 +31,7 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 
 ## CI pipelines
 
-Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, a separate **post-merge pipeline** (defined in `jenkins/L0_Test.groovy`) runs every test marked `post_merge` across all supported GPU configurations.
+Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test-db YAML file.
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
@@ -40,7 +40,7 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 Integration tests are listed under `tests/integration/test_lists/test-db/`. Most YAML files are named after the GPU or configuration they run on (for example `l0_a100.yml`). Some files, like `l0_sanity_check.yml`, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:
 
 - `stage`: either `pre_merge` or `post_merge`.
-- `backend`: for example `pytorch`, `autodeploy`, `cpp` or `fmha`. Grep the YAML files for `backend:` to see the values currently in use.
+- `backend`: for example `pytorch`, `cpp`, or `fmha`. Grep the YAML files for `backend:` to see the values currently in use.
 
 Example from `l0_a30.yml`:
 
@@ -54,7 +54,7 @@ Example from `l0_a30.yml`:
 
 ## Unit tests
 
-Unit tests live under `tests/unittest/` and run during the merge-request pipeline. They are invoked from `jenkins/L0_MergeRequest.groovy` and do not require mapping to specific hardware stages.
+Unit tests live under `tests/unittest/`. They are listed in the same test-db YAML files as integration tests, as entries starting with `unittest/` (see the `l0_a30.yml` example above), and run in the `jenkins/L0_Test.groovy` stages mapped to those files, like any other test.
 
 ## Jenkins stage names
 

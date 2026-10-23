@@ -8,13 +8,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 import yaml
-from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.routing import Mount, Route
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -155,35 +149,10 @@ async def google_scholar(query: list[str]) -> str:
     return "\n=======\n".join(combined)
 
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
-    sse = SseServerTransport("/messages/")
-
-    async def handle_sse(request: Request) -> Response:
-        async with sse.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,  # noqa: SLF001
-        ) as (read_stream, write_stream):
-            await mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp_server.create_initialization_options(),
-            )
-        return Response()
-
-    return Starlette(
-        debug=debug,
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
-    )
-
-
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Google Scholar MCP SSE-based server")
+    parser = argparse.ArgumentParser(description="Google Scholar MCP Streamable HTTP server")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to config.yaml (API keys, endpoints)"
     )
@@ -198,6 +167,5 @@ if __name__ == "__main__":
     host = args.host or _CFG.get("mcp_host", "0.0.0.0")
     port = args.port or _CFG.get("mcp_port", 8084)
 
-    mcp_server = mcp._mcp_server  # noqa: WPS437
-    starlette_app = create_starlette_app(mcp_server, debug=True)
+    starlette_app = mcp.streamable_http_app()
     uvicorn.run(starlette_app, host=host, port=port)

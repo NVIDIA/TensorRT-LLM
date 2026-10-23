@@ -19,35 +19,33 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    baseTransBuffer.cpp
-    blockKey.cpp
     cacheFormatter.cpp
-    cacheTransferLayer.cpp
-    mlaCacheFormatter.cpp
     cacheTransceiver.cpp
-    capacityScheduler.cpp
-    contextProgress.cpp
+    cacheTransferLayer.cpp
     contextTransferCoordinator.cpp
     dataTransceiver.cpp
-    kvCacheManager.cpp
-    kvCacheEventManager.cpp
-    kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
-    llmRequest.cpp
-    microBatchScheduler.cpp
+    mlaCacheFormatter.cpp
     peftCacheManager.cpp
     rnnCacheFormatter.cpp
-    rnnCacheTransBuffer.cpp
-    evictionPolicy.cpp
-    cacheTransBuffer.cpp
-    agentTree.cpp)
+    rnnCacheTransBuffer.cpp)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
      "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
-list(APPEND SRCS ${XGRAMMAR_SRCS})
+
+add_library(tensorrt_llm_xgrammar_static STATIC ${XGRAMMAR_SRCS})
+set_target_properties(
+  tensorrt_llm_xgrammar_static
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+             POSITION_INDEPENDENT_CODE ON)
+target_include_directories(
+  tensorrt_llm_xgrammar_static SYSTEM
+  PRIVATE ${xgrammar_source_dir}/3rdparty/picojson
+          ${xgrammar_source_dir}/3rdparty/dlpack/include
+          ${xgrammar_source_dir}/include)
 
 if(NOT WIN32)
   # additional warnings
@@ -66,24 +64,79 @@ endif()
 
 # Include kv_cache_manager_v2 C++ sources.
 include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
-list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
 
 # Include the KVCM cold-page compression codec bridge sources.
 include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_compression/CMakeLists.txt)
-list(APPEND SRCS ${KV_CACHE_COMPRESSION_SRCS})
+
+add_library(tllm_kv_cache_host_memory STATIC ${KV_CACHE_HOST_MEMORY_SRCS})
+add_library(tllm::kv_cache_host_memory ALIAS tllm_kv_cache_host_memory)
+target_include_directories(tllm_kv_cache_host_memory
+                           PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR})
+target_link_libraries(
+  tllm_kv_cache_host_memory
+  PUBLIC tllm::common_logging CUDA::cuda_driver Threads::Threads
+  PRIVATE tllm::runtime_topology)
+if(NOT WIN32)
+  target_link_libraries(tllm_kv_cache_host_memory PRIVATE NUMA::NUMA)
+endif()
+
+add_library(tllm_kv_cache STATIC ${KV_CACHE_MANAGER_V2_SRCS}
+                                 ${KV_CACHE_COMPRESSION_SRCS})
+add_library(tllm::kv_cache ALIAS tllm_kv_cache)
+target_include_directories(
+  tllm_kv_cache PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR} ${SHA256_DIR})
+target_link_libraries(
+  tllm_kv_cache PUBLIC tllm::kv_cache_host_memory tllm::common_cuda
+                       tllm::executor_types CUDA::cuda_driver)
+
+add_library(
+  tllm_kv_cache_legacy STATIC
+  baseTransBuffer.cpp
+  blockKey.cpp
+  cacheTransBuffer.cpp
+  evictionPolicy.cpp
+  kvCacheManager.cpp
+  kvCacheEventManager.cpp
+  kvCacheTransferManager.cpp
+  llmRequest.cpp)
+add_library(tllm::kv_cache_legacy ALIAS tllm_kv_cache_legacy)
+target_link_libraries(
+  tllm_kv_cache_legacy
+  PUBLIC tllm::runtime_buffers tllm::runtime_distributed tllm::executor_values
+  PRIVATE tllm::common_environment tllm::executor_transfer_agent
+          tllm::kernel_kv_cache_copy)
+
+add_library(
+  tllm_batch_scheduler STATIC
+  agentTree.cpp capacityScheduler.cpp contextProgress.cpp
+  microBatchScheduler.cpp noOpPeftCacheManager.cpp)
+add_library(tllm::batch_scheduler ALIAS tllm_batch_scheduler)
+target_link_libraries(tllm_batch_scheduler PUBLIC tllm::kv_cache_legacy)
+target_include_directories(tllm_batch_scheduler
+                           PRIVATE ${maybe_nvtx_includedir})
+
+foreach(component tllm_kv_cache_host_memory tllm_kv_cache tllm_kv_cache_legacy
+                  tllm_batch_scheduler)
+  target_compile_features(${component} PUBLIC cxx_std_20)
+  set_target_properties(
+    ${component} PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON
+                            CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endforeach()
+target_compile_options(
+  tllm_kv_cache PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+add_cuda_architectures(tllm_kv_cache 89)
 
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
+                      PUBLIC tllm::kv_cache tllm::batch_scheduler)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${xgrammar_source_dir}/3rdparty/picojson
-         ${xgrammar_source_dir}/3rdparty/dlpack/include
-         ${xgrammar_source_dir}/include
-         ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
+  PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              POSITION_INDEPENDENT_CODE ON)
 
 set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
@@ -104,5 +157,7 @@ endif()
 
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
-                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)
+target_link_libraries(
+  ${BATCH_MANAGER_STATIC_TARGET}
+  PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils
+  PRIVATE tensorrt_llm_xgrammar_static)

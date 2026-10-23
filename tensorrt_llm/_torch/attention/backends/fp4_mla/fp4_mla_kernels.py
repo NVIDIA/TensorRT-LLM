@@ -1379,6 +1379,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     q_sf_out_ptr,
     kv_lens_ptr,
     prompt_lens_ptr,
+    helix_position_offsets_ptr,
+    helix_local_slots_ptr,
+    helix_is_inactive_rank_ptr,
     page_ids_ptr,
     hp_page_ids_ptr,
     paged_kv_indptr_ptr,
@@ -1417,6 +1420,8 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     K_RESIDUAL_D: tl.constexpr,
     STORE_K_RESIDUAL: tl.constexpr,
     FUSE_ROPE_CACHE_STORE: tl.constexpr,
+    USE_HELIX: tl.constexpr,
+    USE_HELIX_LOCAL_SLOTS: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
     MAX_GEN_TILES: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -1433,6 +1438,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q_SF_COLS: tl.constexpr,
     WRITE_Q: tl.constexpr,
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
+    Q_ROWS_PER_SEQ: tl.constexpr = 0,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
@@ -1457,6 +1463,20 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     # Generation tokens are request-major. Deriving their absolute position
     # here avoids materializing per-token metadata in a CUDA graph.
     first_new_pos = kv_len - gen_len
+    rope_first_new_pos = first_new_pos
+    if USE_HELIX:
+        rope_first_new_pos = tl.load(helix_position_offsets_ptr + seq_idx * gen_len)
+    if USE_HELIX_LOCAL_SLOTS:
+        # Helix owns a contiguous rank-local subset of a linear verify group,
+        # but that subset can begin at any token in the group.
+        first_new_pos = kv_len
+        for token_idx in tl.static_range(0, MAX_GEN_TILES * HP_BLOCK):
+            local_slot = tl.load(
+                helix_local_slots_ptr + seq_idx * gen_len + token_idx,
+                mask=token_idx < gen_len,
+                other=-1,
+            )
+            first_new_pos = tl.minimum(first_new_pos, tl.where(local_slot >= 0, local_slot, kv_len))
     if FUSE_ROPE_CACHE_STORE:
         work_idx = tl.program_id(1)
         dim_block = work_idx
@@ -1489,7 +1509,15 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 q_token = seq_idx * gen_len + q_token_idx
                 head_lanes = tl.arange(0, BLOCK_Q_HEADS)
                 head_offsets = q_head_block * BLOCK_Q_HEADS + head_lanes
-                q_rows = q_token * NUM_Q_HEADS + head_offsets
+                # The BF16 Q input is token-major; the FP4 output follows the
+                # decode layout: token-major, or packed per request where each
+                # request owns Q_ROWS_PER_SEQ rows (a multiple of 128) holding
+                # its [query token, head] pairs.
+                q_in_rows = q_token * NUM_Q_HEADS + head_offsets
+                if Q_ROWS_PER_SEQ > 0:
+                    q_rows = seq_idx * Q_ROWS_PER_SEQ + q_token_idx * NUM_Q_HEADS + head_offsets
+                else:
+                    q_rows = q_in_rows
                 q_input_row_stride: tl.constexpr = Q_PREFIX_D + ROPE_DIM
                 q_packed_row_stride: tl.constexpr = (Q_PREFIX_D + 2 * ROPE_DIM) // 2
                 # Every lane is valid only when the launch covers the head
@@ -1509,7 +1537,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         tl.static_assert(Q_PREFIX_BLOCK_D % FP4_BLOCK == 0)
                         q_global_scale = tl.load(q_global_scale_ptr).to(tl.float32)
                         prefix_dims = tl.arange(0, Q_PREFIX_BLOCK_D)
-                        prefix_base = q_rows[:, None].to(tl.int64) * q_input_row_stride
+                        prefix_base = q_in_rows[:, None].to(tl.int64) * q_input_row_stride
                         prefix_groups: tl.constexpr = Q_PREFIX_BLOCK_D // FP4_BLOCK
                         q_prefix_iterations: tl.constexpr = Q_PREFIX_BLOCKS_PER_PROGRAM
                         for q_prefix_iteration in tl.range(
@@ -1585,7 +1613,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                                 mask=row_mask[:, None],
                             )
                 else:
-                    position = (first_new_pos + q_token_idx).to(tl.int64)
+                    position = (rope_first_new_pos + q_token_idx).to(tl.int64)
+                    if USE_HELIX_LOCAL_SLOTS:
+                        position = tl.load(helix_position_offsets_ptr + q_token).to(tl.int64)
                     valid_position = position >= 0
                     pair_offsets = tl.arange(0, ROPE_PAIR_BLOCK)
                     pair_mask = pair_offsets < ROPE_DIM // 2
@@ -1710,6 +1740,12 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                     return
     else:
         dim_block = tl.program_id(2)
+    if USE_HELIX_LOCAL_SLOTS:
+        if first_new_pos >= kv_len:
+            return
+    elif USE_HELIX:
+        if tl.load(helix_is_inactive_rank_ptr + seq_idx):
+            return
     if FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1:
         if dim_block * FP4_BLOCK > V_HEAD_D:
             return
@@ -1895,6 +1931,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             position = first_new_pos.to(tl.int64)
             if position < 0:
                 return
+            # Under helix the cache slot is rank-local while RoPE must use the
+            # GLOBAL position; they coincide everywhere else.
+            rope_position = rope_first_new_pos.to(tl.int64)
             page_idx = position // page_size
             page_pos = position - page_idx * page_size
             physical_page_offset = page_start + page_idx
@@ -1927,7 +1966,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 latent_cache_ptr + latent_token * (NUM_DIM_BLOCKS * FP4_BLOCK) + tail_odd_d,
             ).to(tl.float32)
             rope_pair_offsets = tail_byte_offsets
-            rotary_offsets = position * (ROPE_DIM * 2) + rope_pair_offsets * 2
+            rotary_offsets = rope_position * (ROPE_DIM * 2) + rope_pair_offsets * 2
             cos = tl.load(rotary_cos_sin_ptr + rotary_offsets).to(tl.float32)
             sin = tl.load(rotary_cos_sin_ptr + rotary_offsets + 1).to(tl.float32)
             tail_even, tail_odd = _fp4_mla_rope_fp32(tail_even, tail_odd, cos, sin)
@@ -2046,9 +2085,22 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
 
         abs_positions = block_base_pos + token_offsets
         valid_tokens = abs_positions < kv_len
-        from_latent = abs_positions >= first_new_pos
         hp_slots = abs_positions % HP_POOL_SIZE
-        new_token_offsets = abs_positions - first_new_pos
+        if USE_HELIX_LOCAL_SLOTS:
+            from_latent = abs_positions < 0
+            new_token_offsets = abs_positions - abs_positions
+            for token_idx in tl.static_range(0, MAX_GEN_TILES * HP_BLOCK):
+                local_slot = tl.load(
+                    helix_local_slots_ptr + seq_idx * gen_len + token_idx,
+                    mask=token_idx < gen_len,
+                    other=-1,
+                )
+                is_local_token = abs_positions == local_slot
+                from_latent = from_latent | is_local_token
+                new_token_offsets = tl.where(is_local_token, token_idx, new_token_offsets)
+        else:
+            from_latent = abs_positions >= first_new_pos
+            new_token_offsets = abs_positions - first_new_pos
         # Linear MTP uses a uniform generation length, so each sequence
         # occupies one contiguous gen_len slice in latent_cache.
         latent_tokens = seq_idx * gen_len + new_token_offsets
@@ -2129,7 +2181,13 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
 
         if FUSE_ROPE_CACHE_STORE and not q1_shared_main:
             if dim_block * FP4_BLOCK >= V_HEAD_D:
-                positions = abs_positions.to(tl.int64)
+                positions = (rope_first_new_pos + new_token_offsets).to(tl.int64)
+                if USE_HELIX_LOCAL_SLOTS:
+                    positions = tl.load(
+                        helix_position_offsets_ptr + safe_latent_tokens,
+                        mask=valid_tokens & from_latent,
+                        other=-1,
+                    ).to(tl.int64)
                 valid_position = valid_tokens & from_latent & (positions >= 0)
                 rope_pair_offsets = (safe_even_d - V_HEAD_D) // 2
                 rope_dim_mask = mask_even_d & (even_d >= V_HEAD_D) & (odd_d < V_HEAD_D + ROPE_DIM)
