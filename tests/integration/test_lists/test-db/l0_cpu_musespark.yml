@@ -1,0 +1,20 @@
+version: 0.0.1
+# [MuseSpark CI trim] CPU-only MuseSpark coverage for feat/musespark-open-agentx: the
+# cpu_only-marked MuseSpark tests that l0_cpu.yml already runs. Run by the
+# CPU-Generic-x86-MuseSpark-1 stage in jenkins/L0_Test.groovy.
+l0_cpu_musespark:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 0
+        lte: 0
+    wildcards:
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: generic
+      orchestrator: mpi
+  tests:
+  - unittest/llmapi/apps/test_musespark_serve_extensions.py
+  # Picked up on l0_cpu through the unittest/_torch/modeling directory entry.
+  - unittest/_torch/modeling/test_modeling_musespark_open_preprocess.py

@@ -37,11 +37,10 @@ class TestMuseSparkOpen(LlmapiAccuracyTestHarness):
     # (meta-models/Muse-Spark-Open-816B-A42B-NVFP4): it only has to match
     # the references/*.yaml key.
     MODEL_NAME = "musespark_open"
-    # Pre-release the NVFP4 checkpoint is staged outside llm-models and named
-    # by MUSESPARK_REFERENCE_CKPT; the llm_models_root() path takes over
-    # once it lands there.
+    # MUSESPARK_REFERENCE_CKPT points at a checkpoint staged outside
+    # llm-models; otherwise the llm-models copy (ftp/llm-models!621) is used.
     MODEL_PATH = os.environ.get("MUSESPARK_REFERENCE_CKPT") or (
-        f"{llm_models_root()}/MuseSparkOpen"
+        f"{llm_models_root()}/Muse-Spark-Open-816B-A42B-NVFP4"
     )
 
     @staticmethod

@@ -73,10 +73,11 @@ class TestModelingV2MuseSparkOpenNvfp4Tep4(LlmapiAccuracyTestHarness):
 
     # The reference key of the built-in model's suite (test_musespark_open.py).
     MODEL_NAME = "musespark_open"
-    # Pre-release the checkpoints are staged outside llm-models and named by
-    # these variables; the llm_models_root() paths take over once they land there.
+    # The environment variables point at checkpoints staged outside llm-models;
+    # otherwise the llm_models_root() paths are used. The NVFP4 target is in
+    # llm-models (ftp/llm-models!621).
     MODEL_PATH = os.environ.get("MUSESPARK_REFERENCE_CKPT") or (
-        f"{llm_models_root()}/MuseSparkOpen"
+        f"{llm_models_root()}/Muse-Spark-Open-816B-A42B-NVFP4"
     )
     DFLASH2_MODEL_PATH = os.environ.get("MUSESPARK_DFLASH2_CKPT") or (
         f"{llm_models_root()}/Muse-Spark-Open-816B-A42B-DFlash2"

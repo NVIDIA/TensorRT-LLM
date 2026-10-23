@@ -3115,6 +3115,19 @@ String getTestReuseStagePattern(String stageName) {
 def MULTI_GPU_RUN_WITH_SINGLE = [
     // Add stage patterns here, e.g.:
     // "DGX_H100-2_GPUs-*",
+    // [MuseSpark CI trim] The branch's only GPU stage; see MUSESPARK_ONLY_STAGES.
+    "GB300-4_GPUs-PyTorch-MuseSpark-*",
+]
+
+// [MuseSpark CI trim] feat/musespark-open-agentx: every automatically selected
+// run (bare `/bot run`, with or without --disable-fail-fast) is narrowed to these
+// stages in launchTestJobs. Explicit --stage-list / --extra-stage still reach any
+// stage. Revert this block, the two MuseSpark stages and their test-db lists
+// before merging the branch back to main.
+@Field
+def MUSESPARK_ONLY_STAGES = [
+    "CPU-Generic-x86-MuseSpark-*",
+    "GB300-4_GPUs-PyTorch-MuseSpark-*",
 ]
 
 @Field
@@ -6416,6 +6429,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     x86TestConfigs = [
         "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
+        // [MuseSpark CI trim] cpu_only MuseSpark tests; see MUSESPARK_ONLY_STAGES.
+        "CPU-Generic-x86-MuseSpark-1": ["cpu", "l0_cpu_musespark", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -6599,6 +6614,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
+        // [MuseSpark CI trim] Pre-merge MuseSpark GPU tests; see MUSESPARK_ONLY_STAGES.
+        "GB300-4_GPUs-PyTorch-MuseSpark-1": ["auto:gb300-x4", "l0_gb300_musespark", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
@@ -7222,6 +7239,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Start as a normal pre-merge job
     parallelJobsFiltered = parallelJobs - multiGpuJobs - postMergeJobs - onDemandJobs
 
+    // [MuseSpark CI trim] The MuseSpark GB300 stage is the branch's only GPU coverage,
+    // so it runs on every pre-merge /bot run, not just when a multi-GPU file changed.
+    parallelJobsFiltered += multiGpuJobs.findAll { stageMatchesAnyPattern(it.key, MUSESPARK_ONLY_STAGES) }
+
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
         parallelJobsFiltered += multiGpuJobs
@@ -7326,6 +7347,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // Keep manually triggered stages out of every automatic selection path.
     parallelJobsFiltered -= onDemandJobs
+
+    // [MuseSpark CI trim] Narrow the automatic selection to the MuseSpark stages.
+    parallelJobsFiltered = parallelJobsFiltered.findAll { stageMatchesAnyPattern(it.key, MUSESPARK_ONLY_STAGES) }
+    echo "[MuseSpark CI trim] Automatic stage selection narrowed to: ${parallelJobsFiltered.keySet()}"
 
     // Check --stage-list, only run the stages in stage-list. Supports wildcard '*'.
     if (testFilter[TEST_STAGE_LIST] != null) {
