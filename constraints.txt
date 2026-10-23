@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # setup.py appends these constraints to wheel install_requires, so every entry
 # must also be a valid TensorRT-LLM runtime dependency outside the base image.
 # Runtime dependencies belong in requirements.txt; only base-image vulnerability
@@ -8,3 +9,7 @@
 jupyterlab>=4.6.4
 # WAR against https://github.com/advisories/GHSA-6966-vjj6-99xv
 notebook>=7.6.3
+# WAR against https://github.com/advisories/GHSA-27vj-qcqg-25rc
+# The base image (pytorch:26.09-py3) ships fsspec 2026.2.0; the floor forces a reinstall.
+fsspec>=2026.6.0
+certifi>=2026.10.19
