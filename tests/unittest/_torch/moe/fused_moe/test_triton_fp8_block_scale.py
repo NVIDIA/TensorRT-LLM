@@ -23,8 +23,8 @@ from tensorrt_llm._torch.moe.fused_moe.interface import ActivationType
 from tensorrt_llm._utils import get_sm_version
 
 skip_unsupported = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 120,
-    reason="Requires CUDA SM120 for the Triton FP8 block-scale MoE path",
+    not torch.cuda.is_available() or get_sm_version() not in (120, 121),
+    reason="Requires CUDA SM120 or SM121 for the Triton FP8 block-scale MoE path",
 )
 
 
@@ -81,7 +81,10 @@ def _run_moe_bf16_reference(
             gate_up = x[t].float() @ w31_bf16[e].float().T
             u, g = gate_up[:intermediate], gate_up[intermediate:]
             act_int = int(activation_type)
-            if act_int in (int(ActivationType.Swiglu), int(ActivationType.Silu)):
+            if act_int == int(ActivationType.Relu2):
+                # Non-gated: the whole projection is the up half.
+                ic2 = F.relu(gate_up).square()
+            elif act_int in (int(ActivationType.Swiglu), int(ActivationType.Silu)):
                 ic2 = F.silu(g) * u
             else:
                 ic2 = F.gelu(g) * u
@@ -134,6 +137,26 @@ SHAPES = [
 # available for manual experiments but out of the correctness parametrization.
 CORRECTNESS_SHAPES = [s for s in SHAPES if s.name != "laguna_bench"]
 
+# Nemotron-H Lightning expert dimensions; 1856 is not a multiple of the 128-row scale block.
+LIGHTNING_HIDDEN = 2688
+LIGHTNING_INTER = 1856
+LIGHTNING_PADDED_INTER = 1920
+LIGHTNING_CORR = MoeShape(
+    "lightning_corr",
+    num_tokens=32,
+    hidden=LIGHTNING_HIDDEN,
+    intermediate=LIGHTNING_INTER,
+    num_experts=16,
+    top_k=6,
+)
+
+# Non-gated (Relu2) experts: one aligned size and two that end in a partial scale block.
+RELU2_SHAPES = [
+    MoeShape("tiny_aligned", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=2),
+    MoeShape("tiny_unaligned", num_tokens=64, hidden=256, intermediate=192, num_experts=8, top_k=2),
+    LIGHTNING_CORR,
+]
+
 
 def _make_inputs(
     shape: MoeShape,
@@ -156,9 +179,11 @@ def _make_inputs(
     token_selected_experts = topk_ids.to(torch.int64)
     token_final_scales = torch.softmax(topk_vals.float(), dim=-1)
 
+    # Non-gated (Relu2) experts carry only the up projection.
+    gate_up_size = inter if activation_type == int(ActivationType.Relu2) else 2 * inter
     w3_w1_bf16 = (
         torch.randn(
-            (num_experts, 2 * inter, hidden), dtype=torch.bfloat16, device=device, generator=g
+            (num_experts, gate_up_size, hidden), dtype=torch.bfloat16, device=device, generator=g
         )
         * 0.05
     )
@@ -201,3 +226,49 @@ def test_fp8_matches_bf16_reference(shape: MoeShape, activation_type: int) -> No
 
     diff = calc_diff(out_fp8, out_ref).item()
     assert diff < 1e-2, f"shape={shape.name} cosine-diff={diff:.4e} exceeds 1e-2"
+
+
+@skip_unsupported
+@pytest.mark.parametrize("shape", RELU2_SHAPES, ids=lambda s: s.name)
+def test_fp8_relu2_matches_bf16_reference(shape: MoeShape) -> None:
+    inputs = _make_inputs(shape, activation_type=int(ActivationType.Relu2))
+
+    out_fp8 = run_triton_fp8_block_scale_moe(**inputs)
+    out_ref = _run_moe_bf16_reference(**inputs)
+
+    assert out_fp8.shape == out_ref.shape == (shape.num_tokens, shape.hidden)
+    assert out_fp8.dtype == torch.bfloat16
+
+    diff = calc_diff(out_fp8, out_ref).item()
+    assert diff < 1e-2, f"shape={shape.name} cosine-diff={diff:.4e} exceeds 1e-2"
+
+
+@skip_unsupported
+def test_fp8_relu2_padded_weights_match_unpadded_reference() -> None:
+    """Lightning experts as the loader leaves them: 1856 rows padded to 1920 with a zero tail."""
+    inputs = _make_inputs(LIGHTNING_CORR, activation_type=int(ActivationType.Relu2))
+    pad = LIGHTNING_PADDED_INTER - LIGHTNING_INTER
+    # The 15-block scale grids already cover 1920 rows, so only the FP8 weights grow.
+    padded_inputs = dict(
+        inputs,
+        w3_w1=F.pad(inputs["w3_w1"].view(torch.uint8), (0, 0, 0, pad)).view(torch.float8_e4m3fn),
+        w2=F.pad(inputs["w2"].view(torch.uint8), (0, pad)).view(torch.float8_e4m3fn),
+    )
+
+    out_fp8 = run_triton_fp8_block_scale_moe(**padded_inputs)
+    out_ref = _run_moe_bf16_reference(**inputs)
+
+    assert padded_inputs["w3_w1"].shape[1] == padded_inputs["w2"].shape[2] == LIGHTNING_PADDED_INTER
+    assert out_fp8.shape == out_ref.shape == (LIGHTNING_CORR.num_tokens, LIGHTNING_CORR.hidden)
+
+    diff = calc_diff(out_fp8, out_ref).item()
+    assert diff < 1e-2, f"padded lightning_corr cosine-diff={diff:.4e} exceeds 1e-2"
+
+
+@skip_unsupported
+def test_non_gated_experts_reject_gated_activation() -> None:
+    inputs = _make_inputs(RELU2_SHAPES[0], activation_type=int(ActivationType.Relu2))
+    inputs["activation_type"] = int(ActivationType.Swiglu)
+
+    with pytest.raises(ValueError, match="Unsupported non-gated activation_type"):
+        run_triton_fp8_block_scale_moe(**inputs)
