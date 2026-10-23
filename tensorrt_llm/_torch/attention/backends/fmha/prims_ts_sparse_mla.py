@@ -92,6 +92,8 @@ _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WARMED_PROFILES: set = set()
 _VALIDATED_CONTRACTS: set = set()
 _LATENT_DIM = 512
+# Prepared-sinks cache entries (one per layer; DeepSeek-V4 has 61).
+_SINKS_CACHE_LIMIT = 512
 _ROPE_DIM = 64
 _FUSED_OUTPUT_BLOCK = 128
 
@@ -160,9 +162,11 @@ class PrimsTSSparseMlaFmha(Fmha):
         # manager they were built from. The owner is held weakly: a freed
         # manager (or a new one at the same address) never resolves to a
         # stale view of released pool memory.
+        self._checked_key = None
         self._pool_views_owner: Optional[weakref.ReferenceType] = None
         self._pool_views: dict[tuple[int, int], torch.Tensor] = {}
-        self._sinks_cache: Optional[tuple[int, torch.Tensor]] = None
+        # One prepared FP32 sinks vector per source tensor (one per layer).
+        self._sinks_cache: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
 
     # ------------------------------------------------------------------ availability
     @classmethod
@@ -401,19 +405,27 @@ class PrimsTSSparseMlaFmha(Fmha):
         sinks = fwd.attention_sinks
         if sinks is None:
             return None
-        cached = self._sinks_cache
         if (
-            cached is not None
-            and cached[0] == sinks.data_ptr()
-            and cached[1].numel() == sinks.numel()
+            sinks.dtype == torch.float32
+            and sinks.dim() == 1
+            and sinks.is_contiguous()
+            and not sinks.requires_grad
         ):
-            return cached[1]
+            # DeepseekV4TrtllmAttention.attn_sink is already a per-head FP32
+            # parameter; pass it through so its address stays stable per layer.
+            return sinks
+        key = (sinks.data_ptr(), sinks.numel(), sinks.dtype)
+        prepared = self._sinks_cache.get(key)
+        if prepared is not None:
+            return prepared
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "PrimTS sparse MLA attention sinks must be prepared before CUDA graph capture."
             )
         prepared = sinks.detach().to(torch.float32).reshape(-1).contiguous()
-        self._sinks_cache = (sinks.data_ptr(), prepared)
+        if len(self._sinks_cache) >= _SINKS_CACHE_LIMIT:
+            self._sinks_cache.clear()
+        self._sinks_cache[key] = prepared
         return prepared
 
     @staticmethod
@@ -694,6 +706,49 @@ class PrimsTSSparseMlaFmha(Fmha):
         return True
 
     # ------------------------------------------------------------------ forward
+    def _check_request(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        fwd: AttentionForwardArgs,
+    ) -> None:
+        """Run the full request check once per request geometry.
+
+        The manager selected this library through is_supported(); the re-check
+        here guards a changed request, so it runs only when the per-step
+        geometry (metadata object, query, indices, output, fusion mode, token
+        counts) differs from the last accepted call.
+        """
+        indices = fwd.sparse_runtime_params.sparse_attn_indices
+        output = fwd.output
+        check_key = (
+            id(metadata),
+            int(metadata.num_tokens),
+            int(metadata.num_ctx_tokens),
+            q.shape,
+            q.dtype,
+            k is None,
+            v is None,
+            None
+            if not isinstance(indices, torch.Tensor)
+            else (indices.shape, indices.dtype, indices.stride(-1)),
+            None if output is None else (output.shape, output.dtype, output.is_contiguous()),
+            fwd.enable_dsv4_epilogue_fusion,
+            fwd.quant_q_buffer is None,
+            fwd.attention_sinks is None,
+            fwd.output_sf is None,
+            fwd.out_scale is None,
+            fwd.dsv4_inv_rope_cos_sin_cache is None,
+        )
+        if check_key == self._checked_key:
+            return
+        reason = self._unsupported_reason(q, k, v, metadata, fwd)
+        if reason is not None:
+            raise RuntimeError(f"PrimTS sparse MLA FMHA cannot run this request: {reason}")
+        self._checked_key = check_key
+
     def forward(
         self,
         q: torch.Tensor,
@@ -706,9 +761,9 @@ class PrimsTSSparseMlaFmha(Fmha):
             DeepseekV4AttentionType,
         )
 
-        reason = self._unsupported_reason(q, k, v, metadata, forward_args)
-        if reason is not None:
-            raise RuntimeError(f"PrimTS sparse MLA FMHA cannot run this request: {reason}")
+        self._check_request(q, k, v, metadata, forward_args)
+        indices = forward_args.sparse_runtime_params.sparse_attn_indices
+        output = forward_args.output
         attn = self.attn
         manager = metadata.kv_cache_manager
         heads = int(attn.num_heads)
@@ -720,7 +775,6 @@ class PrimsTSSparseMlaFmha(Fmha):
         extra = self._extra_capacity(metadata)
         is_fp8 = self._is_fp8_cache(metadata)
         fused = bool(forward_args.enable_dsv4_epilogue_fusion)
-        output = forward_args.output
         groups = int(output.shape[0]) if fused else None
 
         if is_fp8:
@@ -762,7 +816,6 @@ class PrimsTSSparseMlaFmha(Fmha):
         # come from the metadata too, derived once per step: the token's
         # position within the window, and the compressed rows selected beyond
         # the window.
-        indices = forward_args.sparse_runtime_params.sparse_attn_indices
         positions = metadata.token_positions_cuda[start:end]
         lengths = metadata.sparse_mla_swa_lens[start:end]
         swa_pool = self._pool_view(manager, DeepseekV4AttentionType.SWA, 1)

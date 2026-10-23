@@ -386,6 +386,218 @@ def test_graph_replay_follows_new_indices_and_lengths():
     assert not torch.equal(replayed, torch.zeros_like(replayed))
 
 
+def test_prepared_launch_matches_the_full_path_per_layer():
+    """A validate=False run with the pools and sinks of an earlier full run takes
+    the prepared launch, byte-identical to the full path, with one prepared
+    entry per (pools, sinks) key so layers sharing the plan do not evict each
+    other; a new pool or new sinks address goes back through the full path.
+    """
+    _skip_unless_toolchain()
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    rows, heads, topk, extra_topk = 6, 64, 128, 256
+    pool, extra_pool, query, sets = _two_source_case(
+        rows, heads, topk, extra_topk, device, torch.bfloat16
+    )
+    indices, lengths, extra_indices, extra_lengths = sets[0]
+    sinks_a = torch.randn(heads, dtype=torch.float32, device=device)
+    sinks_b = torch.randn(heads, dtype=torch.float32, device=device)
+    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, has_sinks=True)
+    prepared_launches = []
+    original = wrapper._run_prepared
+
+    def counting_run_prepared(*args, **kwargs):
+        prepared_launches.append(1)
+        return original(*args, **kwargs)
+
+    wrapper._run_prepared = counting_run_prepared
+
+    def launch(sinks, kv=pool, validate=False, idx=0):
+        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
+        wrapper.run(
+            query,
+            kv,
+            sets[idx][0],
+            sets[idx][1],
+            extra_pool,
+            extra_indices=sets[idx][2],
+            extra_lengths=sets[idx][3],
+            softmax_scale=LATENT**-0.5,
+            output_scale=1.0,
+            sinks=sinks,
+            out=out,
+            validate=validate,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    ref_a = launch(sinks_a, validate=True)  # full path records layer A
+    ref_b = launch(sinks_b, validate=True)  # full path records layer B
+    assert not prepared_launches and len(wrapper._prepared) == 2
+    got_a = launch(sinks_a)
+    got_b = launch(sinks_b)
+    assert len(prepared_launches) == 2, "both layers must hit their prepared launch"
+    torch.testing.assert_close(got_a, ref_a, rtol=0, atol=0)
+    torch.testing.assert_close(got_b, ref_b, rtol=0, atol=0)
+    assert not torch.equal(got_a, got_b)
+    # The prepared launch reads the live index set, not the recorded one.
+    got_a1 = launch(sinks_a, idx=1)
+    assert len(prepared_launches) == 3
+    torch.testing.assert_close(got_a1, launch(sinks_a, validate=True, idx=1), rtol=0, atol=0)
+    # A different pool storage or sinks address is not prepared: full path.
+    other_pool = pool.clone()
+    launch(sinks_a, kv=other_pool)
+    launch(sinks_a.clone())
+    assert len(prepared_launches) == 3 and len(wrapper._prepared) == 4
+    # Re-planning drops every prepared launch.
+    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, has_sinks=True)
+    assert not wrapper._prepared
+
+
+def test_request_check_runs_once_per_geometry(monkeypatch) -> None:
+    """The full request re-check runs on the first call and again only when the
+    request geometry changes; repeated steps of one shape skip it."""
+    adapter = PrimsTSSparseMlaFmha.__new__(PrimsTSSparseMlaFmha)
+    adapter._checked_key = None
+    reasons = []
+
+    def fake_reason(self, q, k, v, metadata, fwd):
+        reasons.append(1)
+        return None
+
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "_unsupported_reason", fake_reason)
+
+    def make(rows: int, width: int = 640, fusion: bool = False, ctx: int = 0):
+        metadata = SimpleNamespace(num_tokens=ctx + rows, num_ctx_tokens=ctx)
+        indices = torch.zeros(rows, width, dtype=torch.int32)
+        output = torch.empty(rows, 64 * LATENT, dtype=torch.bfloat16)
+        fwd = SimpleNamespace(
+            sparse_runtime_params=SimpleNamespace(sparse_attn_indices=indices),
+            output=output,
+            enable_dsv4_epilogue_fusion=fusion,
+            quant_q_buffer=None,
+            attention_sinks=None,
+            output_sf=None,
+            out_scale=None,
+            dsv4_inv_rope_cos_sin_cache=None,
+        )
+        return torch.empty(rows, 64 * LATENT, dtype=torch.bfloat16), metadata, fwd
+
+    q, metadata, fwd = make(8)
+    adapter._check_request(q, None, None, metadata, fwd)
+    adapter._check_request(q, None, None, metadata, fwd)
+    adapter._check_request(q, None, None, metadata, fwd)
+    assert len(reasons) == 1
+    q2, _, fwd2 = make(16)  # new row count on the same metadata object
+    adapter._check_request(q2, None, None, metadata, fwd2)
+    assert len(reasons) == 2
+    adapter._check_request(q2, None, None, metadata, fwd2)
+    assert len(reasons) == 2
+    _, _, fwd3 = make(16, fusion=True)
+    adapter._check_request(q2, None, None, metadata, fwd3)
+    assert len(reasons) == 3
+    adapter._check_request(q2, None, None, metadata, fwd3)
+    assert len(reasons) == 3
+    _, metadata4, fwd4 = make(16, fusion=True)  # only the metadata object differs
+    adapter._check_request(q2, None, None, metadata4, fwd4)
+    assert len(reasons) == 4
+
+    def rejecting_reason(self, q, k, v, metadata, fwd):
+        return "nope"
+
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "_unsupported_reason", rejecting_reason)
+    adapter._check_request(q2, None, None, metadata4, fwd4)  # same geometry: skipped
+    q5, metadata5, fwd5 = make(4)
+    with pytest.raises(RuntimeError, match="nope"):
+        adapter._check_request(q5, None, None, metadata5, fwd5)
+
+
+def test_prepared_launch_single_pool_matches_the_full_path():
+    """SWA-only layers plan no extra pool; their prepared launch must match the
+    full path and reject extra indices."""
+    _skip_unless_toolchain()
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    rows, heads, topk = 6, 64, 128
+    pool, _, query, sets = _two_source_case(rows, heads, topk, 256, device, torch.bfloat16)
+    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(device, rows, heads, max_topk=topk)
+    prepared_launches = []
+    original = wrapper._run_prepared
+
+    def counting_run_prepared(*args, **kwargs):
+        prepared_launches.append(1)
+        return original(*args, **kwargs)
+
+    wrapper._run_prepared = counting_run_prepared
+
+    def launch(validate: bool, idx: int = 0) -> torch.Tensor:
+        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
+        wrapper.run(
+            query,
+            pool,
+            sets[idx][0],
+            sets[idx][1],
+            softmax_scale=LATENT**-0.5,
+            output_scale=1.0,
+            out=out,
+            validate=validate,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    ref = launch(validate=True)
+    assert not prepared_launches and len(wrapper._prepared) == 1
+    got = launch(validate=False)
+    assert len(prepared_launches) == 1
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    ref1 = launch(validate=True, idx=1)
+    got1 = launch(validate=False, idx=1)
+    assert len(prepared_launches) == 2
+    torch.testing.assert_close(got1, ref1, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="extra indices"):
+        wrapper.run(
+            query,
+            pool,
+            sets[0][0],
+            sets[0][1],
+            extra_indices=sets[0][2],
+            extra_lengths=sets[0][3],
+            softmax_scale=LATENT**-0.5,
+            output_scale=1.0,
+            out=torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device),
+            validate=False,
+        )
+
+
+def test_sinks_pass_through_or_are_prepared_once_per_layer() -> None:
+    """FP32 per-head sinks are passed through at a stable address; other
+    dtypes are converted once per source tensor, so the kernel key keyed by the
+    sinks address stays stable for every layer served by one adapter."""
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla as mod
+
+    adapter = PrimsTSSparseMlaFmha.__new__(PrimsTSSparseMlaFmha)
+    adapter._sinks_cache = {}
+    fp32 = torch.nn.Parameter(torch.randn(64, device="cuda"), requires_grad=False)
+    assert adapter._sinks(SimpleNamespace(attention_sinks=fp32)) is fp32
+    assert not adapter._sinks_cache
+    bf16_a = torch.randn(64, device="cuda").to(torch.bfloat16)
+    bf16_b = torch.randn(64, device="cuda").to(torch.bfloat16)
+    prep_a = adapter._sinks(SimpleNamespace(attention_sinks=bf16_a))
+    prep_b = adapter._sinks(SimpleNamespace(attention_sinks=bf16_b))
+    assert prep_a.dtype == torch.float32 and prep_a is not prep_b
+    assert adapter._sinks(SimpleNamespace(attention_sinks=bf16_a)) is prep_a
+    assert adapter._sinks(SimpleNamespace(attention_sinks=bf16_b)) is prep_b
+    torch.testing.assert_close(prep_a, bf16_a.float())
+    assert adapter._sinks(SimpleNamespace(attention_sinks=None)) is None
+    assert mod._SINKS_CACHE_LIMIT >= 61
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize(
     "rows,heads,groups,topk,extra_topk",
