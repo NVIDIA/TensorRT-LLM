@@ -1394,9 +1394,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rope_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rope_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rope_original_max_positions;
-    op->mFP8ContextFMHA
-        = usesFp8ContextFmha(
-            op->mKVCacheQuantMode, is_fp8_out, is_fp4_out, use_paged_context_fmha, use_sage_attn, is_mla_enable);
+    op->mFP8ContextFMHA = usesFp8ContextFmha(
+        op->mKVCacheQuantMode, is_fp8_out, is_fp4_out, use_paged_context_fmha, use_sage_attn, is_mla_enable);
     // SageAttention block sizes and quantization mode.
     op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
     op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
