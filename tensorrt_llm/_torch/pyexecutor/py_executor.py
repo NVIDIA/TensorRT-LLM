@@ -4523,7 +4523,7 @@ class PyExecutor:
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             request.decoding_iter = request.py_decoding_iter
-            response = request.create_response(False, self.dist.rank)
+            response = request.create_response()
             if response is not None:
                 response.result.cached_tokens = request.cached_tokens
                 self._enqueue_responses([(request.py_request_id, response)])
@@ -7672,13 +7672,15 @@ class PyExecutor:
         return local_schedulable_count, _ADPForwardIntent(global_intent)
 
     def _has_adp_dummy_kv_capacity(self,
-                                   token_nums: Optional[List[int]]) -> bool:
+                                   token_nums: Optional[List[int]],
+                                   draft_reserve: Optional[int] = None) -> bool:
         """Check the full dummy allocation before entering rank-local code.
 
         V1's dummy allocator historically checked only that one block was
         free. Generation dummies also reserve draft tokens, so that check can
         still let the C++ batch allocation fail after a peer rank has
-        succeeded.
+        succeeded. ``draft_reserve`` overrides the draft tokens reserved for
+        the dummy; by default they follow the dummy role.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -7686,8 +7688,9 @@ class PyExecutor:
         has_cp_helix = getattr(mapping, "has_cp_helix", None)
         if callable(has_cp_helix) and has_cp_helix():
             token_num = max(token_num, 2)
-        draft_reserve = (self.max_total_draft_tokens
-                         if self._adp_dummy_is_gen else 0)
+        if draft_reserve is None:
+            draft_reserve = (self.max_total_draft_tokens
+                             if self._adp_dummy_is_gen else 0)
         available_tokens = self.kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num, max_num_draft_tokens=draft_reserve)
         if available_tokens < token_num:
@@ -7948,7 +7951,14 @@ class PyExecutor:
         if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
                for request in self.active_requests):
             return
-        if not self._has_adp_dummy_kv_capacity(None):
+        # A KDA context-only cache manager keeps no replay or draft-verification
+        # buffers, so it cannot run a generation row; pad with a one-token
+        # context dummy instead.
+        context_dummy = getattr(self.kv_cache_manager, "kda_context_only",
+                                False) is True
+        token_nums = [1] if context_dummy else None
+        if not self._has_adp_dummy_kv_capacity(
+                token_nums, draft_reserve=0 if context_dummy else None):
             logger.warning_once(
                 "attention-DP rank scheduled an empty batch and cannot afford "
                 "even a padding dummy; the forward pass is vetoed fleet-wide "
@@ -7963,9 +7973,10 @@ class PyExecutor:
             # peers in the collectives that follow.
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
-                token_nums=None,
-                is_gen=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
+                token_nums=token_nums,
+                is_gen=not context_dummy,
+                max_num_draft_tokens=(0 if context_dummy else
+                                      self.max_total_draft_tokens),
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -7987,10 +7998,14 @@ class PyExecutor:
                 return
 
         dummy_request.is_attention_dp_dummy = True
-        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
-        dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
-        scheduled_batch.generation_requests.append(dummy_request)
+        if context_dummy:
+            scheduled_batch.append_context_request(dummy_request)
+        else:
+            # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip
+            # it.
+            dummy_request.py_skip_gen_alloc_revert = True
+            scheduled_batch.generation_requests.append(dummy_request)
         # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
         # cannot queue: no forward runs then, so the usual dummy teardown in
         # `_handle_responses` is not reached this iteration.
@@ -9276,7 +9291,7 @@ class PyExecutor:
                 has_prepended_logits = self._has_prepended_logits(req)
                 logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
                                    if has_prepended_logits else None)
-                response = req.create_response(False, self.dist.rank)
+                response = req.create_response()
                 if logits_snapshot is not None and response is not None:
                     response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
@@ -9318,7 +9333,7 @@ class PyExecutor:
                 logits_snapshot = request.py_result.get_latest_logits_unexcluded(
                 )
 
-            response = request.create_response(False, self.dist.rank)
+            response = request.create_response()
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
@@ -9434,7 +9449,7 @@ class PyExecutor:
                     # Response creation may finalize and copy scalar ctx GPU totals.
                     self.perf_manager.compute_batch_gpu_times(
                         [request], gpu_times_cache=gpu_times_cache)
-                response = request.create_response(False, self.dist.rank)
+                response = request.create_response()
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens

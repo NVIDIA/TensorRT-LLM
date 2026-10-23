@@ -9,6 +9,7 @@ This module tests:
 
 """
 
+import pickle
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -16,6 +17,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     attach_py_objects_to_requests,
@@ -26,15 +28,18 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     merge_helix_requests,
     merge_requests,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
     MultimodalItemPartition,
 )
 from tensorrt_llm.mapping import CpType
+from tensorrt_llm.sampling_params import LogprobMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -205,6 +210,205 @@ def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
 
     assert llm_request.py_end_id == 7
     assert llm_request.child_requests[0].py_end_id == 7
+
+
+@pytest.mark.parametrize("shape", [(12, 8), (12, 3, 2, 2)])
+@pytest.mark.parametrize("output_length", [None, 6])
+def test_encoder_feature_metadata_drives_native_request(shape, output_length) -> None:
+    features = torch.ones(shape)
+    request = LlmRequest(
+        request_id=42,
+        max_new_tokens=10,
+        input_tokens=[1, 2, 3],
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=False,
+        encoder_input_tokens=[4, 5],
+        encoder_input_features=features,
+        encoder_output_len=output_length,
+    )
+    # Feature length takes precedence over token length, while explicit output
+    # length accounts for encoder downsampling.
+    assert request.encoder_output_len == (12 if output_length is None else output_length)
+    assert request.py_encoder_input_features is features
+    request.validate(10, 30, 0)
+    request.pause(20)
+    assert request.state.name == "ENCODER_INIT"
+    assert request.py_encoder_input_features is features
+
+
+def test_executor_request_to_llm_request_owns_encoder_features_in_python() -> None:
+    features = torch.arange(96, dtype=torch.float32).reshape(12, 8)
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+    )
+    executor_request.py_multimodal_data = {
+        "audio": {"encoder_input_features": features, "encoder_output_len": 6}
+    }
+    llm_request = executor_request_to_llm_request(
+        42, executor_request, child_req_ids=[43, 44], exclude_last_generation_logits=False
+    )
+    child, sibling = llm_request.child_requests
+    assert llm_request.py_encoder_input_features is features
+    for request in (llm_request, child, sibling):
+        assert request.py_encoder_input_features is features
+        assert request.py_encoder_input_features.data_ptr() == features.data_ptr()
+        assert request.encoder_output_len == 6
+        assert request.state.name == "ENCODER_INIT"
+        request.validate(10, 30, 0)
+        request.pause(20)
+        assert request.state.name == "ENCODER_INIT"
+        assert request.encoder_output_len == 6
+
+        assert request.py_encoder_input_features is features
+
+    child.py_encoder_input_features = child.py_encoder_input_features.clone()
+    child.py_encoder_input_features.add_(1)
+    assert child.py_encoder_input_features.data_ptr() != features.data_ptr()
+    torch.testing.assert_close(child.py_encoder_input_features, features + 1)
+    assert llm_request.py_encoder_input_features is features
+    assert sibling.py_encoder_input_features is features
+    torch.testing.assert_close(features, torch.arange(96, dtype=torch.float32).reshape(12, 8))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mode", [LogprobMode.RAW, LogprobMode.PROCESSED])
+def test_logprob_flag_is_python_owned(enabled, mode) -> None:
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        output_config=trtllm.OutputConfig(return_log_probs=enabled),
+    )
+    request = executor_request_to_llm_request(
+        42, executor_request, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    assert request.py_return_log_probs is enabled
+    assert request.child_requests[0].py_return_log_probs is enabled
+    assert not hasattr(request, "return_log_probs")
+    assert (request.py_result._log_probs is not None) is enabled
+    if enabled:
+        assert request.child_requests[0].py_result._log_probs is not request.py_result._log_probs
+    request.py_logprobs_mode = mode
+    request.py_seq_slot = 0
+    slot_params = SlotSamplingParams(num_slots=1, device="cpu")
+    slot_params.admit([request], torch.tensor([0]))
+    assert slot_params.need_raw_logprobs == [enabled and mode == LogprobMode.RAW]
+    assert slot_params.need_processed_logprobs == [enabled and mode == LogprobMode.PROCESSED]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("beam_width", [1, 2])
+@pytest.mark.parametrize("simple_format", [False, True])
+def test_python_logprob_response_snapshots(streaming, beam_width, simple_format) -> None:
+    request = LlmRequest(
+        request_id=42,
+        max_new_tokens=10,
+        input_tokens=[1, 2, 3],
+        sampling_config=trtllm.SamplingConfig(beam_width=beam_width),
+        is_streaming=streaming,
+        return_log_probs=True,
+        logprobs_simple_format=simple_format,
+    )
+    request.state = (
+        LlmRequestState.GENERATION_IN_PROGRESS if streaming else LlmRequestState.GENERATION_COMPLETE
+    )
+    first_probs = [[-0.5] if simple_format else [{4: Logprob(-0.5)}] for _ in range(beam_width)]
+    next_probs = [[-0.25] if simple_format else [{5: Logprob(-0.25)}] for _ in range(beam_width)]
+    request.add_new_tokens([4] * beam_width)
+    request.py_result.set_log_probs(first_probs, [-0.5] * beam_width)
+    first_response = request.create_response()
+    assert first_response is not None
+    # Exercise the IPC snapshot boundary for beam-search results, which replace
+    # all logprobs each iteration rather than emitting greedy streaming deltas.
+    snapshot = pickle.loads(pickle.dumps(first_response))
+    native_result = first_response.result.get_result()
+    assert native_result.log_probs is None
+    assert native_result.cum_log_probs is None
+    assert snapshot.result.log_probs == first_probs
+    assert snapshot.result.cum_log_probs == [-0.5] * beam_width
+    request.add_new_tokens([5] * beam_width)
+    if beam_width > 1:
+        request.py_result.set_log_probs(
+            [first + next_ for first, next_ in zip(first_probs, next_probs)],
+            [-0.75] * beam_width,
+        )
+    else:
+        request.py_result.append_log_probs(next_probs)
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    final_response = request.create_response()
+    assert final_response is not None
+    expected = (
+        next_probs
+        if streaming and beam_width == 1
+        else [first + next_ for first, next_ in zip(first_probs, next_probs)]
+    )
+    assert final_response.result.log_probs == expected
+    assert final_response.result.cum_log_probs == [-0.75] * beam_width
+    assert snapshot.result.log_probs == first_probs
+    assert snapshot.result.cum_log_probs == [-0.5] * beam_width
+    if streaming and beam_width == 1:
+        assert first_response.result.log_probs == first_probs
+        assert first_response.result.cum_log_probs == [-0.5]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_optional_tensor_results_are_python_owned(streaming) -> None:
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=4,
+        streaming=streaming,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        output_config=trtllm.OutputConfig(
+            return_context_logits=True,
+            return_generation_logits=True,
+            return_encoder_output=True,
+            additional_model_outputs=[trtllm.AdditionalModelOutput("hidden", True)],
+        ),
+    )
+    request = executor_request_to_llm_request(
+        42, executor_request, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    assert request.py_return_context_logits
+    assert request.py_return_generation_logits
+    assert request.py_return_encoder_output
+    assert request.child_requests[0].py_return_encoder_output
+    for name in ("return_context_logits", "return_generation_logits", "alloc_context_logits"):
+        assert not hasattr(request, name)
+    context = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    generation = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+    encoder = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    # Preallocate CPU storage so these response tests do not require CUDA or
+    # pinned-memory allocation, while exercising the real append/get methods.
+    request.py_result._context_logits._storage = torch.empty(3, 1, 4)
+    request.py_result._context_logits.beam_width = 1
+    request.py_result._generation_logits.use_chunked_generation_logits = False
+    request.py_result._generation_logits._storage = torch.empty(4, 1, 4)
+    request.py_result._generation_logits.beam_width = 1
+    request.py_result.append_context_logits(context)
+    request.py_result.append_generation_logits(generation)
+    request.py_result.set_encoder_output(encoder)
+    request.py_result.append_additional_context_outputs("hidden", context)
+    request.py_result.append_additional_generation_outputs("hidden", generation)
+    request.add_new_token(4, 0)
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    response = request.create_response()
+    assert response is not None
+    native = response.result.get_result()
+    for name in (
+        "context_logits",
+        "generation_logits",
+        "encoder_output",
+        "additional_outputs",
+        "spec_dec_fast_logits_info",
+    ):
+        assert not hasattr(native, name)
+    torch.testing.assert_close(response.result.context_logits, context)
+    torch.testing.assert_close(response.result.generation_logits, generation.transpose(0, 1))
+    torch.testing.assert_close(response.result.encoder_output, encoder)
+    torch.testing.assert_close(response.result.additional_context_outputs["hidden"], context)
+    torch.testing.assert_close(response.result.additional_generation_outputs["hidden"], generation)
 
 
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
