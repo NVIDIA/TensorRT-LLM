@@ -2458,13 +2458,12 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
                 "generation_servers")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
-        backend = spec.get("attention_backend")
-        if not ((spec.get("decoding_type") == "DFlash" and backend == "TRTLLM")
-                or (spec.get("decoding_type") == "DSpark"
-                    and backend in (None, "AUTO", "TRTLLM"))):
-            return ("speculative_config to be DFlash with attention_backend "
-                    "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
-                    "in both sections")
+        # AUTO, the default, resolves to the sharing TRTLLM backend for windowed
+        # drafters.
+        if (spec.get("decoding_type") not in ("DFlash", "DSpark") or
+                spec.get("attention_backend") not in (None, "AUTO", "TRTLLM")):
+            return ("speculative_config to be DFlash or DSpark with "
+                    "attention_backend AUTO or TRTLLM in both sections")
     return None
 
 
