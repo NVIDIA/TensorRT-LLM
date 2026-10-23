@@ -321,6 +321,15 @@ class TestWanUnit:
         torch.testing.assert_close(morton_out.float(), native_out.float(), atol=0.1, rtol=0.05)
 
     @torch.no_grad()
+    def test_morton_token_order_rejects_mismatched_per_token_timesteps(self):
+        """A per-token timestep with fewer entries than tokens cannot be permuted
+        consistently with the tokens, so the forward must raise, not skip the permutation."""
+        model = self._morton_model(self.DEVICE, dense_layers=[0, 1], expand_timesteps=True)
+        hs, ts, enc = self._morton_inputs(self.DEVICE, expand_timesteps=True)
+        with pytest.raises(ValueError, match="one timestep per token"), torch.inference_mode():
+            model(hidden_states=hs, timestep=ts[:, :-1], encoder_hidden_states=enc)
+
+    @torch.no_grad()
     def test_morton_token_order_runs_sparse_sol_layer(self):
         """Morton order through a routed Sol-Attn layer: layer 0 dense, layer 1 sparse.
         The CuTe kernel must actually run (kernel census) and produce finite output."""

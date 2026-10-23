@@ -312,8 +312,8 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
             "a Z-order permutation over the (frames, height, width) latent grid "
             "around the transformer block stack so that each 64-token block covers "
             "a compact 3D neighborhood instead of a run along width. Dense math is "
-            "unchanged; only the block routing sees a different order. Honored by "
-            "models that wire tensorrt_llm._torch.visual_gen.token_order (WAN)."
+            "unchanged; only the block routing sees a different order. Supported by "
+            "the Wan pipelines; other pipelines reject a non-native order."
         ),
     )
 

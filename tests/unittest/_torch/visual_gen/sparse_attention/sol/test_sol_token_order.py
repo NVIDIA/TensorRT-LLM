@@ -23,6 +23,7 @@ attention) lives in ``test_wan_transformer.py``.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,7 +37,10 @@ from tensorrt_llm._torch.visual_gen.token_order import (
 )
 from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig
 
+_CPU_ONLY = pytest.mark.cpu_only
 
+
+@_CPU_ONLY
 def test_token_order_defaults_to_native_and_rejects_unknown():
     assert SolAttentionConfig(tau=2.0).token_order == "native"
     assert SolAttentionConfig(tau=2.0, token_order="morton").token_order == "morton"
@@ -44,12 +48,14 @@ def test_token_order_defaults_to_native_and_rejects_unknown():
         SolAttentionConfig(tau=2.0, token_order="hilbert")
 
 
+@_CPU_ONLY
 def test_resolve_token_order_reads_config_or_defaults():
     assert resolve_token_order(None) == "native"
     assert resolve_token_order(SolAttentionConfig(tau=2.0)) == "native"
     assert resolve_token_order(SolAttentionConfig(tau=2.0, token_order="morton")) == "morton"
 
 
+@_CPU_ONLY
 def test_require_native_token_order_rejects_morton_for_other_models():
     require_native_token_order(None, "FLUX")
     require_native_token_order(SolAttentionConfig(tau=2.0), "FLUX")
@@ -57,6 +63,38 @@ def test_require_native_token_order_rejects_morton_for_other_models():
         require_native_token_order(SolAttentionConfig(tau=2.0, token_order="morton"), "FLUX")
 
 
+@_CPU_ONLY
+def test_base_pipeline_rejects_morton_unless_supported():
+    """Any pipeline that does not declare ``supports_token_order`` rejects a non-native
+    order at construction, before it touches the rest of its config."""
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+    from tensorrt_llm.visual_gen.args import AttentionConfig
+
+    class _StubPipeline(BasePipeline):
+        pass
+
+    morton_cfg = SimpleNamespace(
+        attention=AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=SolAttentionConfig(tau=2.0, token_order="morton"),
+        )
+    )
+    with pytest.raises(ValueError, match="_StubPipeline"):
+        _StubPipeline(morton_cfg)
+
+
+@_CPU_ONLY
+def test_wan_pipelines_declare_token_order_support():
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+
+    assert WanPipeline.supports_token_order
+    assert WanImageToVideoPipeline.supports_token_order
+    assert WanDMDPipeline.supports_token_order
+
+
+@_CPU_ONLY
 @pytest.mark.parametrize("grid", [(1, 32, 32), (4, 8, 8), (21, 30, 52), (3, 5, 7)])
 def test_morton3d_permutation_round_trips(grid):
     perm, inverse = morton3d_permutation(grid, torch.device("cpu"))
@@ -68,6 +106,7 @@ def test_morton3d_permutation_round_trips(grid):
     assert torch.equal(x.index_select(1, perm).index_select(1, inverse), x)
 
 
+@_CPU_ONLY
 def test_morton3d_blocks_cover_compact_cubes():
     """On a power-of-two grid every 64-token block is exactly one 4x4x4 cube."""
     frames, height, width = 4, 8, 8
@@ -84,6 +123,7 @@ def test_morton3d_blocks_cover_compact_cubes():
     assert int((native[:64] // (height * width)).max()) == 0
 
 
+@_CPU_ONLY
 def test_token_reorder_native_is_identity_and_morton_restores():
     x = torch.randn(1, 4 * 8 * 8, 5)
     native = TokenReorder("native")
@@ -99,6 +139,7 @@ def test_token_reorder_native_is_identity_and_morton_restores():
     assert torch.equal(morton.restore(y), x)
 
 
+@_CPU_ONLY
 def test_token_reorder_keeps_indices_of_every_prepared_grid():
     """A captured CUDA graph replays the index pointers it saw; switching grids must not free them."""
     morton = TokenReorder("morton")

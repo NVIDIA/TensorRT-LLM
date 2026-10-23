@@ -14,7 +14,7 @@
 # limitations under the License.
 """Token orderings for block-sparse attention over a 3D latent grid.
 
-Block-sparse attention kernels (Sol-Attn, skip-softmax) decide per block of
+Block-sparse attention kernels such as Sol-Attn decide per block of
 consecutive tokens. In the native T-H-W raster order a block is a run along
 width inside one frame row, so blocks have weak 3D locality. A Morton
 (Z-order) permutation makes consecutive tokens cover compact 3D neighborhoods
@@ -81,18 +81,19 @@ def resolve_token_order(sparse_attention_config) -> TokenOrder:
     return getattr(sparse_attention_config, "token_order", None) or "native"
 
 
-def require_native_token_order(sparse_attention_config, model_name: str) -> None:
-    """Raise when a config asks for a token order that ``model_name`` does not wire.
+def require_native_token_order(sparse_attention_config, pipeline_name: str) -> None:
+    """Raise when a config asks for a token order that ``pipeline_name`` does not wire.
 
-    Only models that apply :class:`TokenReorder` around their block stack honor
-    ``token_order``; everywhere else a non-native order would silently run as
-    native, so the pipeline rejects it at construction.
+    Only pipelines whose transformer applies :class:`TokenReorder` around its
+    block stack honor ``token_order`` (they set ``supports_token_order``);
+    everywhere else a non-native order would silently run as native, so
+    ``BasePipeline`` rejects it at construction.
     """
     order = resolve_token_order(sparse_attention_config)
     if order != "native":
         raise ValueError(
             f"sparse_attention_config.token_order={order!r} is only supported by the "
-            f"Wan pipelines; use token_order='native' for {model_name}."
+            f"Wan pipelines; use token_order='native' for {pipeline_name}."
         )
 
 

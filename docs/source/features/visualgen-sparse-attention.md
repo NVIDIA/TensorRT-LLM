@@ -297,13 +297,16 @@ attention_config:
   Morton / Z-order once before the transformer blocks and restores the raster
   order after them, so each 64-token routing block covers a compact 3D
   neighborhood instead of a run along width. Dense attention is
-  permutation-equivariant, so only the block routing changes. Wan honors this
-  knob; other models reject it. It is opt-in and not recommended for
+  permutation-equivariant in exact arithmetic, so only the block routing
+  changes the math; in BF16 the permutation also changes the reduction order
+  inside every kernel. The Wan pipelines honor this knob; other pipelines
+  reject it at construction. It is opt-in and not recommended for
   Wan2.2-T2V-A14B at the recipe above: with torch.compile and CUDA graphs on
   it is about 3 % slower than the native order at every `tau` from 0.5 to
-  1.0, and the permutation alone moves the worst-prompt LPIPS against the
-  native-order dense output over the 0.25 gate, so it does not move the
-  speed-vs-quality frontier as the gate measures it.
+  1.0, and the BF16 reduction-order change alone (every layer dense, Morton
+  order) already moves the worst-prompt LPIPS against the native-order dense
+  output over the 0.25 gate, so it does not move the speed-vs-quality
+  frontier as the gate measures it.
 
 The TRTLLM envelope is full-mask BF16 self-attention on SM100 or SM103 with 4-D
 BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The predictor is
