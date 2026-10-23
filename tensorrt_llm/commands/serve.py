@@ -2515,24 +2515,20 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         telemetry=telemetry,
     )
     from tensorrt_llm._utils import mpi_rank
-    is_remote_client = os.environ.get(
-        DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1"
-    if not is_remote_client:
+    if os.environ.get(DisaggLauncherEnvs.
+                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
-    from mpi4py import MPI
     from mpi4py.futures import MPICommExecutor
 
     from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
-    rank_info_auth_key = _resolve_rank_info_auth_key(disagg_cfg,
-                                                     is_remote_client,
-                                                     MPI.COMM_WORLD)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if is_remote_client:
+    if os.environ.get(DisaggLauncherEnvs.
+                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
         instance_idx = os.environ.get(
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
@@ -2541,7 +2537,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
-        _launch_disaggregated_server(config_file, llm_args, rank_info_auth_key)
+        _launch_disaggregated_server(config_file, llm_args)
         return
 
     is_leader, instance_idx, sub_comm = split_world_comm(
@@ -2566,7 +2562,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
-                                     log_level, rank_info_auth_key)
+                                     log_level)
 
     else:
         # Common workers
@@ -2581,28 +2577,6 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
     TLLM_DISAGG_DEPLOYMENT_ID = "TRTLLM_DISAGG_DEPLOYMENT_ID"
     TLLM_DISAGG_ROLE = "TRTLLM_DISAGG_ROLE"
-    TLLM_DISAGG_RANK_INFO_AUTH_KEY = "TRTLLM_DISAGG_RANK_INFO_AUTH_KEY"
-
-
-def _resolve_rank_info_auth_key(disagg_config, is_remote_client,
-                                world_comm) -> bytes:
-    if is_remote_client:
-        encoded_key = os.environ.pop(
-            DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY, None)
-        try:
-            auth_key = bytes.fromhex(encoded_key or "")
-        except ValueError:
-            auth_key = b""
-        if not auth_key:
-            raise RuntimeError(
-                "Invalid launcher-provisioned RankInfo authentication key")
-        return auth_key
-
-    configured_key = getattr(disagg_config, "internal_request_auth_key", None)
-    if configured_key is not None:
-        return configured_key.encode("utf-8")
-    return world_comm.bcast(
-        secrets.token_bytes(32) if world_comm.Get_rank() == 0 else None, root=0)
 
 
 class DisaggWorkerEnvs(StrEnum):
@@ -2628,9 +2602,7 @@ class DisaggWorkerEnvs(StrEnum):
     TLLM_DISAGG_WORKER_PROCESS_ID = "TRTLLM_DISAGG_WORKER_PROCESS_ID"
 
 
-def _launch_disaggregated_server(disagg_config_file: str,
-                                 llm_args: dict,
-                                 rank_info_auth_key: Optional[bytes] = None):
+def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     # Launching the server
     instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
@@ -2655,8 +2627,6 @@ def _launch_disaggregated_server(disagg_config_file: str,
                                        "internal_request_auth_key", None)
     if internal_disagg_auth_key is not None:
         launch_kwargs["internal_disagg_auth_key"] = internal_disagg_auth_key
-    if rank_info_auth_key is not None:
-        _set_rank_info_auth_key(llm_args, rank_info_auth_key)
 
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
@@ -2664,11 +2634,8 @@ def _launch_disaggregated_server(disagg_config_file: str,
                   **launch_kwargs)
 
 
-def _launch_disaggregated_leader(sub_comm,
-                                 instance_idx: int,
-                                 config_file: str,
-                                 log_level: str,
-                                 rank_info_auth_key: Optional[bytes] = None):
+def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
+                                 log_level: str):
     global _child_p_global  # Declare usage of global variable
     # Assuming logger and mpi_rank are available from module imports or passed in
     from tensorrt_llm._utils import mpi_rank
@@ -2696,9 +2663,6 @@ def _launch_disaggregated_leader(sub_comm,
     # the forked process, so we need to remove them before launching the server
     # process.
     non_mpi_env, mpi_env = split_mpi_env()
-    if rank_info_auth_key is not None:
-        non_mpi_env[DisaggLauncherEnvs.
-                    TLLM_DISAGG_RANK_INFO_AUTH_KEY] = rank_info_auth_key.hex()
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env

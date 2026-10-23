@@ -1142,7 +1142,6 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
     model_fn, scheduler, worker = model_with_connector
 
     transceiver_config = _disagg_transceiver_config(use_kv_cache_manager_v2)
-    transceiver_config._rank_info_auth_key = b"test-rank-info-auth-key"
 
     prefill_worker = model_fn(disable_overlap_scheduler=True,
                               cache_transceiver_config=transceiver_config)

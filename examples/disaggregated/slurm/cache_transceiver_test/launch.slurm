@@ -36,7 +36,6 @@ GEN_NODE="${NODES[1]}"
 ZMQ_PORT=$((20000 + (SLURM_JOB_ID % 20000)))
 CONTAINER_NAME="ctt_${SLURM_JOB_ID}"
 DRIVER="python3 ${HERE}/run_cache_transceiver_test.py"
-RANK_INFO_AUTH_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 
 echo "ctx_node=${CTX_NODE} gen_node=${GEN_NODE} zmq_port=${ZMQ_PORT}"
 
@@ -106,7 +105,6 @@ for SWEEP_IDX in $(seq 0 $((NUM_SWEEPS - 1))); do
 export UCX_PROTO_INFO=${PROTO_INFO_VALUE}"
     fi
 
-    export TRTLLM_DISAGG_RANK_INFO_AUTH_KEY="${RANK_INFO_AUTH_KEY}"
     EXPORTS="ALL,CTX_NODE=${CTX_NODE},ZMQ_PORT=${ZMQ_PORT},CTT_CONFIG=${CONFIG},CTT_SWEEP=${SWEEP_IDX}"
 
     # `timeout -k 60 --signal=TERM`: send SIGTERM at PER_SWEEP_TIMEOUT, then

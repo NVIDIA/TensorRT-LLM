@@ -709,7 +709,6 @@ def test_single_node_transfer(tmp_path):
             "CTT_SWEEP": "0",
             "CTT_SWEEP_NAME": "default",
             "CUDA_VISIBLE_DEVICES": "0",
-            "TRTLLM_DISAGG_RANK_INFO_AUTH_KEY": "ab" * 32,
             # Emit protocol-selection tables while transfers are active so the
             # report can deterministically identify the CUDA KV-data transport.
             "UCX_PROTO_INFO": "y",

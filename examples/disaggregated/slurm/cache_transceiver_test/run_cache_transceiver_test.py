@@ -129,17 +129,6 @@ def make_rid(case_idx, reqlen_idx, r):
     return case_idx * RID_COMBINATION_STRIDE + reqlen_idx * RID_REQLEN_STRIDE + r
 
 
-def _rank_info_auth_key_from_env(environ) -> bytes:
-    encoded_key = environ.get("TRTLLM_DISAGG_RANK_INFO_AUTH_KEY", "")
-    try:
-        auth_key = bytes.fromhex(encoded_key)
-    except ValueError as exc:
-        raise RuntimeError("Invalid launcher-provisioned RankInfo authentication key") from exc
-    if not auth_key:
-        raise RuntimeError("Missing launcher-provisioned RankInfo authentication key")
-    return auth_key
-
-
 def seed_for(rid, rank, layer):
     # Distinct per (request, rank, layer); deterministic on both ctx and gen.
     return (rid * 1_000_003 + rank * 1009 + layer * 31) & 0x7FFFFFFF
@@ -757,7 +746,6 @@ def main():
     args = ap.parse_args()
     role = args.role
     is_ctx = role == "ctx"
-    rank_info_auth_key = _rank_info_auth_key_from_env(os.environ)
 
     cfg_path = os.environ["CTT_CONFIG"]
     sweep = int(os.environ.get("CTT_SWEEP", "0"))
@@ -1049,7 +1037,6 @@ def main():
             # request deadline. The cell alarm remains the C++ path's bound.
             kv_transfer_timeout_ms=(timeout_s - TRANSFER_TIMEOUT_GRACE_SECONDS) * 1000,
         )
-        cache_cfg._rank_info_auth_key = rank_info_auth_key
 
         # Build the cache manager + transceiver ONCE per case (the manager is
         # sized for the largest request length and serves all of them).
