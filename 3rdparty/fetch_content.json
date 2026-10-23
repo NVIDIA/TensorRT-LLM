@@ -97,7 +97,8 @@
     {
       "name": "nanobind",
       "git_repository": "https://github.com/wjakob/nanobind",
-      "git_tag": "a0ed2587f1089ef7657e2ed49ad6756b01c74e9f"
+      "git_tag": "a0ed2587f1089ef7657e2ed49ad6756b01c74e9f",
+      "patch_file": "patches/nanobind_pytorch_profiler.patch"
     },
     {
       "name": "nvtx",
