@@ -169,7 +169,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
         assert call.kwargs == {}
 
 
-def test_request_admission_reserves_score_high_watermark():
+def test_request_admission_does_not_grow_workspace():
     manager = _make_triattention(budget=128, beta=64)
     assert manager._selection_width_capacity == 256
     manager._phase = mock.Mock()
@@ -193,18 +193,12 @@ def test_request_admission_reserves_score_high_watermark():
     for request in requests:
         manager.on_request_init(request)
 
-    assert manager._build_score_runtime.call_args_list == [
-        mock.call(score_token_capacity=1024),
-        mock.call(score_token_capacity=2048),
-    ]
-    manager._compaction_done_event.synchronize.assert_called_once_with()
-    assert manager._phase.reserve.call_args_list == [
-        mock.call(10101),
-        mock.call(1101),
-    ]
+    manager._build_score_runtime.assert_not_called()
+    manager._compaction_done_event.synchronize.assert_not_called()
+    manager._phase.reserve.assert_not_called()
 
 
-def test_request_admission_aligns_clamped_score_bucket_to_tile():
+def test_request_admission_accepts_unaligned_sequence_limit_without_growth():
     manager = _make_triattention(budget=128, beta=64)
     manager._phase = mock.Mock()
     manager._selection_width_capacity = 256
@@ -216,7 +210,7 @@ def test_request_admission_aligns_clamped_score_bucket_to_tile():
 
     manager.on_request_init(_make_request(1, py_prompt_len=850, py_max_new_tokens=200))
 
-    manager._build_score_runtime.assert_called_once_with(score_token_capacity=1152)
+    manager._build_score_runtime.assert_not_called()
     manager._compaction_done_event.synchronize.assert_not_called()
 
 
