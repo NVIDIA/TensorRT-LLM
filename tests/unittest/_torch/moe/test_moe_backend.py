@@ -2264,7 +2264,7 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     surfaces as the assert in ``run_moe`` -- so the walk itself is asserted,
     not just the override in isolation.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
     # ``__new__`` rather than the constructor: the real ``__init__`` would want
     # MPI, a process group, and a DG SymmBuffer, none of which this walk needs.
@@ -2281,7 +2281,7 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     model = torch.nn.Module()
     model.moe = wrapper
 
-    ModelLoader._walk_cache_state(model)
+    model_hooks.walk_cache_state(model)
 
     backend._alloc_symm_buffer.assert_called_once_with()
     backend.quant_method.cache_derived_state.assert_called_once_with(backend)
@@ -2297,7 +2297,7 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     ``post_load_weights``, so losing the override here leaves the derived
     MegaMoE-format state silently never recomputed.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
     # ``__new__`` rather than the constructor: the real ``__init__`` would want
     # a process group and the cuMem symmetric-memory rendezvous.
@@ -2317,7 +2317,7 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     model = torch.nn.Module()
     model.moe = wrapper
 
-    ModelLoader._walk_cache_state(model)
+    model_hooks.walk_cache_state(model)
 
     backend.create_weights.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(backend)
