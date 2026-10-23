@@ -274,6 +274,17 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             mgr.shutdown()
             del mgr
 
+    def test_index_key_coalesced_into_kv_pool_needs_an_offset_override(self):
+        # One bf16 head of 128 dims makes K == V == INDEX_KEY bytes, so V2
+        # puts all three in one pool slot and layer 1's K page lands three
+        # pages in: no uniform K/V layer offset exists. Without an override
+        # of _kv_pool_mapping_offset the construction must name the cause.
+        with self.assertRaisesRegex(RuntimeError, "_kv_pool_mapping_offset"):
+            _IndexKeyOnSparseLayersV2(
+                sparse_layer_ids=[0, 1, 2, 3],
+                **_make_kwargs(num_layers=4, num_kv_heads=1, dtype=DataType.BF16),
+            )
+
     def test_duplicate_role_against_standard_buffer_asserts(self):
         # Negative control: registering Role.KEY as an extra collides with
         # the standard buffer and must fail loud, both for the assertion
