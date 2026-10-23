@@ -103,7 +103,7 @@ _RANK_INFO_AUTH_CONTEXT = b"trtllm-rank-info-request-v1\0"
 _RANK_INFO_NONCE_BYTES = 32
 _RANK_INFO_AUTH_TAG_BYTES = 32
 _RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
-_RANK_INFO_CHALLENGE_TTL_S = 60.0
+_RANK_INFO_CHALLENGE_TTL_S = 10.0
 
 
 def _validate_rank_info_auth_key(key: Optional[bytes]) -> Optional[bytes]:
@@ -2617,6 +2617,7 @@ class Receiver(ReceiverBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         rank_info_auth_key: Optional[bytes] = None,
+        rank_info_timeout_s: float = _FALLBACK_TX_OVERALL_TIMEOUT_S,
     ):
         self._registrar = peer_registrar
         self._agent = agent
@@ -2625,6 +2626,7 @@ class Receiver(ReceiverBase):
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
         self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_timeout_s = rank_info_timeout_s
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -3040,9 +3042,12 @@ class Receiver(ReceiverBase):
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
+            deadline = time.monotonic() + self._rank_info_timeout_s
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
-                message = messenger.receive()
+                message = messenger.receive(
+                    timeout_ms=max(0, int((deadline - time.monotonic()) * 1000))
+                )
                 if message == [MessageType.AUTHENTICATION_ERROR]:
                     raise RankInfoAuthenticationError(
                         "RankInfo authentication challenge unavailable: server is busy; retry the request"
@@ -3076,13 +3081,19 @@ class Receiver(ReceiverBase):
                             _rank_info_auth_tag(self._rank_info_auth_key, info_endpoint, nonce),
                         ]
                     )
-                    message = messenger.receive()
+                    message = messenger.receive(
+                        timeout_ms=max(0, int((deadline - time.monotonic()) * 1000))
+                    )
                     if message == [MessageType.AUTHENTICATION_ERROR]:
                         raise RankInfoAuthenticationError(
                             "RankInfo authentication failed: challenge expired or proof rejected; "
                             "retry the request and verify matching internal_request_auth_key values"
                         )
                 sender_info = RankInfo.from_bytes(message[0])
+            except TimeoutError as error:
+                raise RankInfoAuthenticationError(
+                    "RankInfo exchange timed out; retry the request and verify peer availability"
+                ) from error
             finally:
                 messenger.stop()
 
@@ -4307,6 +4318,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 rank_info_auth_key=self._rank_info_auth_key,
+                rank_info_timeout_s=self._config.rx_timeout_s or _FALLBACK_TX_OVERALL_TIMEOUT_S,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
