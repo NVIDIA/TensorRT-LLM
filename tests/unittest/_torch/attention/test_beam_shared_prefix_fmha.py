@@ -38,6 +38,7 @@ _LOG2E = 1.4426950408889634
 def _open_size_gate(monkeypatch):
     """The tests use short prompts; open the size gate unless a test sets it."""
     monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_MIN_SHARED_TOKENS", "0")
+    monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_SPEC_MIN_SHARED_TOKENS", "0")
     monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_MIN_GROUP", "1")
 
 
@@ -1436,3 +1437,17 @@ def test_sampling_eligibility_ignores_use_spec_decoding_but_declines_trees():
     assert not lib.sampling_metadata_eligible(meta(is_spec_dec_tree=True))
     assert not lib.sampling_metadata_eligible(meta(is_spec_dec_dynamic_tree=True))
     assert not lib.sampling_metadata_eligible(meta(is_spec_decoding_enabled=True))
+
+
+def test_sharing_pays_gate_is_stricter_with_speculative_decoding(monkeypatch):
+    """The library is off by default with draft tokens (it was not faster in any
+    measured cell) and opens with its own threshold."""
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    monkeypatch.setenv(lib.MIN_SHARED_ENV, "1000")
+    monkeypatch.delenv(lib.SPEC_MIN_SHARED_ENV, raising=False)
+    assert lib.sharing_pays(80, 80, 4, 8000.0, q_len=1)
+    assert not lib.sharing_pays(80, 80, 4, 8000.0, q_len=4)
+    monkeypatch.setenv(lib.SPEC_MIN_SHARED_ENV, "6000")
+    assert lib.sharing_pays(80, 80, 4, 8000.0, q_len=4)
+    assert not lib.sharing_pays(80, 80, 4, 5000.0, q_len=4)

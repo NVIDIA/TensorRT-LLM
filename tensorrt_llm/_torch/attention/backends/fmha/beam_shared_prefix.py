@@ -162,6 +162,19 @@ DEFAULT_MIN_SHARED_TOKENS = 5000
 library is used. Below it the two attention calls plus the merge cost more GPU
 time than the single regular kernel saves (measured ~0.92-0.98x at 600-1600
 tokens, ~1.02-1.19x at 4000, 1.5-1.6x at 8000 on GB200, Qwen3-1.7B)."""
+SPEC_MIN_SHARED_ENV = "TLLM_BEAM_SHARED_PREFIX_SPEC_MIN_SHARED_TOKENS"
+DEFAULT_SPEC_MIN_SHARED_TOKENS = 1 << 30
+"""Smallest shared prefix for the n-sample library with speculative decoding
+(``q_len`` > 1). The default keeps it off: with EAGLE-3 (K=3) on GB200 and
+Qwen3-1.7B the library was not faster than the regular multi-token generation
+kernel end to end in 16 of 17 measured cells (0.77-1.00x; 1.04x at 16000 prompt
+tokens, n=20), although its GPU time per step was up to 7% lower at 8000 tokens
+in a short decode window: the regular kernel already reads the shared pages
+from L2, the prefix call carries ``q_len`` times more queries, and the tail
+(generated tokens) is read through the slower FlashInfer prefill kernel. With
+the library the mean accepted length was also 4-6% lower in single-prompt
+n=20 runs (open item, the attention output itself matches a dense reference to
+0.5%). Set the variable to opt in."""
 MIN_GROUP_ENV = "TLLM_BEAM_SHARED_PREFIX_MIN_GROUP"
 DEFAULT_MIN_GROUP = 4
 """Smallest number of rows sharing a prefix for the n-sample library to be used;
@@ -1438,7 +1451,11 @@ def _int_env(name: str, default: int) -> int:
 
 
 def sharing_pays(
-    num_rows: int, sharing_rows: int, num_sharing_groups: int, shared_tokens_per_row: float
+    num_rows: int,
+    sharing_rows: int,
+    num_sharing_groups: int,
+    shared_tokens_per_row: float,
+    q_len: int = 1,
 ) -> bool:
     """Size gate of the n-sample path: whether reading the shared prompt once pays.
 
@@ -1453,7 +1470,12 @@ def sharing_pays(
     return (
         2 * sharing_rows >= num_rows
         and sharing_rows >= _int_env(MIN_GROUP_ENV, DEFAULT_MIN_GROUP) * num_sharing_groups
-        and shared_tokens_per_row >= _int_env(MIN_SHARED_ENV, DEFAULT_MIN_SHARED_TOKENS)
+        and shared_tokens_per_row
+        >= (
+            _int_env(MIN_SHARED_ENV, DEFAULT_MIN_SHARED_TOKENS)
+            if q_len == 1
+            else _int_env(SPEC_MIN_SHARED_ENV, DEFAULT_SPEC_MIN_SHARED_TOKENS)
+        )
     )
 
 
@@ -1475,9 +1497,12 @@ def resolve_graph_variant(batch) -> int:
     requests = batch.generation_requests
     if not requests:
         return 0
+    q_len = 1 + len(getattr(requests[0], "py_draft_tokens", None) or ())
     gate = (
         _int_env(MIN_SHARED_ENV, DEFAULT_MIN_SHARED_TOKENS),
         _int_env(MIN_GROUP_ENV, DEFAULT_MIN_GROUP),
+        _int_env(SPEC_MIN_SHARED_ENV, DEFAULT_SPEC_MIN_SHARED_TOKENS),
+        q_len,
     )
     memo = _variant_memo
     if (
@@ -1504,7 +1529,7 @@ def resolve_graph_variant(batch) -> int:
     sharing_rows = sum(entry[0] for entry in wide)
     tokens = sum(entry[0] * entry[1] for entry in wide)
     per_row = tokens / sharing_rows if sharing_rows else 0.0
-    variant = int(sharing_pays(rows, sharing_rows, len(wide), per_row))
+    variant = int(sharing_pays(rows, sharing_rows, len(wide), per_row, q_len))
     _variant_memo[:] = [requests[0], requests[-1], len(requests), gate, variant]
     return variant
 
@@ -1675,6 +1700,7 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
             sharing_rows,
             grouping.num_sharing,
             grouping.shared_tokens / max(sharing_rows, 1),
+            q_len,
         ):
             return
 
