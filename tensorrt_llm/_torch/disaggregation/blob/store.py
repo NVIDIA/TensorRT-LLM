@@ -46,7 +46,10 @@ class RegistrationError(StoreError):
     Args:
         reason: What went wrong.
         handle: The handle to ``unregister`` later when the store may have registered the region
-            anyway, or ``None`` when the store certainly did not.
+            anyway, or ``None`` when the store certainly did not. A driver that cannot tell gives
+            the handle. A failure it has no handle for is not a ``RegistrationError(None)``: the
+            driver lets the original exception escape, and the caller keeps the region's memory
+            protected.
     """
 
     def __init__(self, reason: str, handle: RegionHandle | None = None) -> None:
@@ -78,19 +81,22 @@ class RowStatus(enum.Enum):
 
     NOT_READY = "not_ready"
     """The key is held by a write that has not finished: a get delivered nothing, a put published
-    nothing of its own. ``probe`` gives the same answer for such a key."""
+    nothing of its own. ``probe`` gives the same answer for such a key. Only for a hold the store
+    confirmed; a store that cannot tell an unfinished write from another refusal answers FAULT."""
 
     DECLINED = "declined"
-    """For a put: the store would not take the row, for space or policy. Nothing was published;
-    the other rows of the operation go on."""
+    """For a put: the store would not take the row, for space or policy, and said so. Nothing was
+    published; the other rows of the operation go on. A refusal the driver cannot place is
+    FAULT."""
 
     CANCELLED = "cancelled"
     """Never started, because of a cancel or a drain; no byte moved and the row's memory was not
     touched. A row that had started never concludes CANCELLED."""
 
     FAULT = "fault"
-    """Anything else: timeout, size or integrity mismatch, transport or store error. Says nothing
-    about the destination's contents."""
+    """Anything else: timeout, size or integrity mismatch, transport or store error, and any
+    error the driver cannot confirm to be one of the states above. Says nothing about the
+    destination's contents."""
 
 
 @dataclass(frozen=True)
@@ -407,4 +413,60 @@ class StoreDriver(Protocol):
         Allowed only after ``drain`` returned True and every registration is unregistered;
         otherwise raises :class:`DriverRejected` and changes nothing. Idempotent.
         """
+        ...
+
+
+@dataclass(frozen=True)
+class RegionSpec:
+    """One region of a batch registration: the arguments of ``StoreDriver.register`` as a value."""
+
+    address: int
+    nbytes: int
+    layout: RegionLayout
+
+    def __post_init__(self) -> None:
+        Span(self.address, self.nbytes)  # the same checks, the same ValueError
+        if self.layout.nbytes > self.nbytes:
+            raise ValueError(f"layout needs {self.layout.nbytes} bytes, region has {self.nbytes}")
+
+    @property
+    def span(self) -> Span:
+        return Span(self.address, self.nbytes)
+
+
+@runtime_checkable
+class RegistersRegionsTogether(Protocol):
+    """Optional: a driver whose store takes a set of regions in one step and lets them go in one
+    step, as one that opens its client with the memory it will use. A driver declares it by
+    implementing it; the backend checks with ``isinstance`` and then registers a lender's regions
+    through it instead of one ``register`` per region.
+
+    No atomicity is promised. ``register_regions`` fails as ``register`` does: ``DriverRejected``
+    or ``RegistrationError(handle=None)`` say that nothing of the batch is registered;
+    ``RegistrationError(handle=h)`` says that some of it may be and ``h`` revokes whatever is; any
+    other raise says that some of it may be registered with nothing to revoke it by, and the
+    caller keeps the memory protected.
+
+    Whether such a driver also takes ``register`` and ``unregister`` for single regions is its own
+    business; one that does not rejects them with ``DriverRejected``. Threads: as ``register`` and
+    ``unregister``, one call at a time among the four.
+    """
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> RegionHandle:
+        """Register every region of ``specs`` and return one handle for the batch.
+
+        Raises:
+            DriverRejected: Bad geometry, a region overlapping another of the batch or a live
+                registration, or a DEVICE region for a driver without ``device_memory``; nothing
+                escaped.
+            RegistrationError: The store refused; ``handle`` is set when some of the batch may be
+                registered anyway.
+        """
+        ...
+
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        """Revoke the batch, under the rules of ``unregister``: only once every operation touching
+        its regions has ``access_ended``, otherwise :class:`DriverRejected` and the batch stays
+        live; idempotent once it succeeded; any other raise leaves it live and the call
+        retryable."""
         ...
