@@ -11,11 +11,16 @@ import pytest
 from fastapi.responses import JSONResponse
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
+from tensorrt_llm.bindings.executor import RequestPerfMetrics
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.metrics.perf_utils import _input_processing_observer, _time_input_processing
 from tensorrt_llm.serve.anthropic_protocol import AnthropicCreateBatchRequest
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
-from tensorrt_llm.serve.perf_metrics import PerfMetricsMiddleware
+from tensorrt_llm.serve.perf_metrics import (
+    RETURN_METRICS_HEADER,
+    SERVER_TIMING_HEADER,
+    PerfMetricsMiddleware,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -87,6 +92,16 @@ async def test_disabled_input_metrics_do_not_read_clock(serve_env):
         clock.assert_not_called()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mm_encoder_prometheus_route_is_optional(enabled, serve_env):
+    server = serve_env.build_openai_server(
+        AggConfig(role=ServerRole.MM_ENCODER, return_perf_metrics=enabled)
+    )
+
+    response = serve_env.client(server.app).get("/prometheus/metrics")
+    assert response.status_code == (200 if enabled else 404)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["openai_mm_encoder", "openai_responses"])
 @pytest.mark.parametrize("fails", [False, True])
@@ -108,14 +123,24 @@ async def test_total_includes_inline_preprocessing_but_not_generation(
     server.chat_template = None
     server.tool_parser = None
     server.await_disconnected = AsyncMock()
-    server._extract_metrics = AsyncMock()
+    if route != "openai_mm_encoder":
+        server._extract_metrics = AsyncMock()
     now = [1.0]
+    server._collect_perf_metrics = True
+    server._adjusted_steady_clock = SimpleNamespace(
+        now=lambda: now[0], to_reference_time=lambda value: value
+    )
+    server.metrics_collector = None
 
     async def complete():
         now[0] += 10.0
 
     promise = SimpleNamespace(
         request_id="1",
+        finished=True,
+        outputs=[SimpleNamespace(request_perf_metrics=RequestPerfMetrics())],
+        candidate_metrics=[],
+        metrics_dict={},
         prompt_token_ids=[7, 8],
         aresult=AsyncMock(side_effect=complete),
         disaggregated_params=SimpleNamespace(
@@ -142,6 +167,22 @@ async def test_total_includes_inline_preprocessing_but_not_generation(
     else:
         request = ResponsesRequest(model=server.model, input="hi")
     raw_request = server._synthetic_request(request.model_dump(exclude_none=True))
+    raw_request.scope["headers"].append((RETURN_METRICS_HEADER.encode(), b"1"))
+    writer = MagicMock()
+    messages = []
+    response = None
+
+    async def app(scope, receive, send):
+        nonlocal response
+        response = await getattr(server, route)(request, raw_request)
+        await response(scope, receive, send)
+
+    async def send(message):
+        messages.append(message)
+
+    middleware = PerfMetricsMiddleware(
+        app, expose_headers=True, writer=writer, input_processing_observer=observer
+    )
 
     with (
         patch("tensorrt_llm.metrics.perf_utils.time.perf_counter", side_effect=lambda: now[0]),
@@ -155,14 +196,25 @@ async def test_total_includes_inline_preprocessing_but_not_generation(
         ),
         patch(
             "tensorrt_llm.serve.openai_server.responses_api_create_response",
-            new=AsyncMock(return_value=SimpleNamespace(model_dump=lambda: {})),
+            new=AsyncMock(return_value=SimpleNamespace(model_dump=lambda **kwargs: {})),
         ),
     ):
-        response = await getattr(server, route)(request, raw_request)
+        await middleware(raw_request.scope, raw_request.receive, send)
 
     assert response.status_code == (400 if fails else 200)
     totals = [sample.args[1] for sample in observer.call_args_list if sample.args[0] == "total"]
     assert totals == pytest.approx([0.05])
+    if route == "openai_mm_encoder" and not fails:
+        headers = {name.decode(): value.decode() for name, value in messages[0]["headers"]}
+        assert "server_input_total;dur=50.000000" in headers[SERVER_TIMING_HEADER]
+        writer.submit.assert_called_once()
+        record = writer.submit.call_args.args[0]
+        assert record["request_id"] == "1"
+        assert record["phases"]["server"]["input_processing_metrics"]["total"] == pytest.approx(
+            0.05
+        )
+    else:
+        writer.submit.assert_not_called()
 
 
 @pytest.mark.asyncio
