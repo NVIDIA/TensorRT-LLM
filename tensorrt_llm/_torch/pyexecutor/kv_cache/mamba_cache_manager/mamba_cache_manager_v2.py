@@ -1752,6 +1752,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         expected_prompt_length: Optional[int] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         custom_priority_callback: Optional[PagePriorityCallback] = None,
+        locality_domain_id: Optional[int] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -1763,6 +1764,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
             custom_priority_callback=custom_priority_callback,
+            locality_domain_id=locality_domain_id,
         )
         if (
             self.mapping.rank == 0
@@ -1801,6 +1803,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         encoder_output_lens: Optional[List[int]] = None,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
         capture_sampling_params: Optional["SamplingParams"] = None,
+        locality_domain_ids: Optional[List[Optional[int]]] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -1813,6 +1816,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             encoder_output_lens=encoder_output_lens,
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
+            locality_domain_ids=locality_domain_ids,
         )
         if requests:
             self._setup_state_indices(
