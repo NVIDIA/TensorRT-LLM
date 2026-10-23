@@ -229,6 +229,7 @@ __device__ __forceinline__ PackedBf16x8 reduceOneshotPollAll(PackedBf16x8 const&
     return packedAccum;
 }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 // Called by one thread per CTA before every thread's relaxed arrive on the cluster barrier: the barrier expects one
 // arrival (this one) and the bytes of the warp sums of every CTA of the cluster. That cluster barrier phase publishes
 // the initialization; every thread waits for the phase before it sends.
@@ -304,6 +305,7 @@ __device__ __forceinline__ float clusterSumOfSquaresFast(float threadSum)
     }
     return fullSum;
 }
+#endif
 
 // The rotation of the Lamport flags by the thread that GlmLamportFlags::waitAndUpdate elects. arrivals is the last
 // value that thread read from the arrival counter with a relaxed load. Once it covers every CTA, the fence turns that
@@ -349,6 +351,7 @@ __device__ __forceinline__ void rotateIfAllArrived(
     }
 }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 // The fast residual + RMSNorm epilogue of both hops, after the copies of the residual and gamma have completed: the
 // residual added in BF16, the BF16 squares summed in FP32 in element order and over the cluster, (x * rsqrt) * gamma
 // rounded to BF16, the residual output stored after the exchange of the sums (the complete-tx of each st.async
@@ -389,6 +392,7 @@ __device__ __forceinline__ void hopEpilogue(HopKernelParams const& params, GlmLa
         rotateLamportFlags(flag, arrivals, bytesToClearPerStage);
     }
 }
+#endif
 
 // One row per cluster, eight elements per thread, the clusters' CTAs covering the row exactly. Each CTA counts its
 // own arrival (GlmLamportFlags) and the thread that rotates the flags tracks the arrival counter in its poll. The
