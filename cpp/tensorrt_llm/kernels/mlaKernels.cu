@@ -1850,6 +1850,7 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 
     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing separate qkv to FP8");
 
+    static bool const useQGrid = getBoolEnv("TRTLLM_MLA_CTX_Q_GRID");
     if (params.acc_q_len > 0)
     {
         // The Q tensor has layout of [num_tokens, head_num, 576] in the absorption mode.
@@ -1862,6 +1863,11 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                 constexpr int threads_per_block = 288;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
                 dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                if (useQGrid)
+                {
+                    constexpr int qTokensPerBlock = threads_per_block / (576 * sizeof(T) / 16);
+                    grid.x = divUp(params.acc_q_len, qTokensPerBlock);
+                }
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
@@ -1881,6 +1887,11 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                 constexpr int threads_per_block = 256;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
                 dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                if (useQGrid)
+                {
+                    constexpr int qTokensPerBlock = threads_per_block / (512 * sizeof(T) / 16);
+                    grid.x = divUp(params.acc_q_len, qTokensPerBlock);
+                }
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
