@@ -257,6 +257,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.qPtr = runnerParams.qPtr;
         tllmRunnerParams.kPtr = runnerParams.kPtr;
         tllmRunnerParams.vPtr = runnerParams.vPtr;
+        tllmRunnerParams.mVTokenStrideInBytes = runnerParams.vStrideInBytes;
         tllmRunnerParams.kvPtr = kvPoolPtr;
         tllmRunnerParams.kvSfPtr = kvSfPoolPtr;
         tllmRunnerParams.qkvPtr = runnerParams.qkvPtr;

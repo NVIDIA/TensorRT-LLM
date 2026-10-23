@@ -17,10 +17,12 @@ Two levels, on purpose:
   architecture family does.
 * The routing module's ``route`` owns the rest of the decision as one
   forward-reading tree over the facts that fix which code runs: the
-  checkpoint's config, the parallel mapping, the GPU's compute capability and
-  the speculative-decoding config. It returns the target class, or raises
-  :class:`NoTarget` with the reason in words. Reading that one file tells you
-  where any configuration lands.
+  checkpoint's config, the parallel mapping, the GPU's compute capability, the
+  speculative-decoding config and the KV-cache algorithm the engine will run
+  with. It also receives the ``ModelConfig`` and the LLM arguments, from which a
+  family derives any other engine choice its targets depend on. It returns the
+  target class, or raises :class:`NoTarget` with the reason in words. Reading
+  that one file tells you where any configuration lands.
 
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which code runs, so a
@@ -195,6 +197,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             _device_compute_capability(),
             config.spec_config,
             _kv_cache_quant_algo(config, llm_args),
+            model_config=config,
+            llm_args=llm_args,
         )
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:

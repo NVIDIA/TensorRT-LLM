@@ -24,10 +24,27 @@ from tensorrt_llm.serve.serving_extensions import (
     ServingExtension,
     apply_model_chat_extensions,
     register_serving_extension,
+    required_tool_choice_mode,
     structured_output_format_for,
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "model_type,expected",
+    [
+        ("kimi_k3", "template"),
+        ("nemotron_h_omni", "grammar"),
+        ("nemotron_h", "grammar"),
+        ("qwen3", None),
+        ("qwen3_next", None),
+        ("unknown", None),
+        (None, None),
+    ],
+)
+def test_required_tool_choice_mode(model_type, expected):
+    assert required_tool_choice_mode(model_type) == expected
 
 
 @pytest.fixture
@@ -63,6 +80,11 @@ class TestChatExtensionDispatch:
     def test_unregistered_model_type_is_a_no_op(self, scratch_extension, model_type) -> None:
         apply_model_chat_extensions(SimpleNamespace(), model_type)
         assert scratch_extension.cls.applied_requests == []
+
+
+class TestRequiredToolChoiceDispatch:
+    def test_registered_extension_defaults_to_unsupported(self, scratch_extension) -> None:
+        assert required_tool_choice_mode(scratch_extension.model_key) is None
 
 
 class TestStructuredOutputDispatch:
@@ -122,7 +144,7 @@ class TestStructuredOutputDispatch:
 
 
 class TestBuiltinExtensions:
-    """The in-tree Kimi K3 and gpt-oss extensions resolve through the registry."""
+    """Built-in extensions resolve through the registry."""
 
     @pytest.fixture
     def clean_registry(self, monkeypatch):
@@ -151,6 +173,13 @@ class TestBuiltinExtensions:
 
         assert isinstance(hook.__self__, KimiK3ServingExtension)
         assert isinstance(serving_extensions._BY_MODEL_TYPE["kimi_k3"], KimiK3ServingExtension)
+
+    @pytest.mark.parametrize(
+        "model_type,expected",
+        [("kimi_k3", "template"), ("nemotron_h", "grammar"), ("nemotron_h_omni", "grammar")],
+    )
+    def test_required_tool_choice_loads_builtins(self, clean_registry, model_type, expected):
+        assert required_tool_choice_mode(model_type) == expected
 
     def test_gpt_oss_resolves_to_gpt_oss_extension(self, clean_registry) -> None:
         hook = structured_output_format_for("gpt_oss")
@@ -321,6 +350,7 @@ class TestOpenAIChatIntegration:
         )
 
         def generate_async(*, inputs, **kwargs):
+            rendered["generation"] = kwargs
             return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
 
         server = object.__new__(OpenAIServer)
@@ -335,6 +365,7 @@ class TestOpenAIChatIntegration:
         server.tool_parser = None
         server.tool_call_id_type = "random"
         server.multimodal_server_config = None
+        server._input_proc_executor = None
         server.generator = SimpleNamespace(
             args=SimpleNamespace(
                 gather_generation_logits=False,
@@ -364,6 +395,7 @@ class TestOpenAIChatIntegration:
         rendered["create_chat_response"] = server._create_chat_response
 
         app = FastAPI()
+        app.state.server = server
         app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
         return TestClient(app), events, rendered
 
@@ -437,6 +469,272 @@ class TestOpenAIChatIntegration:
         # _create_chat_response(promise, postproc_params, raw_request, ...)
         postproc_params = rendered["create_chat_response"].call_args.args[1]
         assert postproc_params.postproc_args.num_prompt_tokens_offset == 5
+
+    @pytest.fixture(params=["nemotron_h_omni", "nemotron_h"])
+    def required_chat_client(self, chat_client, monkeypatch, request):
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        client, events, rendered = chat_client
+        server = client.app.state.server
+        type(server.model_config).model_type = request.param
+        server.tool_parser = "qwen3_coder"
+        server.generator.args.reasoning_parser = "nemotron-v3"
+        server.generator.args.guided_decoding_backend = "xgrammar"
+
+        async def render_prompt(**kwargs):
+            thinking = rendered.get("thinking", True)
+            return "<|im_start|>assistant\n<think>" + ("\n" if thinking else "</think>")
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
+        return client, server, rendered
+
+    @staticmethod
+    def required_body():
+        return {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "tools": [{"type": "function", "function": {"name": "ping"}}],
+            "tool_choice": "required",
+            "max_tokens": 64,
+        }
+
+    def test_required_template_mode_uses_kimi_extension(self, chat_client, monkeypatch):
+        from tensorrt_llm.serve import chat_utils
+
+        # Keep text-only routing independent of multimodal model initialization.
+        monkeypatch.setattr(
+            chat_utils.MULTIMODAL_PLACEHOLDER_REGISTRY, "get_content_format", lambda _: None
+        )
+        client, _, rendered = chat_client
+        server = client.app.state.server
+        type(server.model_config).model_type = "kimi_k3"
+        server.tool_parser = "kimi_k3"
+        server.generator.args.reasoning_parser = "kimi_k3"
+        server.generator.args.guided_decoding_backend = None
+
+        response = client.post("/v1/chat/completions", json=self.required_body())
+
+        assert response.status_code == 200, response.text
+        assert rendered["chat_template_kwargs"]["tool_choice"] == "required"
+        assert rendered["generation"]["sampling_params"].guided_decoding is None
+        postproc = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc.tool_parser_grammar_constrained is False
+
+    def test_required_grammar_admission_uses_extension_hook(self, required_chat_client):
+        client, server, rendered = required_chat_client
+        model_type = "required-grammar-test-model"
+        type(server.model_config).model_type = model_type
+
+        @register_serving_extension(model_types=(model_type,))
+        class RequiredGrammarExtension(ServingExtension):
+            def required_tool_choice_mode(self):
+                return "grammar"
+
+        try:
+            response = client.post("/v1/chat/completions", json=self.required_body())
+        finally:
+            serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
+
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is not None
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("workers", [0, 4])
+    def test_required_attaches_mandatory_grammar(self, required_chat_client, thinking, workers):
+        import xgrammar
+
+        client, server, rendered = required_chat_client
+        rendered["thinking"] = thinking
+        server.generator.args.num_postprocess_workers = workers
+        body = self.required_body()
+        body["chat_template_kwargs"] = {"enable_thinking": not thinking}
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200, response.text
+        params = rendered["generation"]["sampling_params"].guided_decoding
+        assert params is not None
+        compiler = xgrammar.GrammarCompiler(
+            xgrammar.TokenizerInfo(
+                [bytes([i]) for i in range(256)] + [b"<EOS>"], stop_token_ids=[256]
+            )
+        )
+        compiled = compiler.compile_structural_tag(params.structural_tag)
+        matcher = xgrammar.GrammarMatcher(compiled)
+        if thinking:
+            assert matcher.accept_string("Considering.</think>")
+        assert not matcher.accept_token(256)
+        assert matcher.accept_string("<tool_call>\n<function=ping>\n</function>\n</tool_call>")
+        assert matcher.accept_token(256)
+        postproc = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc.chat_template_kwargs["enable_thinking"] is thinking
+        assert postproc.tool_parser_grammar_constrained is True
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"tools": []},
+            {"prompt_token_ids": [1, 2]},
+            {"prompt_token_ids_b64": "AQAAAA=="},
+            {"add_generation_prompt": False},
+            {"disaggregated_params": {"request_type": "context_only"}},
+            {"response_format": {"type": "json_object"}},
+        ],
+    )
+    def test_required_rejects_conflicting_requests(self, required_chat_client, change):
+        client, server, rendered = required_chat_client
+        response = client.post("/v1/chat/completions", json={**self.required_body(), **change})
+        # The bare app uses FastAPI's 422 for request-schema errors.
+        expected_status = 422 if change.get("tools") == [] else 400
+        assert response.status_code == expected_status, response.text
+        assert "generation" not in rendered
+
+    @pytest.mark.parametrize(
+        "model_type,parser,backend",
+        [
+            ("qwen3", "qwen3_coder", "xgrammar"),
+            ("qwen3_moe", "qwen3_coder", "xgrammar"),
+            ("qwen3_next", "qwen3_coder", "xgrammar"),
+            ("nemotron_h_omni", "qwen3", "xgrammar"),
+            ("nemotron_h_omni", None, "xgrammar"),
+            ("nemotron_h_omni", "qwen3_coder", None),
+            ("nemotron_h_omni", "qwen3_coder", "llguidance"),
+        ],
+    )
+    def test_required_rejects_unsupported_configuration(
+        self, required_chat_client, model_type, parser, backend
+    ):
+        client, server, rendered = required_chat_client
+        type(server.model_config).model_type = model_type
+        server.tool_parser = parser
+        server.generator.args.guided_decoding_backend = backend
+        response = client.post("/v1/chat/completions", json=self.required_body())
+        assert response.status_code == 400, response.text
+        assert "generation" not in rendered
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {"type": "object", "properties": {}, "additionalProperties": True},
+            {"type": "object", "properties": {}, "additionalProperties": {}},
+            {"type": "object", "required": "x"},
+        ],
+    )
+    def test_required_schema_errors_are_client_errors(self, required_chat_client, schema):
+        client, server, rendered = required_chat_client
+        body = self.required_body()
+        body["tools"][0]["function"]["parameters"] = schema
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 400
+        assert "generation" not in rendered
+        assert "EBNF" not in response.text
+        assert "json_schema_converter" not in response.text
+
+    @pytest.mark.parametrize(
+        "reasoning_parser", ["NEMOTRON-V3", "nano-v3", "NANO-V3", "k-exaone", "K-EXAONE"]
+    )
+    def test_required_uses_parser_capabilities(
+        self, required_chat_client, monkeypatch, reasoning_parser
+    ):
+        from tensorrt_llm.serve.render import chat as render_chat_module
+        from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import Qwen3CoderToolParser
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+
+        client, server, rendered = required_chat_client
+        monkeypatch.setitem(ToolParserFactory.parsers, "custom_xml", Qwen3CoderToolParser)
+        server.tool_parser = "CUSTOM_XML"
+        server.generator.args.reasoning_parser = reasoning_parser
+
+        async def render_prompt(**kwargs):
+            return "<assistant></think>\n"
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
+        response = client.post("/v1/chat/completions", json=self.required_body())
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is not None
+        args = server._create_chat_response.call_args.args[1].postproc_args
+        assert args.chat_template_kwargs["enable_thinking"] is False
+
+    @pytest.mark.parametrize("reasoning_parser", [None, "deepseek-r1"])
+    def test_required_reports_missing_reasoning_capability(
+        self, required_chat_client, monkeypatch, reasoning_parser
+    ):
+        from unittest.mock import AsyncMock
+
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        client, server, rendered = required_chat_client
+        server.generator.args.reasoning_parser = reasoning_parser
+        render_prompt = AsyncMock()
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
+
+        response = client.post("/v1/chat/completions", json=self.required_body())
+
+        assert response.status_code == 400, response.text
+        assert "need a reasoning parser that resolves its mode" in response.text
+        assert "--reasoning_parser nemotron-v3" in response.text
+        render_prompt.assert_not_called()
+        assert "generation" not in rendered
+
+    def test_required_rejects_unresolved_prompt(self, required_chat_client, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        client, server, rendered = required_chat_client
+        monkeypatch.setattr(
+            render_chat_module, "async_apply_chat_template", AsyncMock(return_value="assistant:")
+        )
+        response = client.post("/v1/chat/completions", json=self.required_body())
+        assert response.status_code == 400, response.text
+        assert (
+            "Cannot resolve required-tool reasoning state from the rendered prompt" in response.text
+        )
+        assert "--reasoning_parser" not in response.text
+        assert "generation" not in rendered
+
+    @pytest.mark.parametrize("reasoning_parser", ["nemotron-v3", "nano-v3", "k-exaone"])
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("tool_choice", [None, "auto"])
+    def test_non_required_chat_resolves_mode_from_prompt(
+        self, chat_client, monkeypatch, reasoning_parser, thinking, tool_choice
+    ):
+        from unittest.mock import AsyncMock
+
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        client, _, rendered = chat_client
+        server = client.app.state.server
+        server.generator.args.reasoning_parser = reasoning_parser
+        prompt = "<|im_start|>assistant\n<think>" + ("\n" if thinking else "</think>")
+        monkeypatch.setattr(
+            render_chat_module, "async_apply_chat_template", AsyncMock(return_value=prompt)
+        )
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "chat_template_kwargs": {"thinking": not thinking, "enable_thinking": not thinking},
+        }
+        if tool_choice is not None:
+            body.update(tools=self.required_body()["tools"], tool_choice=tool_choice)
+            server.tool_parser = "qwen3_coder"
+
+        response = client.post("/v1/chat/completions", json=body)
+
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is None
+        postproc = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc.chat_template_kwargs["thinking"] is thinking
+        assert postproc.chat_template_kwargs["enable_thinking"] is thinking
+        assert postproc.tool_parser_grammar_constrained is False
+
+    def test_auto_does_not_attach_required_grammar(self, required_chat_client):
+        client, server, rendered = required_chat_client
+        response = client.post(
+            "/v1/chat/completions", json={**self.required_body(), "tool_choice": "auto"}
+        )
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is None
+        postproc = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc.tool_parser_grammar_constrained is False
 
 
 def _chat_request(**overrides):
