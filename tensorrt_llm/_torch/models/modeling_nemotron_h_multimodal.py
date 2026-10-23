@@ -57,6 +57,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
@@ -2865,6 +2866,7 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     _supports_flash_attn = True
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
