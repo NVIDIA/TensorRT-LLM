@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .fp4_block_scale_moe_renorm_routed import ACT_SWIGLU, ROUTING_RENORMALIZE, _ckpt
+from .fp4_block_scale_moe_renorm_routed import _ckpt, run_renorm_moe
 from .fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renorm_routed as _finalized
 
 
@@ -109,34 +108,21 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
         top_k: int,
         intermediate_size: int,
     ) -> tuple:
-        rows, topk_weights, topk_rows = torch.ops.trtllm.fp4_block_scale_moe_runner(
+        rows, topk_weights, topk_rows = run_renorm_moe(
             routing_logits,
-            None,
             hidden_states,
             hidden_states_scale,
             gemm1_weights,
             gemm1_weights_scale,
-            None,
-            None,
-            None,
-            None,
             gemm2_weights,
             gemm2_weights_scale,
-            None,
             output1_scale_scalar,
             output1_scale_gate_scalar,
             output2_scale_scalar,
             num_experts,
             top_k,
-            None,
-            None,
             intermediate_size,
-            0,
-            num_experts,
-            None,
-            ROUTING_RENORMALIZE,
             False,
-            ACT_SWIGLU,
         )
         return rows, topk_weights, topk_rows
 

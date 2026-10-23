@@ -7,6 +7,8 @@ combine, in one trtllm-gen call."""
 
 from __future__ import annotations
 
+from functools import cache
+
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
@@ -14,6 +16,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner as _pre_routed,
 )
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+from tensorrt_llm._torch.utils import last_positive_power_of_2
 
 from .renorm_moe_routing_op import renorm_moe_routing_op as _renorm
 
@@ -28,6 +33,167 @@ ACT_SWIGLU = 0
 #: read stale routing buffers. So the guard admits what was measured, not what
 #: the tier list might also cover.
 CERTIFIED_PAIRS = frozenset({(512, 10)})
+
+#: The geometry `DECODE_TACTICS` was measured on: (num_experts, top_k, hidden, intermediate).
+DECODE_TACTICS_GEOMETRY = (512, 10, 2560, 640)
+
+#: trtllm-gen tactic `(tileN, FC1 x FC2 config index)` per AutoTuner bucket (the row count
+#: rounded down to a power of two) for the decode row counts, at `DECODE_TACTICS_GEOMETRY`.
+#: Each is the fastest valid tactic of its bucket on GB300 over a 48-layer chain of distinct
+#: expert stacks (HBM-cold weights, as a decode step streams them), with router logits whose
+#: distinct experts per layer match serving's routing skew, in one CUDA graph with PDL. The
+#: tactics compared per bucket (the fastest few, the runner's default, the AutoTuner's picks)
+#: all gave bitwise the same output, so the choice moves time only; the entry's test holds
+#: each pinned tactic bitwise to the AutoTuner path.
+#:
+#: A call outside AutoTuner tuning mode whose bucket is listed runs its tactic directly; any
+#: other call goes through `torch.ops.trtllm.fp4_block_scale_moe_runner` (the AutoTuner), so
+#: the larger buckets are still profiled at warmup. The config index addresses the runner's
+#: compiled cubin list: `_pinned_tactic` refuses a tactic the runner does not list as valid.
+DECODE_TACTICS: dict[int, tuple[int, int]] = {
+    1: (8, 55),
+    2: (8, 53),
+    4: (8, 44),
+    8: (8, 0),
+    16: (8, 44),
+    32: (8, 44),
+    64: (16, 38),
+    128: (16, 36),
+    256: (32, 32),
+    512: (32, 32),
+    1024: (64, 5),
+}
+
+
+@cache
+def _runner():
+    """The SwiGlu trtllm-gen runner object the AutoTuner path also uses (one per act type;
+    the other constructor arguments only shape the AutoTuner's tuning config)."""
+    num_experts, top_k, _, intermediate = DECODE_TACTICS_GEOMETRY
+    return FP4BlockScaleMoERunner(
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=ROUTING_RENORMALIZE,
+        do_finalize=True,
+        act_type=ACT_SWIGLU,
+    ).get_runner()
+
+
+@cache
+def _checked_tactic(bucket: int) -> tuple[int, int]:
+    """`DECODE_TACTICS[bucket]`, once confirmed valid for the bucket's row count."""
+    tactic = DECODE_TACTICS[bucket]
+    num_experts, top_k, hidden, intermediate = DECODE_TACTICS_GEOMETRY
+    valid = _runner().get_valid_configs(top_k, hidden, intermediate, num_experts, bucket)
+    assert list(tactic) in [list(t) for t in valid], (
+        f"pinned tactic {tactic} for {bucket} rows is not a valid config of this build's "
+        "trtllm-gen FP4 MoE runner; re-measure DECODE_TACTICS"
+    )
+    return tactic
+
+
+def _pinned_tactic(
+    num_tokens: int, num_experts: int, top_k: int, hidden: int, intermediate: int
+) -> tuple[int, int] | None:
+    """The pinned tactic for this call, or None for the AutoTuner path."""
+    if (num_experts, top_k, hidden, intermediate) != DECODE_TACTICS_GEOMETRY:
+        return None
+    bucket = last_positive_power_of_2(num_tokens)
+    if bucket not in DECODE_TACTICS or AutoTuner.get().is_tuning_mode:
+        return None
+    return _checked_tactic(bucket)
+
+
+def run_renorm_moe(
+    routing_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    do_finalize: bool,
+) -> list[torch.Tensor]:
+    """One logits-routed trtllm-gen FP4 MoE call (Renormalize, SwiGlu, no expert
+    parallelism): `[out]` with `do_finalize`, else `[rows, topk_weights, topk_rows]`. A
+    `DECODE_TACTICS` bucket runs its pinned tactic; any other call is the AutoTuner's."""
+    tactic = _pinned_tactic(
+        hidden_states.shape[0], num_experts, top_k, hidden_states.shape[1] * 2, intermediate_size
+    )
+    if tactic is None:
+        return torch.ops.trtllm.fp4_block_scale_moe_runner(
+            routing_logits,
+            None,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            None,
+            None,
+            None,
+            None,
+            gemm2_weights,
+            gemm2_weights_scale,
+            None,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            None,
+            None,
+            intermediate_size,
+            0,
+            num_experts,
+            None,
+            ROUTING_RENORMALIZE,
+            do_finalize,
+            ACT_SWIGLU,
+        )
+    return _runner().run_moe(
+        routing_logits,
+        None,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        None,
+        None,
+        None,
+        None,
+        gemm2_weights,
+        gemm2_weights_scale,
+        None,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        num_experts,
+        top_k,
+        None,
+        None,
+        intermediate_size,
+        0,
+        num_experts,
+        None,
+        ROUTING_RENORMALIZE,
+        do_finalize,
+        list(tactic),
+        None,
+        None,
+        None,
+    )
 
 
 def _ckpt(tokens: int, dist: str = "randn") -> dict:
@@ -96,6 +262,12 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
 
     Not certified: fp32 logits (the runner's other accepted logits dtype).
 
+    Tactics: a call of 1..2047 rows outside AutoTuner tuning mode runs the
+    `DECODE_TACTICS` tactic of its power-of-two bucket (measured HBM-cold with
+    serving's routing skew); the AutoTuner, which profiles one layer's experts
+    warm in L2 under uniform routing, takes the rest and the warmup's tuning
+    pass. The test holds each pinned tactic bitwise to the AutoTuner path.
+
     Hard limits
       T            certified at 1, 128 and 16384 (max_num_tokens of the tuned config).
                    Autotuner buckets stop at 8192, the op's
@@ -120,34 +292,21 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
         top_k: int,
         intermediate_size: int,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.fp4_block_scale_moe_runner(
+        return run_renorm_moe(
             routing_logits,
-            None,
             hidden_states,
             hidden_states_scale,
             gemm1_weights,
             gemm1_weights_scale,
-            None,
-            None,
-            None,
-            None,
             gemm2_weights,
             gemm2_weights_scale,
-            None,
             output1_scale_scalar,
             output1_scale_gate_scalar,
             output2_scale_scalar,
             num_experts,
             top_k,
-            None,
-            None,
             intermediate_size,
-            0,
-            num_experts,
-            None,
-            ROUTING_RENORMALIZE,
             True,
-            ACT_SWIGLU,
         )[0]
 
     def reference(
