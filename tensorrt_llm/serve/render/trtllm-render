@@ -11,8 +11,28 @@ script outside the package so that importing ``tensorrt_llm`` anywhere else is u
 import ctypes
 import glob
 import os
+import re
 import sys
 import warnings
+
+
+def _version(path: str) -> list:
+    return [int(part) for part in re.findall(r"\d+", path)]
+
+
+def _stub_candidates() -> list:
+    """Toolkit stubs, most preferred first: ``$CUDA_HOME``, ``/usr/local/cuda``, then the newest versioned."""
+    roots = [os.environ["CUDA_HOME"]] if os.environ.get("CUDA_HOME") else []
+    roots.append("/usr/local/cuda")
+    roots += sorted(glob.glob("/usr/local/cuda-*"), key=_version, reverse=True)
+    candidates, seen = [], set()
+    for root in roots:
+        for pattern in ("lib64/stubs/libcuda.so", "targets/*/lib/stubs/libcuda.so"):
+            for stub in sorted(glob.glob(os.path.join(root, pattern))):
+                if os.path.realpath(stub) not in seen:
+                    seen.add(os.path.realpath(stub))
+                    candidates.append(stub)
+    return candidates
 
 
 def _load_cuda_stub_if_needed() -> None:
@@ -21,25 +41,24 @@ def _load_cuda_stub_if_needed() -> None:
         return
     except OSError:
         pass
-    roots = [os.environ["CUDA_HOME"]] if os.environ.get("CUDA_HOME") else []
-    roots.append("/usr/local/cuda*")
-    stubs = [
-        stub
-        for root in roots
-        for pattern in ("lib64/stubs/libcuda.so", "targets/*/lib/stubs/libcuda.so")
-        for stub in sorted(glob.glob(os.path.join(root, pattern)))
-    ]
-    if not stubs:
-        sys.exit(
-            "trtllm-render: libcuda.so.1 not found and no CUDA toolkit stub under "
-            "$CUDA_HOME or /usr/local/cuda*; install the CUDA toolkit stubs or expose a GPU driver"
+    failures = []
+    for stub in _stub_candidates():
+        try:
+            ctypes.CDLL(stub, mode=ctypes.RTLD_GLOBAL)
+        except OSError as error:
+            failures.append(f"{stub}: {error}")
+            continue
+        warnings.filterwarnings("ignore", message="CUDA initialization:", category=UserWarning)
+        print(
+            f"trtllm-render: no GPU driver found; running CPU-only with the CUDA toolkit stub ({stub}).",
+            file=sys.stderr,
+            flush=True,
         )
-    ctypes.CDLL(stubs[0], mode=ctypes.RTLD_GLOBAL)
-    warnings.filterwarnings("ignore", message="CUDA initialization:", category=UserWarning)
-    print(
-        f"trtllm-render: no GPU driver found; running CPU-only with the CUDA toolkit stub ({stubs[0]}).",
-        file=sys.stderr,
-        flush=True,
+        return
+    sys.exit(
+        "trtllm-render: libcuda.so.1 not found and no usable CUDA toolkit stub under $CUDA_HOME or "
+        "/usr/local/cuda*; install the CUDA toolkit stubs or expose a GPU driver"
+        + "".join(f"\n  tried {failure}" for failure in failures)
     )
 
 

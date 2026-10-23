@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import ctypes
+import fnmatch
 import glob
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,11 +33,9 @@ import time
 import urllib.error
 import urllib.request
 import warnings
-from pathlib import Path
 
 import pytest
 
-import tensorrt_llm
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.serve.render import RenderResources, fingerprints_match, render_chat
 from tensorrt_llm.serve.render.__main__ import build_parser
@@ -184,44 +184,82 @@ class TestCommandLine:
 class TestCpuOnlyStartup:
     """The renderer builds with no GPU, no weights and no server or executor object."""
 
-    def test_the_launcher_loads_the_cuda_stub_only_when_the_driver_is_missing(
+    def test_the_launcher_loads_a_cuda_stub_only_when_the_driver_is_missing(
         self, monkeypatch
     ) -> None:
-        path = Path(tensorrt_llm.__file__).parent / "serve" / "render" / "trtllm-render"
-        loader = importlib.machinery.SourceFileLoader("trtllm_render_launcher", str(path))
+        path = shutil.which("trtllm-render")
+        assert path is not None, "trtllm-render is not installed"
+        # The installed launcher starts the renderer end to end.
+        result = subprocess.run(
+            [sys.executable, path, "--help"], capture_output=True, text=True, timeout=600
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "--model" in result.stdout
+
+        loader = importlib.machinery.SourceFileLoader("trtllm_render_launcher", path)
         launcher = importlib.util.module_from_spec(
             importlib.util.spec_from_loader(loader.name, loader)
         )
         loader.exec_module(launcher)
 
-        state = {"driver": True, "stubs": ["/cuda/lib64/stubs/libcuda.so"]}
+        stub = "{}/lib64/stubs/libcuda.so"
+        installed = ["/usr/local/cuda-12.4", "/usr/local/cuda-13.0"] + [
+            stub.format(root)
+            for root in (
+                "/usr/local/cuda",
+                "/usr/local/cuda-12.4",
+                "/usr/local/cuda-13.0",
+                "/opt/cuda",
+            )
+        ]
+        driver_present = True
+        unloadable = set()
         loaded = []
 
         def cdll(name, mode=0):
             loaded.append((name, mode))
-            if name == "libcuda.so.1" and not state["driver"]:
+            if (name == "libcuda.so.1" and not driver_present) or name in unloadable:
                 raise OSError(name)
 
+        def fake_glob(pattern):
+            depth = len(pattern.split("/"))
+            return [
+                p for p in installed if len(p.split("/")) == depth and fnmatch.fnmatch(p, pattern)
+            ]
+
+        def load():
+            loaded.clear()
+            launcher._load_cuda_stub_if_needed()
+
         monkeypatch.setattr(ctypes, "CDLL", cdll)
-        monkeypatch.setattr(glob, "glob", lambda pattern: list(state["stubs"]))
+        monkeypatch.setattr(glob, "glob", fake_glob)
+        monkeypatch.setattr(os.path, "realpath", lambda p: p)
         monkeypatch.delenv("CUDA_HOME", raising=False)
         stderr = io.StringIO()
         monkeypatch.setattr(sys, "stderr", stderr)
 
         with warnings.catch_warnings():
-            launcher._load_cuda_stub_if_needed()
+            load()
             assert loaded == [("libcuda.so.1", 0)]
             assert stderr.getvalue() == ""
 
-            loaded.clear()
-            state["driver"] = False
-            launcher._load_cuda_stub_if_needed()
-            assert loaded[-1] == ("/cuda/lib64/stubs/libcuda.so", ctypes.RTLD_GLOBAL)
+            driver_present = False
+            load()
+            assert loaded[-1] == (stub.format("/usr/local/cuda"), ctypes.RTLD_GLOBAL)
             assert "CPU-only" in stderr.getvalue()
 
-            state["stubs"] = []
-            with pytest.raises(SystemExit, match="libcuda.so.1 not found"):
-                launcher._load_cuda_stub_if_needed()
+            monkeypatch.setenv("CUDA_HOME", "/opt/cuda")
+            load()
+            assert loaded[-1][0] == stub.format("/opt/cuda")
+
+            monkeypatch.delenv("CUDA_HOME")
+            unloadable.add(stub.format("/usr/local/cuda"))
+            load()
+            assert loaded[-1][0] == stub.format("/usr/local/cuda-13.0")
+
+            unloadable.update(p for p in installed if p.endswith("libcuda.so"))
+            with pytest.raises(SystemExit, match=r"tried /usr/local/cuda/lib64/stubs/libcuda.so"):
+                load()
 
     def test_building_the_app_initializes_no_cuda_and_imports_no_server(self, checkpoint) -> None:
         code = textwrap.dedent(
