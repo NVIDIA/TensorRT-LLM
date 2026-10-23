@@ -155,13 +155,13 @@ class BaseWorker(GenerationExecutor):
             raise ValueError(f"Unsupported backend config: {self._backend}")
 
         from tensorrt_llm._torch.pyexecutor.model_loader import \
-            _construct_checkpoint_loader
+            construct_checkpoint_loader
         from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
             create_py_executor
 
         self._configure_device()
         self.mapping = self.llm_args.parallel_config.to_mapping()
-        self.checkpoint_loader = _construct_checkpoint_loader(
+        self.checkpoint_loader = construct_checkpoint_loader(
             self.llm_args.checkpoint_loader,
             self.llm_args.checkpoint_format,
             mx_config=self.llm_args.mx_config,
