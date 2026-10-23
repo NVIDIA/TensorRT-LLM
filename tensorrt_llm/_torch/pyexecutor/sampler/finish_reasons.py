@@ -513,6 +513,17 @@ class FinishReasonsHandler:
             past_tokens: The past tokens device tensor
               Shape: [max_stop_word_length - 1, max_beam_width]
         """
+        stop_words = request.py_stop_words_list
+        if request.py_beam_width > 1 and stop_words and all(len(word) == 1 for word in stop_words):
+            # Single-token stops only inspect the new token. Keep the shared
+            # history shape for batches that also contain multi-token stops.
+            return torch.zeros(
+                max(0, self._max_stop_word_length - 1),
+                self._max_beam_width,
+                device="cuda",
+                dtype=torch.int32,
+            )
+
         past_tokens_host = torch.zeros(
             max(0, self._max_stop_word_length - 1),
             self._max_beam_width,
