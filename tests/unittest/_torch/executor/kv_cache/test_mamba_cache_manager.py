@@ -2005,6 +2005,92 @@ def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
     assert request.expect_snapshot_points == [128, 137, 150]
 
 
+def _fp4_mla_snapshot_manager(**state_config) -> MambaHybridCacheManagerV2:
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.enable_block_reuse = True
+    mgr.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+    mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
+    mgr._branch_snapshot_points = {}
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_config=MambaStateConfig(**state_config),
+    )
+    return mgr
+
+
+def test_v2_hybrid_fp4_mla_snapshot_points_align_to_cache_blocks():
+    mgr = _fp4_mla_snapshot_manager(
+        periodic_snapshot_interval=100,
+        additional_snapshot_offsets_from_end=[0, 13],
+    )
+    requests = [
+        SimpleNamespace(prompt_len=350, expect_snapshot_points=[]),
+        SimpleNamespace(prompt_len=100, expect_snapshot_points=[]),
+    ]
+
+    mgr.prepare_expect_snapshot_points(requests)
+
+    # 100 and 87 lie inside the first block and can never be reused; 200,
+    # 300, 337, and 350 move down to the block that a reuse would end on.
+    assert [request.expect_snapshot_points for request in requests] == [[128, 256], []]
+
+
+def test_v2_hybrid_without_fp4_mla_keeps_unaligned_snapshot_points():
+    mgr = _fp4_mla_snapshot_manager(periodic_snapshot_interval=100)
+    mgr._attention_cache_layout_policy = None
+    request = SimpleNamespace(prompt_len=350, expect_snapshot_points=[])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [100, 200, 300]
+
+
+def test_v2_hybrid_fp4_mla_branch_snapshot_point_aligns_prompt_end():
+    mgr = _fp4_mla_snapshot_manager(periodic_snapshot_interval=0, enable_branch_snapshot=True)
+    request = SimpleNamespace(
+        py_request_id=3,
+        prompt_len=300,
+        context_current_position=0,
+        expect_snapshot_points=[],
+    )
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    # The branch snapshot falls back to the prompt end, which FP4 MLA can
+    # reuse only up to its last full block.
+    assert request.expect_snapshot_points == [256]
+
+
+@pytest.mark.parametrize("fp4_mla", [False, True])
+def test_v2_hybrid_fp4_mla_advances_history_with_pending_snapshot(fp4_mla: bool):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.enable_block_reuse = True
+    mgr.is_draft = False
+    mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
+    mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy if fp4_mla else None
+    mgr.conversation_manager = None
+    request = SimpleNamespace(
+        py_request_id=7,
+        is_dummy_request=False,
+        context_current_position=128,
+        context_remaining_length=172,
+        expect_snapshot_points=[256],
+    )
+    kv_cache = SimpleNamespace(is_active=True, resize=MagicMock(return_value=True))
+    mgr.kv_cache_map = {request.py_request_id: kv_cache}
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+
+    mgr.update_context_resources(batch)
+
+    # Only the FP4 MLA HP ring needs the completed chunk's history before
+    # the pending snapshot at 256 commits.
+    if fp4_mla:
+        kv_cache.resize.assert_called_once_with(None, 128)
+    else:
+        kv_cache.resize.assert_not_called()
+
+
 def test_mamba_snapshot_rule_count_deduplicates_and_filters_unreachable_points():
     config = KvCacheConfig(
         enable_block_reuse=True,
