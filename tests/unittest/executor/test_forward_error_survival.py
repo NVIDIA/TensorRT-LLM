@@ -122,7 +122,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.inflight_req_ids = set()
     executor._transfer_held_failures = {}
     executor.is_shutdown = False
-    executor.dist = Mock(tp_size=1, world_size=1)
+    executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
 
     executor._disagg_coordinator = MagicMock()
     executor.resource_manager = MagicMock()
@@ -615,24 +615,40 @@ def test_terminate_request_defers_free_while_transfer_holds_a_claim():
 
 
 # ---------------------------------------------------------------------------
-# TP-wide forward-failure agreement (_agree_on_forward_failure)
+# Group-wide forward-failure agreement (_agree_on_forward_failure)
 # ---------------------------------------------------------------------------
 
 
-def _agreeing_executor(tp_size=2, enable_attention_dp=False):
+def _agreeing_executor(tp_size=2, cp_size=1, enable_attention_dp=False):
     """Executor shell exposing only what _agree_on_forward_failure touches."""
     executor = object.__new__(PyExecutor)
-    executor.dist = Mock(tp_size=tp_size, world_size=tp_size)
+    executor.dist = Mock(tp_size=tp_size, cp_size=cp_size, world_size=tp_size * cp_size)
     executor.enable_attention_dp = enable_attention_dp
+    executor.is_shutdown = False
+    executor._fatal_error = None
     executor._handle_errors = Mock()
     return executor
 
 
-def test_agreement_is_skipped_without_tp():
-    executor = _agreeing_executor(tp_size=1)
+def test_agreement_is_skipped_on_a_single_rank_group():
+    executor = _agreeing_executor(tp_size=1, cp_size=1)
     outputs = {"logits": object()}
     assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
-    executor.dist.tp_allgather.assert_not_called()
+    executor.dist.tp_cp_allgather.assert_not_called()
+
+
+def test_agreement_covers_pure_cp():
+    """Helix-style tp=1, cp>1 groups need the agreement too.
+
+    Only rank 0 emits responses there as well.
+    """
+    executor = _agreeing_executor(tp_size=1, cp_size=2)
+    executor.dist.tp_cp_allgather.return_value = [(None, False), ("boom on cp rank 1", False)]
+
+    result = PyExecutor._agree_on_forward_failure(executor, {"logits": object()})
+
+    assert result is None
+    executor.dist.tp_cp_allgather.assert_called_once_with((None, False), small_payload=True)
 
 
 def test_agreement_is_skipped_under_attention_dp():
@@ -640,47 +656,120 @@ def test_agreement_is_skipped_under_attention_dp():
     executor = _agreeing_executor(enable_attention_dp=True)
     outputs = {"logits": object()}
     assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
-    executor.dist.tp_allgather.assert_not_called()
+    executor.dist.tp_cp_allgather.assert_not_called()
 
 
 def test_agreement_failing_rank_broadcasts_its_error():
     """The failing rank contributes its message so rank 0 can emit responses."""
     executor = _agreeing_executor()
     executor._last_forward_error_msg = "boom on rank 1"
-    executor.dist.tp_allgather.return_value = [None, "boom on rank 1"]
+    executor.dist.tp_cp_allgather.return_value = [(None, False), ("boom on rank 1", False)]
 
     assert PyExecutor._agree_on_forward_failure(executor, None) is None
 
-    executor.dist.tp_allgather.assert_called_once_with("boom on rank 1", small_payload=True)
+    executor.dist.tp_cp_allgather.assert_called_once_with(
+        ("boom on rank 1", False), small_payload=True
+    )
     # _forward_step already ran _handle_errors on this rank.
     executor._handle_errors.assert_not_called()
 
 
 def test_agreement_healthy_rank_joins_peer_failure():
     executor = _agreeing_executor()
-    executor.dist.tp_allgather.return_value = [None, "boom on rank 1"]
+    executor.dist.tp_cp_allgather.return_value = [(None, False), ("boom on rank 1", False)]
 
     result = PyExecutor._agree_on_forward_failure(executor, {"logits": object()})
 
     assert result is None
-    executor.dist.tp_allgather.assert_called_once_with(None, small_payload=True)
-    executor._handle_errors.assert_called_once_with("TP peer forward failure: boom on rank 1")
+    executor.dist.tp_cp_allgather.assert_called_once_with((None, False), small_payload=True)
+    # Severity was already classified on the failing rank; the joining rank
+    # must not re-charge its own budget (else budgets and fatal decisions
+    # drift apart across ranks).
+    executor._handle_errors.assert_called_once_with(
+        "TP/CP peer forward failure: boom on rank 1", charge_budget=False
+    )
 
 
 def test_agreement_passes_through_a_healthy_iteration():
     executor = _agreeing_executor()
-    executor.dist.tp_allgather.return_value = [None, None]
+    executor.dist.tp_cp_allgather.return_value = [(None, False), (None, False)]
     outputs = {"logits": object()}
 
     assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
     executor._handle_errors.assert_not_called()
 
 
+def test_agreement_peer_fatal_drags_healthy_rank_into_shutdown():
+    """A peer's fatal classification must shut this rank down too."""
+    executor = _agreeing_executor()
+    executor.dist.tp_cp_allgather.return_value = [(None, False), ("CUDA OOM on rank 1", True)]
+
+    result = PyExecutor._agree_on_forward_failure(executor, {"logits": object()})
+
+    assert result is None
+    assert executor._fatal_error is not None
+    executor._handle_errors.assert_called_once_with(
+        "fatal forward failure on a TP/CP peer: CUDA OOM on rank 1", charge_budget=False
+    )
+
+
+def test_agreement_peer_fatal_escalates_a_nonfatal_failing_rank():
+    """A nonfatal-failing rank joins a peer's fatal classification.
+
+    Rank 0 failed transiently (nonfatal budget), rank 1 failed fatally:
+    both must reach the same shutdown decision.
+    """
+    executor = _agreeing_executor()
+    executor._last_forward_error_msg = "transient error on rank 0"
+    executor.dist.tp_cp_allgather.return_value = [
+        ("transient error on rank 0", False),
+        ("CUDA OOM on rank 1", True),
+    ]
+
+    assert PyExecutor._agree_on_forward_failure(executor, None) is None
+
+    assert executor._fatal_error is not None
+    executor._handle_errors.assert_called_once_with(
+        "transient error on rank 0", charge_budget=False
+    )
+
+
+def test_agreement_locally_fatal_rank_does_not_rehandle():
+    """The rank whose own _handle_errors already went fatal just reports."""
+    executor = _agreeing_executor()
+    executor._last_forward_error_msg = "CUDA OOM on rank 1"
+    executor._fatal_error = RuntimeError("Fatal error: CUDA OOM on rank 1")
+    executor.is_shutdown = True
+    executor.dist.tp_cp_allgather.return_value = [
+        ("transient error on rank 0", False),
+        ("CUDA OOM on rank 1", True),
+    ]
+
+    assert PyExecutor._agree_on_forward_failure(executor, None) is None
+
+    executor.dist.tp_cp_allgather.assert_called_once_with(
+        ("CUDA OOM on rank 1", True), small_payload=True
+    )
+    executor._handle_errors.assert_not_called()
+
+
+def test_agreement_graceful_shutdown_drain_is_not_fatal():
+    """is_shutdown alone (graceful drain) must not poison the gather."""
+    executor = _agreeing_executor()
+    executor.is_shutdown = True  # graceful shutdown, still draining
+    executor.dist.tp_cp_allgather.return_value = [(None, False), (None, False)]
+    outputs = {"logits": object()}
+
+    assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
+    executor.dist.tp_cp_allgather.assert_called_once_with((None, False), small_payload=True)
+    executor._handle_errors.assert_not_called()
+
+
 def _tp_loop_executor(monkeypatch):
     """Loop executor under plain TP=2 whose healthy forward meets a peer failure."""
     executor = _loop_executor(monkeypatch)
-    executor.dist = Mock(tp_size=2, world_size=2)
-    executor.dist.tp_allgather.return_value = [None, "peer forward failure"]
+    executor.dist = Mock(tp_size=2, cp_size=1, world_size=2)
+    executor.dist.tp_cp_allgather.return_value = [(None, False), ("peer forward failure", False)]
     executor._forward_step = Mock(return_value={"logits": Mock()})
     executor._handle_errors = Mock()
     return executor
@@ -693,8 +782,10 @@ def test_executor_loop_joins_tp_peer_failure(monkeypatch):
     PyExecutor._executor_loop(executor)
 
     executor._forward_step.assert_called_once()
-    executor.dist.tp_allgather.assert_called_once()
-    executor._handle_errors.assert_called_once_with("TP peer forward failure: peer forward failure")
+    executor.dist.tp_cp_allgather.assert_called_once()
+    executor._handle_errors.assert_called_once_with(
+        "TP/CP peer forward failure: peer forward failure", charge_budget=False
+    )
     executor._sample_async.assert_not_called()
     executor._update_request_states.assert_not_called()
     assert executor._event_loop_completed
@@ -707,8 +798,10 @@ def test_executor_loop_overlap_joins_tp_peer_failure(monkeypatch):
     PyExecutor._executor_loop_overlap(executor)
 
     executor._forward_step.assert_called_once()
-    executor.dist.tp_allgather.assert_called_once()
-    executor._handle_errors.assert_called_once_with("TP peer forward failure: peer forward failure")
+    executor.dist.tp_cp_allgather.assert_called_once()
+    executor._handle_errors.assert_called_once_with(
+        "TP/CP peer forward failure: peer forward failure", charge_budget=False
+    )
     executor._sample_async.assert_not_called()
     assert executor.previous_batch is None
     assert executor._event_loop_completed
