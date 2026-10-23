@@ -63,7 +63,13 @@ def parse_args():
 
 
 def generate_mpi_worker_config(
-    worker_config, allocations, env_config, disagg_hostname, disagg_port, output_path
+    worker_config,
+    allocations,
+    env_config,
+    disagg_hostname,
+    disagg_port,
+    output_path,
+    internal_request_auth_key=None,
 ):
     """Generate a config YAML compatible with ``trtllm-serve disaggregated_mpi_worker``."""
 
@@ -95,6 +101,9 @@ def generate_mpi_worker_config(
         "context_servers": ctx_section,
         "generation_servers": gen_section,
     }
+
+    if internal_request_auth_key is not None:
+        config["internal_request_auth_key"] = internal_request_auth_key
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w") as f:
@@ -291,6 +300,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
     print("=" * 72)
 
     server_config = convert_allocations_to_server_config(allocations)
+    server_config.update(config.get("server_config_extra", {}))
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config["hostname"]
@@ -311,6 +321,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
         disagg_server_hostname,
         disagg_server_port,
         mpi_config_base_path,
+        internal_request_auth_key=server_config.get("internal_request_auth_key"),
     )
 
     total_mpi_tasks = ctx_num * ctx_world_size + gen_num * gen_world_size

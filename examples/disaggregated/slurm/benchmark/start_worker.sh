@@ -1,4 +1,6 @@
 #! /bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -u
 set -e
 set -x
@@ -95,4 +97,4 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     ${trtllm_serve_cmd} ${model_path} \
         --host $(hostname) --port ${port} \
-        --config ${config_file}
+        --config ${config_file} --disagg_config "${log_dir}/server_config.yaml"

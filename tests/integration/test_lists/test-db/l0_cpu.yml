@@ -169,6 +169,9 @@ l0_cpu:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_disagg_telemetry_launcher.py::test_rank_info_key_is_carried_by_transceiver_config
   - unittest/llmapi/test_disagg_telemetry_launcher.py::test_grpc_cli_propagates_rank_info_key
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_read_disagg_auth_key
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_read_disagg_auth_key_rejects_invalid_config
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_mpi_launcher_reads_key_from_disagg_config
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   - unittest/llmapi/test_llm_quant.py

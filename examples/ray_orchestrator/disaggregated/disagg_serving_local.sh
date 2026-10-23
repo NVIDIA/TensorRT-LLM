@@ -5,16 +5,21 @@
 # Parse command line arguments
 BACKEND="ray"
 ATTACH_MODE=false
+DISAGG_CONFIG=""
 MODEL_DIR="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TP_SIZE=1
 TRANSCEIVER_BACKEND="NIXL"
 TRANSCEIVER_RUNTIME="CPP"
-USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend UCX|NIXL] [--transceiver_runtime CPP|PYTHON] [--help]"
+USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--disagg_config PATH] [--model model_dir] [--tp_size N] [--transceiver_backend UCX|NIXL] [--transceiver_runtime CPP|PYTHON] [--help]"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --executor)
             BACKEND="$2"
+            shift 2
+            ;;
+        --disagg_config)
+            DISAGG_CONFIG="$2"
             shift 2
             ;;
         --attach)
@@ -41,6 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "$USAGE"
             echo "Options:"
             echo "  --executor ray|mpi   Choose distributed executor (default: ray)"
+            echo "  --disagg_config PATH  Shared disaggregated serving config (optional)"
             echo "  --attach             Attach to existing ray cluster (skip ray start/stop)"
             echo "  --model model_dir    Model directory (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)"
             echo "  --tp_size N          Tensor parallel size (default: 1)"
@@ -113,9 +119,11 @@ disable_overlap_scheduler: true
 EOF
 fi
 
-# Generate disaggregated server config
-echo "Generating disagg_config_local.yaml"
-cat > disagg_config_local.yaml << EOF
+# Generate a default disaggregated server config if none was supplied.
+if [[ -z "$DISAGG_CONFIG" ]]; then
+    DISAGG_CONFIG="disagg_config_local.yaml"
+    echo "Generating disagg_config_local.yaml"
+    cat > disagg_config_local.yaml << EOF
 hostname: localhost
 port: 8000
 model: $MODEL_DIR
@@ -144,6 +152,8 @@ generation_servers:
       - "localhost:8002"
 EOF
 
+fi
+
 # Conditionally start ray head if using ray backend and not in attach mode
 RAY_STARTED=false
 if [[ "$BACKEND" == "ray" && "$ATTACH_MODE" != "true" ]]; then
@@ -166,18 +176,18 @@ if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml --disagg_config "$DISAGG_CONFIG" &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
 fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml --disagg_config "$DISAGG_CONFIG" &> output_gen0 &
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."
-trtllm-serve disaggregated -c disagg_config_local.yaml -t 300
+trtllm-serve disaggregated -c "$DISAGG_CONFIG" -t 300
 
 # Cleanup
 if [[ "$RAY_STARTED" == "true" && "$ATTACH_MODE" != "true" ]]; then
