@@ -16,9 +16,10 @@
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Exaone4_5_ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Exaone4_5_ForConditionalGeneration")
 class Exaone4_5HfWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict):
         """Rename HF checkpoint prefixes; supports plain dict and ConsumableWeightsDict."""

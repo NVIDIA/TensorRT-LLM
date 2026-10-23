@@ -1,12 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Gemma3ForCausalLM")
-@register_mapper("HF", "Gemma3ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Gemma3ForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Gemma3ForConditionalGeneration")
 class Gemma3HfWeightMapper(HfWeightMapper):
 
     def should_skip_module(self, module_name: str) -> bool:

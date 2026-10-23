@@ -80,6 +80,7 @@ BASE_EXAMPLE_CLASSES = {
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
+    "tensorrt_llm.checkpoint_format": ["CheckpointFormat"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],
     "tensorrt_llm.executor.postproc_worker": [
@@ -99,7 +100,8 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
-        "KvCacheConfig", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
+        "CheckpointIOPolicy", "KvCacheConfig", "SchedulerConfig", "LoadFormat",
+        "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
