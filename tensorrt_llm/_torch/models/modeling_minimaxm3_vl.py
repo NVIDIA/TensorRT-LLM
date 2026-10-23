@@ -14,7 +14,7 @@ features produced by the tower.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -1743,6 +1743,14 @@ class MiniMaxM3VLInputProcessor:
     """
 
     supports_tokenization_cache = True
+
+    # Opt into ``BaseMultimodalInputProcessor.call_with_token_ids`` for
+    # ``prompt_token_ids`` + ``multi_modal_data`` requests (a pre-templated,
+    # pre-tokenized prompt from a front end such as Dynamo). The hooks below
+    # expand the placeholder token in place; without this flag the base class
+    # detokenizes the ids and re-applies the chat template, which doubles the
+    # image marker and rejects the request.
+    supports_token_id_mm_expansion: ClassVar[bool] = True
 
     def __init__(
         self,

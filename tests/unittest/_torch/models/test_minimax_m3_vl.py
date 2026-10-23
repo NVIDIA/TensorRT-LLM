@@ -2246,26 +2246,52 @@ def test_fast_path_expand_rejects_placeholder_count_mismatch():
         )
 
 
-def test_fast_path_hooks_are_registered_on_processor_class():
-    """The runtime's tokenized-prompt branch in
-    ``create_input_processor_with_hash.input_processor_wrapper`` gates
-    on ``hasattr(input_processor, 'get_text_with_mm_placeholders')`` and
-    ``hasattr(input_processor, 'expand_prompt_token_ids_for_mm')``. If
-    these go missing, the runtime detokenizes Dynamo's prompt_token_ids
-    and the M3 chat template gets re-applied, producing the duplicate
-    image marker that crashed the HF processor.
+def test_token_id_request_takes_the_fast_path_without_detokenizing():
+    """A ``prompt_token_ids`` + image request is expanded in token space.
+
+    ``BaseMultimodalInputProcessor.__call__`` dispatches such a request to
+    ``call_with_token_ids`` only when ``supports_token_id_mm_expansion`` is
+    set; otherwise it detokenizes the ids and re-applies the chat template,
+    which doubles the image marker and rejects the request. A pre-templated
+    request from a front end such as Dynamo must therefore never reach the
+    tokenizer's ``decode`` and must come back with the placeholder framed as
+    ``VISION_START + IMAGE_TOKEN * N + VISION_END``.
     """
+    from tensorrt_llm.sampling_params import SamplingParams
+
     cls = get_minimax_m3_vl_input_processor_cls()
-    assert hasattr(cls, "get_text_with_mm_placeholders"), (
-        "MiniMaxM3VLInputProcessor must expose get_text_with_mm_placeholders "
-        "for the tokenized + MM fast path; without it the runtime "
-        "detokenizes Dynamo's prompt_token_ids and re-runs the chat "
-        "template, doubling image markers and crashing at "
-        "image_grid_thw[index].prod()."
+    assert cls.supports_token_id_mm_expansion is True
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+
+    class _NoDecodeTokenizer:
+        def decode(self, *args, **kwargs):
+            raise AssertionError("token-id request was detokenized")
+
+    proc._tokenizer = _NoDecodeTokenizer()
+    image = object()
+    grid = torch.tensor([[1, 4, 4]])
+    text_calls: List[Dict] = []
+
+    def fake_call_with_text_prompt(inputs, sampling_params=None):
+        text_calls.append(dict(inputs))
+        return [], {"multimodal_data": {"image": {"image_grid_thw": grid}}}
+
+    proc.call_with_text_prompt = fake_call_with_text_prompt
+    # grid [1, 4, 4] at merge 2 -> 4 placeholders + the two framing tokens.
+    proc.get_num_tokens_per_image = lambda *, image, **kwargs: 6
+
+    ids, extra = proc(
+        {"prompt_token_ids": [1, _IMG_TOK, 2], "multi_modal_data": {"image": [image]}},
+        SamplingParams(),
     )
-    assert hasattr(cls, "expand_prompt_token_ids_for_mm")
-    assert hasattr(cls, "get_num_tokens_per_image")
-    assert hasattr(cls, "get_num_tokens_per_video")
+
+    assert ids == [1, _VS_TOK] + [_IMG_TOK] * 4 + [_VE_TOK, 2]
+    assert torch.equal(extra["multimodal_data"]["image"]["image_grid_thw"], grid)
+    # The vision tower ran once, on the dummy placeholder prompt with the
+    # real image, not on a detokenized copy of the request.
+    assert [c.get("prompt") for c in text_calls] == [""]
+    assert text_calls[0]["multi_modal_data"] == {"image": [image]}
 
 
 # ---------------------------------------------------------------------------
