@@ -14,6 +14,7 @@
 
 # yapf: disable
 import asyncio
+import errno
 import json
 import os
 import traceback
@@ -477,15 +478,14 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
-                # Selective retry budget: ServerDisconnectedError and
-                # ConnectionResetError are transient TCP races (typically at
-                # burst start when client keepalive vs server keepalive race).
+                # aiohttp can wrap an OS connection reset in ClientOSError
+                # rather than a ConnectionResetError subclass.
                 # Give them an extended retry budget while preserving the
                 # original fail-fast for genuine upstream errors.
                 is_transient_tcp = isinstance(
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
-                )
+                ) or (isinstance(e, aiohttp.ClientOSError) and e.errno == errno.ECONNRESET)
                 effective_max = max_retries
                 if is_transient_tcp:
                     effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)
