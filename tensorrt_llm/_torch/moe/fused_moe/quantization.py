@@ -2543,6 +2543,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         """
         module.tmp_raw_input_scales = {}
         module.tmp_weight_scale_2 = {}
+        # Created unconditionally even though only an NVFP4_AWQ / NVFP4_ARC
+        # checkpoint fills it: whether this checkpoint carries a pre-quant
+        # scale is not known until the first expert arrives, by which time
+        # several loader threads are already running.
+        module.tmp_pre_quant_scales = {}
         module._streamed_expert_slots = set()
 
     def _finalize_staged_w3_w1_expert(
@@ -2599,6 +2604,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         w3_weight_scale: torch.Tensor,
         w3_weight_scale_2: torch.Tensor,
         w3_input_scale: torch.Tensor,
+        w1_pre_quant_scale: Optional[torch.Tensor] = None,
+        w3_pre_quant_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """Load one NVFP4 checkpoint expert into a local slot.
 
@@ -2612,6 +2619,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         ``prepare_streaming_expert_load`` must have run first, and
         ``module.process_weights_after_loading()`` must run once the layer's
         last slot is in — nothing else calls it on this path.
+
+        ``w1_pre_quant_scale`` / ``w3_pre_quant_scale`` are the per-channel
+        pre-quant scale an NVFP4_AWQ / NVFP4_ARC checkpoint carries and a plain
+        NVFP4 one does not; passing them stages them exactly as
+        ``load_quant_scales`` does, so ``_finalize_pre_quant_scales`` lands the
+        same ``fc31_act_scale`` on either path. Leaving them out of such a
+        checkpoint's load is silently wrong rather than merely unoptimized: the
+        activation would be quantized unsmoothed against an ``input_scale``
+        calibrated on ``x * pre_quant_scale``.
 
         One deliberate difference from ``load_quant_scales``: it reduces the
         activation ``input_scale`` over every expert in the checkpoint, whereas
@@ -2644,6 +2660,18 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             if value.dtype != torch.uint8:
                 raise TypeError(f"{name} must contain packed NVFP4 uint8 data, "
                                 f"got {value.dtype}.")
+
+        has_pre_quant_scale = (w1_pre_quant_scale is not None
+                               or w3_pre_quant_scale is not None)
+        if has_pre_quant_scale:
+            if w1_pre_quant_scale is None or w3_pre_quant_scale is None:
+                raise ValueError(
+                    "w1_pre_quant_scale and w3_pre_quant_scale must be loaded "
+                    "together; fc31_act_scale is their elementwise maximum.")
+            if not module.is_gated_activation:
+                raise ValueError(
+                    "pre_quant_scale (NVFP4_AWQ / NVFP4_ARC) is not supported "
+                    "with non-gated activations.")
 
         # Cutlass stages the two halves of w3_w1 per expert and needs the slot
         # id as the staging key; other backends write straight through.
@@ -2680,6 +2708,25 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             'w3': w3_input_scale[...].reshape([]),
             'w2': w2_input_scale[...].reshape([]),
         }
+
+        # Per-channel pre-quant scale (NVFP4_AWQ / NVFP4_ARC), keyed by global
+        # expert id like the input scales above and for the same reason: it is
+        # only cross-checked and reduced, never indexed positionally. Sharded
+        # with the same ROW mode ``load_quant_scales`` uses, which for this
+        # 1-D per-channel tensor leaves it whole. Staged on the host
+        # (``load_weight_shard``'s default), where a streaming checkpoint's
+        # tensors already are, so nothing holds device memory for the length of
+        # the layer load; ``_finalize_pre_quant_scales`` moves the reduction's
+        # result onto ``fc31_act_scale``.
+        if has_pre_quant_scale:
+            module.tmp_pre_quant_scales[global_expert_id] = {
+                'w1':
+                load_weight_shard(w1_pre_quant_scale, module.tp_size,
+                                  module.tp_rank, TensorParallelMode.ROW),
+                'w3':
+                load_weight_shard(w3_pre_quant_scale, module.tp_size,
+                                  module.tp_rank, TensorParallelMode.ROW),
+            }
 
         # Backends that only stage their input here resolve this slot right
         # away, so the staged footprint stays proportional to the experts in
@@ -2782,6 +2829,27 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 tmp_weight_scale_2.setdefault(expert_idx, {})
                 tmp_weight_scale_2[expert_idx]['w2'] = w2_weight_scale_2
 
+    def _ensure_fc31_act_scale(self, module: torch.nn.Module) -> None:
+        """Register the per-channel act scale an AWQ checkpoint needs.
+
+        ``create_weights`` registers the slot as ``None`` because only a
+        checkpoint carrying ``*.pre_quant_scale`` (NVFP4_AWQ / NVFP4_ARC) has a
+        value for it. The whole-checkpoint loader creates it as soon as it sees
+        those keys; the streaming loader has no such single point, so it
+        creates it from ``_finalize_pre_quant_scales`` instead, which is the
+        first place after a layer's experts are all in.
+        """
+        if getattr(module, "fc31_act_scale", None) is not None:
+            return
+        # Shape: (1, hidden_size) - single vector for all experts (they share
+        # the same input).
+        fc31_act_scale = nn.Parameter(torch.empty(1,
+                                                  module.hidden_size,
+                                                  dtype=module.dtype,
+                                                  device='cuda'),
+                                      requires_grad=False)
+        module.register_parameter("fc31_act_scale", fc31_act_scale)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Check if pre_quant_scale exists in the checkpoint (for NVFP4_AWQ)
         has_pre_quant_scale = False
@@ -2792,14 +2860,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # If pre_quant_scale exists, we need a per-channel act scale for fc31
         # All experts share the same input, so pre_quant_scale should be identical across experts
         if has_pre_quant_scale:
-            # Create fc31_act_scale parameter (for gate_up_proj / w3_w1)
-            # Shape: (1, hidden_size) - single vector for all experts (they share the same input)
-            fc31_act_scale = nn.Parameter(torch.empty(1,
-                                                      module.hidden_size,
-                                                      dtype=module.dtype,
-                                                      device='cuda'),
-                                          requires_grad=False)
-            module.register_parameter("fc31_act_scale", fc31_act_scale)
+            self._ensure_fc31_act_scale(module)
 
         # Step1: Store raw per-expert input scales individually into tmp dict.
         # Consistency check + global max computation deferred to process_weights_after_loading().
@@ -2977,6 +3038,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
         if not hasattr(module, 'tmp_pre_quant_scales'):
             return
+        if not module.tmp_pre_quant_scales:
+            # Only the streaming loader gets here: it pre-creates the container
+            # before it knows whether the checkpoint carries a pre-quant scale,
+            # and a plain NVFP4 one leaves it empty. The whole-checkpoint loader
+            # creates it only after finding the keys, so an empty-but-present
+            # container never means "the scales went missing" there either.
+            delattr(module, 'tmp_pre_quant_scales')
+            return
+        self._ensure_fc31_act_scale(module)
         # Collect all loaded w3/w1 pre_quant_scales
         all_w3 = []
         all_w1 = []
@@ -3011,10 +3081,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     logger.error(msg)
                     raise ValueError(msg)
 
-        # Take the max of w3 and w1 from the first expert
-        fc31_pre_quant_scale = torch.max(w3_reference,
-                                         w1_reference).to(dtype=module.dtype,
-                                                          device='cuda')
+        # Take the max of w3 and w1 from the first expert. The destination's
+        # device, not a hardcoded 'cuda': the streaming loader stages on the
+        # loader's device, and ``load_quant_scales`` already keys its own
+        # staging off this same parameter.
+        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+            dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
         delattr(module, 'tmp_pre_quant_scales')

@@ -92,6 +92,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
@@ -135,6 +136,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
+    NVFP4MegaMoECuteDslMethod,
     NVFP4TRTLLMGenFusedMoEBaseMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
@@ -2655,7 +2657,8 @@ def _make_cutedsl_sibling_for_quantize_input_test(
 
     ``__new__`` without ``__init__``: the real constructors want a GPU (and,
     for the FC12 one, Rubin), while ``quantize_input`` reads the quant config,
-    the two scales and the scale geometry.
+    the two scales and the scale geometry. The DenseGEMM backend reads the
+    same four, so it shares this fake.
     """
     backend = backend_cls.__new__(backend_cls)
     torch.nn.Module.__init__(backend)
@@ -2680,18 +2683,18 @@ def _make_cutedsl_sibling_for_quantize_input_test(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "backend_cls",
-    [CuteDslFusedMoE, CuteDslFc12FusedMoE],
-    ids=["grouped_gemm", "fused_fc12"],
+    [CuteDslFusedMoE, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
 )
 @pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
 def test_cutedsl_quantize_input_applies_pre_quant_scale(
     monkeypatch: pytest.MonkeyPatch, backend_cls: type, has_pre_quant_scale: bool
 ) -> None:
-    """The two CuteDSL siblings apply an NVFP4_AWQ / NVFP4_ARC pre-quant scale.
+    """The CuteDSL siblings apply an NVFP4_AWQ / NVFP4_ARC pre-quant scale.
 
-    Both select ``NVFP4CuteDslFusedMoEMethod``, which inherits the CUTLASS
+    All three select ``NVFP4CuteDslFusedMoEMethod``, which inherits the CUTLASS
     NVFP4 pipeline and therefore loads a checkpoint's per-channel
-    ``pre_quant_scale`` into ``fc31_act_scale``, and both calibrate
+    ``pre_quant_scale`` into ``fc31_act_scale``, and all three calibrate
     ``fc31_input_scale`` on the scaled activation. Their kernels consume only
     the quantized activation, which leaves ``quantize_input`` as the one place
     to apply it; before this it was dropped and the output silently wrong.
@@ -2729,13 +2732,13 @@ def test_cutedsl_quantize_input_applies_pre_quant_scale(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "backend_cls",
-    [CuteDslFusedMoE, CuteDslFc12FusedMoE],
-    ids=["grouped_gemm", "fused_fc12"],
+    [CuteDslFusedMoE, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
 )
 def test_cutedsl_quantize_input_rejects_prequantized_awq_input(backend_cls: type) -> None:
     """An already-quantized input can no longer take the pre-quant scale.
 
-    Both backends also accept an ``Fp4QuantizedTensor`` produced upstream (a
+    Each backend also accepts an ``Fp4QuantizedTensor`` produced upstream (a
     fused norm+quant, or a post-quant dispatch) that never saw
     ``fc31_act_scale``. Refuse that combination rather than serve the
     checkpoint wrong, as ``CutlassFusedMoE.quantize_input`` does.
@@ -2754,6 +2757,237 @@ def test_cutedsl_quantize_input_rejects_prequantized_awq_input(backend_cls: type
 
     with pytest.raises(AssertionError, match="not expected for AWQ"):
         backend.quantize_input(x, post_quant_comm=False)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4_AWQ on the per-expert STREAMING loader.
+#
+# Kimi K3 never calls the MoE backend's whole-checkpoint ``load_weights``, so
+# ``load_quant_scales`` -- the only thing that read ``*.pre_quant_scale`` --
+# never runs for it. The scale therefore has to travel through
+# ``load_streaming_nvfp4_expert``, or an AWQ checkpoint served over that path
+# gets ``fc31_act_scale is None`` and the fix above does nothing for it.
+# Nothing raises in that state: the loads are silent and only accuracy moves.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu_only
+def test_kimi_k3_nvfp4_expert_spec_covers_the_awq_recipes() -> None:
+    """The streaming layout serves NVFP4 and both of its calibration recipes.
+
+    ``_k3_expert_ckpt_spec`` used to know only plain ``NVFP4``, so an
+    NVFP4_AWQ / NVFP4_ARC checkpoint could not reach this loader at all. The
+    weights are byte-identical across the three; only the extra per-channel
+    scale differs, so one layout covers them.
+
+    ``pre_quant_scale`` must stay OPTIONAL: ``nvidia/Kimi-K3-NVFP4`` stores
+    none, and requiring it would reject the one checkpoint on this path today.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _k3_expert_ckpt_spec
+
+    nvfp4 = _k3_expert_ckpt_spec(QuantAlgo.NVFP4)
+    for quant_algo in (QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC):
+        assert _k3_expert_ckpt_spec(quant_algo) is nvfp4, quant_algo
+    assert "pre_quant_scale" not in nvfp4.kinds
+    assert nvfp4.optional_suffixes == ("w1.pre_quant_scale", "w3.pre_quant_scale")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_kimi_k3_nvfp4_expert_loader_forwards_pre_quant_scale(
+    has_pre_quant_scale: bool,
+) -> None:
+    """The per-expert loader passes a stored pre-quant scale on, and only then.
+
+    The two getters are the seam every streaming route shares (file-grouped,
+    split-file and the shared-dict fallback): the required one raises on a
+    missing key, the optional one answers ``None``. A plain NVFP4 checkpoint
+    must still load, which is why ``None`` has to reach the quant method
+    rather than the key being demanded.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _load_nvfp4_expert
+
+    pre_quant_scale = torch.linspace(0.5, 2.0, 8)
+    stored = (
+        {
+            "experts.5.w1.pre_quant_scale": pre_quant_scale,
+            "experts.5.w3.pre_quant_scale": pre_quant_scale,
+        }
+        if has_pre_quant_scale
+        else {}
+    )
+    captured = {}
+    backend = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            load_streaming_nvfp4_expert=lambda module, **kwargs: captured.update(
+                module=module, **kwargs
+            )
+        )
+    )
+
+    _load_nvfp4_expert(backend, "experts", 5, 2, lambda key: key, stored.get)
+
+    assert captured["module"] is backend
+    assert captured["global_expert_id"] == 5
+    assert captured["local_slot_id"] == 2
+    # Required tensors still come from the required getter, unchanged.
+    assert captured["w1_weight"] == "experts.5.w1.weight"
+    assert captured["w2_input_scale"] == "experts.5.w2.input_scale"
+    for w in ("w1", "w3"):
+        got = captured[f"{w}_pre_quant_scale"]
+        if has_pre_quant_scale:
+            assert got is pre_quant_scale, w
+        else:
+            assert got is None, w
+
+
+def _streaming_module_for_pre_quant_scale_test(hidden_size: int) -> torch.nn.Module:
+    """A module carrying only what the pre-quant-scale staging touches."""
+    module = torch.nn.Module()
+    module.dtype = torch.bfloat16
+    module.hidden_size = hidden_size
+    module.tp_size = 1
+    module.tp_rank = 0
+    module.is_gated_activation = True
+    # ``create_weights`` registers the slot as None; on the whole-checkpoint
+    # path ``load_quant_scales`` replaces it the moment it sees the keys.
+    module.register_parameter("fc31_act_scale", None)
+    return module
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_streaming_stages_pre_quant_scales_for_finalization() -> None:
+    """A streamed AWQ expert's scale reaches ``fc31_act_scale``.
+
+    Two halves, asserted together because either alone passes trivially: the
+    staging container has to exist before the (multi-threaded) loads, and
+    ``_finalize_pre_quant_scales`` has to consume it and allocate the
+    parameter, which on this path no ``load_quant_scales`` has created.
+
+    The real allocation is ``device='cuda'``, so it is substituted here; what
+    is asserted is that the finalizer allocates at all and lands
+    ``max(w3, w1)``, which is the reduction the whole-checkpoint path uses.
+    """
+    hidden_size = 8
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = _streaming_module_for_pre_quant_scale_test(hidden_size)
+
+    # The base implementation, not MegaMoE's override: that one additionally
+    # rematerializes the raw source parameters, which needs real weights.
+    NVFP4FusedMoEMethod.prepare_streaming_expert_load(method, module)
+    assert module.tmp_pre_quant_scales == {}, "staging must predate the loader threads"
+
+    w1 = torch.linspace(0.5, 2.0, hidden_size)
+    w3 = torch.linspace(2.0, 0.5, hidden_size)
+    for global_expert_id in (3, 7):
+        module.tmp_pre_quant_scales[global_expert_id] = {"w1": w1.clone(), "w3": w3.clone()}
+
+    def allocate_on_cpu(mod: torch.nn.Module) -> None:
+        mod.register_parameter(
+            "fc31_act_scale",
+            torch.nn.Parameter(
+                torch.empty(1, mod.hidden_size, dtype=mod.dtype), requires_grad=False
+            ),
+        )
+
+    method._ensure_fc31_act_scale = allocate_on_cpu
+    method._finalize_pre_quant_scales(module)
+
+    assert not hasattr(module, "tmp_pre_quant_scales")
+    torch.testing.assert_close(
+        module.fc31_act_scale.data,
+        torch.max(w1, w3).to(torch.bfloat16).unsqueeze(0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_streaming_plain_checkpoint_leaves_act_scale_unset() -> None:
+    """A plain NVFP4 streamed load must stay exactly as it was.
+
+    The container is now pre-created for every streamed NVFP4 load, AWQ or
+    not, so an empty one means "this checkpoint has no pre-quant scale" and
+    not "the scales went missing". Without this the ``nvidia/Kimi-K3-NVFP4``
+    load would raise ``Missing pre_quant_scale data``.
+    """
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = _streaming_module_for_pre_quant_scale_test(8)
+
+    # Base implementation, for the reason given in the test above.
+    NVFP4FusedMoEMethod.prepare_streaming_expert_load(method, module)
+    method._finalize_pre_quant_scales(module)
+
+    assert module.fc31_act_scale is None
+    assert not hasattr(module, "tmp_pre_quant_scales")
+
+
+def _streaming_expert_kwargs() -> dict:
+    """The required ``load_streaming_nvfp4_expert`` arguments, as packed bytes.
+
+    Only the three weights are inspected before the pre-quant-scale checks, so
+    the scales can be placeholders: the call under test never reaches them.
+    """
+    packed = torch.zeros(2, 2, dtype=torch.uint8)
+    return {
+        f"{w}_{kind}": packed if kind == "weight" else None
+        for w in ("w1", "w2", "w3")
+        for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("supplied", ["w1", "w3"])
+def test_nvfp4_streaming_rejects_half_a_pre_quant_scale_pair(supplied: str) -> None:
+    """One half of the pair cannot produce ``max(w3, w1)``.
+
+    Accepting it would stage an entry the finalizer then rejects with a
+    message about a missing expert, one layer deep and pointing at the wrong
+    thing. Refused at the argument instead.
+    """
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = SimpleNamespace(
+        expert_size_per_partition=1,
+        initial_local_expert_ids=[0],
+        is_gated_activation=True,
+        _streamed_expert_slots=set(),
+    )
+
+    with pytest.raises(ValueError, match="must be loaded together"):
+        method.load_streaming_nvfp4_expert(
+            module,
+            global_expert_id=0,
+            local_slot_id=0,
+            **_streaming_expert_kwargs(),
+            **{f"{supplied}_pre_quant_scale": torch.ones(4)},
+        )
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_streaming_refuses_pre_quant_scale_without_gating() -> None:
+    """``fc31_act_scale`` is a gated-activation concept, as on the other path.
+
+    ``load_quant_scales`` asserts the same thing: without a gate there is no
+    ``max(w3, w1)`` to take, so a checkpoint in that shape is refused rather
+    than loaded with the scale dropped.
+    """
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = SimpleNamespace(
+        expert_size_per_partition=1,
+        initial_local_expert_ids=[0],
+        is_gated_activation=False,
+        _streamed_expert_slots=set(),
+    )
+
+    with pytest.raises(ValueError, match="non-gated activations"):
+        method.load_streaming_nvfp4_expert(
+            module,
+            global_expert_id=0,
+            local_slot_id=0,
+            **_streaming_expert_kwargs(),
+            w1_pre_quant_scale=torch.ones(4),
+            w3_pre_quant_scale=torch.ones(4),
+        )
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
