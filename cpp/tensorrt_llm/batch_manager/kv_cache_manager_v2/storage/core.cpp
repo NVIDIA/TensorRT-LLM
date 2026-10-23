@@ -52,15 +52,52 @@ size_t tierAllocationGranularity(CacheTier tier, size_t quota)
 }
 
 // ---------------------------------------------------------------------------
+// SlotIdMap
+// ---------------------------------------------------------------------------
+
+void SlotIdMap::append(size_t chunk)
+{
+    TLLM_CHECK_DEBUG(mChunkIndices.count(chunk) == 0);
+    mChunkIndices[chunk] = mChunks.size();
+    mChunks.push_back(chunk);
+}
+
+size_t SlotIdMap::pop()
+{
+    size_t const chunk = mChunks.back();
+    mChunks.pop_back();
+    mChunkIndices.erase(chunk);
+    return chunk;
+}
+
+std::optional<SlotCount> SlotIdMap::localIndex(SlotId slotId) const noexcept
+{
+    if (slotId < SlotId{0})
+    {
+        return std::nullopt;
+    }
+    auto const chunk = static_cast<size_t>(slotId.value() / mChunkSize);
+    auto const it = mChunkIndices.find(chunk);
+    if (it == mChunkIndices.end())
+    {
+        return std::nullopt;
+    }
+    return static_cast<SlotCount>(it->second) * mChunkSize + slotId.value() % mChunkSize;
+}
+
+// ---------------------------------------------------------------------------
 // SlotAllocator
 // ---------------------------------------------------------------------------
 
-SlotAllocator::SlotAllocator(SlotCount capacity)
+SlotAllocator::SlotAllocator(
+    SlotCount capacity, SlotIdMap const* slotMap, std::optional<LocalityDomainId> localityDomainId)
     : mCapacity(capacity)
     , mTargetCapacity(capacity)
     , mNumActiveSlots(0)
     , mNumReadyRecycledSlots(0)
     , mOccupiedMask(slotCountToSizeT(capacity))
+    , mSlotMap(slotMap)
+    , mLocalityDomainId(localityDomainId)
 {
 }
 
@@ -123,7 +160,8 @@ Slot SlotAllocator::allocate()
     }
     else if (mNumActiveSlots < std::min(mCapacity, mTargetCapacity))
     {
-        slot.setSlotId(SlotId{mNumActiveSlots++});
+        slot.setSlotId(slotId(mNumActiveSlots++));
+        slot.setLocalityDomainId(mLocalityDomainId);
     }
     else
     {
@@ -131,7 +169,7 @@ Slot SlotAllocator::allocate()
         mRecycledSlots.pop_front();
         TLLM_CHECK_DEBUG_WITH_INFO(slot.hasValidSlot(), "non-ready recycled slot has no valid id");
     }
-    mOccupiedMask.set(toSizeT(slot.slotId()));
+    mOccupiedMask.set(slotCountToSizeT(*localIndex(slot.slotId())));
     return slot;
 }
 
@@ -160,16 +198,17 @@ void SlotAllocator::release(Slot slot)
     {
         throw LogicError("SlotAllocator::release: slot has no valid id");
     }
-    SlotId const slotId = slot.slotId();
-    if (!isValidSlotId(slotId) || !mOccupiedMask.get(toSizeT(slotId)))
+    auto const local = localIndex(slot.slotId());
+    if (slot.localityDomainId() != mLocalityDomainId || !local.has_value() || *local < 0 || *local >= mCapacity
+        || !mOccupiedMask.get(slotCountToSizeT(*local)))
     {
         // The id is not one this allocator has outstanding, so drop it rather than let the
         // rejected slot look like an unreleased one.
         slot.resetSlot();
         throw LogicError("SlotAllocator::release: slot is not occupied");
     }
-    mOccupiedMask.clear(toSizeT(slotId));
-    if (slotId < mTargetCapacity)
+    mOccupiedMask.clear(slotCountToSizeT(*local));
+    if (*local < mTargetCapacity)
     {
         mRecycledSlots.push_back(std::move(slot));
     }
@@ -203,7 +242,7 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
     SlotCount idx = 0;
     for (auto& s : mRecycledSlots)
     {
-        if (s.slotId() < newNumSlots)
+        if (*localIndex(s.slotId()) < newNumSlots)
         {
             if (idx < oldNumReady)
                 ++newNumReady;
@@ -263,7 +302,7 @@ std::vector<SlotId> SlotAllocator::getSlotsBlockingShrink() const
     for (SlotCount id = mTargetCapacity; id < mCapacity; ++id)
     {
         if (mOccupiedMask.get(slotCountToSizeT(id)))
-            result.push_back(SlotId{id});
+            result.push_back(slotId(id));
     }
     return result;
 }
@@ -289,8 +328,8 @@ bool SlotAllocator::check() const noexcept
     {
         if (!slot.hasValidSlot())
             return false;
-        SlotCount id = slot.slotId().value();
-        if (id < mTargetCapacity || id >= mCapacity)
+        auto const local = localIndex(slot.slotId());
+        if (!local.has_value() || *local < mTargetCapacity || *local >= mCapacity)
             return false;
     }
     SlotCount const accountedSlots = slotCountValueFromSize(mRecycledSlots.size())
@@ -319,13 +358,20 @@ void SlotAllocator::scrubEvents()
 // GpuSlotPool
 // ---------------------------------------------------------------------------
 
-GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots)
+GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots,
+    TypedVec<LocalityDomainId, SlotIdMap> const* slotMaps)
     : SlotPoolBase(slotSize)
     , mVirtMem(vmSize, physMemAllocator)
+    , mSlotMaps(slotMaps)
 {
     TLLM_CHECK_DEBUG_WITH_INFO(
         vmSize % physMemAllocator.physMemSize() == 0, "vm_size must be aligned to phys_mem_size");
-    resize(numSlots);
+    TLLM_CHECK_DEBUG(
+        mSlotMaps == nullptr || mSlotMaps->size() == LocalityDomainId{physMemAllocator.numLocalityDomains()});
+    if (numSlots != 0)
+    {
+        resize(numSlots);
+    }
 }
 
 size_t GpuSlotPool::computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept
@@ -340,7 +386,17 @@ SlotCount GpuSlotPool::computeNumSlots(size_t slotSize, size_t numPhysMem, size_
 
 SlotCount GpuSlotPool::numSlots() const noexcept
 {
-    return computeNumSlots(mSlotSize, mVirtMem.numPhysMem(), mVirtMem.physMemSize());
+    SlotCount total = 0;
+    for (LocalityDomainId localityDomainId{0}; localityDomainId < numLocalityDomains(); ++localityDomainId)
+    {
+        total += numSlots(localityDomainId);
+    }
+    return total;
+}
+
+SlotCount GpuSlotPool::numSlots(LocalityDomainId localityDomainId) const noexcept
+{
+    return computeNumSlots(mSlotSize, mVirtMem.numPhysMem(localityDomainId), mVirtMem.physMemSize());
 }
 
 void GpuSlotPool::destroy()
@@ -350,9 +406,55 @@ void GpuSlotPool::destroy()
 
 void GpuSlotPool::resize(SlotCount newNumSlots)
 {
-    size_t physSize = mVirtMem.physMemSize();
-    size_t newPhysMem = computeNumPhysMem(mSlotSize, newNumSlots, physSize);
-    mVirtMem.realloc(physSize * newPhysMem);
+    resize(newNumSlots, LocalityDomainId{0});
+}
+
+void GpuSlotPool::resize(SlotCount newNumSlots, LocalityDomainId localityDomainId)
+{
+    size_t const physSize = mVirtMem.physMemSize();
+    size_t const required = computeNumPhysMem(mSlotSize, newNumSlots, physSize);
+    size_t const old = mVirtMem.numPhysMem(localityDomainId);
+    if (required < old)
+    {
+        mVirtMem.shrink(old - required, localityDomainId);
+    }
+    else if (required > old)
+    {
+        try
+        {
+            if (mSlotMaps == nullptr)
+            {
+                mVirtMem.extend(required - old, localityDomainId, old * physSize);
+            }
+            else
+            {
+                // Walk the domain's chunks in order; a chunk's bytes are a multiple of physSize in
+                // every pool, so each piece maps whole physical chunks.
+                auto const& slotMap = (*mSlotMaps)[localityDomainId];
+                size_t const chunkBytes = slotCountToSizeT(slotMap.chunkSize()) * mSlotSize;
+                size_t mapped = old * physSize;
+                size_t const end = required * physSize;
+                while (mapped < end)
+                {
+                    size_t const chunkIndex = mapped / chunkBytes;
+                    size_t const offsetInChunk = mapped % chunkBytes;
+                    size_t const size = std::min(end - mapped, chunkBytes - offsetInChunk);
+                    size_t const offset = slotMap.chunks().at(chunkIndex) * chunkBytes + offsetInChunk;
+                    mVirtMem.extend(size / physSize, localityDomainId, offset);
+                    mapped += size;
+                }
+            }
+        }
+        catch (...)
+        {
+            size_t const added = mVirtMem.numPhysMem(localityDomainId) - old;
+            if (added != 0)
+            {
+                mVirtMem.shrink(added, localityDomainId);
+            }
+            throw;
+        }
+    }
 }
 
 SlotCount GpuSlotPool::extendByOnePhysMem()
@@ -363,7 +465,11 @@ SlotCount GpuSlotPool::extendByOnePhysMem()
 
 Address GpuSlotPool::slotAddress(SlotId slot) const
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "GpuSlotPool::slotAddress: slot index out of bounds");
+    // Slot ids may lie beyond numSlots() when domains interleave, so bound by the reservation.
+    TLLM_CHECK_DEBUG_WITH_INFO(mSlotMaps == nullptr
+            ? isValidSlotId(slot)
+            : slot >= SlotId{0} && mSlotSize * (toSizeT(slot) + 1) <= mVirtMem.virtualBytes(),
+        "GpuSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mVirtMem.address() + mSlotSize * toSizeT(slot));
 }
 
@@ -498,11 +604,11 @@ Address DiskSlotPool::slotAddress(SlotId slot) const
 // ---------------------------------------------------------------------------
 
 PoolGroupBase::PoolGroupBase(SlotCount numSlots)
-    : mSlotAllocator(numSlots)
 {
+    mSlotAllocators.push_back(std::make_unique<SlotAllocator>(numSlots));
 }
 
-SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
+SlotCount PoolGroupBase::getNumSlotsFromPools(LocalityDomainId /*localityDomainId*/) const noexcept
 {
     if (mPools.empty())
         return 0;
@@ -519,57 +625,72 @@ PoolGroupBase::~PoolGroupBase()
     KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
-SlotCount PoolGroupBase::numSlots() const noexcept
+SlotCount PoolGroupBase::numSlots(LocalityDomainId localityDomainId) const noexcept
 {
-    SlotCount n = mSlotAllocator.numSlots();
+    SlotCount n = mSlotAllocators[localityDomainId]->numSlots();
     if (TLLM_UNLIKELY(gDebug))
     {
         // Mirrors Python PoolGroupBase.num_slots: assert num_slots <= self._get_num_slots_from_pools()
-        [[maybe_unused]] SlotCount poolSlots = getNumSlotsFromPools();
+        [[maybe_unused]] SlotCount poolSlots = getNumSlotsFromPools(localityDomainId);
         TLLM_CHECK_WITH_INFO(n <= poolSlots, "SlotAllocator capacity exceeds pool capacity");
     }
     return n;
 }
 
-Slot PoolGroupBase::allocate()
+Slot PoolGroupBase::allocate(LocalityDomainId localityDomainId)
 {
-    return mSlotAllocator.allocate();
+    return mSlotAllocators.at(localityDomainId)->allocate();
 }
 
-std::vector<Slot> PoolGroupBase::allocateMultiple(SlotCount numSlots)
+std::vector<Slot> PoolGroupBase::allocateMultiple(SlotCount numSlots, LocalityDomainId localityDomainId)
 {
-    return mSlotAllocator.allocateMultiple(numSlots);
+    return mSlotAllocators.at(localityDomainId)->allocateMultiple(numSlots);
 }
 
 void PoolGroupBase::release(Slot slot)
 {
-    mSlotAllocator.release(std::move(slot));
+    LocalityDomainId const owner = slot.localityDomainId().value_or(LocalityDomainId{0});
+    mSlotAllocators.at(owner)->release(std::move(slot));
 }
 
 void PoolGroupBase::destroy()
 {
     if (mDestroyed)
         return;
-    if (mSlotAllocator.numSlots() != 0)
+    for (auto& allocator : mSlotAllocators)
     {
-        mSlotAllocator.synchronize();
-        mSlotAllocator.prepareForShrink(0);
-        mSlotAllocator.finishShrink();
+        if (allocator->numSlots() != 0)
+        {
+            allocator->synchronize();
+            allocator->prepareForShrink(0);
+            allocator->finishShrink();
+        }
     }
     for (auto& p : mPools)
         p->destroy();
     mDestroyed = true;
 }
 
-void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots)
+void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots, LocalityDomainId localityDomainId)
 {
-    SlotCount n = newNumSlots.value_or(mSlotAllocator.numSlots());
+    TLLM_CHECK_DEBUG(localityDomainId == LocalityDomainId{0});
+    SlotCount n = newNumSlots.value_or(mSlotAllocators[LocalityDomainId{0}]->numSlots());
     for (auto& p : mPools)
         p->resize(n);
     // Mirrors Python PoolGroupBase.resize_pools: assert NDEBUG or self._check(True)
     // After resize, allocator capacity must not exceed pool capacity (allow mismatch).
-    TLLM_CHECK_DEBUG_WITH_INFO(mSlotAllocator.numSlots() <= getNumSlotsFromPools(),
+    TLLM_CHECK_DEBUG_WITH_INFO(mSlotAllocators[LocalityDomainId{0}]->numSlots() <= getNumSlotsFromPools(),
         "After resizePools: allocator capacity exceeds pool capacity");
+}
+
+std::vector<std::pair<SlotCount, SlotCount>> PoolGroupBase::slotRanges() const
+{
+    SlotCount const count = mSlotAllocators[LocalityDomainId{0}]->numSlots();
+    if (count == 0)
+    {
+        return {};
+    }
+    return {{SlotCount{0}, count}};
 }
 
 TypedVec<PoolIndex, Address> PoolGroupBase::slotAddress(SlotId slotId) const
@@ -594,10 +715,24 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 // GpuPoolGroup
 // ---------------------------------------------------------------------------
 
-GpuPoolGroup::GpuPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator)
-    : PoolGroupBase(numSlots)
+size_t localityDomainChunkSlots(TypedVec<PoolIndex, size_t> const& slotSizeList, size_t physMemSize)
 {
+    // Includes the pools holding smaller quantization-scale buffers.
+    size_t chunkSlots = 1;
+    for (size_t sz : slotSizeList)
+    {
+        chunkSlots = std::lcm(chunkSlots, physMemSize / std::gcd(physMemSize, sz));
+    }
+    return chunkSlots;
+}
+
+GpuPoolGroup::GpuPoolGroup(TypedVec<LocalityDomainId, SlotCount> const& numSlots,
+    TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator)
+    : PoolGroupBase(physMemAllocator.numLocalityDomains() == 1 ? numSlots.at(LocalityDomainId{0}) : SlotCount{0})
+{
+    int const numLocalityDomains = physMemAllocator.numLocalityDomains();
+    TLLM_CHECK_WITH_INFO(numSlots.size().value() == numLocalityDomains,
+        "GpuPoolGroup: one initial slot count per locality domain is required");
     size_t physMemSize = physMemAllocator.physMemSize();
     // Query total GPU memory to size virtual address space (mirrors Python GpuPoolGroup).
     size_t totalGpuMem = 0;
@@ -609,15 +744,196 @@ GpuPoolGroup::GpuPoolGroup(
     // @TODO: We should replace maxSlotSize with sum. This should also be updated in Python. Will do it later.
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
     size_t maxSlotSize = *std::max_element(slotSizeList.begin(), slotSizeList.end());
+
+    if (numLocalityDomains == 1)
+    {
+        for (size_t sz : slotSizeList)
+        {
+            // VA proportional to GPU memory, scaled by slot size ratio (mirrors Python).
+            // Compute ratio as double first to avoid size_t overflow.
+            double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
+            size_t vmSize = roundDown(static_cast<size_t>(static_cast<double>(totalGpuMem) * sizeRatio), physMemSize);
+            vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots[LocalityDomainId{0}]) * sz, physMemSize));
+            mPools.push_back(
+                std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots[LocalityDomainId{0}]));
+        }
+        return;
+    }
+
+    size_t const chunkSize = localityDomainChunkSlots(slotSizeList, physMemSize);
+    mChunkSize = static_cast<SlotCount>(chunkSize);
+    size_t const maxSlots = totalGpuMem / maxSlotSize;
+    // At most one partially used chunk per domain needs extra VA padding.
+    mMaxChunks = divUp(maxSlots, chunkSize) + static_cast<size_t>(numLocalityDomains);
+
+    mSlotMaps.reserve(LocalityDomainId{numLocalityDomains});
+    mSlotAllocators.clear();
+    for (LocalityDomainId localityDomainId{0}; localityDomainId < numLocalityDomains; ++localityDomainId)
+    {
+        mSlotMaps.emplace_back(mChunkSize);
+    }
+    for (LocalityDomainId localityDomainId{0}; localityDomainId < numLocalityDomains; ++localityDomainId)
+    {
+        mSlotAllocators.push_back(
+            std::make_unique<SlotAllocator>(SlotCount{0}, &mSlotMaps[localityDomainId], localityDomainId));
+    }
     for (size_t sz : slotSizeList)
     {
-        // VA proportional to GPU memory, scaled by slot size ratio (mirrors Python).
-        // Compute ratio as double first to avoid size_t overflow.
-        double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
-        size_t vmSize = roundDown(static_cast<size_t>(static_cast<double>(totalGpuMem) * sizeRatio), physMemSize);
-        vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
-        mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));
+        mPools.push_back(
+            std::make_unique<GpuSlotPool>(sz, mMaxChunks * chunkSize * sz, physMemAllocator, SlotCount{0}, &mSlotMaps));
     }
+    for (LocalityDomainId localityDomainId{0}; localityDomainId < numLocalityDomains; ++localityDomainId)
+    {
+        SlotCount const count = numSlots[localityDomainId];
+        resizePools(count, localityDomainId);
+        if (count != 0)
+        {
+            mSlotAllocators[localityDomainId]->expand(count);
+        }
+    }
+}
+
+GpuPoolGroup::~GpuPoolGroup()
+{
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+}
+
+size_t GpuPoolGroup::roundedNumBytes(size_t granularity) const noexcept
+{
+    size_t total = 0;
+    for (auto const& pool : mPools)
+    {
+        auto const& gpuPool = static_cast<GpuSlotPool const&>(*pool);
+        for (LocalityDomainId localityDomainId{0}; localityDomainId < gpuPool.numLocalityDomains(); ++localityDomainId)
+        {
+            total += roundUp(gpuPool.slotSize() * slotCountToSizeT(gpuPool.numSlots(localityDomainId)), granularity);
+        }
+    }
+    return total;
+}
+
+SlotCount GpuPoolGroup::getNumSlotsFromPools(LocalityDomainId localityDomainId) const noexcept
+{
+    if (mPools.empty())
+        return 0;
+    SlotCount minSlots = std::numeric_limits<SlotCount>::max();
+    for (auto const& pool : mPools)
+    {
+        minSlots = std::min(minSlots, static_cast<GpuSlotPool const&>(*pool).numSlots(localityDomainId));
+    }
+    return minSlots;
+}
+
+void GpuPoolGroup::resizeSlotMap(SlotCount numSlots, LocalityDomainId localityDomainId)
+{
+    if (mSlotMaps.empty())
+    {
+        return;
+    }
+    auto& slotMap = mSlotMaps[localityDomainId];
+    size_t const numChunks = divUp(slotCountToSizeT(numSlots), slotCountToSizeT(mChunkSize));
+    if (numChunks > slotMap.chunks().size() + mFreeChunks.size() + mMaxChunks - mNumChunks)
+    {
+        throw OutOfPagesError("GpuPoolGroup: slot ranges exceed the virtual memory reservation");
+    }
+    while (slotMap.chunks().size() < numChunks)
+    {
+        size_t chunk;
+        if (!mFreeChunks.empty())
+        {
+            chunk = mFreeChunks.top();
+            mFreeChunks.pop();
+        }
+        else
+        {
+            chunk = mNumChunks++;
+        }
+        slotMap.append(chunk);
+    }
+    while (slotMap.chunks().size() > numChunks)
+    {
+        mFreeChunks.push(slotMap.pop());
+    }
+}
+
+// Resize backing transactionally without changing issued ids or the allocator capacity.
+void GpuPoolGroup::resizePools(std::optional<SlotCount> newNumSlots, LocalityDomainId localityDomainId)
+{
+    if (mSlotMaps.empty())
+    {
+        PoolGroupBase::resizePools(newNumSlots, localityDomainId);
+        return;
+    }
+    SlotCount const target = newNumSlots.value_or(mSlotAllocators.at(localityDomainId)->numSlots());
+    std::vector<SlotCount> oldCounts;
+    oldCounts.reserve(mPools.stdSize());
+    SlotCount oldNumSlots = 0;
+    for (auto const& pool : mPools)
+    {
+        SlotCount const count = static_cast<GpuSlotPool const&>(*pool).numSlots(localityDomainId);
+        oldCounts.push_back(count);
+        oldNumSlots = std::max(oldNumSlots, count);
+    }
+    if (target > oldNumSlots)
+    {
+        resizeSlotMap(target, localityDomainId);
+    }
+    try
+    {
+        for (auto& pool : mPools)
+        {
+            static_cast<GpuSlotPool&>(*pool).resize(target, localityDomainId);
+        }
+    }
+    catch (...)
+    {
+        for (PoolIndex poolIdx{0}; poolIdx < mPools.size(); ++poolIdx)
+        {
+            static_cast<GpuSlotPool&>(*mPools[poolIdx]).resize(oldCounts[toSizeT(poolIdx)], localityDomainId);
+        }
+        resizeSlotMap(oldNumSlots, localityDomainId);
+        throw;
+    }
+    resizeSlotMap(target, localityDomainId);
+    TLLM_CHECK_DEBUG_WITH_INFO(mSlotAllocators[localityDomainId]->numSlots() <= getNumSlotsFromPools(localityDomainId),
+        "After resizePools: allocator capacity exceeds pool capacity");
+}
+
+std::vector<std::pair<SlotCount, SlotCount>> GpuPoolGroup::slotRanges() const
+{
+    if (mSlotMaps.empty())
+    {
+        return PoolGroupBase::slotRanges();
+    }
+    std::vector<std::pair<SlotCount, SlotCount>> ranges;
+    for (LocalityDomainId localityDomainId{0}; localityDomainId < numLocalityDomains(); ++localityDomainId)
+    {
+        SlotCount const count = mSlotAllocators[localityDomainId]->numSlots();
+        auto const& chunks = mSlotMaps[localityDomainId].chunks();
+        for (size_t i = 0; i < chunks.size(); ++i)
+        {
+            SlotCount const size = std::min(mChunkSize, count - static_cast<SlotCount>(i) * mChunkSize);
+            if (size > 0)
+            {
+                SlotCount const start = static_cast<SlotCount>(chunks[i]) * mChunkSize;
+                ranges.emplace_back(start, start + size);
+            }
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<SlotCount, SlotCount>> merged;
+    for (auto const& [start, end] : ranges)
+    {
+        if (!merged.empty() && merged.back().second == start)
+        {
+            merged.back().second = end;
+        }
+        else
+        {
+            merged.emplace_back(start, end);
+        }
+    }
+    return merged;
 }
 
 // ---------------------------------------------------------------------------
@@ -651,9 +967,9 @@ void HostPoolGroup::waitSlotUsable(SlotId slot) const
 
 // A failed fill surfaces out of waitSlotUsable, after the slots are already
 // taken, so they are returned to the allocator before the error propagates.
-Slot HostPoolGroup::allocate()
+Slot HostPoolGroup::allocate(LocalityDomainId localityDomainId)
 {
-    Slot slot = PoolGroupBase::allocate();
+    Slot slot = PoolGroupBase::allocate(localityDomainId);
     try
     {
         waitSlotUsable(slot.slotId());
@@ -666,9 +982,9 @@ Slot HostPoolGroup::allocate()
     return slot;
 }
 
-std::vector<Slot> HostPoolGroup::allocateMultiple(SlotCount numSlots)
+std::vector<Slot> HostPoolGroup::allocateMultiple(SlotCount numSlots, LocalityDomainId localityDomainId)
 {
-    std::vector<Slot> slots = PoolGroupBase::allocateMultiple(numSlots);
+    std::vector<Slot> slots = PoolGroupBase::allocateMultiple(numSlots, localityDomainId);
     if (slots.empty())
     {
         return slots;
@@ -712,9 +1028,10 @@ DiskPoolGroup::DiskPoolGroup(
 // CacheLevelStorage
 // ---------------------------------------------------------------------------
 
-std::vector<Slot> CacheLevelStorage::allocateMultiple(PoolGroupIndex pgIdx, SlotCount numSlots)
+std::vector<Slot> CacheLevelStorage::allocateMultiple(
+    PoolGroupIndex pgIdx, SlotCount numSlots, LocalityDomainId localityDomainId)
 {
-    return mPoolGroups.at(pgIdx)->allocateMultiple(numSlots);
+    return mPoolGroups.at(pgIdx)->allocateMultiple(numSlots, localityDomainId);
 }
 
 void CacheLevelStorage::release(PoolGroupIndex pgIdx, Slot slot)
@@ -722,9 +1039,9 @@ void CacheLevelStorage::release(PoolGroupIndex pgIdx, Slot slot)
     mPoolGroups.at(pgIdx)->release(std::move(slot));
 }
 
-SlotCount CacheLevelStorage::numFreeSlots(PoolGroupIndex pgIdx) const
+SlotCount CacheLevelStorage::numFreeSlots(PoolGroupIndex pgIdx, LocalityDomainId localityDomainId) const
 {
-    return mPoolGroups.at(pgIdx)->numFreeSlots();
+    return mPoolGroups.at(pgIdx)->numFreeSlots(localityDomainId);
 }
 
 TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const
@@ -742,10 +1059,13 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    // slotCountList is per domain: StorageManager sizes it from an equal share of the quota.
+    int const numLocalityDomains = mPhysMemAllocator.numLocalityDomains();
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
+            TypedVec<LocalityDomainId, SlotCount>(LocalityDomainId{numLocalityDomains}, slotCountList[pgIdx]),
+            slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
     }
 }
 

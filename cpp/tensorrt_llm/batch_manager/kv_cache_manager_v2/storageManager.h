@@ -143,17 +143,21 @@ public:
     // Allocate slots for all life cycles at the given cache level.
     // numSlotsPerLc[lcId] = how many slots to allocate for that life cycle.
     // Returns a vector indexed by lcId.
+    // localityDomainId selects the GPU domain the slots come from; it is required when the GPU
+    // tier is localized and ignored for the other tiers.
     TypedVec<LifeCycleId, std::vector<Slot>> newSlots(CacheLevel level,
         TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder = {},
-        DropRecorder const& dropRecorder = {});
+        DropRecorder const& dropRecorder = {}, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     TypedVec<LifeCycleId, std::vector<Slot>> newGpuSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {},
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Allocate slots for a single pool group at the given cache level.
     // Returns numSlots Slot objects. Throws OutOfPagesError if allocation fails.
     std::vector<Slot> newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {},
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
@@ -175,27 +179,31 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
-    // Ensure the requested free slots exist at this level (evicting pages as needed).
+    // Ensure the requested free slots exist at this level (evicting pages as needed). On a
+    // localized GPU tier only pages of localityDomainId are evicted and counted as free.
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {},
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Force-evict pages from a level to free space.
     void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
-        DropRecorder const& dropRecorder = {});
+        DropRecorder const& dropRecorder = {}, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
-    // Dynamic cache level resizing.
+    // Dynamic cache level resizing. A localized GPU level is resized one domain at a time.
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
         TypedVec<PoolGroupIndex, float> const& ratioList,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages);
     void shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
-        std::vector<SharedPtr<Page>> const& persistentPages);
-    void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots);
+        std::vector<SharedPtr<Page>> const& persistentPages, LocalityDomainId localityDomainId = LocalityDomainId{0});
+    void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
+        LocalityDomainId localityDomainId = LocalityDomainId{0});
 
     // ---- Migration ---------------------------------------------------------
 
     // Migrate pages excluded from eviction to one destination level. Locked pages cannot move.
-    void batchedMigrate(
-        CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
+    // dstLocalityDomainId is required when the destination is a localized GPU tier.
+    void batchedMigrate(CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
+        MigrationRecorder const& migrationRecorder, std::optional<LocalityDomainId> dstLocalityDomainId = std::nullopt);
 
     //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
     //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
@@ -204,13 +212,17 @@ public:
 
     //! Promote locked sparse host pages into one shared GPU allocation per page, updating all owners.
     //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves host ownership.
+    // localityDomainId is required when the GPU tier is localized: the promoted pages land there.
     void promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {},
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier. If a later batch fails, earlier batches may already have migrated.
-    int64_t prefetch(
-        CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
+    // dstLocalityDomainId is required when the destination is a localized GPU tier.
+    int64_t prefetch(CacheLevel dstLevel,
+        TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages,
+        std::optional<LocalityDomainId> dstLocalityDomainId = std::nullopt);
 
     // ---- Query helpers -----------------------------------------------------
 
@@ -229,6 +241,12 @@ public:
     PoolGroupIndex numPoolGroups(CacheLevel level) const
     {
         return mSlotDescLists.at(level).size();
+    }
+
+    // 1 unless the GPU tier is localized.
+    int numLocalityDomains() const noexcept
+    {
+        return mNumLocalityDomains;
     }
 
     PoolGroupIndex numPoolGroups() const
@@ -318,12 +336,19 @@ public:
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
-    StorageStatistics getStatistics(CacheLevel level = kHotLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0}) const;
-    TypedVec<PoolGroupIndex, float> getUtilization(CacheLevel level = kHotLevel) const;
+    // Summed over locality domains unless one is given.
+    StorageStatistics getStatistics(CacheLevel level = kHotLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0},
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt) const;
+    TypedVec<PoolGroupIndex, float> getUtilization(
+        CacheLevel level = kHotLevel, std::optional<LocalityDomainId> localityDomainId = std::nullopt) const;
     float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).
+    // Slots of locality domain 0 (the whole group when not localized).
     SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
+    // One past the highest usable slot id across all locality domains.
+    SlotCount slotIndexUpperBound(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
+    std::vector<std::pair<SlotCount, SlotCount>> slotRanges(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
@@ -396,16 +421,24 @@ private:
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
 
     void _prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
-        MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
+        MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder,
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
         PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
-        DropRecorder const& dropRecorder = {});
+        DropRecorder const& dropRecorder = {}, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
-        bool defrag = false);
+        bool defrag = false, std::optional<LocalityDomainId> dstLocalityDomainId = std::nullopt);
     void _migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
-        KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
+        KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder,
+        std::optional<LocalityDomainId> localityDomainId);
+
+    // The domain whose allocator serves `level`: 0 unless the level is a localized GPU tier, which
+    // then requires an explicit domain. Also the eviction filter for that level, if any.
+    LocalityDomainId resolveLocalityDomain(CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const;
+    std::optional<LocalityDomainId> localityDomainFilter(
+        CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const;
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
@@ -474,6 +507,7 @@ private:
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     RetentionExpiryQueue mRetentionExpiries;
+    int mNumLocalityDomains{1};
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;

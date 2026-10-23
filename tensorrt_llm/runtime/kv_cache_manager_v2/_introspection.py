@@ -246,6 +246,11 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
+def locality_domain_free_slots(manager: Any) -> list[int]:
+    """Return the free GPU slot count per locality domain, summed over pool groups."""
+    return list(_cpp().locality_domain_free_slots(manager))
+
+
 def grains_for_slots(num_slots: int, slot_size_list: list[int], granularity: int) -> int:
     """Return the grain count required for a pool group slot count."""
     return int(_cpp().grains_for_slots(num_slots, slot_size_list, granularity))
