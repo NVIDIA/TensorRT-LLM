@@ -4135,6 +4135,7 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.sage_attn_num_elts_per_blk_k = fwd.sage_attn_num_elts_per_blk_k;
     c.sage_attn_num_elts_per_blk_v = fwd.sage_attn_num_elts_per_blk_v;
     c.sage_attn_qk_int8 = fwd.sage_attn_qk_int8;
+    c.locality_domain_id = fwd.locality_domain_id;
     c.sage_attn_smooth_k = fwd.sage_attn_smooth_k;
     c.skip_correction_threshold = attn.skip_correction_threshold;
     return c;
@@ -4182,6 +4183,7 @@ std::string AttentionBase::toString() const
     TRTLLM_DUMP_FIELD(sage_attn_num_elts_per_blk_k)
     TRTLLM_DUMP_FIELD(sage_attn_num_elts_per_blk_v)
     TRTLLM_DUMP_FIELD(sage_attn_qk_int8)
+    TRTLLM_DUMP_FIELD(locality_domain_id)
     TRTLLM_DUMP_FIELD(sage_attn_smooth_k)
     TRTLLM_DUMP_FIELD(skip_correction_threshold)
 #undef TRTLLM_DUMP_FIELD
@@ -4468,19 +4470,19 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
     tensorrt_llm::torch_ext::AttentionBase const& c) const noexcept
 {
     std::size_t h = 0;
-    for (auto const v :
-        {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type), std::int64_t{c.is_fp8_out},
-            std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache}, std::int64_t{c.cross_attention},
-            c.tokens_per_block, static_cast<std::int64_t>(c.mask_type), std::int64_t{c.use_variable_window},
-            static_cast<std::int64_t>(c.position_embedding_type), c.num_heads, c.num_kv_heads, c.head_size,
-            c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()), std::int64_t{c.uses_spcompress},
-            std::int64_t{c.paged_context_fmha}, std::int64_t{c.is_spec_decoding_enabled},
-            c.spec_decoding_target_max_gen_len, std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant},
-            std::int64_t{c.use_sparse_attention}, std::int64_t{c.use_tllm_gen_sparse_attention},
-            std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
-            c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
-            std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
-            c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
+    for (auto const v : {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type),
+             std::int64_t{c.is_fp8_out}, std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache},
+             std::int64_t{c.cross_attention}, c.tokens_per_block, static_cast<std::int64_t>(c.mask_type),
+             std::int64_t{c.use_variable_window}, static_cast<std::int64_t>(c.position_embedding_type), c.num_heads,
+             c.num_kv_heads, c.head_size, c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()),
+             std::int64_t{c.uses_spcompress}, std::int64_t{c.paged_context_fmha},
+             std::int64_t{c.is_spec_decoding_enabled}, c.spec_decoding_target_max_gen_len,
+             std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant}, std::int64_t{c.use_sparse_attention},
+             std::int64_t{c.use_tllm_gen_sparse_attention}, std::int64_t{c.use_nvfp4_mla_kv_cache},
+             std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank, c.qk_nope_head_dim, c.qk_rope_head_dim,
+             c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num, std::int64_t{c.rope_append},
+             c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k, c.sage_attn_num_elts_per_blk_v,
+             std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}, c.locality_domain_id})
     {
         h = hashCombine(h, v);
     }
