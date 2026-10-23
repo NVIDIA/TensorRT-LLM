@@ -10,6 +10,7 @@ This module tests:
 
 """
 
+import datetime
 import pickle
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -158,6 +159,152 @@ def test_request_broadcaster_requires_conversation_params_attr():
 
     with pytest.raises(AttributeError):
         RequestBroadcaster._collect_py_objects(None, source_items)
+
+
+def _broadcast_round_trip(request: trtllm.Request) -> trtllm.Request:
+    request.py_conversation_params = None
+    items = [RequestQueueItem(42, request)]
+    sidecar = RequestBroadcaster._collect_py_objects(None, items)
+    restored_items, restored_sidecar = pickle.loads(pickle.dumps((items, sidecar)))
+    attach_py_objects_to_requests(restored_items, restored_sidecar)
+    return restored_items[0].request
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("original_end_id", [None, 99])
+def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> None:
+    request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        end_id=-1,
+        output_config=trtllm.OutputConfig(return_perf_metrics=True),
+    )
+    request.py_logprobs_mode = LogprobMode.PROCESSED if enabled else LogprobMode.RAW
+    request.py_logprobs_simple_format = enabled
+    request.py_return_routed_experts = enabled
+    request.py_original_end_id = original_end_id
+    request.py_mm_item_order = [1, 0]
+    request.py_arrival_time = 123.0
+
+    restored = _broadcast_round_trip(request)
+    for attribute in (
+        "py_logprobs_mode",
+        "py_logprobs_simple_format",
+        "py_return_routed_experts",
+        "py_original_end_id",
+        "py_mm_item_order",
+        "py_arrival_time",
+    ):
+        assert getattr(restored, attribute) == getattr(request, attribute)
+
+    translated = executor_request_to_llm_request(42, restored, [], False)
+    assert translated.py_logprobs_mode == request.py_logprobs_mode
+    assert translated.py_logprobs_simple_format is enabled
+    assert translated.py_return_routed_experts is enabled
+    assert translated.py_original_end_id == original_end_id
+    assert translated.py_mm_item_order == [1, 0]
+    translated.finish_by_reason(trtllm.FinishReason.CANCELLED)
+    response = translated.create_response()
+    assert response is not None
+    metrics = response.result.get_result().request_perf_metrics
+    assert metrics.timing_metrics.arrival_time == datetime.timedelta(seconds=123)
+
+
+def test_request_broadcast_preserves_absent_python_input_defaults() -> None:
+    restored = _broadcast_round_trip(
+        trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10, end_id=7)
+    )
+    assert not hasattr(restored, "py_original_end_id")
+    translated = executor_request_to_llm_request(42, restored, [], False)
+    assert translated.py_logprobs_mode == LogprobMode.RAW
+    assert translated.py_logprobs_simple_format is False
+    assert translated.py_return_routed_experts is False
+    assert translated.py_original_end_id == 7
+    assert translated.py_mm_item_order is None
+
+
+@pytest.mark.parametrize("position_ids", [None, [4, 5, 6]])
+@pytest.mark.parametrize("override", [None, [], [7, 8, 9]])
+def test_request_translation_preserves_position_ids_after_broadcast(position_ids, override) -> None:
+    restored = _broadcast_round_trip(
+        trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10, position_ids=position_ids)
+    )
+    translated = executor_request_to_llm_request(42, restored, [], False, position_ids=override)
+    assert translated.py_position_ids == (position_ids if override is None else override)
+
+
+@pytest.mark.parametrize("output_length", [None, 6])
+def test_request_translation_preserves_direct_encoder_inputs_after_broadcast(output_length) -> None:
+    features = torch.arange(96, dtype=torch.float32).reshape(12, 8)
+    restored = _broadcast_round_trip(
+        trtllm.Request(
+            input_token_ids=[1, 2, 3],
+            max_tokens=10,
+            encoder_input_features=features,
+            encoder_output_length=output_length,
+            sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        )
+    )
+    assert restored.encoder_output_length == output_length
+    translated = executor_request_to_llm_request(42, restored, [43], False)
+    for request in (translated, *translated.child_requests):
+        torch.testing.assert_close(request.py_encoder_input_features, features)
+        assert request.py_encoder_input_features is translated.py_encoder_input_features
+        assert request.encoder_output_len == (12 if output_length is None else output_length)
+        assert request.state == LlmRequestState.ENCODER_INIT
+        request.pause(20)
+        assert request.state == LlmRequestState.ENCODER_INIT
+
+
+@pytest.mark.parametrize("output_length", [None, 6])
+def test_request_translation_preserves_token_encoder_output_length(output_length) -> None:
+    restored = _broadcast_round_trip(
+        trtllm.Request(
+            input_token_ids=[1, 2, 3],
+            max_tokens=10,
+            encoder_input_token_ids=[4, 5, 6, 7],
+            encoder_output_length=output_length,
+        )
+    )
+    translated = executor_request_to_llm_request(42, restored, [], False)
+    assert translated.encoder_output_len == (4 if output_length is None else output_length)
+    assert translated.state == LlmRequestState.ENCODER_INIT
+
+
+@pytest.mark.parametrize("direct_output_length", [None, 6, 7])
+@pytest.mark.parametrize("direct_features", [False, True])
+def test_request_translation_resolves_encoder_input_routes(
+    direct_features, direct_output_length
+) -> None:
+    features = torch.ones(12, 8)
+    request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        encoder_input_features=features if direct_features else None,
+        encoder_output_length=direct_output_length,
+    )
+    request.py_multimodal_data = {
+        "audio": {"encoder_input_features": features, "encoder_output_len": 6}
+    }
+    restored = _broadcast_round_trip(request)
+    if direct_features:
+        with pytest.raises(ValueError, match="Specify encoder_input_features either directly"):
+            executor_request_to_llm_request(42, restored, [], False)
+    elif direct_output_length == 7:
+        with pytest.raises(ValueError, match="encoder_output_length conflicts"):
+            executor_request_to_llm_request(42, restored, [], False)
+    else:
+        translated = executor_request_to_llm_request(42, restored, [], False)
+        torch.testing.assert_close(translated.py_encoder_input_features, features)
+        assert translated.encoder_output_len == 6
+        assert translated.state == LlmRequestState.ENCODER_INIT
+
+
+def test_request_translation_requires_multimodal_encoder_output_length() -> None:
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+    request.py_multimodal_data = {"audio": {"encoder_input_features": torch.ones(12, 8)}}
+    with pytest.raises(ValueError, match="without encoder_output_len"):
+        executor_request_to_llm_request(42, _broadcast_round_trip(request), [], False)
 
 
 def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> None:

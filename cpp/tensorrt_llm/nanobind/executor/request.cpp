@@ -715,6 +715,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("request_type", &tle::Request::getRequestType, &tle::Request::setRequestType)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
+        .def_prop_ro("encoder_output_length", &tle::Request::getEncoderOutputLength)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
