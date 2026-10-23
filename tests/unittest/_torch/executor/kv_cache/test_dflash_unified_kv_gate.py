@@ -210,20 +210,26 @@ def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generatio
 
 
 def test_dflash_on_generation_worker_only_keeps_separate_cache(monkeypatch, tmp_path):
+    generation_only = dict(
+        context_servers={},
+        generation_servers={"speculative_config": {"decoding_type": "DFlash"}},
+    )
     # The launcher rejects the variable when only one section sets speculative_config.
     with pytest.raises(click.UsageError, match="both context_servers and generation_servers"):
-        _launch_from_disagg_config(
-            monkeypatch,
-            tmp_path,
-            context_servers={},
-            generation_servers={"speculative_config": {"decoding_type": "DFlash"}},
-        )
+        _launch_from_disagg_config(monkeypatch, tmp_path, **generation_only)
+    # Unset, it keeps the draft KV private on both servers.
     monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, **generation_only)
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "0"
     target = _model_config(kv_heads=8, head_dim=128)
     draft = _model_config(kv_heads=8, head_dim=128)
 
     for _role in ("context", "generation"):
         creator = _creator(is_disagg=True, target=target, draft=draft)
+        creator._speculative_config = DFlashDecodingConfig(
+            max_draft_len=7, attention_backend="TRTLLM"
+        )
         assert not creator._should_unify_dflash_kv_cache()
 
 
@@ -348,6 +354,33 @@ def test_disagg_separate_windowed_draft_pool_is_refused(monkeypatch, shared, win
         with pytest.raises(ValueError, match="TRTLLM_DISAGG_SHARED_DRAFT_KV=1 on every worker"):
             creator._check_shared_draft_kv_request()
     else:
+        creator._check_shared_draft_kv_request()
+
+
+def test_disagg_dflash_shares_its_draft_kv_without_the_variable(monkeypatch):
+    """Separately launched servers with the same DFlash config share without a launcher."""
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout, draft_windows=[2048])
+    creator._speculative_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
+    creator._sparse_attention_config = None
+
+    creator._check_shared_draft_kv_request()
+    assert creator._should_unify_dflash_kv_cache()
+
+
+def test_disagg_windowed_drafter_that_cannot_share_is_refused(monkeypatch):
+    """The refusal names what keeps a TRTLLM drafter's window from sharing the target's manager."""
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout, draft_windows=[2048])
+    creator._speculative_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
+    creator._sparse_attention_config = None
+    creator._mapping.pp_size = 2
+
+    with pytest.raises(
+        ValueError, match="pipeline_parallel_size is 2, not 1: use attention_backend"
+    ):
         creator._check_shared_draft_kv_request()
 
 

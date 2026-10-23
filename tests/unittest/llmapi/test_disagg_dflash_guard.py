@@ -17,11 +17,12 @@ import pytest
 from tensorrt_llm.llmapi import (
     CacheTransceiverConfig,
     DFlashDecodingConfig,
+    DSparkDecodingConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
     llm_args,
 )
-from tensorrt_llm.llmapi.llm_args import disagg_dflash_error
+from tensorrt_llm.llmapi.llm_args import disagg_dflash_error, disagg_shares_draft_kv
 
 pytestmark = pytest.mark.cpu_only
 
@@ -74,17 +75,20 @@ class TestTorchLlmArgsValidation:
         "attention_backend,shared_draft_kv,warns",
         [
             ("VANILLA", None, True),
-            ("TRTLLM", None, True),
+            ("TRTLLM", None, False),
             ("TRTLLM", "1", False),
-            ("AUTO", None, True),
+            ("TRTLLM", "0", True),
+            ("AUTO", None, False),
             ("AUTO", "1", False),
+            ("AUTO", "0", True),
         ],
     )
     def test_disagg_dflash_warns_unless_the_draft_kv_is_shared(
         self, monkeypatch, attention_backend, shared_draft_kv, warns
     ):
         # The drafter's context reaches a generation engine only through a draft
-        # KV shared with the target (TRTLLM backend, TRTLLM_DISAGG_SHARED_DRAFT_KV=1).
+        # KV shared with the target: the TRTLLM backend, unless
+        # TRTLLM_DISAGG_SHARED_DRAFT_KV=0 keeps it private.
         warnings = []
         monkeypatch.setattr(llm_args.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
         if shared_draft_kv is None:
@@ -110,3 +114,26 @@ class TestTorchLlmArgsValidation:
             model="dummy", cache_transceiver_config=_transceiver_config(), **self._SHAPE
         )
         assert args.speculative_config is None
+
+
+@pytest.mark.parametrize(
+    ("decoding_type", "attention_backend", "env", "shares"),
+    [
+        ("DFlash", "AUTO", None, True),
+        ("DFlash", "TRTLLM", None, True),
+        ("DFlash", "VANILLA", None, False),
+        ("DFlash", "AUTO", "0", False),
+        ("DFlash", "VANILLA", "1", True),
+        ("DSpark", "AUTO", None, False),
+        ("DSpark", "AUTO", "1", True),
+    ],
+)
+def test_disagg_shares_draft_kv(monkeypatch, decoding_type, attention_backend, env, shares):
+    """Unset, the variable leaves the choice to a DFlash backend that can share; DSpark needs it."""
+    if env is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", env)
+    config_cls = DFlashDecodingConfig if decoding_type == "DFlash" else DSparkDecodingConfig
+    config = config_cls(max_draft_len=7, attention_backend=attention_backend)
+    assert disagg_shares_draft_kv(config) is shares

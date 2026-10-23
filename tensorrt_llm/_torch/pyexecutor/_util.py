@@ -31,7 +31,8 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy,
+    disagg_shares_draft_kv)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -2063,12 +2064,12 @@ class KvCacheCreator:
         """Whether this run can place target and DFlash or standalone DSpark
         layers in one V2 manager.
 
-        Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV=1.
+        A disaggregated worker shares as ``disagg_shares_draft_kv`` decides.
         """
         if self._dflash_unify_blocker() is not None:
             return False
-        return not (self._is_disagg
-                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1")
+        return not self._is_disagg or disagg_shares_draft_kv(
+            self._speculative_config)
 
     def _check_shared_draft_kv_request(self) -> None:
         """Fail at startup when disaggregated draft KV sharing is missing or cannot be honored."""
@@ -2082,16 +2083,21 @@ class KvCacheCreator:
                     and self._get_draft_max_attention_window(
                         self._unification_max_seq_len,
                         self._kv_cache_config) is not None):
+                blocker = self._dflash_unify_blocker()
+                fix = (
+                    "use attention_backend VANILLA" if blocker else
+                    "set TRTLLM_DISAGG_SHARED_DRAFT_KV=1 on every worker, or "
+                    "use attention_backend VANILLA")
                 raise ValueError(
                     f"{self._unified_drafter_name()} with attention_backend "
                     "TRTLLM on a disaggregated worker must share its "
-                    "sliding-window draft KV with the target: set "
-                    "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 on every worker, or use "
-                    "attention_backend VANILLA. A separate draft KV cache "
-                    "retires the blocks behind the window at a request's real "
-                    "position while a transferred request's drafter fills it "
-                    "from position 0, so acceptance length collapses once a "
-                    "request passes the window.")
+                    "sliding-window draft KV with the target, but "
+                    f"{blocker or 'TRTLLM_DISAGG_SHARED_DRAFT_KV is not 1'}: "
+                    f"{fix}. A separate draft KV cache retires the blocks "
+                    "behind the window at a request's real position while a "
+                    "transferred request's drafter fills it from position 0, "
+                    "so acceptance length collapses once a request passes the "
+                    "window.")
             return
         blocker = self._dflash_unify_blocker()
         if blocker is not None:
