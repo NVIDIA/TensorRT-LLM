@@ -31,6 +31,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace tensorrt_llm::locality_domain
@@ -38,6 +39,41 @@ namespace tensorrt_llm::locality_domain
 
 namespace
 {
+
+// SM count of every stream this file creates on a Green Context. Kernel launchers read it while a
+// CUDA graph is being captured, where querying the stream's resources is not allowed.
+class LocalizedStreamSmCounts
+{
+public:
+    static LocalizedStreamSmCounts& instance()
+    {
+        static auto* const counts = new LocalizedStreamSmCounts;
+        return *counts;
+    }
+
+    void add(CUstream stream, unsigned int smCount)
+    {
+        std::lock_guard<std::mutex> const lock{mMutex};
+        mCounts[stream] = smCount;
+    }
+
+    void remove(CUstream stream)
+    {
+        std::lock_guard<std::mutex> const lock{mMutex};
+        mCounts.erase(stream);
+    }
+
+    unsigned int find(CUstream stream) const
+    {
+        std::lock_guard<std::mutex> const lock{mMutex};
+        auto const it = mCounts.find(stream);
+        return it == mCounts.end() ? 0 : it->second;
+    }
+
+private:
+    mutable std::mutex mMutex;
+    std::map<CUstream, unsigned int> mCounts;
+};
 
 #if CUDA_VERSION >= 13040
 constexpr int kLocalityDomainApiVersion = 13'040;
@@ -385,6 +421,10 @@ public:
                 result = mApi.greenCtxStreamCreate(
                     &mRemainderStream, mRemainderGreenContext, CU_STREAM_NON_BLOCKING, /*priority=*/0);
             }
+            if (result == CUDA_SUCCESS)
+            {
+                LocalizedStreamSmCounts::instance().add(mRemainderStream, getRemainderSmCount());
+            }
             if (result != CUDA_SUCCESS)
             {
                 TLLM_LOG_WARNING(
@@ -425,6 +465,7 @@ public:
                 return result;
             }
             mLocalizedStreams[localityDomainId] = newStream;
+            LocalizedStreamSmCounts::instance().add(newStream, mLocalizedResources[localityDomainId].sm.smCount);
         }
         *stream = mLocalizedStreams[localityDomainId];
         return CUDA_SUCCESS;
@@ -476,6 +517,7 @@ private:
         {
             if (stream != nullptr)
             {
+                LocalizedStreamSmCounts::instance().remove(stream);
                 CUresult const result = cuStreamDestroy(stream);
                 if (result != CUDA_SUCCESS)
                 {
@@ -488,6 +530,7 @@ private:
 
         if (mRemainderStream != nullptr)
         {
+            LocalizedStreamSmCounts::instance().remove(mRemainderStream);
             CUresult const result = cuStreamDestroy(mRemainderStream);
             if (result != CUDA_SUCCESS)
             {
@@ -1112,6 +1155,22 @@ CUstream LocalizationHandle::getReservedRemainderStream()
 {
     TLLM_CHECK_WITH_INFO(mImpl != nullptr, "Cannot use a moved-from LocalizationHandle");
     return mImpl->getReservedRemainderStream();
+}
+
+unsigned int getLocalizedStreamSmCount(CUstream stream) noexcept
+{
+    if (stream == nullptr)
+    {
+        return 0;
+    }
+    try
+    {
+        return LocalizedStreamSmCounts::instance().find(stream);
+    }
+    catch (std::system_error const&)
+    {
+        return 0;
+    }
 }
 
 bool deviceSupportsLocalization(int device) noexcept
