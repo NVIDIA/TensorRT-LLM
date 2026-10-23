@@ -658,14 +658,18 @@ def test_timeout_progress_reports_mixed_sender_phases_without_advancing_deadline
     task.retire_backend_done_physical_operation(3)
     task.retire_unsubmitted_physical_operation(4)
     task.mark_physical_operation_in_doubt(5)
-    before = (
-        session._deadline_monotonic_s,
-        session._retirement._request_deadline,
-        session._retirement._drain_started,
-        dict(session._retirement._claims),
-        session._logical_outcomes._terminal,
-        [operation.state for operation in task._physical_operations.values()],
-    )
+
+    def snapshot_state() -> tuple[object, ...]:
+        return (
+            session._deadline_monotonic_s,
+            session._retirement._request_deadline,
+            session._retirement._drain_started,
+            dict(session._retirement._claims),
+            session._logical_outcomes._terminal,
+            [operation.state for operation in task._physical_operations.values()],
+        )
+
+    before = snapshot_state()
     clock.return_value = 100.0
     clock.reset_mock()
 
@@ -682,14 +686,7 @@ def test_timeout_progress_reports_mixed_sender_phases_without_advancing_deadline
         assert f"{phase}=1" in description
     assert "source_pieces=1" in description
     assert "unavailable_tasks=0" in description
-    assert before == (
-        session._deadline_monotonic_s,
-        session._retirement._request_deadline,
-        session._retirement._drain_started,
-        dict(session._retirement._claims),
-        session._logical_outcomes._terminal,
-        [operation.state for operation in task._physical_operations.values()],
-    )
+    assert before == snapshot_state()
     clock.assert_not_called()
     assert backend_status.mock_calls == []
 
@@ -713,12 +710,16 @@ def test_timeout_progress_reports_publication_not_remote_submission() -> None:
     owner = task._physical_owner
     assert owner is not None
     owner.record_writer_result(1, True, wait_for_local_completion=True)
-    before = (
-        session._retirement._request_deadline,
-        dict(session._retirement._claims),
-        session._logical_outcomes._terminal,
-        dict(owner._writer_results),
-    )
+
+    def snapshot_state() -> tuple[object, ...]:
+        return (
+            session._retirement._request_deadline,
+            dict(session._retirement._claims),
+            session._logical_outcomes._terminal,
+            dict(owner._writer_results),
+        )
+
+    before = snapshot_state()
     clock.return_value = 100.0
     clock.reset_mock()
 
@@ -729,12 +730,7 @@ def test_timeout_progress_reports_publication_not_remote_submission() -> None:
     assert "expected_writer_results=4" in description  # KV and AUX each need two writers.
     assert "received_writer_results=1" in description
     assert "local_completion_pending=0" in description
-    assert before == (
-        session._retirement._request_deadline,
-        dict(session._retirement._claims),
-        session._logical_outcomes._terminal,
-        dict(owner._writer_results),
-    )
+    assert before == snapshot_state()
     clock.assert_not_called()
 
 

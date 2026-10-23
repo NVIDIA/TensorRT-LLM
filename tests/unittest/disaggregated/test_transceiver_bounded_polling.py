@@ -192,6 +192,28 @@ def _make_tx_session(
     return session
 
 
+def _assert_context_timeout_retains_transfer(
+    transceiver: KvCacheTransceiverV2,
+    session: _FakeSession | TxSession,
+    req: _FakeRequest,
+    warning: Mock,
+    unavailable_reason: str,
+) -> None:
+    assert transceiver._send_sessions == {16: session}
+    assert transceiver._send_reqs == {16: req}
+    assert session.aux_slot == 0
+    assert req.state is None
+    assert not req.py_kv_send_session_retired
+    assert warning.call_count == 2
+    for args, _kwargs in warning.call_args_list:
+        message = args[0]
+        assert "rid=16" in message
+        assert "kv_transfer_timeout_ms=60000ms" in message
+        assert "keeping it in progress" in message
+        assert "deadline_owner=native_sender_overall_wait" in message
+        assert f"progress_at_observation=unavailable({unavailable_reason})" in message
+
+
 def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
     monkeypatch,
 ) -> None:
@@ -282,27 +304,15 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
         warning,
     )
 
-    completed, failed = transceiver.check_context_transfer_status(None)
+    for _ in range(2):
+        completed, failed = transceiver.check_context_transfer_status(None)
+        assert completed == []
+        assert failed == []
 
-    completed_again, failed_again = transceiver.check_context_transfer_status(None)
-
-    assert completed == []
-    assert failed == []
-    assert completed_again == []
-    assert failed_again == []
     assert session.blocking_calls == [True, True]
     assert not session.closed
-    assert session.aux_slot == 0
-    assert transceiver._send_sessions == {16: session}
-    assert transceiver._send_reqs == {16: req}
-    assert warning.call_count == 2
-    messages = [args[0] for args, _kwargs in warning.call_args_list]
-    assert all("rid=16" in message for message in messages)
-    assert all("kv_transfer_timeout_ms=60000ms" in message for message in messages)
-    assert all("keeping it in progress" in message for message in messages)
-    assert all("deadline_owner=native_sender_overall_wait" in message for message in messages)
-    assert all(
-        "progress_at_observation=unavailable(alternate_session)" in message for message in messages
+    _assert_context_timeout_retains_transfer(
+        transceiver, session, req, warning, "alternate_session"
     )
 
 
@@ -344,19 +354,11 @@ def test_context_timeout_snapshot_failure_does_not_release_session(monkeypatch) 
         assert completed == []
         assert failed == []
 
-    assert transceiver._send_sessions == {16: session}
-    assert transceiver._send_reqs == {16: req}
     assert not session._closed
-    assert session.aux_slot == 0
-    assert req.state is None
-    assert not req.py_kv_send_session_retired
     session._aux_buffer.free_slot.assert_not_called()
     assert session.wait_complete.call_count == 2
     assert session._timeout_progress_description.call_count == 2
-    assert warning.call_count == 2
-    for args, _kwargs in warning.call_args_list:
-        assert "deadline_owner=native_sender_overall_wait" in args[0]
-        assert "progress_at_observation=unavailable(snapshot_failed)" in args[0]
+    _assert_context_timeout_retains_transfer(transceiver, session, req, warning, "snapshot_failed")
     assert session.close()
 
 

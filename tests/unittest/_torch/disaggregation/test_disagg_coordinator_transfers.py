@@ -348,6 +348,8 @@ def test_timeout_check_flags_both_directions(clock, monkeypatch, reporting: str)
     h.coordinator.check_transfer_timeouts()
     assert warning.call_count == 2
     messages = [call.args[0] for call in warning.call_args_list]
+    assert messages[0].startswith("Observed timeout on context request 1")
+    assert messages[1].startswith("Observed timeout on generation request 2")
     assert all("deadline_owner=executor_request" in message for message in messages)
     expected = {
         "native": "progress_at_observation=tx",
@@ -356,6 +358,29 @@ def test_timeout_check_flags_both_directions(clock, monkeypatch, reporting: str)
     }[reporting]
     assert all(expected in message for message in messages)
     assert describe.call_count == (0 if reporting == "unsupported" else 2)
+
+
+@pytest.mark.parametrize("cancel_receives", [False, True])
+def test_timeout_checks_preserve_per_request_and_per_sweep_clocks(
+    inflight_cancel, monkeypatch, cancel_receives: bool
+) -> None:
+    h = _Harness(kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True)
+    first = _receiving(h, 1, started_at=100.0)
+    second = _receiving(h, 2, started_at=100.0)
+    now = Mock(side_effect=[101.0, 101.5])
+    monkeypatch.setattr(coordinator_module.time, "monotonic", now)
+
+    if cancel_receives:
+        h.coordinator._cancel_timed_out_gen_transfers()
+    else:
+        h.coordinator.check_transfer_timeouts()
+
+    # Equality does not expire the deadline. Receive cancellation uses one
+    # timestamp per sweep; the general check samples each request separately.
+    assert not first.py_kv_transfer_timed_out
+    assert second.py_kv_transfer_timed_out is (not cancel_receives)
+    assert now.call_count == (1 if cancel_receives else 2)
+    assert first.py_kv_transfer_start_time == second.py_kv_transfer_start_time == 100.0
 
 
 def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) -> None:
@@ -474,7 +499,16 @@ def test_timed_out_receive_is_cancelled_once_until_the_request_is_forgotten(
 
     assert req.py_kv_transfer_timed_out
     assert h.transceiver.call_log.count("cancel_request:1") == 1
-    assert any("deadline_owner=executor_request" in call.args[0] for call in warning.call_args_list)
+    timeout_messages = [
+        call.args[0]
+        for call in warning.call_args_list
+        if "deadline_owner=executor_request" in call.args[0]
+    ]
+    assert len(timeout_messages) == 1
+    message = timeout_messages[0]
+    assert message.startswith("Requesting cancellation for generation request 1")
+    assert "elapsed 2000ms > kv_transfer_timeout_ms=1000ms" in message
+    assert "deadline_owner=executor_request" in message
 
     h.coordinator.forget_request(1)
     h.transceiver.request_and_receive_async(req)

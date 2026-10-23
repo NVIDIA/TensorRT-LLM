@@ -255,6 +255,33 @@ class DisaggTransferCoordinator:
             return f"{owner} progress_at_observation=unavailable(snapshot_failed)"
         return f"{owner} {progress}"
 
+    def _flag_transfer_timeout(
+        self,
+        request: LlmRequest,
+        kind: str,
+        timeout_ms: int,
+        *,
+        current_time: float | None = None,
+    ) -> None:
+        if request.py_kv_transfer_start_time is None:
+            return
+        if current_time is None:
+            current_time = time.monotonic()
+        elapsed_ms = (current_time - request.py_kv_transfer_start_time) * 1000
+        if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
+            verb = (
+                "Requesting cancellation for"
+                if self.inflight_cancel_active()
+                else "Observed timeout on"
+            )
+            logger.warning(
+                f"{verb} {kind} request {request.py_request_id} due to KV cache "
+                f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
+                f"kv_transfer_timeout_ms={timeout_ms}ms; "
+                f"{self._describe_transfer_timeout(request)}"
+            )
+            request.py_kv_transfer_timed_out = True
+
     @nvtx_range("check_transfer_timeouts")
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
         """Flag transfers that exceeded ``kv_transfer_timeout_ms``.
@@ -268,32 +295,14 @@ class DisaggTransferCoordinator:
         if timeout_ms is None:
             return
 
-        def flag_if_timed_out(req: LlmRequest, kind: str) -> None:
-            if req.py_kv_transfer_start_time is None:
-                return
-            elapsed_ms = (time.monotonic() - req.py_kv_transfer_start_time) * 1000
-            if elapsed_ms > timeout_ms and not req.py_kv_transfer_timed_out:
-                verb = (
-                    "Requesting cancellation for"
-                    if self.inflight_cancel_active()
-                    else "Observed timeout on"
-                )
-                logger.warning(
-                    f"{verb} {kind} request {req.py_request_id} due to KV cache "
-                    f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
-                    f"kv_transfer_timeout_ms={timeout_ms}ms; "
-                    f"{self._describe_transfer_timeout(req)}"
-                )
-                req.py_kv_transfer_timed_out = True
-
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
         # context side.
         for req in self._transfers.requests_in_transfer().values():
-            flag_if_timed_out(req, "context")
+            self._flag_transfer_timeout(req, "context", timeout_ms)
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
-                flag_if_timed_out(req, "generation")
+                self._flag_transfer_timeout(req, "generation", timeout_ms)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -746,16 +755,9 @@ class DisaggTransferCoordinator:
         }
         current_time = time.monotonic()
         for request in requests_in_transfer.values():
-            if request.py_kv_transfer_start_time is None:
-                continue
-            elapsed_ms = (current_time - request.py_kv_transfer_start_time) * 1000
-            if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
-                logger.warning(
-                    f"Requesting cancellation for generation request "
-                    f"{request.py_request_id} due to KV cache transfer timeout; "
-                    f"{self._describe_transfer_timeout(request)}"
-                )
-                request.py_kv_transfer_timed_out = True
+            self._flag_transfer_timeout(
+                request, "generation", timeout_ms, current_time=current_time
+            )
 
         user_canceled_ids = set(self._registry.canceled_request_ids())
         local_timed_out_ids = sorted(
