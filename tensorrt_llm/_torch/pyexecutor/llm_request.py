@@ -1632,6 +1632,8 @@ def executor_request_to_llm_request(
     sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if position_ids is None:
+        position_ids = executor_request.position_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     # Kept in its native list[list[int]] form, like py_bad_words. The
@@ -1685,23 +1687,34 @@ def executor_request_to_llm_request(
     # feature tensor, not encoder token ids. Python owns the payload; native
     # encoder input/output lengths drive admission and post-encoder cross-KV
     # sizing.
-    encoder_input_features = None
-    encoder_output_len = None
+    encoder_input_features = executor_request.encoder_input_features
+    encoder_output_len = executor_request.encoder_output_length
     py_mm_data = py_multimodal_data or {}
     audio_mm_data = py_mm_data.get("audio") or {}
     if isinstance(audio_mm_data, dict):
         # Only enc-dec input processors emit encoder_input_features (decoder-only
         # audio models use the generic HF input_features), so its presence is a
         # safe routing signal.
-        encoder_input_features = audio_mm_data.get("encoder_input_features")
-        if encoder_input_features is not None:
+        mm_encoder_input_features = audio_mm_data.get("encoder_input_features")
+        if mm_encoder_input_features is not None:
+            if encoder_input_features is not None:
+                raise ValueError(
+                    "Specify encoder_input_features either directly or in "
+                    "multimodal_data['audio'], not both.")
             if "encoder_output_len" not in audio_mm_data:
                 raise ValueError(
                     "multimodal_data['audio'] carries encoder_input_features "
                     "without encoder_output_len; encoder-decoder input "
                     "processors must emit both (the post-encoder length "
                     "sizes the cross-KV cache).")
-            encoder_output_len = int(audio_mm_data["encoder_output_len"])
+            mm_encoder_output_len = int(audio_mm_data["encoder_output_len"])
+            if (encoder_output_len is not None
+                    and encoder_output_len != mm_encoder_output_len):
+                raise ValueError(
+                    "encoder_output_length conflicts with "
+                    "multimodal_data['audio']['encoder_output_len'].")
+            encoder_input_features = mm_encoder_input_features
+            encoder_output_len = mm_encoder_output_len
 
     llm_request = LlmRequest(
         request_id=req_id,
