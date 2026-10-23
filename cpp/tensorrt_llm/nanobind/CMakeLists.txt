@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
 set(TRTLLM_NB_MODULE bindings)
 set(TRTLLM_NB_MODULE
     ${TRTLLM_NB_MODULE}
@@ -45,6 +59,19 @@ else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 endif()
 
+target_compile_definitions(
+  ${TRTLLM_NB_MODULE}
+  PRIVATE ENABLE_NANOBIND_PROFILING=$<BOOL:${ENABLE_NANOBIND_PROFILING}>)
+if(ENABLE_NANOBIND_PROFILING)
+  target_compile_definitions(nanobind-static PRIVATE TLLM_NANOBIND_PROFILING)
+  target_include_directories(
+    nanobind-static PRIVATE ${PROJECT_SOURCE_DIR}/include ${TORCH_INCLUDE_DIRS})
+  # Reuse th_common's shared selector and scope implementation; do not embed a
+  # hidden second copy in the nanobind static library or Python module.
+  target_link_libraries(nanobind-static PRIVATE th_common ${TORCH_LIBRARIES}
+                                                ${TORCH_PYTHON_LIB})
+endif()
+
 # SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the
 # shared lib). Only add the include directory so headers resolve during
 # compilation of kvCacheManagerV2.cpp.
@@ -72,8 +99,10 @@ target_link_libraries(
          th_common
          pg_utils)
 target_compile_definitions(
-  ${TRTLLM_NB_MODULE} PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
-                             PYBIND11_DETAILED_ERROR_MESSAGES=1)
+  ${TRTLLM_NB_MODULE}
+  PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
+         PYBIND11_DETAILED_ERROR_MESSAGES=1
+         TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
 
 if(NOT WIN32)
   set(TRTLLM_NB_MODULE_RPATH_LIST

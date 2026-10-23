@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, cast
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
     KvCacheTransceiver,
+    SendTerminalOutcome,
 )
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
@@ -495,6 +496,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions.clear()
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
+        outcomes = getattr(self, "_profile_send_outcomes", None)
+        if outcomes is not None:
+            outcomes.clear()
         self._shutdown_complete = True
 
     def __enter__(self):
@@ -881,8 +885,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return to_process
 
     def _close_failed_sessions(
-        self, sessions: dict, reqs: dict, failed: list, mark_retired: bool = False
-    ):
+        self,
+        sessions: dict[int, TxSessionBase] | dict[int, RxSessionBase],
+        reqs: dict[int, LlmRequest],
+        failed: list[int],
+        mark_retired: bool = False,
+    ) -> None:
         for rid in failed:
             session = sessions.get(rid)
             if session is None:
@@ -894,6 +902,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 else:
                     req.py_kv_send_session_retired = True
+            if mark_retired:
+                self._record_send_terminal_outcome(rid, "failed")
             sessions.pop(rid, None)
 
     def _retire_send_session(
@@ -901,7 +911,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid: int,
         req: Optional[LlmRequest] = None,
         *,
-        outcome: str = "retired",
+        outcome: Literal["retired", "completed", "cancelled"] = "retired",
         session_already_closed: bool = False,
     ) -> None:
         """Close a send session and prevent later chunks from recreating it."""
@@ -917,6 +927,45 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs.pop(rid, None)
         if req is not None:
             req.py_kv_send_session_retired = True
+        if outcome == "completed":
+            self._record_send_terminal_outcome(rid, "complete")
+        elif outcome == "cancelled":
+            self._record_send_terminal_outcome(rid, "cancelled")
+
+    def observe_send_terminal_outcome(self, req: LlmRequest, enabled: bool = True) -> None:
+        """Register only a profiler-tracked send; opt out after its observation.
+
+        The optional table is bounded by the adapter's pending sends. It has
+        no request references and is never populated by unobserved transfers.
+        """
+        outcomes: dict[int, SendTerminalOutcome | None] | None = getattr(
+            self, "_profile_send_outcomes", None
+        )
+        rid = get_unique_rid(req)
+        if rid is None:
+            return
+        if enabled:
+            if outcomes is None:
+                outcomes = {}
+                self._profile_send_outcomes = outcomes
+            outcomes.setdefault(rid, None)
+        elif outcomes is not None:
+            outcomes.pop(rid, None)
+
+    def get_send_terminal_outcome(self, req: LlmRequest) -> SendTerminalOutcome | None:
+        """Read an opt-in outcome without polling or consuming retirement state."""
+        outcomes: dict[int, SendTerminalOutcome | None] | None = getattr(
+            self, "_profile_send_outcomes", None
+        )
+        rid = get_unique_rid(req)
+        return outcomes.get(rid) if outcomes is not None and rid is not None else None
+
+    def _record_send_terminal_outcome(self, rid: int, outcome: SendTerminalOutcome) -> None:
+        outcomes: dict[int, SendTerminalOutcome | None] | None = getattr(
+            self, "_profile_send_outcomes", None
+        )
+        if outcomes is not None and rid in outcomes:
+            outcomes[rid] = outcome
 
     @staticmethod
     def _ownership_blocks_retirement(session: object) -> bool:
@@ -998,6 +1047,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether a transfer session still owns this request's resources."""
         rid = get_unique_rid(req)
         return rid in self._send_sessions or rid in self._recv_sessions
+
+    def transfer_resource_ownership(self, req: LlmRequest) -> bool:
+        """Observe the same authoritative ownership predicate used by the executor."""
+        return self.has_inflight_transfer(req)
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""

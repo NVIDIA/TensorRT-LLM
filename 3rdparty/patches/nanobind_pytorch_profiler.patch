@@ -1,0 +1,217 @@
+diff --git a/src/nb_func.cpp b/src/nb_func.cpp
+index 915b2fc..1b6d720 100644
+--- a/src/nb_func.cpp
++++ b/src/nb_func.cpp
+@@ -7,6 +7,14 @@
+     BSD-style license that can be found in the LICENSE file.
+ */
+ 
++#if defined(TLLM_NANOBIND_PROFILING)
++#  include "trtllm_pytorch_tensor_adapter.h"
++#  include "tensorrt_llm/common/profiler.h"
++#  include <optional>
++#  include <stdexcept>
++#  include <string>
++#endif
++
+ #include "nb_internals.h"
+ #include "buffer.h"
+ #include "nb_ft.h"
+@@ -29,6 +37,103 @@ NAMESPACE_BEGIN(detail)
+ // Forward/external declarations
+ extern Buffer buf;
+ 
++#if defined(TLLM_NANOBIND_PROFILING)
++// Observational Python work must not replace a pending operation exception.
++class nb_func_profiler_error_state {
++public:
++    nb_func_profiler_error_state() noexcept {
++        PyErr_Fetch(&type, &value, &traceback);
++    }
++    ~nb_func_profiler_error_state() noexcept {
++        PyErr_Clear();
++        PyErr_Restore(type, value, traceback);
++    }
++    nb_func_profiler_error_state(const nb_func_profiler_error_state &) = delete;
++    nb_func_profiler_error_state &operator=(const nb_func_profiler_error_state &) = delete;
++
++private:
++    PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
++};
++
++static std::string nb_func_profiler_utf8(PyObject *value) {
++    if (!value)
++        throw std::runtime_error("nanobind profiler name unavailable");
++    Py_ssize_t size = 0;
++    const char *data = PyUnicode_AsUTF8AndSize(value, &size);
++    if (!data)
++        throw std::runtime_error("nanobind profiler name is not UTF-8");
++    return std::string(data, (size_t) size);
++}
++
++static std::string nb_func_profiler_name(PyObject *self) {
++    const func_data *f = nb_func_data(self);
++    std::string name = "trtllm::nanobind::";
++    if (f->flags & (uint32_t) func_flags::has_scope) {
++        const bool module_scope = PyModule_Check(f->scope);
++        object module = steal<object>(PyObject_GetAttrString(
++            f->scope, module_scope ? "__name__" : "__module__"));
++        name += nb_func_profiler_utf8(module.ptr());
++        name += '.';
++        if (!module_scope) {
++            object qualname = steal<object>(
++                PyObject_GetAttrString(f->scope, "__qualname__"));
++            name += nb_func_profiler_utf8(qualname.ptr());
++            name += '.';
++        }
++    }
++    name += (f->flags & (uint32_t) func_flags::has_name)
++                ? f->name : "<anonymous>";
++    return name;
++}
++
++class nb_func_record_scope {
++public:
++    nb_func_record_scope(PyObject *self, PyObject *const *args,
++                         size_t nargs, PyObject *kwnames) noexcept {
++        nb_func_profiler_error_state error_state;
++        try {
++            record.emplace(tensorrt_llm::common::ProfilerRegion::kNanobind);
++            record->startWithLazyName(
++                [&]() { return nb_func_profiler_name(self); },
++                [&](tensorrt_llm::common::ProfilerMetadata &metadata) {
++                    const size_t nkwargs =
++                        kwnames ? (size_t) NB_TUPLE_GET_SIZE(kwnames) : 0;
++                    size_t tensor_index = 0;
++                    for (size_t i = 0; i < nargs + nkwargs; ++i) {
++                        if (!trtllm_pytorch_profiler::isTensor(args[i]))
++                            continue;
++                        at::Tensor tensor =
++                            trtllm_pytorch_profiler::unpackTensor(args[i]);
++                        std::string prefix = "nanobind.tensor." +
++                                             std::to_string(tensor_index++);
++                        metadata.add(prefix + ".shape", tensor.sizes().vec());
++                        if (tensor.layout() == c10::kStrided)
++                            metadata.add(prefix + ".stride", tensor.strides().vec());
++                        metadata.add(prefix + ".dtype",
++                                     c10::toString(tensor.scalar_type()));
++                        metadata.add(prefix + ".device", tensor.device().str());
++                    }
++                    metadata.add("nanobind.tensor_count",
++                                 static_cast<std::int64_t>(tensor_index));
++                });
++        } catch (...) {
++            // Only observation is contained; dispatch remains outside this boundary.
++            record.reset();
++        }
++    }
++
++    ~nb_func_record_scope() noexcept {
++        nb_func_profiler_error_state error_state;
++        record.reset();
++    }
++    nb_func_record_scope(const nb_func_record_scope &) = delete;
++    nb_func_record_scope &operator=(const nb_func_record_scope &) = delete;
++
++private:
++    std::optional<tensorrt_llm::common::RecordFunctionWithMetadata> record;
++};
++#endif
++
+ static PyObject *nb_func_vectorcall_simple_0(PyObject *, PyObject *const *,
+                                              size_t, PyObject *) noexcept;
+ static PyObject *nb_func_vectorcall_simple_1(PyObject *, PyObject *const *,
+@@ -610,6 +715,10 @@ static PyObject *nb_func_vectorcall_complex(PyObject *self,
+ 
+     func_data *fr = nb_func_data(self);
+ 
++#if defined(TLLM_NANOBIND_PROFILING)
++    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
++#endif
++
+     const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
+                is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
+ 
+@@ -888,6 +997,10 @@ static PyObject *nb_func_vectorcall_simple(PyObject *self,
+     const size_t count         = (size_t) Py_SIZE(self),
+                  nargs_in      = (size_t) NB_VECTORCALL_NARGS(nargsf);
+ 
++#if defined(TLLM_NANOBIND_PROFILING)
++    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
++#endif
++
+     const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
+                is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
+ 
+@@ -978,6 +1091,10 @@ static PyObject *nb_func_vectorcall_simple_0(PyObject *self,
+     func_data *fr = nb_func_data(self);
+     const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
+ 
++#if defined(TLLM_NANOBIND_PROFILING)
++    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
++#endif
++
+     // Handler routine that will be invoked in case of an error condition
+     PyObject *(*error_handler)(PyObject *, PyObject *const *, size_t,
+                                PyObject *) noexcept = nullptr;
+@@ -1017,6 +1134,10 @@ static PyObject *nb_func_vectorcall_simple_1(PyObject *self,
+                                              PyObject *kwargs_in) noexcept {
+     func_data *fr = nb_func_data(self);
+     const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
++
++#if defined(TLLM_NANOBIND_PROFILING)
++    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
++#endif
+     bool is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
+ 
+     // Handler routine that will be invoked in case of an error condition
+diff --git a/src/trtllm_pytorch_tensor_adapter.h b/src/trtllm_pytorch_tensor_adapter.h
+new file mode 100644
+index 0000000..218c847
+--- /dev/null
++++ b/src/trtllm_pytorch_tensor_adapter.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <torch/version.h>
++
++#if TORCH_VERSION_MAJOR != 2 || TORCH_VERSION_MINOR != 14
++#  error "TLLM_NANOBIND_PROFILING requires the validated PyTorch 2.14 private Tensor API"
++#endif
++#if defined(Py_LIMITED_API) || defined(NB_FREE_THREADED)
++#  error "TLLM_NANOBIND_PROFILING requires the CPython GIL and full Python API"
++#endif
++
++// Parse Torch/pybind11 before nb_internals.h defines its check macro.
++#include <torch/csrc/autograd/python_variable.h>
++
++namespace trtllm_pytorch_profiler {
++
++//! Check the concrete Tensor subtype hierarchy without Python callbacks or error changes.
++inline bool isTensor(PyObject *value) noexcept {
++    return value != nullptr && THPVariableClass != nullptr &&
++           PyObject_TypeCheck(value, reinterpret_cast<PyTypeObject *>(THPVariableClass));
++}
++
++//! Copy the underlying Tensor handle; guarded non-tensors produce an undefined handle.
++inline at::Tensor unpackTensor(PyObject *value) {
++    return isTensor(value) ? THPVariable_Unpack(value) : at::Tensor{};
++}
++
++} // namespace trtllm_pytorch_profiler
