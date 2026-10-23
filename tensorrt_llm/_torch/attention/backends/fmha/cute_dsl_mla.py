@@ -57,6 +57,9 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# ``assumed_align`` the decode runner compiles the page table and the KV
+# lengths with; their runtime pointers must keep it.
+_KERNEL_INPUT_ALIGN_BYTES = 16
 
 
 @triton.jit(
@@ -665,21 +668,11 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
-        if cache_seqs_base.data_ptr() % 16 != 0:
-            # Mixed context/generation batches can expose an aligned buffer
-            # through an int32 slice whose storage offset is not 16-byte
-            # aligned. CuTe DSL requires the runtime pointer itself to keep
-            # the alignment assumed when compiling the kernel.
-            cache_seqs_base = cache_seqs_base.clone()
+        cache_seqs_base = self._aligned_kernel_input(params.sequence_lengths.to(torch.int32))
         # The page-table batch dimension determines the kernel launch batch.
-        page_table = (
-            page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
-            .transpose(0, 1)
-            .to(torch.int32)
+        page_table = self._generation_page_table(
+            page_table_layer, meta.num_contexts, batch_size, layer_in_pool
         )
-        if layers_in_pool > 1:
-            page_table = page_table + layer_in_pool
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view
@@ -739,6 +732,42 @@ class CuteDslMlaFmha(PhasedFmha):
             ),
             block_split_kvs,
         )
+
+    @staticmethod
+    def _aligned_kernel_input(tensor: torch.Tensor) -> torch.Tensor:
+        """Return ``tensor``, or a contiguous copy when its pointer breaks ``assumed_align``.
+
+        The decode runner compiles the page table and the KV lengths with a
+        16-byte ``assumed_align``, which the runtime pointer itself must keep.
+        Slicing past the context requests of a mixed batch, or into a
+        non-first pool of ``kv_cache_block_offsets``, can leave a 4- or 8-byte
+        aligned view of an aligned buffer. Aligned views (every decode-only
+        batch whose pool offset is aligned) pass through without a copy; the
+        copy otherwise comes from the caching allocator and, under CUDA graph
+        capture, replays with the graph.
+        """
+        if tensor.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return tensor
+        return tensor.clone(memory_format=torch.contiguous_format)
+
+    @classmethod
+    def _generation_page_table(
+        cls,
+        page_table_layer: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        layer_in_pool: int,
+    ) -> torch.Tensor:
+        """This step's ``[max_blocks, batch]`` int32 page table for the generation requests.
+
+        ``page_table_layer`` is one pool's ``[num_seqs, max_blocks]`` view of
+        ``kv_cache_block_offsets``; ``layer_in_pool`` folds a KVCacheManagerV1
+        layer slot into the page indices.
+        """
+        rows = page_table_layer[num_contexts : num_contexts + batch_size].to(torch.int32)
+        if layer_in_pool:
+            rows = rows + layer_in_pool
+        return cls._aligned_kernel_input(rows).transpose(0, 1)
 
     @staticmethod
     def _split_kv_plan(
