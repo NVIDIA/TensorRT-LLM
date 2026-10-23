@@ -478,10 +478,12 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
+                # ServerDisconnectedError and connection resets can result from
+                # transient TCP races, such as client/server keepalive races at
+                # burst start. Give them an extended retry budget to recover
+                # while preserving the original fail-fast for other errors.
                 # aiohttp can wrap an OS connection reset in ClientOSError
                 # rather than a ConnectionResetError subclass.
-                # Give them an extended retry budget while preserving the
-                # original fail-fast for genuine upstream errors.
                 is_transient_tcp = isinstance(
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
