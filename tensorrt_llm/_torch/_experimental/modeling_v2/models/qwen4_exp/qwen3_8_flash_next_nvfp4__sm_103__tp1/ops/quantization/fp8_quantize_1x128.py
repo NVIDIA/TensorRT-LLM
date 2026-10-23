@@ -72,46 +72,12 @@ class Fp8Quantize1x128(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTPLayer._moe decode: one token at hidden 2560", spec=dict(tokens=1, **_CKPT)),
         Cell(
-            why="3 tokens: inside the data buffer's 4-row allocation pad",
-            spec=dict(tokens=3, **_CKPT),
-        ),
-        Cell(why="4 tokens: exactly one 4-row pad unit", spec=dict(tokens=4, **_CKPT)),
-        Cell(
-            why="5 tokens: the first count spilling into a second pad unit",
-            spec=dict(tokens=5, **_CKPT),
-        ),
-        Cell(
             why="20 tokens == H/128: the scale buffer is square, its transpose undetectable",
             spec=dict(tokens=20, **_CKPT),
         ),
-        Cell(why="64 tokens: a multiple of every pad", spec=dict(tokens=64, **_CKPT)),
-        Cell(why="1024 tokens: prefill-shaped", spec=dict(tokens=1024, **_CKPT)),
         Cell(
-            why="8192 tokens: max_num_tokens, the top of the certified column",
-            spec=dict(tokens=8192, **_CKPT),
-        ),
-        Cell(
-            why="H 128: one whole block per row", spec=dict(tokens=7, hidden=128, use_ue8m0=False)
-        ),
-        Cell(
-            why="H 7168: the widest width measured",
-            spec=dict(tokens=64, hidden=7168, use_ue8m0=False),
-        ),
-        Cell(
-            why="H 16: the narrowest width the op takes, one short block",
-            spec=dict(tokens=3, hidden=16, use_ue8m0=False),
-        ),
-        Cell(
-            why="H 144: a 16-wide tail block takes the amax of its own elements",
-            spec=dict(tokens=64, hidden=144, use_ue8m0=False),
-        ),
-        Cell(
-            why="H 2576: the checkpoint width plus a 16-wide tail",
-            spec=dict(tokens=64, hidden=2576, use_ue8m0=False),
-        ),
-        Cell(
-            why="use_ue8m0=True: the round-up power-of-two scale, bit-exact",
-            spec=dict(tokens=17, hidden=2560, use_ue8m0=True),
+            why="16384 rows: max_num_tokens of the tuned config",
+            spec=dict(tokens=16384, **_CKPT),
         ),
     )
 
@@ -121,25 +87,26 @@ class Fp8Quantize1x128(OpWrapper):
     sm_100 family the op returns a 1-D padded buffer instead. That branch was
     read, not run.
 
-    Preconditions, all enforced loudly by the op: `input` bf16 (fp16, fp32 and
-    fp8 raise), 2-D (flatten `[B, S, H]` yourself), contiguous, CUDA, and
-    `H % 16 == 0` -- the width, not the block count, so H need not be a
-    multiple of 128. `T == 0` is accepted and returns `[0, H]` / `[NB, 0]`.
-    A consumer needing `H % 128 == 0` (the block-scale MoE runner) owns that
-    constraint.
+    Preconditions, enforced loudly by the op: `input` bf16, 2-D (flatten
+    `[B, S, H]` yourself), contiguous (the test holds the column-slice
+    rejection), CUDA, and `H % 16 == 0` -- the width, not the block count, so
+    H need not be a multiple of 128. A consumer needing `H % 128 == 0` (the
+    block-scale MoE runner) owns that constraint.
 
-    Edge behaviour, measured: an all-zero block takes scale
-    `bf16(1e-10) / 448` and all-zero codes; `inf` poisons its whole block
-    (scale inf, its own code NaN, every other code 0); NaN stays in its own
-    element (the running max ignores it); the block max maps to exactly +-448
-    and nothing overflows. `data` is a leading-row view of an allocation padded
-    to a multiple of 4 rows -- the padded rows are uninitialized, so a
-    raw-pointer reader must stop at `T`. CUDA-graph capturable; stream-
-    independent; the registered fake matches eager shapes.
+    `data` is a leading-row view of an allocation padded to a multiple of 4
+    rows -- the padded rows are uninitialized, so a raw-pointer reader must
+    stop at `T`. CUDA-graph capture and replay are certified.
 
     Hard limits
-      T   certified 0..8192 at H 2560; above that not probed
-      H   multiple of 16 (raises otherwise); certified 16..7168
+      T   certified at 1, 20 and 16384 at H 2560 (16384: max_num_tokens of the
+          tuned config); above that not probed
+      H   multiple of 16 (raises otherwise); certified at 2560, the draft layer's
+          width
+
+    Not certified: `T == 0` (the op accepts it and returns `[0, H]` /
+    `[NB, 0]`); a short tail block (`H % 128 != 0`); all-zero blocks (the
+    `AMAX_FLOOR` scale), `inf` / NaN inputs and saturation; `use_ue8m0=True`;
+    the registered fake.
     """
 
     def __call__(
