@@ -461,6 +461,7 @@ def _compute_mean_phase_kernel(
     F_BLOCK: tl.constexpr,
     HAS_SWA: tl.constexpr,
 ):
+    """Evaluate fixed-order phase means and derive active decode/SWA metadata."""
     request = tl.program_id(0)
     f = tl.arange(0, F_BLOCK)
     position = tl.load(logical_lengths + request).to(tl.float32)

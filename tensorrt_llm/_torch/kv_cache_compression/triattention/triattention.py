@@ -118,7 +118,13 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         *,
         pretrained_config: "PretrainedConfig",
     ) -> None:
+        """Validate selector support before loading calibration or allocating buffers."""
         super().__init__(config, pretrained_config=pretrained_config)
+        if config.budget > 16384:
+            raise ValueError(
+                f"TriAttention budget must be at most 16384 for the Blackwell TopK selector; "
+                f"got {config.budget}"
+            )
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode

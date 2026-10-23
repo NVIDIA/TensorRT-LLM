@@ -197,6 +197,16 @@ def test_request_admission_does_not_grow_workspace():
     manager._compaction_done_event.synchronize.assert_not_called()
     manager._phase.reserve.assert_not_called()
 
+    # Admission checks the effective position after the sequence-length cap.
+    limit = 1 << 24
+    manager.kv_cache_manager.max_seq_len = limit + 1024
+    manager.on_request_init(_make_request(4, py_prompt_len=100, py_max_new_tokens=limit - 101))
+    with pytest.raises(ValueError, match="exact-FP32"):
+        manager.on_request_init(_make_request(5, py_prompt_len=100, py_max_new_tokens=limit - 100))
+    manager.kv_cache_manager.max_seq_len = limit - 1
+    manager.on_request_init(_make_request(6, py_prompt_len=100, py_max_new_tokens=2 * limit))
+    manager._build_score_runtime.assert_not_called()
+
 
 def test_request_admission_accepts_unaligned_sequence_limit_without_growth():
     manager = _make_triattention(budget=128, beta=64)
