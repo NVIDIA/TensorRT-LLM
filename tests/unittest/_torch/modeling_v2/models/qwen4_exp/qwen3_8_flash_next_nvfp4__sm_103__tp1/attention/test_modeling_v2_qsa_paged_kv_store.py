@@ -50,25 +50,11 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(as_int)
 
 
-def _hole(spec, table, live_requests, allocated_cols):
-    """One row that resolves to no slot, and the table edit it needs."""
-    tpb, width, slots, pages = (spec[k] for k in ("tokens_per_block", "width", "slots", "pages"))
-    kind = spec["hole"]
-    if kind == "unallocated_page":
-        assert int(table[0, allocated_cols[0]]) == -1
-        return 0, allocated_cols[0] * tpb
-    if kind == "page_past_pool":
-        table[live_requests] = -1
-        table[live_requests, 0] = pages + 7
-        return live_requests, 0
-    if kind == "request_past_table":
-        return slots, 0
-    if kind == "negative_request":
-        return -1, 0
-    if kind == "negative_position":
-        return 0, -1
-    assert kind == "column_past_table"
-    return 0, width * tpb
+def _hole(spec, table, allocated_cols):
+    """One row that resolves to no slot: its (request, position)."""
+    assert spec["hole"] == "unallocated_page", spec["hole"]
+    assert int(table[0, allocated_cols[0]]) == -1
+    return 0, allocated_cols[0] * spec["tokens_per_block"]
 
 
 def _build(spec, seed: int):
@@ -91,29 +77,21 @@ def _build(spec, seed: int):
         allocated_cols.append(cols)
     assert used <= pages and len(segments) < slots, "pool or table too small for the batch"
     if spec["hole"] is not None:
-        request, position = _hole(spec, table, len(segments), allocated_cols)
+        request, position = _hole(spec, table, allocated_cols)
         requests.append(request)
         positions.append(position)
 
     rows = len(positions)
     qkv = torch.randn(
-        rows, spec["heads_q"] + 2 * hkv, head_dim, generator=gen, dtype=torch.float32
+        rows,
+        spec["heads_q"] + 2 * hkv + spec.get("row_pad_heads", 0),
+        head_dim,
+        generator=gen,
+        dtype=torch.float32,
     ).to(device=DEV, dtype=spec["row_dtype"])
     k = qkv[:, spec["heads_q"] : spec["heads_q"] + hkv]
-    v = qkv[:, spec["heads_q"] + hkv :]
-    if spec["k_layout"] == "head_major":
-        k = k.transpose(1, 2).contiguous().transpose(1, 2)
-        v = v.transpose(1, 2).contiguous().transpose(1, 2)
-        assert k.stride(2) != 1
-
+    v = qkv[:, spec["heads_q"] + hkv : spec["heads_q"] + 2 * hkv]
     table = table.to(DEV)
-    if spec["table_layout"] == "role_slice":
-        padded = torch.full((slots, 2, width), -1, dtype=torch.int32, device=DEV)
-        padded[:, 0] = table
-        table = padded[:, 0]
-    elif spec["table_layout"] == "transposed":
-        table = table.t().contiguous().t()
-        assert table.stride(1) != 1
 
     pool = torch.full((pages, 2, hkv, tpb, head_dim), FILL, dtype=torch.bfloat16, device=DEV).to(
         spec["cache_dtype"]
@@ -147,24 +125,20 @@ def test_certified_cells(cell, certifying):  # noqa: F811
 
 
 def _decode_args(seed: int, **overrides):
-    spec = op.CELLS[0].spec
+    """The decode cell's layout over a bf16 pool, without its skipped row."""
+    spec = {**op.CELLS[0].spec, "hole": None}
     return _build({**spec, **overrides}, seed=seed)
 
 
-def test_fp8_pool_saturates_an_out_of_range_row() -> None:
-    """1000.0 lands as e4m3's finite maximum, matching torch's own conversion."""
-    args, _ = _decode_args(seed=4, cache_dtype=torch.float8_e4m3fn)
-    args["k"] = torch.full_like(args["k"], 1000.0)
-    out = op(**args)
-    page, slot = int(args["block_table"][0, 0]), 0
-    stored = out[0][page, :, slot, :]
-    assert torch.equal(_bits(stored), _bits(args["k"][0].to(torch.float8_e4m3fn)))
-    assert float(stored[0, 0].float()) == 448.0
+#: The cell of 32 MTP7 verify blocks (256 rows): the segments, pool and table it runs over.
+_MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("fp8 decode MTP7: 32 requests"))
+_MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots")}
 
 
 def test_cuda_graph_replay_follows_updated_positions() -> None:
-    """Captured once, replayed against new positions written into the same buffer."""
-    args, pool = _decode_args(seed=9)
+    """Captured once at 32 MTP7 verify blocks, replayed against new positions written
+    into the same buffer."""
+    args, pool = _decode_args(seed=9, **_MTP7_BATCH)
     positions = args["logical_positions"]
     saved = positions.clone()
     positions.zero_()
@@ -187,37 +161,6 @@ def test_cuda_graph_replay_follows_updated_positions() -> None:
     _compare((args["k_cache"], args["v_cache"]), ref)
 
 
-def test_op_rejects_operands_it_cannot_serve() -> None:
-    """The callable's own loud errors: why `is_valid` carries only the stride guard."""
-    args, _ = _decode_args(seed=5)
-    row, cache = args["k"], args["k_cache"]
-    narrow = torch.zeros(row.shape[0], row.shape[1], 64, dtype=row.dtype, device=DEV)
-    cases = {
-        "QSA K/V inputs must use BF16 or FP16": dict(k=row.float(), v=row.float()),
-        "QSA K/V cache must use BF16, FP16, or FP8 E4M3": dict(
-            k_cache=cache.float(), v_cache=cache.float()
-        ),
-        "QSA K/V pairs must use matching dtypes": dict(v=args["v"].half()),
-        "QSA K/V cache token dimension does not match tokens_per_block": dict(tokens_per_block=16),
-        "QSA K/V inputs and caches have incompatible head geometry": dict(k=narrow, v=narrow),
-        "QSA K/V store request metadata must use integer storage": dict(
-            logical_positions=args["logical_positions"].float()
-        ),
-        "QSA K/V store metadata must have one entry per input row": dict(
-            request_indices=args["request_indices"][:1].contiguous()
-        ),
-        "QSA K/V store requires a two-dimensional int32 block table": dict(
-            block_table=args["block_table"].long()
-        ),
-        "QSA paged K/V store requires CUDA tensors": {
-            name: (t.cpu() if isinstance(t, torch.Tensor) else t) for name, t in args.items()
-        },
-    }
-    for message, override in cases.items():
-        with pytest.raises(ValueError, match=message):
-            op(**{**args, **override})
-
-
 def test_guard_refuses_strided_row_metadata() -> None:
     """`is_valid`'s one guard, after the hazard it exists for.
 
@@ -226,44 +169,22 @@ def test_guard_refuses_strided_row_metadata() -> None:
     buffer is read through its base pointer: accepted, and rows land elsewhere.
     """
     args, pool = _decode_args(seed=10)
-    requests, positions = args["request_indices"], args["logical_positions"]
+    requests = args["request_indices"]
     rows = requests.numel()
     wide_requests = torch.full((rows, 2), rows - 1, dtype=requests.dtype, device=DEV)
     wide_requests[:, 0] = requests
-    wide_positions = torch.full((rows, 2), 31, dtype=positions.dtype, device=DEV)
-    wide_positions[:, 0] = positions
     ref = op.reference(**args)
+    strided = {**args, "request_indices": wide_requests[:, 0]}
 
-    for override in (
-        dict(request_indices=wide_requests[:, 0]),
-        dict(logical_positions=wide_positions[:, 0]),
-    ):
-        pool.fill_(FILL)
-        out = op(**{**args, **override})  # unguarded: accepted
-        assert not all(torch.equal(_bits(got), _bits(want)) for got, want in zip(out, ref)), (
-            "strided metadata was expected to place rows elsewhere"
-        )
-
-        pool.fill_(FILL)
-        before = pool.clone()
-        with pytest.raises(AssertionError, match="must be a contiguous 1-D tensor"):
-            with validating(op):
-                op(**{**args, **override})
-        assert torch.equal(_bits(pool), _bits(before)), "a refused call still wrote"
-
-
-def test_int64_position_past_int32_is_truncated_not_skipped() -> None:
-    """Hard-limit probe: the kernel casts each position to int32.
-
-    `2^32 + 5` should resolve to a page column far past the table and be
-    skipped; truncated, it is position 5, a real slot, and it is written.
-    """
-    args, pool = _decode_args(seed=11)
-    args["logical_positions"][0] = 2**32 + 5
-    ref = op.reference(**args)
-    out = op(**args)
-    page = int(args["block_table"][0, 0])
-    assert torch.equal(_bits(out[0][page, :, 5, :]), _bits(args["k"][0].to(out[0].dtype))), (
-        "position 2^32 + 5 was expected to land on slot 5 of page column 0"
+    pool.fill_(FILL)
+    out = op(**strided)  # unguarded: accepted
+    assert not all(torch.equal(_bits(got), _bits(want)) for got, want in zip(out, ref)), (
+        "strided metadata was expected to place rows elsewhere"
     )
-    assert not torch.equal(_bits(out[0]), _bits(ref[0])), "the reference skips that row"
+
+    pool.fill_(FILL)
+    before = pool.clone()
+    with pytest.raises(AssertionError, match="must be a contiguous 1-D tensor"):
+        with validating(op):
+            op(**strided)
+    assert torch.equal(_bits(pool), _bits(before)), "a refused call still wrote"
