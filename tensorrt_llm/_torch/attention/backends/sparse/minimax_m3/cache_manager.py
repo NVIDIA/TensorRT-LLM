@@ -877,6 +877,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
         index_scale: Optional[int] = None,
+        kv_factor: Optional[int] = None,
     ):
         """Return page indices; padded entries remain ``BAD_PAGE_INDEX`` (-1).
 
@@ -905,6 +906,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             index_scale: Kept for compatibility with the base virtual method;
                 M3 bypasses the V1 block-id conversion entirely, so any
                 caller-supplied scale is ignored alongside ``index_scales``.
+            kv_factor: Kept for compatibility with the base virtual method;
+                M3 returns raw slot IDs without KV aggregation.
         """
         res = []
         for req_idx, req_id in enumerate(request_ids):

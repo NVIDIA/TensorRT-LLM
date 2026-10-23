@@ -224,6 +224,13 @@ class _ExecutorMemoryMonitor:
                 ))
 
 
+def _pin_dflash_auto_attention_backend(spec_config) -> None:
+    """Resolve a DFlash AUTO a GPU-less frontend left open, before the model and KV caches read it."""
+    if (spec_config is not None and spec_config.spec_dec_mode.is_dflash()
+            and spec_config.attention_backend == "AUTO"):
+        spec_config.resolve_from_checkpoint()
+
+
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
                                           spec_config) -> bool:
     """Whether this speculation is qualified on the FlashInfer target backend.
@@ -613,6 +620,7 @@ def _create_py_executor(
     if spec_config is not None and spec_config.decoding_type == "AUTO":
         from tensorrt_llm._torch.speculative import suggest_spec_config
         spec_config = suggest_spec_config(max_batch_size)
+    _pin_dflash_auto_attention_backend(spec_config)
 
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
         if not spec_config.spec_dec_mode.support_overlap_scheduler():

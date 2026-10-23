@@ -329,6 +329,8 @@ class _PrepareStager:
             host is None
             or getattr(manager, "sparse_metadata_batch", None) is not None
             or getattr(manager, "_use_per_layer_page_tables", True)
+            # Shared attention-op tables are not the life cycles' SHARED-path tables.
+            or getattr(manager, "_attention_op_pool_groups", None) is not None
             or not dst.is_cuda
             or dst.dtype != torch.int32
             or host.dtype != torch.int32

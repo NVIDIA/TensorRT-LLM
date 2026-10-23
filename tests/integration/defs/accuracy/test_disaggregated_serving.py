@@ -39,7 +39,8 @@ from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
+from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
+                                          DSparkDecodingConfig,
                                           Eagle3DecodingConfig, LlmArgs,
                                           MTPDecodingConfig)
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -1661,6 +1662,97 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU"])
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-8B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+    DRAFT_PATH = f"{llm_models_root()}/Qwen3-8B-DFlash-b16"
+    MAX_DRAFT_LEN = 15
+
+    @pytest.mark.skip_less_device(2)
+    def test_gsm8k_1p1d_unified_draft_kv(self):
+        """DFlash draft KV travels with the target KV from ctx to gen.
+
+        The drafter's layers share the target's KV cache manager, so the
+        generation worker drafts from the prompt context computed on the
+        context worker. Verified speculative decoding is lossless, so the
+        GSM8K score cannot see a drafter that starts from an empty context;
+        acceptance length can, so it is gated too.
+        """
+        speculative_config = {
+            "decoding_type": "DFlash",
+            "max_draft_len": self.MAX_DRAFT_LEN,
+            "speculative_model": self.DRAFT_PATH,
+            # The unified draft KV layout requires the TRTLLM drafter backend.
+            "attention_backend": "TRTLLM",
+        }
+        # Both workers run the drafter: the context worker writes the
+        # drafter's prompt KV into the shared manager, which is then
+        # transferred with the target KV.
+        common_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                # "auto" resolves Qwen3 to V1; the shared draft KV needs V2.
+                "use_kv_cache_manager_v2": True,
+            },
+            # KVCacheManagerV2 requires the Python transceiver.
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "speculative_config": speculative_config,
+        }
+        ctx_server_config = {**common_server_config, "cuda_graph_config": None}
+        gen_server_config = {
+            **common_server_config,
+            "cuda_graph_config": {
+                "max_batch_size": 16,
+                "enable_padding": True,
+            },
+            # Acceptance length is read back off this worker's /metrics.
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                assert_worker_log_contains=
+                "target and draft KV layers share one KV cache manager",
+                extra_env={"TRTLLM_DISAGG_SHARED_DRAFT_KV": "1"}) as llm:
+            llm.args.speculative_config = DFlashDecodingConfig(
+                max_draft_len=self.MAX_DRAFT_LEN,
+                speculative_model=self.DRAFT_PATH,
+            )
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+            # Drafting from an empty prompt context costs ~17% acceptance
+            # length on this model, well below the 95% floor.
+            acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
+            print(f"[AL] test_gsm8k_1p1d_unified_draft_kv "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv",
+                acceptance_length)
 
 
 @skip_pre_blackwell

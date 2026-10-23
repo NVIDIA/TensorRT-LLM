@@ -319,6 +319,10 @@ class TestSplitGpuBudgetForDraft:
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
         # one-engine arm; this test's config is a two-model drafter.
         mode.use_one_engine.return_value = False
+        # Likewise a truthy is_dflash() or is_dspark() would route costing
+        # through the shared target and drafter cache path.
+        mode.is_dflash.return_value = False
+        mode.is_dspark.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
         class RecordingKVCacheManager(KVCacheManagerV2):
@@ -1407,6 +1411,18 @@ class TestCacheBytesPerRequest:
             12 * self.LAYER_BYTES * full
         )
         assert bytes_per_request == expected
+
+    def test_joint_reuse_draft_is_bounded_by_its_windows(self):
+        """A joint-reuse draft is prepared and committed with the target, so
+        its windows bound retention: an all-sliding drafter spends nothing per
+        request beyond its intercept."""
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True, max_attention_window=[128]),
+            is_draft=True,
+            joint_kv_cache_reuse=True,
+        )
+        assert bytes_per_request == 0
 
     def test_uniform_full_attention_declines(self):
         """Per-request spend proportional to the slope reports None so the

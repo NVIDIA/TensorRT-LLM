@@ -19,6 +19,7 @@ from tensorrt_llm.llmapi import (
     DFlashDecodingConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
+    llm_args,
 )
 from tensorrt_llm.llmapi.llm_args import disagg_dflash_error
 
@@ -63,24 +64,42 @@ class TestDisaggDFlashError:
 
 
 class TestTorchLlmArgsValidation:
-    """The guard wired into TorchLlmArgs.validate_speculative_config."""
+    """What TorchLlmArgs.validate_speculative_config does with DFlash on a disaggregated engine."""
 
     # Keeps the DFlash token-budget rule satisfied so only the disagg guard
     # is under test: max_batch_size * (1 + max_draft_len) <= max_num_tokens.
     _SHAPE = dict(max_batch_size=8, max_num_tokens=8192, max_seq_len=8192)
 
-    def test_disagg_gen_side_dflash_config_is_refused(self):
-        # Both disagg sides carry the same cache_transceiver_config (the
-        # gen-side yaml of a ctx/gen pair looks exactly like this), so this
-        # is the generation-side shape the guard exists for -- and the
-        # context-side shape, refused by design (see disagg_dflash_error).
-        with pytest.raises(ValueError, match="DFlash.*disaggregated"):
-            TorchLlmArgs(
-                model="dummy",
-                speculative_config=_dflash_config(),
-                cache_transceiver_config=_transceiver_config(),
-                **self._SHAPE,
-            )
+    @pytest.mark.parametrize(
+        "attention_backend,shared_draft_kv,warns",
+        [
+            ("VANILLA", None, True),
+            ("TRTLLM", None, True),
+            ("TRTLLM", "1", False),
+            ("AUTO", None, True),
+            ("AUTO", "1", False),
+        ],
+    )
+    def test_disagg_dflash_warns_unless_the_draft_kv_is_shared(
+        self, monkeypatch, attention_backend, shared_draft_kv, warns
+    ):
+        # The drafter's context reaches a generation engine only through a draft
+        # KV shared with the target (TRTLLM backend, TRTLLM_DISAGG_SHARED_DRAFT_KV=1).
+        warnings = []
+        monkeypatch.setattr(llm_args.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+        if shared_draft_kv is None:
+            monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", shared_draft_kv)
+        TorchLlmArgs(
+            model="dummy",
+            speculative_config=DFlashDecodingConfig(
+                max_draft_len=7, attention_backend=attention_backend
+            ),
+            cache_transceiver_config=_transceiver_config(),
+            **self._SHAPE,
+        )
+        assert any("DFlash acceptance is degraded" in str(w) for w in warnings) == warns
 
     def test_aggregated_dflash_config_is_allowed(self):
         args = TorchLlmArgs(model="dummy", speculative_config=_dflash_config(), **self._SHAPE)
