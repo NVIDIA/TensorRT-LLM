@@ -1062,8 +1062,16 @@ async def reframe_openai_stream(
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames."""
     reframer = AnthropicStreamReframer(model=model)
+    done = False
     try:
         async for line in _iter_openai_sse_lines(openai_sse):
+            if done:
+                # The upstream is read to its end, not abandoned at [DONE]: the
+                # chat stream records the request's metrics after its last
+                # frame, and a stream left suspended at [DONE] is closed instead
+                # (GeneratorExit), so that work never runs. A relayed byte
+                # stream likewise ends cleanly at the worker's EOF.
+                continue
             line = line.strip()
             if not line.startswith("data:"):
                 continue
@@ -1073,13 +1081,16 @@ async def reframe_openai_stream(
             if data == "[DONE]":
                 for frame in reframer.finish():
                     yield frame
-                return
+                done = True
+                continue
             try:
                 chunk = ChatCompletionStreamResponse(**json.loads(data))
             except (json.JSONDecodeError, ValueError) as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
+        if done:
+            return
         # Upstream ended without [DONE]. Both streaming producers emit it only
         # after the response is complete, so its absence means the stream was
         # cut short. Calling finish() here would close the message with

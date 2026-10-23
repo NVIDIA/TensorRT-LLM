@@ -2033,7 +2033,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
-            except:
+            except Exception:
+                # Only failures are logged: a consumer that stops reading closes
+                # the stream with GeneratorExit, and a client that disconnects
+                # cancels it, and neither is an error of this stream.
                 logger.error(traceback.format_exc())
                 raise
 

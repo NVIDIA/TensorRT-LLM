@@ -1132,6 +1132,52 @@ def test_stream_reframer_reassembles_sse_frames_split_across_chunks():
     assert "".join(text_deltas) == "hello"
 
 
+def test_stream_reframer_reads_the_upstream_to_its_end_after_done():
+    """The upstream runs past [DONE], so the work it does there runs.
+
+    The chat stream records the request's metrics after its last frame. A
+    reframer that stopped reading at [DONE] left it suspended there, to be
+    closed with GeneratorExit: every streamed /v1/messages request lost its
+    metrics, and the server logged a traceback for it.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_drops_anything_after_done():
+    """Lines after [DONE] are read to reach the end, never reframed."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        yield f"data: {chunk({'content': 'late'}).model_dump_json()}\n\n"
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    text_deltas = [
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(text_deltas) == "hello"
+
+
 def test_stream_reframer_splits_multibyte_characters():
     """A chunk boundary landing inside a UTF-8 sequence must not corrupt output.
 
