@@ -96,6 +96,16 @@ def test_invalid_value_names_its_location_but_not_the_value(client):
     assert error["param"] == "temperature"
 
 
+def test_an_oversized_parameter_name_is_cut_short(client):
+    name = "x" * 200_000
+    response = client.post("/v1/chat/completions", json=_chat_body(**{name: 1}))
+    error = _error(response)
+    shown = "x" * 64 + "..."
+    assert error["message"] == f"Unknown parameter: '{shown}'."
+    assert error["param"] == shown
+    assert len(response.content) < 1024
+
+
 def test_body_that_is_not_json_has_no_parameter(client):
     error = _error(
         client.post(
@@ -173,3 +183,20 @@ def test_disaggregated_server_answers_with_the_same_envelope():
         "code": None,
     }
     server._perf_metrics_collector.validation_exceptions.inc.assert_called_once()
+
+
+def test_disaggregated_server_names_a_missing_body():
+    server = object.__new__(OpenAIDisaggServer)
+    server._perf_metrics_collector = SimpleNamespace(validation_exceptions=Mock())
+    server._val_err_n = 0
+
+    async def chat(request: ChatCompletionRequest):
+        raise AssertionError("a request without a body must not reach the route")
+
+    app = FastAPI()
+    app.add_exception_handler(RequestValidationError, server._request_validation_error)
+    app.add_api_route("/v1/chat/completions", chat, methods=["POST"])
+
+    error = _error(TestClient(app).post("/v1/chat/completions"))
+    assert error["message"] == "The request body is missing."
+    assert error["param"] is None

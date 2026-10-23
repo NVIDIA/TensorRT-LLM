@@ -382,6 +382,24 @@ class ErrorResponse(OpenAIBaseModel):
     code: Union[int, str]
 
 
+# A longer location segment, such as an unknown field name, is cut short so
+# the error cannot echo an arbitrarily long name back.
+_MAX_LOCATION_SEGMENT_CHARS = 64
+
+
+def _error_location(loc: Sequence[Any]) -> str:
+    """The dotted place of a validation error within the request body."""
+    segments = []
+    for segment in loc:
+        if segment == "body":
+            continue
+        text = str(segment)
+        if len(text) > _MAX_LOCATION_SEGMENT_CHARS:
+            text = text[:_MAX_LOCATION_SEGMENT_CHARS] + "..."
+        segments.append(text)
+    return ".".join(segments)
+
+
 def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
                                 limit: int = 20) -> Tuple[str, Optional[str]]:
     """Describe why a request body failed validation, without quoting it.
@@ -404,9 +422,7 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
     param: Optional[str] = None
     for index, error in enumerate(errors):
         error_type = error.get("type", "")
-        location = ".".join(
-            str(segment) for segment in error.get("loc", ())
-            if segment != "body")
+        location = _error_location(error.get("loc", ()))
         if error_type == "json_invalid":
             # The location is a character offset, not a parameter.
             reason = (error.get("ctx") or {}).get("error") or error.get(
@@ -416,7 +432,8 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
         elif error_type == "extra_forbidden":
             description = f"Unknown parameter: '{location}'."
         elif error_type == "missing":
-            description = f"Missing required parameter: '{location}'."
+            description = (f"Missing required parameter: '{location}'."
+                           if location else "The request body is missing.")
         elif location:
             description = f"Invalid value for '{location}': {error.get('msg', '')}."
         else:
