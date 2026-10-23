@@ -25,6 +25,10 @@ Per tile:
 5. O += P V on `mma.sync` (a warp 32 head dims), P from shared memory with `ldmatrix`,
    V with `ldmatrix.trans`.
 
+A one-split launch (65 rows and up) skips the f16 V tile: each warp builds its P V B
+fragments from the raw V rows in registers (the f16 tile's stores and ldmatrix reads, 64 KB a
+tile, bound the standard kernel there), bitwise the same.
+
 The second-level scales act on the scores (K) and the normalized output (V), as in the
 Triton op. With one split the CTA stores the output itself (optionally times the
 sigmoid of the output gate, applied to the bf16-rounded attention value); otherwise it
@@ -68,6 +72,13 @@ LOG2E = 1.4426950408889634
 #: Selected tokens a merge CTA covers per head (four adjacent ones a lane of each warp).
 CHUNK = 128
 MAX_SPLITS = 64
+#: One-split launches (from 65 rows on, `_SPLIT_TABLE`) run the lean split kernel: V's B
+#: fragments dequantized from the raw tile in registers, no f16 V tile (its 64 KB a tile of
+#: shared-memory stores and ldmatrix reads is what bounds the standard kernel at many rows).
+#: Raw V rows and V-scale groups of the lean kernel, padded so that the four tokens a load
+#: instruction touches (two apart) fall in different banks.
+LEAN_RAW_LDV = 144
+LEAN_VS_LD = 80
 
 
 # ---------------------------------------------------------------------------------------
@@ -266,6 +277,98 @@ def _dq_word(word, scale2, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _e2m1_half(half, *, loc=None, ip=None):
+    """Two e2m1 bytes (the low 16 bits: 4 values, low nibble the even one) -> 2 f16x2
+    (values 0-1, values 2-3), unscaled."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_ir(half, cutlass.Int32, loc, ip)],
+        "{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, $2; "
+        "cvt.rn.f16x2.e2m1x2 $0, b0; cvt.rn.f16x2.e2m1x2 $1, b1; }",
+        "=r,=r,r",
+        loc,
+        ip,
+    )
+    return _unpack(res, 2, cutlass.Int32, loc, ip)
+
+
+@dsl_user_op
+def _e4m3x2(half, *, loc=None, ip=None):
+    """Two e4m3 bytes (the low 16 bits) -> f16x2, the low byte in the low half."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [_ir(half, cutlass.Int32, loc, ip)],
+            "{ .reg .b16 h; cvt.u16.u32 h, $1; cvt.rn.f16x2.e4m3x2 $0, h; }",
+            "=r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _hmul2(a, b, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [_ir(a, cutlass.Int32, loc, ip), _ir(b, cutlass.Int32, loc, ip)],
+            "mul.rn.f16x2 $0, $1, $2;",
+            "=r,r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _prmt(a, b, sel, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [
+                _ir(a, cutlass.Int32, loc, ip),
+                _ir(b, cutlass.Int32, loc, ip),
+                _ir(sel, cutlass.Int32, loc, ip),
+            ],  # fmt: skip
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _lds_u16(saddr, *, loc=None, ip=None):
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [_ir(saddr, cutlass.Int32, loc, ip)],
+            "ld.shared.u16 $0, [$1];",
+            "=r,r",
+            loc,
+            ip,
+            side=True,
+        )
+    )
+
+
+@dsl_user_op
+def _stg4(gaddr, a, b, c, d, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [_ir(gaddr, cutlass.Int64, loc, ip)]
+        + [_ir(v, cutlass.Int32, loc, ip) for v in (a, b, c, d)],
+        "{ st.global.v4.b32 [$1], {$2, $3, $4, $5}; mov.u32 $0, 0; }",
+        "=r,l,r,r,r,r",
+        loc,
+        ip,
+        side=True,
+    )
+
+
+@dsl_user_op
 def _scale2(sbyte, *, loc=None, ip=None):
     """An e4m3 byte (in the low 8 bits) -> f16x2 {s, s}."""
     return cutlass.Int32(
@@ -457,8 +560,11 @@ class _SplitKernel:
         req64,
         gated,
         pdl,
+        lean=False,
     ):
         assert group <= 16 and HEAD_DIM == 256 and tpb % 4 == 0
+        assert not lean or splits == 1, "the lean kernel runs one split"
+        self.lean = lean
         self.group, self.kvh, self.width, self.tpb = group, kv_heads, width, tpb
         self.splits, self.tps = splits, tps
         self.n_tiles = -(-width // TILE)
@@ -471,10 +577,12 @@ class _SplitKernel:
         # shared memory carve-out (bytes)
         self.o_tok = 0
         self.tok_bytes = -(-tps * TILE * 4 // 128) * 128
+        self.raw_ldv = LEAN_RAW_LDV if lean else RAW_LDV
+        self.raw_vsld = LEAN_VS_LD if lean else 64
         self.raw_k = TILE * RAW_LD
-        self.raw_v = TILE * RAW_LDV
+        self.raw_v = TILE * self.raw_ldv
         self.raw_ks = TILE * 16
-        self.raw_vs = TILE * 64
+        self.raw_vs = TILE * self.raw_vsld
         self.raw_buf = self.raw_k + self.raw_v + self.raw_ks + self.raw_vs
         self.stages = min(STAGES, tps)
         self.o_raw = self.o_tok + self.tok_bytes
@@ -482,6 +590,11 @@ class _SplitKernel:
         self.o_sp = self.o_sv + TILE * SV_LD
         self.o_red = self.o_sp + 16 * SP_LD
         self.smem = self.o_red + 2 * WARPS * 16 * 4 + 128
+        if lean:
+            # tokens | raw tiles | P | reductions
+            self.o_sp = self.o_raw + self.stages * self.raw_buf
+            self.o_red = self.o_sp + 16 * SP_LD
+            self.smem = self.o_red + 2 * WARPS * 16 * 4 + 128
         assert k_strides == v_strides and ks_strides == vs_strides, (
             "K and V planes share one layout"
         )
@@ -514,7 +627,8 @@ class _SplitKernel:
         )
         req = cute.make_tensor(req_ptr, cute.make_layout((rows,), stride=(1,)))
         gs = cute.make_tensor(gs_ptr, cute.make_layout((3,), stride=(1,)))
-        self.kernel(
+        kernel = self.kernel_lean if self.lean else self.kernel
+        kernel(
             sel,
             q_ptr.toint(),
             k_ptr.toint(),
@@ -564,9 +678,13 @@ class _SplitKernel:
         offs = pg * kss0 + cutlass.Int64(kvh * kss1)
         _cp16z(rk + tt * RAW_LD + 32 * q4, k_base + off, n)
         _cp16z(rk + tt * RAW_LD + 32 * q4 + 16, k_base + off + 16, n)
-        _cp16z(rv + tt * RAW_LDV + 32 * q4, v_base + off, n)
-        _cp16z(rv + tt * RAW_LDV + 32 * q4 + 16, v_base + off + 16, n)
-        _cp16z(rvs + tt * 64 + 16 * q4, vs_base + offs + cutlass.Int64((sl >> 2) * 64 + 16 * q4), n)
+        _cp16z(rv + tt * self.raw_ldv + 32 * q4, v_base + off, n)
+        _cp16z(rv + tt * self.raw_ldv + 32 * q4 + 16, v_base + off + 16, n)
+        _cp16z(
+            rvs + tt * self.raw_vsld + 16 * q4,
+            vs_base + offs + cutlass.Int64((sl >> 2) * 64 + 16 * q4),
+            n,
+        )
         if q4 == 0:
             _cp16z(rks + tt * 16, ks_base + offs + cutlass.Int64(sl * 16), n)
         cute.arch.cp_async_commit_group()
@@ -932,6 +1050,313 @@ class _SplitKernel:
                             _f32_bits(lse_h),
                         )
 
+    @cute.kernel
+    def kernel_lean(
+        self,
+        mSel: cute.Tensor,
+        q_base: cutlass.Int64,
+        k_base: cutlass.Int64,
+        v_base: cutlass.Int64,
+        ks_base: cutlass.Int64,
+        vs_base: cutlass.Int64,
+        mGs: cute.Tensor,
+        mBT: cute.Tensor,
+        mReq: cute.Tensor,
+        out_base: cutlass.Int64,
+        lse_base: cutlass.Int64,
+        gate_base: cutlass.Int64,
+        rows: cutlass.Int32,
+        gate_stride: cutlass.Int32,
+    ):
+        """`kernel` for one split without the f16 V tile: the same MMAs on the same values.
+
+        P V takes V's B fragments straight from the raw tile: lane (g, c) of warp w serves the
+        four head dims 32w + 4g .. 32w + 4g + 3 (one byte pair of each token, one scale block)
+        as n-index g of four n-tiles, n-tile j holding dim 32w + 4n + j. An output element sees
+        the same P row and V column in the same token order as in `kernel`, so the result is
+        bitwise its. The raw tile is read until the end of the tile's P V, so the next tile is
+        issued after barrier [A] (every warp's P V of the tile its buffer held is done)."""
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp = cute.arch.warp_idx()
+        lane = cute.arch.lane_idx()
+        g = lane // 4
+        c = lane % 4
+        group: cutlass.Constexpr = self.group
+        kvh_n: cutlass.Constexpr = self.kvh
+        tps: cutlass.Constexpr = self.tps
+        n_tiles_all: cutlass.Constexpr = self.n_tiles
+        width: cutlass.Constexpr = self.width
+        tpb: cutlass.Constexpr = self.tpb
+        heads: cutlass.Constexpr = self.heads
+        stages: cutlass.Constexpr = self.stages
+        row = bidx // kvh_n
+        kvh = bidx % kvh_n
+        n_t = cutlass.min(tps, n_tiles_all)
+
+        smem = cutlass.utils.SmemAllocator()
+        base_t = smem.allocate_tensor(
+            cutlass.Int8, cute.make_layout((self.smem - 128,), stride=(1,)), byte_alignment=128
+        )
+        sbase = cutlass.Int32(base_t.iterator.toint())
+        s_tok = sbase + self.o_tok
+        s_raw = sbase + self.o_raw
+        s_p = sbase + self.o_sp
+        s_red = sbase + self.o_red
+
+        if const_expr(self.pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+            cute.arch.griddepcontrol_wait()
+
+        # ---- the token table: page * tpb + slot, or -1 ------------------------------------
+        rq = cutlass.Int64(mReq[row])
+        req_ok = (rq >= 0) & (rq < self.num_requests)
+        safe_req = cutlass.Int32(
+            cutlass.min(cutlass.max(rq, cutlass.Int64(0)), cutlass.Int64(self.num_requests - 1))
+        )
+        for i in cutlass.range_constexpr(-(-(tps * TILE) // THREADS)):
+            cl = tidx + i * THREADS
+            colc = cutlass.min(cl, width - 1)
+            tok = mSel[row, colc]
+            ok = req_ok & (cl < width) & (tok >= 0)
+            safe_tok = cutlass.max(tok, 0)
+            lp = safe_tok // tpb
+            ok = ok & (lp < self.bt_width)
+            page = mBT[safe_req, cutlass.min(lp, self.bt_width - 1)]
+            ok = ok & (page >= 0) & (page < self.num_pages)
+            ent = cutlass.Int32(cutlass.select_(ok, page * tpb + safe_tok % tpb, cutlass.Int32(-1)))
+            if cl < tps * TILE:
+                _sts1(s_tok + cl * 4, ent)
+
+        cute.arch.sync_threads()
+
+        # ---- q of this KV head: rows g and g + 8 of the m16 tile, as permuted A fragments --
+        qa = cute.make_rmem_tensor(cute.make_layout((8, 4), stride=(4, 1)), cutlass.Int32)
+        qb = cute.make_rmem_tensor(cute.make_layout((8, 4), stride=(4, 1)), cutlass.Int32)
+        qs0, qs1 = self.qs
+        q_row = q_base + (cutlass.Int64(row) * qs0 + cutlass.Int64(kvh * group) * qs1) * 2
+        for m in cutlass.range_constexpr(8):
+            off = cutlass.Int64((32 * m + 8 * c) * 2)
+            w4 = _ldg4(q_row + cutlass.Int64(g) * (qs1 * 2) + off)
+            for e in cutlass.range_constexpr(4):
+                qa[m, e] = _bf2_to_f2(w4[e])
+            hb = g + 8
+            hbc = cutlass.min(hb, group - 1)
+            w4b = _ldg4(q_row + cutlass.Int64(hbc) * (qs1 * 2) + off)
+            for e in cutlass.range_constexpr(4):
+                qb[m, e] = cutlass.Int32(
+                    cutlass.select_(hb < group, _bf2_to_f2(w4b[e]), cutlass.Int32(0))
+                )
+
+        self._issue(0, 0, tidx, kvh, s_tok, s_raw, k_base, v_base, ks_base, vs_base)
+        if const_expr(stages > 2):
+            if n_t > 1:
+                self._issue(1, 1, tidx, kvh, s_tok, s_raw, k_base, v_base, ks_base, vs_base)
+
+        neg_inf = cutlass.Float32(-math.inf)
+        st = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
+        st[0] = neg_inf
+        st[1] = neg_inf
+        st[2] = cutlass.Float32(0.0)
+        st[3] = cutlass.Float32(0.0)
+        acc = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), cutlass.Float32)
+        acc.fill(0.0)
+        score_scale = cutlass.Float32(self.scale) * mGs[1]
+
+        ktok = warp * 8 + g
+        k_src = ktok * RAW_LD + 4 * c
+        ks_src = ktok * 16
+        sel_k0 = (c // 2) * 0x11
+        sel_k1 = (2 + c // 2) * 0x11
+        ta = warp * 8 + 2 * c
+        p_st_g = s_p + g * SP_LD + ta * 2
+        p_st_h = p_st_g + 8 * SP_LD
+        p_ld = s_p + ((lane % 8) + 8 * ((lane // 8) % 2)) * SP_LD + 16 * (lane // 16)
+        red_g = s_red + g * WARPS * 4
+        red_h = s_red + (g + 8) * WARPS * 4
+        # P V: dims 32w + 4g .. + 3 are byte pair 16w + 2g of a token's V row, scale block
+        # 2w + g // 4 of its four-token scale group.
+        v_pair = 16 * warp + 2 * g
+        v_blk = (2 * warp + g // 4) * 4
+        lo_sel = cutlass.Int32(0x5410)
+        hi_sel = cutlass.Int32(0x7632)
+        ldv: cutlass.Constexpr = self.raw_ldv
+        vsld: cutlass.Constexpr = self.raw_vsld
+
+        ahead: cutlass.Constexpr = stages - 1
+        for j in cutlass.range(n_t):
+            buf = j % stages
+            if const_expr(stages > 2):
+                if j + 1 < n_t:
+                    cute.arch.cp_async_wait_group(1)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+            else:
+                cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()  # [A] tile j landed; every warp's P V of tile j - 1 done
+            if j + ahead < n_t:
+                # into the buffer of tile j - 1
+                self._issue(
+                    j + ahead,
+                    (j + ahead) % stages,
+                    tidx,
+                    kvh,
+                    s_tok,
+                    s_raw,
+                    k_base,
+                    v_base,
+                    ks_base,
+                    vs_base,
+                )
+            rb = s_raw + buf * self.raw_buf
+            rk = rb
+            rv = rb + self.raw_k
+            rks = rv + self.raw_v
+            rvs = rks + self.raw_ks
+
+            # -- S = q K^T for this warp's eight tokens (two accumulator chains), q per k-step
+            ksw = _lds4(rks + ks_src)
+            kws = [_lds1(rk + k_src + 16 * m) for m in range(8)]
+            zero = cutlass.Float32(0.0)
+            sa = [zero, zero, zero, zero]
+            sb = [zero, zero, zero, zero]
+            for m in cutlass.range_constexpr(8):
+                sc = _scale2s(ksw[m // 2], sel_k0 if m % 2 == 0 else sel_k1)
+                b = _dq_word(kws[m], sc)
+                if const_expr(m % 2 == 0):
+                    sa = _mma((qa[m, 0], qb[m, 0], qa[m, 1], qb[m, 1]), (b[0], b[1]), sa)
+                    sa = _mma((qa[m, 2], qb[m, 2], qa[m, 3], qb[m, 3]), (b[2], b[3]), sa)
+                else:
+                    sb = _mma((qa[m, 0], qb[m, 0], qa[m, 1], qb[m, 1]), (b[0], b[1]), sb)
+                    sb = _mma((qa[m, 2], qb[m, 2], qa[m, 3], qb[m, 3]), (b[2], b[3]), sb)
+
+            ea = _lds1(s_tok + (j * TILE + ta) * 4)
+            eb = _lds1(s_tok + (j * TILE + ta + 1) * 4)
+            s0 = cutlass.Float32(cutlass.select_(ea >= 0, (sa[0] + sb[0]) * score_scale, neg_inf))
+            s1 = cutlass.Float32(cutlass.select_(eb >= 0, (sa[1] + sb[1]) * score_scale, neg_inf))
+            s2 = cutlass.Float32(cutlass.select_(ea >= 0, (sa[2] + sb[2]) * score_scale, neg_inf))
+            s3 = cutlass.Float32(cutlass.select_(eb >= 0, (sa[3] + sb[3]) * score_scale, neg_inf))
+            mg = cute.arch.fmax(s0, s1)
+            mh = cute.arch.fmax(s2, s3)
+            mg = cute.arch.fmax(mg, cute.arch.shuffle_sync_bfly(mg, offset=1))
+            mh = cute.arch.fmax(mh, cute.arch.shuffle_sync_bfly(mh, offset=1))
+            mg = cute.arch.fmax(mg, cute.arch.shuffle_sync_bfly(mg, offset=2))
+            mh = cute.arch.fmax(mh, cute.arch.shuffle_sync_bfly(mh, offset=2))
+            if c == 0:
+                _sts1(red_g + warp * 4, _f32_bits(mg))
+                _sts1(red_h + warp * 4, _f32_bits(mh))
+            cute.arch.sync_threads()  # [B] maxes
+            rg0 = _lds4(red_g)
+            rg1 = _lds4(red_g + 16)
+            rh0 = _lds4(red_h)
+            rh1 = _lds4(red_h + 16)
+            tmg = st[0]
+            tmh = st[1]
+            for e in cutlass.range_constexpr(4):
+                tmg = cute.arch.fmax(tmg, cute.arch.fmax(_bits_f32(rg0[e]), _bits_f32(rg1[e])))
+                tmh = cute.arch.fmax(tmh, cute.arch.fmax(_bits_f32(rh0[e]), _bits_f32(rh1[e])))
+            safe_g = cutlass.Float32(cutlass.select_(tmg == neg_inf, cutlass.Float32(0.0), tmg))
+            safe_h = cutlass.Float32(cutlass.select_(tmh == neg_inf, cutlass.Float32(0.0), tmh))
+            corr_g = _ex2(st[0] - safe_g)
+            corr_h = _ex2(st[1] - safe_h)
+            p0 = _ex2(s0 - safe_g)
+            p1 = _ex2(s1 - safe_g)
+            p2 = _ex2(s2 - safe_h)
+            p3 = _ex2(s3 - safe_h)
+            _sts1(p_st_g, _f2_pack(p0, p1))
+            _sts1(p_st_h, _f2_pack(p2, p3))
+            st[0] = tmg
+            st[1] = tmh
+            st[2] = st[2] * corr_g + (p0 + p1)
+            st[3] = st[3] * corr_h + (p2 + p3)
+            cute.arch.sync_threads()  # [C] P
+
+            # -- O += P V: n-tile j of this warp holds dims 32w + 4n + j
+            if cute.arch.vote_any_sync((corr_g != 1.0) | (corr_h != 1.0)):
+                for nt in cutlass.range_constexpr(4):
+                    acc[nt, 0] = acc[nt, 0] * corr_g
+                    acc[nt, 1] = acc[nt, 1] * corr_g
+                    acc[nt, 2] = acc[nt, 2] * corr_h
+                    acc[nt, 3] = acc[nt, 3] * corr_h
+            for kk in cutlass.range_constexpr(4):
+                a = _ldsm4(p_ld + 32 * kk)
+                # tokens t, t + 1 (one scale group: their two scale bytes are adjacent) and
+                # t + 8, t + 9; e2m1 pairs unscaled, each token's scale applied after the
+                # pairing (an exact product either way)
+                lo = []
+                hi = []
+                scl = []
+                for dt in (0, 8):
+                    t0 = 16 * kk + 2 * c + dt
+                    scl.append(_e4m3x2(_lds_u16(rvs + t0 * vsld + v_blk + (t0 & 3))))
+                    for d1 in (0, 1):
+                        ee = _e2m1_half(_lds_u16(rv + (t0 + d1) * ldv + v_pair))
+                        lo.append(ee[0])
+                        hi.append(ee[1])
+                for nt in cutlass.range_constexpr(4):
+                    src = lo if nt < 2 else hi
+                    sel = lo_sel if nt % 2 == 0 else hi_sel
+                    b0 = _hmul2(_prmt(src[0], src[1], sel), scl[0])
+                    b1 = _hmul2(_prmt(src[2], src[3], sel), scl[1])
+                    r = _mma(a, (b0, b1), (acc[nt, 0], acc[nt, 1], acc[nt, 2], acc[nt, 3]))
+                    for e in cutlass.range_constexpr(4):
+                        acc[nt, e] = r[e]
+
+        # ---- the running sums over the quad and the warps -----------------------------------
+        lsg = st[2]
+        lsh = st[3]
+        lsg = lsg + cute.arch.shuffle_sync_bfly(lsg, offset=1)
+        lsh = lsh + cute.arch.shuffle_sync_bfly(lsh, offset=1)
+        lsg = lsg + cute.arch.shuffle_sync_bfly(lsg, offset=2)
+        lsh = lsh + cute.arch.shuffle_sync_bfly(lsh, offset=2)
+        cute.arch.sync_threads()
+        if c == 0:
+            _sts1(red_g + warp * 4, _f32_bits(lsg))
+            _sts1(red_h + warp * 4, _f32_bits(lsh))
+        cute.arch.sync_threads()
+        ug0 = _lds4(red_g)
+        ug1 = _lds4(red_g + 16)
+        uh0 = _lds4(red_h)
+        uh1 = _lds4(red_h + 16)
+        tsg = cutlass.Float32(0.0)
+        tsh = cutlass.Float32(0.0)
+        for e in cutlass.range_constexpr(4):
+            tsg = tsg + _bits_f32(ug0[e])
+            tsh = tsh + _bits_f32(uh0[e])
+        for e in cutlass.range_constexpr(4):
+            tsg = tsg + _bits_f32(ug1[e])
+            tsh = tsh + _bits_f32(uh1[e])
+
+        # ---- epilogue: this lane's dims 32w + 8c .. 32w + 8c + 7 of heads g and g + 8 --------
+        gv = mGs[2]
+        ig = cutlass.Float32(0.0)
+        ih = cutlass.Float32(0.0)
+        if tsg > 0.0:
+            ig = gv / tsg
+        if tsh > 0.0:
+            ih = gv / tsh
+        d0 = 32 * warp + 8 * c
+        for half in cutlass.range_constexpr(2):
+            h = kvh * group + g + 8 * half
+            inv = ig if half == 0 else ih
+            if (g + 8 * half) < group:
+                # columns 2c, 2c + 1 of n-tile j: dims d0 + j and d0 + 4 + j
+                o = [acc[j, 2 * half + k] * inv for k in range(2) for j in range(4)]
+                if const_expr(self.gated):
+                    gw = _ldg4(
+                        gate_base + (cutlass.Int64(row) * gate_stride + h * HEAD_DIM + d0) * 2
+                    )
+                    for e in cutlass.range_constexpr(4):
+                        o[2 * e] = _round_bf16(o[2 * e]) * _sigmoid(_bf2_lo(gw[e]))
+                        o[2 * e + 1] = _round_bf16(o[2 * e + 1]) * _sigmoid(_bf2_hi(gw[e]))
+                _stg4(
+                    out_base + (cutlass.Int64(row) * heads + h) * (HEAD_DIM * 2) + d0 * 2,
+                    _bf2_pack(o[0], o[1]),
+                    _bf2_pack(o[2], o[3]),
+                    _bf2_pack(o[4], o[5]),
+                    _bf2_pack(o[6], o[7]),
+                )
+
 
 @dsl_user_op
 def _f32_bits(x, *, loc=None, ip=None):
@@ -1141,6 +1566,7 @@ def nvfp4_sparse_gqa_decode(
     output_gate: Optional[torch.Tensor] = None,
     pdl: bool = True,
     splits: Optional[int] = None,
+    lean: Optional[bool] = None,
 ) -> torch.Tensor:
     """Decode-path NVFP4 sparse GQA. Returns `[rows, Hq, D]` bf16 (contiguous); with
     `output_gate` (`[rows, Hq * D]` bf16, unit column stride) the result is
@@ -1173,6 +1599,7 @@ def nvfp4_sparse_gqa_decode(
         tps = -(-n_tiles // splits)
         n_splits = -(-n_tiles // tps)
     use_pdl = bool(pdl and get_env_enable_pdl())
+    lean = bool((True if lean is None else lean) and n_splits == 1)
     gated = output_gate is not None
     if gated:
         assert output_gate.shape == (rows, num_q_heads * head_dim) and output_gate.stride(1) == 1
@@ -1196,6 +1623,7 @@ def nvfp4_sparse_gqa_decode(
         req64,
         gated and n_splits == 1,
         use_pdl,
+        lean,
     )
     if n_splits > 1:
         part = torch.empty(
@@ -1228,6 +1656,7 @@ def nvfp4_sparse_gqa_decode(
             req64=req64,
             gated=gated and n_splits == 1,
             pdl=use_pdl,
+            lean=lean,
         )
         fn = cute.compile(
             kern,
@@ -1334,7 +1763,10 @@ class QsaPagedSparseGqaNvfp4Decode(OpWrapper):
     tile at one row, a single split of 33 tiles from 128 rows up), each split followed by the
     merge. GB300, 2051 selected tokens a row, one layer: 1 row 6.7 us, 4 rows 8.5, 32 rows 22.3,
     128 rows 67.8, 256 rows 133, 512 rows 231, 1024 rows 449 -- against 9.0 / 18.8 / 49.5 /
-    158 / 292 / 557 / 1036 us for the Triton op.
+    158 / 292 / 557 / 1036 us for the Triton op. A one-split launch (65 rows and up) runs the
+    kernel without the f16 V tile: 72 rows 65.1 -> 61.7 us, 128 rows 71.6 -> 66.6, 192 rows
+    111.4 -> 101.6, 256 rows 137.5 -> 128.3 (12 chained calls, gated), bitwise the standard
+    kernel.
 
     Numerics: dequantized K/V values are exact in f16; scores on f16 MMAs with fp32
     accumulation; P rounded to f16 (as the Triton op); the second-level scales act on the

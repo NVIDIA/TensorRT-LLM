@@ -15,6 +15,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     qsa_paged_sparse_gqa_nvfp4 as _nvfp4_module,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
+    nvfp4_sparse_gqa_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
     qsa_paged_sparse_gqa_nvfp4_decode as op,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_paged_sparse_gqa
@@ -207,3 +210,24 @@ def test_replay_matches_eager(rows) -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, op(**fresh))
+
+
+@pytest.mark.parametrize("rows", [72, 200])
+@pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
+def test_lean_split_kernel_is_bitwise_the_standard_one(rows, gated) -> None:
+    """A one-split launch builds P V's B fragments from the raw V tile; its output equals the
+    standard kernel's (forced with `lean=False`) bit for bit."""
+    args = _args(
+        dict(segments=tuple((100 + (499 * g) % 8000, 1) for g in range(rows)), gated=gated),
+        seed=rows + 5,
+    )
+    call = dict(args)
+    gate = call.pop("output_gate", None)
+    positional = [call.pop(name) for name in (
+        "q", "k_cache", "v_cache", "k_scale_cache", "v_scale_cache", "kv_scale_quant_orig",
+        "block_table", "selected_tokens", "request_indices", "tokens_per_block", "softmax_scale",
+    )]  # fmt: skip
+    lean = nvfp4_sparse_gqa_decode(*positional, output_gate=gate, lean=True)
+    standard = nvfp4_sparse_gqa_decode(*positional, output_gate=gate, lean=False)
+    torch.cuda.synchronize()
+    assert torch.equal(lean, standard)
