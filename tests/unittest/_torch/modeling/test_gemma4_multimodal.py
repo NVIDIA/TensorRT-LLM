@@ -1369,6 +1369,22 @@ class TestGemma4EncoderItems(unittest.TestCase):
             {"image": 2520, "video": 20160, "audio": 750},
         )
 
+    def test_video_beyond_the_default_frame_count_fills_the_budget(self):
+        """A budget above the default video admits longer videos, so the profiling dummy grows."""
+        processor = _make_item_input_processor(num_frames=32)
+        self.assertEqual(
+            processor.get_mm_max_tokens_per_item(max_num_encoder_tokens=30000)["video"], 47 * 630
+        )
+
+        budget = 64 * 630
+        self.assertEqual(
+            processor.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["video"], budget
+        )
+        dummy = processor.get_dummy_mm_data(max_num_encoder_tokens=budget, mm_counts={"video": 1})
+        self.assertEqual(dummy["video"]["num_frames"], [64])
+        metadata = processor.get_mm_encoder_item_metadata([], dummy)
+        self.assertEqual(metadata.encoder_token_lengths, [budget])
+
     def test_encoder_iteration_bounds(self):
         processor = _make_item_input_processor()
         self.assertEqual(processor.get_max_mm_encoder_output_embeddings(20160), 2240)
@@ -1381,7 +1397,7 @@ class TestGemma4EncoderItems(unittest.TestCase):
         self.assertEqual(audio_processor.get_max_mm_encoder_output_embeddings(20160), 20160)
 
     def test_dummy_items_have_the_largest_legal_size(self):
-        processor = _make_item_input_processor(num_frames=4, audio_seq_length=750)
+        processor = _make_item_input_processor(audio_seq_length=750)
         budget = 8192
         max_tokens_per_item = processor.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)
         self.assertEqual(set(max_tokens_per_item), {"image", "video", "audio"})

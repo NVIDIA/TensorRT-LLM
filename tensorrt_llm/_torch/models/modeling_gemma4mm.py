@@ -489,8 +489,10 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         """Report the largest legal encoder item of each modality.
 
         Every image and video frame is padded to its processor's patch count, so all images cost
-        the same. The video processor's ``num_frames`` bounds a video at startup; under a token
-        budget, a video holds as many frames as fit.
+        the same. The video processor's ``num_frames`` bounds a video at startup. Under a token
+        budget, a video holds as many frames as fit, even beyond that default: preprocessing keeps
+        every frame the media loader decoded (``do_sample_frames=False``), and admission checks
+        only the budget.
         """
         max_tokens_per_item: dict[str, int] = {}
         if self._image_processor is not None:
@@ -500,9 +502,10 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         video_processor = self._video_processor
         if video_processor is not None:
             frame_tokens = _padded_patches_per_frame(video_processor)
-            num_frames = int(video_processor.num_frames)
-            if max_num_encoder_tokens is not None:
-                num_frames = min(num_frames, max_num_encoder_tokens // frame_tokens)
+            if max_num_encoder_tokens is None:
+                num_frames = int(video_processor.num_frames)
+            else:
+                num_frames = max_num_encoder_tokens // frame_tokens
             if num_frames > 0:
                 max_tokens_per_item["video"] = num_frames * frame_tokens
         audio_tokens = self._audio_tokens_per_item()
