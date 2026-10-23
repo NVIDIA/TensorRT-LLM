@@ -1455,6 +1455,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
         self.layer_specs = tuple(layer_specs) if layer_specs is not None else None
+        if (
+            self.layer_specs is not None
+            and type(self)._extra_buffers_per_layer is not KVCacheManagerV2._extra_buffers_per_layer
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not support layer_specs with "
+                "an overridden _extra_buffers_per_layer."
+            )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
