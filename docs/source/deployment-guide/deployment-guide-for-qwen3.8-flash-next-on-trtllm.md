@@ -25,6 +25,8 @@ The BF16, block-FP8, and NVFP4 checkpoints support the same feature set:
 
 The KV-cache dtype and the GDN recurrent-state dtype are selected independently of the model weight precision, through `kv_cache_config.dtype` and `kv_cache_config.mamba_ssm_cache_dtype`.
 
+With an FP8 KV cache, the QSA sparse attention on SM100/SM103/SM107 runs the PrimTS kernel with FP8 queries (unit scale, clamped to the E4M3 range) against the FP8 cache; the Triton path upcasts K/V to BF16 instead. The two differ at FP8 rounding level: full GSM8K on B300 at TP1 scores 95.45 with either kernel.
+
 ## Prerequisites
 
 * GPU: NVIDIA Blackwell architecture. The BF16 checkpoint also runs on Hopper.
