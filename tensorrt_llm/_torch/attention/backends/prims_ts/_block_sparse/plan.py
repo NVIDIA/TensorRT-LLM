@@ -35,6 +35,7 @@ from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
+from ..sage import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 _P = ParamSpec("_P")
@@ -86,18 +87,20 @@ class _BlockSparsePlanState:
 
     Every block-sparse state executes one ``prepare -> prepared-route
     attention`` adapter, including a pattern whose rows select every KV block;
-    a dense state skips route preparation. Caller BSR and token mask tensors
-    belong to individual runs and are never retained here.
+    a dense state skips route preparation. A Sage state of either kind
+    prepares its scales first. Caller BSR and token mask tensors belong to
+    individual runs and are never retained here.
 
     Runtime geometry, dtypes, the compiled launch, and the readiness event are
     published together. ``run()`` therefore sees either the complete old state
     or the complete new one, never a mix. Plan-owned row offsets describe
     uniform capacity slices. Mutable route scratch, the optional unmasked-ABI
-    dummy mask, and the event are also state-owned.
-    Policy is immutable after publication; the cached compiled adapter is
-    shared read-only.
+    dummy mask, a Sage state's mutable prepared scales, and the event are also
+    state-owned. Policy is immutable after publication; the cached compiled
+    adapter is shared read-only.
 
-    One revision owns one mutable route workspace. Ordered runs on one
+    One revision owns one mutable route workspace and, for a Sage state, one
+    mutable prepared-scale buffer that every run rewrites. Ordered runs on one
     stream, or externally synchronized cross-stream runs, are valid. Unordered
     concurrent runs of the same revision are unsupported because their prepare
     launches would race. Different wrappers and published revisions own
@@ -128,7 +131,7 @@ class _BlockSparsePlanState:
     page_size: int | None
     sage: SageAttentionConfig | None
     # Expected shape of every Sage scale tensor, by field name.
-    sage_scale_shapes: dict[str, tuple[int, int]] | None
+    sage_scale_shapes: dict[str, tuple[int, ...]] | None
 
     # Only an unmasked specialization needs a shape-correct ABI placeholder;
     # dense plans own neither it nor route storage.
@@ -137,6 +140,10 @@ class _BlockSparsePlanState:
     # Immutable row capacities and mutable per-run route payload.
     row_route_offsets: torch.Tensor | None
     route_workspace: torch.Tensor | None
+    # Mutable per-run prepared scales of a Sage plan, in the layout the plan
+    # compiled.
+    sage_scales: torch.Tensor | None
+    sage_scales_layout: _SageScaleLayout | None
     # Semantic row bound; unlike route capacity, this distinguishes
     # multiple semantic blocks packed into one prepared route.
     max_blocks_per_row: int | None
@@ -296,6 +303,7 @@ def _build_block_sparse_plan_state(
             out_dtype_key=static.out_dtype_key,
             v_dtype_key=static.v_dtype_key,
             sage=static.sage,
+            softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
         )
         policy = (
             *spec.policy,
@@ -305,6 +313,13 @@ def _build_block_sparse_plan_state(
         dummy_kv_valid_bits = None
         row_route_offsets = None
         route_workspace = None
+        sage_scales = None
+        if spec.sage_scales is not None:
+            sage_scales = torch.empty(
+                spec.sage_scales.total_words(static.batch_size * static.num_kv_heads),
+                dtype=torch.float32,
+                device=device,
+            )
         if static.use_block_sparse:
             route_layout = _BlockSparseRouteLayout.create(
                 kv_route_size=static.kv_route_size,
@@ -351,6 +366,8 @@ def _build_block_sparse_plan_state(
         dummy_kv_valid_bits=dummy_kv_valid_bits,
         row_route_offsets=row_route_offsets,
         route_workspace=route_workspace,
+        sage_scales=sage_scales,
+        sage_scales_layout=spec.sage_scales,
         max_blocks_per_row=static.max_blocks_per_row,
         policy=policy,
         compiled=compiled,
@@ -377,6 +394,8 @@ def _wait_and_record_block_sparse_plan(
         state.row_route_offsets.record_stream(stream)
     if state.route_workspace is not None:
         state.route_workspace.record_stream(stream)
+    if state.sage_scales is not None:
+        state.sage_scales.record_stream(stream)
 
 
 __all__ = [

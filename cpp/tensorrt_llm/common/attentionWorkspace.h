@@ -66,6 +66,11 @@ struct AttentionContextWorkspaceSizes
     size_t sageKScale{};
     size_t sageVScale{};
     size_t sageKMean{};
+<<<<<<< HEAD
+=======
+    size_t sageKMeanSum{};
+    size_t cpWorkspace{};
+>>>>>>> origin/main
     size_t fmhaMultiCtasKvScratch{};
 };
 
@@ -97,6 +102,11 @@ struct AttentionContextWorkspaceLayout
     WorkspaceSlice sageKScale{};
     WorkspaceSlice sageVScale{};
     WorkspaceSlice sageKMean{};
+<<<<<<< HEAD
+=======
+    WorkspaceSlice sageKMeanSum{};
+    WorkspaceSlice cpWorkspace{};
+>>>>>>> origin/main
     WorkspaceSlice fmhaMultiCtasKvScratch{};
     size_t totalSize{};
 };
@@ -130,6 +140,13 @@ struct AttentionContextWorkspaceViews
     float* sageKScale{};
     float* sageVScale{};
     float* sageKMean{};
+<<<<<<< HEAD
+=======
+    int64_t* sageKMeanSum{};
+    T* gatherInBuffer{};
+    T* gatherOutBuffer{};
+    int* cuCpPartialSeqlens{};
+>>>>>>> origin/main
     void* fmhaMultiCtasKvScratch{};
 };
 
@@ -249,6 +266,11 @@ public:
         layout.sageKScale = nextSlice(offset, sizes.sageKScale, alignment);
         layout.sageVScale = nextSlice(offset, sizes.sageVScale, alignment);
         layout.sageKMean = nextSlice(offset, sizes.sageKMean, alignment);
+<<<<<<< HEAD
+=======
+        layout.sageKMeanSum = nextSlice(offset, sizes.sageKMeanSum, alignment);
+        layout.cpWorkspace = nextSlice(offset, sizes.cpWorkspace, alignment);
+>>>>>>> origin/main
         layout.fmhaMultiCtasKvScratch = nextSlice(offset, sizes.fmhaMultiCtasKvScratch, alignment);
         layout.totalSize = offset;
         return layout;
@@ -285,6 +307,19 @@ public:
         views.sageKScale = ptr<float>(workspace, layout.sageKScale);
         views.sageVScale = ptr<float>(workspace, layout.sageVScale);
         views.sageKMean = ptr<float>(workspace, layout.sageKMean);
+<<<<<<< HEAD
+=======
+        views.sageKMeanSum = ptr<int64_t>(workspace, layout.sageKMeanSum);
+
+        views.gatherInBuffer = ptr<T>(workspace, layout.cpWorkspace);
+        if (views.gatherInBuffer != nullptr)
+        {
+            auto const cpBufferElements
+                = cpMaxPaddedSequenceLength * static_cast<size_t>(headSize) * (numHeads + 2 * numKvHeads);
+            views.gatherOutBuffer = views.gatherInBuffer + cpBufferElements;
+            views.cuCpPartialSeqlens = reinterpret_cast<int*>(views.gatherOutBuffer + cpBufferElements);
+        }
+>>>>>>> origin/main
         views.fmhaMultiCtasKvScratch = ptr<void>(workspace, layout.fmhaMultiCtasKvScratch);
         return views;
     }

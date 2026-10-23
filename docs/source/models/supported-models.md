@@ -97,7 +97,7 @@ statuses for the same architecture in the two matrices.
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
 [^15]: Kimi K3 is only supported on NVIDIA Blackwell GPUs (`SM100` family); see the [Kimi K3 deployment guide](../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.md). Which recipes fit is set by the attention layout rather than by the GPU count: DEP16 (`enable_attention_dp: true`) replicates the BF16 non-expert weights on every rank (114 GB) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB), needing 210 GB per rank, so it requires GB300-class per-GPU memory. TEP16 (`enable_attention_dp: false`) shards those non-expert weights instead and needs 115 GB per rank; it is validated end-to-end on GB200 (`SM100`) at 16 GPUs. On B200 (`SM100`), kernel and module support is functional and covered by CI. Note that the FP8 weight-read path (TRTLLM-14765) does not relax the DEP16 requirement: the conversion runs after the weights are already resident in BF16, so it lowers the steady-state footprint but not the load-time peak.
 [^16]: Guided decoding for `Glm4MoeForCausalLM` is currently supported only with the `xgrammar` backend; `llguidance` is not working.
-[^17]: Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain `DFlash`.
+[^17]: Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain `DFlash`. Speculators-format DSpark checkpoints require `aux_hidden_state_layer_ids` to be a nonempty list of positive integers; booleans, floats and strings are rejected rather than coerced.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
 [^19]: KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as `kv_cache_config.mamba_state_config.periodic_snapshot_interval`; the model default disables reuse when no snapshot policy is configured.
 [^20]: Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Image and video inputs require `transformers==5.17.0`. Beam search is not supported. See the [GLM-5.3-Flash deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md) for setup and feature-specific requirements.
@@ -190,9 +190,11 @@ The following optimizations are available to models that implement
     `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
     encoder work is selected, so they use none of the per-iteration encoder item or token budget.
     Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
-    items populate the cache for later requests. The item path also keeps encoder outputs in this
-    cache until the request's prefill completes, so the cache is never smaller than the output of
-    one encoder iteration, even when `encoder_cache_max_bytes` is `0`. Item scheduling does not
+    items populate the cache for later requests. With KV cache manager V2, items covered by confirmed
+    KV reuse are not encoded. With chunked prefill, each chunk waits only for its required items
+    and releases encoder outputs after use. KV cache manager V1 keeps whole-request encoder
+    scheduling. The cache is never smaller than the output of one encoder iteration, even when
+    `encoder_cache_max_bytes` is `0`. Item scheduling does not
     support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
     the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
     the `EAGER` policy raises an error.

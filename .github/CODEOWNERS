@@ -165,7 +165,6 @@
 /cpp/tests/unit_tests/kernels @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/kernels @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/kernels @NVIDIA/trt-llm-kernels-devs
-/tests/unittest/_torch/thop @NVIDIA/trt-llm-kernels-devs
 
 # ===== MODELS =====
 /docs/source/features/multi-modality.md @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
@@ -354,8 +353,6 @@
 /tests/microbenchmarks/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/moe @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/thop/parallel/*moe* @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
 
 # ===== TOP-K =====

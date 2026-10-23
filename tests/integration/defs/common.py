@@ -437,10 +437,19 @@ def get_static_port_range() -> Optional[tuple[int, int]]:
     return low, high
 
 
+def _port_accepts_connections(port: int) -> bool:
+    """Check for reachable services that a local bind probe cannot detect."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        return probe.connect_ex(("localhost", port)) == 0
+
+
 def reserve_port_from_range(port_range: tuple[int, int],
                             source: str) -> Optional[int]:
-    """Probe-bind random ports from an inclusive (low, high) window.
+    """Probe random ports from an inclusive (low, high) window.
 
+    A port must allow binding and reject loopback connections. Forwarded
+    services can accept connections without a local listening socket.
     The first port found free is recorded in PORTS_IN_USE and returned;
     None is returned once every candidate in the window is taken.
     """
@@ -461,6 +470,13 @@ def reserve_port_from_range(port_range: tuple[int, int],
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("localhost", port))
+                if _port_accepts_connections(port):
+                    print_info(
+                        f"[get_free_port_in_ci] pid={pid} candidate port={port} "
+                        f"in {source} range {port_range} accepts connections; "
+                        "trying another.")
+                    available_ports.remove(port)
+                    continue
                 PORTS_IN_USE.add(port)
                 print_info(
                     f"[get_free_port_in_ci] pid={pid} allocated port={port} "
@@ -515,7 +531,7 @@ def get_free_port_in_ci(max_attempts: int = 100) -> int:
     # Last resort: a system-assigned ephemeral port.
     for _ in range(max_attempts):
         port = get_free_port()
-        if port not in PORTS_IN_USE:
+        if port not in PORTS_IN_USE and not _port_accepts_connections(port):
             PORTS_IN_USE.add(port)
             print_info(
                 f"[get_free_port_in_ci] pid={pid} allocated system ephemeral "

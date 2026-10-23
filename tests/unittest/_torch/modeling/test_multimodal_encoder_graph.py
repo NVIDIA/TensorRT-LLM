@@ -9,6 +9,7 @@ The runner has two layers worth testing:
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence
 from unittest import mock
@@ -16,6 +17,7 @@ from unittest import mock
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.multimodal_encoder_graph as encoder_graph_module
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey,
     EncoderGraphTensorSpec,
@@ -365,6 +367,98 @@ def test_encoder_graph_tensor_spec_materialize(token_dim, expected_shape):
     spec = EncoderGraphTensorSpec(shape=base_shape, dtype=torch.float32, token_dim=token_dim)
     t = spec.materialize(total_tokens=128, device=torch.device("cpu"))
     assert tuple(t.shape) == expected_shape
+
+
+def test_clear_resets_graphs_before_releasing_pool_owner():
+    runner = MultimodalEncoderGraphRunner.__new__(MultimodalEncoderGraphRunner)
+    events = []
+    first_graph = mock.Mock()
+    second_graph = mock.Mock()
+    first_graph.reset.side_effect = lambda: events.append("reset-first")
+    second_graph.reset.side_effect = lambda: events.append("reset-second")
+    runner._captured = {
+        EncoderGraphKey(total_tokens=8, num_contexts=1): mock.Mock(graph=first_graph),
+        EncoderGraphKey(total_tokens=16, num_contexts=1): mock.Mock(graph=second_graph),
+    }
+    runner._memory_pool = (12345, 67890)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.multimodal_encoder_graph.release_nccl_window_graph_owner",
+        side_effect=lambda pool: events.append(("release", pool)),
+    ):
+        runner.clear()
+        runner.clear()
+
+    assert events == [
+        "reset-first",
+        "reset-second",
+        ("release", (12345, 67890)),
+    ]
+    assert runner._captured == {}
+    assert runner._memory_pool is None
+
+
+def test_uncoordinated_clear_does_not_release_pool_owner():
+    runner = MultimodalEncoderGraphRunner.__new__(MultimodalEncoderGraphRunner)
+    graph = mock.Mock()
+    runner._captured = {EncoderGraphKey(total_tokens=8, num_contexts=1): mock.Mock(graph=graph)}
+    runner._memory_pool = (12345, 67890)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.multimodal_encoder_graph.release_nccl_window_graph_owner"
+    ) as release_owner:
+        runner.clear(release_nccl_window_owners=False)
+
+    graph.reset.assert_called_once_with()
+    release_owner.assert_not_called()
+    assert runner._memory_pool is None
+
+
+def test_capture_scopes_warmup_and_captured_encoder_calls(monkeypatch):
+    """Load-time capture has no outer NCCL-window tensor scope, so each encoder call opens one."""
+    events = []
+    active = []
+    scoped_inputs = []
+
+    @contextlib.contextmanager
+    def discard(inputs):
+        events.append("scope")
+        scoped_inputs.append(inputs)
+        active.append("scope")
+        try:
+            yield
+        finally:
+            active.pop()
+
+    @contextlib.contextmanager
+    def capture(graph, pool, **kwargs):
+        active.append("capture")
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def encoder_fn(inputs, metadata):
+        events.append(("encoder", tuple(active)))
+        return {"y": inputs["x"]}
+
+    monkeypatch.setattr(encoder_graph_module, "discard_nccl_window_tensor_outputs", discard)
+    monkeypatch.setattr(encoder_graph_module, "nccl_window_graph_capture", capture)
+    monkeypatch.setattr(encoder_graph_module.torch.cuda, "CUDAGraph", mock.Mock)
+    monkeypatch.setattr(encoder_graph_module.torch.cuda, "synchronize", lambda: None)
+
+    runner = _make_logic_runner(encoder_fn=encoder_fn)
+    runner._memory_pool = (12345, 67890)
+    key = EncoderGraphKey(num_contexts=1, total_tokens=8)
+    runner._capture_key(key, [8], torch.device("cpu"))
+
+    warmup_steps = runner._config.warmup_steps
+    assert events == ["scope", ("encoder", ("scope",))] * warmup_steps + [
+        "scope",
+        ("encoder", ("capture", "scope")),
+    ]
+    static_inputs = runner._captured[key].inputs
+    assert all(inputs is static_inputs for inputs in scoped_inputs)
 
 
 pytestmark_cuda = pytest.mark.skipif(
