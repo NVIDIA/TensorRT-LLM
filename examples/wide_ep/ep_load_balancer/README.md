@@ -318,7 +318,7 @@ Per-layer dynamic EPLB has the following constraints:
 
 `planner` selects the replica planner and its weight copy. The default, `halo_q`, is described above. `planner: halo_r` replaces both:
 
-1. **Plan.** After the same routed-token count exchange, one warp computes the balanced target load and repeatedly moves the routed tokens of an overloaded rank's hottest experts to the eligible rank with the most room below that target. Each overloaded rank offers its 4 hottest experts; each receiving rank takes up to `(num_slots - num_experts) / ep_size` distinct experts, one per helper slot. Every rank computes the same plan, and every routed token is then mapped to its owner's resident slot or to a receiver's helper slot.
+1. **Plan.** After the same routed-token count exchange, one warp computes the balanced target load and repeatedly moves the routed tokens of an overloaded rank's hottest experts to the lowest-indexed eligible rank that has room for them below that target. Each overloaded rank offers its 4 hottest experts; each receiving rank takes up to `(num_slots - num_experts) / ep_size` distinct experts, one per helper slot. Every rank computes the same plan, and every routed token is then mapped to its owner's resident slot or to a receiver's helper slot.
 2. **Copy.** A relay copy moves each replicated expert over NVLink with ordinary unicast loads and stores. The receivers of an expert split its weights into 8 KiB slices; each receiver pulls its share from the owner and writes it into the helper slot of every receiver. Only the READY flag uses multicast: it is published through the same multicast READY row as with `halo_q`.
 
 ```yaml
