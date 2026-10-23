@@ -173,6 +173,28 @@ __device__ void drainAndResetReadyRow(
     systemFence();
 }
 
+//! This warp's selected routes, as compacted by pre_materialize_and_compact_worker_routes: their route indices are
+//! hotIndices[begin, begin + count) and their stable ordinals are still in the output.
+struct WarpSelectedRoutes
+{
+    int begin;
+    int count;
+};
+
+__device__ WarpSelectedRoutes warpSelectedRoutes(int routeCount, int experts, int worker, int workers)
+{
+    extern __shared__ int shared[];
+    int const warp = threadIdx.x >> 5;
+    int const warps = blockDim.x >> 5;
+    int const workerSpan = (routeCount + workers - 1) / workers;
+    int const workerBegin = worker * workerSpan;
+    int const workerEnd = imin(routeCount, workerBegin + workerSpan);
+    int const warpSpan = ((workerSpan + warps * 32 - 1) / (warps * 32)) * 32;
+    int const begin = workerBegin + warp * warpSpan;
+    int const end = imin(workerEnd, begin + warpSpan);
+    return WarpSelectedRoutes{begin, imin(shared[warp * (experts + 1) + experts], imax(0, end - begin))};
+}
+
 //! Slot of every selected route of this worker's span, from the stable ordinals kept in shared memory.
 __device__ void materializeSelectedRoutes(int const* routes, int* output, int const* routePrefix, int const* plan,
     int* routeAux, int* status, int routeCount, int ep, int experts, int helpers, int worker, int workers, Epoch epoch)
@@ -180,7 +202,6 @@ __device__ void materializeSelectedRoutes(int const* routes, int* output, int co
     extern __shared__ int shared[];
     int const lane = threadIdx.x & 31;
     int const warp = threadIdx.x >> 5;
-    int const warps = blockDim.x >> 5;
     int const bins = experts + 1;
     int* expertLut = worker_expert_lut(experts);
     int* hotIndices = routeAux + 2 + workers * bins;
@@ -191,13 +212,7 @@ __device__ void materializeSelectedRoutes(int const* routes, int* output, int co
     int const* lowMasks = halo_r::planField(plan, halo_r::PlanField::kHelperLowMask);
     int const* highMasks = halo_r::planField(plan, halo_r::PlanField::kHelperHighMask);
 
-    int const workerSpan = (routeCount + workers - 1) / workers;
-    int const workerBegin = worker * workerSpan;
-    int const workerEnd = imin(routeCount, workerBegin + workerSpan);
-    int const warpSpan = ((workerSpan + warps * 32 - 1) / (warps * 32)) * 32;
-    int const begin = workerBegin + warp * warpSpan;
-    int const end = imin(workerEnd, begin + warpSpan);
-    int const hotCount = imin(shared[warp * bins + experts], imax(0, end - begin));
+    auto const [begin, hotCount] = warpSelectedRoutes(routeCount, experts, worker, workers);
     for (int offset = lane; offset < hotCount; offset += 32)
     {
         int const index = hotIndices[begin + offset];
@@ -212,6 +227,22 @@ __device__ void materializeSelectedRoutes(int const* routes, int* output, int co
             record_status(status + kHaloRStatusSlotOutsideMask, epoch);
         }
         output[index] = slot;
+    }
+}
+
+//! Timeout fail safe after the compaction: the owner's resident slot for every selected route of this worker's span,
+//! which still holds a stable ordinal.
+__device__ void materializeSelectedRoutesHome(int const* routes, int* output, int const* routeAux, int routeCount,
+    int ep, int experts, int helpers, int worker, int workers)
+{
+    int const lane = threadIdx.x & 31;
+    int const* hotIndices = routeAux + 2 + workers * (experts + 1);
+    int const home = experts / ep;
+    auto const [begin, hotCount] = warpSelectedRoutes(routeCount, experts, worker, workers);
+    for (int offset = lane; offset < hotCount; offset += 32)
+    {
+        int const index = hotIndices[begin + offset];
+        output[index] = halo_r::homeSlot(routes[index], home, home + helpers);
     }
 }
 
@@ -323,18 +354,26 @@ __global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
         return;
     }
 
+    // On a worker timeout, the ordinal pass has already written stable ordinals into the output, which MegaMoE would
+    // read as slots. The worker routes its span to the owners' resident slots instead. The sticky status word still
+    // sets the READY error bit, so the gate rejects every helper tile of the layer.
     int const worker = blockIdx.x - 1;
     int const workers = p.ctas - 1;
-    if (!stable_worker_ordinal_pass(
-            p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, spinCycles))
-    {
-        return;
-    }
+    bool const ordinalsReady = stable_worker_ordinal_pass(
+        p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, spinCycles);
     int* expertLut = worker_expert_lut(p.experts);
     prepare_worker_default_slots(expertLut, p.ep, p.experts, p.helpers);
+    // Before it publishes the plan, CTA 0 may spend up to spinNs draining READY and spinCycles on the count exchange,
+    // and then runs the planner. spinCycles lasts at least spinNs, so two budgets cover both waits and the third
+    // covers the planner. The host check on spinNs keeps spinCycles at most ULLONG_MAX / 10^6 + 1, so the product
+    // cannot overflow.
+    constexpr unsigned long long kPlanWaitBudgets = 3;
     __shared__ int planReady;
-    if (!wait_for_plan_epoch(p.plan, epoch, spinCycles, p.status, &planReady))
+    if (!ordinalsReady || !wait_for_plan_epoch(p.plan, epoch, kPlanWaitBudgets * spinCycles, p.status, &planReady))
     {
+        // The expert LUT holds only the default slots, so every route of the span goes to its owner.
+        pre_materialize_and_compact_worker_routes(
+            p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
         return;
     }
     prepare_worker_selected_experts(expertLut, p.plan);
@@ -342,6 +381,8 @@ __global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
         p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
     if (!wait_for_plan_epoch(p.gridSync + 2, epoch, spinCycles, p.status, &planReady))
     {
+        materializeSelectedRoutesHome(
+            p.routes, p.outSlots, p.routeAux, p.validRouteCount, p.ep, p.experts, p.helpers, worker, workers);
         return;
     }
     materializeSelectedRoutes(p.routes, p.outSlots, p.routePrefix, p.plan, p.routeAux, p.status, p.validRouteCount,

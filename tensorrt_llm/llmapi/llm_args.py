@@ -1949,7 +1949,7 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     planner: Literal["halo_q", "halo_r"] = Field(
         default="halo_q",
         description=
-        "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the ranks with the most spare load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler on `auxiliary_sms` CTAs (at least 2) and its relay copy on 16, supports up to 4 helper slots per rank and requires `helper_slot_mode: shared_banks`.",
+        "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the lowest-indexed ranks with room for them below the balanced load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler on `auxiliary_sms` CTAs (at least 2) and its relay copy on 16, supports up to 4 helper slots per rank and requires `helper_slot_mode: shared_banks`.",
         status="prototype")
 
     @model_validator(mode="after")
