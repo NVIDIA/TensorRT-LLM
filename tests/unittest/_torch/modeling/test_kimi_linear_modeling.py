@@ -57,6 +57,37 @@ def test_kimi_linear_model_builds_shared_aux_stream_registry(
     assert all(stream_dict is aux_stream_dict for stream_dict in layer_aux_stream_dicts)
 
 
+def test_kimi_linear_model_router_stream_is_its_own_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streams = [object() for _ in range(5)]
+    stream_iter = iter(streams)
+
+    class _FakeDecoderLayer(nn.Module):
+        def __init__(self, _model_config, _config, _layer_idx, _aux_stream_dict) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: next(stream_iter))
+    monkeypatch.setattr(modeling_kimi_linear, "KimiLinearDecoderLayer", _FakeDecoderLayer)
+    monkeypatch.setattr(modeling_kimi_linear, "_KIMI_K3_MOE_ROUTER_STREAM", True)
+
+    config = KimiLinearConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        rms_norm_eps=1e-5,
+        attn_res_block_size=1,
+        linear_attn_config={"kda_layers": [1, 3], "full_attn_layers": [2]},
+    )
+    aux_stream_dict = modeling_kimi_linear.KimiLinearModel(
+        ModelConfig(pretrained_config=config)
+    ).aux_stream_dict
+
+    assert aux_stream_dict[AuxStreamType.MoeRouter] is streams[4]
+    assert aux_stream_dict[AuxStreamType.MoeShared] is streams[0]
+
+
 def test_kimi_k3_routed_expert_exclusion_outranks_the_checkpoint_entry() -> None:
     """An excluded layer drops the checkpoint's per-layer format, and only it.
 
