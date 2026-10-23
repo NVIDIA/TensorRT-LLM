@@ -225,3 +225,179 @@ def test_unsupported_geometry_raises_at_buffer_construction():
             offsets=torch.tensor([1.0, 2.0], dtype=torch.float32, device=device),
             decode_width=page_count * tokens_per_block - 1,
         )
+
+
+@requires_sm100
+def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
+    """Long mixed prompts use decode-sized scratch without changing scores."""
+    from unittest import mock
+
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused import (
+        build_score_pipeline,
+    )
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        compute_mean_phase,
+        reduce_per_head_scores,
+    )
+
+    tri, _, prompts, lengths, _, _, _, _ = _build_case(
+        max_requests=2,
+        num_layers=2,
+        page_count=64,
+        tokens_per_block=128,
+        head_dim=128,
+        num_q_heads=8,
+        num_kv_heads=1,
+        prompt_len=7000,
+        seed=19,
+    )
+    prompts.copy_(torch.tensor([7003, 4097], device="cuda", dtype=torch.int32))
+    lengths.copy_(prompts + 193)
+    tri._prompt_lengths_device.copy_(prompts)
+    tri._source_lengths_device.copy_(lengths)
+    tri._logical_source_lengths_device.copy_(
+        torch.tensor([8192, 1048575], device="cuda", dtype=torch.int32)
+    )
+    compute_mean_phase(
+        tri._logical_source_lengths_device,
+        tri._phase_omega,
+        lengths,
+        prompts,
+        tri._mean_cos,
+        tri._mean_sin,
+        tri._decode_lengths_device,
+        None,
+        request_count=2,
+        swa_rebase_delta=0,
+    )
+    cosine = torch.zeros_like(tri._mean_cos)
+    sine = torch.zeros_like(tri._mean_sin)
+    for exponent in range(17):
+        angle = (
+            tri._logical_source_lengths_device.float()[:, None] + float(1 << exponent)
+        ) * tri._phase_omega
+        cosine += angle.cos()
+        sine += angle.sin()
+    torch.testing.assert_close(tri._mean_cos, cosine * (1.0 / 17), rtol=0, atol=0)
+    torch.testing.assert_close(tri._mean_sin, sine * (1.0 / 17), rtol=0, atol=0)
+
+    outputs = []
+    scratch_sizes = []
+    for compact, capacity in ((False, 8192), (True, 384)):
+        scratch, launch = build_score_pipeline(
+            tri._target_layout,
+            block_offsets=tri._block_offsets_device,
+            source_lengths=lengths,
+            prompt_lengths=prompts,
+            mean_cos=tri._mean_cos,
+            mean_sin=tri._mean_sin,
+            q_real=tri._score_q_real,
+            q_imag=tri._score_q_imag,
+            mlr_coef=tri._score_mlr_coef,
+            freq_scale_sq=tri._freq_scale_sq,
+            score_token_capacity=capacity,
+            compact_scores=compact,
+            resident_requests=1 if compact else None,
+        )
+        resident_scratch = scratch
+        if compact:
+            scratch = torch.empty(resident_scratch.numel() * 2, device="cuda")
+            launch(2, scratch)
+        else:
+            launch(2)
+        reduce_per_head_scores(
+            scratch,
+            tri._decode_lengths_device,
+            prompts,
+            tri._row_mean,
+            tri._row_inv_std,
+            tri._selection_scores_rows,
+            tri._selection_row_lengths,
+            request_count=2,
+            padded_head_columns=8,
+            score_token_capacity=capacity,
+            per_layer=False,
+            normalize_scores=True,
+            compact_scores=compact,
+        )
+        outputs.append(tri._selection_scores_rows.clone())
+        scratch_sizes.append(scratch.numel())
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    assert scratch_sizes[1] * 20 < scratch_sizes[0]
+    with mock.patch.object(torch.cuda, "mem_get_info", return_value=(0, 1)):
+        assert tri._try_score_workspace(2) is None
+
+    # Exercise the actual score -> top-k -> native compact chain on a mixed
+    # cohort, then require the resident path to reproduce its KV bytes without
+    # any device allocation after warmup.
+    from conftest import make_eviction_request, make_request
+
+    original_pools = [pool.clone() for pool in tri._target_layout["layer_pools"]]
+    original_offsets = tri._block_offsets_device.clone()
+    requests = [
+        make_eviction_request(
+            request=make_request(i, py_prompt_len=int(prompts[i])),
+            source_length=int(lengths[i]),
+        )
+        for i in range(2)
+    ]
+    tri.kv_cache_manager._stream = torch.cuda.current_stream()
+
+    def stage(manager, request_ids, host, device):
+        for row, request_id in enumerate(request_ids):
+            device[:, row].copy_(original_offsets[:, request_id])
+
+    with mock.patch.object(tri, "_stage_block_offset_snapshot", side_effect=stage):
+        for mode in ("union", "per_head", "per_layer_perhead"):
+            tri.eviction_mode = mode
+            tri._selection_width_capacity = 256
+            tri._allocate_selection_buffers(torch.device("cuda"), tp_size=1)
+            tri._build_score_runtime(score_token_capacity=384)
+            for pool, original in zip(tri._target_layout["layer_pools"], original_pools):
+                pool.copy_(original)
+            optional = tri._try_score_workspace(2)
+            assert optional is not None
+            tri._execute_eviction_round(requests, score_workspace=optional)
+            expected_pools = [pool.clone() for pool in tri._target_layout["layer_pools"]]
+            del optional
+            # Compile the single-request top-k/reduction variants before the
+            # allocation check; kernels always write caller-owned outputs.
+            for item in requests:
+                tri._execute_eviction_round([item])
+            for pool, original in zip(tri._target_layout["layer_pools"], original_pools):
+                pool.copy_(original)
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            with mock.patch.object(
+                torch, "empty", side_effect=AssertionError("fallback allocated")
+            ):
+                for item in requests:
+                    tri._execute_eviction_round([item])
+            torch.cuda.synchronize()
+            assert torch.cuda.max_memory_allocated() == allocated
+            for pool, expected in zip(tri._target_layout["layer_pools"], expected_pools):
+                torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+    with (
+        mock.patch.object(torch.cuda, "mem_get_info", return_value=(2**40, 2**40)),
+        mock.patch.object(torch, "empty", side_effect=torch.OutOfMemoryError),
+    ):
+        assert tri._try_score_workspace(2) is None
+
+    # Initialization itself materializes the fallback, before any admission or
+    # eviction. Profiling therefore observes this storage without a synthetic
+    # long-running request or a second explicit reservation.
+    tri._global_layers = list(range(2))
+    tri._calibration_q_real = tri._score_q_real
+    tri._calibration_q_imag = tri._score_q_imag
+    tri._calibration_mlr_coef = tri._score_mlr_coef
+    tri._omega = tri._phase_omega
+    layout = tri._target_layout
+    with mock.patch.object(tri, "_create_kv_layout", return_value=layout):
+        tri._initialize_eviction_state()
+    assert tri._score_scratch.numel() == 8 * 2 * (tri._selection_width_capacity + 128)
+    assert tri._score_token_capacity < int(prompts.min())
+    ptr = tri._score_scratch.data_ptr()
+    with mock.patch.object(torch, "empty", side_effect=AssertionError("admission allocated")):
+        tri.on_request_init(make_request(0, py_prompt_len=7003, py_max_new_tokens=100000))
+    assert tri._score_scratch.data_ptr() == ptr
