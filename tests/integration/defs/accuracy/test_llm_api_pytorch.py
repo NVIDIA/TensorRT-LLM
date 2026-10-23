@@ -5821,7 +5821,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         enable_attention_dp: bool = False,
         cover_guided_decoding: bool = False,
         enable_block_reuse: bool = False,
-        sparse_attention_config: Optional[QSASparseAttentionConfig] = None
+        sparse_attention_config: Optional[QSASparseAttentionConfig] = None,
+        kv_cache_dtype: str = "auto",
     ) -> LLM:
         """Construct the engine shared by both evaluation tasks.
 
@@ -5830,6 +5831,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         """
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=enable_block_reuse,
+                                        dtype=kv_cache_dtype,
                                         mamba_ssm_cache_dtype="bfloat16")
         if enable_block_reuse:
             # Attention pages alone cannot restore GDN or PLE state, so the
@@ -5877,7 +5879,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             cover_guided_decoding: bool = False,
             enable_block_reuse: bool = False,
             sparse_attention_config: Optional[QSASparseAttentionConfig] = None,
-            acceptance_length_key: Optional[str] = None) -> None:
+            acceptance_length_key: Optional[str] = None,
+            kv_cache_dtype: str = "auto") -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -5886,17 +5889,17 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         # A case opts into the acceptance-length guard by naming its own entry
         # in references/acceptance_length.yaml.
         check_acceptance_length = acceptance_length_key is not None
-        with self._build_llm(
-                model_path,
-                tensor_parallel_size,
-                moe_backend,
-                max_draft_len,
-                check_acceptance_length,
-                moe_expert_parallel_size=moe_expert_parallel_size,
-                enable_attention_dp=enable_attention_dp,
-                cover_guided_decoding=cover_guided_decoding,
-                enable_block_reuse=enable_block_reuse,
-                sparse_attention_config=sparse_attention_config) as llm:
+        with self._build_llm(model_path,
+                             tensor_parallel_size,
+                             moe_backend,
+                             max_draft_len,
+                             check_acceptance_length,
+                             moe_expert_parallel_size=moe_expert_parallel_size,
+                             enable_attention_dp=enable_attention_dp,
+                             cover_guided_decoding=cover_guided_decoding,
+                             enable_block_reuse=enable_block_reuse,
+                             sparse_attention_config=sparse_attention_config,
+                             kv_cache_dtype=kv_cache_dtype) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
