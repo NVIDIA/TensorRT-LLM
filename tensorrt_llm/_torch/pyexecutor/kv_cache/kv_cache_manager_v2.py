@@ -1260,6 +1260,31 @@ def _update_kv_cache_draft_token_location(
             "update_kv_cache_draft_token_location requires all local layers "
             f"in one KV pool, got pools {sorted(local_pool_ids)}"
         )
+        layer_specs = getattr(cache_manager, "layer_specs", None)
+        if layer_specs is not None:
+            if len({(layer.head_dim, layer.dtype) for layer in layer_specs}) != 1:
+                raise ValueError(
+                    "update_kv_cache_draft_token_location requires uniform head_dim and dtype "
+                    "for explicit layer specs"
+                )
+            if any(set(layer.buffer_roles) != {Role.KEY, Role.VALUE} for layer in layer_specs):
+                raise ValueError(
+                    "update_kv_cache_draft_token_location requires explicit layer specs "
+                    "with only KEY and VALUE buffers"
+                )
+            # The kernel advances each layer base by one contiguous K/V pair.
+            if any(
+                int(cache_manager.kv_cache_pool_mapping[layer_idx][1]) != layer_idx
+                for layer_idx in range(cache_manager.num_local_layers)
+            ):
+                raise ValueError(
+                    "update_kv_cache_draft_token_location requires explicit layers "
+                    "in contiguous local-layer order within the KV pool"
+                )
+            layer = layer_specs[0]
+            head_size_in_bytes = get_size_in_bytes(layer.head_dim, layer.dtype)
+        else:
+            head_size_in_bytes = int(cache_manager.head_dim * kv_cache_dtype_byte_size)
         pool_idx = local_pool_ids.pop()
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
             accepted_draft_token_offsets,
@@ -1270,7 +1295,7 @@ def _update_kv_cache_draft_token_location(
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
             # total so the C++ kernel computes correct strides and grid dims.
             cache_manager.num_kv_heads_per_layer[0],
-            int(cache_manager.head_dim * kv_cache_dtype_byte_size),
+            head_size_in_bytes,
             cache_manager.max_total_draft_tokens,
             max_attention_window,
             rewind_draft_token_separate_adjustments,
