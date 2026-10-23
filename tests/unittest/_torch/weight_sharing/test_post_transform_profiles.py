@@ -521,6 +521,93 @@ def test_full_attention_constraint_rejects_other_sliding_windows(
     assert "sliding_window" in constraints.unsupported_dimensions(None)
 
 
+class _CausalLM(nn.Module):
+    """An `lm_head` plus a nested `model.embed_tokens`, as in the dense decoder roots."""
+
+    def __init__(self, *, tied: bool, device: str = "cpu") -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(8, 4, device=device)
+        self.lm_head = nn.Linear(4, 8, bias=False, device=device)
+        if tied:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+
+def _split_tie_parameters(model: _CausalLM) -> _CausalLM:
+    """Give the head its own Parameter over the table's memory, as meta-init materialization can."""
+    model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.data)
+    return model
+
+
+def _model_with_two_heads() -> nn.Module:
+    model = nn.Module()
+    model.target = _CausalLM(tied=True)
+    model.draft = _CausalLM(tied=True)
+    return model
+
+
+def _model_with_head_view() -> _CausalLM:
+    model = _CausalLM(tied=False)
+    table = model.model.embed_tokens.weight
+    model.lm_head.weight = nn.Parameter(table.data[:, :2])
+    return model
+
+
+@pytest.mark.parametrize(
+    "model_factory, expected",
+    [
+        pytest.param(lambda: _CausalLM(tied=True), True, id="shared-parameter"),
+        pytest.param(
+            lambda: _split_tie_parameters(_CausalLM(tied=True)),
+            True,
+            id="shared-memory",
+        ),
+        pytest.param(lambda: _CausalLM(tied=False), False, id="distinct"),
+        pytest.param(lambda: _CausalLM(tied=True, device="meta"), True, id="meta-shared-parameter"),
+        pytest.param(lambda: _CausalLM(tied=False, device="meta"), False, id="meta-distinct"),
+        pytest.param(_model_with_head_view, False, id="different-view"),
+        pytest.param(nn.Module, None, id="no-head"),
+        pytest.param(_model_with_two_heads, None, id="ambiguous-heads"),
+    ],
+)
+def test_runtime_config_realizes_tied_word_embeddings_from_model(
+    model_factory: object,
+    expected: bool | None,
+) -> None:
+    model = model_factory()
+    for declared_tie in (True, False):
+        runtime_config = PostTransformRuntimeConfig.from_model_config(
+            SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie)),
+            model=model,
+        )
+
+        assert runtime_config.tied_word_embeddings == (
+            declared_tie if declared_tie == expected else None
+        )
+
+
+def test_runtime_config_tie_needs_a_tensor_weight() -> None:
+    model = _CausalLM(tied=False)
+    del model.lm_head.weight
+    model.lm_head.weight = "not a tensor"
+
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=False)),
+        model=model,
+    )
+
+    assert runtime_config.tied_word_embeddings is None
+
+
+def test_runtime_config_keeps_declared_tie_without_model() -> None:
+    for declared_tie in (True, False):
+        runtime_config = PostTransformRuntimeConfig.from_model_config(
+            SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie))
+        )
+
+        assert runtime_config.tied_word_embeddings is declared_tie
+
+
 def test_registry_rejects_duplicate_profile_id() -> None:
     with pytest.raises(ValueError, match="Duplicate post-transform profile_id"):
         PostTransformProfileRegistry(
