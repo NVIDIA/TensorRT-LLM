@@ -379,7 +379,7 @@ def test_qwen4_manager_also_supports_dense_attention(monkeypatch) -> None:
     assert manager._extra_buffers_per_layer(tokens_per_block=32) == {}
 
 
-@pytest.mark.parametrize("dtype", (DataType.NVFP4, DataType.FLOAT))
+@pytest.mark.parametrize("dtype", (DataType.FLOAT,))
 def test_qsa_cache_manager_delegates_regular_kv_layout(
     monkeypatch: pytest.MonkeyPatch, dtype: DataType
 ) -> None:

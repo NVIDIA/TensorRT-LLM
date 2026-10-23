@@ -40,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, PageIndexMode
@@ -48,12 +49,17 @@ if TYPE_CHECKING:
     import transformers
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
+_IDENTITY_PAGE_INDEX_EXPANSION = 1
+_NVFP4_VALUES_PER_BYTE = 2
+_NVFP4_BLOCK_SIZE = 16
+_SIDE_PLANES_SIZE_STEP = 16
 _INDEX_K_ELEMENT_BYTES = torch.empty((), dtype=QSA_INDEX_K_CACHE_DTYPE).element_size()
 _POSITION_ELEMENT_BYTES = torch.empty((), dtype=QSA_POSITION_CACHE_DTYPE).element_size()
 
 # Per-token RoPE/mRoPE coordinates used when raw index keys are compressed.
 # They are request state shared by all local QSA layers.
 QSA_INDEX_POSITION = DataRole("qsa_index_position")
+QSA_SIDE_PLANES = DataRole("qsa_side_planes")
 
 
 PLE_CONV_STATE = DataRole("ple_conv_state")
@@ -166,7 +172,8 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     QSA adds a per-layer index-K cache and request-wide position coordinates.
     These buffers share the main K/V allocation, eviction, and prefix-reuse
-    lifecycle. The parent hybrid manager owns GDN/Mamba recurrent state.
+    lifecycle. This manager owns GDN replay and PLE state, while the parent
+    manages common pool allocation and request lifecycles.
 
     Index geometry is resolved from the same serving/checkpoint configuration
     as the indexer. A local fallback could otherwise give the indexer and its
@@ -181,6 +188,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             PLE_CONV_STATE: MapperKind.REPLICATED,
             PLE_NGRAM_CONTEXT: MapperKind.REPLICATED,
             QSA_INDEX_POSITION: MapperKind.REPLICATED,
+            QSA_SIDE_PLANES: MapperKind.REPLICATED,
         }
 
     @override
@@ -201,6 +209,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         self.qsa_index_dim = self.qsa_index_kv_heads = 0
         self.qsa_sparse_layer_ids = []
         self.qsa_position_layer_id = None
+        self.qsa_side_planes_size: int | None = None
         self._qsa_enabled = (
             sparse_attention_config is not None and sparse_attention_config.algorithm == "qsa"
         )
@@ -242,31 +251,44 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         *,
         tokens_per_block: int,
     ) -> dict[int, list[BufferConfig]]:
-        """Register per-layer index K and lifecycle-aligned position pages."""
+        """Register per-layer index K and lifecycle-aligned position pages.
+
+        Both are registered as their own roles unless either page could have
+        the size of a K/V or block-scale page at some split of the KV heads over
+        ranks (`_main_cache_page_sizes`), which V2 would coalesce into that pool.
+        They are then packed, in local sparse-layer order with the position page
+        last, into one `QSA_SIDE_PLANES` buffer on the first local sparse layer,
+        grown until its size is none of those page sizes. Neither the choice nor
+        the size depends on the KV heads this rank holds, so peers of different
+        TP or attention-DP layouts register the same transfer roles.
+        """
         if not self._qsa_enabled:
             return {}
         index_size = (
             self.qsa_index_kv_heads * self.qsa_index_dim * _INDEX_K_ELEMENT_BYTES * tokens_per_block
         )
+        position_size = QSA_POSITION_COORDINATE_AXES * _POSITION_ELEMENT_BYTES * tokens_per_block
         local_sparse_layers = self.qsa_local_sparse_layer_ids
         # Coordinates are request-wide, so all local indexers use one view.
         # Register the position role once; duplicating it on every sparse layer
         # wastes one three-axis int32 page per layer without adding state.
         self.qsa_position_layer_id = next(iter(local_sparse_layers), None)
+        self.qsa_side_planes_size = None
+        if self.qsa_position_layer_id is None:
+            return {}
+        position_local_idx = self.layer_offsets[self.qsa_position_layer_id]
+        main_page_sizes = self._main_cache_page_sizes(tokens_per_block)
+        if index_size in main_page_sizes or position_size in main_page_sizes:
+            packed_size = len(local_sparse_layers) * index_size + position_size
+            while packed_size in main_page_sizes:
+                packed_size += _SIDE_PLANES_SIZE_STEP
+            self.qsa_side_planes_size = packed_size
+            return {position_local_idx: [BufferConfig(role=QSA_SIDE_PLANES, size=packed_size)]}
         result = {
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=index_size)]
             for layer_id in local_sparse_layers
         }
-        if self.qsa_position_layer_id is not None:
-            local_idx = self.layer_offsets[self.qsa_position_layer_id]
-            result[local_idx].append(
-                BufferConfig(
-                    role=QSA_INDEX_POSITION,
-                    size=(
-                        QSA_POSITION_COORDINATE_AXES * _POSITION_ELEMENT_BYTES * tokens_per_block
-                    ),
-                )
-            )
+        result[position_local_idx].append(BufferConfig(role=QSA_INDEX_POSITION, size=position_size))
         return result
 
     @override
@@ -275,7 +297,30 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         layer_idx: int,
         kv_layout: str = "NHD",
     ) -> Optional[torch.Tensor]:
-        """Return the index-K view using the indexer's resolved geometry."""
+        """Return the index-K view using the indexer's resolved geometry.
+
+        ``[slots, tokens_per_block, heads, dim]`` (NHD) or ``[slots, heads,
+        tokens_per_block, dim]`` (HND), indexed by lifecycle slot.
+        """
+        if self.qsa_side_planes_size is not None:
+            if kv_layout not in ("NHD", "HND"):
+                raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+            if layer_idx not in self.qsa_local_sparse_layer_ids:
+                return None
+            ordinal = self.qsa_local_sparse_layer_ids.index(layer_idx)
+            index_size = (
+                self.qsa_index_kv_heads
+                * self.qsa_index_dim
+                * _INDEX_K_ELEMENT_BYTES
+                * self.tokens_per_block
+            )
+            planes = self._side_planes()
+            plane = planes[:, ordinal * index_size : (ordinal + 1) * index_size]
+            if kv_layout == "NHD":
+                page_shape = [self.tokens_per_block, self.qsa_index_kv_heads, self.qsa_index_dim]
+            else:
+                page_shape = [self.qsa_index_kv_heads, self.tokens_per_block, self.qsa_index_dim]
+            return plane.view(QSA_INDEX_K_CACHE_DTYPE).view(planes.shape[0], *page_shape)
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=self.qsa_index_kv_heads,
@@ -349,9 +394,9 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         QSA tables store lifecycle slot IDs. Preserving V2's coalesced stride is
         therefore required even when several layers share one physical pool.
         """
-        if not self._qsa_enabled or self.dtype not in QSA_SPARSE_KV_CACHE_DTYPES:
-            # The parent owns packed data and scale-page layouts such as
-            # NVFP4. QSA returns to the regular backend for these formats.
+        if not self._qsa_enabled or (
+            self.dtype not in QSA_SPARSE_KV_CACHE_DTYPES and self.dtype != DataType.NVFP4
+        ):
             return super().get_buffers(layer_idx, kv_layout)
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
@@ -361,8 +406,11 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             raise NotImplementedError("QSA sparse attention requires both K and V cache buffers")
 
         layer_offset = self.layer_offsets[layer_idx]
-        torch_dtype = binding_to_torch_dtype(self.dtype)
-        head_dim = self.head_dim_per_layer[layer_offset]
+        packed = self.dtype == DataType.NVFP4
+        torch_dtype = torch.uint8 if packed else binding_to_torch_dtype(self.dtype)
+        head_dim = self.head_dim_per_layer[layer_offset] // (
+            _NVFP4_VALUES_PER_BYTE if packed else 1
+        )
         num_heads = self.num_kv_heads_per_layer[layer_offset]
         if kv_layout == "NHD":
             page_shape = [self.tokens_per_block, num_heads, head_dim]
@@ -372,11 +420,59 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             layer_idx, (Role.KEY, Role.VALUE), dtype=torch_dtype, page_shape=page_shape
         )
 
+    def get_block_scale_buffers(
+        self, layer_idx: int, kv_layout: str = "NHD"
+    ) -> Optional[torch.Tensor]:
+        """Return NVFP4 K/V block-scale bytes with the same slot indexing as the data.
+
+        The view is [slots, 2, heads, tokens, head_dim // 16] for HND, or
+        [slots, 2, tokens, heads, head_dim // 16] for NHD. K scales are
+        token-major within each head page; V scales retain the kernel's
+        four-token grouping.
+        """
+        if self.dtype != DataType.NVFP4:
+            raise ValueError(f"block scales exist only for an NVFP4 pool, not {self.dtype}")
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+        if layer_idx not in self.layer_offsets:
+            return None
+        if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
+            raise NotImplementedError("QSA sparse attention requires both K and V cache buffers")
+        local_idx = self.layer_offsets[layer_idx]
+        width = self.head_dim_per_layer[local_idx] // _NVFP4_BLOCK_SIZE
+        heads = self.num_kv_heads_per_layer[local_idx]
+        page_shape = (
+            [self.tokens_per_block, heads, width]
+            if kv_layout == "NHD"
+            else [heads, self.tokens_per_block, width]
+        )
+        return self._get_view_by_role_and_layer(
+            layer_idx,
+            (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+            dtype=torch.uint8,
+            page_shape=page_shape,
+        )
+
     @torch.compiler.disable
     def get_qsa_position_buffer(self) -> Optional[torch.Tensor]:
         """Return per-token three-axis RoPE/mRoPE position coordinates."""
         if self.qsa_position_layer_id is None:
             return None
+        if self.qsa_side_planes_size is not None:
+            position_size = (
+                QSA_POSITION_COORDINATE_AXES * _POSITION_ELEMENT_BYTES * self.tokens_per_block
+            )
+            planes = self._side_planes()
+            start = len(self.qsa_local_sparse_layer_ids) * (
+                self.qsa_index_kv_heads
+                * self.qsa_index_dim
+                * _INDEX_K_ELEMENT_BYTES
+                * self.tokens_per_block
+            )
+            plane = planes[:, start : start + position_size]
+            return plane.view(QSA_POSITION_CACHE_DTYPE).view(
+                planes.shape[0], self.tokens_per_block, QSA_POSITION_COORDINATE_AXES
+            )
         return self._get_view_by_role_and_layer(
             self.qsa_position_layer_id,
             (QSA_INDEX_POSITION,),
@@ -414,6 +510,76 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
                     f"layer {layer_id} uses pool/scale {candidate}, expected {mapping}"
                 )
         return mapping
+
+    def _main_cache_page_sizes(self, tokens_per_block: int) -> set[int]:
+        """Every size, in bytes, a local layer's K/V or block-scale page can have
+        at any split of that layer's KV heads over ranks: one head per rank up to
+        all of them. The set is the same on every TP and attention-DP layout."""
+        global_layer = {local: layer for layer, local in self.layer_offsets.items()}
+        sizes = set()
+        for local_idx in range(self.num_local_layers):
+            heads = self.num_kv_heads_per_layer[local_idx]
+            total = (
+                self.num_kv_heads
+                if isinstance(self.num_kv_heads, int)
+                else self.num_kv_heads[global_layer[local_idx]]
+            )
+            for role in self._get_buffer_roles_for_layer(local_idx):
+                page = self.get_layer_bytes_per_token(local_idx, role) * tokens_per_block
+                if page:
+                    sizes.update(page // heads * h for h in range(1, total + 1))
+        return sizes
+
+    def _side_planes(self) -> torch.Tensor:
+        """uint8 ``[slots, qsa_side_planes_size]`` over the packed side-plane pool."""
+        local_idx = self.layer_offsets[self.qsa_position_layer_id]
+        page_stride = self.impl.get_page_stride(local_idx, QSA_SIDE_PLANES)
+        if page_stride != self.qsa_side_planes_size:
+            raise RuntimeError(
+                "QSA side-plane page stride mismatch: "
+                f"expected {self.qsa_side_planes_size}, got {page_stride}"
+            )
+        converter = self.impl.get_page_index_converter(local_idx, QSA_SIDE_PLANES)
+        if (
+            int(converter.scale) != 1
+            or int(converter.layer_offset) != 0
+            or int(converter.expansion) != _IDENTITY_PAGE_INDEX_EXPANSION
+        ):
+            raise RuntimeError(
+                "QSA side planes share their V2 pool with another buffer: "
+                f"scale={int(converter.scale)}, layer_offset={int(converter.layer_offset)}, "
+                f"expansion={int(converter.expansion)}"
+            )
+        addr = self.impl.get_mem_pool_base_address(local_idx, QSA_SIDE_PLANES, PageIndexMode.SHARED)
+        num_slots = self.impl.get_page_index_upper_bound(local_idx, QSA_SIDE_PLANES)
+        return convert_to_torch_tensor(
+            TensorWrapper(addr, torch.uint8, [num_slots, self.qsa_side_planes_size])
+        )
+
+    @override
+    def _build_pool_mapping_tensors(self) -> None:
+        """Refuse an NVFP4 layout whose K/V and block-scale slots differ.
+
+        The attention op reads a layer's K/V pages and their block scales
+        through one block-offset table: a page index scaled for the K/V pool
+        addresses the scale pool too. A layer whose two page-index scales
+        differ would read and write other slots' scales without any error.
+        """
+        if self._qsa_enabled and self.dtype == DataType.NVFP4:
+            for layer_id in self.pp_layers:
+                local_idx = self.layer_offsets[layer_id]
+                if self._is_local_mamba_layer(local_idx):
+                    continue
+                data_scale = self.impl.get_page_index_scale(local_idx, Role.KEY)
+                scale_scale = self.impl.get_page_index_scale(local_idx, Role.KEY_BLOCK_SCALE)
+                if data_scale != scale_scale:
+                    raise RuntimeError(
+                        "NVFP4 K/V and block-scale pools hold a different number of pages "
+                        f"per lifecycle slot (layer {layer_id}: {data_scale} vs {scale_scale}); "
+                        "another buffer was coalesced into one of them, and the attention op "
+                        "would address the block scales of other slots"
+                    )
+        return super()._build_pool_mapping_tensors()
 
     def _init_qwen4_exp_ple_geometry(
         self,
@@ -619,4 +785,5 @@ __all__ = [
     "PLE_CONV_STATE",
     "PLE_NGRAM_CONTEXT",
     "QSA_INDEX_POSITION",
+    "QSA_SIDE_PLANES",
 ]

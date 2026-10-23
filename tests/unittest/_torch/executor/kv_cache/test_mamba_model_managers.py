@@ -1354,6 +1354,7 @@ def test_slot_role_view_rejects_incompatible_physical_layout(monkeypatch, invali
 def test_qwen4_position_uses_model_owned_slot_view(monkeypatch):
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = 42
+    manager.qsa_side_planes_size = None
     manager.tokens_per_block = 4
     manager._get_view_by_role_and_layer = Mock(
         return_value=torch.zeros(3, 1, 4, 3, dtype=torch.int32)
