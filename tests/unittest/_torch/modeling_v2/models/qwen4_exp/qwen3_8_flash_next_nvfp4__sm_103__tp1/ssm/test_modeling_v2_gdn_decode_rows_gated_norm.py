@@ -7,8 +7,9 @@ then the gated norm entry's) in torch's default band for the bf16 output and the
 dtype (fp32 or bf16), the pool compared whole so slots the call did not name are
 gated too. Beyond the cells: a fixed row bitwise across batch sizes over a bf16 pool, a
 stale-read check under graph replay (a producer rewrites the projection inside the graph
-right before the op), and the guards. The `gdn_decode_rows` entry (the recurrence alone)
-has its own cells below.
+right before the op), the two launch variants (state rows by bulk copy into shared memory,
+or loaded into registers) bitwise each other, and the guards. The `gdn_decode_rows` entry
+(the recurrence alone) has its own cells below.
 """
 
 import zlib
@@ -16,6 +17,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm import (  # noqa: E501
+    gdn_decode_rows_gated_norm as rows_mod,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows as rows_op,
 )
@@ -150,6 +154,63 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
         want = op(src.clone(), *args[1:])
         assert torch.equal(graph_out, want), f"replay {trial} output"
         assert torch.equal(after, args[1]), f"replay {trial} pool"
+
+
+_VARIANT_SPECS = (
+    dict(rows=1, state="bf16"),
+    dict(rows=8, state="bf16", pad=True),
+    dict(rows=33, state="bf16"),
+    dict(rows=3),
+    dict(rows=33, pad=True),
+    dict(rows=2, pool="coalesced", state="bf16", pad=True),
+    dict(rows=2, pool="coalesced"),
+)
+
+
+@pytest.mark.parametrize("norm", [True, False], ids=["norm", "rows"])
+@pytest.mark.parametrize("spec", _VARIANT_SPECS, ids=lambda s: "-".join(map(str, s.values())))
+def test_bulk_and_register_variants_agree(spec, norm) -> None:
+    """The bulk-copy and the register variants: outputs and state bitwise equal.
+
+    The bulk-copy variant stages the state rows in shared memory; the register variant holds
+    them in registers; both compute the same instructions. Over contiguous bf16 and fp32 pools
+    and the cache manager's coalesced pool (slot 100, ~2.8G elements past the base, by the
+    bulk copy), with pad rows.
+    """
+    args = _build(spec, seed=zlib.crc32(repr(spec).encode()) % (2**31))
+    proj, pool, slots = args[0], args[1], args[2]
+    assert rows_mod._bulk_eligible(pool, K)
+    live = slots[slots >= 0].long()
+    before = pool[live].clone()
+    got = []
+    for bulk in (False, True):
+        pool[live] = before
+        w = args[5] if norm else None
+        out = rows_mod.launch(proj, pool, slots, args[3], args[4], w, EPS, H, K, bulk=bulk)
+        got.append((out.clone(), pool[live].clone()))
+    assert torch.equal(got[0][0], got[1][0]), "outputs differ between the variants"
+    assert torch.equal(got[0][1], got[1][1]), "states differ between the variants"
+
+
+def test_variant_choice_and_unaligned_pool() -> None:
+    """The variant choice, and the fallback for a pool the bulk copy cannot take.
+
+    The bulk variant from the batch the register variant needs a second wave for; a pool 8-
+    but not 16-byte aligned stays on the register variant whatever is asked, and matches the
+    aligned pool's result.
+    """
+    sms = torch.cuda.get_device_properties(DEV).multi_processor_count
+    edge = (2 * sms) // HV
+    assert not rows_mod._use_bulk(edge, HV, DEV) and rows_mod._use_bulk(edge + 1, HV, DEV)
+    args = _build(dict(rows=33, state="bf16"), seed=19)
+    pool = args[1]
+    flat = torch.empty(pool.numel() + 4, dtype=pool.dtype, device=DEV)
+    shifted = flat[4:].view(pool.shape)
+    shifted.copy_(pool)
+    assert not rows_mod._bulk_eligible(shifted, K)
+    want = rows_mod.launch(args[0], pool, *args[2:], bulk=True)
+    got = rows_mod.launch(args[0], shifted, *args[2:], bulk=True)
+    assert torch.equal(got, want) and torch.equal(shifted, pool)
 
 
 def test_guards() -> None:

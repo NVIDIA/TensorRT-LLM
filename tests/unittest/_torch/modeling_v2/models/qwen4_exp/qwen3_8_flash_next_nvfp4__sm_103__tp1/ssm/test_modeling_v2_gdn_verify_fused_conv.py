@@ -7,7 +7,9 @@ epilogue (`fp8_gemv_conv1d_verify`); an eager one runs `fp8_gemv` and then
 `causal_conv1d_triton_update`. Both must hand the recurrence the same thing: the conv output
 (contiguous, as the cached replay reads it), `a`, `b` and `z` bitwise, and leave the conv pool
 and the per-step snapshot buffer bitwise the same. The recurrence is stubbed to record its
-inputs (it is the same call on both sides), the epilogue to record `z`.
+inputs (it is the same call on both sides), the epilogue to record `z`. Over a bf16 pool (the
+CuTe replay) `a` and `b` reach the recurrence as views of the projection (no copies), and only
+the fused step asks for PDL (its GEMV signals its dependents; the Triton conv does not).
 """
 
 import types
@@ -46,9 +48,11 @@ def _block(layer, x, si, int_idx, conv0, win0, p, fused, monkeypatch):
     epilogue were handed, and the pools."""
     seen = {}
 
-    def replay(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p_, work):
-        seen.update(mq_out=mq_out.clone(), a=a_d.clone(), b=b_d.clone())
+    def replay(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p_, work, pdl=False):
+        seen.update(mq_out=mq_out.clone(), a=a_d.clone(), b=b_d.clone(), pdl=pdl)
         assert mq_out.is_contiguous() and mq_out.shape == (n * p_, CONV)
+        # the CuTe replay reads a / b through their row stride: views, not copies
+        assert a_d.stride(0) > HV and b_d.stride(0) > HV
         return torch.zeros(1, n * p_, HV, V, dtype=BF16, device=DEV)
 
     monkeypatch.setattr(M, "_replay_verify", replay)
@@ -56,7 +60,10 @@ def _block(layer, x, si, int_idx, conv0, win0, p, fused, monkeypatch):
         conv_dim=CONV,
         in_proj_split=(CONV, VD, HV, HV),
         _bound=types.SimpleNamespace(
-            conv={0: conv0.clone()}, ssm={0: torch.zeros(1, device=DEV)}, int_conv={0: win0.clone()}
+            conv={0: conv0.clone()},
+            ssm={0: torch.zeros(1, device=DEV)},
+            int_conv={0: win0.clone()},
+            replay=types.SimpleNamespace(cute=True),
         ),
     )
     target = object.__new__(M.DecodeTarget)
@@ -80,4 +87,5 @@ def test_fused_verify_matches_two_launch(layer, n, p, monkeypatch) -> None:
     fused = _block(layer, x, si, int_idx, conv0, win0, p, True, monkeypatch)
     for key in ("mq_out", "a", "b", "z", "conv", "win"):
         assert torch.equal(eager[key].view(torch.int16), fused[key].view(torch.int16)), key
+    assert fused["pdl"] and not eager["pdl"], "PDL exactly after the fused GEMV"
     assert not torch.equal(fused["conv"], conv0) and not torch.equal(fused["win"], win0)

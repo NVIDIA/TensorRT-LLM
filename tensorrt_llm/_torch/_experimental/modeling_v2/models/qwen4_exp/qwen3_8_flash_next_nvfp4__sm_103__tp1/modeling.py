@@ -3057,19 +3057,27 @@ def _live_score_columns(core, md, batch: int) -> int:
     return (longest + _MAX_VERIFY_WIDTH) // core.compress_ratio + 1
 
 
-def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay) -> torch.Tensor:
+def _replay_verify(
+    core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, pdl=False
+) -> torch.Tensor:
     """One GDN layer's verify recurrence under the cached replay: `n` generation sequences
     of `p` rows over the conv output `mq_out` (`[n * p, conv_dim]`, token-major) and the
     raw `a`/`b` projections, with the fp32 gating parameters fused into the kernel.
 
-    `replay` is `(work_items, n_writes, partitioned)`; the work items are given exactly
-    when the manager runs its all-layer commit after the step (without that commit every
-    history wrap goes uncommitted, with it a wrap committed here is committed twice). A bf16
-    pool runs the CuTe kernel (`gdn_cached_replay_cute`), which commits every wrap here: the
-    manager's all-layer commit is off for it (`_bind_replay`), so no work items reach it.
-    `mq_out` is the conv's fresh, contiguous output, so the kernel reads q/k/v from it
-    directly (`packed_qkv`) and never from the views. The conv before it does not signal
-    dependents, so the kernel launches without PDL."""
+    `replay` is `(work_items, n_writes, partitioned)`. For the Triton kernel (an fp32 pool)
+    the work items are given exactly when the manager runs its all-layer commit after the
+    step (without that commit every history wrap goes uncommitted, with it a wrap committed
+    here is committed twice). A bf16 pool runs the CuTe kernel (`gdn_cached_replay_cute`),
+    which commits every wrap here: the manager's all-layer commit is off for it
+    (`_bind_replay`), and the work items its metadata still builds over every decode row
+    hand the kernel each row's slot, pending count and history half in one load. `mq_out`
+    is the conv's fresh, contiguous output, so the kernel reads q/k/v from it directly
+    (`packed_qkv`) and never from the views; the CuTe kernel reads `a`/`b` through their
+    row stride (column views of the input projection). `pdl`: the kernel right before is
+    the in_proj GEMV with the conv as its epilogue, which signals its dependents at its
+    start -- the CuTe kernel then reads the checkpoint and the history (which nothing in
+    the step writes ahead of it) before `griddepcontrol.wait`. The Triton conv does not
+    signal dependents, so after it the kernel launches without PDL."""
     work_items, n_writes, partitioned = replay
     state = core._bound.replay
     old_x, old_B, old_dt, old_dA = state.old[i]
@@ -3098,7 +3106,7 @@ def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
         use_qk_l2norm_in_kernel=True,
         A_log=L.a_log,
         dt_bias=L.dt_bias,
-        launch_with_pdl=False,
+        launch_with_pdl=bool(pdl and state.cute),
         replay_work_items=work_items,
         n_writes=n_writes,
         block_v=None,
@@ -3117,7 +3125,15 @@ def _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
 def _replay_work(core, mm, num_decodes: int) -> tuple:
     """`_replay_verify`'s `replay` argument for a verify step of `num_decodes` generation
     requests: the partitioned replay exactly when `update_mamba_states` runs the manager's
-    all-layer commit after the step."""
+    all-layer commit after the step. The CuTe kernel (a bf16 pool, never partitioned)
+    takes the work items the metadata builds over all `num_decodes` rows whenever they
+    are there, with no all-layer commit."""
+    state = core._bound.replay
+    if state.cute:
+        built = getattr(mm, "replay_num_decodes", None) == num_decodes
+        if built and getattr(mm, "replay_work_items", None) is not None:
+            return mm.replay_work_items[:num_decodes], mm.replay_n_writes, False
+        return None, None, False
     partitioned = (
         core._bound.replay.all_layer_commit
         and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
@@ -5558,6 +5574,8 @@ class DecodeTarget:
         conv step as its epilogue (`fp8_gemv_conv1d_verify`, then `mq_d` is None); else the
         conv runs here over the projection's q|k|v columns `mq_d`."""
         core = self.core
+        # The in_proj GEMV ran the conv as its epilogue and signals its dependents early.
+        after_gemv = mq_out is not None
         if mq_out is None:
             # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
             x3 = torch.transpose(torch.reshape(mq_d, [n, p, core.conv_dim]), 1, 2)
@@ -5578,7 +5596,9 @@ class DecodeTarget:
             # Back to token-major (a view).
             mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
         if replay is not None:
-            return _replay_verify(core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay)
+            return _replay_verify(
+                core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, pdl=after_gemv
+            )
         q, k, v = pack_gdn_decode_qkv(
             mq_out, core.num_k_heads, core.head_k_dim, core.num_v_heads, core.head_v_dim
         )
@@ -5718,10 +5738,12 @@ class DecodeTarget:
             )
             return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g)
         if is_verify:
+            # The CuTe replay kernel reads `a`/`b` through their row stride: no copies.
+            strided_ab = replay is not None and core._bound.replay.cute
             out = self._gdn_verify(
                 mixed_qkv,
-                a.contiguous(),
-                b.contiguous(),
+                a if strided_ab else a.contiguous(),
+                b if strided_ab else b.contiguous(),
                 ssm_states,
                 i,
                 L,

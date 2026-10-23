@@ -303,3 +303,61 @@ def test_negative_slots() -> None:
 @pytest.mark.parametrize("mode", ["a", "b"])
 def test_graph_replay_matches_eager(mode, pdl) -> None:
     assert run_graph(mode=mode, pdl=pdl)
+
+
+#: Launch mappings a batch can take, and the mapping each is checked against: the state tiles
+#: all by bulk copy with the state dots before the first barrier (the small-batch default),
+#: against the first tile in registers and the dots after it.
+_MAPPINGS = (
+    (dict(tpc=2, warps=2, pf=0, minb=4, early_acc=True), dict(tpc=2, warps=2, pf=1, minb=4)),
+    (dict(tpc=4, warps=4, pf=0, minb=4, early_acc=True), dict(tpc=4, warps=4, pf=1, minb=4)),
+    (dict(tpc=8, warps=4, pf=1, minb=4, early_acc=True), dict(tpc=8, warps=4, pf=1, minb=4)),
+    (dict(tpc=8, warps=4, pf=0, minb=4), dict(tpc=24, warps=8, pf=1, minb=2)),
+)
+
+
+@pytest.mark.parametrize("n,t", [(1, 4), (4, 4), (5, 3), (32, 4), (8, 8)])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_launch_mappings_agree(n, t, pdl) -> None:
+    """Every launch mapping computes the same instructions per state row.
+
+    One step bitwise equal across mappings (output, checkpoint with in-kernel commits, u / k /
+    G history), with wrapping and appending rows and a negative slot, with and without the
+    engine's work items.
+    """
+    spec = dict(path="small", n=n, t=t, steps=1, layers=1, state_dtype=BF)
+    bm = trep._Bench(spec, 4242 + n, exact=False)
+    sidx = bm.state_indices.clone()
+    if n > 2:
+        sidx[n // 2] = -1
+    act = bm.inputs()
+    snap = [x.clone() for x in bm.state(0)]
+    # every row listed (row, slot, pending count, half), reversed, the dead row with its -1
+    sl = sidx.long()
+    safe = sl.clamp(min=0)
+    wi = (
+        torch.stack(
+            [torch.arange(n, device="cuda"), sl, bm.pnat[safe].long(), bm.buf[safe].long()], 1
+        )
+        .to(torch.int32)
+        .flip(0)
+        .contiguous()
+    )
+    nw = torch.zeros(1, dtype=torch.int32, device="cuda")
+    for new_cfg, old_cfg in _MAPPINGS:
+        for with_wi in (False, True):
+            got = []
+            for cfg in (new_cfg, old_cfg):
+                for x, y in zip(bm.state(0), snap):
+                    x.copy_(y)
+                kw = bm.kwargs(0, act)
+                # a dead row's output is never written: a sentinel, the same for every call
+                sentinel = torch.full((n, t, trep.HV, trep.V), 3.0, dtype=BF, device="cuda")
+                kw.update(state_indices=sidx, launch_with_pdl=pdl, output=sentinel)
+                if with_wi:
+                    kw.update(replay_work_items=wi, n_writes=nw, use_all_layer_commit=False)
+                out = cr.cached_replay_update(**kw, in_kernel_commit=True, config=cfg)
+                torch.cuda.synchronize()
+                got.append([out.clone()] + [x.clone() for x in bm.state(0)])
+            for name, x, y in zip(("out", "state", "u", "k", "G"), *got):
+                assert torch.equal(x, y), f"{name}: {new_cfg} vs {old_cfg} (work items {with_wi})"

@@ -17,6 +17,13 @@ reduction (RPW rows in RPW - 1 + log2(32 / RPW) shuffles, not 5 RPW), which leav
 j's sum in lanes [j * 32 / RPW, (j + 1) * 32 / RPW); `u` goes back to every lane by
 index shuffles. The CTA holds the head's whole output, so the gated RMS norm runs in
 place.
+
+Two variants of that CTA, the same arithmetic instruction for instruction (bitwise the same
+output and state): the state rows loaded into registers (128 registers a thread, two CTAs
+an SM), or -- from the batch where the register variant needs a second wave -- each warp's
+rows brought into shared memory by one bulk copy (TMA) issued as soon as the slot is known,
+which holds no registers while in flight (64 a thread, three to four CTAs an SM): the pool
+streams at 6.8 TB/s read + write instead of 5.3-5.7.
 """
 
 from __future__ import annotations
@@ -198,6 +205,151 @@ def _round_bf16(x, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _lds_state(saddr, pred, *, loc=None, ip=None):
+    """Four fp32 of a staged state row (shared memory), or zeros where `pred` is 0."""
+    r = _asm_n(
+        4,
+        T.f32(),
+        [cutlass.Int32(saddr), cutlass.Int32(pred)],
+        "{ .reg .pred p; setp.ne.b32 p, $5, 0; mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; "
+        "mov.b32 $3, 0; @p ld.shared.v4.f32 {$0, $1, $2, $3}, [$4]; }",
+        "=f,=f,=f,=f,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+    return [cutlass.Float32(v) for v in r]
+
+
+@dsl_user_op
+def _lds_state_bf16(saddr, pred, *, loc=None, ip=None):
+    """Four bf16 of a staged state row (shared memory) as fp32, or zeros where `pred` is 0."""
+    r = _asm_n(
+        4,
+        T.f32(),
+        [cutlass.Int32(saddr), cutlass.Int32(pred)],
+        "{ .reg .pred p; .reg .b32 w0, w1; setp.ne.b32 p, $5, 0; mov.b32 w0, 0; "
+        "mov.b32 w1, 0; @p ld.shared.v2.b32 {w0, w1}, [$4]; shl.b32 $0, w0, 16; "
+        "and.b32 $1, w0, 0xFFFF0000; shl.b32 $2, w1, 16; and.b32 $3, w1, 0xFFFF0000; }",
+        "=f,=f,=f,=f,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+    return [cutlass.Float32(v) for v in r]
+
+
+@dsl_user_op
+def _fma(a, b, c, *, loc=None, ip=None):
+    """`a * b + c` rounded once (pinned: not left to the backend's contraction)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b), cutlass.Float32(c)],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _mul(a, b, *, loc=None, ip=None):
+    """`a * b` rounded (pinned: not contracted into a neighbouring add)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sts_f32(saddr, x, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(saddr), cutlass.Float32(x)],
+        "{ st.shared.f32 [$1], $2; mov.u32 $0, 0; }",
+        "=r,r,f",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _lds_f32(saddr, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int32(saddr)],
+            "ld.shared.f32 $0, [$1];",
+            "=f,r",
+            loc,
+            ip,
+            side_effects=True,
+        )
+    )
+
+
+@dsl_user_op
+def _mbar_init(saddr, *, loc=None, ip=None):
+    """An mbarrier of arrival count 1, made visible to the async proxy."""
+    _asm(
+        T.i32(),
+        [cutlass.Int32(saddr)],
+        "{ mbarrier.init.shared::cta.b64 [$1], 1; fence.mbarrier_init.release.cluster; "
+        "mov.u32 $0, 0; }",
+        "=r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _bulk_g2s(saddr, gaddr, nbytes, mbar, *, loc=None, ip=None):
+    """One 1-D bulk copy global -> shared of `nbytes`, completing on the mbarrier.
+
+    With `mbarrier.arrive.expect_tx`; the L2 policy is evict-first (the state is read once a
+    step).
+    """
+    _asm(
+        T.i32(),
+        [cutlass.Int32(saddr), cutlass.Int64(gaddr), cutlass.Int32(nbytes), cutlass.Int32(mbar)],
+        "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$4], $3; "
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+        "[$1], [$2], $3, [$4], pol; mov.u32 $0, 0; }",
+        "=r,r,l,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _mbar_wait(mbar, pred, *, loc=None, ip=None):
+    """Wait for phase 0 of the mbarrier where `pred` is not 0."""
+    _asm(
+        T.i32(),
+        [cutlass.Int32(mbar), cutlass.Int32(pred)],
+        "{ .reg .pred P1, P2; setp.ne.b32 P2, $2, 0; @!P2 bra DONE; LAB_WAIT: "
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [$1], 0; @P1 bra DONE; bra LAB_WAIT; "
+        "DONE: mov.u32 $0, 0; }",
+        "=r,r,r",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
 def _rows_reduce(vals, lane):
     """Sum each of `vals` (a lane's partial of one row each) over the warp. Each halving
     level (offset 16 first) trades half the rows with the partner lane, so row j's sum
@@ -223,9 +375,17 @@ def _rows_reduce(vals, lane):
 
 class _GdnRowsKernel:
     """CTA (v-head, row): the row's whole state of that head. `norm`: the gated RMS norm on
-    the head's output; else the recurrence's output, rounded to bf16, is stored as is."""
+    the head's output; else the recurrence's output, rounded to bf16, is stored as is.
 
-    def __init__(self, k_heads, v_heads, kdim, vdim, pdl, norm=True, state_bf16=False):
+    `bulk`: each warp's `RPW` state rows (contiguous: `s_row == K`) come into shared memory
+    by one 1-D bulk copy (TMA, an mbarrier a warp) issued as soon as the slot is known, and
+    both passes over the rows read them from there; the state then holds no registers while
+    it is in flight (64 registers a thread, three to four CTAs an SM, against two). Else the
+    rows are loaded into registers (any 4-element-aligned layout). The arithmetic is the same
+    instruction for instruction: the bulk variant pins the state update to the
+    `fma(decay, h, u * k)` the backend contracts the register variant's to."""
+
+    def __init__(self, k_heads, v_heads, kdim, vdim, pdl, norm=True, state_bf16=False, bulk=False):
         assert kdim == 32 * _PL and vdim % _WARPS == 0
         self.h, self.hv, self.k, self.v, self.pdl = k_heads, v_heads, kdim, vdim, pdl
         self.norm = norm
@@ -234,6 +394,10 @@ class _GdnRowsKernel:
         self.ld_state, self.st_state = (
             (_ld_state_bf16, _st_state_bf16) if state_bf16 else (_ld_state, _st_state)
         )
+        self.lds_state = _lds_state_bf16 if state_bf16 else _lds_state
+        self.bulk = bulk
+        # The register cap that lets the bulk variant hold four CTAs an SM (three with fp32).
+        self.minb = (4 if state_bf16 else 3) if bulk else 0
         self.rpw = vdim // _WARPS
         assert self.rpw in (4, 8, 16, 32)
         # Lanes that hold one row's reduced sums.
@@ -243,6 +407,11 @@ class _GdnRowsKernel:
         self.z_off = self.v_off + v_heads * vdim
         self.a_off = self.z_off + v_heads * vdim
         self.b_off = self.a_off + v_heads
+        # Shared memory: the norm's per-warp partials, the mbarriers, the staged rows.
+        self.wbytes = self.rpw * kdim * self.sb
+        self.o_mb = 64
+        self.o_st = 128
+        self.smem = self.o_st + (_WARPS * self.wbytes if bulk else 0)
 
     @cute.jit
     def __call__(
@@ -284,9 +453,10 @@ class _GdnRowsKernel:
         ).launch(
             grid=[self.hv, rows, 1],
             block=[32 * _WARPS, 1, 1],
-            smem=_WARPS * 4 + 64,
+            smem=self.smem + 128 if self.bulk else _WARPS * 4 + 64,
             stream=stream,
             use_pdl=self.pdl,
+            min_blocks_per_mp=self.minb,
         )
 
     @cute.kernel
@@ -313,9 +483,18 @@ class _GdnRowsKernel:
         kh = hv // (self.hv // self.h)
         v0 = warp * self.rpw
         jl = lane // self.lpr  # the value row whose sums this lane ends up holding
-        red = cutlass.utils.SmemAllocator().allocate_tensor(
-            cutlass.Float32, cute.make_layout((_WARPS,), stride=(1,)), byte_alignment=16
-        )
+        if cutlass.const_expr(self.bulk):
+            sm = cutlass.utils.SmemAllocator().allocate_tensor(
+                cutlass.Int8, cute.make_layout((self.smem,), stride=(1,)), byte_alignment=128
+            )
+            sbase = cutlass.Int32(sm.iterator.toint())
+            s_red = sbase
+            s_mb = sbase + self.o_mb + warp * 8
+            s_st = sbase + self.o_st + warp * self.wbytes
+        else:
+            red = cutlass.utils.SmemAllocator().allocate_tensor(
+                cutlass.Float32, cute.make_layout((_WARPS,), stride=(1,)), byte_alignment=16
+            )
 
         # 1. Before the wait: the warp's state rows (a negative slot reads none: zero state),
         # the gate constants and the norm weight of this lane's row.
@@ -325,17 +504,34 @@ class _GdnRowsKernel:
             live = cutlass.Int32(1)
         # 64-bit: a coalesced cache page puts every GDN layer's state of a slot in one
         # page, so `slot * s_slot` passes int32.
-        base = (
-            pool_base
-            + (
-                cutlass.Int64(cutlass.max(slot, cutlass.Int32(0))) * s_slot
-                + cutlass.Int64(hv * s_head + v0 * s_row + lane * _PL)
+        h = []
+        if cutlass.const_expr(self.bulk):
+            wbase = (
+                pool_base
+                + (
+                    cutlass.Int64(cutlass.max(slot, cutlass.Int32(0))) * s_slot
+                    + cutlass.Int64(hv * s_head + v0 * s_row)
+                )
+                * self.sb
             )
-            * self.sb
-        )
-        h = [
-            self.ld_state(base + cutlass.Int64(j * s_row * self.sb), live) for j in range(self.rpw)
-        ]
+            base = wbase + cutlass.Int64(lane * _PL * self.sb)
+            if lane == 0:
+                _mbar_init(s_mb)
+                if slot >= 0:
+                    _bulk_g2s(s_st, wbase, cutlass.Int32(self.wbytes), s_mb)
+        else:
+            base = (
+                pool_base
+                + (
+                    cutlass.Int64(cutlass.max(slot, cutlass.Int32(0))) * s_slot
+                    + cutlass.Int64(hv * s_head + v0 * s_row + lane * _PL)
+                )
+                * self.sb
+            )
+            h = [
+                self.ld_state(base + cutlass.Int64(j * s_row * self.sb), live)
+                for j in range(self.rpw)
+            ]
         a_log = mALog[hv]
         dtb = mDt[hv]
         w_l = cutlass.Float32(0.0)
@@ -376,23 +572,40 @@ class _GdnRowsKernel:
         beta = 1.0 / (1.0 + cute.math.exp(-b))
 
         # 3. Per value row: hk = h.k, u = beta (v - decay hk); h = decay h + u k; o = h.q.
+        if cutlass.const_expr(self.bulk):
+            srow = s_st + lane * (_PL * self.sb)
+            cute.arch.sync_warp()
+            _mbar_wait(s_mb, live)
         part = []
         for j in cutlass.range_constexpr(self.rpw):
+            if cutlass.const_expr(self.bulk):
+                hj = self.lds_state(srow + j * (self.k * self.sb), live)
+            else:
+                hj = h[j]
             acc = cutlass.Float32(0.0)
             for e in cutlass.range_constexpr(_PL):
-                acc = h[j][e] * kn[e] + acc
+                acc = hj[e] * kn[e] + acc
             part.append(acc)
         hk = _rows_reduce(part, lane)
         u_l = beta * (v_l - decay * hk)
         part = []
         for j in cutlass.range_constexpr(self.rpw):
             u = cute.arch.shuffle_sync(u_l, j * self.lpr)
+            if cutlass.const_expr(self.bulk):
+                hj = self.lds_state(srow + j * (self.k * self.sb), live)
+            else:
+                hj = h[j]
             acc = cutlass.Float32(0.0)
             for e in cutlass.range_constexpr(_PL):
-                h[j][e] = u * kn[e] + decay * h[j][e]
-                acc = h[j][e] * qn[e] + acc
+                if cutlass.const_expr(self.bulk):
+                    # the register variant's contraction, pinned (rows from shared memory
+                    # would let the backend contract the other product)
+                    hj[e] = _fma(decay, hj[e], _mul(u, kn[e]))
+                else:
+                    hj[e] = u * kn[e] + decay * hj[e]
+                acc = hj[e] * qn[e] + acc
             part.append(acc)
-            self.st_state(base + cutlass.Int64(j * s_row * self.sb), live, *h[j])
+            self.st_state(base + cutlass.Int64(j * s_row * self.sb), live, *hj)
         o = _rows_reduce(part, lane)
 
         # 4. The gated RMS norm over the head's V outputs, each rounded to bf16 first (the
@@ -404,12 +617,20 @@ class _GdnRowsKernel:
         y = o_b
         if cutlass.const_expr(self.norm):
             ss = cute.arch.warp_reduction_sum(o_b * o_b * cutlass.Float32(own))
-            if lane == 0:
-                red[warp] = ss
-            cute.arch.sync_threads()
-            tot = red[0]
-            for i in cutlass.range_constexpr(1, _WARPS):
-                tot = tot + red[i]
+            if cutlass.const_expr(self.bulk):
+                if lane == 0:
+                    _sts_f32(s_red + warp * 4, ss)
+                cute.arch.sync_threads()
+                tot = _lds_f32(s_red)
+                for i in cutlass.range_constexpr(1, _WARPS):
+                    tot = tot + _lds_f32(s_red + i * 4)
+            else:
+                if lane == 0:
+                    red[warp] = ss
+                cute.arch.sync_threads()
+                tot = red[0]
+                for i in cutlass.range_constexpr(1, _WARPS):
+                    tot = tot + red[i]
             rstd = cute.math.rsqrt(tot / self.v + eps)
             y = o_b * rstd * w_l * (1.0 / (1.0 + cute.math.exp(-z_l)))
         _st_bf16(out_base + (cutlass.Int64(row) * s_out + hv * self.v + v0 + jl) * 2, own, y)
@@ -418,10 +639,84 @@ class _GdnRowsKernel:
 _COMPILED: dict = {}
 
 
-def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, pdl=True, out=None):
+def _bulk_eligible(pool, kdim) -> bool:
+    """The bulk copy's layout: a warp's rows contiguous, every copy 16-byte aligned."""
+    es = pool.element_size()
+    return (
+        pool.stride(2) == kdim
+        and pool.data_ptr() % 16 == 0
+        and all(s_ * es % 16 == 0 for s_ in pool.stride()[:2])
+    )
+
+
+def _use_bulk(rows, v_heads, device, state_bf16=True) -> bool:
+    """Whether a batch takes the bulk-copy variant.
+
+    Over a bf16 pool, from the batch the register variant cannot hold in one wave (two of its
+    CTAs an SM): below that the register variant's lead (its rows are in registers when the
+    wait returns) is worth more than the occupancy. An fp32 pool keeps the register variant:
+    its 64 state registers a thread already hold the CTA's 64 KB in flight (6.9 TB/s; the
+    bulk copy 6.85).
+    """
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return state_bf16 and rows * v_heads > 2 * sms
+
+
+def _compile(key, k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16, bulk, proj, ptrs):
+    gm = cute.AddressSpace.gmem
+    cargs = (
+        from_dlpack(proj, assumed_align=8).mark_layout_dynamic(leading_dim=1),
+        make_ptr(
+            cutlass.BFloat16 if state_bf16 else cutlass.Float32,
+            ptrs[1],
+            gm,
+            assumed_align=16 if (bulk or not state_bf16) else 8,
+        ),
+        make_ptr(cutlass.Int32, ptrs[2], gm, assumed_align=4),
+        make_ptr(cutlass.Float32, ptrs[3], gm, assumed_align=4),
+        make_ptr(cutlass.Float32, ptrs[4], gm, assumed_align=4),
+        make_ptr(cutlass.BFloat16, ptrs[5], gm, assumed_align=2),
+        make_ptr(cutlass.BFloat16, ptrs[6], gm, assumed_align=2),
+    )
+    fn = cute.compile(
+        _GdnRowsKernel(k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16, bulk),
+        *cargs,
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int64(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Float32(1e-6),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    _COMPILED[key] = fn
+    return fn
+
+
+def launch(
+    proj,
+    pool,
+    slots,
+    A_log,
+    dt_bias,
+    norm_weight,
+    eps,
+    k_heads,
+    kdim,
+    pdl=True,
+    out=None,
+    bulk=None,
+):
     """The launch behind `GdnDecodeRowsGatedNorm.__call__` and, with `norm_weight=None`,
     `GdnDecodeRows.__call__`; updates `pool` in place and returns the gated-normed output
-    (or the recurrence's) `[rows, HV * V]` bf16, written into `out` when given."""
+    (or the recurrence's) `[rows, HV * V]` bf16, written into `out` when given.
+
+    `bulk`: None picks the variant by pool dtype and batch (`_use_bulk`), True / False force
+    it (True falls back to the register variant where the pool's layout does not admit the
+    bulk copy). Both variants are compiled together on the first call of a configuration, so
+    a batch size seen first under serving does not compile."""
     rows = proj.shape[0]
     v_heads, vdim = pool.shape[1], pool.shape[2]
     norm = norm_weight is not None
@@ -431,7 +726,10 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
         return out
     pdl = bool(pdl and get_env_enable_pdl())
     state_bf16 = pool.dtype == torch.bfloat16
-    key = (k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16)
+    eligible = _bulk_eligible(pool, kdim)
+    if bulk is None:
+        bulk = _use_bulk(rows, v_heads, proj.device, state_bf16)
+    bulk = bool(bulk) and eligible
     ptrs = (
         proj,
         pool.data_ptr(),
@@ -441,37 +739,13 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
         (norm_weight if norm else A_log).data_ptr(),
         out.data_ptr(),
     )
-    fn = _COMPILED.get(key)
+    base_key = (k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16)
+    fn = _COMPILED.get(base_key + (bulk,))
     if fn is None:
-        gm = cute.AddressSpace.gmem
-        cargs = (
-            from_dlpack(proj, assumed_align=8).mark_layout_dynamic(leading_dim=1),
-            make_ptr(
-                cutlass.BFloat16 if state_bf16 else cutlass.Float32,
-                ptrs[1],
-                gm,
-                assumed_align=8 if state_bf16 else 16,
-            ),
-            make_ptr(cutlass.Int32, ptrs[2], gm, assumed_align=4),
-            make_ptr(cutlass.Float32, ptrs[3], gm, assumed_align=4),
-            make_ptr(cutlass.Float32, ptrs[4], gm, assumed_align=4),
-            make_ptr(cutlass.BFloat16, ptrs[5], gm, assumed_align=2),
-            make_ptr(cutlass.BFloat16, ptrs[6], gm, assumed_align=2),
-        )
-        fn = cute.compile(
-            _GdnRowsKernel(k_heads, v_heads, kdim, vdim, pdl, norm, state_bf16),
-            *cargs,
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int64(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Float32(1e-6),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
-        )
-        _COMPILED[key] = fn
+        for variant in (False, True) if eligible else (False,):
+            if base_key + (variant,) not in _COMPILED:
+                _compile(base_key + (variant,), *base_key, variant, proj, ptrs)
+        fn = _COMPILED[base_key + (bulk,)]
     fn(
         *ptrs,
         rows,
@@ -541,10 +815,13 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     the entry.
 
     Launch: one CTA of 8 warps a (v-head, row), `HV * rows` CTAs, PDL (off with
-    TRTLLM_ENABLE_PDL=0). GB300, graph replay, 461-slot pool, us (FlashInfer's
-    recurrence + the gated norm entry -> this): 128 rows 132.2 -> 118.8 (6.78 TB/s
-    against an in-place `mul_` over the same bytes at 6.83), 64 rows 70.7 -> 62.7, 16
-    rows 19.1 -> 14.9, 4 rows 8.5 -> 8.4.
+    TRTLLM_ENABLE_PDL=0); a bf16 pool's state by bulk copy into shared memory from
+    `rows * HV > 2 * SMs` (7 rows here; an fp32 pool, or a layout the copy cannot take,
+    stays on registers), both variants compiled on the first call. GB300, bf16 pool, a CUDA
+    graph of 36 layers each streaming its own pool from HBM, PDL on / off, us a layer
+    (register-only kernel -> this): 256 rows 152.4 / 141.6 -> 118.8 / 119.4 (6.8 TB/s read +
+    write), 128 rows 77.7 / 72.6 -> 61.1 / 61.7, 32 rows 21.7 / 20.7 -> 17.9 / 18.5, 8 rows
+    7.2 / 7.5 -> 6.5 / 6.9, 1 row 2.6 / 3.5 (the register variant).
 
     Numerics: fp32 inside; each dot product over K is a lane's 4-term FMA chain and then
     the transposed reduction's tree; `o` rounded to bf16 before the norm, the output
@@ -557,7 +834,9 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     path stops) over a contiguous 461-slot pool, and 2 rows over the cache manager's
     coalesced pool (slot stride 36 layers' states, slot 100 ~2.8G elements past the
     base) with the second row a pad slot (-1); the same over a bf16 pool. Under graph
-    replay the op reads the projection after `griddepcontrol.wait` (16 rows). Not
+    replay the op reads the projection after `griddepcontrol.wait` (16 rows). The bulk-copy
+    and register variants bitwise equal (outputs and state) at 1-33 rows over contiguous bf16
+    and fp32 pools and the coalesced pool (slot 100 by the bulk copy), pad rows included. Not
     certified: `pdl=False`.
     """
 

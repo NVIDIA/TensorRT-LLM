@@ -27,7 +27,10 @@ checkpoint is read once and written once and the engine's all-layer commit is no
 Given the engine's replay work items, each CTA reads its row's (row, slot, pending count, half) in
 one load; otherwise slot, then pending count / half. With PDL the state and history (not written by
 the previous kernel) are read before `griddepcontrol.wait`; without it the step's own small inputs
-are issued first. `_Replay.kernel_p` is an experimental persistent variant (slower; not used).
+are issued first. Small batches (the launch is latency-bound there) bring every state tile in by
+bulk copy as soon as the slot is known (`pf=0`: no tile held in registers through the prologue) and
+take the tiles' state dots before the first barrier, while the history is still in flight
+(`early_acc`). `_Replay.kernel_p` is an experimental persistent variant (slower; not used).
 """
 
 from __future__ import annotations
@@ -793,6 +796,7 @@ class _Replay:
         qk_first=True,
         use_wi=False,
         evict_first=True,
+        early_acc=False,
     ):
         assert 1 <= T <= 8
         assert tpc in (24, 12, 8, 4, 2, 1) and tpc % warps == 0
@@ -804,7 +808,11 @@ class _Replay:
         self.S = TILES // tpc
         self.nhv = 3 if tpc == 24 else (2 if tpc == 12 else 1)
         self.commit, self.pdl = commit, pdl
-        self.ld, self.pf, self.minb = ld, max(1, min(pf, self.tpw)), minb
+        # pf = 0 (shared-memory tiles only): every state tile goes by bulk copy, issued as soon
+        # as the slot is known, and no state tile is held in registers through the prologue
+        self.ld, self.pf, self.minb = ld, max(0 if smem_tiles else 1, min(pf, self.tpw)), minb
+        # the tiles' state dots before the first barrier, while the history is in flight
+        self.use_early = bool(early_acc) and not persistent
         self.l2norm, self.gating, self.g_f32, self.b_f32 = l2norm, gating, g_f32, b_f32
         self.early_trigger, self.lo_split = early_trigger, lo_split
         self.state_before_wait = state_before_wait
@@ -1055,6 +1063,56 @@ class _Replay:
                     _ldg_b16p(b_ptr + (n64 * T + t) * b_st * 2 + cutlass.Int64(hv) * 2, pi)
                 )
         return graws, braws, alv, dtb
+
+    def _smem_tile(self, s_st, s_mb, i, g, c, zi):
+        """This lane's A fragment words of the warp's staged tile i (after its bulk copy landed).
+
+        Rows g and g + 8; chunk order by row parity keeps each quarter-warp's two rows on
+        disjoint banks.
+        """
+        kslot = i - self.pf
+        _mbar_wait(s_mb + kslot * 8, zi)
+        tb = s_st + kslot * 4096 + g * 256 + c * 16
+        godd = (g % 2) == 1
+        raw = []
+        for ii in range(4):
+            jsw = (g % 2) ^ ii
+            raw.append(_lds4_i32(tb + jsw * 64))
+            raw.append(_lds4_i32(tb + 2048 + jsw * 64))
+        cur = []
+        for jj in range(4):
+            for rr in range(2):
+                for e in range(4):
+                    cur.append(
+                        cutlass.Int32(
+                            cutlass.select_(godd, raw[2 * (jj ^ 1) + rr][e], raw[2 * jj + rr][e])
+                        )
+                    )
+        return cur
+
+    def _tile_dots(self, cur, bq, zf):
+        """D = h0 [16 x 128] times the T keys / T scaled queries.
+
+        Two MMA chains over the head dimension (even / odd 16-wide k-steps), summed.
+        """
+        NT = self.NT
+        acc0 = [[zf, zf, zf, zf] for _ in range(NT)]
+        acc1 = [[zf, zf, zf, zf] for _ in range(NT)]
+        for jj in range(4):
+            for s in range(2):
+                a = (
+                    cur[8 * jj + 2 * s],
+                    cur[8 * jj + 4 + 2 * s],
+                    cur[8 * jj + 2 * s + 1],
+                    cur[8 * jj + 4 + 2 * s + 1],
+                )
+                for nt in range(NT):
+                    bfr = (bq[nt][4 * jj + 2 * s], bq[nt][4 * jj + 2 * s + 1])
+                    if s == 0:
+                        acc0[nt] = _mma(a, bfr, acc0[nt])
+                    else:
+                        acc1[nt] = _mma(a, bfr, acc1[nt])
+        return [[acc0[nt][e] + acc1[nt][e] for e in range(4)] for nt in range(NT)]
 
     def _g_f32(self, x):
         return x if self.g_f32 else _b16_f32(x)
@@ -1449,6 +1507,27 @@ class _Replay:
                 _sts2_f32(s_kk + (g * 8 + 2 * c) * 4, d[0], d[1])
                 _sts2_f32(s_kk + ((g + 8) * 8 + 2 * c) * 4, d[2], d[3])
 
+            # the tiles' state dots need only the state and the new keys / queries: run them
+            # while the history is still in flight
+            early = []
+            if const_expr(self.use_early):
+                for i in cutlass.range_constexpr(TPW):
+                    if const_expr(NSM == 0):
+                        if const_expr(i + self.pf < TPW):
+                            tiles.append(
+                                self._load_tile(
+                                    self._tile_addr(
+                                        h_ptr, slot64, h_ss, h, sp, warp, i + self.pf, g, c
+                                    )
+                                )
+                            )
+                    if const_expr(i < self.pf or NSM == 0):
+                        early.append(self._tile_dots(tiles[i], bq, zf))
+                    else:
+                        early.append(
+                            self._tile_dots(self._smem_tile(s_st, s_mb, i, g, c, zi), bq, zf)
+                        )
+
             _cp_wait_all()
             cute.arch.sync_threads()
 
@@ -1549,7 +1628,7 @@ class _Replay:
                 cutlass.select_(2 * c + 8 < p, cutlass.Int32(0xFFFF), zi)
             ) | cutlass.Int32(cutlass.select_(2 * c + 9 < p, cutlass.Int32(-65536), zi))
             for i in cutlass.range_constexpr(TPW):
-                if const_expr(NSM == 0):
+                if const_expr(NSM == 0 and not self.use_early):
                     if const_expr(i + self.pf < TPW):
                         tiles.append(
                             self._load_tile(
@@ -1558,6 +1637,9 @@ class _Replay:
                         )
                 if const_expr(i < self.pf or NSM == 0):
                     cur = tiles[i]
+                elif const_expr(self.use_early):
+                    # a staged tile is read again from shared memory only for its commit
+                    cur = None
                 else:
                     # rows g and g + 8 of the staged tile; chunk order by row parity keeps each
                     # quarter-warp's two rows on disjoint banks
@@ -1586,23 +1668,10 @@ class _Replay:
                 hl = hvr - hv_first
                 v0 = (mt % 8) * 16
 
-                acc0 = [[zf, zf, zf, zf] for _ in range(NT)]
-                acc1 = [[zf, zf, zf, zf] for _ in range(NT)]
-                for jj in cutlass.range_constexpr(4):
-                    for s in cutlass.range_constexpr(2):
-                        a = (
-                            cur[8 * jj + 2 * s],
-                            cur[8 * jj + 4 + 2 * s],
-                            cur[8 * jj + 2 * s + 1],
-                            cur[8 * jj + 4 + 2 * s + 1],
-                        )
-                        for nt in cutlass.range_constexpr(NT):
-                            bfr = (bq[nt][4 * jj + 2 * s], bq[nt][4 * jj + 2 * s + 1])
-                            if const_expr(s == 0):
-                                acc0[nt] = _mma(a, bfr, acc0[nt])
-                            else:
-                                acc1[nt] = _mma(a, bfr, acc1[nt])
-                acc = [[acc0[nt][e] + acc1[nt][e] for e in range(4)] for nt in range(NT)]
+                if const_expr(self.use_early):
+                    acc = early[i]
+                else:
+                    acc = self._tile_dots(cur, bq, zf)
 
                 au = _ldsm4t(s_u + hl * (16 * PU) + jrow * PU + (v0 + v8) * 2)
                 if const_expr(self.spec_hist):
@@ -1675,6 +1744,10 @@ class _Replay:
                             hw = _bf2_pack(x0, x1)
                             ahi.append(hw)
                             alo.append(_bf2_pack(x0 - _bf2_lo(hw), x1 - _bf2_hi(hw)))
+                        if const_expr(cur is None):
+                            curc = self._smem_tile(s_st, s_mb, i, g, c, zi)
+                        else:
+                            curc = cur
                         taddr = self._tile_addr(h_ptr, slot64, h_ss, h, sp, warp, i, g, c)
                         kp_row = (
                             s_kp + ((lane % 8) + 8 * ((lane // 8) % 2)) * PU + 16 * (lane // 16)
@@ -1690,8 +1763,8 @@ class _Replay:
                                 dcm = _mma(ahi, bf, [zf, zf, zf, zf])
                                 if const_expr(self.lo_split):
                                     dcm = _mma(alo, bf, dcm)
-                                wg = cur[8 * jj + s4]
-                                wh = cur[8 * jj + 4 + s4]
+                                wg = curc[8 * jj + s4]
+                                wh = curc[8 * jj + 4 + s4]
                                 ng.append(
                                     _bf2_pack(
                                         egs * _bf2_lo(wg) + dcm[0], egs * _bf2_hi(wg) + dcm[1]
@@ -2357,7 +2430,12 @@ def parse_config(text: str) -> Optional[dict]:
         out = {}
         for kv in text.split(","):
             k_, v_ = kv.split("=")
-            out[k_] = int(v_) if v_.lstrip("-").isdigit() else (v_ == "True")
+            if v_.lstrip("-").isdigit():
+                out[k_] = int(v_)
+            elif v_ in ("True", "False"):
+                out[k_] = v_ == "True"
+            else:
+                out[k_] = v_
         for b_ in (
             "smem_tiles",
             "persistent",
@@ -2366,6 +2444,7 @@ def parse_config(text: str) -> Optional[dict]:
             "lo_split",
             "early_trigger",
             "state_before_wait",
+            "early_acc",
         ):
             if b_ in out:
                 out[b_] = bool(out[b_])
@@ -2380,14 +2459,16 @@ def parse_config(text: str) -> Optional[dict]:
 
 
 def default_config(n: int, t: int, commit: bool = False) -> dict:
-    """Launch mapping by request count, measured on GB300 at T = 4 (bench_replay.py, 36 cold
-    layers): small batches split a head's 24 m-tiles over more, smaller CTAs; from 32 requests
-    (or with the in-kernel commit from 16) CTAs of 8 m-tiles x 4 warps, capped at 5 (4 with the
-    commit) resident per SM's register file, keep the most state in flight."""
+    """Launch mapping by request count, measured on GB300 at T = 4 (36 cold layers): small
+    batches split a head's 24 m-tiles over more, smaller CTAs, every state tile by bulk copy
+    issued as soon as the slot is known and the state dots taken before the history lands (a
+    latency-bound launch: 1 request 3.3 -> 2.8 us); from 32 requests (or with the in-kernel
+    commit from 16) CTAs of 8 m-tiles x 4 warps, capped at 5 (4 with the commit) resident per
+    SM's register file, keep the most state in flight."""
     if n <= 2:
-        return dict(tpc=2, warps=2, pf=1, minb=4)
+        return dict(tpc=2, warps=2, pf=0, minb=4, early_acc=True)
     if n <= 8:
-        return dict(tpc=4, warps=4, pf=1, minb=4)
+        return dict(tpc=4, warps=4, pf=0, minb=4, early_acc=True)
     if commit:
         return dict(tpc=8, warps=4, pf=1, minb=4)
     if n <= 16:
@@ -2451,6 +2532,7 @@ def cached_replay_update(
     Given work items, the kernel reads each row's (row, slot, pending count, half) from them (one
     load instead of two dependent ones), so they must list every one of the N rows, as the engine's
     builder over all decode rows does (`config={"use_wi": False}` falls back to `state_indices`).
+    Work items with `in_kernel_commit=True` need no `use_all_layer_commit` (the caller runs none).
     The Triton launch knobs (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`) are ignored.
     """
     del old_beta
@@ -2472,7 +2554,7 @@ def cached_replay_update(
     )
     if (replay_work_items is None) != (n_writes is None):
         raise ValueError("replay_work_items and n_writes must either both be set or both be None")
-    if replay_work_items is not None and not use_all_layer_commit:
+    if replay_work_items is not None and not use_all_layer_commit and not in_kernel_commit:
         raise ValueError("Partitioned replay requires the all-layer commit")
     if replay_work_items is None and use_all_layer_commit:
         raise ValueError("use_all_layer_commit requires replay work items")
@@ -2605,12 +2687,20 @@ class GdnCachedReplayCute(OpWrapper):
     )
 
     note = """
-    Metadata consumed: as the Triton entry (slots, per-slot pending count and history half).
-    Call site: `_replay_verify` over a bf16 recurrent pool, `in_kernel_commit=True`, no work
-    items; the target switches the manager's all-layer commit off when it binds a bf16 pool.
-    Compiles one kernel per (T, launch mapping, commit, PDL, ...) on first use (5-10 s):
-    warm-up runs before CUDA-graph capture cover it. Not supported: fp32 state, T > 8,
-    another geometry. Optimized for T = 4; T = 1..8 are tested for correctness.
+    Metadata consumed: as the Triton entry (slots, per-slot pending count and history half),
+    or the engine's replay work items (row, slot, pending count, half) over every row in one
+    load each. Call site: `_replay_verify` over a bf16 recurrent pool, `in_kernel_commit=True`
+    (with the work items the metadata builds, if given, and no all-layer commit); the target
+    switches the manager's all-layer commit off when it binds a bf16 pool. `g` / `beta` may be
+    the in_proj's column views (any row stride). Compiles one kernel per (T, launch mapping,
+    commit, PDL, ...) on first use (5-10 s): warm-up runs before CUDA-graph capture cover it.
+    Not supported: fp32 state, T > 8, another geometry. Optimized for T = 4; T = 1..8 are
+    tested for correctness. Every launch mapping is bitwise every other (the per-row
+    arithmetic does not depend on it).
+
+    GB300, T = 4, in-kernel commit, 25 % of the rows wrapping, PDL off, a CUDA graph of 36
+    layers each streaming its own state, us a layer: 1 request 2.8 (2.76 with the work
+    items), 4: 4.8 (4.4), 32: 17.0 (16.2), 128: 52.3 (51.9), 256: 100.9 (99.6).
     """
 
     def __call__(self, *args, **kwargs) -> torch.Tensor:
