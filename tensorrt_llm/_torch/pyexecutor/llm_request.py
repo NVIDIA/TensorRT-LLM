@@ -863,6 +863,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
+            parent_request: Optional["LlmRequest"] = None,
+            child_id: Optional[int] = None,
             seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
             use_chunked_generation_logits: bool = True,
@@ -913,7 +915,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # when the request is next scheduled.
         self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
 
-        if llm_request is not None:
+        if parent_request is not None:
+            if llm_request is not None or child_id is None:
+                raise ValueError(
+                    "Child construction requires a parent and child_id only.")
+            super().__init__(parent_request, child_id)
+        elif llm_request is not None:
             super().__init__(llm_request)
         else:
             super().__init__(*args,
@@ -1001,6 +1008,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        self.py_original_end_id = self.py_end_id
+        self.py_bad_words = None
+        self.py_no_repeat_ngram_size = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1285,38 +1295,56 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.state = LlmRequestState.GENERATION_COMPLETE
         self.set_finished_reason(reason, beam)
 
-    def create_child_request(self, child_id):
-        child = super().create_child_request(child_id)
-        py_request = LlmRequest(llm_request=child)
+    def create_child_request(self, child_id: int) -> None:
+        """Construct a child with copied inputs and fresh execution/output state.
 
-        # Encoder features are shared read-only. Before an in-place mutation,
-        # clone and reassign the tensor on the request being modified.
-        # Deep-copy other py_* attributes to preserve child independence.
-        for attr_name, attr_value in self.__dict__.items():
-            if attr_name == 'py_encoder_input_features':
-                py_request.py_encoder_input_features = attr_value
-            elif attr_name.startswith('py_'):
-                attr_value = getattr(self, attr_name)
-                setattr(py_request, attr_name, deepcopy(attr_value))
-            elif attr_name in [
-                    'is_attention_dp_dummy', 'is_cuda_graph_dummy',
-                    'encoder_tokens', 'encoder_output_len'
-            ]:
-                setattr(py_request, attr_name, attr_value)
+        Mutable Python inputs are copied independently. Encoder features and
+        native tensor inputs are shared read-only; clone before mutation.
+        Runtime events, cache ownership, sampler progress, and result history
+        are initialized by the constructor rather than inherited from a parent.
+        """
+        child = LlmRequest(
+            parent_request=self,
+            child_id=child_id,
+            client_id=self.py_client_id,
+            return_log_probs=self.py_return_log_probs,
+            return_context_logits=self.py_return_context_logits,
+            return_generation_logits=self.py_return_generation_logits,
+            return_logits_device_memory=self.py_return_logits_device_memory,
+            exclude_last_generation_logits=self.py_result.
+            _exclude_last_generation_logits,
+            additional_outputs=deepcopy(self.py_additional_outputs),
+            return_perf_metrics=self.return_perf_metrics,
+            return_encoder_output=self.py_return_encoder_output,
+            stop_words_list=deepcopy(self.py_stop_words_list),
+            num_logprobs=self.py_num_logprobs,
+            use_chunked_generation_logits=self.py_use_chunked_generation_logits,
+            logits_chunk_size=self.py_logits_chunk_size,
+            logprobs_mode=self.py_logprobs_mode,
+            logprobs_simple_format=self.py_logprobs_simple_format,
+            return_routed_experts=self.py_return_routed_experts,
+            embedding_bias=deepcopy(self.py_embedding_bias),
+            position_ids=deepcopy(self.py_position_ids),
+            guided_decoding_params=deepcopy(self.py_guided_decoding_params),
+            end_id=self.py_end_id,
+            py_lora_path=self.py_lora_path,
+            py_logits_post_processors=deepcopy(self.py_logits_post_processors),
+            py_multimodal_data=deepcopy(self.py_multimodal_data),
+            py_mm_item_order=deepcopy(self.py_mm_item_order),
+            encoder_input_features=self.py_encoder_input_features,
+        )
+        child.py_bad_words = deepcopy(self.py_bad_words)
+        child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
+        child.py_original_end_id = self.py_original_end_id
+        child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
+        child.py_conversation_params = deepcopy(self.py_conversation_params)
+        child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
+        child.is_attention_dp_dummy = self.is_attention_dp_dummy
+        child.is_cuda_graph_dummy = self.is_cuda_graph_dummy
 
-        # Rewrite specific attributes that should use child_request values.
-        py_request.py_request_id = child.request_id
-        py_request.py_batch_idx = None
-        py_request.py_seq_slot = None
-
-        py_request.child_requests = []
-
-        assert py_request.is_child
-        assert py_request.request_id == child.request_id
-        assert py_request.parent_request_id == self.request_id
-        assert py_request.sampling_config.seed != self.sampling_config.seed
-
-        self.child_requests.append(py_request)
+        # Register only after all input copies and Python initialization succeed.
+        self._register_child_request(child)
+        self.child_requests.append(child)
 
 
 def _validate_optional_int_list(values: Any,
