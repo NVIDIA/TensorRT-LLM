@@ -331,7 +331,7 @@ public:
     }
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_int8_woq_per_channel,
+        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_woq_per_channel,
         bool use_mxfp8_act_scaling, bool use_mxfp8_weight_scaling, bool use_fused_finalize)
     {
         mActivationDtype = activation_dtype;
@@ -339,7 +339,7 @@ public:
         mOutputDtype = output_dtype;
         mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
         mUseW4GroupScaling = use_w4_group_scaling;
-        mUseINT8WoqPerChannel = use_int8_woq_per_channel;
+        mUseWoqPerChannel = use_woq_per_channel;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
         mUseMxfp8WeightScaling = use_mxfp8_weight_scaling;
         mUseFusedFinalize = use_fused_finalize;
@@ -357,6 +357,14 @@ public:
                 || (mActivationDtype == c10::ScalarType::Float8_e4m3fn
                     && mWeightDtype == c10::ScalarType::Float8_e4m3fn),
             "use_mxfp8_weight_scaling requires both activation and weight dtypes to be Float8_e4m3fn.");
+
+        // The per-channel weight-only path reinterprets fc2's dimensions as
+        // [num_experts, inter_size, hidden_size] and, for INT4, treats the trailing
+        // dim as packed two-per-byte. That is only meaningful for integer
+        // weight-only quantization, so reject other weight dtypes here rather
+        // than silently transposing them downstream.
+        TORCH_CHECK(
+            !mUseWoqPerChannel || isIntWeightOnlyQuant(), "use_woq_per_channel requires an INT8 or INT4 weight dtype.");
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
         if (mActivationDtype == c10::ScalarType::Half && mWeightDtype == c10::ScalarType::Half)
@@ -629,21 +637,28 @@ public:
 
         ActivationType base_activation_type
             = activation_type.has_value() ? getActivationType(activation_type.value()) : ActivationType::Swiglu;
-        if (mUseINT8WoqPerChannel)
+        if (mUseWoqPerChannel)
         {
-            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
-            // [num_experts, inter_size, hidden_size]
+            // Note: The weight shape for per-channel weight-only quantization is dim-swapped, e.g.,
+            // fc2_expert_weights: [num_experts, inter_size, hidden_size]
             // Mirror the non-woq else-branch below: gated activations (Swiglu/Geglu) require fc1's
             // intermediate dim to be 2x fc2's (one half each for gate and up), while non-gated
             // activations (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
+            //
+            // Under this dim-swapped layout the sub-byte packing sits on fc1's inter dim
+            // (sizes()[2]), while fc2's inter dim (sizes()[1]) is unpacked, so mInnerDimMultiplier
+            // multiplies the fc1 side here -- unlike the non-swapped branch below. For INT8 the
+            // multiplier is 1 and this is identical to the previous form; for INT4 it is 2 (see the
+            // isInt4Quant() branch in the constructor) and the previous form rejected every valid
+            // shape.
             if (isGatedActivation(base_activation_type))
             {
-                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] * mInnerDimMultiplier == fc2_expert_weights.sizes()[1] * 2,
                     "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
             }
             else
             {
-                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier,
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] * mInnerDimMultiplier == fc2_expert_weights.sizes()[1],
                     "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
             }
         }
@@ -665,9 +680,9 @@ public:
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        if (mUseINT8WoqPerChannel)
+        if (mUseWoqPerChannel)
         {
-            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // Note: The weight shape for per-channel weight-only quantization is different, e.g., fc2_expert_weights:
             // [num_experts, inter_size, hidden_size]
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
@@ -956,9 +971,9 @@ public:
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        if (mUseINT8WoqPerChannel)
+        if (mUseWoqPerChannel)
         {
-            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // Note: The weight shape for per-channel weight-only quantization is different, e.g., fc2_expert_weights:
             // [num_experts, inter_size, hidden_size]
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
@@ -1018,16 +1033,16 @@ public:
         // ordering differs from the non-woq path; both mirror the gated/non-gated split used in
         // runMoe(). Gated activations (Swiglu/Geglu) require fc1's intermediate dim to be 2x fc2's;
         // non-gated (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
-        if (mUseINT8WoqPerChannel)
+        if (mUseWoqPerChannel)
         {
             if (isGatedActivation(base_activation_type))
             {
-                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] * mInnerDimMultiplier == fc2_expert_weights.sizes()[1] * 2,
                     "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
             }
             else
             {
-                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier,
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] * mInnerDimMultiplier == fc2_expert_weights.sizes()[1],
                     "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
             }
         }
@@ -1144,9 +1159,9 @@ public:
         int64_t const num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        if (mUseINT8WoqPerChannel)
+        if (mUseWoqPerChannel)
         {
-            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // Note: The weight shape for per-channel weight-only quantization is different, e.g., fc2_expert_weights:
             // [num_experts, inter_size, hidden_size]
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
@@ -1156,8 +1171,13 @@ public:
             std::nullopt, enable_alltoall,
             /*has_input_sf=*/false, /*swizzled_input_sf=*/true, /*use_dynamic_fc2_scale=*/false);
 #endif
-        int64_t const group_size_
-            = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
+        // Only group-scaled INT4 (W4A8_AWQ) carries a group size. Plain per-channel
+        // W4A16 must profile with -1 so the profiler builds QuantParams::Int, matching
+        // getQuantParams() and the runner chosen in the constructor; deriving this from
+        // isInt4Quant() alone would profile a groupwise configuration runMoe never uses.
+        int64_t const group_size_ = (isInt4Quant() && mUseW4GroupScaling)
+            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
+            : -1;
         int64_t const group_size = isWFP4A16Quant()
             ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
             : group_size_;
@@ -1244,7 +1264,7 @@ private:
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
-    bool mUseINT8WoqPerChannel = false;
+    bool mUseWoqPerChannel = false;
     bool mUseMxfp8ActScaling = false;
     bool mUseFusedFinalize = true;
     bool mUseMxfp8WeightScaling = false;
@@ -2528,10 +2548,10 @@ private:
         else if (isIntWeightOnlyQuant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for weight only quantization");
-            if (mUseINT8WoqPerChannel)
+            if (mUseWoqPerChannel)
             {
-                TORCH_CHECK(
-                    quant_scales.value().size() == 2, "Expecting 2 quant scales for INT8 weight only quantization");
+                TORCH_CHECK(quant_scales.value().size() == 2,
+                    "Expecting 2 quant scales for per-channel weight only quantization");
                 auto& fc1_weight_scales = quant_scales.value()[0];
                 auto& fc2_weight_scales = quant_scales.value()[1];
                 return kernels::QuantParams::Int(static_cast<float const*>(fc1_weight_scales.data_ptr()),
