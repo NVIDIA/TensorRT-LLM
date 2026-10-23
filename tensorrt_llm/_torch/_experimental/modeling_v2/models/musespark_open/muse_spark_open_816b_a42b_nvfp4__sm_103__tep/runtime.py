@@ -317,6 +317,9 @@ class _PrepareStager:
         and ``kv_len`` never exceeds the request's allocated capacity, so the
         first ``ceil(capacity / tokens_per_block) + 1`` columns (the batch maximum)
         carry everything read; the built-in copy moves all ``max_blocks_per_seq``.
+        The rows are the host table's at this call: they are snapshotted into the
+        staging block, which the launch reads. Per-layer and shared attention-op
+        tables take ``_attention_op_block_offsets``.
 
         Returns:
             True if the copy is recorded; False if it is declined (the caller
@@ -324,6 +327,13 @@ class _PrepareStager:
         """
         if self._after_decline():
             return False
+        if getattr(manager, "_attention_op_pool_groups", None) is not None or (
+            getattr(manager, "_use_per_layer_page_tables", False)
+            and not getattr(manager, "enable_swa_scratch_reuse", True)
+        ):
+            return self._attention_op_block_offsets(
+                manager, dst, request_ids, beam_width, num_contexts, num_seqs
+            )
         host = getattr(manager, "host_kv_cache_block_offsets", None)
         if (
             host is None
@@ -360,19 +370,103 @@ class _PrepareStager:
         rows = copy_idx.tolist()
         if len(rows) != num_seqs:
             return self._decline("block offsets: copy index length")
-        if not self.staging.room(host.shape[0] * len(rows)):
+        snapshot_bytes = host.shape[0] * num_seqs * cols * 4
+        if not self.staging.room(host.shape[0] * num_seqs, snapshot_bytes, 1):
             return self._decline("staging block full")
+        # The batch's host rows as they are now: later host-table writes must not reach this step.
+        rows_addr, staged = self.staging.stage(snapshot_bytes)
+        snapshot = torch.from_numpy(staged).view(torch.int32).view(host.shape[0], num_seqs, cols)
+        torch.index_select(host[:, :, 0, :cols], 1, copy_idx, out=snapshot)
         scales = [int(s) for s in manager._index_scale_ints]
         kv_offsets = manager.kv_offset.tolist()
-        host_rows, dst_rows = host.shape[1], dst.shape[1]
+        dst_rows = dst.shape[1]
         st = self.staging
         for pool in range(host.shape[0]):
-            for seq, row in enumerate(rows):
-                src = _addr(host, (pool * host_rows + row) * 2 * num_blocks)
+            for seq in range(num_seqs):
+                src = rows_addr + (pool * num_seqs + seq) * cols * 4
                 k = self._dst(_addr(dst, (pool * dst_rows + seq) * 2 * num_blocks), cols * 4)
                 v = self._dst(_addr(dst, ((pool * dst_rows + seq) * 2 + 1) * num_blocks), cols * 4)
                 st.blocks(k, v, src, cols, scales[pool], int(kv_offsets[pool]))
         self.block_cols = cols
+        self.block_seqs = num_seqs
+        return True
+
+    def _attention_op_block_offsets(
+        self,
+        manager: Any,
+        dst: torch.Tensor,
+        request_ids: list[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> bool:
+        """``copy_batch_block_offsets`` of a manager with per-layer or shared attention-op tables.
+
+        As ``KVCacheManagerV2._copy_batch_block_offsets_by_op_pool``: the batch's host rows are
+        snapshotted now, up to the widest row's ``num_blocks``, and every table lane is converted
+        by the manager's own ``(pool, scale, offset)`` parameters over the whole row.
+
+        Returns:
+            True if the copy is recorded; False if it is declined (the caller copies).
+        """
+        from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+
+        host = getattr(manager, "host_kv_cache_block_offsets", None)
+        params = getattr(manager, "_device_attention_op_params", None)
+        tables = int(getattr(manager, "num_attention_op_pools", 0))
+        if (
+            host is None
+            or params is None
+            or getattr(manager, "sparse_metadata_batch", None) is not None
+            or getattr(manager, "kv_cache_type", None) == CacheTypeCpp.CROSS
+            or tuple(params.shape) != (3, tables, 2)
+            or params.dtype != torch.int32
+            or not params.is_contiguous()
+            or host.dtype != torch.int32
+            or host.dim() != 4
+            or not dst.is_cuda
+            or dst.dtype != torch.int32
+            or not dst.is_contiguous()
+            or dst.dim() != 4
+            or dst.shape[0] < tables
+            or dst.shape[2] != 2
+            or dst.shape[3] != host.shape[3]
+            or num_seqs > dst.shape[1]
+            or beam_width > getattr(manager, "max_copy_beam_width", 0)
+        ):
+            return self._decline("block offsets: attention-op table layout or manager mode")
+        caches = [manager.kv_cache_map.get(rid) for rid in request_ids]
+        if None in caches:
+            return self._decline("block offsets: request without a KV cache")
+        copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width, False)
+        if len(copy_idx) != num_seqs:
+            return self._decline("block offsets: copy index length")
+        num_pools, num_blocks = host.shape[0], host.shape[3]
+        width = max([1] + [int(cache.num_blocks) for cache in caches])
+        snapshot_bytes = num_pools * num_seqs * width * 4
+        if not self.staging.room(tables * 2 * num_seqs, snapshot_bytes, 1):
+            return self._decline("staging block full")
+        # Host rows past num_blocks are BAD_PAGE_INDEX; later host writes must not reach this step.
+        rows_addr, rows = self.staging.stage(snapshot_bytes)
+        snapshot = torch.from_numpy(rows).view(torch.int32).view(num_pools, num_seqs, width)
+        torch.index_select(host[:, :, 0, :width], 1, copy_idx, out=snapshot)
+        table, seq, lane = (
+            a.reshape(-1)
+            for a in np.meshgrid(
+                np.arange(tables), np.arange(num_seqs), np.arange(2), indexing="ij"
+            )
+        )
+        # Disjoint from the replay's static inputs, so no _dst bookkeeping.
+        self.staging.tables(
+            _addr(dst) + (table * dst.stride(0) + (seq * 2 + lane) * num_blocks) * 4,
+            rows_addr + seq * width * 4,
+            num_blocks,
+            _addr(params) + (table * 2 + lane) * 4,
+            tables * 2,
+            width,
+            num_seqs * width,
+        )
+        self.block_cols = num_blocks
         self.block_seqs = num_seqs
         return True
 
@@ -521,10 +615,6 @@ class StepInputStaging:
                 not isinstance(attn_metadata, TrtllmAttentionMetadata)
                 or type(attn_metadata).prepare is not TrtllmAttentionMetadata.prepare,
                 "attention metadata type",
-            ),
-            (
-                getattr(attn_metadata, "draft_kv_cache_manager", None) is not None,
-                "draft KV cache manager",
             ),
             (runner.guided_decoder is not None, "guided decoding"),
             (cfg.use_mrope, "mrope"),

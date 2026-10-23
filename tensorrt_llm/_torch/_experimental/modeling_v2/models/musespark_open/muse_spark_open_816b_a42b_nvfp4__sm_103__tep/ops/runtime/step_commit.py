@@ -20,6 +20,11 @@ Descriptor kinds (every element is a 32-bit word):
   ``count`` columns of one host page-index row: ``K[i] = 0`` if the page index
   is ``BAD_PAGE_INDEX`` (-1) else ``scale * v``, and ``V[i]`` the same plus
   ``kv_offset``, in int32 arithmetic as the C++ kernel.
+* ``TABLE``  one lane of an attention-op page table row, as
+  ``KVCacheManagerV2._copy_batch_block_offsets_by_op_pool`` converts it: ``(pool,
+  scale, offset)`` read from the manager's device parameters, ``dst[i] = -1`` if
+  ``i`` is past the snapshot's ``width`` or ``src[pool * pool_stride + i]`` is
+  ``BAD_PAGE_INDEX``, else ``src[...] * scale + offset``, in int32 arithmetic.
 
 Programs run concurrently and in no particular order, so the descriptors of one
 launch must write disjoint words and must not read a word another descriptor of
@@ -48,9 +53,9 @@ import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 
-KIND_COPY, KIND_GATHER, KIND_FILL, KIND_BLOCKS = 0, 1, 2, 3
+KIND_COPY, KIND_GATHER, KIND_FILL, KIND_BLOCKS, KIND_TABLE = 0, 1, 2, 3, 4
 
-#: int64 fields per descriptor: kind, dst, src, count, a4, a5, a6, unused.
+#: int64 fields per descriptor: kind, dst, src, count, a4, a5, a6, a7.
 DESC_FIELDS = 8
 _DESC_BYTES = DESC_FIELDS * 8
 
@@ -89,13 +94,23 @@ def _step_commit_kernel(desc_addr, BLOCK: tl.constexpr):
         elif kind == 2:
             values = tl.zeros([BLOCK], dtype=tl.int32) + a5.to(tl.int32)
             tl.store(dst + offs * a6, values, mask=mask)
-        else:
+        elif kind == 3:
             pages = tl.load(src + offs, mask=mask, cache_modifier=".cv")
             scaled = pages * a4.to(tl.int32)
             bad = pages == -1
             tl.store(dst + offs, tl.where(bad, 0, scaled), mask=mask)
             dst_v = a6.to(tl.pointer_type(tl.int32))
             tl.store(dst_v + offs, tl.where(bad, 0, scaled + a5.to(tl.int32)), mask=mask)
+        else:
+            a7 = tl.load(desc + 7, cache_modifier=".cv")
+            param = a4.to(tl.pointer_type(tl.int32))
+            pool = tl.load(param).to(tl.int64)
+            scale = tl.load(param + a5)
+            offset = tl.load(param + 2 * a5)
+            base = tl.load(
+                src + pool * a7 + offs, mask=mask & (offs < a6), other=-1, cache_modifier=".cv"
+            )
+            tl.store(dst + offs, tl.where(base < 0, -1, base * scale + offset), mask=mask)
 
 
 class StepStaging:
@@ -190,17 +205,22 @@ class StepStaging:
         if max_count > self._max_count:
             self._max_count = max_count
 
+    def stage(self, nbytes: int) -> tuple[int, np.ndarray]:
+        """Reserve ``nbytes`` of the data area for descriptors to read: its address and a uint8 view."""
+        start = (self.data_used + _ALIGN - 1) // _ALIGN * _ALIGN
+        if start + nbytes > self._data_np.shape[0]:
+            raise RuntimeError(f"StepStaging: data area of {self._data_np.shape[0]} bytes is full")
+        self.data_used = start + nbytes
+        return self._data_base + start, self._data_np[start : start + nbytes]
+
     def copy_bytes(self, dst_addr: int, payload: np.ndarray) -> None:
         """Record ``dst[i] = payload[i]`` for a uint8 payload whose size is a multiple of 4."""
         nbytes = payload.nbytes
         if nbytes % 4:
             raise ValueError(f"COPY payload of {nbytes} bytes is not whole 32-bit words")
-        start = (self.data_used + _ALIGN - 1) // _ALIGN * _ALIGN
-        if start + nbytes > self._data_np.shape[0]:
-            raise RuntimeError(f"StepStaging: data area of {self._data_np.shape[0]} bytes is full")
-        self._data_np[start : start + nbytes] = payload
-        self.data_used = start + nbytes
-        self._add(KIND_COPY, dst_addr, self._data_base + start, nbytes // 4, 0, 0, 0)
+        src_addr, staged = self.stage(nbytes)
+        staged[:] = payload
+        self._add(KIND_COPY, dst_addr, src_addr, nbytes // 4, 0, 0, 0)
 
     def gather(
         self,
@@ -229,6 +249,26 @@ class StepStaging:
     ) -> None:
         """Record the block-offset transform of one host page-index row's first ``count`` columns."""
         self._add(KIND_BLOCKS, dst_k_addr, src_addr, count, scale, kv_offset, dst_v_addr)
+
+    def tables(
+        self,
+        dst_addrs: np.ndarray,
+        src_addrs: np.ndarray,
+        count: int,
+        params_addrs: np.ndarray,
+        params_stride: int,
+        width: int,
+        pool_stride: int,
+    ) -> None:
+        """Record attention-op table lanes from staged base page indices (``TABLE``), one per address.
+
+        Each ``params_addrs`` entry points at its lane's int32 pool id, with the scale and
+        offset ``params_stride`` and ``2 * params_stride`` elements further.
+        """
+        table = np.empty((dst_addrs.size, DESC_FIELDS), dtype=np.int64)
+        table[:] = (KIND_TABLE, 0, 0, count, 0, params_stride, width, pool_stride)
+        table[:, 1], table[:, 2], table[:, 4] = dst_addrs, src_addrs, params_addrs
+        self.extend(table, max_count=count)
 
     # Execution -------------------------------------------------------------
 

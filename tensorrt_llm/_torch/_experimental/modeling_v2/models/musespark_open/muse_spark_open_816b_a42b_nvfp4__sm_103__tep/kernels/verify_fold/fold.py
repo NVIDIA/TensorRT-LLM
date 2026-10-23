@@ -502,6 +502,10 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             allocated = dflash_allocated_ctx_limit(
                 self._ctx_block_counts, self._ctx_page_size, block_size
             )
+            if self._ctx_unified_cache:
+                self._check_block_within_allocation(
+                    num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                )
             num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
         noise_embedding = noise_embed_2d
         query_positions = fold.query_positions
@@ -672,8 +676,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             if v_new is not None:
                 self._ctx_v_buf[slot_long, :, col_long] = v_new
 
-        self._ctx_len[slots] += gen_num_accepted_long
-        self._ctx_len.clamp_(max=self._max_ctx)
+        self._advance_ctx_len(slots, gen_num_accepted_long)
         if self._ctx_keep and not self._ctx_paged:
             self._compact_ctx_window(slots)
 

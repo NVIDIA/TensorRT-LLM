@@ -47,7 +47,9 @@ full-length drafter context arena the fast paths written for a windowed one
 are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``); over a
 windowed arena the paths that write the arena by column
 (``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and the verify fold)
-stay only where the composition serves the window compaction too (sm103 tep4). The installers
+stay only where the composition serves the window compaction too (sm103 tep4); over a
+paged drafter context those written for the dense arena are left out
+(``dispatch.DENSE_ARENA_PATHS``). The installers
 ask the plan per fast path (``Plan.enabled``); each paragraph below names one
 fast path of ``dispatch.FAST_PATHS``. Their installers live under
 ``kernels/<fast path>/`` and their launches under ``ops/<category>/``.

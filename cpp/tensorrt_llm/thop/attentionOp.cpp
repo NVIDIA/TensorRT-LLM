@@ -1659,14 +1659,17 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
     }
     else
     {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2 || hostKvCachePoolPointers.dim() == 3);
+        // Non-FP4 layers use only the data pointers in a mixed-format pool table.
+        auto const dataPointers
+            = hostKvCachePoolPointers.dim() == 3 ? hostKvCachePoolPointers.select(2, 0) : hostKvCachePoolPointers;
         pointers.primaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
+                readHostTensor2D<int64_t>(dataPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
         pointers.secondaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
+                readHostTensor2D<int64_t>(dataPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
     }
     return pointers;

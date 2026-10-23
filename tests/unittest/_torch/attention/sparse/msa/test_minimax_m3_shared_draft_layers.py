@@ -179,6 +179,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
 def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.layer_specs = None
     manager.dtype = dtype
     manager.pp_layers = [60, 7, 2]
     manager.sparse_layer_ids = {7}
@@ -187,6 +188,7 @@ def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
         assert manager._get_block_scale_role(Role.KEY, local_layer) == expected
         assert manager._get_block_scale_role(Role.VALUE, local_layer) is None
     generic = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    generic.layer_specs = None
     generic.dtype = dtype
     expected = Role.KEY_BLOCK_SCALE if dtype == DataType.NVFP4 else None
     assert generic._get_block_scale_role(Role.KEY, 0) == expected

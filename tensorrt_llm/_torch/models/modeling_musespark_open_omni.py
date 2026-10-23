@@ -1451,19 +1451,25 @@ class MuseSparkOpenOmniForConditionalGeneration(MultimodalModelMixin, PreTrained
         mm_inputs: Any,
         spec_metadata: Any = None,
         lora_params: Optional[Dict[str, Any]] = None,
+        resource_manager: Any = None,
         **forward_kwargs: Any,
     ) -> Dict[str, Any]:
-        """Forward ``spec_metadata`` and ``lora_params`` to the decoder.
+        """Forward ``spec_metadata``, ``lora_params`` and ``resource_manager`` to the decoder.
 
-        The mixin's default drops both, and so did the wrapper's own forward, so
+        The mixin's default drops all three, and so did the wrapper's own forward, so
         neither speculative decoding nor LoRA could reach the decoder through
         this class -- silently, because ``DecoderModelForCausalLM.forward``
-        defaults them to ``None`` rather than complaining. Nothing in the tier
-        exercises either path today; this is the plumbing so that when something
-        does, it does not have to rediscover why the wrapper ate its arguments.
+        defaults them to ``None`` rather than complaining. The resource manager
+        carries the draft KV cache a one-model drafter reads (DFlash on TRTLLM
+        binds its context cache to it); without it the drafter falls back to a
+        private arena.
         """
         del raw_input_ids, position_ids, mm_inputs, forward_kwargs
-        return {"spec_metadata": spec_metadata, "lora_params": lora_params}
+        return {
+            "spec_metadata": spec_metadata,
+            "lora_params": lora_params,
+            "resource_manager": resource_manager,
+        }
 
     def load_weights(self, weights, weight_mapper=None) -> Dict[str, int]:
         """Load the tower and the decoder from one checkpoint.
