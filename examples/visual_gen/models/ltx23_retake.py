@@ -17,8 +17,7 @@
 
 Defaults to the LTX-2.3 distilled 1.1 checkpoint.
 Use ``--model`` to select a checkpoint file, directory, or HuggingFace Hub ID.
-Use ``--text_encoder_path`` to override the Gemma text encoder, or pass
-precomputed prompt conditioning with ``--prompt_conditioning_path``. Source
+Use ``--text_encoder_path`` to override the Gemma text encoder. Source
 decoding requires PyAV, and audio conditioning requires a ``torchaudio`` build
 compatible with the installed PyTorch.
 Both video and audio are regenerated in the selected window by default.
@@ -34,10 +33,8 @@ import argparse
 from pathlib import Path
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.ltx23.checkpoint import (
-    LTX23_MODEL_ID,
-    resolve_ltx23_checkpoint,
-)
+from tensorrt_llm._torch.visual_gen.models.ltx23.checkpoint import LTX23_MODEL_ID
+from tensorrt_llm.visual_gen import MediaRef
 
 _DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "ltx23-retake-bf16-1gpu.yaml"
 
@@ -87,11 +84,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Gemma text encoder path override.",
     )
-    parser.add_argument(
-        "--prompt_conditioning_path",
-        default=None,
-        help="Precomputed prompt conditioning safetensors path.",
-    )
     return parser.parse_args()
 
 
@@ -99,28 +91,15 @@ def main() -> None:
     args = parse_args()
     visual_gen_args = VisualGenArgs.from_yaml(args.visual_gen_args)
     pipeline_config = dict(visual_gen_args.pipeline_config)
-    if args.prompt_conditioning_path is not None:
-        if args.prompt:
-            raise ValueError("--prompt and --prompt_conditioning_path are mutually exclusive.")
-        if args.text_encoder_path is not None:
-            raise ValueError(
-                "--text_encoder_path and --prompt_conditioning_path are mutually exclusive."
-            )
-        pipeline_config["text_encoder_path"] = None
-    elif args.text_encoder_path is not None:
+    if args.text_encoder_path is not None:
         pipeline_config["text_encoder_path"] = args.text_encoder_path
     visual_gen_args = visual_gen_args.model_copy(update={"pipeline_config": pipeline_config})
 
-    model = resolve_ltx23_checkpoint(
-        args.model, workflow="retake", revision=visual_gen_args.revision
-    )
-    with VisualGen(model=model, args=visual_gen_args) as visual_gen:
+    with VisualGen(model=args.model, args=visual_gen_args) as visual_gen:
         params = visual_gen.default_params
-        params.extra_params["retake_video_path"] = args.source
+        params.video_reference = [MediaRef(content=args.source, format="path")]
         params.extra_params["retake_regenerate_video"] = args.regenerate_video
         params.extra_params["retake_regenerate_audio"] = args.regenerate_audio
-        if args.prompt_conditioning_path is not None:
-            params.extra_params["retake_prompt_conditioning_path"] = args.prompt_conditioning_path
         if args.start is not None:
             params.extra_params["retake_start_time"] = args.start
         if args.end is not None:

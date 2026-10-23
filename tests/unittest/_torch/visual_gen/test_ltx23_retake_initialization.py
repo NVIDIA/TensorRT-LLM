@@ -47,7 +47,9 @@ def test_ltx23_retake_frozen_video_initialization(monkeypatch: pytest.MonkeyPatc
     pipeline.vocoder = Mock()
     pipeline.transformer = Mock()
     context = torch.zeros(1, 1, 2, dtype=dtype)
-    pipeline._prepare_prompt_conditioning = Mock(return_value=(context, context, None))
+    pipeline.text_encoder = Mock()
+    pipeline._encode_prompt = Mock(return_value=(context, None))
+    pipeline._process_connectors = Mock(return_value=(context, context, None))
     monkeypatch.setattr(retake_module, "get_videostream_metadata", lambda _: pixel_shape)
     monkeypatch.setattr(retake_module, "decode_audio_from_file", lambda _: object())
 
@@ -59,7 +61,7 @@ def test_ltx23_retake_frozen_video_initialization(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(InitializationComplete):
         pipeline._run_retake(
             req,
-            "source.mp4",
+            b"source video bytes",
             0.5,
             1.5,
             "prompt",

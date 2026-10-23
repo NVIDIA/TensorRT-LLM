@@ -4,9 +4,9 @@
 
 This pipeline keeps a resident retake model for ``trtllm-serve`` and extends the
 native LTX-2.3 pipeline with source-media encoders and masked denoising.
-It either loads Gemma for a live prompt or consumes precomputed post-connector
-conditioning. Retake generalizes image-to-video masking to condition both sides
-of the regenerated window.
+It encodes prompts with Gemma and consumes a standard video reference.
+Retake generalizes image-to-video masking to condition both sides of the
+regenerated window.
 
 Source video/audio decode, stream metadata, audio/video VAE encode, diffusion,
 and VAE decode all use TensorRT-LLM native components.
@@ -19,11 +19,10 @@ import math
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
-import safetensors.torch
 import torch
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.inputs.multimodal_data import AudioData
 from tensorrt_llm.logger import logger
@@ -65,7 +64,6 @@ _RETAKE_DISTILLED_SIGMA_VALUES = [
 _RETAKE_NUM_INFERENCE_STEPS = len(_RETAKE_DISTILLED_SIGMA_VALUES) - 1
 
 _DEFAULT_MAX_SEQUENCE_LENGTH = 1024
-_PROMPT_CONDITIONING_KEYS = ("video_embeds", "audio_embeds", "connector_mask")
 
 # Retake uses the same tiling geometry for source encode and output decode. Keep
 # it separate from the generation pipeline's default because tile boundaries are
@@ -74,45 +72,6 @@ _RETAKE_TILING_CONFIG = TilingConfig(
     spatial_config=SpatialTilingConfig(tile_size_in_pixels=768, tile_overlap_in_pixels=64),
     temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=24),
 )
-
-
-def _load_prompt_conditioning(path: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load precomputed post-connector prompt tensors from safetensors."""
-    tensors = safetensors.torch.load_file(path, device="cpu")
-    keys = set(tensors)
-    required = set(_PROMPT_CONDITIONING_KEYS)
-    if keys != required:
-        raise ValueError(
-            "Prompt-conditioning tensor keys do not match the expected schema: "
-            f"missing={sorted(required - keys)}, unexpected={sorted(keys - required)}"
-        )
-
-    video_embeds, audio_embeds, connector_mask = (tensors[key] for key in _PROMPT_CONDITIONING_KEYS)
-    if video_embeds.ndim != 3 or audio_embeds.ndim != 3:
-        raise ValueError(
-            "Prompt embeddings must be rank 3 [batch, sequence, channels]; "
-            f"got video={tuple(video_embeds.shape)}, audio={tuple(audio_embeds.shape)}"
-        )
-    if connector_mask.ndim != 4:
-        raise ValueError(
-            "Connector mask must be rank 4 [batch, 1, 1, sequence]; "
-            f"got {tuple(connector_mask.shape)}"
-        )
-    if video_embeds.shape[0] != 1:
-        raise ValueError(
-            "LTX-2.3 retake prompt conditioning must contain one prompt; "
-            f"got batch size {video_embeds.shape[0]}."
-        )
-    if video_embeds.shape[:2] != audio_embeds.shape[:2] or (
-        connector_mask.shape[0] != video_embeds.shape[0]
-        or connector_mask.shape[-1] != video_embeds.shape[1]
-    ):
-        raise ValueError(
-            "Prompt-conditioning batch and sequence dimensions do not align: "
-            f"video={tuple(video_embeds.shape)}, audio={tuple(audio_embeds.shape)}, "
-            f"mask={tuple(connector_mask.shape)}"
-        )
-    return video_embeds, audio_embeds, connector_mask
 
 
 def _resolve_retake_time_window(
@@ -232,15 +191,6 @@ class LTX23RetakePipeline(LTX23Pipeline):
     @property
     def extra_param_specs(self) -> dict[str, ExtraParamSchema]:
         return {
-            "retake_video_path": ExtraParamSchema(
-                type="str",
-                description="Path to the source video file for retake.",
-            ),
-            "retake_prompt_conditioning_path": ExtraParamSchema(
-                type="str",
-                default=None,
-                description="Path to precomputed post-connector prompt conditioning.",
-            ),
             "retake_start_time": ExtraParamSchema(
                 type="float",
                 default=0.0,
@@ -266,6 +216,15 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 type="bool",
                 default=True,
                 description="Regenerate video inside the retake window.",
+            ),
+        }
+
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "video_reference": RefSlotSpec(
+                modality="video",
+                roles=[RoleSpec(role="reference", min=1, max=1)],
             ),
         }
 
@@ -408,14 +367,6 @@ class LTX23RetakePipeline(LTX23Pipeline):
     ) -> None:
         native_skip_components = list(skip_components or [])
         native_skip_components += [PipelineComponent.SCHEDULER]
-        if not text_encoder_path:
-            native_skip_components.extend(
-                [
-                    PipelineComponent.TOKENIZER,
-                    PipelineComponent.TEXT_ENCODER,
-                    "connectors",
-                ]
-            )
         super().load_standard_components(
             checkpoint_dir,
             device,
@@ -429,9 +380,12 @@ class LTX23RetakePipeline(LTX23Pipeline):
     @torch.inference_mode()
     def infer(self, req: "DiffusionRequest") -> PipelineOutput:
         extra = req.params.extra_params or {}
-        video_path = extra.get("retake_video_path")
-        if video_path is None:
-            raise ValueError("extra_params['retake_video_path'] is required for LTX-2.3 retake.")
+        refs = req.params.video_reference or []
+        if len(refs) != 1:
+            raise ValueError("LTX-2.3 retake requires exactly one video_reference.")
+        if refs[0].format != "bytes" or not isinstance(refs[0].content, bytes):
+            raise ValueError("LTX-2.3 retake video_reference must be resolved to bytes.")
+        video_bytes = refs[0].content
         start_time = extra.get("retake_start_time")
         end_time = extra.get("retake_end_time")
         regenerate_video = extra.get("retake_regenerate_video", True)
@@ -445,7 +399,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         timer.mark_pre_start()
         video, audio, output_shape = self._run_retake(
             req,
-            video_path,
+            video_bytes,
             start_time,
             end_time,
             prompt,
@@ -473,42 +427,10 @@ class LTX23RetakePipeline(LTX23Pipeline):
             )
         )
 
-    def _prepare_prompt_conditioning(
-        self,
-        prompt: str,
-        max_sequence_length: int,
-        conditioning_path: str | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return supplied prompt conditioning or encode the prompt with Gemma."""
-        if conditioning_path is not None:
-            if prompt:
-                raise ValueError(
-                    "LTX-2.3 retake accepts either a prompt or precomputed prompt "
-                    "conditioning, not both."
-                )
-            video_embeds, audio_embeds, connector_mask = _load_prompt_conditioning(
-                conditioning_path
-            )
-            logger.info(f"Using LTX-2.3 retake prompt conditioning from {conditioning_path}.")
-            return (
-                video_embeds.to(device=self.device, dtype=self.dtype),
-                audio_embeds.to(device=self.device, dtype=self.dtype),
-                connector_mask.to(device=self.device, dtype=self.dtype),
-            )
-
-        text_encoder = getattr(self, "text_encoder", None)
-        if text_encoder is None:
-            raise RuntimeError("Gemma is not loaded for LTX-2.3 retake prompt encoding.")
-        prompt_embeds, prompt_attention_mask = self._encode_prompt(
-            prompt,
-            max_sequence_length=max_sequence_length,
-        )
-        return self._process_connectors(prompt_embeds, prompt_attention_mask)
-
     def _run_retake(
         self,
         req: "DiffusionRequest",
-        video_path: str,
+        video_bytes: bytes,
         start_time: float | None,
         end_time: float | None,
         prompt: str,
@@ -534,7 +456,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         generator = torch.Generator(device=device).manual_seed(seed)
 
         # ---- 1. Source read + validation --------------------------------
-        pixel_shape = get_videostream_metadata(video_path)
+        pixel_shape = get_videostream_metadata(video_bytes)
         num_frames = int(pixel_shape.frames)
         height = int(pixel_shape.height)
         width = int(pixel_shape.width)
@@ -544,7 +466,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         start_time, end_time = _resolve_retake_time_window(start_time, end_time, fps, num_frames)
 
         source_norm_5d = self._read_source_video(
-            video_path, num_frames, height, width, device, dtype
+            video_bytes, num_frames, height, width, device, dtype
         )
 
         # ---- 2. Native VAE encode + seed initial latents ----------------
@@ -601,16 +523,20 @@ class LTX23RetakePipeline(LTX23Pipeline):
         max_sequence_length = (
             getattr(req.params, "max_sequence_length", None) or _DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        conditioning_path = (req.params.extra_params or {}).get("retake_prompt_conditioning_path")
-        video_embeds, audio_embeds, connector_mask = self._prepare_prompt_conditioning(
-            prompt, max_sequence_length, conditioning_path
+        if getattr(self, "text_encoder", None) is None:
+            raise RuntimeError("Gemma is not loaded for LTX-2.3 retake prompt encoding.")
+        prompt_embeds, prompt_attention_mask = self._encode_prompt(
+            prompt, max_sequence_length=max_sequence_length
+        )
+        video_embeds, audio_embeds, connector_mask = self._process_connectors(
+            prompt_embeds, prompt_attention_mask
         )
 
         # RoPE positions remain float32 because position error is amplified by
         # the distilled schedule's large final Euler steps.
 
         # ---- Source audio conditioning ----------------------------------
-        source_audio = decode_audio_from_file(video_path)
+        source_audio = decode_audio_from_file(video_bytes)
         if getattr(self, "audio_decoder", None) is None or getattr(self, "vocoder", None) is None:
             raise RuntimeError(
                 "Audio retake requires the native audio decoder and vocoder weights."
@@ -769,7 +695,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
 
     def _read_source_video(
         self,
-        video_path: str,
+        video_bytes: bytes,
         num_frames: int,
         height: int,
         width: int,
@@ -781,9 +707,9 @@ class LTX23RetakePipeline(LTX23Pipeline):
         Returns ``(1, 3, T, H, W)`` in ``[-1, 1]``. Pixel decoding is
         deterministic and uses sequential frame indices.
         """
-        frames = list(decode_video_by_frame(video_path))
+        frames = list(decode_video_by_frame(video_bytes))
         if not frames:
-            raise ValueError(f"retake source video decoded no frames: {video_path}")
+            raise ValueError("retake source video decoded no frames.")
         source_uint8 = torch.cat(frames, dim=0)  # (T, H, W, C)
         decoded_frames = source_uint8.shape[0]
         if decoded_frames != num_frames:

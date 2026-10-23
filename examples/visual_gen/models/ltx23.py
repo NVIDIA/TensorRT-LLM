@@ -28,10 +28,7 @@ from dataclasses import replace
 import torch.nn.functional as F
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.ltx23.checkpoint import (
-    LTX23_MODEL_ID,
-    resolve_ltx23_checkpoint,
-)
+from tensorrt_llm._torch.visual_gen.models.ltx23.checkpoint import LTX23_MODEL_ID
 
 
 def main() -> None:
@@ -77,10 +74,7 @@ def main() -> None:
         }
     extra_args.compilation_config.resolutions = [(512, 768)]
     extra_args.compilation_config.num_frames = [49]
-    model = resolve_ltx23_checkpoint(
-        args.model, workflow="generation", revision=extra_args.revision
-    )
-    visual_gen = VisualGen(model=model, args=extra_args)
+    visual_gen = VisualGen(model=args.model, args=extra_args)
 
     params = visual_gen.default_params
     params.height = 512

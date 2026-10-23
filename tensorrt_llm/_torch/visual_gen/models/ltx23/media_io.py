@@ -11,6 +11,7 @@ resizing, resampling and normalization remain in the retake pipeline.
 import math
 from collections.abc import Iterator
 from fractions import Fraction
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -82,11 +83,11 @@ def _rgb_frame(
     return np.ascontiguousarray(pixels)
 
 
-def get_videostream_metadata(path: str) -> VideoPixelShape:
+def get_videostream_metadata(source: str | bytes) -> VideoPixelShape:
     """Read display geometry and count frames when the container omits a count."""
     import av
 
-    with av.open(path) as container:
+    with av.open(BytesIO(source) if isinstance(source, bytes) else source) as container:
         if not container.streams.video:
             raise ValueError("Media has no video stream.")
         stream = container.streams.video[0]
@@ -107,14 +108,14 @@ def get_videostream_metadata(path: str) -> VideoPixelShape:
         return VideoPixelShape(batch=1, frames=count, height=height, width=width, fps=float(rate))
 
 
-def decode_video_by_frame(path: str) -> Iterator[torch.Tensor]:
+def decode_video_by_frame(source: str | bytes) -> Iterator[torch.Tensor]:
     """Yield display-oriented RGB uint8 tensors shaped ``(1, H, W, C)``.
 
     Decode sequentially without seeking or changing the frame rate.
     """
     import av
 
-    with av.open(path) as container:
+    with av.open(BytesIO(source) if isinstance(source, bytes) else source) as container:
         if not container.streams.video:
             raise ValueError("Media has no video stream.")
         stream = container.streams.video[0]
@@ -137,7 +138,7 @@ def decode_video_by_frame(path: str) -> Iterator[torch.Tensor]:
             yield torch.from_numpy(pixels).unsqueeze(0)
 
 
-def decode_audio_from_file(path: str) -> AudioData | None:
+def decode_audio_from_file(source: str | bytes) -> AudioData | None:
     """Decode original-rate audio as ``(1, channels, samples)`` on the video timeline.
 
     Trim negative preroll and declared trailing padding; retain delayed starts
@@ -145,7 +146,7 @@ def decode_audio_from_file(path: str) -> AudioData | None:
     """
     import av
 
-    with av.open(path) as container:
+    with av.open(BytesIO(source) if isinstance(source, bytes) else source) as container:
         if not container.streams.audio:
             return None
         stream = container.streams.audio[0]
