@@ -18,7 +18,11 @@ causal block page lists attention reads."""
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
+from tensorrt_llm._torch.visual_gen.cache import (
+    BlockCausalKVCacheManager,
+    RolloutKVCacheInterface,
+    RolloutSpec,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -149,6 +153,11 @@ def page_list_keys(cache, layer, causal_block_size, i):
     page = pages[i].long()[pos // cache.tokens_per_page]
     slot = pos % cache.tokens_per_page
     return buf[page, 0, 0, slot, 0].float()
+
+
+def test_implements_the_rollout_interface():
+    assert issubclass(BlockCausalKVCacheManager, RolloutKVCacheInterface)
+    assert not BlockCausalKVCacheManager.__abstractmethods__
 
 
 def test_geometry_holds_fixed_window_stale_and_chunk(cache):

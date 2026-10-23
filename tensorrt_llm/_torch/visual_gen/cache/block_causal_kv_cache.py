@@ -73,9 +73,7 @@ storage positions here never grow past the resident capacity.
 
 from __future__ import annotations
 
-import collections.abc
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -92,6 +90,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
+from .rollout_kv_cache_interface import ForwardPlan, RolloutKVCacheInterface, RolloutSpec
+
 _DTYPES = {
     torch.bfloat16: tensorrt_llm.bindings.DataType.BF16,
     torch.float16: tensorrt_llm.bindings.DataType.HALF,
@@ -101,96 +101,6 @@ _DTYPES = {
 # integer id that normally comes from an LlmRequest; a rollout has none, so it
 # gets a fixed one, as V2's own guard-page and capture-dummy sequences do.
 _ROLLOUT_REQUEST_ID = 0
-
-
-@dataclass(frozen=True)
-class RolloutSpec:
-    """The geometry of a rollout: what ``open`` lays out in the pool and what every
-    forward of the rollout may ask for. The cache keeps device state per spec, so CUDA
-    graphs captured over a spec replay whenever it is opened again.
-
-    Every causal block sees the fixed region, the ``window_tokens`` tokens before its own
-    start, and itself. The window is the same for every causal block and every forward
-    of a rollout; a window that changes between forwards of one rollout is not
-    supported.
-
-    Args:
-        window_tokens: history tokens each causal block sees before its own start.
-        max_staged_tokens: most tokens a forward may write before a commit; a forward
-            may write fewer.
-        causal_blocks: every causal block size a forward may use, mapped to the most
-            causal blocks of that size one forward cuts its tokens into. Each size gets
-            private pages for that many causal blocks.
-        max_pin_tokens: most tokens any ``open`` of this spec pins.
-    """
-
-    window_tokens: int
-    max_staged_tokens: int
-    causal_blocks: collections.abc.Mapping[int, int]
-    max_pin_tokens: int = 0
-
-    def __post_init__(self) -> None:
-        blocks = dict(sorted((int(size), int(n)) for size, n in dict(self.causal_blocks).items()))
-        object.__setattr__(self, "causal_blocks", MappingProxyType(blocks))
-        if min(self.window_tokens, self.max_staged_tokens) <= 0 or self.max_pin_tokens < 0:
-            raise ValueError(
-                "window_tokens and max_staged_tokens must be positive and max_pin_tokens "
-                "non-negative"
-            )
-        if not blocks or any(
-            size <= 0 or n <= 0 or size * n > self.max_staged_tokens for size, n in blocks.items()
-        ):
-            raise ValueError(
-                f"causal_blocks {blocks} must map positive sizes to positive counts whose "
-                f"tokens fit max_staged_tokens {self.max_staged_tokens}"
-            )
-
-    def __hash__(self) -> int:
-        return hash(
-            (
-                self.window_tokens,
-                self.max_staged_tokens,
-                tuple(self.causal_blocks.items()),
-                self.max_pin_tokens,
-            )
-        )
-
-    @property
-    def causal_block_sizes(self) -> Tuple[int, ...]:
-        """The declared causal block sizes, ascending."""
-        return tuple(self.causal_blocks)
-
-
-@dataclass(frozen=True)
-class ForwardPlan:
-    """One forward over the cache, the way attention takes it (``kv=``): the real new
-    tokens and how they are cut into causal blocks. Built by
-    ``BlockCausalKVCacheManager.plan`` for the open rollout.
-
-    ``num_tokens`` counts the real tokens of the forward across all ranks, before
-    sequence-parallel padding; rows past it are padding, neither cached nor attended.
-    ``graph_key`` holds every host value a forward captured in a CUDA graph bakes in,
-    so a graph runner keys on it; commits only rewrite device tensors and are not part
-    of it.
-    """
-
-    cache: "BlockCausalKVCacheManager"
-    spec: RolloutSpec
-    num_tokens: int
-    causal_block_size: int
-    num_causal_blocks: int
-
-    @property
-    def graph_key(self) -> Tuple:
-        return (id(self.cache), self.spec, self.num_tokens, self.causal_block_size)
-
-    def validate(self) -> None:
-        """Raise unless the plan's cache is open with the spec the plan was made for."""
-        if not self.cache.is_open or self.cache.spec != self.spec:
-            raise RuntimeError(
-                "this ForwardPlan was made for a rollout that is no longer open; make a new "
-                "one with cache.plan()"
-            )
 
 
 @dataclass
@@ -269,7 +179,7 @@ class _SpecState:
     staged_slots: torch.Tensor
 
 
-class BlockCausalKVCacheManager(KVCacheManagerV2):
+class BlockCausalKVCacheManager(KVCacheManagerV2, RolloutKVCacheInterface):
     """``KVCacheManagerV2`` driven as one long-lived sequence with a caller-owned page
     table.
 
@@ -479,7 +389,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         # caller's; the entries hold the cache, so shutdown() clears them.
         self.attention_metadata: Dict[Tuple, object] = {}
         # The open spec and its fields; set by open().
-        self.spec: Optional[RolloutSpec] = None
+        self._spec: Optional[RolloutSpec] = None
         self.window_tokens = 0
         self.max_staged_tokens = 0
         self.causal_block_sizes: Tuple[int, ...] = ()
@@ -624,7 +534,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         """The spec-dependent half of ``open``: bind the pages, allocate or reuse the
         spec's device state and write the kernel-facing tensors."""
         tpb = self.tokens_per_page
-        self.spec = spec
+        self._spec = spec
         self.window_tokens = spec.window_tokens
         self.max_staged_tokens = spec.max_staged_tokens
         self.causal_block_sizes = spec.causal_block_sizes
@@ -1338,6 +1248,11 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     ) -> torch.Tensor:
         rows = self.get_batch_cache_indices(request_ids, layer_idx, num_blocks)
         return torch.tensor([p for row in rows for p in row], dtype=torch.int32)
+
+    @property
+    def spec(self) -> Optional[RolloutSpec]:
+        """The open rollout's spec; ``None`` before the first ``open``."""
+        return self._spec
 
     @property
     def is_open(self) -> bool:
