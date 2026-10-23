@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 grpc = pytest.importorskip("grpc", reason="gRPC runtime not installed")
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.coordinator as coordination  # noqa: E402
