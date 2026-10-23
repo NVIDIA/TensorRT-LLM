@@ -7052,7 +7052,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             true,
             false,
             UBUNTU_22_04_IMAGE,
-            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            true, // Install PyTorch to match the TRT-LLM wheel's libtorch ABI.
             'manylinux_2_28_x86_64',
         ],
         "PY312-UB2404": [
@@ -7062,7 +7062,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             true,
             false,
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
+            true, // Install PyTorch to match the TRT-LLM wheel's libtorch ABI.
             'manylinux_2_28_x86_64',
         ],
     ]
@@ -7075,7 +7075,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             false,
             false,
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
+            true, // Install PyTorch to match the TRT-LLM wheel's libtorch ABI.
             'manylinux_2_39_aarch64',
         ],
         "PY312-DLFW": [
@@ -7193,14 +7193,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // Match the CUDA the DLFW base image builds the wheel with.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
                         }
-                        // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Preinstall the exact public PyTorch build used to link the TRT-LLM wheel in
+                        // stock Ubuntu sanity environments.
                         if (values[6]) {
                             echo "###### Extra CUDA 13 PyTorch install Start ######"
                             // Must match what requirements.txt resolves to from the public index: the
                             // wheel under test is linked against that libtorch, and a mismatch fails
                             // the import with an undefined c10 symbol instead of a version error.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://download.pytorch.org/whl/cu132")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
