@@ -14,7 +14,9 @@ Call-compatible with the vendored Triton ``chunk_gated_delta_rule``
 (``modules/fla/chunk``).
 
 FlashInfer API: ``flashinfer.chunk_gated_delta_rule`` (``flashinfer.gdn_prefill``),
-reached through the adapter above.
+reached through the adapter above. With ``has_initial_state`` the call is the same
+sequence in this module, its gather a Triton kernel that writes zeros for a sequence
+carrying nothing instead of reading its slot, so the caller need not zero the slot first.
 """
 
 from __future__ import annotations
@@ -22,11 +24,14 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (
     chunk_gated_delta_rule as _fi_chunk_gated_delta_rule,
 )
+from tensorrt_llm._torch.modules.fla.fused_state_io import cast_scatter_fp32_vk_to_vk
 
 #: qwen3.8-flash-next-nvfp4's Gated DeltaNet at tp1: (H, HV, K, V) -- 16 q/k
 #: heads, 48 v heads, head dims 128.
@@ -41,6 +46,93 @@ def _engine_slots(num_seqs: int) -> tuple[int, ...]:
     return ((0, ENGINE_SLOTS - 1) + tuple(i * 13 + 4 for i in range(num_seqs)))[:num_seqs]
 
 
+#: Elements of a `[V, K]` state plane a gather program copies.
+_GATHER_BLOCK = 4096
+
+
+@triton.jit
+def _gather_carried_states_kernel(
+    pool_ptr,
+    dst_ptr,
+    slot_ptr,
+    init_ptr,
+    stride_ps,
+    stride_ph,
+    stride_pv,
+    stride_pk,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    PLANE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program: `BLOCK` elements of sequence `n`'s head `h` plane, into the packed
+    `[N, H, V, K]` buffer: the pool row `slot_ptr[n]` when `init_ptr[n]`, else +0.0 (the
+    pool row is not read)."""
+    n = tl.program_id(0)
+    h = tl.program_id(1)
+    i = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < PLANE
+    dst = dst_ptr + (n.to(tl.int64) * H + h) * PLANE + i
+    if tl.load(init_ptr + n) != 0:
+        slot = tl.load(slot_ptr + n).to(tl.int64)
+        src = (
+            pool_ptr + slot * stride_ps + h * stride_ph + (i // K) * stride_pv + (i % K) * stride_pk
+        )
+        tl.store(dst, tl.load(src, mask=mask), mask=mask)
+    else:
+        tl.store(dst, tl.zeros([BLOCK], dtype=dst_ptr.dtype.element_ty), mask=mask)
+
+
+def _gather_carried_states(
+    pool: torch.Tensor, indices: torch.Tensor, has_initial_state: torch.Tensor
+) -> torch.Tensor:
+    """`[N, H, V, K]` in the pool's dtype: `pool[indices[n]]` for a carried sequence, zeros
+    for a fresh one."""
+    num_seqs = indices.shape[0]
+    _, h, v, k = pool.shape
+    out = torch.empty(num_seqs, h, v, k, dtype=pool.dtype, device=pool.device)
+    _gather_carried_states_kernel[(num_seqs, h, triton.cdiv(v * k, _GATHER_BLOCK))](
+        pool, out, indices, has_initial_state, *pool.stride(),
+        H=h, K=k, PLANE=v * k, BLOCK=_GATHER_BLOCK, num_warps=4,
+    )  # fmt: skip
+    return out
+
+
+def _chunk_carried(
+    q, k, v, g, beta, scale, pool, indices, has_initial_state, cu_seqlens, output, linear_gate
+) -> torch.Tensor:
+    """The in-place indexed call of the adapter, its gather `_gather_carried_states`: the
+    packed states in the pool's dtype (the sm_100/103 kernel keeps fp32 inside), FlashInfer's
+    kernel (`g` exponentiated first unless `linear_gate`), and the fused scatter of the final
+    states into the same slots."""
+    import flashinfer
+
+    q3, k3, v3 = q.squeeze(0).contiguous(), k.squeeze(0).contiguous(), v.squeeze(0).contiguous()
+    packed = _gather_carried_states(pool, indices, has_initial_state)
+    out = (
+        output.squeeze(0)
+        if output is not None
+        else q3.new_empty(q3.shape[0], v3.shape[1], v3.shape[2])
+    )
+    final = torch.empty_like(packed)
+    flashinfer.chunk_gated_delta_rule(
+        q=q3,
+        k=k3,
+        v=v3,
+        g=g.squeeze(0) if linear_gate else torch.exp(g.squeeze(0)),
+        beta=beta.squeeze(0).to(torch.float32),
+        scale=scale,
+        initial_state=packed,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        output=out,
+        output_state=final,
+    )
+    cast_scatter_fp32_vk_to_vk(final, pool, indices)
+    return out.unsqueeze(0)
+
+
 class FlashinferChunkGatedDeltaRule(OpWrapper):
     """Run the gated delta rule over whole sequences, returning `(o, final_state)`.
 
@@ -53,20 +145,25 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
 
     computed 64 tokens at a time on tensor cores (WY form, bf16 operands) --
     the same recurrence as the Triton op, a different sum. `g` is in log space
-    (the adapter exponentiates it); `scale=None` is `K ** -0.5`;
+    (the adapter exponentiates it), or with `linear_gate` (the
+    `has_initial_state` call only) the factor `exp(g)` itself, as
+    `gdn_prefill_conv_post(linear_gate=True)` returns it; `scale=None` is `K ** -0.5`;
     `use_qk_l2norm_in_kernel` normalizes q/k first (a Triton `l2norm_fwd`).
 
     One packed row (`q.shape[0] == 1`) split at `cu_seqlens` (required).
     `initial_state` is required: a pool `[S, HV, V, K]`; sequence `n` starts
-    from `initial_state[initial_state_indices[n]]`. With
+    from `initial_state[initial_state_indices[n]]`, or, when `has_initial_state`
+    (bool `[N]`) is given and `has_initial_state[n]` is false, from zeros, its
+    slot not read (the in-place indexed call only). With
     `inplace_indexed_state_update=True` its final state is written back into
     that slot and `final_state` is `None`; otherwise `output_final_state`
     returns a fresh `[N, HV, V, K]` in the pool's dtype and the pool is not
     written.
 
     Fusion boundary: gate exponentiation, optional q/k norm, scale, slot
-    gather, recurrence, output, slot scatter. The conv, q/k/v/g/beta
-    preparation, slot allocation and the gated norm on `o` are the caller's.
+    gather (zeros for a fresh sequence with `has_initial_state`), recurrence,
+    output, slot scatter. The conv, q/k/v/g/beta preparation, slot allocation
+    and the gated norm on `o` are the caller's.
 
     Returns `(o, final_state)`: `o` `[1, T, HV, V]` in `q.dtype` (`output`
     itself when given).
@@ -109,6 +206,19 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                 pool_dtype=torch.bfloat16,
             ),
         ),
+        Cell(
+            why="target call: bf16 pool, has_initial_state [1, 0, 1], seqlens [300, 1024, 500]",
+            spec=dict(
+                geometry=QWEN38_GEOMETRY,
+                seqlens=(300, 1024, 500),
+                slots=ENGINE_SLOTS,
+                indices=_engine_slots(3),
+                pool_dtype=torch.bfloat16,
+                output="buffer",
+                initial=(True, False, True),
+                linear_gate=True,
+            ),
+        ),
     )
 
     note = """
@@ -126,13 +236,27 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     (`gdn_decode.gated_delta_rule_decode_pretranspose`) instead (both halves
     plus the concatenation).
 
+    The target (`PrefillTarget._gdn_core`, `_gdn_core_verify`) passes the
+    context rows by keyword after `gdn_prefill_conv_post(linear_gate=True)`,
+    with `has_initial_state` and `linear_gate=True`.
+
+    Call site with `has_initial_state` (`hi_p` / `hi_all`, the flags
+    `reset_recurrent_state_rows` would zero the fresh slots by): a fresh
+    sequence's slot is never read, and the scatter writes every named slot,
+    so the reset of the recurrent pool before this call is not needed (the
+    conv pass reads no carry for such a sequence and its publish writes the
+    whole conv window). Bitwise the reset followed by the plain call; the
+    gather moves only the carried sequences' rows.
+
     Certified at the 461-slot fp32 pool: three ragged context rows and one
     8192-token row, each into an `output=` buffer, and an 8-token context
     chunk with three one-token rows; and at the 461-slot bf16 pool: three
-    ragged context rows.
+    ragged context rows, and the target's call (300 + 1024 + 500 tokens,
+    the middle one fresh, `has_initial_state`, `linear_gate`, `output=`).
 
     Memory per call: a packed copy of the named slots in and out in the pool's
-    dtype (2 x 3 MiB per sequence fp32, half that bf16), `exp(g)`, and the
+    dtype (2 x 3 MiB per sequence fp32, half that bf16), `exp(g)` (not with
+    `linear_gate`), and the
     output. q/k/v/beta are not copied
     when already contiguous / fp32.
 
@@ -181,7 +305,28 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
         use_qk_l2norm_in_kernel: bool = False,
         output: Optional[torch.Tensor] = None,
         state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        linear_gate: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert not linear_gate or has_initial_state is not None, (
+            "linear_gate is taken with has_initial_state only"
+        )
+        if has_initial_state is not None:
+            assert (
+                inplace_indexed_state_update
+                and initial_state_indices is not None
+                and not output_final_state
+                and not head_first
+                and not use_qk_l2norm_in_kernel
+                and state_workspace is None
+                and cu_seqlens is not None
+                and g.dtype == torch.float32
+            ), "has_initial_state: the in-place indexed call only, q/k normalized by the caller"
+            o = _chunk_carried(
+                q, k, v, g, beta, scale, initial_state, initial_state_indices,
+                has_initial_state, cu_seqlens, output, linear_gate,
+            )  # fmt: skip
+            return o, None
         return _fi_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -217,6 +362,8 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
         use_qk_l2norm_in_kernel: bool = False,
         output: Optional[torch.Tensor] = None,
         state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        linear_gate: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """`(o, final_state, initial_state as the call leaves it)`.
 
@@ -232,10 +379,13 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
         scale = head_k**-0.5 if scale is None else scale
         bounds = cu_seqlens.tolist()
         slots = initial_state_indices.tolist()
+        carried = [True] * len(slots) if has_initial_state is None else has_initial_state.tolist()
         out = torch.zeros(1, q.shape[1], num_v_heads, v.shape[3], dtype=dt, device=q.device)
         finals = []
         for n in range(len(bounds) - 1):
             state = initial_state[slots[n]].to(dt)
+            if not carried[n]:
+                state = torch.zeros_like(state)
             for t in range(bounds[n], bounds[n + 1]):
                 q_t, k_t = q[0, t].to(dt), k[0, t].to(dt)
                 if use_qk_l2norm_in_kernel:
@@ -243,7 +393,8 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                     k_t = k_t / torch.sqrt(k_t.pow(2).sum(-1, keepdim=True) + 1e-6)
                 q_t = q_t.repeat_interleave(repeats, dim=0) * scale
                 k_t = k_t.repeat_interleave(repeats, dim=0)
-                state = state * g[0, t].to(dt).exp()[:, None, None]
+                decay = g[0, t].to(dt) if linear_gate else g[0, t].to(dt).exp()
+                state = state * decay[:, None, None]
                 u = (v[0, t].to(dt) - (state * k_t[:, None, :]).sum(-1)) * beta[0, t].to(dt)[
                     :, None
                 ]

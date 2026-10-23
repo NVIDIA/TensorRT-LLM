@@ -71,7 +71,14 @@ def _build(spec, seed):
         output = torch.full(
             (1, total, num_v_heads, head_v_dim), -7.0, device=DEV, dtype=torch.bfloat16
         )
+    extra = {}
+    if "initial" in spec:
+        extra["has_initial_state"] = torch.tensor(spec["initial"], dtype=torch.bool, device=DEV)
+    if spec.get("linear_gate"):
+        extra["linear_gate"] = True
+        g = torch.exp(g)
     return dict(
+        **extra,
         q=q,
         k=k,
         v=v,
@@ -106,3 +113,31 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     named = set(args["initial_state_indices"].tolist())
     unnamed = [s for s in range(pool.shape[0]) if s not in named]
     assert torch.equal(pool[unnamed], pool_before[unnamed]), "unnamed slots written"
+
+
+_CARRIED = next(c for c in op.CELLS if "initial" in c.spec)
+
+
+def test_has_initial_state_is_the_reset_then_the_plain_call() -> None:
+    """The flags replace `reset_recurrent_state_rows` before the call: zeroing the fresh
+    slots and running the plain in-place call gives the same output and pool, bitwise; a
+    linear gate that is `torch.exp` of the plain call's log gate changes nothing."""
+    args = _build(_CARRIED.spec, seed=5)
+    flags = args.pop("has_initial_state")
+    linear_gate = args.pop("linear_gate", False)
+    pool = args["initial_state"]
+    fresh = args["initial_state_indices"][~flags].long()
+    pool[fresh] = torch.randn_like(pool[fresh])  # stale rows the flags must not read
+    plain = dict(args, initial_state=pool.clone(), output=args["output"].clone())
+    plain["initial_state"][fresh] = 0.0
+    if linear_gate:
+        plain["g"] = torch.log(args["g"])
+        # The linear gate of the target call is torch.exp of the log gate, bitwise.
+        args["g"] = torch.exp(plain["g"])
+
+    o_plain, _ = op(**plain)
+    o, final_state = op(**args, has_initial_state=flags, linear_gate=linear_gate)
+
+    assert final_state is None
+    assert torch.equal(o, o_plain)
+    assert torch.equal(pool, plain["initial_state"])

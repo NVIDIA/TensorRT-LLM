@@ -25,6 +25,11 @@ _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activatio
 #: programs.
 _PREFILL_MIN_ROWS = 32768  # capacity: fixed: a dispatch threshold, not a buffer size
 _PREFILL_ROWS = 8
+#: The amax copy's program: 64 rows on 8 warps. At 16384 tokens on GB300 108 vs 122 us
+#: at 8 rows on 4 warps (bitwise-identical output and maximum; 16 rows on 4 warps 118,
+#: 64 rows on 4 or 16 warps 145 / 126, 128 rows on 8 or 16 warps 371 / 180).
+_AMAX_ROWS = 64
+_AMAX_WARPS = 8
 
 
 def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) -> bool:
@@ -90,14 +95,15 @@ def _rms_norm_gated_amax_kernel(
 
 def _prefill_launch(x, z, weight, eps, gate_activation, amax_parts=None):
     """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every
-    SM); with `amax_parts` the target's copy that also folds the output's maximum."""
+    SM); with `amax_parts` the target's copy that also folds the output's maximum, at
+    `_AMAX_ROWS` rows a program."""
     rows, n = x.shape
     out = torch.empty_like(x)
     if amax_parts is not None:
-        _rms_norm_gated_amax_kernel[(triton.cdiv(rows, _PREFILL_ROWS),)](
+        _rms_norm_gated_amax_kernel[(triton.cdiv(rows, _AMAX_ROWS),)](
             x, out, weight, z, amax_parts, x.stride(0), out.stride(0), z.stride(0), rows, eps,
-            amax_parts.shape[0], N=n, ROWS=_PREFILL_ROWS, HEADS_PER_TOK=z.shape[1],
-            GATE_SIGMOID=gate_activation == "sigmoid", num_warps=4,
+            amax_parts.shape[0], N=n, ROWS=_AMAX_ROWS, HEADS_PER_TOK=z.shape[1],
+            GATE_SIGMOID=gate_activation == "sigmoid", num_warps=_AMAX_WARPS,
         )  # fmt: skip
         return out
     _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(rows, _PREFILL_ROWS),)](
@@ -156,7 +162,8 @@ class RmsNormGatedTokenMajor(OpWrapper):
 
     note = """
     Metadata consumed: none. Two Triton kernels: a multi-row kernel (4 rows per
-    program; 8 from 32768 rows, without fp8 output) when `x.stride(-1) == 1`,
+    program; 8 from 32768 rows, without fp8 output; its amax copy 64 rows on 8
+    warps) when `x.stride(-1) == 1`,
     `z.stride(2) == 1`, `z.stride(1) == N` and N is a power of two <= 256 --
     the checkpoint's N = 128 -- else the generic single-row kernel on a packed
     copy of `z`. PDL on the 4-row path only when the grid is smaller than the

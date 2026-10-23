@@ -253,7 +253,6 @@ from .ops.ssm.gdn_in_proj_conv1d_pdl import MAX_ROWS as _GDN_CONV_FUSED_MAX_ROWS
 from .ops.ssm.gdn_in_proj_conv1d_pdl import gdn_in_proj_conv1d_pdl
 from .ops.ssm.gdn_prefill_conv_post import gdn_prefill_conv_post
 from .ops.ssm.pack_gdn_decode_qkv import pack_gdn_decode_qkv
-from .ops.ssm.reset_recurrent_state_rows import reset_recurrent_state_rows
 from .ops.vision.patch_embed_conv3d import patch_embed_conv3d
 from .ops.vision.pos_embed_interpolate import pos_embed_interpolate
 
@@ -3864,7 +3863,10 @@ class PrefillTarget:
         Outside a verify step, over either pool dtype, the context rows take one fused
         conv + post-conv pass (`_gdn_prefill_prep`) and FlashInfer's chunked recurrence, and
         a mixed step's one-token generation rows the decode step's recurrence
-        (`gdn_decode_rows`); a verify step takes `_gdn_core_verify`."""
+        (`gdn_decode_rows`); a verify step takes `_gdn_core_verify`. A context sequence
+        carrying nothing starts from zeros without its pool slots being cleared: the conv
+        pass reads no carried window for it and publishes the whole window, and the
+        recurrence (`has_initial_state`) gathers zeros for it and scatters its final state."""
         core = self.core
         L = self._layers[i]
         step = self._step
@@ -3894,9 +3896,6 @@ class PrefillTarget:
         mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
         conv_states = core._bound.conv[i]
 
-        # A context sequence carrying nothing starts from a zeroed slot; only the
-        # context prefix is a candidate (a generation row's state must survive).
-        reset_recurrent_state_rows(ssm_states, si_p, hi_p, conv_states)
         if num_decode_tokens > 0:
             mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
             a_p, b_p = a[:num_prefill_tokens], b[:num_prefill_tokens]
@@ -3930,12 +3929,14 @@ class PrefillTarget:
                 use_qk_l2norm_in_kernel=False,
                 output=out_p,
                 state_workspace=None,
+                has_initial_state=hi_p,
+                linear_gate=True,
             )
             # The generation rows: the decode step's recurrence (its kernel without the
             # gated norm, which runs with the context rows' below) over their rows of the
             # projection, whose q/k/v columns the conv step rewrote; it computes both gates
             # and the q/k norm itself and reads the rows' pool slots before its PDL wait
-            # (the context rows' reset and recurrence touch only theirs).
+            # (the context rows' recurrence touches only theirs).
             gdn_decode_rows(
                 proj[num_prefill_tokens:num_tokens],
                 ssm_states,
@@ -3967,6 +3968,8 @@ class PrefillTarget:
                 use_qk_l2norm_in_kernel=False,
                 output=out[:, :num_tokens],
                 state_workspace=None,
+                has_initial_state=hi_all,
+                linear_gate=True,
             )
         out[:, num_tokens:].zero_()
 
@@ -4004,12 +4007,10 @@ class PrefillTarget:
         mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
         a, b = a.contiguous(), b.contiguous()
 
-        conv_states = core._bound.conv[i]
         ssm_states = core._bound.ssm[i]
 
-        # A context sequence carrying nothing starts from a zeroed slot; only the
-        # context prefix is a candidate (a generation row's state must survive).
-        reset_recurrent_state_rows(ssm_states, si_p, hi_p, conv_states)
+        # A context sequence carrying nothing starts from zeros (`has_initial_state`
+        # below; its slots are not cleared first, see `_gdn_core`).
         mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
         a_p, a_d = torch.split(a, [num_prefill_tokens, num_decode_tokens], 0)
         b_p, b_d = torch.split(b, [num_prefill_tokens, num_decode_tokens], 0)
@@ -4032,6 +4033,8 @@ class PrefillTarget:
             use_qk_l2norm_in_kernel=False,
             output=out[:, :num_prefill_tokens],
             state_workspace=None,
+            has_initial_state=hi_p,
+            linear_gate=True,
         )
         out_d = self._gdn_verify(
             mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
@@ -4042,8 +4045,9 @@ class PrefillTarget:
     def _gdn_prefill_prep(self, mq, a, b, L, i, qsl, si, hi):
         """The context rows' recurrence inputs: the causal conv against each sequence's
         carried window (published back to the pool), SiLU, the q|k|v split with q/k
-        L2-normalized, and the decay/beta gates -- one pass over `mq`, the token-major
-        q|k|v column view of the projection."""
+        L2-normalized, and the decay/beta gates (the decay as the factor `exp(g)`, which
+        the chunked recurrence takes with `linear_gate=True`) -- one pass over `mq`, the
+        token-major q|k|v column view of the projection."""
         core = self.core
         return gdn_prefill_conv_post(
             x=mq,
@@ -4063,6 +4067,7 @@ class PrefillTarget:
             pad_slot_id=_PAD_SLOT_ID,
             l2_norm_eps=_L2_NORM_EPS,
             softplus_threshold=_SOFTPLUS_THRESHOLD,
+            linear_gate=True,
         )
 
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:

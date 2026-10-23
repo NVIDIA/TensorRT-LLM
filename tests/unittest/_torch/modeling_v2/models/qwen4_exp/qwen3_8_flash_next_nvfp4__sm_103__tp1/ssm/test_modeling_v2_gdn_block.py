@@ -45,6 +45,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_sigmoid_gating_delta_rule_update import (  # noqa: E501
     fused_sigmoid_gating_delta_rule_update as triton_decode,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
+    reset_recurrent_state_rows,
+)
 
 assert torch.cuda.is_available(), "the Gated-DeltaNet block requires a CUDA device"
 
@@ -258,7 +261,7 @@ def _triton_prefill_block(core, x, L, st):
     T = x.shape[0]
     conv, ssm = core._bound.conv[0], core._bound.ssm[0]
     mixed, z, a, b = torch.split(M.cublas_mm(x, L.in_proj), [CONV, VD, HV, HV], 1)
-    M.reset_recurrent_state_rows(ssm, si_p, hi_p, conv)
+    reset_recurrent_state_rows(ssm, si_p, hi_p, conv)
     conv_args = dict(
         weight=L.conv_w,
         bias=None,
