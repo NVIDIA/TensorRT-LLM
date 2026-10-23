@@ -15,9 +15,9 @@
 """The MiniMax-M3 MSA fmha_sm100 JIT-prefetch planner and its CPU-only builder.
 
 The planner must name the variant every real ``fmha_sm100`` call selects, for
-any context rows, at each MSA call site: the indexer's proxy max-score pass,
-the dense layers' attention, and the block-sparse attention of a BF16/FP8
-cache. The helper, with no visible GPU, must build a kernel where the real
+any context rows, at each MSA call site: the indexer's proxy max-score pass
+(also its segmented, KV-split plan), the dense layers' attention, and the
+block-sparse attention of a BF16/FP8 cache. The helper, with no visible GPU, must build a kernel where the real
 call loads it, so the real call compiles nothing.
 """
 
@@ -137,12 +137,7 @@ ROWS = [[1], [2], [5], [9], [16], [17], [31], [32], [33], [64], [65], [128], [12
 
 def _planned(dtype, heads, kv_heads, mode):
     name = "bfloat16" if dtype == torch.bfloat16 else "float8_e4m3fn"
-    out = set()
-    for qo_len in jpf._row_order():
-        key = jpf.row_variant(name, heads, kv_heads, mode, PAGE, qo_len)
-        if key is not None:
-            out.add(key)
-    return out
+    return set(jpf.planned_variant_keys([(name, heads, kv_heads, mode)], PAGE))
 
 
 @pytest.mark.parametrize("site", SITES, ids=lambda s: f"{str(s[0])[6:]}-{s[1]}x{s[2]}-mode{s[3]}")
@@ -155,6 +150,73 @@ def test_planned_variants_cover_real_calls(site, qo_lens):
         assert real, "no variant selected"
     missing = set(real) - _planned(dtype, heads, kv_heads, mode)
     assert not missing, f"rows={qo_lens}: unplanned {sorted(missing)}"
+
+
+def _selected_split_proxy_variants(fmha, dtype, heads, rows, num_kv_splits):
+    """The ``get_fmha_variant`` keys the indexer's segmented proxy plan of
+    these (queries, cached prefix) rows selects; nothing is built or
+    launched."""
+    import fmha_sm100.api as api
+
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_indexer
+
+    seen = []
+
+    def record(*key):
+        seen.append(tuple(key))
+        return _NoLaunch()
+
+    qo_lens = [n for n, _ in rows]
+    num_pages = sum((n + p + PAGE - 1) // PAGE for n, p in rows)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+    plan, plan_kv_indices = msa_indexer._segmented_proxy_plan(
+        fmha,
+        qo_lens,
+        [p for _, p in rows],
+        num_index_heads=heads,
+        page_size=PAGE,
+        num_kv_splits=num_kv_splits,
+        kv_indices=kv_indices,
+    )
+    q = torch.zeros(sum(qo_lens), heads, 128, dtype=dtype, device="cuda")
+    k = torch.zeros(num_pages, 1, PAGE, 128, dtype=dtype, device="cuda")
+    orig_variant = api.get_fmha_variant
+    api.get_fmha_variant = record
+    try:
+        fmha.fmha_sm100(
+            q,
+            k,
+            k,
+            plan,
+            kv_indices=plan_kv_indices,
+            output_o=False,
+            output_maxscore=True,
+            sm_scale=0.1,
+        )
+    finally:
+        api.get_fmha_variant = orig_variant
+    return seen
+
+
+# Rows (queries, cached prefix) the indexer plans segmented: warmup's prewarm
+# (one 128-query segment), and serving rows past 64 queries over a long prefix.
+SPLIT_ROWS = [((128, 0),), ((65, 8192),), ((1025, 131072),), ((1500, 60000), (50, 20000), (300, 0))]
+
+
+@pytest.mark.parametrize(
+    "site",
+    [s for s in SITES if s[3] == jpf._ONLY_SCORE],
+    ids=lambda s: f"{str(s[0])[6:]}-{s[1]}x{s[2]}",
+)
+@pytest.mark.parametrize("rows", SPLIT_ROWS, ids=lambda r: "rows" + "_".join(str(n) for n, _ in r))
+@pytest.mark.parametrize("num_kv_splits", [1, 2, 16])
+def test_planned_variants_cover_split_proxy_plans(site, rows, num_kv_splits):
+    fmha = _fmha()
+    dtype, heads, kv_heads, mode = site
+    real = _selected_split_proxy_variants(fmha, dtype, heads, rows, num_kv_splits)
+    assert real, "no variant selected"
+    missing = set(real) - _planned(dtype, heads, kv_heads, mode)
+    assert not missing, f"rows={rows} splits={num_kv_splits}: unplanned {sorted(missing)}"
 
 
 def _probe(env):

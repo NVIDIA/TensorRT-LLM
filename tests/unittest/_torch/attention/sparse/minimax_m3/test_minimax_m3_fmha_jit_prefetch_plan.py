@@ -73,6 +73,13 @@ def test_row_variant_matches_fmha_sm100_names(qo_len, heads, kv_heads, mode, exp
     assert _name(jpf.row_variant("float8_e4m3fn", heads, kv_heads, mode, 128, qo_len)) == expected
 
 
+def test_split_proxy_variant_matches_fmha_sm100_names():
+    """The KV-split form of the 128-row score-only kernel, which the indexer's
+    segmented proxy plan runs whatever its split count."""
+    assert _name(jpf.split_proxy_variant("float8_e4m3fn", 128)) == "1_0_1_2_1_1_0"
+    assert _name(jpf.split_proxy_variant("bfloat16", 128)) == "0_0_1_2_1_1_0"
+
+
 def test_block_sparse_long_rows_run_no_variant():
     """Block-sparse rows past 32 tokens are planned for the CuTe DSL sparse
     prefill, which builds no fmha_sm100 variant."""
@@ -118,8 +125,8 @@ def _provider(monkeypatch, sites, nvfp4):
 
 def test_provider_lists_the_standard_ctx_server_kernels(monkeypatch):
     """TP2 MiniMax-M3, NVFP4 KV (FP8 dense layers), FP8 indexer: the planner,
-    the k2q CSR builder, and the 11 variants a cold server builds (the 8 of
-    its warmup and the 3 of its first serving steps)."""
+    the k2q CSR builder, and the 12 variants a cold server can build: the two
+    of the indexer's segmented proxy plan and one per row class at each site."""
     provider = _provider(monkeypatch, [(32, 2, 2, False)] * 3 + [(32, 2, 2, True)] * 57, True)
     ops = [json.loads(s) for s in provider.specs]
     assert ops[0] == {"op": "plan"} and ops[1] == {"op": "k2q_csr"}
@@ -128,11 +135,13 @@ def test_provider_lists_the_standard_ctx_server_kernels(monkeypatch):
     assert set(names) == {
         "1_0_0_3_1_0_5", "1_0_0_2_1_0_1", "1_1_1_3_1_0_0", "1_1_1_2_1_0_0",
         "1_0_0_3_1_0_0", "1_0_0_2_1_0_0", "1_0_1_3_1_0_2", "1_0_1_3_1_0_4",
-        "1_0_1_3_1_0_0", "1_0_1_2_1_0_0", "1_0_1_3_1_0_5",
+        "1_0_1_3_1_0_0", "1_0_1_2_1_0_0", "1_0_1_3_1_0_5", "1_0_1_2_1_1_0",
     }  # fmt: skip
-    # The single-row and longest-row variants of every site come first, as
-    # warmup needs them first (dense layers lead: the model's first layers).
-    assert set(names[:4]) == {"1_0_0_2_1_0_1", "1_0_0_3_1_0_5", "1_1_1_2_1_0_0", "1_1_1_3_1_0_0"}
+    # In the order warmup needs them: the segmented proxy plan's two variants
+    # (unsplit, KV-split), which it loads before its first forward, then the
+    # single-row and longest-row variants of every site.
+    assert names[:2] == ["1_0_1_2_1_0_0", "1_0_1_2_1_1_0"]
+    assert set(names[2:6]) == {"1_0_0_2_1_0_1", "1_0_0_3_1_0_5", "1_1_1_2_1_0_0", "1_1_1_3_1_0_0"}
 
 
 def test_provider_fp8_cache_plans_block_sparse_short_rows(monkeypatch):

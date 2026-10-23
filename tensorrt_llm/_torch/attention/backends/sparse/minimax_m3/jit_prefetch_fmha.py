@@ -24,7 +24,8 @@ directory of a cache keyed by the package sources (``fmha_sm100.jit
 * one FMHA variant per (q dtype, q tile, single warp group, sparse mode, page
   size, split-KV, pack factor). The indexer's proxy max-score pass ("score
   only") and the dense layers' paged attention ("off") pick theirs from the
-  batch's longest context row. A variant is two nvcc compiles, 80-100 s;
+  batch's longest context row; the proxy pass also has a KV-split form for
+  rows with a long cached prefix. A variant is two nvcc compiles, 80-100 s;
 * the NVFP4 sparse prefill's k2q CSR builder, a ``torch.utils.cpp_extension``
   module (about 50 s).
 
@@ -68,6 +69,8 @@ _LONGEST_DISTINCT_ROW = 129
 # Block-sparse rows longer than this are planned for the CuTe DSL sparse
 # prefill instead (fmha_sm100.api._prefill_qlen_threshold).
 _SPARSE_PREFILL_ROWS = 32
+# Queries per segment of a KV-split proxy plan (msa_indexer._PROXY_SEGMENT_LEN).
+_PROXY_SEGMENT_ROWS = 128
 
 
 def variant_spec(dtype_code, qo_tile_size, single_wg, sparse_mode, page_size, split_kv, pack):
@@ -111,10 +114,11 @@ def row_variant(
     ``qo_len`` tokens, or None where that call runs no FMHA variant.
 
     Mirrors ``fmha_sm100.api._fmha_sm100_plan`` and ``_fmha_sm100`` with
-    ``num_kv_splits=1``, as every MSA plan passes it (so never split-KV). A
-    block-sparse plan expands each query token into a row of ``pack`` packed
-    heads; past ``_SPARSE_PREFILL_ROWS`` it is planned for the CuTe DSL sparse
-    prefill, which runs no variant.
+    ``num_kv_splits=1``, as the MSA plans pass it except the indexer's
+    segmented proxy plan (:func:`split_proxy_variant`). A block-sparse plan
+    expands each query token into a row of ``pack`` packed heads; past
+    ``_SPARSE_PREFILL_ROWS`` it is planned for the CuTe DSL sparse prefill,
+    which runs no variant.
     """
     pack = pack_factor(qo_len, num_qo_heads, num_kv_heads)
     if sparse_mode == _SPARSE:
@@ -127,10 +131,45 @@ def row_variant(
     return (_DTYPE_CODES[dtype], tile, packed <= 64, sparse_mode, page_size, False, pack)
 
 
+def split_proxy_variant(dtype: str, page_size: int) -> Tuple:
+    """The ``get_fmha_variant`` key of the indexer's KV-split proxy plan
+    (``msa_indexer.segmented_proxy_plan``), whatever its split count.
+
+    It cuts rows into segments of at most 128 queries and is used only when a
+    row is longer than 64, so its longest segment selects the 128-query tile
+    with both warp groups, and no heads are packed past 32 queries. With more
+    than one KV split, ``fmha_sm100`` runs the split-KV form of that variant;
+    with one, the unsplit one, which :func:`row_variant` gives for such a row.
+    """
+    return (_DTYPE_CODES[dtype], 128, False, _ONLY_SCORE, page_size, True, 1)
+
+
 def _row_order() -> List[int]:
     """Context row lengths, one per variant class, in the order warmup first
     needs them: single rows, then long ones, then the rest."""
     return [1, _LONGEST_DISTINCT_ROW] + list(range(2, _LONGEST_DISTINCT_ROW))
+
+
+def planned_variant_keys(sites, page_size: int) -> List[Tuple]:
+    """Every ``get_fmha_variant`` key the MSA call sites ``sites`` ((q dtype,
+    query heads, KV heads, sparse mode) per rank) can select, in build order:
+    first the two variants of the indexer's segmented proxy plan, unsplit and
+    KV-split, which warmup loads before its first forward
+    (``msa_indexer.prewarm_split_proxy_variants``), then one per row class."""
+    keys: List[Tuple] = []
+
+    def add(key):
+        if key is not None and key not in keys:
+            keys.append(key)
+
+    for dtype, heads, kv_heads, mode in sites:
+        if mode == _ONLY_SCORE:
+            add(row_variant(dtype, heads, kv_heads, mode, page_size, _PROXY_SEGMENT_ROWS))
+            add(split_proxy_variant(dtype, page_size))
+    for qo_len in _row_order():
+        for dtype, heads, kv_heads, mode in sites:
+            add(row_variant(dtype, heads, kv_heads, mode, page_size, qo_len))
+    return keys
 
 
 class MiniMaxM3FmhaProvider:
@@ -191,13 +230,7 @@ class MiniMaxM3FmhaProvider:
         self.specs.append(module_spec("plan"))
         if nvfp4 and any(site[3] == _ONLY_SCORE for site in self.sites):
             self.specs.append(module_spec("k2q_csr"))
-        seen = set()
-        for qo_len in _row_order():
-            for dtype, heads, kv_heads, mode in self.sites:
-                key = row_variant(dtype, heads, kv_heads, mode, page_size, qo_len)
-                if key is not None and key not in seen:
-                    seen.add(key)
-                    self.specs.append(variant_spec(*key))
+        self.specs += [variant_spec(*key) for key in planned_variant_keys(self.sites, page_size)]
 
     def __bool__(self):
         return bool(self.specs)
