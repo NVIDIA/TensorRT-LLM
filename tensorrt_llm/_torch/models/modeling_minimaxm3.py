@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -1299,7 +1300,7 @@ class MiniMaxM3Attention(Attention):
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():
             return
-        if FlashInferTrtllmGenFmha.serves_only_extra_page_sizes():
+        if get_sm_version() == 107:
             # SM107 admits the library only for the KV manager's extra page sizes
             # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
             # there, as before SM107 was admitted.

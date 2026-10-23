@@ -31,7 +31,6 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
-                                          MiniMaxM3SparseAttentionConfig,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
@@ -57,7 +56,7 @@ from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, is_mla,
+from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
@@ -169,8 +168,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # MiniMax-M3 MSA keeps NVFP4 only on its sparse layers, which MSA and
     # Triton serve; its dense and draft layers stay FP8 for trtllm-gen.
     sparse_config = model_config.sparse_attention_config
-    uses_minimax_m3_msa = (isinstance(sparse_config,
-                                      MiniMaxM3SparseAttentionConfig)
+    uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
                            and sparse_config.implementation == "msa")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)

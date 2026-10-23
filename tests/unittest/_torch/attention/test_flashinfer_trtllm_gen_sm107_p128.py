@@ -20,7 +20,7 @@ linear Eagle3 verify (q_len 1 + 3) and mixed context + generation batches.
 The masked tail of a request's last page is read by the kernel: NaN bytes there
 turn the rows that attend to that page into NaN (measured on SM107 for both this
 route and the thop kernels). MiniMax-M3 guards against it by zeroing its KV pools
-at allocation (TRTLLM_M3_KV_POOL_ZERO_INIT, test_minimax_m3_kv_pool_zero_init.py);
+at allocation (test_minimax_m3_kv_pool_zero_init.py);
 the "nan" tail cases check that rows of requests without a tail stay exact.
 """
 

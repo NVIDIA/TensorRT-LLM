@@ -28,7 +28,6 @@ Provides:
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
@@ -39,6 +38,7 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
     convert_to_torch_tensor,
+    get_sm_version,
     prefer_pinned,
 )
 from tensorrt_llm.bindings import DataType
@@ -228,18 +228,26 @@ def extend_attention_op_pools_for_shared_draft_layers(
     )
 
 
-# Zero every KV pool view (NVFP4 + FP8 K/V, NVFP4 block scales, paged index keys) once at allocation, so no reader
-# ever sees uninitialized bytes. Kill switch (diagnostics only): TRTLLM_M3_KV_POOL_ZERO_INIT=0.
-_KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
-
-
 def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
-    """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107)."""
+    """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107).
+
+    On SM107 only FlashInfer TRTLLM-Gen has paged-context kernels for the extra
+    page sizes (its cubins ship with it), so the route exists iff it is enabled.
+    """
+    if get_sm_version() != 107:
+        return
+    # Imported here: the FMHA backends import the attention classes this module serves.
     from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
         FlashInferTrtllmGenFmha,
     )
+    from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 
-    FlashInferTrtllmGenFmha.require_extra_page_size_route(tokens_per_block)
+    if FlashInferTrtllmGenFmha not in get_enabled_fmha_lib_classes():
+        raise RuntimeError(
+            f"SM107 with {tokens_per_block}-token KV pages needs the flashinfer_trtllm_gen FMHA "
+            "library, the only one with paged-context kernels for this page size here, but "
+            "TLLM_FMHA_LIBS excludes it. Keep flashinfer_trtllm_gen in TLLM_FMHA_LIBS (or unset it)."
+        )
 
 
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
@@ -414,19 +422,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
                     layer_idx, kv_layout
                 )
-        if _KV_POOL_ZERO_INIT:
-            # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
-            # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
-            # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
-            # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
-            # byte a kernel writes is unchanged.
-            for view in (
-                *self._kv_buffers.values(),
-                *self._block_scale_buffers.values(),
-                *self._index_k_buffers.values(),
-            ):
-                if view is not None:
-                    view.zero_()
+        # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
+        # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
+        # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
+        # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
+        # byte a kernel writes is unchanged.
+        for view in (
+            *self._kv_buffers.values(),
+            *self._block_scale_buffers.values(),
+            *self._index_k_buffers.values(),
+        ):
+            if view is not None:
+                view.zero_()
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4

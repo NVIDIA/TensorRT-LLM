@@ -54,6 +54,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 DRAFT_LOCAL_LAYER = 60
+_CACHE_MANAGER_MODULE = "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager"
 SCALE = 179  # sub-pages per M3 mega-slot: 3 dense x 2 + 57 sparse x 3 + draft x 2
 DRAFT_K_ADDR = 0x7000_0000
 
@@ -418,32 +419,23 @@ def test_draft_kv_cache_view_accessor_respects_local_layers(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "sm,fmha_libs,env_ok,error",
+    "sm,fmha_libs,error",
     [
-        (107, None, True, None),
-        (107, "-flashinfer_trtllm_gen", True, "TLLM_FMHA_LIBS excludes it"),
-        (107, "fallback", True, "TLLM_FMHA_LIBS excludes it"),
-        # Libraries are tried in list order; fallback raises on P128 paged prefill.
-        (107, "fallback,flashinfer_trtllm_gen", True, "lists fallback first"),
-        (107, "flashinfer_trtllm_gen,fallback", True, None),
-        (107, None, False, "install flashinfer-python"),
+        (107, None, None),
+        (107, "-flashinfer_trtllm_gen", "TLLM_FMHA_LIBS excludes it"),
+        (107, "fallback", "TLLM_FMHA_LIBS excludes it"),
+        (107, "flashinfer_trtllm_gen,fallback", None),
         # Elsewhere the fallback has P128 paged-context kernels, so nothing is required.
-        (103, "-flashinfer_trtllm_gen", False, None),
+        (103, "-flashinfer_trtllm_gen", None),
     ],
 )
 @pytest.mark.parametrize("site", ["separate_draft_manager", "nvfp4_draft_view"])
 def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
-    monkeypatch, sm, fmha_libs, env_ok, error, site
+    monkeypatch, sm, fmha_libs, error, site
 ):
     """On SM107 the P128 opt-in is checked when the KV manager is set up, not at the
     first prefill: a missing FlashInfer route raises an error that names the fix."""
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
-        lambda: sm,
-    )
-    monkeypatch.setattr(
-        FlashInferTrtllmGenFmha, "is_environment_available", classmethod(lambda cls: env_ok)
-    )
+    monkeypatch.setattr(f"{_CACHE_MANAGER_MODULE}.get_sm_version", lambda: sm)
     if fmha_libs is None:
         monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     else:
@@ -477,7 +469,7 @@ def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
         assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
     else:
         # The check passed; the view then fails on the stub's missing layer.
-        with pytest.raises(KeyError):
+        with pytest.raises(KeyError, match=str(DRAFT_LOCAL_LAYER)):
             setup()
 
 
@@ -486,13 +478,7 @@ def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
 def test_p128_target_fails_fast_only_with_a_shared_draft_layer(monkeypatch, shared_draft):
     """On SM107 a BF16 target's dense layers keep SDPA, so a missing FlashInfer route only
     fails setup when a shared draft layer needs it."""
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
-        lambda: 107,
-    )
-    monkeypatch.setattr(
-        FlashInferTrtllmGenFmha, "is_environment_available", classmethod(lambda cls: True)
-    )
+    monkeypatch.setattr(f"{_CACHE_MANAGER_MODULE}.get_sm_version", lambda: 107)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "-flashinfer_trtllm_gen")
     monkeypatch.setattr(
         KVCacheManagerV2,

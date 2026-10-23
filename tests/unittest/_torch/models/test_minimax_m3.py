@@ -2896,11 +2896,7 @@ def test_minimax_m3_dense_backend_library_order(
         "is_available",
         classmethod(lambda cls, attn: available),
     )
-    monkeypatch.setattr(
-        model_module.FlashInferTrtllmGenFmha,
-        "serves_only_extra_page_sizes",
-        classmethod(lambda cls: extra_pages_only),
-    )
+    monkeypatch.setattr(model_module, "get_sm_version", lambda: 107 if extra_pages_only else 100)
     layer = SimpleNamespace(
         attn=legacy,
         layer_idx=0,
