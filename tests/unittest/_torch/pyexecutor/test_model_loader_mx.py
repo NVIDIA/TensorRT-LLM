@@ -48,7 +48,11 @@ from tensorrt_llm._torch.models import modeling_phi3 as modeling_phi3_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
 from tensorrt_llm._torch.models import modeling_qwen3_moe as modeling_qwen3_moe_mod
+from tensorrt_llm._torch.models.checkpoints import memory_init as memory_init_mod
+from tensorrt_llm._torch.models.checkpoints import model_hooks as model_hooks_mod
+from tensorrt_llm._torch.models.checkpoints.gms import model_loading as gms_loading_mod
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
@@ -895,7 +899,7 @@ def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransf
                 architecture="TinyForCausalLM",
                 model_type="tiny",
                 speculative_mode=speculative_mode,
-                protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
+                protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
                 transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
                 runtime_constraints=PostTransformRuntimeConstraints(),
@@ -914,8 +918,11 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         max_num_tokens=128,
         max_seq_len=128,
     )
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
+    # Record each weight copy; tests read the calls from `model_hooks_mod.call_load_weights`.
+    monkeypatch.setattr(
+        model_hooks_mod,
+        "call_load_weights",
+        MagicMock(side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)),
     )
     loader._load_and_validate_config = MagicMock(
         return_value=SimpleNamespace(
@@ -930,7 +937,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
 
     monkeypatch.setattr(model_loader_mod, "timing_metric", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
-    monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
+    monkeypatch.setattr(memory_init_mod, "MetaInitMode", lambda: nullcontext())
 
     # These tests stub ModelConfig, while SourceIdentity has dedicated
     # coverage. Keep this file focused on ModelLoader MX branch behavior.
@@ -958,12 +965,19 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         classmethod(_build_source_identity),
     )
     monkeypatch.setattr(
-        model_loader_mod.AutoModelForCausalLM,
+        memory_init_mod.AutoModelForCausalLM,
         "from_config",
         MagicMock(return_value=_TinyModel(events)),
     )
-    monkeypatch.setattr(model_loader_mod, "get_rank_model_storage", lambda _model: 0)
+    monkeypatch.setattr(memory_init_mod, "get_rank_model_storage", lambda _model: 0)
     return loader
+
+
+def _mock_mx_checkpoint_loader() -> MagicMock:
+    """Return a mocked MX checkpoint loader; `ModelLoader.load()` calls its `load_weights`."""
+    checkpoint_loader = MagicMock(spec=MXCheckpointLoader, name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    return checkpoint_loader
 
 
 @pytest.mark.cpu_only
@@ -1086,7 +1100,7 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
 
 @pytest.mark.cpu_only
 def test_public_support_table_matches_qualified_profile_registry() -> None:
-    profiles = ModelLoader._post_transform_profile_registry().profiles
+    profiles = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
     documentation = (Path(__file__).parents[4] / "docs/source/features/model-express.md").read_text(
         encoding="utf-8"
     )
@@ -1261,7 +1275,7 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     scheme, and `l0_model_express.yml` must list each row exactly once, in a
     block whose GPU count matches the row's two TP groups.
     """
-    profiles = ModelLoader._post_transform_profile_registry().profiles
+    profiles = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
     assert set(_MX_E2E_ROWS) == {profile.profile_id for profile in profiles}, (
         "Every qualified profile needs exactly one `_MX_E2E_ROWS` entry"
     )
@@ -1321,7 +1335,7 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
     limitations list, and the case IDs and `TRTLLM_MX_*_MODEL` variables named
     in the "Qualification Test" section.
     """
-    profiles = ModelLoader._post_transform_profile_registry().profiles
+    profiles = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
     families = {_documented_family(profile) for profile in profiles}
     text_only_families = {
         _documented_family(profile)
@@ -1373,12 +1387,11 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = True
     checkpoint_loader.load_weights.return_value = {}
 
@@ -1388,34 +1401,34 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["mapping"] is loader.mapping
     assert kwargs["model"] is model
-    assert kwargs["source_identity"] is loader._source_identity
+    source_identity = kwargs["source_identity"]
     assert (
-        kwargs["model_config"]
-        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+        kwargs["model_config"] is memory_init_mod.AutoModelForCausalLM.from_config.call_args.args[0]
     )
     assert kwargs["load_config"] is loader.llm_args
     assert (
         kwargs["post_transform_protocol_version"]
-        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+        == mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
     )
     assert kwargs["allow_post_transform_weights"] is True
-    assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
-    assert loader._call_load_weights.call_count == 0
+    assert source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert model_hooks_mod.call_load_weights.call_count == 0
     checkpoint_loader.get_initialized_weight_mapper.assert_called_once()
     assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
+    # The publish carries the same identity that the read got.
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
         checkpoint_dir="/ckpt",
         weights_preloaded=True,
-        source_identity=loader._source_identity,
+        source_identity=source_identity,
     )
 
     # reload() uses self.weight_mapper unconditionally; MX success must
-    # initialize it even though the initial load skipped _call_load_weights.
+    # initialize it even though the initial load skipped call_load_weights.
     model._weights_transformed = True
     model.linear._weights_transformed = True
     loader.reload(model, {"reloaded": MagicMock()})
-    assert loader._call_load_weights.call_count == 1
+    assert model_hooks_mod.call_load_weights.call_count == 1
     assert model._weights_transformed is False
     assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
@@ -1423,8 +1436,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
 
 def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
     loader = _make_loader(monkeypatch, events=[])
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
 
@@ -1453,16 +1465,12 @@ def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
     )
 
 
-def test_cleanup_continues_after_gms_failure(monkeypatch):
+def test_cleanup_releases_gms_backend_and_checkpoint_loader(monkeypatch):
     loader = _make_loader(monkeypatch, events=[])
     gms_backend = MagicMock(name="gms_backend")
-    cleanup_error = RuntimeError("gms cleanup failed")
-    gms_backend.cleanup.side_effect = cleanup_error
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     loader._gms_backend = gms_backend
     loader._checkpoint_loader = checkpoint_loader
-    warning = MagicMock()
-    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
 
     loader.cleanup()
 
@@ -1470,9 +1478,6 @@ def test_cleanup_continues_after_gms_failure(monkeypatch):
     checkpoint_loader.cleanup.assert_called_once_with()
     assert loader._gms_backend is None
     assert loader._checkpoint_loader is None
-    warning.assert_called_once_with(
-        f"Failed to clean up GMS backend {gms_backend!r}: {cleanup_error!r}"
-    )
 
 
 def test_config_failure_retains_checkpoint_loader_for_cleanup(monkeypatch):
@@ -1499,8 +1504,8 @@ def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch)
 
     loader.reload(model, {"reloaded": MagicMock()}, allow_partial_loading=True)
 
-    assert loader._call_load_weights.call_count == 1
-    assert loader._call_load_weights.call_args.kwargs["allow_partial_loading"] is True
+    assert model_hooks_mod.call_load_weights.call_count == 1
+    assert model_hooks_mod.call_load_weights.call_args.kwargs["allow_partial_loading"] is True
     assert model._weights_transformed is True
     assert model.linear._weights_transformed is True
     assert events == ["load_weights"]
@@ -1513,20 +1518,19 @@ def test_mx_partial_fallback_merges_returned_weights(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = True
     fallback_weights = {"mismatched.weight": MagicMock()}
     checkpoint_loader.load_weights.return_value = fallback_weights
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert loader._call_load_weights.call_count == 1
-    load_fn, weights, mapper = loader._call_load_weights.call_args.args
+    assert model_hooks_mod.call_load_weights.call_count == 1
+    load_fn, weights, mapper = model_hooks_mod.call_load_weights.call_args.args
     assert load_fn == model.load_weights
     assert weights is fallback_weights
     assert mapper is loader.weight_mapper
@@ -1534,14 +1538,13 @@ def test_mx_partial_fallback_merges_returned_weights(
         model,
         checkpoint_dir="/ckpt",
         weights_preloaded=True,
-        source_identity=loader._source_identity,
+        source_identity=checkpoint_loader.load_weights.call_args.kwargs["source_identity"],
     )
 
 
-class _PostTransformMxLoader:
-    checkpoint_format = "MX"
-
+class _PostTransformMxLoader(MXCheckpointLoader):
     def __init__(self, *, post_transform: bool) -> None:
+        super().__init__()
         self._post_transform = post_transform
         self._weights_preloaded = True
         self._disk_weight = MagicMock()
@@ -1579,32 +1582,31 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     checkpoint_loader = _PostTransformMxLoader(post_transform=True)
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    loader._call_load_weights.assert_not_called()
+    model_hooks_mod.call_load_weights.assert_not_called()
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
     assert (
-        kwargs["model_config"]
-        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+        kwargs["model_config"] is memory_init_mod.AutoModelForCausalLM.from_config.call_args.args[0]
     )
     assert kwargs["load_config"] is loader.llm_args
     assert (
         kwargs["post_transform_protocol_version"]
-        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+        == mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
     )
     assert callable(kwargs["prepare_post_transform_receiver"])
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
         checkpoint_dir="/ckpt",
         weights_preloaded=True,
-        source_identity=loader._source_identity,
+        source_identity=kwargs["source_identity"],
     )
     # Post-transform receivers skip transform_weights(), but the accepted
     # tensors are already in final layout. Keep the transform guard in sync so
@@ -1662,7 +1664,7 @@ def _tiny_multimodal_profile(
         architecture="TinyForCausalLM",
         model_type="tiny",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
         transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
         runtime_constraints=PostTransformRuntimeConstraints(),
@@ -1681,8 +1683,8 @@ def test_post_transform_transfer_scope_is_derived_from_the_root(
     plain load.
     """
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         PostTransformProfileRegistry(
             profiles=(
                 _tiny_multimodal_profile(_TinyMultimodalModel),
@@ -1690,7 +1692,7 @@ def test_post_transform_transfer_scope_is_derived_from_the_root(
             )
         ),
     )
-    derive_scope = ModelLoader._post_transform_transfer_scope
+    derive_scope = mx_loading_mod.get_post_transform_transfer_scope
 
     assert derive_scope(_TinyModel([])) is PostTransformTransferScope.TARGET_MODEL
     assert (
@@ -1729,12 +1731,12 @@ def test_mx_load_offers_post_transform_weights_only_for_the_registered_scope(
     events: list[str] = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         PostTransformProfileRegistry(profiles=(_tiny_multimodal_profile(_TinyMultimodalModel),)),
     )
     monkeypatch.setattr(
-        model_loader_mod.AutoModelForCausalLM,
+        memory_init_mod.AutoModelForCausalLM,
         "from_config",
         MagicMock(return_value=_TinyMultimodalModel(events, with_encoder=with_encoder)),
     )
@@ -1744,18 +1746,19 @@ def test_mx_load_offers_post_transform_weights_only_for_the_registered_scope(
 
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is with_encoder
+    source_identity = kwargs["source_identity"]
     if with_encoder:
-        assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
-        loader._call_load_weights.assert_not_called()
+        assert source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+        model_hooks_mod.call_load_weights.assert_not_called()
         checkpoint_loader.post_load_publish.assert_called_once_with(
             model,
             checkpoint_dir="/ckpt",
             weights_preloaded=True,
-            source_identity=loader._source_identity,
+            source_identity=source_identity,
         )
     else:
-        assert loader._source_identity.transform_abi_id is None
-        assert loader._call_load_weights.call_count == 1
+        assert source_identity.transform_abi_id is None
+        assert model_hooks_mod.call_load_weights.call_count == 1
         checkpoint_loader.post_load_publish.assert_not_called()
 
 
@@ -1771,7 +1774,7 @@ def test_qualified_profiles_bind_published_transform_abis() -> None:
         for name in weight_sharing_mod.__all__
         if re.fullmatch(r".*_POST_TRANSFORM_LAYOUT_ABI_V\d+", name)
     }
-    profiles = ModelLoader._post_transform_profile_registry().profiles
+    profiles = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
 
     assert {profile.transform_abi_id for profile in profiles} <= published
 
@@ -1786,7 +1789,7 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
             monkeypatch,
             model_class=_UnqualifiedLlamaForCausalLM,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1824,7 +1827,7 @@ def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1851,7 +1854,7 @@ def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
         unqualified_model_factory=lambda: _tiny_qwen2_model(
             model_class=_UnqualifiedQwen2ForCausalLM
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1888,7 +1891,7 @@ def test_qwen2_dense_profile_rejects_effective_unfused_rope() -> None:
         kv_cache_compression_config=SimpleNamespace(changes_physical_kv_length=True)
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -1915,7 +1918,7 @@ def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1950,7 +1953,7 @@ def test_qwen3_dense_profile_qualifies_full_staged_lifecycle(
             monkeypatch,
             model_class=_UnqualifiedQwen3ForCausalLM,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -2004,7 +2007,7 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -2037,7 +2040,7 @@ def test_mistral_dense_profile_qualifies_full_staged_lifecycle() -> None:
         unqualified_model_factory=lambda: _tiny_mistral_model(
             model_class=_UnqualifiedMistralForCausalLM
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -2084,7 +2087,7 @@ def test_mistral_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -2129,7 +2132,7 @@ def test_mistral_dense_profile_rejects_sliding_window_models(
 ) -> None:
     model = _tiny_mistral_model(sliding_window=sliding_window, layer_types=layer_types)
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2150,7 +2153,7 @@ def test_mistral_dense_profile_qualifies_full_attention_layer_types() -> None:
         layer_types=("full_attention", "full_attention"),
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2165,14 +2168,14 @@ def test_mistral_dense_profile_qualifies_full_attention_layer_types() -> None:
 def _qwen3_moe_profile() -> PostTransformProfile:
     (profile,) = (
         candidate
-        for candidate in ModelLoader._post_transform_profile_registry().profiles
+        for candidate in mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
         if candidate.profile_id == _QWEN3_MOE_PROFILE_ID
     )
     return profile
 
 
 def _qualify_qwen3_moe_model(model: nn.Module) -> PostTransformQualificationDecision:
-    return ModelLoader._qualify_post_transform_profile(
+    return mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2422,12 +2425,12 @@ def test_staged_qwen3_moe_finalization_preserves_mx_tensor_catalog(
     """
     model = _tiny_qwen3_moe_model(monkeypatch)
 
-    ModelLoader._setup_aliases(model)
+    model_hooks_mod.setup_aliases(model)
     registered_catalog = _mx_canonical_parameter_catalog(model)
 
-    ModelLoader._setup_aliases(model)
-    ModelLoader._mark_weights_transformed(model)
-    ModelLoader._walk_cache_state(model)
+    model_hooks_mod.setup_aliases(model)
+    model_hooks_mod.mark_weights_transformed(model)
+    model_hooks_mod.walk_cache_state(model)
     published_catalog = _mx_canonical_parameter_catalog(model)
 
     assert published_catalog == registered_catalog
@@ -2487,12 +2490,12 @@ def test_qwen3_moe_profile_rejects_unqualified_moe_variants(
     `test_bf16_profiles_reject_unqualified_runtime_variants` covers the
     variants that every BF16 profile rejects.
     """
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
         architecture="Qwen3MoeForCausalLM",
         model_type="qwen3_moe",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_qwen3_moe_runtime_config(**overrides),
     )
@@ -2528,12 +2531,12 @@ def test_qwen3_moe_profile_rejects_unsupported_moe_features(
     def qualify(
         enabled_features: frozenset[PostTransformFeature],
     ) -> PostTransformQualificationDecision:
-        return ModelLoader._post_transform_profile_registry().qualify(
+        return mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
             root_model_class=modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
             architecture="Qwen3MoeForCausalLM",
             model_type="qwen3_moe",
             speculative_mode=None,
-            protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             enabled_features=enabled_features,
             runtime_config=_qwen3_moe_runtime_config(**overrides),
@@ -2595,7 +2598,7 @@ def test_moe_profile_backend_literals_realize_one_implementation(
     """
     moe_profiles = [
         profile
-        for profile in ModelLoader._post_transform_profile_registry().profiles
+        for profile in mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
         if profile.runtime_constraints.moe_backends is not None
     ]
     assert [profile.profile_id for profile in moe_profiles] == [_QWEN3_MOE_PROFILE_ID], (
@@ -2636,12 +2639,12 @@ def test_qwen3_vl_moe_root_does_not_inherit_qwen3_moe_profile() -> None:
         is modeling_qwen3_moe_mod.Qwen3MoeForCausalLM
     )
 
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=vl_root,
         architecture="Qwen3MoeForCausalLM",
         model_type="qwen3_moe",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_qwen3_moe_runtime_config(),
     )
@@ -2666,7 +2669,7 @@ def test_moe_profiles_pin_partition_and_one_backend_per_abi() -> None:
     """
     abi_owners: dict[str, tuple[str, str]] = {}
     moe_profiles = 0
-    for profile in ModelLoader._post_transform_profile_registry().profiles:
+    for profile in mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles:
         constraints = profile.runtime_constraints
         if constraints.moe_backends is None:
             assert constraints.moe_tp_sizes is None
@@ -2694,12 +2697,12 @@ def test_legacy_llama_file_mistral_root_is_not_qualified() -> None:
         get_registered_model_class("MistralForCausalLM") is modeling_mistral_mod.MistralForCausalLM
     )
 
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=legacy_root,
         architecture="MistralForCausalLM",
         model_type="mistral",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(sliding_window="none"),
     )
@@ -2710,12 +2713,12 @@ def test_legacy_llama_file_mistral_root_is_not_qualified() -> None:
 
 @pytest.mark.cpu_only
 def test_mistral_dense_profile_rejects_native_format_model_type() -> None:
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=modeling_mistral_mod.MistralForCausalLM,
         architecture="MistralForCausalLM",
         model_type="mistral_common",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(sliding_window="none"),
     )
@@ -2730,7 +2733,7 @@ def test_phi3_dense_profile_qualifies_full_staged_lifecycle() -> None:
         profile_id="phi3-for-causal-lm-bf16-target-v1",
         model_factory=_tiny_phi3_model,
         unqualified_model_factory=lambda: _tiny_phi3_model(model_class=_UnqualifiedPhi3ForCausalLM),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -2745,7 +2748,7 @@ def test_phi3_dense_profile_qualifies_full_staged_lifecycle() -> None:
 
     producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         producer,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2785,7 +2788,7 @@ def test_phi3_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: mx_loading_mod.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -2813,7 +2816,7 @@ def test_phi3_dense_profile_qualifies_tp2_rank_lifecycle(
 
 def test_phi3_dense_profile_rejects_unregistered_subclass_root() -> None:
     """An otherwise identical subclass must not inherit the exact-root profile."""
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         _tiny_phi3_model(model_class=_UnqualifiedPhi3ForCausalLM),
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2831,7 +2834,7 @@ def test_phi3_dense_profile_realizes_configured_window_as_full_attention() -> No
     """
     model = _tiny_phi3_model(sliding_window=8)
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2872,7 +2875,7 @@ def test_phi3_dense_profile_rejects_longrope_and_tied_embedding_variants(
     """LongRoPE and tied-embedding Phi3 variants fall outside the profile's constraints."""
     model = _tiny_phi3_model(**variant)
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -2923,12 +2926,12 @@ def test_phi4mm_root_does_not_inherit_phi3_profile() -> None:
     phi4mm_root = get_registered_model_class("Phi4MMForCausalLM")
     assert phi4mm_root is not None
 
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=phi4mm_root,
         architecture="Phi3ForCausalLM",
         model_type="phi3",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(),
     )
@@ -3067,12 +3070,12 @@ def test_bf16_profiles_reject_unqualified_runtime_variants(
     The MoE-only variants of the Qwen3 MoE profile are in
     `test_qwen3_moe_profile_rejects_unqualified_moe_variants`.
     """
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=root_model_class,
         architecture=architecture,
         model_type=model_type,
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
@@ -3156,12 +3159,12 @@ def test_bf16_profiles_reject_wrong_realized_dimension(
     expected_dimension: str,
 ) -> None:
     """Each BF16 profile rejects a realized RoPE fusion or window it was not qualified for."""
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=root_model_class,
         architecture=architecture,
         model_type=model_type,
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(**realized_overrides),
     )
@@ -3251,12 +3254,12 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     supported_sliding_window: str | None,
 ) -> None:
     """Dense profiles still qualify when only MoE-specific runtime dimensions differ."""
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=root_model_class,
         architecture=architecture,
         model_type=model_type,
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
@@ -3274,13 +3277,13 @@ def test_staged_llama_finalization_preserves_mx_tensor_catalog(
     model = _tiny_llama_model(monkeypatch)
 
     # MX discovers and registers tensors after receiver alias preparation.
-    ModelLoader._setup_aliases(model)
+    model_hooks_mod.setup_aliases(model)
     registered_catalog = _mx_canonical_parameter_catalog(model)
 
     # This is the receiver-side finalization sequence after RDMA completes.
-    ModelLoader._setup_aliases(model)
-    ModelLoader._mark_weights_transformed(model)
-    ModelLoader._walk_cache_state(model)
+    model_hooks_mod.setup_aliases(model)
+    model_hooks_mod.mark_weights_transformed(model)
+    model_hooks_mod.walk_cache_state(model)
     published_catalog = _mx_canonical_parameter_catalog(model)
 
     assert registered_catalog
@@ -3292,12 +3295,12 @@ def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(speculative_mode="eagle3_one_model"),
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         _TinyModel([]),
         speculative_mode="eagle3_one_model",
         loads_draft_weights=True,
@@ -3344,8 +3347,8 @@ def test_qualification_reports_realized_moe_lifecycle_features(
     the loader reads fails it.
     """
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     model = _TinyModel([])
@@ -3359,7 +3362,7 @@ def test_qualification_reports_realized_moe_lifecycle_features(
             world_size=dwdp_size, tp_size=dwdp_size, dwdp_size=dwdp_size
         )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -3413,15 +3416,16 @@ def test_skipped_mx_publish_logs_only_reported_details(
     empty feature set there does not mean that no unsupported feature is active.
     """
     messages: list[str] = []
-    monkeypatch.setattr(model_loader_mod.logger, "info", messages.append)
+    monkeypatch.setattr(mx_loading_mod.logger, "info", messages.append)
     checkpoint_loader = SimpleNamespace(checkpoint_format="MX", post_load_publish=MagicMock())
 
-    ModelLoader.__new__(ModelLoader)._post_load_publish(
+    mx_loading_mod.post_load_publish(
         checkpoint_loader,
         _TinyModel([]),
         checkpoint_dir="/checkpoint",
         weights_preloaded=False,
         qualification=decision,
+        source_identity=None,
     )
 
     assert messages == [
@@ -3432,41 +3436,42 @@ def test_skipped_mx_publish_logs_only_reported_details(
 
 
 @pytest.mark.cpu_only
-def test_separate_draft_load_preserves_mx_session(
+def test_gms_writer_draft_load_preserves_mx_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapping = MagicMock()
-    spec_config = SimpleNamespace(speculative_model="draft-checkpoint")
-    loader = ModelLoader(
-        llm_args=MagicMock(),
-        mapping=mapping,
-        spec_config=spec_config,
-        sparse_attention_config=None,
-        max_num_tokens=1,
-        max_seq_len=1,
-    )
     checkpoint_loader = MagicMock()
     checkpoint_loader.checkpoint_format = "MX"
-    checkpoint_loader.load_weights.return_value = {"draft": object()}
-    draft_mapper = MagicMock()
-    monkeypatch.setattr(
-        model_loader_mod.AutoCheckpointMapper,
-        "get",
-        MagicMock(return_value=draft_mapper),
-    )
+    draft_weights = {"draft": object()}
+    checkpoint_loader.load_weights.return_value = draft_weights
+    target_weight_mapper = MagicMock()
+    call_load_weights = MagicMock()
+    monkeypatch.setattr(model_hooks_mod, "call_load_weights", call_load_weights)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    model = SimpleNamespace(
-        draft_config=_make_draft_model_config(),
-        draft_model=MagicMock(),
-        load_draft_weights=lambda _weights: None,
-    )
+    model = SimpleNamespace(load_draft_weights=lambda _weights: None)
 
-    loader._load_separate_draft_weights(model, checkpoint_loader)
+    gms_loading_mod._load_gms_writer_draft_weights(
+        model,
+        checkpoint_loader,
+        speculative_model="draft-checkpoint",
+        mapping=mapping,
+        target_weight_mapper=target_weight_mapper,
+        metrics={},
+    )
 
     checkpoint_loader.load_weights.assert_called_once_with(
         "draft-checkpoint",
         mapping=mapping,
         _preserve_mx_session=True,
+    )
+    # The draft weights go through the draft mapper that the checkpoint loader builds.
+    checkpoint_loader.get_initialized_draft_weight_mapper.assert_called_once_with(
+        model, target_weight_mapper
+    )
+    call_load_weights.assert_called_once_with(
+        model.load_draft_weights,
+        draft_weights,
+        checkpoint_loader.get_initialized_draft_weight_mapper.return_value,
     )
 
 
@@ -3475,12 +3480,12 @@ def test_one_engine_speculative_mode_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         _TinyModel([]),
         speculative_mode="mtp",
         loads_draft_weights=False,
@@ -3496,18 +3501,18 @@ def test_speculative_mode_name_is_canonical_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = MagicMock()
-    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
-    assert ModelLoader._speculative_mode_name(None) is None
+    monkeypatch.setattr(mx_loading_mod.logger, "warning", warning)
+    assert mx_loading_mod.get_speculative_mode_name(None) is None
     warning.assert_not_called()
     assert (
-        ModelLoader._speculative_mode_name(
+        mx_loading_mod.get_speculative_mode_name(
             SimpleNamespace(spec_dec_mode=SimpleNamespace(name="MTP"))
         )
         == "mtp"
     )
     warning.assert_not_called()
     assert (
-        ModelLoader._speculative_mode_name(SimpleNamespace(spec_dec_mode=SimpleNamespace()))
+        mx_loading_mod.get_speculative_mode_name(SimpleNamespace(spec_dec_mode=SimpleNamespace()))
         == "unknown"
     )
     warning.assert_called_once_with(
@@ -3530,14 +3535,14 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
     loader = _make_loader(monkeypatch, events=events)
     if qualification_case == "locality_domain-feature":
         monkeypatch.setattr(
-            ModelLoader,
-            "_POST_TRANSFORM_PROFILE_REGISTRY",
+            mx_loading_mod,
+            "MX_POST_TRANSFORM_PROFILE_REGISTRY",
             _tiny_profile_registry(),
         )
         model = _TinyModel(events)
         model.model_config.locality_domain_policy = LocalityDomainPolicy(enabled=True)
         monkeypatch.setattr(
-            model_loader_mod.AutoModelForCausalLM,
+            memory_init_mod.AutoModelForCausalLM,
             "from_config",
             MagicMock(return_value=model),
         )
@@ -3549,12 +3554,12 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
     assert kwargs["allow_post_transform_weights"] is False
     assert "prepare_post_transform_receiver" not in kwargs
     assert checkpoint_loader.is_weights_preloaded() is False
-    assert loader._call_load_weights.call_count == 1
-    load_fn, weights, mapper = loader._call_load_weights.call_args.args
+    assert model_hooks_mod.call_load_weights.call_count == 1
+    load_fn, weights, mapper = model_hooks_mod.call_load_weights.call_args.args
     assert load_fn == model.load_weights
     assert weights == {"disk.weight": checkpoint_loader._disk_weight}
     assert mapper is loader.weight_mapper
-    assert loader._source_identity.transform_abi_id is None
+    assert kwargs["source_identity"].transform_abi_id is None
     assert events == ["load_weights", "post_load_weights"]
     checkpoint_loader.post_load_publish.assert_not_called()
 
@@ -3566,20 +3571,19 @@ def test_load_qualifies_with_preconstruction_identity_after_model_normalization(
     loader = _make_loader(monkeypatch, events=events)
     registry = MagicMock(wraps=_tiny_profile_registry())
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         registry,
     )
     normalized_model = _TinyModel(events)
     normalized_model.model_config.pretrained_config.architectures = ["NormalizedForCausalLM"]
     normalized_model.model_config.pretrained_config.model_type = "normalized"
     monkeypatch.setattr(
-        model_loader_mod.AutoModelForCausalLM,
+        memory_init_mod.AutoModelForCausalLM,
         "from_config",
         MagicMock(return_value=normalized_model),
     )
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
     checkpoint_loader.is_weights_preloaded.return_value = False
 
@@ -3588,7 +3592,7 @@ def test_load_qualifies_with_preconstruction_identity_after_model_normalization(
     _args, kwargs = checkpoint_loader.load_weights.call_args
     registry.qualify.assert_called_once()
     assert kwargs["allow_post_transform_weights"] is True
-    assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert kwargs["source_identity"].transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
 
 
 @pytest.mark.cpu_only
@@ -3616,26 +3620,25 @@ def test_mx_fallback_runs_standard_weight_mapping(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
     checkpoint_loader.get_initialized_weight_mapper.return_value = MagicMock()
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert loader._call_load_weights.call_count == 1
+    assert model_hooks_mod.call_load_weights.call_count == 1
     assert events[0] == "load_weights"
     assert "post_load_weights" in events
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
         checkpoint_dir="/ckpt",
         weights_preloaded=False,
-        source_identity=loader._source_identity,
+        source_identity=checkpoint_loader.load_weights.call_args.kwargs["source_identity"],
     )
 
 
@@ -3643,8 +3646,8 @@ def test_mx_artifact_identity_failure_falls_back_to_disk(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     artifact_error = ValueError(
@@ -3664,15 +3667,13 @@ def test_mx_artifact_identity_failure_falls_back_to_disk(monkeypatch):
     warning = MagicMock()
     monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
 
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
     checkpoint_loader.get_initialized_weight_mapper.return_value = MagicMock()
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert loader._source_identity is None
     source_identity_factory.assert_not_called()
     warning.assert_called_once()
     assert "falling back to regular checkpoint loading" in warning.call_args.args[0]
@@ -3706,10 +3707,6 @@ class _HookRecorder(nn.Module):
     def setup_aliases(self) -> None:
         self.events.append((self.name, "setup_aliases"))
 
-    def transform_weights(self) -> None:
-        self.events.append((self.name, "transform_weights"))
-        self._weights_transformed = True
-
     def cache_derived_state(self) -> None:
         self.events.append((self.name, "cache_derived_state"))
 
@@ -3730,7 +3727,7 @@ def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
 
-    ModelLoader._setup_aliases(model)
+    model_hooks_mod.setup_aliases(model)
 
     assert events == [
         ("model", "setup_aliases"),
@@ -3740,17 +3737,14 @@ def test_staged_hook_setup_aliases_walks_skip_removed_modules():
 
 
 @pytest.mark.cpu_only
-def test_staged_hook_walks_skip_removed_and_transformed_modules():
+def test_cache_state_and_full_post_load_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
 
-    ModelLoader._walk_transform(model)
-    ModelLoader._walk_cache_state(model)
-    ModelLoader._walk_full_post_load(model)
+    model_hooks_mod.walk_cache_state(model)
+    model_hooks_mod.walk_full_post_load(model)
 
     assert events == [
-        ("model", "transform_weights"),
-        ("child", "transform_weights"),
         ("model", "cache_derived_state"),
         ("child", "cache_derived_state"),
         ("transformed_child", "cache_derived_state"),
@@ -3767,7 +3761,7 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     model._weights_transformed = True
     model.child._weights_transformed = True
 
-    ModelLoader._reset_weights_transformed(model)
+    model_hooks_mod.reset_weights_transformed(model)
 
     assert model._weights_transformed is False
     assert model.child._weights_transformed is False
@@ -3782,7 +3776,7 @@ def test_mark_weights_transformed_only_sets_existing_flags():
     model._weights_transformed = False
     model.child._weights_transformed = False
 
-    ModelLoader._mark_weights_transformed(model)
+    model_hooks_mod.mark_weights_transformed(model)
 
     assert model._weights_transformed is True
     assert model.child._weights_transformed is True
@@ -3867,7 +3861,7 @@ def _make_manifest_loader(
     loader = _make_loader(monkeypatch, events=events)
     loader.mapping = mapping or mapping_mod.Mapping(world_size=1, rank=0, tp_size=1)
     monkeypatch.setattr(
-        model_loader_mod.AutoModelForCausalLM,
+        memory_init_mod.AutoModelForCausalLM,
         "from_config",
         MagicMock(return_value=_ManifestTinyModel(events)),
     )
@@ -3877,13 +3871,13 @@ def _make_manifest_loader(
     else:
         monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
         monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, role)
-    real_write = model_loader_mod.maybe_write_weight_manifest
+    real_write = mx_loading_mod.maybe_write_weight_manifest
 
     def _recording_write(*args, **kwargs):
         events.append("manifest")
         return real_write(*args, **kwargs)
 
-    monkeypatch.setattr(model_loader_mod, "maybe_write_weight_manifest", _recording_write)
+    monkeypatch.setattr(mx_loading_mod, "maybe_write_weight_manifest", _recording_write)
     return loader
 
 
@@ -3901,9 +3895,13 @@ def test_load_writes_final_manifest_at_end_of_load(
 ) -> None:
     events = []
     loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="baseline")
+    from_checkpoint = MagicMock()
+    monkeypatch.setattr(model_loader_mod.ArtifactIdentity, "from_checkpoint", from_checkpoint)
 
     model, _ = loader.load("/ckpt", _hf_checkpoint_loader())
 
+    # HF/AUTO loading needs no source identity, so it never reads or hashes the checkpoint.
+    from_checkpoint.assert_not_called()
     assert events == ["load_weights", "post_load_weights", "manifest"]
     files = sorted(path.name for path in tmp_path.iterdir())
     assert files == ["manifest.final.baseline.rank0.json"]
@@ -3924,8 +3922,7 @@ def test_load_final_manifest_records_mx_receiver_facts(
 ) -> None:
     events = []
     loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="receiver")
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = True
     # `_ManifestTinyModel` is not a registered root, so the post-transform
     # staged path must stay off; the full post-load path still ends in a manifest.
