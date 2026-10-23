@@ -47,6 +47,8 @@ def _worker(lengths):
         _max_ctx=1000,
         _ctx_len=torch.tensor(lengths, dtype=torch.long, device="cuda"),
         _ctx_len_host=list(lengths),
+        _ctx_base_pages=torch.zeros(len(lengths), dtype=torch.long, device="cuda"),
+        _ctx_base_host=[0] * len(lengths),
         _batch_to_slot=torch.zeros(8, dtype=torch.long, device="cuda"),
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)

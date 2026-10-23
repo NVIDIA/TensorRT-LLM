@@ -127,6 +127,74 @@ def test_dflash_rebased_ctx_rows_hide_the_reused_prefix() -> None:
     assert torch.equal(dflash_rebased_ctx_rows(row, torch.zeros(1, dtype=torch.long)), row)
 
 
+@pytest.mark.parametrize(
+    ("first_pos", "tail"),
+    [
+        # A reused prefix ending inside a 64-token page with a one-token tail:
+        # the base rounds up to the next page and the context stays shorter
+        # than it for 55 steps.
+        (8200, 1),
+        # One token into a page: the first write offsets overlap the stored
+        # tail, which sits below the base and is never read.
+        (8193, 1),
+        # A page-aligned prefix end is never short of its base.
+        (8192, 1),
+    ],
+)
+def test_dflash_rebased_ctx_view_writes_the_block_into_an_owned_page(
+    first_pos: int, tail: int
+) -> None:
+    """A tail stored after a reused prefix on an unpaired pool, with the mirror
+    funded the way the manager funds it: pages up to the one holding the
+    context plus the draft tokens, the window below it, nothing past it. The
+    block decode writes the block's own K/V at rebased positions
+    num_ctx .. num_ctx + block_size through the view it reads, so at every
+    context length those positions must resolve to a funded entry, including
+    the steps on which the context is still shorter than the rounded-up base
+    and the decode reads nothing. Entry ``base`` is unfunded on those steps and
+    holds 0, the pool page another request owns."""
+    import torch
+
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker, dflash_rebased_ctx_view
+
+    page_size, block_size, draft_len, window_pages = 64, 3, 3, 64
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_page_size = page_size
+    worker._ctx_reuse_addressable = False
+    base = worker._ctx_base_for_store(0, first_pos)
+    assert base == -(-first_pos // page_size)
+    base_pages = torch.tensor([base])
+
+    def funded_row(ctx_len: int) -> torch.Tensor:
+        last = (ctx_len + draft_len - 1) // page_size
+        row = torch.zeros(1, base + 8, dtype=torch.int32)
+        row[0, last + 1 - window_pages : last + 1] = (
+            torch.arange(last + 1 - window_pages, last + 1, dtype=torch.int32) + 1000
+        )
+        return row
+
+    blind_steps = 0
+    for ctx_len in range(first_pos + tail, (base + 1) * page_size):
+        row = funded_row(ctx_len)
+        view, num_ctx = dflash_rebased_ctx_view(row, base_pages, torch.tensor([ctx_len]), page_size)
+        assert view.shape == row.shape
+        blind = ctx_len < base * page_size
+        blind_steps += blind
+        assert num_ctx.item() == max(0, ctx_len - base * page_size)
+        if blind:
+            assert view[0, 0] == row[0, ctx_len // page_size]
+            if (ctx_len + draft_len - 1) // page_size < base:
+                # Entry ``base`` is funded only once the draft tokens reach it.
+                assert row[0, base] == 0
+        for pos in range(num_ctx.item() + block_size):
+            entry = view[0, pos // page_size]
+            assert entry >= 1000, (ctx_len, pos)
+            if pos < num_ctx.item():
+                # A read position p is absolute position base * page_size + p.
+                assert entry == row[0, (base * page_size + pos) // page_size]
+    assert blind_steps == max(0, base * page_size - first_pos - tail)
+
+
 def test_dflash_write_ctx_len_zero_length_reset_wins_over_a_pending_base() -> None:
     """_store_prefill_context records a chunk's base pages before the overflow
     check that may reset the same slot to length 0 in the same call. The reset

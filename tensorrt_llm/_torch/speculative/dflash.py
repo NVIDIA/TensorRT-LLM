@@ -16,7 +16,7 @@
 import os
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -532,6 +532,29 @@ def dflash_rebased_ctx_rows(rows: torch.Tensor, base_pages: torch.Tensor) -> tor
     width = rows.size(1)
     index = torch.arange(width, device=rows.device).unsqueeze(0) + base_pages.view(-1, 1)
     return rows.gather(1, index.clamp_(max=width - 1))
+
+
+def dflash_rebased_ctx_view(
+    rows: torch.Tensor, base_pages: torch.Tensor, num_ctx: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Block-table rows and context lengths the block decode reads for slots
+    whose first ``base_pages`` pages hold no drafter K/V (a prefix the target
+    reused, see ``_ctx_base_for_store``).
+
+    The context length is shortened by the base, so the decode never reads
+    below it. The decode also writes the block's own K/V through the returned
+    rows, at rebased positions ``num_ctx .. num_ctx + block_size``, so entry 0
+    of a row has to name a page the request holds. While the context is
+    shorter than the base (a tail stored inside the rounded-up page) it reads
+    nothing and the row is shifted only to the page holding the context
+    length: entry ``base`` lies past the allocation and resolves to another
+    request's page. The offsets written in that page belong to the reused
+    prefix, which no reader addresses. From ``base * page_size`` on the shift
+    is the base itself.
+    """
+    rebase_pages = torch.minimum(base_pages, num_ctx // page_size)
+    num_ctx = (num_ctx - base_pages * page_size).clamp(min=0)
+    return dflash_rebased_ctx_rows(rows, rebase_pages), num_ctx
 
 
 @dataclass
@@ -2282,13 +2305,16 @@ class DFlashWorker(SpecWorkerBase):
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
                 # Pages below a slot's base hold no drafter K/V (a prefix the
                 # target reused): the read numbers from the base instead, see
-                # _ctx_base_for_store. Writes above keep the absolute table.
+                # _ctx_base_for_store and dflash_rebased_ctx_view. Writes above
+                # keep the absolute table.
                 base_pages = self._ctx_base_pages[slots]
-                num_ctx_per_req_t = (num_ctx_per_req_t - base_pages * self._ctx_page_size).clamp_(
-                    min=0
-                )
-                self._ctx_block_tables_read[gen_rows_out] = dflash_rebased_ctx_rows(
-                    self._ctx_block_tables[gen_rows_out], base_pages
+                self._ctx_block_tables_read[gen_rows_out], num_ctx_per_req_t = (
+                    dflash_rebased_ctx_view(
+                        self._ctx_block_tables[gen_rows_out],
+                        base_pages,
+                        num_ctx_per_req_t,
+                        self._ctx_page_size,
+                    )
                 )
                 ctx_page_table = self._ctx_block_tables_read
             noise_embedding = noise_embed_2d
