@@ -48,6 +48,18 @@ function(tllm_assert_test_is_component_local target)
         "${target} links the full TensorRT-LLM library; use FULL_STACK explicitly"
     )
   endif()
+  foreach(dep IN LISTS link_libraries)
+    if(NOT TARGET ${dep})
+      continue()
+    endif()
+    get_target_property(dep_interface ${dep} INTERFACE_LINK_LIBRARIES)
+    if("${SHARED_TARGET}" IN_LIST dep_interface)
+      message(
+        FATAL_ERROR
+          "${target} links ${dep}, which interface-links the full TensorRT-LLM library; use FULL_STACK explicitly"
+      )
+    endif()
+  endforeach()
 endfunction()
 
 function(add_tllm_gtest test_name)
