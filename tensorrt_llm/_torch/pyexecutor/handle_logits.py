@@ -60,7 +60,14 @@ class HandleLogits:
                 llm_req.py_result.append_context_logits(
                     context_logits_device_view)
 
-            if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
+            is_last_draft_context_chunk = (
+                llm_req.py_is_draft
+                and llm_req.context_current_position + llm_req.context_chunk_size
+                == llm_req.py_prompt_len - 1
+            )
+            if llm_req.py_return_generation_logits and (
+                llm_req.is_last_context_chunk or is_last_draft_context_chunk
+            ):
                 # Get the logits from the last context token and draft tokens
                 logits_view = logits[logits_end - 1:logits_end]
                 if beam_width > 1:

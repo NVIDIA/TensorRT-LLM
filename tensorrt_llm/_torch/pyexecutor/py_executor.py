@@ -1525,6 +1525,7 @@ class PyExecutor:
                     continue
 
                 req.py_last_draft_tokens = req.py_draft_tokens
+                req.py_draft_logits = None
 
                 if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * self.max_total_draft_tokens
