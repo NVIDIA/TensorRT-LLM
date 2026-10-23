@@ -269,7 +269,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 | `none` | `TrtllmCutlassUnquantizedImpl` | `trtllm.cutlass.grouped_gemm.none` | Fuses routed-expert LoRA |
 | `fp8` | `TrtllmCutlassFp8Impl` | `trtllm.cutlass.grouped_gemm.fp8` | Static per-tensor e4m3 input; fuses routed-expert LoRA |
 | `fp8_block_scales` | `DeepgemmCudaHopperFp8BlockScalesImpl` | `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | SM90; `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM |
-| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias or activation constants |
+| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias and no activation constant but a uniform pre-SiLU SwiGLU clamp |
 | `nvfp4` | `TrtllmCutlassNvfp4Impl` | `trtllm.cutlass.grouped_gemm.nvfp4` | Quantizes activations to NVFP4 itself |
 | `w4a16_nvfp4` | `TrtllmCutlassW4a16Nvfp4Impl` | `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | Dequantizes the weights every forward, then runs unquantized |
 | `mxfp8` | `TrtllmCutlassMxfp8Impl` | `trtllm.cutlass.grouped_gemm.mxfp8` | Dynamic MXFP8 input |
@@ -724,9 +724,9 @@ never from the checkpoint:
 register shape. The resolver declines a backend unless its declaration opts in,
 and materialization enforces the same contract. The CUTLASS grouped-GEMM leaves
 opt in because their SwiGLU adaptor consumes the mode. The SM120
-FP8-block-scale leaf runs a Triton kernel that takes no activation constants
-and only gated SiLU / GELU, so it declares `kinds={Swiglu, Geglu}` and nothing
-else.
+FP8-block-scale leaf runs a Triton kernel that clamps before the SiLU only and
+takes the clamp by value, so it declares `kinds={Swiglu, Geglu}` with
+`limit=UNIFORM_SCALAR` and nothing else.
 
 With `USING_OSS_CUTLASS_MOE_GEMM=OFF`, the Torch runner uses the bundled
 internal kernel archive's legacy interfaces. That build supports pre-SiLU

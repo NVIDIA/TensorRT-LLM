@@ -4763,6 +4763,7 @@ def test_triton_fp8_block_scales_leaf_localizes_global_slot_ids(enable_alltoall,
     leaf.w3_w1_weight = leaf.w2_weight = None
     leaf.quant_scales = SimpleNamespace(fc_weight_scales=None, proj_weight_scales=None)
     leaf.activation_type = ActivationType.Swiglu
+    leaf.act_clamp = None
     ctx = dataclasses.replace(
         _cpu_run_context(num_tokens=2),
         # 1 is below this rank's slots, 8 (num_slots) above them.

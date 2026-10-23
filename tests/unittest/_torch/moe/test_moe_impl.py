@@ -1818,11 +1818,14 @@ _TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
             120, _TRITON_FP8_BLOCK_SCALES_ID, SwigluActivation(), None, id="triton-plain-swiglu"
         ),
         pytest.param(
+            120, _TRITON_FP8_BLOCK_SCALES_ID, SwigluActivation(clamp=5.0), None, id="triton-clamp"
+        ),
+        pytest.param(
             120,
             _TRITON_FP8_BLOCK_SCALES_ID,
-            SwigluActivation(clamp=5.0),
-            "take no activation clamp",
-            id="triton-clamp",
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            "post-SiLU clamping",
+            id="triton-post-silu-clamp",
         ),
     ],
 )
@@ -1830,7 +1833,7 @@ def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
     sm, impl_id, activation, rejection
 ):
     """The SM90 leaf issues the CUTLASS op, which takes every activation constant;
-    the SM120 Triton kernel takes none and runs only gated SiLU / GELU."""
+    the SM120 Triton kernel runs gated SiLU / GELU and clamps before the SiLU."""
     with override_moe_environment(MoEEnvironment(sm=sm)):
         report = resolve_moe_impl(
             _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES),
@@ -1853,7 +1856,6 @@ def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
         pytest.param(
             "Swiglu", True, frozenset({"clamp"}), "post-SiLU clamping", id="post_silu_clamp"
         ),
-        pytest.param("Swiglu", False, frozenset({"clamp"}), "take no activation clamp", id="clamp"),
         pytest.param(
             "Relu2",
             False,

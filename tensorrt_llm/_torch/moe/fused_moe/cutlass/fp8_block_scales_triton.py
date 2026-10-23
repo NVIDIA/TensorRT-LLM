@@ -17,7 +17,7 @@
 import torch
 
 from ....utils import ActivationType
-from ..activation import MoEActivationSupport
+from ..activation import ActivationParamShape, MoEActivationSupport
 from ..fused_moe_triton_fp8_block_scale import run_triton_fp8_block_scale_moe
 from ..impl_contract import (
     MoEDeployment,
@@ -54,9 +54,12 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
     sm_support = SmSupport(allowed=frozenset({120}))
     #: The Triton kernel is instantiated for BF16 activations only.
     supported_dtypes = BF16_ONLY
-    # The kernel takes no activation constants and runs only these gated kinds.
+    # Only these two gated kinds, and of the three ABI registers only the clamp:
+    # the kernel takes it by value, so a per-expert clamp cannot be honoured.
+    # ``clamp_after_silu`` stays unset -- the kernel clamps before the SiLU only.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu})
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu}),
+        limit=ActivationParamShape.UNIFORM_SCALAR,
     )
     issues_fused_moe_op = False
 
@@ -113,4 +116,5 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
             self.quant_scales.proj_weight_scales,
             activation_type=self.activation_type,
             output_dtype=ctx.output_dtype,
+            swiglu_limit=self.act_clamp,
         )
