@@ -44,7 +44,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
-from ...cache import ForwardPlan
+from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
 
 
@@ -615,6 +615,11 @@ class CuDNNAttention(AttentionBackend):
         """
         plan.validate()
         kv_cache = plan.cache
+        if not isinstance(kv_cache, BlockCausalKVCacheManager):
+            raise NotImplementedError(
+                f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
+                f"{type(kv_cache).__name__}"
+            )
         if self._resolve_mask(attention_mask, key_padding_mask):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
@@ -895,7 +900,7 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
-            kv: A ``ForwardPlan`` from a ``RolloutKVCacheInterface``. When given,
+            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
                 ``k``/``v`` are the new tokens only: they are written at
                 ``staging_offset`` and attention runs over everything cached before them
                 plus themselves, full within a causal block and causal across causal

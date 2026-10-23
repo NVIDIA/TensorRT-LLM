@@ -191,6 +191,16 @@ class BlockCausalKVCacheManager(KVCacheManagerV2, RolloutKVCacheInterface):
     Several streams (for example the two branches of classifier-free guidance) take
     one instance each.
 
+    A pipeline drives the rollout through ``RolloutKVCacheInterface`` (``open``,
+    ``plan``, ``commit``, ``close``, ``shutdown``) and puts the prompt in with
+    ``write_range(layer_idx, 0, k, v)`` on every layer followed by ``commit`` of its
+    length. The other members are the paged layout's own and serve its attention
+    backends, tests and benchmark: ``write_staged``, ``write_range`` past the fixed
+    region, ``zero_values``, ``kv_buffer``, ``table``/``page_table``,
+    ``causal_block_pages``/``causal_block_lengths``/``causal_block_offsets``,
+    ``cached_tokens``, ``staging_offset``, ``history_tokens``, ``capacity`` and the
+    pool sizing helpers.
+
     Terms, used the same way in this cache, its attention backends and its kernels.
     "Block" alone is never used: in the LLM code it means a page.
 

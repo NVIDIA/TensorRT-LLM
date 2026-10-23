@@ -487,7 +487,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 backends. The TRTLLM kernels have no key-padding input, so callers
                 that need padded keys must guard at the model level or select the
                 ``VANILLA`` backend.
-            kv: A ``ForwardPlan`` from a ``RolloutKVCacheInterface``. When given,
+            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
                 ``k``/``v`` are the new tokens only: the fused kernel writes them at
                 ``staging_offset`` and attends over everything cached before them plus
                 themselves, full within a causal block and causal across causal blocks.
@@ -575,6 +575,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         returns ``[S, H*D]`` with zero rows past them."""
         plan.validate()
         kv_cache = plan.cache
+        if not isinstance(kv_cache, BlockCausalKVCacheManager):
+            raise NotImplementedError(
+                f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
+                f"{type(kv_cache).__name__}"
+            )
         if attention_mask != PredefinedAttentionMask.FULL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_attention_config is not None:
