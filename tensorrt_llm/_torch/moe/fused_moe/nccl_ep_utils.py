@@ -201,20 +201,11 @@ class NcclEpContext:
         # a downgraded library, but do not probe a non-public config field.
         self.kernel_resets_recv_topk_idx = nccl_ep_supports_version("0.2")
 
-        # Capability probe for the opportunistic zero-copy dispatch path.
-        # When the Pythonic GroupConfig facade exposes `zero_copy` (i.e.,
-        # the wheel was built against a libnccl_ep.so that has the field
-        # in ncclEpGroupConfig_t), we allocate a VMM-backed,
-        # window-registered dispatch output buffer; the LL dispatch
-        # opportunistically picks zero-copy when recv_x->win_hdl is set
-        # (nvlink-only + rank-major + !fp8). The config flag itself stays
-        # AUTO/OFF -- strict zero_copy=ON requires combine inputs to be
-        # windowed too, which would force a caller-side interface change
-        # (the MLP output is caller-owned). The C-side strict-ON check
-        # remains in the library for future use.
-        self.zerocopy_enabled = not (
-            use_internal_fp8_dispatch or external_fp8 or external_nvfp4
-        ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
+        # The pool supplies registered windows; NCCL-EP selects direct access
+        # or staging for each operation in its default opportunistic mode.
+        self.window_buffers_supported = "zero_copy" in getattr(
+            GroupConfig, "__dataclass_fields__", {}
+        )
 
         # MPI sub-communicator scoped to the EP group. Mirrors the
         # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
@@ -271,14 +262,7 @@ class NcclEpContext:
         device_id = torch.cuda.current_device()
         device = torch.device("cuda", device_id)
 
-        # Dispatch output tokens: 3D [ep_size, max_tokens_per_rank, hidden]
-        # for LL rank-major. When zerocopy is enabled the buffer must be
-        # VMM-backed (cuMemMap) so ncclCommWindowRegister's internal
-        # cuMemGetAddressRange call succeeds -- torch's caching
-        # allocator returns plain cudaMalloc memory which fails that
-        # check with CUDA_ERROR_INVALID_VALUE. Allocate via
-        # nccl.core.mem_alloc (VMM-backed) then build a zero-copy torch
-        # view over the raw pointer via the TRT-LLM CAI wrapper.
+        # LL rank-major dispatch output: [ep_size, max_tokens_per_rank, token_width].
         token_dtype = torch.float8_e4m3fn if use_internal_fp8_dispatch else torch.bfloat16
         token_width = (
             hidden_size // 2
@@ -343,10 +327,8 @@ class NcclEpContext:
                 device=device,
             )
 
-        # Wrap each persistent buffer as a Tensor descriptor. Torch owns the
-        # storage; the descriptor only carries shape + a pointer (+ window
-        # handle on dispatch output when zerocopy is on, so libnccl_ep's
-        # opportunistic LL zero-copy path can fire).
+        # Persistent descriptors refer to ordinary context-owned storage. The
+        # per-operation descriptors carry windows acquired from the NCCL pool.
         self.output_tokens_nd = Tensor(self.output_tokens_buf)
         self.recv_topk_idx_nd = Tensor(self.recv_topk_idx_buf)
         self.recv_topk_weights_nd = Tensor(self.recv_topk_weights_buf)
@@ -402,20 +384,7 @@ class NcclEpContext:
                 logger.warning(f"NCCL EP group destroy error: {e}")
             self.ep_group = None
 
-        # Deregister windows before the comm goes away. close() is
-        # idempotent and local; the comm would auto-close any leftover
-        # windows on destroy, but explicit LIFO release matches the rest
-        # of this teardown path. Both dispatch-output and combine-input
-        # windows are registered only when zerocopy is on.
-        for attr in ("_combine_input_window",):
-            w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    w.close()
-                except _NCCL_RUNTIME_ERRORS as e:
-                    logger.warning(f"NCCL EP window close error ({attr}): {e}")
-                setattr(self, attr, None)
-
+        # Pooled windows belong to the allocator, not this EP context.
         self.output_tokens_nd = None
         self.output_tokens_buf = None
 

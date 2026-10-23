@@ -35,7 +35,7 @@ CUDA-graph capture is supported once the handle exists.
 """
 
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -46,6 +46,16 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .base import Communication
 
 _NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
+
+
+class NcclEPWindow(NamedTuple):
+    """Borrowed registration metadata; the caller owns the tensor lease."""
+
+    handle: int
+    data_ptr: int
+    numel: int
+    dtype: torch.dtype
+    device: torch.device
 
 
 class NcclEP(Communication):
@@ -302,9 +312,9 @@ class NcclEP(Communication):
         topk_nd = Tensor(topk_idx_dev)
         dispatch_outputs = ctx.dispatch_outputs
         window_tokens = None
-        # CUDA graph capture requires stable context-owned output addresses.
-        # Eager dispatch keeps the operation-scoped NCCL-window allocation.
-        if ctx.zerocopy_enabled and not torch.cuda.is_current_stream_capturing():
+        # The pool owns registration, graph-pool lifetimes, and capture-time
+        # misses. A prewarmed window can be used during capture as well as eager.
+        if ctx.window_buffers_supported:
             window_tokens, actual_kind, window_handle = (
                 torch.ops.trtllm.allocate_output_with_nccl_window(
                     ctx.output_tokens_buf,
@@ -346,7 +356,6 @@ class NcclEP(Communication):
             "num_tokens": num_tokens,
             "topk_nd": topk_nd,
             "topk_idx_dev": topk_idx_dev,
-            "window_tokens": window_tokens,
         }
 
         # Match NVLinkOneSided's contract: token_selected_slots in
@@ -405,12 +414,18 @@ class NcclEP(Communication):
     def combine(
         self,
         final_hidden_states: torch.Tensor,
+        *,
+        window: Optional[NcclEPWindow] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Combine MoE-reduced rank-major output back to the home rank.
 
         Input: [max_recv_tokens, hidden] -- already weighted per-row by fused_moe.
         Output: [num_tokens, hidden] -- combined to original token order.
+
+        The caller may supply window metadata for the input tensor. It must
+        keep that tensor's lease valid through this operation. Missing metadata
+        or a mismatched destination uses NCCL-EP's ordinary input path.
         """
         from nccl.ep import (
             CombineConfig,
@@ -453,7 +468,23 @@ class NcclEP(Communication):
             device=combine_input_c.device,
         )
 
-        combine_input_nd = Tensor(combine_input_c)
+        # Only attach the pool's window if the backend actually returned its
+        # supplied destination. A fresh/converted output uses NCCL-EP staging.
+        if (
+            window is not None
+            and window.handle
+            and combine_input_c.device == window.device
+            and combine_input_c.dtype == window.dtype
+            and combine_input_c.data_ptr() == window.data_ptr
+            and combine_input_c.numel() == window.numel
+        ):
+            combine_input_nd = Tensor(
+                combine_input_c,
+                window=window,
+                window_offset=0,
+            )
+        else:
+            combine_input_nd = Tensor(combine_input_c)
         combine_output_nd = Tensor(combine_output)
 
         if self.use_low_precision_combine:
