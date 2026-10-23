@@ -45,6 +45,7 @@ os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 
 _inited = False
 
+_INDUCTOR_QUIESCE_POOL_ENV = "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"
 _UNIFIED_CACHE_ROOT_ENV = "TRTLLM_CACHE_DIR"
 _TRTLLM_DG_CACHE_ENV = "TRTLLM_DG_CACHE_DIR"
 _TRTLLM_DG_DUMP_CUBIN_ENV = "TRTLLM_DG_JIT_DUMP_CUBIN"
@@ -92,6 +93,14 @@ def _set_numexpr_thread_default() -> None:
     # TRT-LLM uses NumExpr only for scalar checkpoint formulas. Avoid creating
     # its helper pool unless the embedding application explicitly opts in.
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def _keep_inductor_compile_pool_alive() -> None:
+    # Inductor shuts down its async-compile worker pool after a short idle
+    # period. A compile submitted while that shutdown is in flight can wait
+    # forever, and a rank stuck there stalls every collective of its group
+    # (e.g. a torch.compile'd helper recompiling inside a TP forward).
+    os.environ.setdefault(_INDUCTOR_QUIESCE_POOL_ENV, "0")
 
 
 def _add_trt_llm_dll_directory():
@@ -162,6 +171,7 @@ def _setup_vendored_triton_kernels():
 def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
     _set_numexpr_thread_default()
+    _keep_inductor_compile_pool_alive()
     _setup_unified_cache()
     _add_trt_llm_dll_directory()
     _preload_python_lib()
